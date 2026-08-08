@@ -743,7 +743,10 @@ def _describe(
         "is_default": defn.key not in explicit,
         "minimum": defn.minimum,
         "maximum": defn.maximum,
-        "choices": [{"value": value, "label": label} for value, label in defn.choices] or None,
+        # Always a list, never None. A setting that is not a select simply has no choices,
+        # and an empty list says that without forcing every consumer to handle a null --
+        # the API schema types this as a list, and the UI maps over it directly.
+        "choices": [{"value": value, "label": label} for value, label in defn.choices],
         "unit": defn.unit,
         "dangerous": defn.dangerous,
         "read_only": defn.read_only,

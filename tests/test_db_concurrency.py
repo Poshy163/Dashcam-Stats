@@ -148,11 +148,40 @@ class TestConcurrentWrites:
         assert total == 48, "a writer silently lost its rows"
 
 
-class TestPragmas:
-    async def test_write_lock_is_taken_eagerly(self, db_session):
-        """Guards the `begin` hook: without it the upgrade deadlock returns."""
+class TestClaimIsOneStatement:
+    """The claim must not read a candidate and then update it separately.
+
+    That shape takes a read snapshot and needs a write-lock upgrade afterwards, which
+    SQLite refuses immediately (SQLITE_BUSY_SNAPSHOT) rather than waiting -- busy_timeout
+    does not apply. Selecting inside the UPDATE keeps it atomic.
+    """
+
+    def test_claim_selects_inside_the_update(self):
+        import inspect
+
+        source = inspect.getsource(queue.claim_next)
+        update_at = source.find("update(ProcessingJob)")
+        assert update_at != -1, "claim_next no longer issues an UPDATE"
+
+        # A standalone `await session.execute(select(...))` before the UPDATE is the
+        # read-then-write pattern this guards against. The subquery form embeds the
+        # select in the statement instead.
+        assert "scalar_subquery()" in source, (
+            "claim_next should select the candidate inside the UPDATE, not beforehand"
+        )
+        assert "execute(\n            select(" not in source
+
+    async def test_transactions_stay_deferred(self, db_session):
+        """Forcing BEGIN IMMEDIATE starves readers.
+
+        It fixes the claim race by serialising everything, including read-only API
+        requests, which then queue behind long worker writes and fail on BEGIN itself.
+        Under WAL a deferred read never takes the write lock at all.
+        """
         from app.db.session import get_engine
 
         engine = get_engine()
-        listeners = engine.sync_engine.dispatch.begin
-        assert listeners, "no 'begin' handler installed; BEGIN IMMEDIATE is not in effect"
+        assert not engine.sync_engine.dispatch.begin, (
+            "a 'begin' handler is installed; if it forces BEGIN IMMEDIATE it will starve "
+            "readers behind the workers' write transactions"
+        )

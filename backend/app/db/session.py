@@ -48,7 +48,7 @@ SQLITE_PRAGMAS: tuple[tuple[str, str], ...] = (
     ("synchronous", "NORMAL"),
     # SQLite defaults foreign keys to OFF; the schema leans on ON DELETE CASCADE.
     ("foreign_keys", "ON"),
-    ("busy_timeout", "15000"),
+    ("busy_timeout", "30000"),
     # Negative values are KiB, so this is a 64 MiB page cache per connection. Telemetry
     # queries sweep long index ranges and benefit far more than the memory costs.
     ("cache_size", "-65536"),
@@ -82,29 +82,17 @@ def _apply_sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:
     finally:
         cursor.close()
 
-    # Hand transaction control to us so the "begin" handler below can choose the locking
-    # mode. Left alone, pysqlite opens transactions implicitly and there is no way to ask
-    # for an immediate one.
-    dbapi_connection.isolation_level = None
-
-
-def _begin_immediate(conn: Any) -> None:
-    """Start every transaction with ``BEGIN IMMEDIATE``.
-
-    ``busy_timeout`` does not cover lock *upgrades*. A transaction that reads first and
-    writes later holds a shared lock, and when it tries to upgrade while another
-    connection is writing, SQLite returns SQLITE_BUSY **immediately** rather than waiting
-    -- waiting could deadlock, so the timeout is deliberately not honoured. That is the
-    exact shape of the job-claim query (SELECT the next id, then UPDATE it), and under two
-    workers plus the scheduler and the log sink it produced a steady trickle of
-    "database is locked" failures.
-
-    Taking the write lock up front turns that instant failure into an ordinary wait
-    governed by ``busy_timeout``. It serialises writers, which SQLite does anyway, at the
-    cost of readers queueing behind a writer -- a trade worth making when the alternative
-    is losing work.
-    """
-    conn.exec_driver_sql("BEGIN IMMEDIATE")
+    # Transactions are left deferred on purpose.
+    #
+    # An earlier attempt forced `BEGIN IMMEDIATE` on every transaction to stop the job
+    # claim losing a lock-upgrade race. It worked, and made things worse: a deferred
+    # transaction that only reads never takes the write lock at all, but an immediate one
+    # always does, so every read-only API request queued behind the workers' long write
+    # transactions and eventually failed on `BEGIN IMMEDIATE` itself. Under WAL, readers
+    # and a single writer coexist happily -- serialising them threw that away.
+    #
+    # The upgrade race is fixed where it actually lives instead: `queue.claim_next` is a
+    # single atomic UPDATE rather than a SELECT followed by an UPDATE.
 
 
 def _build_engine() -> AsyncEngine:
@@ -127,7 +115,6 @@ def _build_engine() -> AsyncEngine:
     engine = create_async_engine(url, **kwargs)
     if url.get_backend_name() == "sqlite":
         event.listen(engine.sync_engine, "connect", _apply_sqlite_pragmas)
-        event.listen(engine.sync_engine, "begin", _begin_immediate)
     return engine
 
 

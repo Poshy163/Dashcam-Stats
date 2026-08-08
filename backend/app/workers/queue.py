@@ -103,41 +103,52 @@ async def claim_next(session: AsyncSession, worker_id: str) -> ProcessingJob | N
         return None
 
     now = datetime.now(UTC)
-    candidate = (
+
+    # One statement, deliberately. Reading the candidate id and then updating it in a
+    # separate statement takes a read snapshot first and needs to upgrade to a write lock
+    # afterwards; if any other connection wrote in between, SQLite fails that upgrade
+    # *immediately* with SQLITE_BUSY_SNAPSHOT, which busy_timeout does not wait out. Under
+    # two workers plus the scheduler that quietly abandoned jobs. Selecting the row inside
+    # the UPDATE keeps the whole claim atomic, so there is no snapshot to invalidate.
+    #
+    # The `state == QUEUED` predicate still does the mutual exclusion: whichever worker
+    # lands first flips the row, and the other matches zero rows and asks again.
+    next_queued = (
+        select(ProcessingJob.id)
+        .where(
+            ProcessingJob.state == JobState.QUEUED,
+            (ProcessingJob.not_before.is_(None)) | (ProcessingJob.not_before <= now),
+        )
+        .order_by(ProcessingJob.priority.asc(), ProcessingJob.queued_at.asc())
+        .limit(1)
+        .scalar_subquery()
+    )
+
+    claimed = (
         await session.execute(
-            select(ProcessingJob.id)
+            update(ProcessingJob)
             .where(
+                ProcessingJob.id == next_queued,
                 ProcessingJob.state == JobState.QUEUED,
-                (ProcessingJob.not_before.is_(None)) | (ProcessingJob.not_before <= now),
             )
-            .order_by(ProcessingJob.priority.asc(), ProcessingJob.queued_at.asc())
-            .limit(1)
+            .values(
+                state=JobState.RUNNING,
+                worker_id=worker_id,
+                started_at=now,
+                heartbeat_at=now,
+                attempts=ProcessingJob.attempts + 1,
+                progress=0.0,
+            )
+            .returning(ProcessingJob.id)
+            .execution_options(synchronize_session=False)
         )
     ).scalar_one_or_none()
 
-    if candidate is None:
-        return None
-
-    # The state predicate is what makes this safe: whichever worker's UPDATE lands first
-    # flips the row out of QUEUED, and the other matches zero rows and moves on.
-    result = await session.execute(
-        update(ProcessingJob)
-        .where(ProcessingJob.id == candidate, ProcessingJob.state == JobState.QUEUED)
-        .values(
-            state=JobState.RUNNING,
-            worker_id=worker_id,
-            started_at=now,
-            heartbeat_at=now,
-            attempts=ProcessingJob.attempts + 1,
-            progress=0.0,
-        )
-        .execution_options(synchronize_session=False)
-    )
-    if result.rowcount == 0:
+    if claimed is None:
         return None
 
     await session.flush()
-    return await session.get(ProcessingJob, candidate)
+    return await session.get(ProcessingJob, claimed)
 
 
 async def heartbeat(
