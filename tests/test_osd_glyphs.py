@@ -118,6 +118,74 @@ class TestBinarise:
         assert binarise(strip).any()
 
 
+class TestTextBandIsolation:
+    """The defect that made GPS fixes intermittent on real footage.
+
+    The overlay is cropped as a fixed rectangle at the bottom of the frame, so it also
+    catches whatever the scene puts there — a lit bonnet edge, a lane marking, a bumper.
+    A *horizontal* streak of that ink is far more damaging than it looks: segmentation
+    splits glyphs on empty columns, so a bright line above the text fills every gap
+    between characters and welds them into one run, which the width filter then discards
+    in its entirety.
+
+    On real frames this deleted the whole latitude field while leaving everything else
+    perfect — ``E:138.7158 N: 64 km/h`` — and the recording was stored as having no GPS
+    fix with the coordinates plainly legible in the picture. Removing it took the fix rate
+    on a 240-frame sample from 69% to essentially 100%.
+    """
+
+    LINE = "2026-08-04 17:44:39 E:138.6769 N:-34.8088 68 km/h"
+
+    def _glyph_count(self, strip: np.ndarray) -> int:
+        return len(segment_glyphs(binarise(strip)))
+
+    def test_a_detached_streak_above_the_text_is_removed(self):
+        strip = render_text(self.LINE)
+        expected = self._glyph_count(strip)
+        # Separated from the text by blank rows, as a distant object would be.
+        strip[0:2, 700:1100] = 255
+        assert self._glyph_count(strip) == expected
+
+    def test_a_streak_touching_the_text_is_removed(self):
+        # The harder case, and the one seen on the rear camera: no blank row separates the
+        # streak from the glyphs, so splitting the strip on empty rows cannot find it. The
+        # glyphs themselves have to say where the line sits.
+        strip = render_text(self.LINE)
+        expected = self._glyph_count(strip)
+        strip[6:10, 700:1100] = 255
+        assert self._glyph_count(strip) == expected
+
+    def test_the_welded_field_is_recovered_not_merely_survived(self):
+        # Guards the specific failure: without isolation the streaked span collapses from
+        # many glyphs into one over-wide run that is then dropped entirely.
+        strip = render_text(self.LINE)
+        streaked = strip.copy()
+        streaked[0:2, 700:1100] = 255
+        before = segment_glyphs(streaked >= 170)  # what plain thresholding would give
+        after = segment_glyphs(binarise(streaked))
+
+        def in_streak(glyphs):
+            return [g for g in glyphs if 700 <= g.x0 < 1100]
+
+        # The welded run is not merely misshapen, it is *absent*: segment_glyphs discards
+        # anything over the width bound, so every character under the streak disappears
+        # without trace. That silence is what made the failure so hard to see.
+        assert in_streak(before) == []
+        assert len(in_streak(after)) >= 5
+        assert len(after) == len(segment_glyphs(binarise(strip)))
+
+    def test_a_clean_strip_is_left_alone(self):
+        strip = render_text(self.LINE)
+        assert np.array_equal(binarise(strip), binarise(strip.copy()))
+        assert self._glyph_count(strip) == sum(1 for c in self.LINE if c != " ")
+
+    def test_isolation_does_not_fire_on_too_little_evidence(self):
+        # Two glyphs are not enough to locate a line; clipping on that basis could delete
+        # the text and keep the debris.
+        strip = render_text("26")
+        assert len(segment_glyphs(binarise(strip))) == 2
+
+
 class TestTemplateLearning:
     def _learn(self, samples: list[tuple[str, datetime]]) -> GlyphTemplates:
         learner = TemplateLearner()

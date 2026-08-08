@@ -59,7 +59,15 @@ TIMESTAMP_GLYPH_COUNT = 18
 _TRAILING_LITERALS = ("k", "m", "/", "h")
 
 _MIN_SAMPLES_PER_CHAR = 3
-_BRIGHT_FLOOR = 170
+
+#: Absolute lower bound on the binarisation threshold. This is not the threshold itself —
+#: see :func:`binarise` — only the floor beneath it.
+#:
+#: It is set where it is because the glyphs are anti-aliased: each stroke carries a halo a
+#: shade or two dimmer than the core. Admitting that halo thickens every character just
+#: enough to turn a ``5`` into a ``6``, which is what a floor of 100 did here — the fix
+#: rate fell to nothing while the decodes still looked superficially plausible.
+_MIN_TEXT_LEVEL = 170
 
 
 @dataclass(slots=True)
@@ -82,29 +90,136 @@ class Glyph:
 def binarise(strip: np.ndarray) -> np.ndarray:
     """Threshold the overlay strip to a boolean text mask.
 
-    A fixed bright floor rather than pure Otsu: Otsu assumes a bimodal histogram, which
-    holds at night but not at midday when the bonnet below the text is itself bright.
-    Otsu is used only to *raise* the floor when the whole strip is washed out.
+    A single global threshold, which is warranted: measured across real strips the
+    background sits between 1 and 28 and the glyph strokes at 255, so the separation is
+    enormous and does not drift along the width.
+
+    Column-local thresholding was tried here twice and kept neither time. Estimating the
+    background from a column mean was actively harmful, because the mean is dragged up by
+    the very stroke it passes through. Estimating it from a low percentile was sound and
+    made no difference at all — identical results on every frame of a 240-frame sample —
+    because a bright background was never what went wrong. What went wrong was ink from
+    the scene bridging the gaps between glyphs, which :func:`isolate_text_band` removes.
+
+    The floor is where it is because the glyphs are anti-aliased: each stroke carries a
+    halo a shade or two dimmer than the core. Lowering the floor to admit that halo
+    thickens every character just enough to turn a ``5`` into a ``6``, which took the fix
+    rate to zero while the decodes still looked superficially plausible.
     """
     if strip.ndim == 3:
         strip = strip[..., 0]
-    floor = _BRIGHT_FLOOR
+
     hi = int(strip.max())
-    if hi <= floor:
-        # Dim strip (heavy underexposure) — fall back to a relative threshold so the text
-        # is still separated rather than losing the whole frame.
-        floor = max(60, int(hi * 0.75))
-    else:
-        otsu = _otsu_threshold(strip)
-        floor = max(floor, min(otsu, hi - 10))
-    return strip >= floor
+    if hi <= _MIN_TEXT_LEVEL:
+        # Heavily underexposed: nothing clears the absolute floor, so fall back to a
+        # relative one rather than returning an empty mask.
+        return isolate_text_band(strip >= max(60, int(hi * 0.75)))
+
+    return isolate_text_band(strip >= _MIN_TEXT_LEVEL)
+
+
+def _row_bands(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Contiguous runs of rows containing ink, as ``(y0, y1)`` half-open pairs."""
+    rows = mask.any(axis=1)
+    bands: list[tuple[int, int]] = []
+    start: int | None = None
+    for y in range(len(rows) + 1):
+        inked = bool(rows[y]) if y < len(rows) else False
+        if inked and start is None:
+            start = y
+        elif not inked and start is not None:
+            bands.append((start, y))
+            start = None
+    return bands
+
+
+def _glyph_run_count(band: np.ndarray, min_width: int, max_width: int) -> int:
+    """How many glyph-shaped column runs a band contains."""
+    columns = band.any(axis=0)
+    count = 0
+    start: int | None = None
+    for x in range(len(columns) + 1):
+        inked = bool(columns[x]) if x < len(columns) else False
+        if inked and start is None:
+            start = x
+        elif not inked and start is not None:
+            if min_width <= x - start <= max_width:
+                count += 1
+            start = None
+    return count
+
+
+#: A glyph must be at least this tall to vote on where the text line sits. Digits are 33
+#: pixels here and ``:`` is 23; ``-`` and ``.`` are excluded, which is the point — they
+#: carry no useful information about the line's vertical extent.
+_LINE_VOTE_MIN_HEIGHT = 15
+
+#: How many such glyphs are needed before their vote is trusted.
+_LINE_VOTE_MIN_COUNT = 4
+
+
+def isolate_text_band(mask: np.ndarray, *, min_width: int = 2, max_width: int = 60) -> np.ndarray:
+    """Keep only the horizontal band of ink that holds the overlay line.
+
+    The crop is a fixed rectangle at the bottom of the frame, so it catches whatever the
+    scene puts there alongside the text — the lit edge of a bonnet, a lane marking, the
+    bumper of the car in front. That intruding ink is usually a *horizontal* streak, and a
+    streak is far more damaging than it looks: glyph segmentation splits on empty columns,
+    so a bright line running above the text fills in every gap between characters and
+    welds them into a single run. The width filter then throws the whole run away.
+
+    That is not a hypothetical. It is how ``N:-34.7758`` became one 195-pixel-wide blob
+    and vanished from an otherwise perfect reading, leaving ``E:138.7158 N: 64 km/h`` and
+    a recording marked as having no GPS fix while the coordinates sat plainly legible in
+    the frame.
+
+    Two passes, because streaks come in two shapes. A streak separated from the text by
+    blank rows splits the strip into bands, and the text band is picked out by counting
+    glyph-shaped column runs rather than raw ink — a streak is a lot of ink in very few
+    runs, while a line of text is the reverse. A streak that *touches* the text leaves one
+    unbroken band and survives that test, so the second pass asks the glyphs themselves
+    where the line sits: whatever segmented cleanly votes on the top and bottom edge, and
+    the mask is clipped to the result. Anything hanging above or below is not part of the
+    line and goes.
+    """
+    bands = _row_bands(mask)
+    if len(bands) > 1:
+
+        def score(band: tuple[int, int]) -> tuple[int, int]:
+            top, bottom = band
+            window = mask[top:bottom]
+            return _glyph_run_count(window, min_width, max_width), int(window.sum())
+
+        top, bottom = max(bands, key=score)
+        isolated = np.zeros_like(mask)
+        isolated[top:bottom] = mask[top:bottom]
+        mask = isolated
+
+    votes = [
+        (glyph.y0, glyph.y1)
+        for glyph in segment_glyphs(mask, min_width=min_width, max_width=max_width)
+        if glyph.height >= _LINE_VOTE_MIN_HEIGHT
+    ]
+    if len(votes) < _LINE_VOTE_MIN_COUNT:
+        # Too little clean material to locate the line; leave the mask alone rather than
+        # clip it on the strength of a couple of glyphs that might themselves be debris.
+        return mask
+
+    top = int(np.median([y0 for y0, _ in votes]))
+    bottom = int(np.median([y1 for _, y1 in votes]))
+    if bottom <= top:
+        return mask
+
+    clipped = np.zeros_like(mask)
+    clipped[top:bottom] = mask[top:bottom]
+    return clipped
 
 
 def _otsu_threshold(image: np.ndarray) -> int:
     hist = np.bincount(image.ravel(), minlength=256).astype(np.float64)
     total = hist.sum()
     if total == 0:
-        return _BRIGHT_FLOOR
+        return _MIN_TEXT_LEVEL
     omega = np.cumsum(hist) / total
     mu = np.cumsum(hist * np.arange(256)) / total
     mu_t = mu[-1]

@@ -46,6 +46,103 @@ class TestHappyPath:
         assert r.raw_text == REAL_LINE
 
 
+class TestFieldsAreIndependent:
+    """Each field stands on its own.
+
+    Every line below is one this parser used to throw away whole. They come from real
+    frames where something bright in the scene sat behind the left of the overlay and ate
+    the date; the coordinates and speed beside it were never in any doubt. Because the
+    three fields were matched as one pattern, a damaged clock discarded a clean fix, and
+    long runs of a drive went missing from the map for a cosmetic reason.
+    """
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "202670 13:49:22 E:138.7075 N:-34.7955 61 km/h",
+            "-07-28 13:49:25 E:138.7078 N:-34.7955 57 km/h",
+            "2 07-28 13:49:24 E:138.7078 N:-34.7955 57 km/h",
+            "8--07-28 13:49:26 E:138.7082 N:-34.7955 50 km/h",
+        ],
+    )
+    def test_a_mangled_date_does_not_cost_the_fix(self, line):
+        r = parse_osd_text(line)
+        assert r.has_position is True, "coordinates were legible and must survive"
+        assert r.lat == pytest.approx(-34.79, abs=0.01)
+        assert r.lon == pytest.approx(138.70, abs=0.01)
+        assert r.valid is True
+
+    def test_a_damaged_separator_still_yields_everything(self):
+        # One date separator decoding as ':' is cosmetic; the digits are all correct.
+        r = parse_osd_text("2026-07:28 13:49:03 E:138.7035 N:-34.7956 62 km/h")
+        assert r.captured_at == datetime(2026, 7, 28, 13, 49, 3)
+        assert r.has_position is True
+        assert r.speed_kmh == pytest.approx(62.0)
+
+    def test_speed_survives_unreadable_coordinates(self):
+        # "km/h" is a dependable anchor: four glyphs at a fixed place on the line.
+        r = parse_osd_text("2026-07-28 13:49:14 /Eh38.7059 N:- 55 66 km/h")
+        assert r.speed_kmh == pytest.approx(66.0)
+        assert r.has_position is False
+
+    def test_nothing_readable_is_still_not_a_crash(self):
+        r = parse_osd_text("k m / h : : E N")
+        assert r.valid is False
+        assert r.problems and "no recognisable overlay content" in r.problems
+
+
+class TestCoordinatesAreNeverInvented:
+    """Guards against the three ways this parser has silently produced a wrong position.
+
+    A missing fix costs nothing — the overlay repeats every second. A *wrong* fix drags
+    journey bounds across the planet, wrecks every distance, and is plainly visible on the
+    map. So each of these prefers no answer to a plausible one.
+    """
+
+    def test_a_minus_misread_as_a_dot_does_not_flip_hemisphere(self):
+        # 'N:.34.7956' is equally consistent with a misread '-' and a misread ':'. Guessing
+        # wrong puts an Adelaide drive in Iraq, so the reading is refused instead.
+        r = parse_osd_text("2026-07-28 13:49:02 E:138.7035 N:.34.7956 62 km/h")
+        assert r.has_position is False
+        assert r.lat is None
+
+    def test_an_explicit_sign_is_not_treated_as_ambiguous(self):
+        r = parse_osd_text("2026-07-28 13:49:02 E:138.7035 N:-34.7956 62 km/h")
+        assert r.lat == pytest.approx(-34.7956)
+
+    def test_a_genuine_positive_latitude_is_kept(self):
+        # Northern hemisphere: no sign printed at all, and ':' before the digits is the
+        # overlay's own separator rather than a damaged minus.
+        r = parse_osd_text("2026-07-28 13:49:02 E:2.3522 N:48.8566 62 km/h")
+        assert r.lat == pytest.approx(48.8566)
+        assert r.has_position is True
+
+    @pytest.mark.parametrize(
+        ("line", "expected_lon"),
+        [
+            # A misread hour let the seconds field swallow the '13' of '138', leaving a
+            # longitude of 8.7067 -- off the coast of Nigeria, mid-drive.
+            ("2026-07-28 m:49:19 E:138.7067 N:-34.7955 66 km/h", 138.7067),
+            ("2026-08-04 15:35: :1138.6754 N:-34.8113 0 km/h", 138.6754),
+        ],
+    )
+    def test_the_clock_cannot_eat_the_leading_digit_of_a_coordinate(self, line, expected_lon):
+        r = parse_osd_text(line)
+        if r.has_position:
+            assert r.lon == pytest.approx(expected_lon)
+
+    def test_seconds_are_not_spliced_onto_a_fraction(self):
+        # '22:52:13 .6848' must not become a longitude of 13.6848.
+        r = parse_osd_text("2026h07-30 22:52:13 .6848 N:-34.8324 0 km/h")
+        assert r.lon != pytest.approx(13.6848)
+
+    def test_a_date_is_never_read_as_a_coordinate(self):
+        # With the coordinates gone, a date whose separators decoded as dots has the shape
+        # of one. Inventing a position from the clock is worse than reporting none.
+        r = parse_osd_text("2026.0731 15:15:03")
+        assert r.has_position is False
+
+
 class TestNoFix:
     def test_zero_coordinates_mean_no_fix_not_null_island(self):
         r = parse_osd_text(REAL_NOFIX)
@@ -124,7 +221,11 @@ class TestValidation:
     def test_impossible_datetimes_are_refused(self, bad):
         r = parse_osd_text(bad)
         assert r.captured_at is None
-        assert r.valid is False
+        # The clock is refused, but the fields either side of it are untouched. Fields are
+        # parsed independently precisely so a bad digit in the date cannot take a good
+        # coordinate down with it.
+        assert r.has_fix is True
+        assert (r.lat, r.lon) == (-34.8088, 138.6769)
 
     def test_implausible_year_is_refused(self):
         r = parse_osd_text("1026-08-04 17:44:39 E:138.6769 N:-34.8088 68 km/h")

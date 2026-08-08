@@ -154,15 +154,66 @@ every location attached to a detection. It is built for accuracy first.
    samples frames, locates the bright text band along the bottom edge, and stores the region.
 2. **Sampling.** Decode at 1 fps via VAAPI (`-vf fps=1`), cropping to the OSD strip in the
    same FFmpeg graph so only a thin strip is ever transferred back to system memory.
-3. **Binarisation.** The text is near-white on dark, anti-aliased. Otsu threshold on the
-   luma plane, then connected-component segmentation into glyph boxes.
+3. **Binarisation and text-band isolation.** The text is near-white on dark, so a single
+   global threshold suffices — measured on real strips the background sits at 1–28 and the
+   strokes at 255. Column-local thresholding was implemented, measured and removed; see
+   below. What the strip *does* need is removal of scene ink, because the crop is a fixed
+   rectangle that also catches lit bonnet edges and lane markings.
 4. **Glyph classification.** The font is fixed across the corpus, so each glyph box is matched
    against a bundled template set (`0-9`, `-`, `:`, `.`, `E`, `N`, `k`, `m`, `/`, `h`, space).
    Normalised cross-correlation gives a per-glyph score; the minimum across the field becomes
    that field's confidence.
-5. **Parsing and validation.** The reconstructed string is parsed against the OSD pattern.
-   A point is rejected unless the date parses, the timestamp is monotonic within the segment,
-   |lat| ≤ 90, |lon| ≤ 180, and speed ≤ 400 km/h. `0.0000/0.0000` sets `fix = false`.
+5. **Parsing and validation.** Timestamp, position and speed are matched **independently**,
+   so damage to one never costs the others. A point is rejected unless |lat| ≤ 90,
+   |lon| ≤ 180 and speed ≤ 400 km/h; `0.0000/0.0000` sets `fix = false`; the timestamp must
+   parse and stay monotonic within the segment, but a failed clock no longer discards a
+   good fix.
+
+### 4.1 Why the fix rate was intermittent
+
+Worth recording, because the symptom pointed away from the cause. Coordinates were plainly
+legible in frames the app reported as having no GPS fix, and the same recording would
+"click between seeing it and not".
+
+The cause was **horizontal scene ink**, not thresholding or classification. Glyph
+segmentation splits on empty columns, so a bright streak crossing the strip — a sunlit
+bonnet edge, a lane marking — fills every gap between characters and welds a whole field
+into one run wider than the width filter allows. That run is then dropped in its entirety
+and silently: the decode still succeeds, just with a field missing, which is why
+`E:138.7158 N: 64 km/h` looked like a plausible reading rather than a bug.
+
+`isolate_text_band` removes it in two passes, because streaks come in two shapes. One
+detached from the text splits the strip into row bands, and the text band is identified by
+counting glyph-shaped column runs (a streak is much ink in few runs; text is the reverse).
+One *touching* the text leaves a single band, so the cleanly segmented glyphs vote on the
+line's top and bottom edge and the mask is clipped to it.
+
+Measured on real footage, 680 frames across 17 recordings and both cameras:
+
+| | before | after |
+| --- | --- | --- |
+| GPS fix | 69% | 96%¹ |
+| Speed | 86% | 98% |
+| Implausible coordinate jumps | 5 | 0 |
+
+¹ Excluding frames where the camera itself reported `E:00.0000 N:00.0000`. Those are real
+satellite outages — GPS acquisition at the start of a drive, or an indoor park — and
+reporting them as "no fix" is correct, not a miss.
+
+**Two things measured and rejected.** A column-local threshold using a *mean* background
+made results markedly worse (the mean is dragged up by the stroke it passes through); one
+using a low percentile was sound and changed nothing at all, because a bright background
+was never the problem. Neither is in the code. Lowering the brightness floor to admit the
+anti-aliased halo around each stroke thickened glyphs enough to turn `5` into `6`, taking
+the fix rate to zero while the decodes still looked superficially plausible.
+
+**Coordinates are never invented.** Three distinct paths were found that silently produced
+a *wrong* position, which is far worse than none — a missing fix costs nothing when the
+overlay repeats every second, whereas a wrong one drags journey bounds across the planet.
+A `-` misread as `.` flipped an Adelaide drive into the northern hemisphere; the timestamp
+pattern ate the leading `1` of `138.7067` and returned a longitude off Nigeria; the tolerant
+fallback spliced a seconds field onto a fraction. Each is now refused explicitly rather than
+resolved by guesswork, and each has a named regression test.
 6. **Derivation.** Heading is computed from consecutive fixes; distance by haversine with a
    jitter gate (points closer than the 11 m quantisation are not accumulated, otherwise
    stationary noise inflates distance).
