@@ -242,6 +242,40 @@ Discovered → Inspected → Telemetry → Detected → Plates → Completed
 | 4 · Plates | Plate detection inside tracked vehicle boxes only, OCR on the best few crops per track | Never OCR every frame; per-track voting |
 | 5 · Summarise | Roll up counts, distance, speeds; attach journey; write thumbnails | Single pass |
 
+**Models come from upstream, and so does their inference code.** Weights are fetched on
+first use into `/data/models` and cached, so the image stays small and the container works
+offline once warmed. They are published by two MIT-licensed projects rather than hosted
+here — [open-image-models](https://github.com/ankandrew/open-image-models) for the RF-DETR
+COCO detectors and the YOLOv9 plate localiser, and
+[fast-plate-ocr](https://github.com/ankandrew/fast-plate-ocr) for plate text.
+
+Their inference code is used too, which is the more consequential half of that decision.
+This repository previously hand-rolled letterboxing, anchor decoding, NMS and CTC decoding
+against release assets on its own GitHub that were never published — so every model 404'd,
+detection and plate reading were silently unavailable on every run, and none of that code
+had executed against real weights even once. Each of those steps is a place to be quietly
+wrong rather than loudly broken: a transposed output layout yields plausible boxes in the
+wrong places, and an alphabet one character out of step yields confidently misspelt plates.
+Two concrete mismatches were found and avoided while wiring this up — the COCO detectors
+label on the 91-entry COCO ID space rather than the contiguous 80-name list, and the OCR
+model's config declares RGB input where frames here are BGR. Both would have degraded
+results without raising anything.
+
+Verified on real footage before merging: 5–10 vehicles per urban frame at 0.85–0.94
+confidence with correct car/truck labels, and plate `S945CDX` read at 1.00 confidence
+across five separate frames of one drive, normalising to a South Australian pattern. OCR
+confidence tracks crop size honestly — a 128×53 crop reads at 1.00, a 35×17 crop at 0.15 —
+so `plates.min_store_confidence` (0.3) discards the unreadable rather than storing guesses.
+
+Inference runs on ONNX Runtime. The image ships the plain build, whose only provider is
+CPU: `onnxruntime-openvino` installs under the same module name *and* bundles its own copy
+of the OpenVINO runtime that hardware probing already loads, and two builds of one native
+library in a single process is not a risk worth taking here. `app/ai/runtime.py` picks the
+best available provider rather than hard-coding CPU, so installing that package later is
+enough to move inference onto the iGPU with no code change. Cost measured on an i9-class
+CPU: ~104 ms/frame for RF-DETR nano, so a 60 s clip sampled at 4 fps spends roughly 25 s in
+detection.
+
 **Object tracking.** ByteTrack over sampled frames produces one `tracked_objects` row per
 physical vehicle with first/last seen, rather than hundreds of independent detections.
 Individual `detections` rows are retained sparsely for the timeline.

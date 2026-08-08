@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 
 from app.ai.backend import get_backend
 from app.ai.models import describe_models
+from app.ai.runtime import describe_runtime
 from app.api.deps import PaginationDep, SessionDep
 from app.api.schemas import (
     JourneyOut,
@@ -384,6 +385,10 @@ async def system_hardware():
     hardware = await detect_hardware_async()
     data = hardware.as_dict()
     data["inference"]["backend"] = get_backend().describe()
+    # What actually executes the detection and OCR graphs, which is not the same thing as
+    # the OpenVINO devices probed above: those describe the hardware, this describes where
+    # inference is really scheduled.
+    data["inference"]["onnx"] = describe_runtime()
     data["models"] = describe_models()
     return data
 

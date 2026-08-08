@@ -12,14 +12,16 @@ Two decisions keep this affordable and accurate:
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
-from app.ai.backend import LoadedModel, get_backend
-from app.ai.detector import Detection2D, letterbox, nms
-from app.ai.models import OCR_ALPHABET, REGISTRY, ensure_model
+from app.ai.detector import Detection2D, load_detector
+from app.ai.models import OCR_CONFIG_FILE, ensure_model, model_dir
+from app.ai.runtime import onnx_providers
 from app.ai.tracker import sharpness
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
@@ -63,95 +65,82 @@ class PlateDetector:
     """Locates plates within a vehicle crop."""
 
     def __init__(self) -> None:
-        self._model: LoadedModel | None = None
-        self._spec = REGISTRY.get("plate-detector")
+        self._detector: Any | None = None
         self._loaded = False
 
     @property
     def available(self) -> bool:
-        return self._model is not None
+        return self._detector is not None
 
     async def load(self) -> bool:
         if self._loaded:
             return self.available
         self._loaded = True
 
-        path = await ensure_model("plate-detector")
-        if path is None:
+        threshold = float(get_settings_service().get_nowait("plates.detection_confidence"))
+        self._detector = await load_detector("plate-detector", conf_thresh=threshold)
+        if self._detector is None:
             log.warning("plate detection unavailable: model could not be obtained")
             return False
-        self._model = get_backend().load(path)
-        return self.available
+        return True
 
     async def detect(
         self, vehicle_crop: np.ndarray, *, min_width_px: int
     ) -> list[tuple[tuple[float, float, float, float], float]]:
         """Plate boxes within *vehicle_crop*, normalised to that crop, plus confidence."""
-        if self._model is None or self._spec is None or vehicle_crop.size == 0:
+        if self._detector is None or vehicle_crop.size == 0:
             return []
 
-        threshold = float(get_settings_service().get_nowait("plates.detection_confidence"))
         height, width = vehicle_crop.shape[:2]
-        padded, scale, pad_x, pad_y = letterbox(vehicle_crop, self._spec.input_size)
-        blob = padded[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+        if not height or not width:
+            return []
 
         try:
-            outputs = await self._model.infer(blob)
+            # The exported graph has NMS folded in, so what comes back is already the
+            # final box set rather than raw anchors.
+            predictions = await asyncio.to_thread(self._detector.predict, vehicle_crop)
         except Exception as exc:
             log.debug("plate detection inference failed", error=str(exc))
             return []
 
-        pred = np.squeeze(outputs[0])
-        if pred.ndim != 2:
-            return []
-        if pred.shape[0] < pred.shape[1]:
-            pred = pred.transpose()
-
-        scores = pred[:, 4] if pred.shape[1] >= 5 else np.zeros(len(pred))
-        keep = scores >= threshold
-        if not keep.any():
-            return []
-
-        boxes = pred[keep, :4]
-        scores = scores[keep]
-        cx = (boxes[:, 0] - pad_x) / scale
-        cy = (boxes[:, 1] - pad_y) / scale
-        bw = boxes[:, 2] / scale
-        bh = boxes[:, 3] / scale
-        xyxy = np.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], axis=1)
-
         results: list[tuple[tuple[float, float, float, float], float]] = []
-        for index in nms(xyxy, scores, 0.4):
-            x1, y1, x2, y2 = xyxy[index]
+        for prediction in predictions:
+            box = prediction.bounding_box
             # Anything this narrow carries too few pixels per character to read; OCR would
             # return a confident-looking guess from noise.
-            if (x2 - x1) < min_width_px:
+            if (box.x2 - box.x1) < min_width_px:
                 continue
             results.append(
                 (
                     (
-                        float(np.clip(x1 / width, 0, 1)),
-                        float(np.clip(y1 / height, 0, 1)),
-                        float(np.clip(x2 / width, 0, 1)),
-                        float(np.clip(y2 / height, 0, 1)),
+                        float(np.clip(box.x1 / width, 0, 1)),
+                        float(np.clip(box.y1 / height, 0, 1)),
+                        float(np.clip(box.x2 / width, 0, 1)),
+                        float(np.clip(box.y2 / height, 0, 1)),
                     ),
-                    float(scores[index]),
+                    float(prediction.confidence),
                 )
             )
         return results
 
 
 class PlateOCR:
-    """CTC text recogniser for cropped plates."""
+    """Text recogniser for cropped plates.
+
+    Inference belongs to `fast-plate-ocr <https://github.com/ankandrew/fast-plate-ocr>`_,
+    including the alphabet, slot count and geometry, all of which it reads from the config
+    file shipped alongside the weights. Those used to be hard-coded here, which is a quiet
+    way to be wrong: an alphabet one character out of step with the model does not raise,
+    it returns confidently misspelt plates.
+    """
 
     def __init__(self) -> None:
-        self._model: LoadedModel | None = None
-        self._spec = REGISTRY.get("plate-ocr")
+        self._recogniser: Any | None = None
         self._loaded = False
 
     @property
     def available(self) -> bool:
-        return self._model is not None
+        return self._recogniser is not None
 
     async def load(self) -> bool:
         if self._loaded:
@@ -162,78 +151,68 @@ class PlateOCR:
         if path is None:
             log.warning("plate OCR unavailable: model could not be obtained")
             return False
-        self._model = get_backend().load(path)
-        return self.available
 
-    @staticmethod
-    def preprocess(crop: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-        """Grayscale, contrast-normalise and resize a plate crop."""
-        gray = crop[..., 0] if crop.ndim == 3 else crop
-        gray = gray.astype(np.float32)
-        # Percentile stretch rather than min/max: a single specular highlight on a wet
-        # plate would otherwise dominate the range and flatten the characters. A flat
-        # crop (high == low) has no contrast to stretch and becomes uniformly black.
-        low, high = np.percentile(gray, (2, 98))
-        gray = np.clip((gray - low) / (high - low), 0, 1) if high > low else np.zeros_like(gray)
+        config_path = model_dir("plate-ocr") / OCR_CONFIG_FILE
+        if not config_path.exists():
+            log.warning("plate OCR unavailable: model config is missing", path=str(config_path))
+            return False
 
-        target_w, target_h = size
-        h, w = gray.shape[:2]
-        ys = np.minimum((np.arange(target_h) * h // target_h), h - 1)
-        xs = np.minimum((np.arange(target_w) * w // target_w), w - 1)
-        return gray[ys][:, xs]
+        try:
+            from fast_plate_ocr import LicensePlateRecognizer
+        except ImportError:
+            log.warning("fast-plate-ocr is not installed; plate OCR unavailable")
+            return False
+
+        def build() -> Any:
+            return LicensePlateRecognizer(
+                onnx_model_path=path,
+                plate_config_path=config_path,
+                providers=list(onnx_providers()),
+            )
+
+        try:
+            self._recogniser = await asyncio.to_thread(build)
+        except Exception as exc:
+            log.warning(
+                "plate OCR failed to load",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return False
+        return True
 
     async def read(self, crop: np.ndarray) -> tuple[str, float]:
         """Recognise text in a plate crop. Returns ``("", 0.0)`` when unreadable."""
-        if self._model is None or self._spec is None or crop.size == 0:
+        if self._recogniser is None or crop.size == 0:
             return "", 0.0
 
-        prepared = self.preprocess(crop, self._spec.input_size)
-        blob = prepared[None, None].astype(np.float32)
+        # The model's config declares RGB input and the library takes arrays at face value,
+        # so a BGR crop straight from the decoder would be read with its red and blue
+        # channels swapped -- no error, just a worse answer.
+        if crop.ndim == 3 and crop.shape[2] == 3:
+            crop = crop[:, :, ::-1]
+        image = np.ascontiguousarray(crop, dtype=np.uint8)
 
         try:
-            outputs = await self._model.infer(blob)
+            predictions = await asyncio.to_thread(
+                self._recogniser.run, image, return_confidence=True
+            )
         except Exception as exc:
             log.debug("plate OCR inference failed", error=str(exc))
             return "", 0.0
 
-        return self._ctc_decode(np.squeeze(outputs[0]))
-
-    @staticmethod
-    def _ctc_decode(logits: np.ndarray) -> tuple[str, float]:
-        """Greedy CTC decode with a genuine per-character confidence.
-
-        The confidence returned is the mean softmax probability of the characters actually
-        emitted — not a placeholder. It is shown to the user next to every plate, so it has
-        to mean something.
-        """
-        if logits.ndim != 2 or logits.size == 0:
+        if not predictions:
             return "", 0.0
-        # Some exports put time on the last axis.
-        if logits.shape[0] < logits.shape[1] and logits.shape[0] <= len(OCR_ALPHABET) + 1:
-            logits = logits.transpose()
 
-        shifted = logits - logits.max(axis=1, keepdims=True)
-        exp = np.exp(shifted)
-        probs = exp / np.clip(exp.sum(axis=1, keepdims=True), 1e-9, None)
-
-        indices = probs.argmax(axis=1)
-        confidences = probs[np.arange(len(indices)), indices]
-
-        chars: list[str] = []
-        kept: list[float] = []
-        previous = -1
-        for index, confidence in zip(indices, confidences):
-            # CTC: index 0 is the blank, and repeats collapse unless separated by one.
-            if index != previous and index != 0:
-                position = int(index) - 1
-                if 0 <= position < len(OCR_ALPHABET):
-                    chars.append(OCR_ALPHABET[position])
-                    kept.append(float(confidence))
-            previous = int(index)
-
-        if not chars:
+        prediction = predictions[0]
+        text = str(prediction.plate or "").strip()
+        if not text:
             return "", 0.0
-        return "".join(chars), float(np.mean(kept))
+
+        # The mean probability of the characters actually emitted. This is shown to the
+        # user beside every plate, so it has to mean something rather than be a placeholder.
+        probs = prediction.char_probs
+        confidence = float(np.mean(np.asarray(probs)[: len(text)])) if probs is not None else 0.0
+        return text, confidence
 
 
 def select_ocr_candidates(readings: list[PlateReading], limit: int) -> list[PlateReading]:

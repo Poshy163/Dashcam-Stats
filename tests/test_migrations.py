@@ -116,6 +116,71 @@ class TestSeeding:
         assert profile.region_y + profile.region_h >= 0.99
         assert profile.region_y <= 0.963
 
+    async def test_retired_detection_model_is_rewritten(self, migrated):
+        """A stored model name from the retired registry must not survive the upgrade.
+
+        Settings are seeded idempotently, so an upgraded deployment keeps whatever is in
+        the row. Left alone, that is a name the registry no longer knows, and detection
+        switches itself off with only a log line to show for it — the failure mode this
+        migration exists to prevent. Asserting the rewrite happens is the only way to know
+        it does: a migration that matches nothing passes just as quietly as one that works.
+        """
+        import asyncio
+        from datetime import UTC, datetime
+
+        from alembic import command
+        from sqlalchemy import text
+
+        from app.ai.models import REGISTRY
+        from app.db.models import AppSetting
+        from app.db.session import alembic_config
+
+        key = "processing.detection_model"
+        async with session_scope() as session:
+            # Settings persist only once chosen, so this row exists exactly for the users
+            # the migration is for: those who picked a model from the retired registry.
+            # Written as JSON, the way the application stores a string setting.
+            await session.execute(
+                text(
+                    "INSERT INTO app_settings (key, value, updated_at) "
+                    "VALUES (:k, :v, :t) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                ),
+                {"k": key, "v": '"yolov8n"', "t": datetime.now(UTC)},
+            )
+            await session.commit()
+
+        await dispose_engine()
+        config = alembic_config()
+        # Step back over the migration and forward again, so the real upgrade() runs
+        # against a genuinely stale row rather than a re-creation of what it does.
+        await asyncio.to_thread(command.downgrade, config, "0002")
+        await asyncio.to_thread(command.upgrade, config, "head")
+
+        async with session_scope() as session:
+            stored = (
+                await session.execute(select(AppSetting.value).where(AppSetting.key == key))
+            ).scalar_one()
+        assert stored == "rfdetr-nano"
+        assert stored in REGISTRY
+
+    async def test_every_detection_choice_exists_in_the_registry(self, migrated):
+        """The settings dropdown must not offer a model that cannot be fetched.
+
+        These two lists live in different files and drifted apart once already, which is
+        what left every deployment pointing at weights that 404'd.
+        """
+        from app.ai.models import REGISTRY
+        from app.core.settings_schema import SETTINGS
+
+        definition = next(s for s in SETTINGS if s.key == "processing.detection_model")
+        offered = {value for value, _label in (definition.choices or ())}
+        assert offered, "detection model setting offers no choices"
+        assert offered <= set(REGISTRY), (
+            f"offered but unavailable: {sorted(offered - set(REGISTRY))}"
+        )
+        assert definition.default in REGISTRY
+
     async def test_seeding_twice_does_not_duplicate(self, migrated):
         from app.db.seed import seed_defaults
 

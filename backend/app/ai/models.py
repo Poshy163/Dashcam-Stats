@@ -5,6 +5,24 @@ time a feature needs one, verified, and cached — so the image stays small, the
 works fully offline once warmed, and a user who never enables plate reading never pays for
 that model.
 
+**Weights come from upstream projects, never from this repository.** An earlier version
+pointed at release assets on this repo that were never published, so every model 404'd and
+every processing run logged a failure for a feature that could not possibly work. Hosting
+weights here means maintaining them here; pointing at the projects that train and publish
+them does not. The two used are both MIT licensed, matching this repository:
+
+* `open-image-models <https://github.com/ankandrew/open-image-models>`_ — RF-DETR COCO
+  detectors and YOLOv9 plate localisers, exported to ONNX with NMS already folded in.
+* `fast-plate-ocr <https://github.com/ankandrew/fast-plate-ocr>`_ — plate text recognition.
+  Its global model is trained on plates from 65-odd countries, Australia among them, over
+  the alphabet ``0-9A-Z``.
+
+Those projects also supply the inference code, which is why :mod:`app.ai.detector` and
+:mod:`app.ai.plates` no longer hand-roll letterboxing, anchor decoding, NMS or CTC. Every
+one of those is a place to be subtly and silently wrong — a transposed output layout or an
+off-by-one alphabet yields confident nonsense rather than an error — and none of it had
+ever run against real weights.
+
 Nothing here raises on failure. ``ensure_model`` returns ``None`` when a model cannot be
 obtained, and the caller reports the feature unavailable instead of failing a recording.
 """
@@ -125,70 +143,92 @@ class ModelSpec:
     input_size: tuple[int, int]
     labels: tuple[str, ...] = ()
     description: str = ""
-    #: OpenVINO IR needs the .xml and its sibling .bin; this names the one to open.
+    #: Which upstream inference implementation reads this file: ``rf_detr`` or ``yolo_v9``
+    #: for detectors, ``cct`` for the OCR head. Detectors need it because a local ONNX
+    #: file carries no hint of its own output layout.
+    runtime: str = ""
+    #: Names the file to open when a model is more than one file.
     entry: str = ""
 
     @property
     def entry_file(self) -> str:
         return self.entry or self.files[0].filename
 
+    def file_path(self, filename: str) -> Path:
+        return model_dir(self.name) / filename
 
-# Sources are pinned to a specific upstream release so a rebuild cannot silently change
-# the model behind a user's results.
-_YOLO_BASE = "https://github.com/Poshy163/Dashcam-Stats/releases/download/models-v1"
+
+# Pinned to specific upstream release assets, so a rebuild cannot silently change the model
+# behind a user's results. Both tags are immutable published releases.
+_OIM = "https://github.com/ankandrew/open-image-models/releases/download/assets"
+_FPO = "https://github.com/ankandrew/cnn-ocr-lp/releases/download/arg-plates"
 
 REGISTRY: dict[str, ModelSpec] = {
-    "yolov8n": ModelSpec(
-        name="yolov8n",
+    "rfdetr-nano": ModelSpec(
+        name="rfdetr-nano",
         task="detection",
-        files=[
-            ModelFile("yolov8n.xml", f"{_YOLO_BASE}/yolov8n.xml"),
-            ModelFile("yolov8n.bin", f"{_YOLO_BASE}/yolov8n.bin"),
-        ],
-        entry="yolov8n.xml",
-        input_size=(640, 640),
-        labels=COCO_CLASSES,
-        description="YOLOv8 nano, COCO. Fast enough for real-time on an iGPU.",
+        files=[ModelFile("rf-detr-nano-384-coco.onnx", f"{_OIM}/rf-detr-nano-384-coco.onnx")],
+        input_size=(384, 384),
+        runtime="rf_detr",
+        description="RF-DETR nano, COCO. Fast enough for real-time on an iGPU.",
     ),
-    "yolov8s": ModelSpec(
-        name="yolov8s",
+    "rfdetr-small": ModelSpec(
+        name="rfdetr-small",
         task="detection",
-        files=[
-            ModelFile("yolov8s.xml", f"{_YOLO_BASE}/yolov8s.xml"),
-            ModelFile("yolov8s.bin", f"{_YOLO_BASE}/yolov8s.bin"),
-        ],
-        entry="yolov8s.xml",
-        input_size=(640, 640),
-        labels=COCO_CLASSES,
-        description="YOLOv8 small, COCO. Better on distant and partially occluded vehicles.",
+        files=[ModelFile("rf-detr-small-512-coco.onnx", f"{_OIM}/rf-detr-small-512-coco.onnx")],
+        input_size=(512, 512),
+        runtime="rf_detr",
+        description="RF-DETR small, COCO. Better on distant and partly occluded vehicles.",
+    ),
+    "rfdetr-medium": ModelSpec(
+        name="rfdetr-medium",
+        task="detection",
+        files=[ModelFile("rf-detr-medium-576-coco.onnx", f"{_OIM}/rf-detr-medium-576-coco.onnx")],
+        input_size=(576, 576),
+        runtime="rf_detr",
+        description="RF-DETR medium, COCO. Highest recall, noticeably slower.",
     ),
     "plate-detector": ModelSpec(
         name="plate-detector",
         task="plate_detection",
         files=[
-            ModelFile("plate-detector.xml", f"{_YOLO_BASE}/plate-detector.xml"),
-            ModelFile("plate-detector.bin", f"{_YOLO_BASE}/plate-detector.bin"),
+            ModelFile(
+                "yolo-v9-t-384-license-plates-end2end.onnx",
+                f"{_OIM}/yolo-v9-t-384-license-plates-end2end.onnx",
+            )
         ],
-        entry="plate-detector.xml",
-        input_size=(320, 320),
+        input_size=(384, 384),
         labels=("plate",),
+        runtime="yolo_v9",
         description="Licence plate localiser, run only inside tracked vehicle boxes.",
     ),
     "plate-ocr": ModelSpec(
         name="plate-ocr",
         task="plate_ocr",
         files=[
-            ModelFile("plate-ocr.xml", f"{_YOLO_BASE}/plate-ocr.xml"),
-            ModelFile("plate-ocr.bin", f"{_YOLO_BASE}/plate-ocr.bin"),
+            ModelFile("cct_xs_v2_global.onnx", f"{_FPO}/cct_xs_v2_global.onnx"),
+            # The config carries the alphabet, slot count and input geometry. Reading them
+            # from the file the weights shipped with is the point: hard-coding an alphabet
+            # that drifts out of step with the model produces confident wrong text rather
+            # than a failure.
+            ModelFile(
+                "cct_xs_v2_global_plate_config.yaml",
+                f"{_FPO}/cct_xs_v2_global_plate_config.yaml",
+            ),
         ],
-        entry="plate-ocr.xml",
-        input_size=(128, 32),
-        description="CTC text recogniser for cropped plates.",
+        entry="cct_xs_v2_global.onnx",
+        input_size=(128, 64),
+        runtime="cct",
+        description="Plate text recognition, global model (includes Australian plates).",
     ),
 }
 
-#: Alphabet the OCR head emits, index 0 reserved for the CTC blank.
-OCR_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+#: Companion config for the OCR weights, by filename within the model directory.
+OCR_CONFIG_FILE = "cct_xs_v2_global_plate_config.yaml"
+
+#: Used when the configured detection model is not one the registry knows about, which
+#: happens to a deployment carrying a setting from a retired registry.
+DEFAULT_DETECTION_MODEL = "rfdetr-nano"
 
 _locks: dict[str, asyncio.Lock] = {}
 

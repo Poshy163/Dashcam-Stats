@@ -21,6 +21,7 @@ from app.ai.plates import (
     select_ocr_candidates,
     vote_track_plate,
 )
+from app.ai.runtime import describe_runtime, onnx_providers
 from app.ai.tracker import ByteTracker, Track
 
 __all__ = [
@@ -39,9 +40,11 @@ __all__ = [
     "Track",
     "crop_with_margin",
     "describe_models",
+    "describe_runtime",
     "ensure_model",
     "get_backend",
     "normalise",
+    "onnx_providers",
     "plate_box_in_frame",
     "plate_similarity",
     "select_ocr_candidates",

@@ -227,10 +227,14 @@ SETTINGS: tuple[SettingDef, ...] = (
         "processing.detection_model",
         "Detection model",
         "select",
-        "yolov8n",
+        "rfdetr-nano",
         "processing",
         "Model used for road-object detection.",
-        choices=(("yolov8n", "YOLOv8n (fast)"), ("yolov8s", "YOLOv8s (accurate)")),
+        choices=(
+            ("rfdetr-nano", "RF-DETR nano (fast)"),
+            ("rfdetr-small", "RF-DETR small (balanced)"),
+            ("rfdetr-medium", "RF-DETR medium (accurate)"),
+        ),
         requires="processing.detection_enabled",
     ),
     SettingDef(
