@@ -42,6 +42,11 @@ export default function Settings() {
 
   const scanNow = useMutation({ mutationFn: api.scan.now })
   const processNew = useMutation({ mutationFn: api.scan.processNew })
+  const [reprocessStage, setReprocessStage] = useState('everything')
+  const reprocessAll = useMutation({
+    mutationFn: (onlyFailed: boolean) => api.scan.reprocessAll([reprocessStage], onlyFailed),
+    onSuccess: () => client.invalidateQueries({ queryKey: ['jobs'] }),
+  })
   const plan = useMutation({ mutationFn: api.retention.plan })
 
   const hardware = useQuery({
@@ -139,6 +144,48 @@ export default function Settings() {
                   .
                 </p>
               )}
+
+              <div className="w-full border-t border-border pt-3">
+                <div className="label mb-1 text-xs">Reprocess existing footage</div>
+                <p className="hint mb-2">
+                  Re-runs analysis on footage already indexed. Needed after a change that
+                  invalidates earlier results — a decoder fix, a new model, or a corrected
+                  overlay region. Queued below new footage so scanning is not starved.
+                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    className="input w-auto"
+                    value={reprocessStage}
+                    onChange={(e) => setReprocessStage(e.target.value)}
+                  >
+                    <option value="everything">Everything</option>
+                    <option value="metadata">Metadata only</option>
+                    <option value="telemetry">Telemetry only</option>
+                    <option value="detection">Object detection</option>
+                    <option value="plates">Licence plate detection</option>
+                  </select>
+                  <button
+                    className="btn"
+                    onClick={() => reprocessAll.mutate(false)}
+                    disabled={reprocessAll.isPending}
+                  >
+                    Reprocess all footage
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={() => reprocessAll.mutate(true)}
+                    disabled={reprocessAll.isPending}
+                  >
+                    Reprocess failed only
+                  </button>
+                </div>
+                {reprocessAll.data && (
+                  <p className="hint mt-2">
+                    Queued {reprocessAll.data.queued} recordings. Watch progress on the
+                    Queue page.
+                  </p>
+                )}
+              </div>
             </section>
           )}
 

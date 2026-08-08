@@ -262,6 +262,11 @@ class ReprocessRequest(BaseModel):
     stages: list[str] = Field(default_factory=lambda: ["everything"])
 
 
+class ReprocessAllRequest(ReprocessRequest):
+    #: Limit the rerun to recordings that previously failed, rather than the whole library.
+    only_failed: bool = False
+
+
 class MergeRequest(BaseModel):
     journey_ids: list[int]
 

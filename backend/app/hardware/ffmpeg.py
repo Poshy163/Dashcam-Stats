@@ -422,11 +422,13 @@ def build_filter_chain(
     pix_fmt: str = "bgr24",
 ) -> str:
     filters: list[str] = []
-    # VAAPI hands back GPU surfaces; everything downstream is a CPU filter, so download
-    # first or the graph fails to configure.
-    if hwaccel_label == "vaapi":
-        filters.append("hwdownload")
-        filters.append("format=nv12")
+    # Deliberately no `hwdownload` here. `select_hwaccel` passes
+    # `-hwaccel_output_format nv12`, which already hands frames back in system memory, so
+    # adding hwdownload gives that filter software input it cannot accept and the graph
+    # fails to configure -- turning every hardware-accelerated decode into an error. The
+    # two settings have to agree: either output vaapi surfaces and download in the graph,
+    # or download at the decoder and filter normally. Everything downstream here is numpy
+    # or a CPU filter, so downloading at the decoder is the cheaper half of that choice.
     if fps:
         filters.append(f"fps={fps:g}")
     if crop:
@@ -437,7 +439,7 @@ def build_filter_chain(
     return ",".join(filters)
 
 
-async def iter_frames(
+async def _decode_frames(
     path: Path | str,
     *,
     fps: float | None = None,
@@ -450,12 +452,7 @@ async def iter_frames(
     grayscale: bool = False,
     timeout: float = DEFAULT_DECODE_TIMEOUT,
 ) -> AsyncIterator[tuple[float, np.ndarray]]:
-    """Yield ``(offset_seconds, frame)`` decoded from *path*.
-
-    Crop and scale are applied in the filter graph, so only the pixels actually wanted
-    cross the pipe. The offset is derived from the output frame index and the requested
-    rate, which is exact because ``fps=`` resamples to a constant rate.
-    """
+    """One decode attempt. Callers should use :func:`iter_frames`, which adds fallback."""
     hw_args, label = select_hwaccel(hwaccel, codec)
     pix_fmt = "gray" if grayscale else "bgr24"
     channels = 1 if grayscale else 3
@@ -545,6 +542,64 @@ async def iter_frames(
         # Damaged-but-partially-readable files are normal here; the frames already
         # yielded are still usable, so this is a warning rather than a failure.
         log.debug("decoder reported errors", file=Path(path).name, stderr=stderr[-500:])
+
+
+async def iter_frames(
+    path: Path | str,
+    *,
+    fps: float | None = None,
+    crop: Crop | None = None,
+    scale: tuple[int, int] | None = None,
+    start: float | None = None,
+    duration: float | None = None,
+    hwaccel: str = "auto",
+    codec: str | None = None,
+    grayscale: bool = False,
+    timeout: float = DEFAULT_DECODE_TIMEOUT,
+) -> AsyncIterator[tuple[float, np.ndarray]]:
+    """Yield ``(offset_seconds, frame)`` decoded from *path*, falling back to software.
+
+    Crop and scale are applied in the filter graph, so only the pixels actually wanted
+    cross the pipe. The offset is derived from the output frame index and the requested
+    rate, which is exact because ``fps=`` resamples to a constant rate.
+
+    A hardware decode that fails is retried in software. Acceleration depends on the
+    driver, the codec and the specific file, and a stage that silently yields nothing is
+    far worse than one that runs slower -- a misconfigured filter graph once produced zero
+    telemetry across an entire library while every other stage reported success.
+    """
+    kwargs = {
+        "fps": fps,
+        "crop": crop,
+        "scale": scale,
+        "start": start,
+        "duration": duration,
+        "codec": codec,
+        "grayscale": grayscale,
+        "timeout": timeout,
+    }
+    _, label = select_hwaccel(hwaccel, codec)
+    yielded = 0
+
+    try:
+        async for item in _decode_frames(path, hwaccel=hwaccel, **kwargs):
+            yielded += 1
+            yield item
+        return
+    except FFmpegError as exc:
+        # Retrying is only safe before anything reached the caller; mid-stream the
+        # consumer has already seen frames and would receive them twice.
+        if label == "software" or yielded:
+            raise
+        log.warning(
+            "hardware decode failed; retrying in software",
+            file=Path(path).name,
+            decoder=label,
+            error=str(exc),
+        )
+
+    async for item in _decode_frames(path, hwaccel="cpu", **kwargs):
+        yield item
 
 
 async def extract_frame(

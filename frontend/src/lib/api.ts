@@ -210,6 +210,9 @@ export const api = {
   scan: {
     now: () => post<ScanResult>('/scan'),
     processNew: () => post<{ queued: number }>('/process'),
+    /** Requeue the library — or just the failures — after a processing change. */
+    reprocessAll: (stages: string[], onlyFailed = false) =>
+      post<{ queued: number; stages: string[] }>('/reprocess', { stages, onlyFailed }),
   },
 
   retention: {

@@ -14,6 +14,7 @@ from app.api.schemas import (
     JourneyOut,
     LogEntryOut,
     Paginated,
+    ReprocessAllRequest,
     RetentionPlanOut,
     SafetyReportOut,
     SettingCategoryOut,
@@ -28,10 +29,12 @@ from app.config import get_config
 from app.core.logging import get_logger
 from app.core.settings_service import SettingValidationError, get_settings_service
 from app.db.models import (
+    JobKind,
     Journey,
     LogEntry,
     Plate,
     Recording,
+    RecordingState,
     RetentionRun,
     TelemetryPoint,
     TrackedObject,
@@ -41,6 +44,7 @@ from app.hardware.detect import detect_hardware_async
 from app.retention import current_usage, evaluate_safety
 from app.retention import execute as run_retention
 from app.retention import plan as plan_retention
+from app.workers import queue
 from app.workers.scheduler import get_scheduler
 from app.workers.worker import get_worker_pool
 
@@ -194,6 +198,44 @@ async def scan_now():
 @router.post("/process")
 async def process_new():
     return {"queued": await get_scheduler().process_new()}
+
+
+@router.post("/reprocess")
+async def reprocess_all(body: ReprocessAllRequest, session: SessionDep):
+    """Requeue the whole library, or just the failures.
+
+    Needed whenever a processing change invalidates earlier results -- a decoder fix, a
+    new model, a corrected overlay region. Per-recording reprocessing does not scale to a
+    library of hundreds of files, and re-running only the stages that changed is far
+    cheaper than re-running everything.
+
+    Queued at a lower priority than new footage so a bulk rerun never starves the scanner.
+    """
+    stmt = select(Recording.id).where(
+        Recording.ignored.is_(False),
+        Recording.file_missing.is_(False),
+    )
+    if body.only_failed:
+        stmt = stmt.where(Recording.state == RecordingState.FAILED)
+
+    recording_ids = list((await session.execute(stmt)).scalars())
+    for recording_id in recording_ids:
+        await queue.enqueue(
+            session,
+            recording_id,
+            kind=JobKind.REPROCESS,
+            stages=body.stages,
+            priority=200,
+            force=True,
+        )
+
+    log.info(
+        "queued bulk reprocess",
+        recordings=len(recording_ids),
+        stages=body.stages,
+        only_failed=body.only_failed,
+    )
+    return {"queued": len(recording_ids), "stages": body.stages}
 
 
 # --------------------------------------------------------------------------------------
