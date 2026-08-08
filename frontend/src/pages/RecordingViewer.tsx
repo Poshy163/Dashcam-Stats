@@ -20,7 +20,7 @@ import {
   formatDuration,
   formatSpeed,
 } from '@/lib/format'
-import type { TelemetryPoint, TrackedObject } from '@/lib/types'
+import type { TelemetryPoint } from '@/lib/types'
 
 const REPROCESS_OPTIONS = [
   ['everything', 'Everything'],

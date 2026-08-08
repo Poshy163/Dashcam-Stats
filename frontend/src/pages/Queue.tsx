@@ -11,7 +11,7 @@ import {
   StatTile,
 } from '@/components/ui'
 import { api } from '@/lib/api'
-import { formatDateTime, formatDuration, realtimeFactor } from '@/lib/format'
+import { formatDateTime, realtimeFactor } from '@/lib/format'
 
 const STATES = ['', 'queued', 'running', 'failed', 'completed', 'cancelled']
 

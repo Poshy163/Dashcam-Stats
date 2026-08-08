@@ -65,6 +65,8 @@ export interface Recording {
   vehicleCount: number
   plateCount: number
   thumbnailPath: string | null
+  /** The row is kept after the file goes, so history survives retention cleanup. */
+  fileMissing: boolean
 }
 
 export interface TelemetryPoint {
