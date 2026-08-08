@@ -98,6 +98,19 @@ SETTINGS: tuple[SettingDef, ...] = (
         minimum=40,
         maximum=100,
     ),
+    SettingDef(
+        "general.stream_cache_gb",
+        "Playback cache size",
+        "float",
+        5.0,
+        "general",
+        "Browsers cannot play the camera's MPEG-TS files, so clips are remuxed to MP4 the "
+        "first time they are viewed and cached here. The copies are disposable and live "
+        "in /data; the least recently watched are evicted once this limit is reached.",
+        minimum=0.5,
+        maximum=500.0,
+        unit="GB",
+    ),
     # ---------------------------------------------------------------- scanner
     SettingDef(
         "scanner.enabled",

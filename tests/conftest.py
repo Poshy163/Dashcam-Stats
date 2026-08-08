@@ -12,7 +12,6 @@ regardless, so a developer without ffmpeg still gets a useful suite.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import shutil
 import subprocess
@@ -186,8 +185,8 @@ def pytest_configure(config: pytest.Config) -> None:
     # Keep tests from ever reaching a real share, whatever the developer's environment says.
     os.environ.pop("DASHCAM_SMB_URL", None)
 
-    # Set here rather than by overriding pytest-asyncio's `event_loop_policy` fixture,
-    # which that plugin deprecates. Windows' default proactor loop does not host aiosqlite
-    # cleanly; the selector policy matches how the Linux container behaves anyway.
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # The default proactor policy is left in place on Windows. An earlier version forced
+    # the selector policy here, which broke every test that shells out to ffmpeg:
+    # SelectorEventLoop raises NotImplementedError from create_subprocess_exec, and only
+    # the proactor loop can spawn subprocesses on Windows. aiosqlite runs its work in a
+    # thread and is happy either way, so there is nothing to trade off.

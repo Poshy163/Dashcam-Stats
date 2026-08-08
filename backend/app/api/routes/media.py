@@ -18,6 +18,7 @@ from app.api.deps import SessionDep
 from app.core.logging import get_logger
 from app.core.paths import PathTraversalError, resolve_footage_path, resolve_media_path
 from app.db.models import Recording
+from app.media import ensure_playable
 
 log = get_logger(__name__)
 
@@ -98,8 +99,13 @@ async def stream_recording(
     except FileNotFoundError:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording file not found") from None
 
+    # The camera records MPEG-TS, which no browser can demux. The H.264 inside is fine,
+    # so this hands back a remuxed MP4 (copied, not re-encoded) and serves that instead.
+    playable = await ensure_playable(path, recording_id)
+    path = playable.path
+
     size = path.stat().st_size
-    media_type = mimetypes.guess_type(path.name)[0] or "video/mp2t"
+    media_type = playable.media_type
     base_headers = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"}
 
     if not range_header:
