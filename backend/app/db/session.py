@@ -167,14 +167,20 @@ async def dispose_engine() -> None:
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
-    """FastAPI dependency.
+    """FastAPI dependency: commits when the handler returns, rolls back if it raises.
 
-    The route owns its transaction: nothing is committed here, so a handler that raises
-    after a partial write leaves nothing behind.
+    The commit is not optional. Without it every write route silently did nothing --
+    flushing inside the request and then rolling back when the session closed. Queueing a
+    reprocess, flagging a plate, editing its notes, merging journeys and retrying a job
+    all reported success and changed nothing, which is a far worse failure than an error
+    would have been.
+
+    Read-only handlers are unaffected: committing a session with nothing dirty is a no-op.
     """
     async with get_session_factory()() as session:
         try:
             yield session
+            await session.commit()
         except Exception:
             await session.rollback()
             raise

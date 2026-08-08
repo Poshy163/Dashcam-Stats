@@ -32,10 +32,49 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.types import TypeDecorator
 
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+class UtcDateTime(TypeDecorator):
+    """A ``DateTime`` that is always timezone-aware UTC in Python.
+
+    SQLite has no timezone-aware column type: an aware datetime goes in and a **naive**
+    one comes back. That leaked in three directions before this existed --
+
+    * comparing a stored timestamp against a freshly computed one raised
+      ``TypeError: can't compare offset-naive and offset-aware datetimes``, which broke
+      journey clustering;
+    * the API serialised naive values with no offset, so ``new Date()`` in the browser
+      read UTC as local time and every timestamp in the UI was wrong by the local offset;
+    * arithmetic between two stored values silently assumed they shared a zone.
+
+    Normalising on the way in and stamping UTC on the way out fixes all three at the
+    source, so nothing downstream has to remember. The stored representation does not
+    change, so no migration is needed.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, _dialect: object) -> datetime | None:
+        if value is None:
+            return None
+        # A naive value reaching the database is taken to be UTC: everything here
+        # converts before storing, so that assumption holds.
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    def process_result_value(self, value: datetime | None, _dialect: object) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
 
 class Base(DeclarativeBase):
@@ -111,7 +150,7 @@ class Camera(Base):
     name: Mapped[str] = mapped_column(String(128))
     role: Mapped[CameraRole] = mapped_column(Enum(CameraRole), default=CameraRole.OTHER)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
     recordings: Mapped[list[Recording]] = relationship(back_populates="camera")
 
@@ -122,8 +161,8 @@ class Journey(Base):
     __tablename__ = "journeys"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    ended_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime] = mapped_column(UtcDateTime, index=True)
+    ended_at: Mapped[datetime] = mapped_column(UtcDateTime)
     duration_s: Mapped[float] = mapped_column(Float, default=0.0)
 
     # Derived from telemetry; null when the journey has no GPS fix at all.
@@ -149,10 +188,8 @@ class Journey(Base):
     manual: Mapped[bool] = mapped_column(Boolean, default=False)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow
-    )
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
 
     recordings: Mapped[list[Recording]] = relationship(back_populates="journey")
 
@@ -187,10 +224,8 @@ class Recording(Base):
 
     # --- timing -----------------------------------------------------------------------
     # Parsed from the filename; the OSD clock supersedes it once telemetry is read.
-    started_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
-    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True, index=True)
+    ended_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     duration_s: Mapped[float | None] = mapped_column(Float, nullable=True)
     # True when the start time came from decoded OSD rather than the filename.
     time_from_osd: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -227,7 +262,7 @@ class Recording(Base):
 
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_count: Mapped[int] = mapped_column(Integer, default=0)
-    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
     # --- rollups (denormalised so list views never aggregate) --------------------------
     has_gps: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
@@ -246,12 +281,12 @@ class Recording(Base):
 
     # --- bookkeeping ------------------------------------------------------------------
     ignored: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
-    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    last_scanned_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    processed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     # Set when the file is gone from disk; the row is kept so history survives cleanup.
     file_missing: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
     camera: Mapped[Camera | None] = relationship(back_populates="recordings")
     journey: Mapped[Journey | None] = relationship(back_populates="recordings")
@@ -281,7 +316,7 @@ class TelemetryPoint(Base):
     # Offset within the recording, so the player can seek straight to it.
     t_offset_s: Mapped[float] = mapped_column(Float)
     # Wall-clock read from the OSD itself -- authoritative over the filename.
-    captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    captured_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
     # Null when the dashcam had no fix. `E:00.0000 N:00.0000` is a no-fix marker and is
     # never stored as a real coordinate.
@@ -327,15 +362,13 @@ class Vehicle(Base):
     # Which model produced make/model/colour, so unattributed guesses are impossible.
     classifier: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_seen_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     observation_count: Mapped[int] = mapped_column(Integer, default=0)
     representative_crop_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow
-    )
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
 
 
 class TrackedObject(Base):
@@ -368,10 +401,8 @@ class TrackedObject(Base):
     duration_s: Mapped[float] = mapped_column(Float, default=0.0)
     frame_count: Mapped[int] = mapped_column(Integer, default=0)
 
-    first_seen_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
-    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_seen_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True, index=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
     lat: Mapped[float | None] = mapped_column(Float, nullable=True)
     lon: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -426,12 +457,8 @@ class Plate(Base):
     # Which AU pattern it matched, if any. Null means it did not match a known format.
     pattern_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    first_seen_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
-    last_seen_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
+    first_seen_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True, index=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True, index=True)
     observation_count: Mapped[int] = mapped_column(Integer, default=0, index=True)
     journey_count: Mapped[int] = mapped_column(Integer, default=0)
 
@@ -442,10 +469,8 @@ class Plate(Base):
     flagged: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow
-    )
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
 
     observations: Mapped[list[PlateObservation]] = relationship(
         back_populates="plate", cascade="all, delete-orphan", passive_deletes=True
@@ -475,9 +500,7 @@ class PlateObservation(Base):
     )
 
     t_offset_s: Mapped[float] = mapped_column(Float)
-    captured_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
+    captured_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True, index=True)
     first_seen_offset_s: Mapped[float | None] = mapped_column(Float, nullable=True)
     last_seen_offset_s: Mapped[float | None] = mapped_column(Float, nullable=True)
 
@@ -540,15 +563,13 @@ class ProcessingJob(Base):
 
     worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Lets a crashed worker's claim be reclaimed after a heartbeat timeout.
-    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
-    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    queued_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     # Backoff gate for transient failures.
-    not_before: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
+    not_before: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True, index=True)
 
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -562,10 +583,8 @@ class ScanRun(Base):
     __tablename__ = "scan_runs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, index=True
-    )
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     trigger: Mapped[str] = mapped_column(String(32), default="scheduled")
 
     files_seen: Mapped[int] = mapped_column(Integer, default=0)
@@ -586,9 +605,7 @@ class AppSetting(Base):
 
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     value: Mapped[dict | list | str | int | float | bool | None] = mapped_column(JSON)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow
-    )
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
 
 
 class LogEntry(Base):
@@ -597,7 +614,7 @@ class LogEntry(Base):
     __tablename__ = "log_entries"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    ts: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, index=True)
     level: Mapped[str] = mapped_column(String(16), index=True)
     logger: Mapped[str] = mapped_column(String(64))
     message: Mapped[str] = mapped_column(Text)
@@ -638,7 +655,7 @@ class OsdProfile(Base):
         ForeignKey("cameras.id", ondelete="SET NULL"), nullable=True
     )
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
 
 class RetentionRun(Base):
@@ -647,10 +664,8 @@ class RetentionRun(Base):
     __tablename__ = "retention_runs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, index=True
-    )
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     trigger: Mapped[str] = mapped_column(String(32), default="scheduled")
 
     dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
