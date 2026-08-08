@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 T = TypeVar("T")
 
@@ -74,6 +74,23 @@ class RecordingOut(ApiModel):
     plate_count: int = 0
     thumbnail_path: str | None = None
     file_missing: bool = False
+
+    #: Carried only so the two fields below can be derived from it; the raw probe output
+    #: is internal detail and never reaches a client.
+    probe_json: dict[str, Any] | None = Field(default=None, exclude=True)
+
+    #: Problems found in the source file itself -- a wrapped PTS, an unreadable frame, a
+    #: frame rate the container lied about. Surfaced so a damaged recording reads as a bad
+    #: file rather than as the application misbehaving.
+    warnings: list[str] = Field(default_factory=list)
+    source_damaged: bool = False
+
+    @model_validator(mode="after")
+    def _lift_probe_warnings(self) -> RecordingOut:
+        if isinstance(self.probe_json, dict):
+            self.warnings = [str(w) for w in self.probe_json.get("warnings") or []]
+            self.source_damaged = bool(self.probe_json.get("source_damaged")) or bool(self.warnings)
+        return self
 
 
 class TelemetryPointOut(ApiModel):

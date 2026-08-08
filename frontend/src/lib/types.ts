@@ -67,6 +67,11 @@ export interface Recording {
   thumbnailPath: string | null
   /** The row is kept after the file goes, so history survives retention cleanup. */
   fileMissing: boolean
+
+  /** Problems in the source file itself — a wrapped PTS, frames that will not decode. */
+  warnings: string[]
+  /** True when the camera wrote a damaged file. Not an application error. */
+  sourceDamaged: boolean
 }
 
 export interface TelemetryPoint {

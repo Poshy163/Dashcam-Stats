@@ -163,19 +163,33 @@ export default function Recordings() {
 function Thumb({ recording }: { recording: Recording }) {
   const src = mediaUrl(recording.thumbnailPath)
   if (!src) {
+    // Distinguish "the camera wrote a broken file" from "not processed yet". Without
+    // that, a damaged source reads as an application failure.
     return (
-      <div className="flex aspect-video items-center justify-center rounded bg-surface-sunken text-2xs text-content-faint">
-        no thumbnail
+      <div className="flex aspect-video flex-col items-center justify-center gap-1 rounded bg-surface-sunken px-2 text-center text-2xs text-content-faint">
+        {recording.sourceDamaged ? (
+          <>
+            <span className="text-state-warn">damaged file</span>
+            <span>no frame could be decoded</span>
+          </>
+        ) : (
+          <span>no thumbnail</span>
+        )}
       </div>
     )
   }
   return (
-    <img
-      src={src}
-      alt=""
-      loading="lazy"
-      className="aspect-video w-full rounded object-cover"
-    />
+    <div className="relative">
+      <img src={src} alt="" loading="lazy" className="aspect-video w-full rounded object-cover" />
+      {recording.sourceDamaged && (
+        <span
+          className="badge absolute left-1 top-1 bg-state-warn/85 text-white"
+          title={recording.warnings.join('\n') || 'The source file is damaged'}
+        >
+          damaged
+        </span>
+      )}
+    </div>
   )
 }
 

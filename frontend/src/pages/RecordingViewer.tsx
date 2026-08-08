@@ -179,6 +179,24 @@ export default function RecordingViewer() {
         </div>
       )}
 
+      {r.sourceDamaged && (
+        <div className="card border-state-warn/40 p-3">
+          <div className="text-sm font-medium text-state-warn">This file is damaged</div>
+          <p className="mt-1 text-sm text-content-muted">
+            The camera wrote a file the decoder cannot fully read, so playback may stutter,
+            show blocky artefacts or stop early. Nothing here can repair it — the picture
+            was never written correctly.
+          </p>
+          {r.warnings.length > 0 && (
+            <ul className="mt-2 space-y-0.5 text-xs text-content-faint">
+              {r.warnings.map((w) => (
+                <li key={w}>{w}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
       <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(18rem,1fr)]">
         <div className="space-y-3">
           {r.fileMissing ? (

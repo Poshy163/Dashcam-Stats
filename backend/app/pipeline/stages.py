@@ -51,7 +51,13 @@ from app.db.models import (
     TelemetryPoint,
     TrackedObject,
 )
-from app.hardware.ffmpeg import DecodeError, FFmpegError, iter_frames, probe, write_thumbnail
+from app.hardware.ffmpeg import (
+    DecodeError,
+    FFmpegError,
+    extract_frame,
+    iter_frames,
+    probe,
+)
 from app.journeys.builder import JourneyBuilder
 from app.osd import (
     GlyphTemplates,
@@ -110,6 +116,96 @@ def _save_jpeg(image: np.ndarray, path: Path, quality: int = 85) -> str | None:
     return None
 
 
+#: A frame this flat carries no picture. Decoders emit a solid fill -- classically green
+#: in YUV, where a zeroed chroma plane renders as green -- when reference frames are
+#: missing, which is exactly what the damaged segments in this corpus produce.
+_FLAT_FRAME_STDDEV = 12.0
+
+#: How far the green channel may dominate before the frame is treated as decoder fill
+#: rather than a genuinely green scene. Real foliage never comes close.
+_GREEN_DOMINANCE = 1.6
+
+
+def frame_quality(frame: np.ndarray) -> float:
+    """Score how much of a real picture a frame contains. Higher is better, 0 is unusable.
+
+    Damaged footage does not fail to decode; it decodes into something. A missing
+    reference frame yields a flat fill, and the resulting thumbnail looks like an
+    application bug rather than a broken file. Scoring the frame lets a bad one be
+    rejected in favour of another offset, and lets "no thumbnail" be an honest answer.
+    """
+    if frame is None or frame.size == 0:
+        return 0.0
+
+    # Detail. A real scene has structure at every scale; a fill has none.
+    detail = float(frame.std())
+    if detail < _FLAT_FRAME_STDDEV:
+        return 0.0
+
+    if frame.ndim == 3 and frame.shape[2] >= 3:
+        blue, green, red = (float(frame[..., i].mean()) for i in range(3))
+        others = max(1.0, (blue + red) / 2.0)
+        if green / others > _GREEN_DOMINANCE:
+            # Overwhelmingly green with little else: decoder fill, not a scene.
+            return 0.0
+
+        # A frame that is largely one flat region -- half picture, half fill, which is how
+        # partially-damaged segments decode -- scores below a clean one.
+        halves = [frame[: frame.shape[0] // 2], frame[frame.shape[0] // 2 :]]
+        detail = min(float(h.std()) for h in halves if h.size) or detail
+
+    return detail
+
+
+async def _choose_thumbnail(
+    source: Path,
+    target: Path,
+    *,
+    duration_s: float | None,
+    codec: str | None,
+    width: int,
+    quality: int,
+) -> bool:
+    """Write the best thumbnail the file can offer, or none at all.
+
+    Several offsets are tried rather than one. A single fixed seek lands on a broken
+    frame often enough in damaged footage, and the first few seconds of any clip are the
+    most likely to be mid-GOP after a truncated write.
+    """
+    span = duration_s or 4.0
+    # Spread across the clip, skipping the very start where damage concentrates.
+    candidates = [t for t in (span * 0.25, span * 0.5, span * 0.75, 1.0, 0.0) if t < span]
+
+    best_frame: np.ndarray | None = None
+    best_score = 0.0
+
+    for offset in candidates:
+        try:
+            frame = await extract_frame(source, offset, codec=codec)
+        except FFmpegError:
+            continue
+        if frame is None:
+            continue
+        score = frame_quality(frame)
+        if score > best_score:
+            best_frame, best_score = frame, score
+        # Good enough; no point decoding further.
+        if best_score > 40.0:
+            break
+
+    if best_frame is None or best_score <= 0.0:
+        return False
+
+    scale = width / best_frame.shape[1]
+    if 0 < scale < 1:
+        height = max(1, int(best_frame.shape[0] * scale))
+        ys = (np.arange(height) / scale).astype(np.int32).clip(0, best_frame.shape[0] - 1)
+        xs = (np.arange(width) / scale).astype(np.int32).clip(0, best_frame.shape[1] - 1)
+        best_frame = best_frame[ys][:, xs]
+
+    return _save_jpeg(best_frame, target, quality) is not None
+
+
 # --------------------------------------------------------------------------------------
 # Stage 1 - inspection
 # --------------------------------------------------------------------------------------
@@ -161,15 +257,28 @@ async def stage_inspect(
     settings = get_settings_service()
     if not recording.thumbnail_path:
         thumb = _media_path("thumbnails", f"{recording.id:08d}.jpg")
-        seek = min(2.0, (info.duration_s or 4.0) / 2)
-        if await write_thumbnail(
+        chosen = await _choose_thumbnail(
             path,
             thumb,
-            t=seek,
+            duration_s=info.duration_s,
+            codec=info.video_codec,
             width=int(settings.get_nowait("general.thumbnail_width")),
             quality=int(settings.get_nowait("general.thumbnail_quality")),
-        ):
+        )
+        if chosen:
             recording.thumbnail_path = relative_to_media(thumb)
+        else:
+            # No frame in the file decoded to a usable picture. Saying so is more useful
+            # than a green rectangle that looks like the application misbehaved.
+            info.warnings.append(
+                "no usable frame could be decoded; the source file appears to be damaged"
+            )
+
+    recording.probe_json = {
+        "warnings": info.warnings,
+        "pts_wrapped": info.pts_wrapped,
+        "source_damaged": bool(info.warnings),
+    }
 
     recording.metadata_state = StageState.DONE
     if recording.state is RecordingState.DISCOVERED:
