@@ -10,6 +10,7 @@ const Dashboard = lazy(() => import('@/pages/Dashboard'))
 const Recordings = lazy(() => import('@/pages/Recordings'))
 const RecordingViewer = lazy(() => import('@/pages/RecordingViewer'))
 const Journeys = lazy(() => import('@/pages/Journeys'))
+const Heatmap = lazy(() => import('@/pages/Heatmap'))
 const JourneyDetail = lazy(() => import('@/pages/JourneyDetail'))
 const Plates = lazy(() => import('@/pages/Plates'))
 const PlateDetail = lazy(() => import('@/pages/PlateDetail'))
@@ -30,6 +31,7 @@ export default function App() {
           <Route path="/recordings/:id" element={<RecordingViewer />} />
           <Route path="/journeys" element={<Journeys />} />
           <Route path="/journeys/:id" element={<JourneyDetail />} />
+          <Route path="/heatmap" element={<Heatmap />} />
           <Route path="/plates" element={<Plates />} />
           <Route path="/plates/:id" element={<PlateDetail />} />
           <Route path="/vehicles" element={<Vehicles />} />

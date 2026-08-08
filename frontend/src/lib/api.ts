@@ -7,6 +7,8 @@
  * the components actually see.
  */
 import type {
+  Heatmap,
+  HeatmapFilters,
   Job,
   Journey,
   JourneyDetail,
@@ -182,6 +184,11 @@ export const api = {
   vehicles: {
     list: (query?: Query) => request<Paginated<Vehicle>>('/vehicles', { query }),
     get: (id: number) => request<Vehicle>(`/vehicles/${id}`),
+  },
+
+  map: {
+    /** Grid-aggregated fixes, ready for a heat layer. See the `Heatmap` type. */
+    heatmap: (filters?: HeatmapFilters) => request<Heatmap>('/map/heatmap', { query: filters }),
   },
 
   jobs: {

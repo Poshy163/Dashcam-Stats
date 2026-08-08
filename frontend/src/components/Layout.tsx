@@ -9,6 +9,7 @@ const NAV = [
   { to: '/', label: 'Dashboard', end: true, icon: GridIcon },
   { to: '/recordings', label: 'Recordings', icon: FilmIcon },
   { to: '/journeys', label: 'Journeys', icon: RouteIcon },
+  { to: '/heatmap', label: 'Heatmap', icon: HeatIcon },
   { to: '/plates', label: 'Plates', icon: PlateIcon },
   { to: '/vehicles', label: 'Vehicles', icon: CarIcon },
   { to: '/queue', label: 'Queue', icon: QueueIcon },
@@ -178,6 +179,15 @@ function RouteIcon({ className }: IconProps) {
       <circle cx="5" cy="15" r="2.2" />
       <circle cx="15" cy="5" r="2.2" />
       <path d="M7 14c4 0 3-9 6-9" strokeLinecap="round" />
+    </svg>
+  )
+}
+function HeatIcon({ className }: IconProps) {
+  return (
+    <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6">
+      <circle cx="10" cy="10" r="2" />
+      <circle cx="10" cy="10" r="5" opacity="0.6" />
+      <circle cx="10" cy="10" r="8" opacity="0.3" />
     </svg>
   )
 }

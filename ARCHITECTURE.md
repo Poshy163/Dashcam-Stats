@@ -293,6 +293,40 @@ shows the confidence alongside the text.
 
 ---
 
+## 5.1 The heat map
+
+`GET /api/map/heatmap` answers "where do I actually drive", and the two decisions that make
+it work are both consequences of the sample rate rather than of cartography.
+
+**Aggregation happens in SQL, not the browser.** One second of footage is one telemetry
+point, so a few days of driving is already tens of thousands of coordinates and a year is
+millions. Returning raw fixes is a payload that grows without bound, and the browser ends
+up aggregating anyway. Rounding coordinates onto a grid and counting bounds the response by
+the *area* covered instead of the *time* spent covering it — a commute driven two hundred
+times is the same number of cells as one commute, only hotter. Precision is capped at four
+decimal places because that is what the overlay prints; offering more would invent
+resolution the source does not have.
+
+**Stationary time has to be filtered, and the remaining spread compressed.** The camera
+samples at 1 Hz whether or not the car is moving, so an hour parked is 3,600 fixes in one
+cell. Measured on a synthetic 40-trip commute with an hour parked at each end: the busiest
+cell held **101×** the weight of the busiest road cell, which on a map is a single
+incandescent dot at home and nothing else. A `min_speed_kmh` filter removes it — and even
+then the faintest road cell sits at 0.028 of the brightest on a linear ramp, which is
+invisible, so intensities are compressed logarithmically to 0.19. Both numbers came from
+measurement; neither problem was visible from the code.
+
+Null speeds are kept by the filter rather than dropped: an unreadable speed field says
+nothing about whether the car was moving, and discarding those fixes would punch holes in
+real routes. Rows are also required to have non-null coordinates and not merely `has_fix` —
+a flagged row with null coordinates would round to a cell at Null Island.
+
+Blur radius is derived from how large a grid cell currently is on screen rather than fixed,
+because cells are a fixed size on the *ground*: a constant radius collapses to specks when
+zoomed out and beads into disconnected blobs when zoomed in.
+
+---
+
 ## 6. Retention safety
 
 Retention refuses to act unless **every** guard passes:

@@ -64,6 +64,8 @@ READ_ENDPOINTS = [
     "/api/system/database",
     "/api/retention/safety",
     "/api/search?q=ABC",
+    "/api/map/heatmap",
+    "/api/map/coverage",
 ]
 
 
@@ -145,6 +147,101 @@ class TestWriteEndpoints:
         plan = response.json()
         assert plan["deletion_enabled"] is False, "deletion must default to off"
         assert "safety" in plan
+
+
+class TestHeatmap:
+    """The heat map aggregates in SQL, so the aggregation itself needs checking.
+
+    A 200 proves nothing here: an endpoint that groups wrongly, or that lets the no-fix
+    placeholder through, returns 200 with a map that is quietly wrong — a hot spot in the
+    Gulf of Guinea, or every cell weighted 1 because the grouping never collapsed anything.
+    """
+
+    @pytest.fixture
+    async def telemetry(self, db_session):
+        from app.db.models import TelemetryPoint
+
+        async with session_scope() as session:
+            rec = Recording(
+                rel_path="20260804174353_camera_0.ts",
+                filename="20260804174353_camera_0.ts",
+                size_bytes=1024,
+                state=RecordingState.COMPLETED,
+            )
+            session.add(rec)
+            await session.flush()
+
+            points = [
+                # Six fixes inside one ~110 m cell at precision 3, from three distinct
+                # coordinates. They must collapse to a single cell of weight 6.
+                *[(-34.8088, 138.6769) for _ in range(3)],
+                *[(-34.80881, 138.67691) for _ in range(2)],
+                (-34.80884, 138.67694),
+                # A second cell, clearly elsewhere.
+                (-34.7956, 138.7031),
+            ]
+            for index, (lat, lon) in enumerate(points):
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec.id,
+                        t_offset_s=float(index),
+                        lat=lat,
+                        lon=lon,
+                        has_fix=True,
+                        speed_kmh=60.0,
+                    )
+                )
+            # No-fix rows, which must never reach the map. The flagged-but-null case is the
+            # dangerous one: it would round to (0, 0) and put a hot spot off West Africa.
+            session.add(
+                TelemetryPoint(
+                    recording_id=rec.id, t_offset_s=90.0, lat=None, lon=None, has_fix=False
+                )
+            )
+            session.add(
+                TelemetryPoint(
+                    recording_id=rec.id, t_offset_s=91.0, lat=None, lon=None, has_fix=True
+                )
+            )
+            await session.flush()
+
+    async def test_fixes_collapse_into_weighted_cells(self, client, telemetry):
+        response = await client.get("/api/map/heatmap?precision=3")
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+        assert body["cells"] == 2, f"expected two cells, got {body['points']}"
+        assert body["total_points"] == 7
+        assert body["max_weight"] == 6
+        assert body["truncated"] is False
+
+        heaviest = max(body["points"], key=lambda p: p[2])
+        assert heaviest[2] == 6
+        assert heaviest[0] == pytest.approx(-34.809, abs=1e-3)
+        assert heaviest[1] == pytest.approx(138.677, abs=1e-3)
+
+    async def test_no_fix_rows_never_reach_the_map(self, client, telemetry):
+        body = (await client.get("/api/map/heatmap?precision=4")).json()
+        for lat, lon, _weight in body["points"]:
+            assert (lat, lon) != (0.0, 0.0), "the no-fix placeholder was plotted as a coordinate"
+            assert -90 <= lat <= 90 and -180 <= lon <= 180
+
+    async def test_finer_precision_splits_cells_that_coarser_merges(self, client, telemetry):
+        coarse = (await client.get("/api/map/heatmap?precision=2")).json()
+        fine = (await client.get("/api/map/heatmap?precision=4")).json()
+        assert fine["cells"] >= coarse["cells"]
+        # Whatever the grid, every fix is still accounted for exactly once.
+        assert fine["total_points"] == coarse["total_points"] == 7
+
+    async def test_precision_beyond_the_source_resolution_is_refused(self, client):
+        # The overlay prints four decimals; offering more would invent precision.
+        assert (await client.get("/api/map/heatmap?precision=7")).status_code == 422
+
+    async def test_empty_library_is_an_empty_map_not_an_error(self, client):
+        body = (await client.get("/api/map/heatmap")).json()
+        assert body["points"] == []
+        assert body["max_weight"] == 0
+        assert body["total_points"] == 0
 
 
 class TestNotFound:

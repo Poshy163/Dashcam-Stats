@@ -386,3 +386,24 @@ class HealthOut(BaseModel):
     worker: str
     version: str
     detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class HeatmapOut(BaseModel):
+    """Grid cells with a visit count, ready to be drawn as a heat layer.
+
+    ``points`` is deliberately a bare ``[lat, lon, weight]`` triple rather than an object
+    per cell. There can be twenty thousand of them, and the field names would be most of
+    the payload.
+    """
+
+    points: list[list[float]] = Field(default_factory=list)
+    #: Decimal places the grid was rounded to: 2 is about 1.1 km, 3 about 110 m, 4 about 11 m.
+    precision: int
+    cells: int
+    #: Visits in the busiest cell. The client normalises its colour ramp against this.
+    max_weight: int
+    #: Total fixes represented, which is also seconds of driving at the 1 Hz sample rate.
+    total_points: int
+    average_speed_kmh: float | None = None
+    #: True when the cell cap was hit, so the map is showing the densest cells only.
+    truncated: bool = False

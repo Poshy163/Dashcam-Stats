@@ -349,3 +349,36 @@ export interface SearchResults {
   recordings: Recording[]
   journeys: Journey[]
 }
+
+/**
+ * A heat map of where the vehicle has actually been.
+ *
+ * `points` are `[lat, lon, weight]` triples on a grid the server rounded to `precision`
+ * decimal places. Aggregation happens in SQL because one second of footage is one fix, so
+ * a year of driving is millions of coordinates; grouping into cells bounds the payload by
+ * the area covered rather than the time spent covering it.
+ */
+export interface Heatmap {
+  points: [number, number, number][]
+  /** Grid resolution in decimal places: 2 is about 1.1 km, 3 about 110 m, 4 about 11 m. */
+  precision: number
+  cells: number
+  /** Weight of the busiest cell; the colour ramp normalises against this. */
+  maxWeight: number
+  /** Total fixes represented, which at the 1 Hz sample rate is also seconds of driving. */
+  totalPoints: number
+  averageSpeedKmh: number | null
+  /** True when the cell cap was reached, so only the densest cells are shown. */
+  truncated: boolean
+}
+
+export interface HeatmapFilters {
+  /** Index signature so this satisfies the api client's `Query` shape. */
+  [key: string]: string | number | boolean | null | undefined
+  precision?: number
+  start?: string
+  end?: string
+  journeyId?: number
+  camera?: string
+  minSpeedKmh?: number
+}
