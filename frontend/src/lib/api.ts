@@ -112,6 +112,19 @@ function post<T>(path: string, body?: unknown, opts: { rawKeys?: boolean } = {})
   })
 }
 
+/** What POST /api/scan reports back, so the Settings page can summarise the run. */
+export interface ScanResult {
+  scanId: number | null
+  seen: number
+  new: number
+  changed: number
+  unsettled: number
+  missing: number
+  queued: number
+  errors: number
+  errorMessage: string | null
+}
+
 export interface RecordingFilters extends Query {
   page?: number
   pageSize?: number
@@ -195,7 +208,7 @@ export const api = {
   },
 
   scan: {
-    now: () => post<{ scanId: number }>('/scan'),
+    now: () => post<ScanResult>('/scan'),
     processNew: () => post<{ queued: number }>('/process'),
   },
 

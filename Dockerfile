@@ -49,16 +49,33 @@ LABEL org.opencontainers.image.title="Dashcam Analyser" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}"
 
-# non-free-firmware carries the Intel iHD VAAPI driver, which is what Gen9+ iGPUs
+# The non-free component carries the Intel iHD VAAPI driver, which is what Gen9+ iGPUs
 # (including the Iris Xe in a 13th-gen i9) actually use for hardware decode.
-RUN echo 'deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware' \
-        > /etc/apt/sources.list.d/nonfree.list \
-    && apt-get update && apt-get install -y --no-install-recommends \
+#
+# The components are added to the *existing* source entry rather than declared in a new
+# .list file. Recent Debian images ship deb822 (`debian.sources`) with a `Signed-By` key,
+# and a second entry for the same suite without that key makes apt abort with
+# "Conflicting values set for option Signed-By" before it installs anything. Both source
+# formats are handled so the build does not depend on which one the base image ships.
+#
+# The Intel media driver is installed separately and allowed to fail: it is preferred on
+# Intel hardware, but on an AMD iGPU or a host with no GPU at all mesa-va-drivers already
+# covers decode, and failing the whole image build over a driver the machine may never use
+# would be the wrong trade.
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's/^Components:.*/Components: main contrib non-free non-free-firmware/' \
+            /etc/apt/sources.list.d/debian.sources; \
+    else \
+        sed -i 's/^\(deb.*bookworm[^ ]*\) main.*$/\1 main contrib non-free non-free-firmware/' \
+            /etc/apt/sources.list; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
         ffmpeg \
         libva2 \
         libva-drm2 \
         vainfo \
-        intel-media-va-driver-non-free \
         i965-va-driver \
         mesa-va-drivers \
         intel-opencl-icd \
@@ -69,8 +86,11 @@ RUN echo 'deb http://deb.debian.org/debian bookworm main contrib non-free non-fr
         libgomp1 \
         tini \
         gosu \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
+        curl; \
+    apt-get install -y --no-install-recommends intel-media-va-driver-non-free \
+        || apt-get install -y --no-install-recommends intel-media-va-driver \
+        || echo 'WARNING: no Intel media driver available; VAAPI will fall back to Mesa'; \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=pydeps /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}" \

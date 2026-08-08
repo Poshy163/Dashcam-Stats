@@ -129,15 +129,25 @@ export default function Settings() {
               </button>
               {scanNow.data && (
                 <p className="hint w-full">
-                  Saw {String(scanNow.data.seen ?? 0)} files, {String(scanNow.data.new ?? 0)} new,{' '}
-                  {String(scanNow.data.queued ?? 0)} queued for processing.
+                  Saw {scanNow.data.seen} files, {scanNow.data.new} new,{' '}
+                  {scanNow.data.queued} queued for processing
+                  {scanNow.data.unsettled > 0 && (
+                    <>
+                      {' '}&mdash; {scanNow.data.unsettled} skipped as still being written
+                    </>
+                  )}
+                  .
                 </p>
               )}
             </section>
           )}
 
           {category.key === 'storage' && (
-            <RetentionPanel plan={plan} />
+            <RetentionPanel
+              result={plan.data}
+              pending={plan.isPending}
+              onRun={() => plan.mutate()}
+            />
           )}
 
           {category.key === 'advanced' && (
@@ -314,20 +324,24 @@ function Field({
   )
 }
 
-interface RetentionMutation {
-  data?: RetentionPlan
-  isPending: boolean
-  mutate: () => void
-}
-
-function RetentionPanel({ plan }: { plan: RetentionMutation }) {
-  const result = plan.data
+// Takes the pieces it needs rather than the whole mutation object: TanStack's
+// UseMutationResult carries generics that would leak into this component's signature for
+// no benefit.
+function RetentionPanel({
+  result,
+  pending,
+  onRun,
+}: {
+  result: RetentionPlan | undefined
+  pending: boolean
+  onRun: () => void
+}) {
   return (
     <section className="card space-y-3 p-4">
       <div className="flex items-center gap-2">
         <h3 className="text-sm font-semibold">Retention</h3>
-        <button className="btn ml-auto" onClick={() => plan.mutate()} disabled={plan.isPending}>
-          {plan.isPending ? 'Evaluating…' : 'Run Now'}
+        <button className="btn ml-auto" onClick={onRun} disabled={pending}>
+          {pending ? 'Evaluating…' : 'Run Now'}
         </button>
       </div>
 
@@ -355,7 +369,7 @@ function RetentionPanel({ plan }: { plan: RetentionMutation }) {
 
           {result.safety && (
             <ul className="space-y-0.5 text-xs">
-              {result.safety.checks.map((check: { name: string; passed: boolean; reason: string | null }) => (
+              {result.safety.checks.map((check) => (
                 <li key={check.name} className={check.passed ? 'text-content-muted' : 'text-state-error'}>
                   {check.passed ? '✓' : '✕'} {check.name}
                   {check.reason ? ` — ${check.reason}` : ''}
@@ -364,13 +378,13 @@ function RetentionPanel({ plan }: { plan: RetentionMutation }) {
             </ul>
           )}
 
-          {result.candidates?.length > 0 && (
+          {result.candidates.length > 0 && (
             <details className="text-xs">
               <summary className="cursor-pointer text-content-muted">
                 Recordings that would be removed
               </summary>
               <ul className="tabular mt-1 space-y-0.5">
-                {result.candidates.slice(0, 50).map((c: { recordingId: number; filename: string; sizeBytes: number }) => (
+                {result.candidates.slice(0, 50).map((c) => (
                   <li key={c.recordingId} className="text-content-faint">
                     {c.filename} — {formatBytes(c.sizeBytes)}
                   </li>
