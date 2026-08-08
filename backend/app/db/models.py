@@ -626,9 +626,9 @@ class OsdProfile(Base):
     name: Mapped[str] = mapped_column(String(128), unique=True)
     # Fractional crop: x, y, w, h in 0..1
     region_x: Mapped[float] = mapped_column(Float, default=0.0)
-    region_y: Mapped[float] = mapped_column(Float, default=0.94)
+    region_y: Mapped[float] = mapped_column(Float, default=0.9537)
     region_w: Mapped[float] = mapped_column(Float, default=1.0)
-    region_h: Mapped[float] = mapped_column(Float, default=0.06)
+    region_h: Mapped[float] = mapped_column(Float, default=0.0463)
 
     pattern: Mapped[str] = mapped_column(Text)
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)

@@ -24,7 +24,11 @@ from app.osd.glyphs import binarise, segment_glyphs
 log = get_logger(__name__)
 
 #: Defaults matching the observed overlay, with padding for firmware variation.
-DEFAULT_REGION = (0.0, 0.94, 1.0, 0.06)
+#: Measured directly on the corpus: the overlay occupies y=1040..1072 of a 1080-line
+#: frame. This crop is 1030..1080 -- tight enough to exclude the scene above the text
+#: (headlights and bright sky break glyph segmentation at night) while leaving margin
+#: for firmware that positions the overlay a few pixels differently.
+DEFAULT_REGION = (0.0, 0.9537, 1.0, 0.0463)
 
 #: Calibration never looks above this fraction of the frame. The overlay is always
 #: bottom-anchored, and searching higher only invites false positives from the scene.

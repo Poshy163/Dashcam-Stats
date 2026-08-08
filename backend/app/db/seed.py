@@ -17,7 +17,7 @@ DEFAULT_OSD_PROFILE_NAME = "default"
 
 #: Fractions of frame width/height, so the profile survives a non-1080p source. The OSD
 #: is a single text band hugging the bottom edge of both cameras.
-DEFAULT_OSD_REGION: tuple[float, float, float, float] = (0.0, 0.94, 1.0, 0.06)
+DEFAULT_OSD_REGION: tuple[float, float, float, float] = (0.0, 0.9537, 1.0, 0.0463)
 
 #: Parses the burned-in overlay, e.g.
 #:     2026-08-04 17:44:38   E:138.6769 N:-34.8088  68 km/h

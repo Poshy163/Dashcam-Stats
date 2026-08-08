@@ -41,6 +41,10 @@ log = get_logger(__name__)
 
 EARTH_RADIUS_M = 6_371_008.8
 
+#: Ceiling on how fast the vehicle could actually be moving between two fixes. Well
+#: above any road speed, so it only ever catches OCR damage rather than fast driving.
+_MAX_PLAUSIBLE_SPEED_KMH = 400.0
+
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -88,6 +92,8 @@ class TelemetryResult:
     #: Overlay clock at the first readable frame. More trustworthy than the filename,
     #: which is only the moment the camera opened the file.
     osd_start_time: datetime | None = None
+    #: Fixes discarded for implying impossible movement -- misread coordinates.
+    implausible_jumps: int = 0
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -324,8 +330,26 @@ class TelemetryExtractor:
         return result
 
     @staticmethod
+    def _seconds_between(a: TelemetrySample, b: TelemetrySample) -> float:
+        """Elapsed time between two samples, preferring the overlay clock.
+
+        Falls back to the decode offset, which is what exists when a timestamp failed to
+        parse but the coordinates did.
+        """
+        if a.captured_at is not None and b.captured_at is not None:
+            gap = abs((b.captured_at - a.captured_at).total_seconds())
+            if gap > 0:
+                return gap
+        return max(0.0, b.t_offset_s - a.t_offset_s)
+
+    @staticmethod
     def _derive(result: TelemetryResult, *, min_move_m: float) -> None:
-        """Fill in heading and the journey rollups."""
+        """Fill in heading and the journey rollups, discarding impossible movement."""
+        # Metres a vehicle could plausibly cover in one second. Anything beyond this
+        # between consecutive fixes is a misread coordinate, not travel.
+        max_step_m = _MAX_PLAUSIBLE_SPEED_KMH * 1000.0 / 3600.0
+        rejected: list[TelemetrySample] = []
+
         fixes = [s for s in result.samples if s.has_fix and s.lat is not None and s.lon is not None]
         if fixes:
             result.first_fix, result.last_fix = fixes[0], fixes[-1]
@@ -338,7 +362,23 @@ class TelemetryExtractor:
             if anchor is None:
                 anchor = sample
                 continue
+
             step = haversine_m(anchor.lat, anchor.lon, sample.lat, sample.lon)  # type: ignore[arg-type]
+
+            # An OCR misread that lands inside the valid coordinate range still passes
+            # every per-point check: 138.6769 read as 13.8769 is a perfectly legal
+            # longitude about 13,000 km away. Only comparing consecutive fixes catches it,
+            # and without this a single bad digit turned a two-minute clip into a
+            # 31,000 km journey. Reject the *sample*, not the anchor -- the anchor is the
+            # last position we still trust.
+            gap_s = TelemetryExtractor._seconds_between(anchor, sample)
+            if step > max_step_m * max(1.0, gap_s):
+                sample.has_fix = False
+                sample.lat = None
+                sample.lon = None
+                rejected.append(sample)
+                continue
+
             if step < min_move_m:
                 # Within the overlay's 4-decimal-place quantisation: not movement, and a
                 # bearing between two jitter samples would be meaningless too.
@@ -349,6 +389,17 @@ class TelemetryExtractor:
                 1,  # type: ignore[arg-type]
             )
             anchor = sample
+
+        if rejected:
+            result.implausible_jumps = len(rejected)
+            result.warnings.append(
+                f"discarded {len(rejected)} position(s) implying travel faster than "
+                f"{_MAX_PLAUSIBLE_SPEED_KMH:.0f} km/h; these are misread coordinates"
+            )
+            # first/last fix may have just been invalidated.
+            still_fixed = [s for s in result.samples if s.has_fix]
+            result.first_fix = still_fixed[0] if still_fixed else None
+            result.last_fix = still_fixed[-1] if still_fixed else None
 
         speeds = [s.speed_kmh for s in result.samples if s.speed_kmh is not None]
         if speeds:
