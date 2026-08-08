@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
 
@@ -544,10 +544,20 @@ async def retry_job(job_id: int, session: SessionDep):
     return JobOut.model_validate(job)
 
 
-@router.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def cancel_job(job_id: int, session: SessionDep) -> None:
+# `response_model=None` is load-bearing, not decoration. FastAPI infers the response model
+# from the return annotation, and a bare `-> None` yields `NoneType` -- a class object, so
+# truthy -- which trips its "204 must not have a response body" assertion *at import time*
+# and takes the whole app down before it serves anything. Returning an explicit Response
+# and suppressing the inferred model keeps this working across FastAPI versions.
+@router.delete(
+    "/jobs/{job_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def cancel_job(job_id: int, session: SessionDep) -> Response:
     if not await queue.cancel(session, job_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found or already finished")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --------------------------------------------------------------------------------------
