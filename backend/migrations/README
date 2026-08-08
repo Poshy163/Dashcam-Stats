@@ -1,0 +1,20 @@
+Alembic migrations for the dashcam analyser.
+
+The application runs `alembic upgrade head` itself at startup (app.db.session.init_db),
+so a fresh /data volume needs no manual step.
+
+Manual use, from the `backend/` directory:
+
+    alembic upgrade head
+    alembic downgrade -1
+    alembic revision --autogenerate -m "describe the change"
+    alembic upgrade head --sql          # offline: emit SQL instead of applying it
+
+The database URL is never read from alembic.ini. env.py takes it from
+app.config.get_config().sync_sqlalchemy_url so migrations can never target a different
+database than the running application. Set DASHCAM_DATA_DIR (or DASHCAM_DATABASE_URL) to
+point them elsewhere.
+
+SQLite cannot ALTER most things in place, so env.py enables render_as_batch: schema
+changes are emitted as create-copy-drop-rename. Write new migrations with
+`with op.batch_alter_table(...) as batch_op:` when altering existing columns.

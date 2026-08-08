@@ -1,0 +1,13 @@
+-r requirements.txt
+
+pytest>=8.3,<9
+pytest-asyncio>=0.24,<1.2
+pytest-cov>=6.0,<8
+anyio>=4.6,<5
+# Exercises the FastAPI app through real HTTP rather than by calling handlers directly,
+# so dependency wiring and middleware are actually covered.
+asgi-lifespan>=2.1,<3
+
+ruff>=0.8,<0.15
+mypy>=1.13,<2
+types-requests

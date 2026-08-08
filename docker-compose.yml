@@ -1,0 +1,32 @@
+services:
+  dashcam:
+    image: ghcr.io/poshy163/dashcam-analyser:latest
+    container_name: dashcam-analyser
+    restart: unless-stopped
+
+    ports:
+      - 8098:8080
+
+    devices:
+      # Exposes the iGPU for hardware video decode (VAAPI) and OpenVINO inference.
+      # Remove this line to run CPU-only; the app detects the change and adapts.
+      - /dev/dri:/dev/dri
+
+    volumes:
+      # Application database, settings, thumbnails, crops and models. Never deleted by
+      # retention under any circumstance.
+      - dashcam-data:/data
+
+      # Your raw footage. Mounted read-only: retention reports what it would remove
+      # instead of deleting. Drop the `:ro` and enable deletion in Settings > Storage
+      # if you later want automatic cleanup.
+      - /mnt/Vault/dashcam:/dashcam:ro
+
+    # Everything else is configured in the web UI. These are the only variables that
+    # exist, and all of them already have sensible defaults.
+    environment:
+      - TZ=Australia/Adelaide
+      # - DASHCAM_LOG_LEVEL=INFO
+
+volumes:
+  dashcam-data:

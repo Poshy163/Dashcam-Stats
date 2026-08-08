@@ -1,0 +1,815 @@
+"""Processing stages.
+
+Each stage is independently re-runnable and owns exactly one ``StageState`` column, so
+"reprocess telemetry only" never re-runs detection and reprocessing anything never
+duplicates a row.
+
+Cost discipline, which is what makes this viable over terabytes:
+
+* telemetry decodes a thin overlay strip at 1 fps — the rate the overlay itself updates;
+* detection samples a few frames a second and stores *tracks*, not frames;
+* plate OCR runs on a handful of crops per tracked vehicle, never per frame.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.ai.detector import ObjectDetector
+from app.ai.normalise_au import normalise
+from app.ai.plates import (
+    PlateDetector,
+    PlateOCR,
+    PlateReading,
+    crop_with_margin,
+    plate_box_in_frame,
+    select_ocr_candidates,
+    vote_track_plate,
+)
+from app.ai.tracker import ByteTracker
+from app.config import get_config
+from app.core.logging import get_logger
+from app.core.paths import relative_to_media, resolve_footage_path
+from app.core.settings_service import get_settings_service
+from app.db.models import (
+    Camera,
+    CameraRole,
+    Detection,
+    OsdProfile,
+    Plate,
+    PlateObservation,
+    Recording,
+    RecordingState,
+    StageState,
+    TelemetryPoint,
+    TrackedObject,
+)
+from app.hardware.ffmpeg import DecodeError, FFmpegError, iter_frames, probe, write_thumbnail
+from app.journeys.builder import JourneyBuilder
+from app.osd import (
+    GlyphTemplates,
+    OsdRegion,
+    TelemetryExtractor,
+    expected_time_from_filename,
+    missing_characters,
+    select_training_set,
+)
+
+log = get_logger(__name__)
+
+ProgressCallback = Callable[[str, float], None]
+
+#: Learned overlay templates are shared across every recording and rarely change.
+_templates_cache: GlyphTemplates | None = None
+
+#: How far the overlay clock may sit from the filename before it is treated as a misread.
+#: Generous enough to absorb a camera whose clock drifts by a few minutes, tight enough
+#: that a mangled hour or day digit is caught.
+_MAX_OSD_FILENAME_DRIFT_S = 15 * 60
+
+
+class StageError(RuntimeError):
+    """A stage failed for this recording. Carries whether retrying could ever help."""
+
+    def __init__(self, message: str, *, permanent: bool = False) -> None:
+        super().__init__(message)
+        self.permanent = permanent
+
+
+@dataclass(slots=True)
+class StageResult:
+    name: str
+    ok: bool
+    detail: str | None = None
+    stats: dict[str, object] | None = None
+
+
+def _media_path(*parts: str) -> Path:
+    path = get_config().media_dir.joinpath(*parts)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _save_jpeg(image: np.ndarray, path: Path, quality: int = 85) -> str | None:
+    """Write a BGR array as JPEG and return its media-relative path."""
+    try:
+        import cv2
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if cv2.imwrite(str(path), image, [int(cv2.IMWRITE_JPEG_QUALITY), quality]):
+            return relative_to_media(path)
+    except Exception as exc:
+        log.debug("could not write crop", path=str(path), error=str(exc))
+    return None
+
+
+# --------------------------------------------------------------------------------------
+# Stage 1 - inspection
+# --------------------------------------------------------------------------------------
+
+
+async def stage_inspect(
+    session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
+) -> StageResult:
+    """Read container metadata and generate a thumbnail."""
+    path = resolve_footage_path(recording.rel_path)
+    if not path.exists():
+        recording.file_missing = True
+        raise StageError(f"{recording.filename} is no longer on disk", permanent=True)
+
+    try:
+        info = await probe(path)
+    except FFmpegError as exc:
+        # Empty files and files with no video stream will never succeed, however many
+        # times we retry them.
+        raise StageError(str(exc), permanent=True) from exc
+
+    recording.container = info.container
+    recording.video_codec = info.video_codec
+    recording.video_profile = info.video_profile
+    recording.width = info.width
+    recording.height = info.height
+    recording.fps = info.fps
+    recording.fps_container = info.fps_container
+    recording.bitrate = info.bitrate
+    recording.pix_fmt = info.pix_fmt
+    recording.has_audio = info.has_audio
+    recording.audio_codec = info.audio_codec
+    recording.audio_sample_rate = info.audio_sample_rate
+    recording.audio_channels = info.audio_channels
+    recording.duration_s = info.duration_s
+    recording.size_bytes = info.size_bytes
+    recording.probe_json = {"warnings": info.warnings, "pts_wrapped": info.pts_wrapped}
+
+    if recording.started_at is None:
+        parsed = expected_time_from_filename(recording.filename)
+        if parsed is not None:
+            recording.started_at = parsed.replace(tzinfo=UTC)
+    if recording.started_at and info.duration_s:
+        recording.ended_at = recording.started_at + timedelta(seconds=info.duration_s)
+
+    if progress:
+        progress("metadata", 0.6)
+
+    settings = get_settings_service()
+    if not recording.thumbnail_path:
+        thumb = _media_path("thumbnails", f"{recording.id:08d}.jpg")
+        seek = min(2.0, (info.duration_s or 4.0) / 2)
+        if await write_thumbnail(
+            path,
+            thumb,
+            t=seek,
+            width=int(settings.get_nowait("general.thumbnail_width")),
+            quality=int(settings.get_nowait("general.thumbnail_quality")),
+        ):
+            recording.thumbnail_path = relative_to_media(thumb)
+
+    recording.metadata_state = StageState.DONE
+    if recording.state is RecordingState.DISCOVERED:
+        recording.state = RecordingState.METADATA_EXTRACTED
+
+    return StageResult(
+        "metadata",
+        True,
+        stats={
+            "duration_s": info.duration_s,
+            "resolution": info.resolution,
+            "fps": info.fps,
+            "warnings": info.warnings,
+        },
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Stage 2 - telemetry
+# --------------------------------------------------------------------------------------
+
+
+async def _active_profile(session: AsyncSession) -> OsdRegion:
+    profile = (
+        await session.execute(select(OsdProfile).where(OsdProfile.active.is_(True)).limit(1))
+    ).scalar_one_or_none()
+    if profile is None:
+        return OsdRegion()
+    return OsdRegion(x=profile.region_x, y=profile.region_y, w=profile.region_w, h=profile.region_h)
+
+
+async def _get_templates(
+    session: AsyncSession, extractor: TelemetryExtractor, region: OsdRegion
+) -> GlyphTemplates | None:
+    """Load learned overlay templates, learning them from the library on first use."""
+    global _templates_cache
+    if _templates_cache is not None:
+        extractor._templates = _templates_cache
+        return _templates_cache
+
+    path = get_config().data_dir / "osd_templates.npz"
+    if extractor.load_templates(path):
+        _templates_cache = extractor.templates
+        return _templates_cache
+
+    # Choose training footage that actually contains every digit. Sampling the first few
+    # files is not enough: a week of recordings can easily contain no 9 in any stable
+    # timestamp field, and an unlearned digit decodes as its nearest lookalike at high
+    # confidence, so no threshold would catch it.
+    rows = (
+        await session.execute(
+            select(Recording.rel_path, Recording.filename)
+            .where(Recording.file_missing.is_(False), Recording.ignored.is_(False))
+            .order_by(Recording.started_at.asc())
+            .limit(500)
+        )
+    ).all()
+
+    candidates: list[tuple[str, datetime]] = []
+    by_name: dict[str, str] = {}
+    for rel_path, filename in rows:
+        when = expected_time_from_filename(filename)
+        if when is not None:
+            candidates.append((filename, when))
+            by_name[filename] = rel_path
+
+    if not candidates:
+        return None
+
+    chosen = select_training_set(candidates, limit=10)
+    paths = [resolve_footage_path(by_name[name]) for name, _ in chosen]
+    paths = [p for p in paths if p.exists()]
+    if not paths:
+        return None
+
+    extractor._template_path = path
+    templates = await extractor.learn_templates(paths, region=region)
+    missing = missing_characters(templates)
+    if missing:
+        log.warning(
+            "overlay templates are incomplete; telemetry accuracy will suffer",
+            missing=sorted(missing),
+        )
+    _templates_cache = templates
+    return templates
+
+
+async def stage_telemetry(
+    session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
+) -> StageResult:
+    """Decode the burned-in overlay into telemetry points."""
+    settings = get_settings_service()
+    if not bool(settings.get_nowait("telemetry.enabled")):
+        recording.telemetry_state = StageState.SKIPPED
+        return StageResult("telemetry", True, "disabled")
+
+    path = resolve_footage_path(recording.rel_path)
+    region = await _active_profile(session)
+    extractor = TelemetryExtractor()
+
+    if await _get_templates(session, extractor, region) is None:
+        recording.telemetry_state = StageState.SKIPPED
+        return StageResult("telemetry", True, "no overlay templates available")
+
+    if progress:
+        progress("telemetry", 0.1)
+
+    result = await extractor.extract(
+        path,
+        region=region,
+        sample_fps=float(settings.get_nowait("telemetry.sample_fps")),
+        min_confidence=float(settings.get_nowait("telemetry.min_confidence")),
+        max_speed_kmh=float(settings.get_nowait("telemetry.max_speed_kmh")),
+        min_move_m=float(settings.get_nowait("telemetry.min_move_metres")),
+        hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
+    )
+
+    # Reprocessing replaces the previous pass rather than appending to it.
+    await session.execute(delete(TelemetryPoint).where(TelemetryPoint.recording_id == recording.id))
+
+    tz = await settings.timezone()
+    rows = []
+    for sample in result.samples:
+        captured = sample.captured_at
+        if captured is not None and captured.tzinfo is None:
+            # The overlay prints local wall-clock time with no zone; attach the configured
+            # one so every stored timestamp is comparable.
+            captured = captured.replace(tzinfo=tz).astimezone(UTC)
+        rows.append(
+            {
+                "recording_id": recording.id,
+                "journey_id": recording.journey_id,
+                "t_offset_s": sample.t_offset_s,
+                "captured_at": captured,
+                "lat": sample.lat,
+                "lon": sample.lon,
+                "has_fix": sample.has_fix,
+                "speed_kmh": sample.speed_kmh,
+                "heading_deg": sample.heading_deg,
+                "ocr_confidence": sample.ocr_confidence,
+                "raw_text": sample.raw_text,
+            }
+        )
+
+    if rows:
+        await session.execute(TelemetryPoint.__table__.insert(), rows)
+
+    recording.telemetry_point_count = len(rows)
+    recording.gps_point_count = result.fix_count
+    recording.has_gps = result.has_gps
+    recording.distance_m = result.distance_m or None
+    recording.avg_speed_kmh = result.avg_speed_kmh
+    recording.max_speed_kmh = result.max_speed_kmh
+    if result.first_fix:
+        recording.start_lat = result.first_fix.lat
+        recording.start_lon = result.first_fix.lon
+
+    # The overlay clock is the camera's own time and beats the filename, which only
+    # records when the file was opened -- but only when the two agree. Both come from the
+    # same device, so a large disagreement means the overlay was misread, not that the
+    # filename is wrong. Accepting a bad reading here is expensive: started_at drives
+    # journey clustering, so one mangled digit can tear a drive apart and file a recording
+    # under a time it never happened.
+    if result.osd_start_time is not None:
+        filename_time = expected_time_from_filename(recording.filename)
+        drift = (
+            abs((result.osd_start_time - filename_time).total_seconds())
+            if filename_time is not None
+            else 0.0
+        )
+        if filename_time is not None and drift > _MAX_OSD_FILENAME_DRIFT_S:
+            log.warning(
+                "ignoring overlay timestamp: it disagrees with the filename",
+                file=recording.filename,
+                osd=result.osd_start_time.isoformat(),
+                filename_time=filename_time.isoformat(),
+                drift_s=round(drift),
+            )
+        else:
+            localised = result.osd_start_time.replace(tzinfo=tz).astimezone(UTC)
+            recording.started_at = localised
+            recording.time_from_osd = True
+            if recording.duration_s:
+                recording.ended_at = localised + timedelta(seconds=recording.duration_s)
+
+    recording.telemetry_state = StageState.DONE
+    return StageResult(
+        "telemetry",
+        True,
+        stats={
+            "points": len(rows),
+            "fixes": result.fix_count,
+            "distance_m": result.distance_m,
+            "parse_failures": result.parse_failures,
+            "warnings": result.warnings,
+        },
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Stage 3 - object detection and tracking
+# --------------------------------------------------------------------------------------
+
+
+def _should_analyse(recording: Recording, camera: Camera | None) -> bool:
+    if camera is None:
+        return True
+    if camera.role is CameraRole.REAR:
+        return bool(get_settings_service().get_nowait("processing.process_rear_camera"))
+    return True
+
+
+async def _nearest_fix(
+    session: AsyncSession, recording_id: int, offset_s: float
+) -> tuple[float | None, float | None, datetime | None]:
+    """The telemetry fix closest to an offset, for stamping a detection with a location."""
+    row = (
+        await session.execute(
+            select(TelemetryPoint.lat, TelemetryPoint.lon, TelemetryPoint.captured_at)
+            .where(
+                TelemetryPoint.recording_id == recording_id,
+                TelemetryPoint.has_fix.is_(True),
+            )
+            .order_by(func.abs(TelemetryPoint.t_offset_s - offset_s))
+            .limit(1)
+        )
+    ).first()
+    return row if row else (None, None, None)
+
+
+async def stage_detect(
+    session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
+) -> StageResult:
+    """Detect and track road objects across sampled frames."""
+    settings = get_settings_service()
+    if not bool(settings.get_nowait("processing.detection_enabled")):
+        recording.detection_state = StageState.SKIPPED
+        return StageResult("detection", True, "disabled")
+
+    camera = await session.get(Camera, recording.camera_id) if recording.camera_id else None
+    if not _should_analyse(recording, camera):
+        recording.detection_state = StageState.SKIPPED
+        return StageResult("detection", True, "rear camera analysis disabled")
+
+    detector = ObjectDetector()
+    if not await detector.load():
+        recording.detection_state = StageState.SKIPPED
+        return StageResult("detection", True, "detection model unavailable")
+
+    path = resolve_footage_path(recording.rel_path)
+    sample_fps = float(settings.get_nowait("processing.frame_sample_fps"))
+    tracker = ByteTracker()
+    duration = recording.duration_s or 0.0
+    frames = 0
+
+    try:
+        async for offset, frame in iter_frames(
+            path,
+            fps=sample_fps,
+            hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
+            codec=recording.video_codec,
+        ):
+            detections = await detector.detect(frame)
+            tracker.update(detections, offset, frame)
+            frames += 1
+            if progress and duration:
+                progress("detection", min(0.95, offset / duration))
+    except DecodeError as exc:
+        # Partial results from a damaged file are still worth keeping.
+        log.warning("detection ended early", file=recording.filename, error=str(exc))
+    except FFmpegError as exc:
+        raise StageError(f"decode failed: {exc}") from exc
+
+    tracks = tracker.finish(min_frames=int(settings.get_nowait("processing.track_min_frames")))
+
+    await session.execute(delete(TrackedObject).where(TrackedObject.recording_id == recording.id))
+
+    keep_detections = bool(settings.get_nowait("advanced.keep_sparse_detections"))
+    stride = max(1, int(settings.get_nowait("advanced.detection_store_stride")))
+
+    for track in tracks:
+        lat, lon, captured = await _nearest_fix(session, recording.id, track.first_offset_s)
+        crop_path = None
+        if track.best_crop is not None and track.best_crop.size:
+            crop_path = _save_jpeg(
+                track.best_crop,
+                _media_path("vehicles", f"{recording.id:08d}", f"{track.track_key:04d}.jpg"),
+                int(settings.get_nowait("general.thumbnail_quality")),
+            )
+
+        stored = TrackedObject(
+            recording_id=recording.id,
+            journey_id=recording.journey_id,
+            track_key=track.track_key,
+            class_label=track.class_label,
+            confidence_max=track.confidence_max,
+            confidence_avg=track.confidence_avg,
+            first_seen_offset_s=track.first_offset_s,
+            last_seen_offset_s=track.last_offset_s,
+            duration_s=track.duration_s,
+            frame_count=track.frame_count,
+            first_seen_at=captured,
+            last_seen_at=captured,
+            lat=lat,
+            lon=lon,
+            best_frame_offset_s=track.best_offset_s,
+            best_bbox=list(track.best_box) if track.best_box else None,
+            crop_path=crop_path,
+        )
+        session.add(stored)
+        await session.flush()
+
+        if keep_detections:
+            for index, (offset, confidence, x, y, w, h) in enumerate(track.samples):
+                if index % stride:
+                    continue
+                session.add(
+                    Detection(
+                        tracked_object_id=stored.id,
+                        recording_id=recording.id,
+                        t_offset_s=offset,
+                        class_label=track.class_label,
+                        confidence=confidence,
+                        x=x,
+                        y=y,
+                        w=w,
+                        h=h,
+                    )
+                )
+
+    recording.vehicle_count = len(tracks)
+    recording.detection_state = StageState.DONE
+    return StageResult(
+        "detection",
+        True,
+        stats={
+            "frames_analysed": frames,
+            "tracks": len(tracks),
+            "device": detector.device,
+        },
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Stage 4 - licence plates
+# --------------------------------------------------------------------------------------
+
+
+async def stage_plates(
+    session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
+) -> StageResult:
+    """Read plates from tracked vehicles and upsert the plate database."""
+    settings = get_settings_service()
+    if not bool(settings.get_nowait("plates.enabled")):
+        recording.plate_state = StageState.SKIPPED
+        return StageResult("plates", True, "disabled")
+
+    camera = await session.get(Camera, recording.camera_id) if recording.camera_id else None
+    if not _should_analyse(recording, camera):
+        recording.plate_state = StageState.SKIPPED
+        return StageResult("plates", True, "rear camera analysis disabled")
+
+    detector, ocr = PlateDetector(), PlateOCR()
+    if not await detector.load() or not await ocr.load():
+        recording.plate_state = StageState.SKIPPED
+        return StageResult("plates", True, "plate models unavailable")
+
+    tracks = list(
+        (
+            await session.execute(
+                select(TrackedObject).where(
+                    TrackedObject.recording_id == recording.id,
+                    TrackedObject.class_label.in_(["car", "truck", "bus", "motorcycle"]),
+                )
+            )
+        ).scalars()
+    )
+    if not tracks:
+        recording.plate_state = StageState.DONE
+        return StageResult("plates", True, "no vehicles to inspect")
+
+    path = resolve_footage_path(recording.rel_path)
+    min_width = int(settings.get_nowait("plates.min_plate_width"))
+    max_reads = int(settings.get_nowait("plates.max_ocr_per_track"))
+    min_store = float(settings.get_nowait("plates.min_store_confidence"))
+    save_crops = bool(settings.get_nowait("plates.save_crops"))
+    region_setting = str(settings.get_nowait("plates.region"))
+    quality = int(settings.get_nowait("general.thumbnail_quality"))
+
+    # One observation per plate per tracked vehicle -- reprocessing updates in place.
+    await session.execute(
+        delete(PlateObservation).where(PlateObservation.recording_id == recording.id)
+    )
+
+    stored = 0
+    for index, track in enumerate(tracks):
+        if track.best_frame_offset_s is None or not track.best_bbox:
+            continue
+        if progress:
+            progress("plates", (index + 1) / max(1, len(tracks)))
+
+        frame = None
+        try:
+            async for _, decoded in iter_frames(
+                path,
+                start=track.best_frame_offset_s,
+                duration=0.5,
+                fps=None,
+                hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
+                codec=recording.video_codec,
+            ):
+                frame = decoded
+                break
+        except FFmpegError:
+            continue
+        if frame is None:
+            continue
+
+        height, width = frame.shape[:2]
+        bx1, by1, bx2, by2 = track.best_bbox
+        vehicle = _as_detection(bx1, by1, bx2, by2, track.class_label, track.confidence_max)
+        vehicle_crop = crop_with_margin(
+            frame, (vehicle.x, vehicle.y, vehicle.x + vehicle.w, vehicle.y + vehicle.h), 0.02
+        )
+        if vehicle_crop is None or vehicle_crop.size == 0:
+            continue
+
+        boxes = await detector.detect(vehicle_crop, min_width_px=min_width)
+        readings: list[PlateReading] = []
+        for plate_box, confidence in boxes:
+            frame_box = plate_box_in_frame(vehicle, plate_box)
+            crop = crop_with_margin(frame, frame_box)
+            if crop is None:
+                continue
+            readings.append(
+                PlateReading(
+                    raw_text="",
+                    ocr_confidence=0.0,
+                    detection_confidence=confidence,
+                    bbox=frame_box,
+                    crop=crop,
+                    vehicle_crop=vehicle_crop,
+                    offset_s=track.best_frame_offset_s,
+                )
+            )
+
+        for reading in select_ocr_candidates(readings, max_reads):
+            text, confidence = await ocr.read(reading.crop)
+            reading.raw_text = text
+            reading.ocr_confidence = confidence
+
+        vote = vote_track_plate(readings)
+        if vote is None or vote.ocr_confidence < min_store:
+            continue
+
+        result = normalise(vote.text, region=region_setting)
+        plate = await _upsert_plate(session, result, vote.ocr_confidence)
+
+        plate_crop_path = vehicle_crop_path = None
+        if save_crops:
+            plate_crop_path = (
+                _save_jpeg(
+                    vote.best.crop,
+                    _media_path(
+                        "plates", f"{plate.id:08d}", f"{recording.id:08d}_{track.track_key:04d}.jpg"
+                    ),
+                    quality,
+                )
+                if vote.best.crop is not None
+                else None
+            )
+            vehicle_crop_path = _save_jpeg(
+                vehicle_crop,
+                _media_path(
+                    "plates",
+                    f"{plate.id:08d}",
+                    f"{recording.id:08d}_{track.track_key:04d}_vehicle.jpg",
+                ),
+                quality,
+            )
+
+        session.add(
+            PlateObservation(
+                plate_id=plate.id,
+                recording_id=recording.id,
+                journey_id=recording.journey_id,
+                camera_id=recording.camera_id,
+                tracked_object_id=track.id,
+                t_offset_s=track.best_frame_offset_s,
+                captured_at=track.first_seen_at,
+                first_seen_offset_s=track.first_seen_offset_s,
+                last_seen_offset_s=track.last_seen_offset_s,
+                raw_text=vote.best.raw_text,
+                normalised_text=result.normalised,
+                ocr_confidence=vote.ocr_confidence,
+                detection_confidence=vote.detection_confidence,
+                vote_count=vote.vote_count,
+                lat=track.lat,
+                lon=track.lon,
+                plate_crop_path=plate_crop_path,
+                vehicle_crop_path=vehicle_crop_path,
+                bbox={"box": list(vote.best.bbox)},
+            )
+        )
+        stored += 1
+
+    await session.flush()
+    await _refresh_plate_rollups(session, recording.id)
+
+    recording.plate_count = stored
+    recording.plate_state = StageState.DONE
+    return StageResult("plates", True, stats={"observations": stored, "tracks": len(tracks)})
+
+
+def _as_detection(x1, y1, x2, y2, label, confidence):
+    from app.ai.detector import Detection2D  # local import keeps the module import graph flat
+
+    return Detection2D(
+        class_label=label,
+        confidence=confidence,
+        x=float(x1),
+        y=float(y1),
+        w=float(x2 - x1),
+        h=float(y2 - y1),
+    )
+
+
+async def _upsert_plate(session: AsyncSession, result, confidence: float) -> Plate:
+    """Find or create the plate identity for a normalised reading."""
+    key = result.normalised or result.raw.upper()
+    plate = (
+        await session.execute(select(Plate).where(Plate.normalised_text == key))
+    ).scalar_one_or_none()
+
+    if plate is None:
+        plate = Plate(
+            normalised_text=key,
+            display_text=result.display_text,
+            region=result.state_hint,
+            # Null pattern means the reading matched no known format. The UI shows that
+            # as unverified rather than presenting a guess as a confirmed plate.
+            pattern_name=result.pattern_name,
+            best_confidence=confidence,
+        )
+        session.add(plate)
+        await session.flush()
+    elif confidence > plate.best_confidence:
+        plate.best_confidence = confidence
+        if result.pattern_name and not plate.pattern_name:
+            plate.pattern_name = result.pattern_name
+            plate.region = result.state_hint
+    return plate
+
+
+async def _refresh_plate_rollups(session: AsyncSession, recording_id: int) -> None:
+    plate_ids = list(
+        (
+            await session.execute(
+                select(PlateObservation.plate_id.distinct()).where(
+                    PlateObservation.recording_id == recording_id
+                )
+            )
+        ).scalars()
+    )
+    for plate_id in plate_ids:
+        row = (
+            await session.execute(
+                select(
+                    func.count(PlateObservation.id),
+                    func.min(PlateObservation.captured_at),
+                    func.max(PlateObservation.captured_at),
+                    func.count(func.distinct(PlateObservation.journey_id)),
+                    func.max(PlateObservation.ocr_confidence),
+                ).where(PlateObservation.plate_id == plate_id)
+            )
+        ).one()
+        plate = await session.get(Plate, plate_id)
+        if plate is None:
+            continue
+        plate.observation_count = int(row[0] or 0)
+        plate.first_seen_at = row[1]
+        plate.last_seen_at = row[2]
+        plate.journey_count = int(row[3] or 0)
+        plate.best_confidence = float(row[4] or 0.0)
+
+
+# --------------------------------------------------------------------------------------
+# Stage 5 - summarise
+# --------------------------------------------------------------------------------------
+
+
+async def stage_summarise(
+    session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
+) -> StageResult:
+    """Roll up counts, attach a journey, and mark the recording finished."""
+    recording.vehicle_count = int(
+        (
+            await session.execute(
+                select(func.count(TrackedObject.id)).where(
+                    TrackedObject.recording_id == recording.id
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    recording.plate_count = int(
+        (
+            await session.execute(
+                select(func.count(PlateObservation.id)).where(
+                    PlateObservation.recording_id == recording.id
+                )
+            )
+        ).scalar()
+        or 0
+    )
+
+    journey = await JourneyBuilder().assign_recording(session, recording)
+
+    # Detections and telemetry are written before the journey is known, so backfill the
+    # pointer rather than leaving them orphaned from journey-scoped queries.
+    if journey is not None:
+        for model in (TelemetryPoint, TrackedObject, PlateObservation):
+            await session.execute(
+                model.__table__.update()
+                .where(model.recording_id == recording.id)
+                .values(journey_id=journey.id)
+            )
+
+    recording.processed_at = datetime.now(UTC)
+    recording.state = RecordingState.COMPLETED
+    recording.error_message = None
+    return StageResult("summarise", True, stats={"journey_id": journey.id if journey else None})
+
+
+STAGES: dict[str, Callable] = {
+    "metadata": stage_inspect,
+    "telemetry": stage_telemetry,
+    "detection": stage_detect,
+    "plates": stage_plates,
+    "summarise": stage_summarise,
+}
+
+STAGE_ORDER: tuple[str, ...] = ("metadata", "telemetry", "detection", "plates", "summarise")

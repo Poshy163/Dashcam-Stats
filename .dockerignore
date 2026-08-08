@@ -1,0 +1,33 @@
+# Keep the build context small and, more importantly, keep local state out of the image.
+.git
+.github
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.venv
+**/venv
+**/node_modules
+frontend/dist
+**/.vite
+
+# Never bake anyone's footage, database or credentials into a published image.
+data/
+tests/fixtures/*.ts
+tests/fixtures/*.mp4
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+credentials*
+*.pem
+*.key
+
+# Docs and dev-only files add nothing to the runtime image.
+*.md
+!README.md
+.vscode
+.idea
+.DS_Store

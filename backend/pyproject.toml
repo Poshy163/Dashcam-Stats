@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dashcam-analyser"
+version = "0.1.0"
+description = "Self-hosted analysis of dashcam footage: telemetry OCR, object tracking and plate reading."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Joshua Leaper" }]
+
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite",
+    "alembic",
+    "pydantic>=2",
+    "pydantic-settings",
+    "python-multipart",
+    "structlog",
+    "numpy",
+    "opencv-python-headless",
+    "pillow",
+    "httpx",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "anyio",
+    "ruff",
+    "mypy",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.hatch.build.targets.sdist]
+include = ["app", "migrations", "alembic.ini", "tests"]
+
+# Ruff is configured once at the repository root (ruff.toml) so the package under
+# backend/ and the test suite at the root share one ruleset. Ruff resolves the
+# nearest config per file, so a [tool.ruff] section here would silently override it.
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning:app.*"]
+
+[tool.mypy]
+python_version = "3.11"
+plugins = []
+packages = ["app"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+disallow_untyped_defs = true
+# Third-party CV/inference wheels ship no stubs; the app's own code is still checked.
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["migrations.*"]
+ignore_errors = true

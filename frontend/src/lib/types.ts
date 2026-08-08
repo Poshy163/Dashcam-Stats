@@ -1,0 +1,344 @@
+/**
+ * API response shapes, mirroring backend/app/api/schemas.py.
+ *
+ * A note that matters throughout: this dashcam writes no telemetry metadata, so GPS and
+ * speed are recovered by OCR of a burned-in overlay. Every value derived from it carries a
+ * confidence, and `hasFix` is a real distinction — the camera prints `E:00.0000 N:00.0000`
+ * when it has no satellite lock, which is not a coordinate. Anything that renders a
+ * position must check `hasFix` rather than testing for non-null numbers.
+ */
+
+export type RecordingState =
+  | 'discovered'
+  | 'metadata_extracted'
+  | 'queued'
+  | 'processing'
+  | 'completed'
+  | 'failed'
+  | 'ignored'
+  | 'deleted'
+
+export type StageState = 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+export type JobState = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+export type CameraRole = 'front' | 'rear' | 'cabin' | 'other'
+
+export interface Camera {
+  id: number
+  key: string
+  name: string
+  role: CameraRole
+}
+
+export interface Recording {
+  id: number
+  filename: string
+  relPath: string
+  camera: Camera | null
+  journeyId: number | null
+
+  startedAt: string | null
+  endedAt: string | null
+  durationS: number | null
+  /** True when the time came from the decoded overlay rather than the filename. */
+  timeFromOsd: boolean
+
+  sizeBytes: number
+  videoCodec: string | null
+  width: number | null
+  height: number | null
+  fps: number | null
+  hasAudio: boolean
+
+  state: RecordingState
+  metadataState: StageState
+  telemetryState: StageState
+  detectionState: StageState
+  plateState: StageState
+  errorMessage: string | null
+
+  hasGps: boolean
+  gpsPointCount: number
+  distanceM: number | null
+  avgSpeedKmh: number | null
+  maxSpeedKmh: number | null
+
+  vehicleCount: number
+  plateCount: number
+  thumbnailPath: string | null
+}
+
+export interface TelemetryPoint {
+  tOffsetS: number
+  capturedAt: string | null
+  lat: number | null
+  lon: number | null
+  /** False means the camera had no satellite lock; lat/lon are null and must not be plotted. */
+  hasFix: boolean
+  speedKmh: number | null
+  /** Derived from consecutive fixes — a bearing, not a compass reading. */
+  headingDeg: number | null
+  ocrConfidence: number | null
+}
+
+export interface Journey {
+  id: number
+  title: string | null
+  startedAt: string
+  endedAt: string
+  durationS: number
+  distanceM: number | null
+  avgSpeedKmh: number | null
+  maxSpeedKmh: number | null
+  hasGps: boolean
+  recordingCount: number
+  vehicleCount: number
+  uniquePlateCount: number
+  startLat: number | null
+  startLon: number | null
+  endLat: number | null
+  endLon: number | null
+  manual: boolean
+}
+
+export interface JourneyDetail extends Journey {
+  recordings: Recording[]
+  /** Simplified [lat, lon] pairs; fixes only, so gaps mean lost signal. */
+  route: [number, number][]
+}
+
+export interface TrackedObject {
+  id: number
+  recordingId: number
+  classLabel: string
+  confidenceMax: number
+  firstSeenOffsetS: number
+  lastSeenOffsetS: number
+  durationS: number
+  frameCount: number
+  lat: number | null
+  lon: number | null
+  cropPath: string | null
+}
+
+export interface Plate {
+  id: number
+  /** Normalised for matching and display. */
+  displayText: string
+  normalisedText: string
+  /** Null when OCR output matched no known Australian format — shown as uncertain. */
+  patternName: string | null
+  region: string | null
+  firstSeenAt: string | null
+  lastSeenAt: string | null
+  observationCount: number
+  journeyCount: number
+  bestConfidence: number
+  flagged: boolean
+  notes: string | null
+  representativeCropPath: string | null
+  representativeVehiclePath: string | null
+}
+
+export interface PlateObservation {
+  id: number
+  plateId: number
+  recordingId: number
+  recordingFilename: string
+  journeyId: number | null
+  cameraName: string | null
+  tOffsetS: number
+  capturedAt: string | null
+  /** Unmodified OCR output, always kept beside the normalised value. */
+  rawText: string
+  normalisedText: string
+  ocrConfidence: number
+  detectionConfidence: number
+  voteCount: number
+  lat: number | null
+  lon: number | null
+  plateCropPath: string | null
+  vehicleCropPath: string | null
+}
+
+export interface Vehicle {
+  id: number
+  classLabel: string | null
+  primaryPlate: Plate | null
+  /** Null unless a classifier actually produced them — never inferred. */
+  make: string | null
+  model: string | null
+  colour: string | null
+  classifier: string | null
+  firstSeenAt: string | null
+  lastSeenAt: string | null
+  observationCount: number
+  representativeCropPath: string | null
+}
+
+export interface Job {
+  id: number
+  recordingId: number | null
+  recordingFilename: string | null
+  kind: string
+  stages: string[] | null
+  state: JobState
+  progress: number
+  stageCurrent: string | null
+  speedRealtime: number | null
+  decoder: string | null
+  inferenceDevice: string | null
+  attempts: number
+  maxAttempts: number
+  queuedAt: string
+  startedAt: string | null
+  finishedAt: string | null
+  errorMessage: string | null
+}
+
+export interface QueueStats {
+  queued: number
+  running: number
+  failed: number
+  completedToday: number
+  paused: boolean
+}
+
+export interface HardwareInfo {
+  gpu: {
+    name: string | null
+    vendor: string | null
+    driver: string | null
+    renderNodes: string[]
+  }
+  decode: {
+    vaapiAvailable: boolean
+    vaapiCodecs: string[]
+    hardwareDecode: boolean
+  }
+  inference: {
+    openvinoAvailable: boolean
+    openvinoDevices: string[]
+    preferredDevice: string
+    backendName?: string
+  }
+  cpu: { model: string | null; cores: number }
+  ffmpeg: { version: string | null }
+  /** Human-readable diagnostics, e.g. "/dev/dri mapped but not accessible to uid 1000". */
+  notes: string[]
+}
+
+export interface Status {
+  totals: {
+    recordings: number
+    journeys: number
+    telemetryPoints: number
+    trackedObjects: number
+    plates: number
+    footageBytes: number
+    footageFiles: number
+    durationS: number
+  }
+  processing: {
+    completed: number
+    pending: number
+    processing: number
+    failed: number
+    recordingsToday: number
+    throughputPerHour: number | null
+  }
+  storage: {
+    limitBytes: number
+    usedBytes: number
+    deletionEnabled: boolean
+    footageWritable: boolean
+  }
+  latestJourney: Journey | null
+  hardware: HardwareInfo
+  version: string
+}
+
+export interface LogEntry {
+  id: number
+  ts: string
+  level: string
+  logger: string
+  message: string
+  context: Record<string, unknown> | null
+  recordingId: number | null
+  jobId: number | null
+}
+
+export type SettingType = 'bool' | 'int' | 'float' | 'string' | 'select' | 'path' | 'bytes'
+
+export interface SettingDef {
+  key: string
+  label: string
+  type: SettingType
+  value: unknown
+  default: unknown
+  description: string
+  minimum: number | null
+  maximum: number | null
+  choices: { value: string; label: string }[]
+  unit: string | null
+  dangerous: boolean
+  readOnly: boolean
+  /** Key of a boolean setting that gates this one; used to grey out dependents. */
+  requires: string | null
+  isDefault: boolean
+}
+
+export interface SettingCategory {
+  key: string
+  label: string
+  description: string
+  settings: SettingDef[]
+}
+
+export interface RetentionCandidate {
+  recordingId: number
+  filename: string
+  startedAt: string | null
+  sizeBytes: number
+  reason: string
+}
+
+export interface RetentionPlan {
+  bytesBefore: number
+  bytesLimit: number
+  bytesToFree: number
+  candidates: RetentionCandidate[]
+  wouldDeleteCount: number
+  wouldFreeBytes: number
+  blocked: boolean
+  blockedReason: string | null
+  /** False in the recommended read-only deployment: the plan is a report, not an action. */
+  deletionEnabled: boolean
+  safety: SafetyReport
+}
+
+export interface SafetyCheck {
+  name: string
+  passed: boolean
+  reason: string | null
+}
+
+export interface SafetyReport {
+  ok: boolean
+  checks: SafetyCheck[]
+  blockedReason: string | null
+}
+
+export interface Paginated<T> {
+  items: T[]
+  total: number
+  page: number
+  pageSize: number
+  pages: number
+}
+
+export interface SearchResults {
+  plates: Plate[]
+  recordings: Recording[]
+  journeys: Journey[]
+}

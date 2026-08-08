@@ -1,0 +1,130 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Theme tokens are raw RGB triplets so Tailwind's `<alpha-value>` syntax works against
+   them (see tailwind.config.js). Light is the base definition; dark overrides only the
+   values, never the names, so no component ever needs to know which theme is active. */
+@layer base {
+  :root {
+    --surface: 250 250 251;
+    --surface-raised: 255 255 255;
+    --surface-sunken: 241 242 245;
+    --border: 224 226 232;
+    --content: 24 26 32;
+    --content-muted: 92 98 112;
+    --content-faint: 138 145 160;
+    --accent: 37 110 220;
+    --accent-muted: 219 232 251;
+
+    --state-ok: 22 140 90;
+    --state-warn: 190 130 20;
+    --state-error: 200 55 55;
+    --state-busy: 37 110 220;
+    --state-idle: 138 145 160;
+
+    color-scheme: light;
+  }
+
+  .dark {
+    --surface: 15 17 21;
+    --surface-raised: 23 26 32;
+    --surface-sunken: 10 11 14;
+    --border: 42 47 57;
+    --content: 232 234 239;
+    --content-muted: 152 160 175;
+    --content-faint: 106 114 130;
+    --accent: 96 156 255;
+    --accent-muted: 30 48 78;
+
+    --state-ok: 62 190 130;
+    --state-warn: 226 168 62;
+    --state-error: 240 110 110;
+    --state-busy: 96 156 255;
+    --state-idle: 106 114 130;
+
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-surface text-content antialiased;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  /* Tabular figures everywhere numbers are compared down a column — speeds, sizes,
+     timestamps, confidences. Proportional digits make those columns unreadable. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-border;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-lg border border-border bg-surface-raised;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-md border border-border
+           px-3 py-1.5 text-sm font-medium transition-colors
+           hover:bg-surface-sunken focus-visible:outline focus-visible:outline-2
+           focus-visible:outline-offset-2 focus-visible:outline-accent
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .btn-primary {
+    @apply border-transparent bg-accent text-white hover:bg-accent/90;
+  }
+
+  .btn-danger {
+    @apply border-transparent bg-state-error text-white hover:bg-state-error/90;
+  }
+
+  .input {
+    @apply w-full rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm
+           text-content placeholder:text-content-faint
+           focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent;
+  }
+
+  .label {
+    @apply text-sm font-medium text-content;
+  }
+
+  .hint {
+    @apply text-xs leading-relaxed text-content-muted;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-2xs font-medium;
+  }
+
+  /* Leaflet ships its own light chrome; these keep the map from glaring in dark mode. */
+  .leaflet-container {
+    @apply bg-surface-sunken;
+  }
+  .dark .leaflet-tile-pane {
+    filter: brightness(0.75) contrast(1.05) saturate(0.85);
+  }
+  .leaflet-control-attribution {
+    @apply bg-surface-raised/80 text-2xs text-content-muted;
+  }
+  .leaflet-bar a {
+    @apply bg-surface-raised text-content;
+  }
+}

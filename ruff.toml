@@ -1,0 +1,45 @@
+# Root lint config. The package lives in backend/ but the test suite lives here, so a
+# single config at the root covers both and CI does not need two invocations.
+line-length = 100
+target-version = "py311"
+extend-exclude = ["backend/migrations/versions", "frontend", ".venv"]
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
+ignore = [
+    # Assigning `Depends()` as a default is FastAPI's own idiom, not a mutable-default bug.
+    "B008",
+    # `ruff format` owns line width. Leaving E501 on as well only flags long string
+    # literals and comments, which the formatter cannot split and which are usually the
+    # clearest way to write the thing anyway.
+    "E501",
+    # The enums are `(str, Enum)` rather than `StrEnum` because SQLAlchemy's `Enum` column
+    # type and Pydantic serialisation both behave predictably with that pairing.
+    "UP042",
+    # These zips pair sequences whose equal length is established immediately above; the
+    # explicit `strict=` would be noise at every call site.
+    "B905",
+    # Unpacking a tuple and using part of it reads better than indexing it.
+    "RUF059",
+    # Several nested conditionals here carry a comment explaining each condition
+    # separately; collapsing them would merge two distinct reasons into one line.
+    "SIM102",
+    # `try/except/pass` around best-effort cleanup is clearer about intent than
+    # `contextlib.suppress` when the cleanup is two lines of its own.
+    "SIM105",
+    # Typographic apostrophes and en dashes are deliberate in user-facing strings.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[lint.isort]
+known-first-party = ["app"]
+
+[lint.per-file-ignores]
+# The dashcam prints local wall-clock time with no zone, so naive datetimes are the
+# correct representation for an overlay reading and for the fixture timestamps that
+# mimic it. Requiring tzinfo here would mean inventing a timezone the source never had.
+"tests/**" = ["DTZ001", "DTZ005", "S101"]
+"backend/app/osd/**" = ["DTZ001"]
+"backend/scripts/**" = ["DTZ001", "T201"]

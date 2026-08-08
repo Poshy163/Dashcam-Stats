@@ -1,0 +1,38 @@
+# Runtime dependencies.
+#
+# Upper bounds are deliberate: this image is rebuilt automatically, and a silent major
+# version bump in SQLAlchemy or Pydantic breaking a user's running deployment is worse
+# than being a release behind.
+
+# --- web -------------------------------------------------------------------------------
+fastapi>=0.115,<0.117
+uvicorn[standard]>=0.32,<0.36
+python-multipart>=0.0.12,<0.1
+
+# --- data ------------------------------------------------------------------------------
+SQLAlchemy[asyncio]>=2.0.36,<2.1
+aiosqlite>=0.20,<0.22
+alembic>=1.14,<1.17
+
+pydantic>=2.9,<3
+pydantic-settings>=2.6,<3
+
+# --- media / imaging -------------------------------------------------------------------
+# headless: the container has no X11, and the GUI build pulls in a large dependency tree
+# for functions that are never called here.
+opencv-python-headless>=4.10,<5
+numpy>=1.26,<3
+Pillow>=11.0,<12
+
+# --- inference -------------------------------------------------------------------------
+# OpenVINO drives the Intel iGPU through the same /dev/dri render node as VAAPI.
+# onnxruntime is the CPU fallback for hosts with no usable GPU. Neither pulls in CUDA.
+openvino>=2024.4,<2026
+onnxruntime>=1.19,<2
+
+# --- support ---------------------------------------------------------------------------
+structlog>=24.4,<26
+httpx>=0.27,<0.29
+# python:*-slim ships no zoneinfo database, and every timestamp in this app is
+# timezone-aware. Without this, ZoneInfo("Australia/Adelaide") raises at runtime.
+tzdata>=2024.2
