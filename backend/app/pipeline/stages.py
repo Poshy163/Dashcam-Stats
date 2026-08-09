@@ -773,6 +773,88 @@ async def stage_detect(
 # --------------------------------------------------------------------------------------
 
 
+#: Readings to try both ways up before committing to an orientation for the recording.
+_ORIENTATION_SAMPLE = 8
+
+#: How decisively the mirrored side must win before the recording is treated as mirrored.
+#:
+#: Measured over 195 stored observations: the front camera votes 73 as-is against 5
+#: mirrored, and the rear votes 4 as-is against 34 mirrored -- 14.6:1 and 8.5:1. A 3:1
+#: threshold is nowhere near either, which is what makes it safe to decide automatically.
+_ORIENTATION_RATIO = 3.0
+
+#: Confidence a reading needs before its orientation vote counts at all.
+_ORIENTATION_MIN_CONFIDENCE = 0.80
+
+
+class _PlateOrientation:
+    """Decides, per recording, whether plate crops need flipping before they are read.
+
+    Some dashcams mirror the rear channel, so it reads like a rear-view mirror. Nothing in
+    this pipeline knew that, so every plate the rear camera saw was recognised backwards:
+    of 74 stored rear observations, 64% matched no Australian format, against 21% on the
+    front. The tell is arithmetic rather than impressionistic -- 65% of unmatched
+    seven-character reads end in "2", which is a mirrored leading "S", against a 3% base
+    rate -- and the badge misread as "ATOYOT" is "TOYOTA" spelled backwards.
+
+    Rather than a setting or an assumption about which camera is which, the orientation is
+    *measured*: the first few readings are recognised both ways up, and each way scores a
+    point when it produces a named Australian series at high confidence. Whichever side
+    wins decisively is used for the rest of the recording. If neither wins, nothing is
+    flipped -- so on footage that is not mirrored this costs a handful of extra OCR calls
+    and changes no result.
+    """
+
+    __slots__ = ("_as_is", "_flipped", "_sampled", "mirrored")
+
+    def __init__(self) -> None:
+        self.mirrored: bool | None = None
+        self._as_is = 0
+        self._flipped = 0
+        self._sampled = 0
+
+    @staticmethod
+    def _is_named_hit(text: str, confidence: float, region: str) -> bool:
+        """A reading that looks like a real registration, not merely like characters."""
+        if not text or confidence < _ORIENTATION_MIN_CONFIDENCE:
+            return False
+        result = normalise(text, region=region)
+        return result.matched and result.state_hint is not None
+
+    async def read(self, ocr, crop: np.ndarray, *, region: str) -> tuple[str, float]:
+        """Recognise *crop*, establishing the recording's orientation while it does."""
+        if self.mirrored is not None:
+            return await ocr.read(_flip(crop) if self.mirrored else crop)
+
+        as_is = await ocr.read(crop)
+        flipped = await ocr.read(_flip(crop))
+        self._as_is += self._is_named_hit(*as_is, region)
+        self._flipped += self._is_named_hit(*flipped, region)
+        self._sampled += 1
+
+        if self._sampled >= _ORIENTATION_SAMPLE:
+            # Decide, and stop paying for two reads. Ties and silence both mean "as-is",
+            # which is the behaviour that predates this and the safe default.
+            self.mirrored = self._flipped >= max(1.0, self._as_is * _ORIENTATION_RATIO)
+
+        # Until the vote is in, take whichever reading actually looks like a plate.
+        if self._is_named_hit(*flipped, region) and not self._is_named_hit(*as_is, region):
+            return flipped
+        return flipped if flipped[1] > as_is[1] and self._flipped > self._as_is else as_is
+
+    def describe(self) -> dict[str, object]:
+        return {
+            "mirrored": self.mirrored,
+            "votes_as_is": self._as_is,
+            "votes_mirrored": self._flipped,
+        }
+
+
+def _flip(crop: np.ndarray) -> np.ndarray:
+    """Horizontally mirrored, contiguous because the recogniser wants a real array."""
+    return np.ascontiguousarray(crop[:, ::-1])
+
+
 @dataclass(slots=True)
 class _PlateHit:
     """A confirmed read, held until the stage's single write phase at the end."""
@@ -841,6 +923,9 @@ async def stage_plates(
     # Holding results in memory costs little: only readings that beat min_store are kept,
     # which is around one track in a hundred.
     hits: list[_PlateHit] = []
+    orientation = _PlateOrientation()
+    store_unmatched = bool(settings.get_nowait("plates.store_unmatched"))
+    rejected = 0
     for index, track in enumerate(tracks):
         if track.best_frame_offset_s is None or not track.best_bbox:
             continue
@@ -893,7 +978,7 @@ async def stage_plates(
             )
 
         for reading in select_ocr_candidates(readings, max_reads):
-            text, confidence = await ocr.read(reading.crop)
+            text, confidence = await orientation.read(ocr, reading.crop, region=region_setting)
             reading.raw_text = text
             reading.ocr_confidence = confidence
 
@@ -901,10 +986,21 @@ async def stage_plates(
         if vote is None or vote.ocr_confidence < min_store:
             continue
 
+        result = normalise(vote.text, region=region_setting)
+        if not result.matched and not store_unmatched:
+            # Confidence alone was the only gate, and confidence measures how sure the
+            # recogniser is that it read the characters correctly -- not whether what it
+            # read is a registration. It was completely right about "KEECE" on a door
+            # decal (0.998), "ARROW" on a road sign (0.975) and "TOYOTA" on a tailgate
+            # (0.929), and each became a plate card. Roughly half the plate database was
+            # signage. The catalogue already knows the answer; nothing was asking it.
+            rejected += 1
+            continue
+
         hits.append(
             _PlateHit(
                 track=track,
-                result=normalise(vote.text, region=region_setting),
+                result=result,
                 vote=vote,
                 vehicle_crop=vehicle_crop if save_crops else None,
             )
@@ -974,7 +1070,19 @@ async def stage_plates(
 
     recording.plate_count = stored
     recording.plate_state = StageState.DONE
-    return StageResult("plates", True, stats={"observations": stored, "tracks": len(tracks)})
+    return StageResult(
+        "plates",
+        True,
+        stats={
+            "observations": stored,
+            "tracks": len(tracks),
+            # Both surfaced deliberately: "0 plates" is otherwise indistinguishable from
+            # "read plenty and refused them all", and the orientation vote is the kind of
+            # automatic decision that must be visible when it goes wrong.
+            "rejected_unmatched": rejected,
+            **orientation.describe(),
+        },
+    )
 
 
 def _as_detection(x1, y1, x2, y2, label, confidence):

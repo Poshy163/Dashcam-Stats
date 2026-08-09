@@ -98,8 +98,17 @@ def _generic_six() -> tuple[PlatePattern, ...]:
     ``O`` -- while claiming nothing about where the plate is from. ``AAA###`` and ``###AAA``
     are omitted: they are named series above and would otherwise be duplicated at a lower
     priority.
+
+    The two blanket masks are omitted as well, and for a different reason: they constrain
+    nothing. ``AAAAAA`` accepts *any* six-letter word, so the word TOYOTA read off a
+    tailgate badge was stored as a plate at 0.99 confidence, matching ``AU:GEN:AAAAAA``.
+    ``000000`` is the same hole for digits. A pattern catalogue whose job is to say "this
+    has the shape of a registration" cannot include an entry that says "any six characters
+    of one kind", because that is not a shape.
     """
     named = {"AAA###", "###AAA"}
+    blanket = {LETTER_SLOT * 6, DIGIT_SLOT * 6}
+    named = named | blanket
     masks: list[str] = []
     for letters in range(7):
         masks.append(LETTER_SLOT * letters + DIGIT_SLOT * (6 - letters))

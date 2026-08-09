@@ -422,6 +422,19 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="plates.enabled",
     ),
     SettingDef(
+        "plates.store_unmatched",
+        "Keep readings that match no plate format",
+        "bool",
+        False,
+        "plates",
+        "Off by default. Confidence says how sure the recogniser is that it read the "
+        "characters correctly, not that what it read is a registration -- so a door "
+        "decal, a tailgate badge and a road sign all became plates at high confidence. "
+        "Turn this on to keep them anyway, for example if your plates are personalised "
+        "and fit none of the known Australian formats.",
+        requires="plates.enabled",
+    ),
+    SettingDef(
         "plates.region",
         "Plate region",
         "select",
