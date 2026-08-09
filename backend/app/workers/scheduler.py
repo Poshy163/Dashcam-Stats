@@ -141,13 +141,19 @@ class Scheduler:
     async def _run_scan(self) -> None:
         summary = await self._scanner.scan(trigger="scheduled")
         settings = get_settings_service()
-        if summary.new and await settings.auto_process():
+        # `changed` matters as much as `new`. A file the camera rewrote, or one the settle
+        # window held back last time, is reset to DISCOVERED with its stage states cleared
+        # but is never enqueued by the scan itself. Gating on `new` alone left it demoted
+        # and unprocessed -- showing stale telemetry as if current -- until some unrelated
+        # new file happened to arrive. On a library that has finished importing, that is
+        # never: this one reported `new: 0` on all twenty scans since its initial import.
+        if (summary.new or summary.changed) and await settings.auto_process():
             async with session_scope() as session:
                 summary.queued = await queue_unprocessed(session)
 
         # New footage almost always extends the most recent journey, so keep boundaries
         # fresh rather than waiting for the next full rebuild.
-        if summary.new:
+        if summary.new or summary.changed:
             async with session_scope() as session:
                 await JourneyBuilder().rebuild(session)
 

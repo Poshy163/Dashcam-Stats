@@ -249,8 +249,50 @@ def _coerce_path(defn: SettingDef, raw: Any) -> str:
     # but a bare root or a drive letter must keep its separator.
     trimmed = value.rstrip("/\\")
     if not trimmed or trimmed.endswith(":"):
-        return value
+        trimmed = value
+
+    _require_containment(defn, trimmed)
     return trimmed
+
+
+#: Settings naming a directory that the application will walk or delete from, and the
+#: deployment root each must stay inside.
+_CONTAINED_PATH_SETTINGS: dict[str, str] = {"general.footage_dir": "footage_dir"}
+
+
+def _require_containment(defn: SettingDef, value: str) -> None:
+    """Refuse a path setting that escapes the root the container was given.
+
+    The setting's own description tells the user it "must be inside the container's allowed
+    roots", and :mod:`app.core.paths` documents that "the UI value is validated against this
+    one, so a setting change can never widen what the web layer is able to reach". Neither
+    was true: nothing checked, and a single settings write repointed both the scanner and
+    the retention deleter at any absolute path on the host.
+
+    That also produced a split brain. ``/media`` and ``/stream`` resolve against the
+    immutable environment root, while the scanner and retention read the mutable setting —
+    so an operator correcting a typo in this field would silently change what retention
+    deletes against while the player kept serving from the old root, with nothing to say
+    the two had diverged.
+
+    The bound is the deployment root from the environment, which only the compose file can
+    change. Making the promise true is cheaper than the alternatives, and this is the one
+    setting where being wrong deletes footage.
+    """
+    attribute = _CONTAINED_PATH_SETTINGS.get(defn.key)
+    if attribute is None:
+        return
+
+    from app.config import get_config
+    from app.core.paths import is_within
+
+    root = getattr(get_config(), attribute)
+    if not is_within(root, value):
+        raise SettingValidationError(
+            defn.key,
+            f"must be inside {root}; the container can only reach paths under the "
+            "directory it was started with",
+        )
 
 
 def _coerce_bytes(defn: SettingDef, raw: Any) -> int:

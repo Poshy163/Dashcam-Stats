@@ -434,6 +434,14 @@ async def queue_unprocessed(session: AsyncSession, limit: int | None = None) -> 
                     RecordingState.METADATA_EXTRACTED,
                 ]
             ),
+            # A fingerprint is deliberately withheld from a file whose mtime is still
+            # inside the settle window, which makes its absence an exact marker for "the
+            # dashcam is probably still writing this". Without this the settle window did
+            # nothing for *new* files: the row was created, counted as new, and picked up
+            # by the very same scan, so every drive's final segment was probed mid-write
+            # and cached a truncated duration, a partial telemetry track and a thumbnail
+            # from an incomplete file.
+            Recording.fingerprint.isnot(None),
             Recording.id.notin_(active),
         )
         .order_by(Recording.started_at.desc().nullslast())

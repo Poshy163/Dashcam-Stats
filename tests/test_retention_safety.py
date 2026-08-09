@@ -69,7 +69,7 @@ class TestUnmountedShare:
 
     async def test_missing_directory_blocks_everything(self, db_session, temp_dirs, tmp_path):
         _, footage = temp_dirs
-        await get_settings_service().set("general.footage_dir", str(tmp_path / "never-mounted"))
+        await _force_footage_dir(str(tmp_path / "never-mounted"))
 
         report = await evaluate_safety(db_session)
         assert report.ok is False
@@ -111,19 +111,79 @@ class TestUnmountedShare:
         assert any(c.name == "consistent_with_index" and not c.passed for c in report.checks)
 
 
+async def _force_footage_dir(value: str) -> None:
+    """Set ``general.footage_dir`` past its own validation.
+
+    The settings layer now refuses a footage directory outside the container's root, which
+    is the first line of defence. The retention guards are the second, and they still have
+    to hold: they are what stands between a misconfiguration reached some other way — an
+    older database, a hand-edited row, a future setting — and a deletion of real footage.
+    Testing them means getting the bad value into place past the gate that exists to stop
+    it, rather than deleting the gate.
+    """
+    import app.core.settings_service as svc
+
+    contained = svc._CONTAINED_PATH_SETTINGS
+    svc._CONTAINED_PATH_SETTINGS = {}
+    try:
+        await svc.get_settings_service().set("general.footage_dir", value)
+    finally:
+        svc._CONTAINED_PATH_SETTINGS = contained
+
+
+class TestFootageDirContainment:
+    """The setting itself must not be able to point outside the container's root.
+
+    The setting's description told the user it "must be inside the container's allowed
+    roots" and `app.core.paths` documented that "the UI value is validated against this
+    one, so a setting change can never widen what the web layer is able to reach". Neither
+    was true — nothing checked. A single settings write repointed both the scanner and the
+    retention deleter at any absolute path on the host.
+
+    It also produced a split brain: /media and /stream resolve against the immutable
+    environment root while the scanner and retention read the mutable setting, so an
+    operator fixing a typo here would silently change what retention deletes against while
+    the player kept serving from the old root.
+    """
+
+    @pytest.mark.parametrize("outside", ["/", "/etc", "/var/lib", "/tmp/elsewhere"])
+    async def test_a_path_outside_the_root_is_refused(self, db_session, outside):
+        from app.core.settings_service import SettingValidationError, get_settings_service
+
+        with pytest.raises(SettingValidationError) as excinfo:
+            await get_settings_service().set("general.footage_dir", outside)
+        assert "general.footage_dir" in str(excinfo.value)
+
+    async def test_the_configured_root_itself_is_accepted(self, db_session, temp_dirs):
+        from app.core.settings_service import get_settings_service
+
+        _, footage = temp_dirs
+        await get_settings_service().set("general.footage_dir", str(footage))
+        assert str(await get_settings_service().footage_dir()) == str(footage)
+
+    async def test_a_subdirectory_of_the_root_is_accepted(self, db_session, temp_dirs):
+        from app.core.settings_service import get_settings_service
+
+        _, footage = temp_dirs
+        nested = footage / "front"
+        nested.mkdir(exist_ok=True)
+        await get_settings_service().set("general.footage_dir", str(nested))
+        assert str(await get_settings_service().footage_dir()) == str(nested)
+
+
 class TestPathGuards:
     async def test_footage_directory_may_not_overlap_data(self, db_session, temp_dirs):
         data, _ = temp_dirs
         # /data holds the database and every derived artefact; it is never a deletion
         # target under any circumstance.
-        await get_settings_service().set("general.footage_dir", str(data))
+        await _force_footage_dir(str(data))
 
         report = await evaluate_safety(db_session)
         assert report.ok is False
         assert any(c.name == "not_data_directory" and not c.passed for c in report.checks)
 
     async def test_system_root_is_refused(self, db_session):
-        await get_settings_service().set("general.footage_dir", "/")
+        await _force_footage_dir("/")
         report = await evaluate_safety(db_session)
         assert report.ok is False
 
@@ -225,7 +285,7 @@ class TestExecution:
 
     async def test_blocked_run_is_still_recorded(self, db_session, temp_dirs):
         _, footage = temp_dirs  # empty: safety will refuse
-        await get_settings_service().set("general.footage_dir", str(footage))
+        await _force_footage_dir(str(footage))
 
         result = await plan(db_session)
         run = await execute(db_session, result, dry_run=False, trigger="test")
