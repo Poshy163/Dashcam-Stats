@@ -171,3 +171,40 @@ class TestTimestampsCarryTheirZone:
         async with session_scope() as session:
             stored = await session.get(Recording, recording)
             assert stored.started_at < datetime.now(UTC)
+
+
+class TestAccessLogsAreNotPersisted:
+    """The HTTP access log must not reach the database.
+
+    It is one row per request and the UI polls — the Queue page alone asks for
+    /api/jobs/stats every few seconds. On a real deployment that made 135 of every 200
+    stored rows access noise, and it cost twice over: the Logs page became unreadable, and
+    every request turned into an INSERT competing with the workers for SQLite's single
+    write lock, surfacing as "database is locked" while a worker tried to claim its next
+    job.
+
+    Dedupe cannot help, because the key includes the message and every access line carries
+    a different URL and source port.
+    """
+
+    def test_access_records_are_dropped_before_the_queue(self):
+        from app.core.logging import DatabaseLogSink
+
+        sink = DatabaseLogSink(session_factory=lambda: None)
+        sink.emit_event(
+            {
+                "logger": "uvicorn.access",
+                "level": "info",
+                "event": '192.168.1.7:57529 - "GET /api/jobs/stats HTTP/1.1" 200',
+            }
+        )
+        assert len(sink._queue) == 0, "an access log line was queued for the database"
+
+    def test_application_records_are_still_stored(self):
+        from app.core.logging import DatabaseLogSink
+
+        sink = DatabaseLogSink(session_factory=lambda: None)
+        sink.emit_event(
+            {"logger": "app.workers.worker", "level": "error", "event": "worker loop error"}
+        )
+        assert len(sink._queue) == 1, "a real application event was dropped"

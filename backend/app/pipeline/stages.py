@@ -13,6 +13,7 @@ Cost discipline, which is what makes this viable over terabytes:
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -366,6 +367,49 @@ async def _get_templates(
     return templates
 
 
+# Loaded models, kept for the life of the process and shared by every worker.
+#
+# Building an inference session is not cheap: ONNX Runtime parses the graph and the
+# OpenVINO provider compiles it for the target device, which takes seconds on the iGPU.
+# Constructing the detector per recording paid that on all 678 of them, twice over with two
+# workers -- most of the wall-clock cost of a short clip, and a large allocation churned
+# each time, which is the shape of the container being OOM-killed mid-run.
+#
+# Keyed by model name so changing the setting rebuilds rather than silently keeping the old
+# network. The lock stops two workers compiling the same graph at once.
+_detector_cache: dict[str, ObjectDetector] = {}
+_plate_models: tuple[PlateDetector, PlateOCR] | None = None
+_model_lock = asyncio.Lock()
+
+
+async def _shared_detector(name: str) -> ObjectDetector | None:
+    async with _model_lock:
+        cached = _detector_cache.get(name)
+        if cached is not None:
+            return cached if cached.available else None
+        detector = ObjectDetector(name)
+        if not await detector.load():
+            # Cached even when unavailable, so a missing model is not re-attempted -- and
+            # re-downloaded -- once per recording for the length of the queue.
+            _detector_cache[name] = detector
+            return None
+        _detector_cache[name] = detector
+        return detector
+
+
+async def _shared_plate_models() -> tuple[PlateDetector, PlateOCR] | None:
+    global _plate_models
+    async with _model_lock:
+        if _plate_models is None:
+            detector, ocr = PlateDetector(), PlateOCR()
+            ok = await detector.load() and await ocr.load()
+            _plate_models = (detector, ocr)
+            if not ok:
+                return None
+        detector, ocr = _plate_models
+        return (detector, ocr) if detector.available and ocr.available else None
+
+
 async def stage_telemetry(
     session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
 ) -> StageResult:
@@ -523,8 +567,8 @@ async def stage_detect(
         recording.detection_state = StageState.SKIPPED
         return StageResult("detection", True, "rear camera analysis disabled")
 
-    detector = ObjectDetector()
-    if not await detector.load():
+    detector = await _shared_detector(str(settings.get_nowait("processing.detection_model")))
+    if detector is None:
         recording.detection_state = StageState.SKIPPED
         return StageResult("detection", True, "detection model unavailable")
 
@@ -641,10 +685,11 @@ async def stage_plates(
         recording.plate_state = StageState.SKIPPED
         return StageResult("plates", True, "rear camera analysis disabled")
 
-    detector, ocr = PlateDetector(), PlateOCR()
-    if not await detector.load() or not await ocr.load():
+    models = await _shared_plate_models()
+    if models is None:
         recording.plate_state = StageState.SKIPPED
         return StageResult("plates", True, "plate models unavailable")
+    detector, ocr = models
 
     tracks = list(
         (

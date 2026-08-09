@@ -58,6 +58,10 @@ MIN_PLAUSIBLE_BITRATE = 100_000
 MAX_PLAUSIBLE_FPS = 120.0
 MIN_PLAUSIBLE_FPS = 1.0
 
+#: Files that failed hardware decode this run, so the attempt is not repeated per stage.
+_hwaccel_refused: set[str] = set()
+_HWACCEL_REFUSED_MAX = 512
+
 DEFAULT_PROBE_TIMEOUT = 60.0
 DEFAULT_DECODE_TIMEOUT = 900.0
 
@@ -615,6 +619,14 @@ async def iter_frames(
     _, label = select_hwaccel(hwaccel, codec)
     yielded = 0
 
+    # A file that already refused to decode on the GPU will refuse again. Without this,
+    # every stage that reads it pays a failed ffmpeg launch first, and a damaged file is
+    # read several times per run -- one clip produced eight identical "hardware decode
+    # failed" warnings in twenty seconds, each one a process spawned to learn something
+    # already known.
+    if label != "software" and str(path) in _hwaccel_refused:
+        hwaccel, label = "cpu", "software"
+
     try:
         async for item in _decode_frames(path, hwaccel=hwaccel, **kwargs):
             yielded += 1
@@ -625,8 +637,9 @@ async def iter_frames(
         # consumer has already seen frames and would receive them twice.
         if label == "software" or yielded:
             raise
+        _remember_hwaccel_failure(path)
         log.warning(
-            "hardware decode failed; retrying in software",
+            "hardware decode failed; using software for this file from now on",
             file=Path(path).name,
             decoder=label,
             error=str(exc),
@@ -634,6 +647,20 @@ async def iter_frames(
 
     async for item in _decode_frames(path, hwaccel="cpu", **kwargs):
         yield item
+
+
+def _remember_hwaccel_failure(path: Path | str) -> None:
+    """Note that this file cannot be hardware decoded.
+
+    Bounded, and oldest-out: the set exists to stop a damaged file being retried within a
+    run, not to be an authoritative record. Losing an entry costs one wasted attempt, and
+    a restart clearing it is correct -- a driver or firmware change is exactly the kind of
+    thing that would make hardware decode start working again.
+    """
+    key = str(path)
+    _hwaccel_refused.add(key)
+    while len(_hwaccel_refused) > _HWACCEL_REFUSED_MAX:
+        _hwaccel_refused.pop()
 
 
 async def extract_frame(

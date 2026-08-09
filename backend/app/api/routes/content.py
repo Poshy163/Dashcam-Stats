@@ -552,18 +552,104 @@ async def patch_plate(plate_id: int, body: PlatePatch, session: SessionDep):
 # --------------------------------------------------------------------------------------
 
 
+#: Classes shown on the Vehicles page by default. Tracking follows people and bicycles too,
+#: and they are legitimate detections, but a page called Vehicles should not open on a list
+#: of pedestrians.
+_VEHICLE_CLASSES = ("car", "truck", "bus", "motorcycle")
+
+
+def _sighting_out(track: TrackedObject, plate: Plate | None) -> VehicleOut:
+    """One tracked object rendered as a vehicle sighting."""
+    return VehicleOut(
+        id=track.id,
+        class_label=track.class_label,
+        primary_plate=PlateOut.model_validate(plate) if plate is not None else None,
+        # make/model/colour stay null: nothing in this pipeline classifies them, and
+        # inventing them would be worse than leaving the fields empty.
+        first_seen_at=track.first_seen_at,
+        last_seen_at=track.last_seen_at,
+        observation_count=track.frame_count,
+        representative_crop_path=track.crop_path,
+    )
+
+
+async def _plates_for_tracks(session, track_ids: list[int]) -> dict[int, Plate]:
+    """The plate read on each track, where one was."""
+    if not track_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(PlateObservation.tracked_object_id, Plate)
+            .join(Plate, Plate.id == PlateObservation.plate_id)
+            .where(PlateObservation.tracked_object_id.in_(track_ids))
+            .order_by(PlateObservation.ocr_confidence.desc())
+        )
+    ).all()
+    # Highest confidence first, so the first row seen for a track is the one to keep.
+    found: dict[int, Plate] = {}
+    for track_id, plate in rows:
+        found.setdefault(track_id, plate)
+    return found
+
+
 @router.get("/vehicles", response_model=Paginated[VehicleOut])
 async def list_vehicles(session: SessionDep, page: PaginationDep, class_label: str | None = None):
-    stmt = select(Vehicle)
-    if class_label:
-        stmt = stmt.where(Vehicle.class_label == class_label)
-    return await _paginate(
-        session, stmt.order_by(Vehicle.last_seen_at.desc().nullslast()), page, VehicleOut
+    """Vehicles actually seen, which live in ``tracked_objects``.
+
+    This used to select from ``vehicles``, a table for *identity across sightings* that
+    nothing in the pipeline has ever written a row to — re-identifying a car between drives
+    is not implemented, and faking it would be worse than leaving it empty. So the page was
+    structurally empty: it queried a table with no writer while 1,071 real sightings sat
+    one table over, and the empty state told the user detection had not run.
+
+    The table stays, because it is where re-identification would go. The page shows what
+    exists today: one row per physical vehicle followed across a recording, which is what
+    the UI already described itself as showing.
+    """
+    stmt = select(TrackedObject).where(TrackedObject.crop_path.is_not(None))
+    stmt = stmt.where(
+        TrackedObject.class_label == class_label
+        if class_label
+        else TrackedObject.class_label.in_(_VEHICLE_CLASSES)
+    )
+
+    total = int(
+        (
+            await session.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))
+        ).scalar()
+        or 0
+    )
+    tracks = list(
+        (
+            await session.execute(
+                stmt.order_by(
+                    TrackedObject.first_seen_at.desc().nullslast(), TrackedObject.id.desc()
+                )
+                .offset(page.offset)
+                .limit(page.page_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    plates = await _plates_for_tracks(session, [t.id for t in tracks])
+    return Paginated[VehicleOut](
+        items=[_sighting_out(t, plates.get(t.id)) for t in tracks],
+        total=total,
+        page=page.page,
+        page_size=page.page_size,
+        pages=page.pages(total),
     )
 
 
 @router.get("/vehicles/{vehicle_id}", response_model=VehicleOut)
 async def get_vehicle(vehicle_id: int, session: SessionDep):
+    """One sighting. Ids here are ``tracked_objects`` ids, matching the list above."""
+    track = await session.get(TrackedObject, vehicle_id)
+    if track is not None:
+        plates = await _plates_for_tracks(session, [track.id])
+        return _sighting_out(track, plates.get(track.id))
+
     vehicle = await session.get(Vehicle, vehicle_id)
     if vehicle is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Vehicle not found")

@@ -455,6 +455,72 @@ class TestHeatmapStatistics:
         )
 
 
+class TestVehicleSightings:
+    """The Vehicles page must show the vehicles that were actually seen.
+
+    It used to select from ``vehicles``, a table for identity across sightings that nothing
+    in the pipeline has ever written a row to — re-identifying a car between drives is not
+    implemented. So the page was structurally empty: it queried a table with no writer while
+    1,071 real sightings sat one table over in ``tracked_objects``, and the empty state told
+    the user that detection had not run.
+    """
+
+    @pytest.fixture
+    async def sightings(self, db_session):
+        from datetime import UTC, datetime
+
+        from app.db.models import TrackedObject
+
+        async with session_scope() as session:
+            rec = Recording(
+                rel_path="v.ts", filename="v.ts", size_bytes=1, state=RecordingState.COMPLETED
+            )
+            session.add(rec)
+            await session.flush()
+            base = datetime(2026, 7, 28, 9, 4, tzinfo=UTC)
+            for index, label in enumerate(("car", "truck", "person")):
+                session.add(
+                    TrackedObject(
+                        recording_id=rec.id,
+                        track_key=index,
+                        class_label=label,
+                        confidence_max=0.9,
+                        confidence_avg=0.8,
+                        first_seen_offset_s=0.0,
+                        last_seen_offset_s=5.0,
+                        duration_s=5.0,
+                        frame_count=12,
+                        first_seen_at=base,
+                        last_seen_at=base,
+                        crop_path=f"tracks/{label}.jpg",
+                    )
+                )
+            await session.flush()
+
+    async def test_sightings_are_listed(self, client, sightings):
+        body = (await client.get("/api/vehicles")).json()
+        assert body["total"] > 0, (
+            "the Vehicles page is empty while tracked objects exist; it is querying a "
+            "table nothing writes to"
+        )
+        assert all(item["representative_crop_path"] for item in body["items"])
+
+    async def test_people_are_not_listed_as_vehicles(self, client, sightings):
+        labels = {i["class_label"] for i in (await client.get("/api/vehicles")).json()["items"]}
+        assert "person" not in labels, "a page called Vehicles should not open on pedestrians"
+        assert {"car", "truck"} == labels
+
+    async def test_a_class_can_still_be_asked_for_explicitly(self, client, sightings):
+        body = (await client.get("/api/vehicles?class_label=person")).json()
+        assert body["total"] == 1
+
+    async def test_a_listed_sighting_can_be_opened(self, client, sightings):
+        listed = (await client.get("/api/vehicles")).json()["items"]
+        for item in listed:
+            response = await client.get(f"/api/vehicles/{item['id']}")
+            assert response.status_code == 200, response.text
+
+
 class TestPlateCrops:
     """The Plates grid is the page with the pictures on it.
 

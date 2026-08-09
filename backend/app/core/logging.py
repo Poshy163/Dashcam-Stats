@@ -73,6 +73,22 @@ __all__ = [
 ]
 
 DEFAULT_DB_LEVEL = "INFO"
+
+#: Loggers whose records are never written to the database, whatever the level.
+#:
+#: The HTTP access log is one line per request, and the UI polls: the Queue page alone asks
+#: for /api/jobs/stats every few seconds. On a real deployment that made 135 of every 200
+#: stored rows access noise, which cost twice over. The Logs page became unreadable — the
+#: events worth seeing were buried and, at 100 rows a page, unreachable — and every request
+#: turned into an INSERT competing with the workers for SQLite's single write lock, which
+#: showed up as "database is locked" in the worker claiming its next job.
+#:
+#: Dedupe cannot help here: the key includes the message, and every access line carries a
+#: different URL and source port, so no two are ever alike.
+#:
+#: These records are not lost. They still go to stdout, which is where a request log
+#: belongs and where `docker compose logs` will find it.
+_NEVER_PERSIST = frozenset({"uvicorn.access", "uvicorn.asgi", "watchfiles.main"})
 DEFAULT_DEDUPE_WINDOW_S = 30.0
 DEFAULT_QUEUE_CAPACITY = 2048
 DEFAULT_FLUSH_INTERVAL_S = 1.0
@@ -394,6 +410,9 @@ class DatabaseLogSink:
     def emit_event(self, event_dict: dict[str, Any], *, force: bool = False) -> None:
         """Build a record from a structlog event dict and emit it."""
         if _in_sink.get():
+            return
+        if str(event_dict.get("logger") or event_dict.get("logger_name") or "") in _NEVER_PERSIST:
+            # Still printed to stdout by the renderer; simply not worth a database row.
             return
         level = _LEVEL_ALIASES.get(
             str(event_dict.get("level", "info")).lower(),
