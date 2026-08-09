@@ -8,10 +8,11 @@ from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, select
 
 from app.ai.backend import get_backend
-from app.ai.models import describe_models
+from app.ai.models import describe_models, is_present
 from app.ai.runtime import describe_runtime
 from app.api.deps import PaginationDep, SessionDep
 from app.api.schemas import (
+    FeatureStatus,
     JourneyOut,
     LogEntryOut,
     Paginated,
@@ -52,6 +53,65 @@ from app.workers.worker import get_worker_pool
 log = get_logger(__name__)
 
 router = APIRouter(prefix="/api", tags=["system"])
+
+
+def _feature_status(settings, totals: StatusTotals) -> list[FeatureStatus]:
+    """Why an analysis count is what it is.
+
+    A zero on the dashboard has two completely different meanings and looked identical
+    until now. On a real library, "0 vehicles seen" across 674 processed recordings was not
+    a finding about quiet roads — the detection weights were fetched from a URL that did
+    not exist, every attempt 404'd, and the stage silently produced nothing while the
+    recordings were still marked completed. The number was accurate and told the user the
+    opposite of the truth.
+    """
+
+    def describe(
+        key: str, label: str, setting: str, models: tuple[str, ...], results: int
+    ) -> FeatureStatus:
+        enabled = bool(settings.get_nowait(setting))
+        missing = [name for name in models if not is_present(name)]
+        if not enabled:
+            reason = "Switched off in settings."
+        elif missing:
+            reason = (
+                f"Model{'s' if len(missing) > 1 else ''} not downloaded yet "
+                f"({', '.join(missing)}). They are fetched on first use; a failure here "
+                "leaves this feature unavailable rather than failing the recording."
+            )
+        elif results == 0:
+            reason = (
+                "Ready, but nothing has been analysed with it yet. Recordings processed "
+                "before it became available need reprocessing to be included."
+            )
+        else:
+            reason = None
+        return FeatureStatus(
+            key=key,
+            label=label,
+            enabled=enabled,
+            ready=enabled and not missing,
+            blocked_reason=reason,
+            results=results,
+        )
+
+    detection_model = str(settings.get_nowait("processing.detection_model"))
+    return [
+        describe(
+            "detection",
+            "Vehicle detection",
+            "processing.detection_enabled",
+            (detection_model,),
+            totals.tracked_objects,
+        ),
+        describe(
+            "plates",
+            "Plate reading",
+            "plates.enabled",
+            ("plate-detector", "plate-ocr"),
+            totals.plates,
+        ),
+    ]
 
 
 @router.get("/status", response_model=StatusOut)
@@ -144,6 +204,7 @@ async def get_status(session: SessionDep):
         storage=storage,
         latest_journey=JourneyOut.model_validate(latest) if latest else None,
         hardware=hardware_dict,
+        features=_feature_status(settings, totals),
         version=get_config().version,
     )
 

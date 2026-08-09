@@ -24,10 +24,20 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
-#: Latitude/longitude below this magnitude are treated as the no-fix placeholder. The
-#: overlay prints exactly 0.0000, and genuine coordinates that close to Null Island are
-#: 600 km off the African coast — not somewhere a dashcam is driving.
-NO_FIX_EPSILON = 1e-6
+#: Latitude/longitude below this magnitude are treated as the no-fix placeholder.
+#:
+#: The overlay prints exactly ``00.0000`` when it has no satellite lock, so an exact-zero
+#: test looks sufficient and is not. The placeholder goes through the same OCR as
+#: everything else, and one misread digit turns it into ``00.0001`` — still obviously the
+#: placeholder, but no longer within a hair of zero. On a real 674-recording library that
+#: let fourteen "coordinates" through: ``0.0001, 0.0000``, ``0.0000, 0.0009``,
+#: ``0.0100, 0.0000`` at 77 km/h. Each was stored as a genuine position in the Gulf of
+#: Guinea, and each added roughly 14,000 km to whatever journey it landed in.
+#:
+#: A tenth of a degree is about 11 km, which is a wide net for a placeholder and no net at
+#: all for a real coordinate: the nearest land to (0, 0) is 600 km away. Nothing legitimate
+#: is being discarded, because nothing legitimate is there.
+NO_FIX_EPSILON = 0.1
 
 MAX_LATITUDE = 90.0
 MAX_LONGITUDE = 180.0

@@ -29,8 +29,15 @@ export default function Dashboard() {
   if (status.isError) return <ErrorState error={status.error} retry={() => status.refetch()} />
   if (!status.data) return null
 
-  const { totals, processing, storage, latestJourney, hardware } = status.data
+  const { totals, processing, storage, latestJourney, hardware, features } = status.data
   const storagePct = storage.limitBytes ? storage.usedBytes / storage.limitBytes : 0
+
+  // A count is only worth reading once the thing producing it was working. Detection ran
+  // against models that could not be downloaded for the whole of this library's history,
+  // so "0 vehicles seen" over 674 recordings was accurate and told the user the opposite
+  // of the truth. Where a feature cannot vouch for its own number, the tile says so
+  // instead of showing it.
+  const blocked = (key: string) => features?.find((f) => f.key === key && f.blockedReason)
 
   return (
     <div className="space-y-5">
@@ -58,10 +65,46 @@ export default function Dashboard() {
         <StatTile label="Recordings" value={totals.recordings} />
         <StatTile label="Journeys" value={totals.journeys} />
         <StatTile label="Footage" value={formatBytes(totals.footageBytes)} hint={`${totals.footageFiles} files`} />
-        <StatTile label="Vehicles seen" value={totals.trackedObjects} />
-        <StatTile label="Unique plates" value={totals.plates} />
+        <StatTile
+          label="Vehicles seen"
+          value={blocked('detection') ? '—' : totals.trackedObjects}
+          tone={blocked('detection') ? 'warn' : 'default'}
+          hint={blocked('detection') ? 'Not available' : undefined}
+        />
+        <StatTile
+          label="Unique plates"
+          value={blocked('plates') ? '—' : totals.plates}
+          tone={blocked('plates') ? 'warn' : 'default'}
+          hint={blocked('plates') ? 'Not available' : undefined}
+        />
         <StatTile label="Telemetry points" value={totals.telemetryPoints.toLocaleString()} />
       </div>
+
+      {features && features.some((f) => f.blockedReason) && (
+        <div className="card border-state-warn/40 p-3">
+          <div className="text-xs font-medium uppercase tracking-wide text-state-warn">
+            Analysis not running
+          </div>
+          <ul className="mt-1.5 space-y-1.5">
+            {features
+              .filter((f) => f.blockedReason)
+              .map((f) => (
+                <li key={f.key} className="text-sm text-content-muted">
+                  <span className="font-medium text-content">{f.label}:</span> {f.blockedReason}
+                  {f.ready && f.results === 0 && (
+                    <>
+                      {' '}
+                      <Link className="text-accent hover:underline" to="/settings">
+                        Reprocess the library
+                      </Link>{' '}
+                      to fill it in.
+                    </>
+                  )}
+                </li>
+              ))}
+          </ul>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-5">
         <StatTile label="Analysed" value={processing.completed} tone="ok" />

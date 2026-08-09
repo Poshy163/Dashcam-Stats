@@ -302,9 +302,18 @@ async def get_journey(journey_id: int, session: SessionDep):
     tolerance = float(get_settings_service().get_nowait("maps.route_simplify_m"))
     route = _simplify([(lat, lon) for lat, lon in fixes if lat is not None], tolerance)
 
-    detail = JourneyDetailOut.model_validate(journey)
-    detail.recordings = [RecordingOut.model_validate(r) for r in recordings]
-    detail.route = route
+    # Validate against JourneyOut, not JourneyDetailOut. They differ by one field, and that
+    # field is the whole problem: JourneyDetailOut declares `recordings`, so validating the
+    # ORM object against it makes Pydantic read `journey.recordings` — a lazy relationship —
+    # while extracting attributes. Under the async engine that lazy load has no greenlet to
+    # run in and raises MissingGreenlet, so *every* journey detail request failed with a 400
+    # and the Journeys page led nowhere. Assigning the recordings on the next line came too
+    # late; the read had already happened.
+    detail = JourneyDetailOut(
+        **JourneyOut.model_validate(journey).model_dump(),
+        recordings=[RecordingOut.model_validate(r) for r in recordings],
+        route=route,
+    )
     return detail
 
 

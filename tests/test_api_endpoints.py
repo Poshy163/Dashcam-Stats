@@ -149,6 +149,128 @@ class TestWriteEndpoints:
         assert "safety" in plan
 
 
+class TestFeatureStatus:
+    """A zero has to say which kind of zero it is.
+
+    On the live library "0 vehicles seen" across 674 processed recordings was accurate and
+    completely misleading: the detection weights were fetched from a URL that did not
+    exist, every attempt 404'd, and the stage produced nothing while the recordings were
+    still marked completed. Nothing in the API distinguished that from quiet roads.
+    """
+
+    async def test_status_reports_why_a_feature_produced_nothing(self, client):
+        body = (await client.get("/api/status")).json()
+        features = {f["key"]: f for f in body["features"]}
+        assert {"detection", "plates"} <= set(features)
+
+        for feature in features.values():
+            assert {"enabled", "ready", "blocked_reason", "results", "label"} <= set(feature)
+            # The invariant that makes the tile trustworthy: a zero is either explained or
+            # genuinely means nothing was found.
+            if feature["results"] == 0:
+                assert feature["blocked_reason"], (
+                    f"{feature['key']} reports 0 results with no explanation, which is "
+                    "indistinguishable from having genuinely found nothing"
+                )
+
+    async def test_a_feature_with_missing_models_is_not_ready(self, client):
+        # Models are downloaded on first use and no test downloads them, so this is the
+        # unavailable case — exactly the state the live deployment was in.
+        features = {f["key"]: f for f in (await client.get("/api/status")).json()["features"]}
+        detection = features["detection"]
+        assert detection["ready"] is False
+        assert detection["blocked_reason"]
+
+    async def test_switching_a_feature_off_is_reported_as_such(self, client):
+        await client.put("/api/settings", json={"values": {"plates.enabled": False}})
+        features = {f["key"]: f for f in (await client.get("/api/status")).json()["features"]}
+        assert features["plates"]["enabled"] is False
+        assert "settings" in features["plates"]["blocked_reason"].lower()
+
+
+class TestDetailEndpoints:
+    """Detail routes, which the list routes link to and no test previously opened.
+
+    `/api/journeys` was covered and passed; `/api/journeys/{id}` was not, and returned 400
+    for every journey on the live deployment. `JourneyDetailOut` declares a `recordings`
+    field, so validating an ORM Journey against it made Pydantic read the lazy relationship
+    during attribute extraction, where the async engine has no greenlet to load it in. The
+    Journeys page listed 45 drives and every one of them led to an error.
+
+    A list endpoint returning 200 says nothing about the page it links to.
+    """
+
+    @pytest.fixture
+    async def journey(self, db_session):
+        from datetime import UTC, datetime, timedelta
+
+        from app.db.models import Journey, TelemetryPoint
+
+        async with session_scope() as session:
+            base = datetime(2026, 8, 4, 17, 43, tzinfo=UTC)
+            j = Journey(started_at=base, ended_at=base + timedelta(minutes=18), duration_s=1080.0)
+            session.add(j)
+            await session.flush()
+            rec = Recording(
+                rel_path="detail.ts",
+                filename="detail.ts",
+                size_bytes=1024,
+                state=RecordingState.COMPLETED,
+                journey_id=j.id,
+                started_at=base,
+                ended_at=base + timedelta(minutes=1),
+            )
+            session.add(rec)
+            await session.flush()
+            for step in range(5):
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec.id,
+                        journey_id=j.id,
+                        t_offset_s=float(step),
+                        captured_at=base + timedelta(seconds=step),
+                        lat=-34.8088 + step * 1e-3,
+                        lon=138.6769 + step * 1e-3,
+                        has_fix=True,
+                        speed_kmh=60.0,
+                    )
+                )
+            await session.flush()
+            return j.id
+
+    async def test_journey_detail_loads(self, client, journey):
+        response = await client.get(f"/api/journeys/{journey}")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["id"] == journey
+        assert len(body["recordings"]) == 1
+        assert len(body["route"]) >= 2, "the map needs the route geometry"
+
+    async def test_every_listed_journey_can_be_opened(self, client, journey):
+        """Whatever the list offers, the detail route must serve — that is the link."""
+        listed = (await client.get("/api/journeys")).json()["items"]
+        assert listed, "fixture did not produce a journey"
+        for item in listed:
+            response = await client.get(f"/api/journeys/{item['id']}")
+            assert response.status_code == 200, (
+                f"journey {item['id']} is listed but its page returns "
+                f"{response.status_code}: {response.text[:200]}"
+            )
+
+    async def test_recording_detail_and_its_sub_resources_load(self, client, journey):
+        listed = (await client.get("/api/recordings")).json()["items"]
+        assert listed
+        rid = listed[0]["id"]
+        for path in (
+            f"/api/recordings/{rid}",
+            f"/api/recordings/{rid}/telemetry",
+            f"/api/recordings/{rid}/detections",
+            f"/api/recordings/{rid}/plates",
+        ):
+            response = await client.get(path)
+            assert response.status_code == 200, f"{path}: {response.text[:200]}"
+
+
 class TestHeatmap:
     """The heat map aggregates in SQL, so the aggregation itself needs checking.
 

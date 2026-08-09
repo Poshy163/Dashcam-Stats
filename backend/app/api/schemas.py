@@ -364,12 +364,35 @@ class StatusStorage(BaseModel):
     footage_writable: bool = False
 
 
+class FeatureStatus(BaseModel):
+    """Whether an optional analysis feature can actually run, and whether it has.
+
+    Exists so the UI can tell two very different zeroes apart. "0 vehicles seen" across
+    674 recordings reads as a finding — nothing was out there — when the truth was that
+    the detection models 404'd on every attempt and the stage never ran at all. A count
+    is only meaningful once you know the thing producing it was working.
+    """
+
+    key: str
+    label: str
+    #: The user has this feature switched on in settings.
+    enabled: bool
+    #: Everything it needs is present: models downloaded, libraries importable.
+    ready: bool
+    #: Why it is not ready, in words a user can act on. None when it is.
+    blocked_reason: str | None = None
+    #: Results actually recorded so far, so "ready but never run" is distinguishable
+    #: from "ran and genuinely found nothing".
+    results: int = 0
+
+
 class StatusOut(BaseModel):
     totals: StatusTotals
     processing: StatusProcessing
     storage: StatusStorage
     latest_journey: JourneyOut | None = None
     hardware: dict[str, Any]
+    features: list[FeatureStatus] = Field(default_factory=list)
     version: str
 
 

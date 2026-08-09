@@ -234,6 +234,23 @@ export interface HardwareInfo {
   notes: string[]
 }
 
+/**
+ * Whether an optional analysis feature can actually run, and whether it has.
+ *
+ * Exists so the UI can tell two very different zeroes apart. "0 vehicles seen" across 674
+ * recordings reads as a finding — the roads were empty — when the truth was that the
+ * detection models could not be downloaded and the stage never ran. A count only means
+ * something once you know the thing producing it was working.
+ */
+export interface FeatureStatus {
+  key: string
+  label: string
+  enabled: boolean
+  ready: boolean
+  blockedReason: string | null
+  results: number
+}
+
 export interface Status {
   totals: {
     recordings: number
@@ -245,6 +262,7 @@ export interface Status {
     footageFiles: number
     durationS: number
   }
+  features?: FeatureStatus[]
   processing: {
     completed: number
     pending: number

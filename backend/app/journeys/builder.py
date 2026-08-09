@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -31,8 +31,22 @@ from app.db.models import (
     TrackedObject,
 )
 from app.osd import haversine_m
+from app.osd.outliers import (
+    looks_like_sign_loss,
+    plausible_radius_m,
+    robust_centre,
+    spatial_outliers,
+)
 
 log = get_logger(__name__)
+
+#: Ceiling on a single leg of a journey's distance measurement.
+#:
+#: Independent of the outlier pass, which needs three points and a majority before it
+#: will act and so cannot judge a short journey. 50 km between two consecutive 1 Hz
+#: samples is not a leg, it is a misread digit, and admitting one put 154,701 km on an
+#: eighteen-minute drive.
+_MAX_LEG_M = 50_000.0
 
 
 def as_utc(value: datetime | None) -> datetime | None:
@@ -247,6 +261,14 @@ class JourneyBuilder:
 
         recording_ids = [r.id for r in recordings]
 
+        # Before anything is derived from the fixes, drop the ones that cannot belong to
+        # this drive. Doing it here rather than in each consumer is the point: bounds,
+        # start/end, distance, the map and the recording viewer all read the same rows, so
+        # cleaning them once leaves every view agreeing rather than each filtering to its
+        # own taste. It also self-heals -- a journey rebuilt after a decoder improvement
+        # re-examines its own history.
+        await self._reject_outliers(session, recording_ids, journey.duration_s)
+
         # Aggregate bounds and max speed in SQL rather than pulling every point back:
         # a long journey has tens of thousands of telemetry rows.
         bounds = (
@@ -324,6 +346,65 @@ class JourneyBuilder:
         return journey
 
     @staticmethod
+    async def _reject_outliers(
+        session: AsyncSession, recording_ids: list[int], span_s: float
+    ) -> int:
+        """Clear coordinates that cannot belong to this journey. Returns how many.
+
+        The journey is the smallest scope at which the worst failure mode is visible. When
+        the rear camera loses the minus sign in front of a latitude it usually loses it for
+        the whole clip, so every fix in that recording agrees with every other one at high
+        confidence while sitting 7,700 km away. Nothing inside the recording contradicts it;
+        only its neighbours in the drive do.
+
+        Rejected rows keep their timestamp, speed and raw text and lose only the position,
+        because the rest of the reading was never in doubt — the speed on a sign-flipped
+        line is perfectly good, and discarding it would trade one wrong number for a
+        missing one.
+        """
+        rows = (
+            await session.execute(
+                select(TelemetryPoint.id, TelemetryPoint.lat, TelemetryPoint.lon).where(
+                    TelemetryPoint.recording_id.in_(recording_ids),
+                    TelemetryPoint.has_fix.is_(True),
+                    TelemetryPoint.lat.is_not(None),
+                    TelemetryPoint.lon.is_not(None),
+                )
+            )
+        ).all()
+        if len(rows) < 3:
+            return 0
+
+        points = [(float(r.lat), float(r.lon)) for r in rows]
+        outliers = spatial_outliers(points, span_s=span_s)
+        if not outliers:
+            return 0
+
+        centre = robust_centre([p for i, p in enumerate(points) if i not in outliers])
+        radius = plausible_radius_m(span_s)
+        sign_losses = (
+            sum(1 for i in outliers if looks_like_sign_loss(points[i], centre, radius))
+            if centre
+            else 0
+        )
+
+        await session.execute(
+            update(TelemetryPoint)
+            .where(TelemetryPoint.id.in_([rows[i].id for i in outliers]))
+            .values(has_fix=False, lat=None, lon=None, heading_deg=None)
+        )
+        log.info(
+            "discarded positions that cannot belong to this journey",
+            rejected=len(outliers),
+            of=len(rows),
+            # Worth separating: a dropped minus sign points at the overlay region or the
+            # glyph templates, where a mangled digit points at the weather.
+            sign_losses=sign_losses,
+            radius_km=round(radius / 1000.0, 1),
+        )
+        return len(outliers)
+
+    @staticmethod
     async def _track_metrics(
         session: AsyncSession, recording_ids: list[int], min_move_m: float
     ) -> tuple[float | None, float | None]:
@@ -338,6 +419,7 @@ class JourneyBuilder:
         )
 
         distance = 0.0
+        skipped = 0
         anchor: tuple[float, float] | None = None
         moving_sum = 0.0
         moving_count = 0
@@ -354,12 +436,31 @@ class JourneyBuilder:
                 anchor = (lat, lon)
                 continue
             step = haversine_m(anchor[0], anchor[1], lat, lon)
+
+            # A ceiling on a single leg, independent of the outlier pass above. That pass
+            # needs three points and a majority to act, so a short journey can still carry
+            # a coordinate it could not judge -- and without this, one such point put
+            # 154,701 km on an eighteen-minute drive and 21 of 45 journeys reported a
+            # distance no car could cover. Skip the leg rather than the point: the anchor
+            # is the last position still trusted, and moving it to a coordinate this one
+            # disagrees with would corrupt every leg after it too.
+            if step > _MAX_LEG_M:
+                skipped += 1
+                continue
+
             # The overlay quantises coordinates to about 11 m, so smaller hops are noise.
             # Advancing the anchor on every sample would sum that noise into hundreds of
             # phantom metres for a parked car.
             if step >= min_move_m:
                 distance += step
                 anchor = (lat, lon)
+
+        if skipped:
+            log.warning(
+                "skipped implausible legs while measuring a journey",
+                skipped=skipped,
+                max_leg_km=round(_MAX_LEG_M / 1000.0, 1),
+            )
 
         if not any_point:
             return None, None
