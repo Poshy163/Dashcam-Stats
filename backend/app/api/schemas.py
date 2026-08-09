@@ -12,9 +12,11 @@ Two rules run through all of these:
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Generic, TypeVar
+from typing import Annotated, Any, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.api.deps import SQLITE_MAX_INT
 
 T = TypeVar("T")
 
@@ -302,12 +304,19 @@ class ReprocessAllRequest(ReprocessRequest):
     only_failed: bool = False
 
 
+#: A row id inside a request body. Path and query bounds do not reach here, and
+#: ``Journey.id.in_(journey_ids)`` binds these straight to SQLite. See deps.SQLITE_MAX_INT.
+BodyRowId = Annotated[int, Field(ge=1, le=SQLITE_MAX_INT)]
+
+
 class MergeRequest(BaseModel):
-    journey_ids: list[int]
+    #: Bounded in length as well: this is a UI multi-select, and the library holds ~130
+    #: journeys, so a list longer than this is not something a person assembled.
+    journey_ids: list[BodyRowId] = Field(max_length=1000)
 
 
 class SplitRequest(BaseModel):
-    at_recording_id: int
+    at_recording_id: BodyRowId
 
 
 class PlatePatch(BaseModel):

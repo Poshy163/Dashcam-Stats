@@ -14,7 +14,7 @@ import re
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
-from app.api.deps import SessionDep
+from app.api.deps import RowId, SessionDep
 from app.core.logging import get_logger
 from app.core.paths import PathTraversalError, resolve_footage_path, resolve_media_path
 from app.db.models import Recording
@@ -74,7 +74,7 @@ def _parse_range(header: str, size: int) -> tuple[int, int] | None:
 
 @router.get("/stream/{recording_id}", summary="Stream a recording")
 async def stream_recording(
-    recording_id: int,
+    recording_id: RowId,
     session: SessionDep,
     request: Request,
     range_header: str | None = Header(default=None, alias="Range"),

@@ -20,12 +20,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Query
 from sqlalchemy import Float, String, distinct, func, select
 from sqlalchemy import cast as sa_cast
 
-from app.api.deps import SessionDep
+from app.api.deps import SQLITE_MAX_INT, SessionDep
 from app.api.geometry import build_polylines
 from app.api.schemas import HeatmapOut, RoutesOut
 from app.core.logging import get_logger
@@ -73,7 +74,9 @@ async def heatmap(
     ),
     start: datetime | None = Query(None, description="Only fixes at or after this instant."),
     end: datetime | None = Query(None, description="Only fixes at or before this instant."),
-    journey_id: int | None = Query(None, description="Restrict to one journey."),
+    journey_id: Annotated[
+        int | None, Query(ge=1, le=SQLITE_MAX_INT, description="Restrict to one journey.")
+    ] = None,
     camera: str | None = Query(None, description="Restrict to one camera key."),
     min_speed_kmh: float = Query(
         0.0,
@@ -189,7 +192,9 @@ async def routes(
     session: SessionDep,
     start: datetime | None = Query(None, description="Only fixes at or after this instant."),
     end: datetime | None = Query(None, description="Only fixes at or before this instant."),
-    journey_id: int | None = Query(None, description="Restrict to one journey."),
+    journey_id: Annotated[
+        int | None, Query(ge=1, le=SQLITE_MAX_INT, description="Restrict to one journey.")
+    ] = None,
     simplify_m: float = Query(
         DEFAULT_SIMPLIFY_M,
         ge=0.0,

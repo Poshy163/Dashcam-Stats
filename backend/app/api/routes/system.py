@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from app.ai.backend import get_backend
 from app.ai.models import describe_models, is_present
 from app.ai.runtime import describe_runtime
-from app.api.deps import PaginationDep, SessionDep
+from app.api.deps import PaginationDep, RowIdFilter, SessionDep
 from app.api.schemas import (
     FeatureStatus,
     JourneyOut,
@@ -415,8 +415,8 @@ async def list_logs(
     session: SessionDep,
     page: PaginationDep,
     level: str | None = None,
-    recording_id: int | None = None,
-    job_id: int | None = None,
+    recording_id: RowIdFilter = None,
+    job_id: RowIdFilter = None,
     search: str | None = Query(None),
 ):
     stmt = select(LogEntry)

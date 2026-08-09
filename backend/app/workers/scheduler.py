@@ -19,6 +19,7 @@ from app.core.logging import get_logger, prune_logs
 from app.core.settings_service import get_settings_service
 from app.db.session import session_scope
 from app.journeys.builder import JourneyBuilder
+from app.pipeline.repair import repair_durations
 from app.retention import execute as run_retention
 from app.retention import plan as plan_retention
 from app.scanner.discovery import Scanner, queue_unprocessed
@@ -172,6 +173,17 @@ class Scheduler:
         # when there is nothing to do, which is the normal case.
         async with session_scope() as session:
             await JourneyBuilder().repair_stale(session)
+
+        # The same self-healing, one level down: a recording whose stored duration is
+        # impossible for its file size was measured by a probe that has since been fixed.
+        # Two files were still claiming 26 hours each long after the clamp that catches
+        # them started working, because a probe only ever runs once per recording.
+        async with session_scope() as session:
+            corrected = await repair_durations(session)
+        if corrected:
+            # Journey rollups are built on these durations, so they are now stale too.
+            async with session_scope() as session:
+                await JourneyBuilder().repair_stale(session)
 
     async def _run_retention(self) -> None:
         async with session_scope() as session:

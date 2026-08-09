@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, Response, status
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import aliased, selectinload
 
-from app.api.deps import PaginationDep, SessionDep
+from app.api.deps import PaginationDep, RowId, RowIdFilter, SessionDep
 from app.api.geometry import build_polyline_indices
 from app.api.schemas import (
     JobOut,
@@ -63,10 +63,22 @@ def _day_start(value: datetime) -> datetime:
     Adelaide those differ by nine and a half hours. Comparing the raw value against UTC
     would slide every boundary by that much, so a date is anchored in the configured zone
     before being converted.
+
+    The conversion is guarded because it is arithmetic on a calendar with ends. Stamping
+    ``0001-01-01`` with a +9:30 zone and converting to UTC lands before ``datetime.min``
+    and raises ``OverflowError`` -- which is an ``ArithmeticError``, so it slipped past the
+    ``ValueError`` handler and returned 500. ``date_from=0001-01-01`` is not an attack; it
+    is what a date picker sends when someone holds the up arrow.
     """
     if value.tzinfo is None:
         value = value.replace(tzinfo=local_zone() if _is_date_only(value) else UTC)
-    return value.astimezone(UTC)
+    try:
+        return value.astimezone(UTC)
+    except (OverflowError, OSError, ValueError):
+        raise ValueError(
+            f"{value.date().isoformat()} is outside the range of dates this "
+            "application can represent."
+        ) from None
 
 
 def _before_end_of(column, value: datetime):
@@ -82,7 +94,14 @@ def _before_end_of(column, value: datetime):
     different bug in the other direction.
     """
     if _is_date_only(value):
-        return column < _day_start(value) + timedelta(days=1)
+        try:
+            return column < _day_start(value) + timedelta(days=1)
+        except OverflowError:
+            # The other end of the calendar: 9999-12-31 has no day after it.
+            raise ValueError(
+                f"{value.date().isoformat()} is outside the range of dates this "
+                "application can represent."
+            ) from None
     return column <= _day_start(value)
 
 
@@ -117,8 +136,8 @@ async def _paginate(session, stmt, page, schema):
 async def list_recordings(
     session: SessionDep,
     page: PaginationDep,
-    camera_id: int | None = None,
-    journey_id: int | None = None,
+    camera_id: RowIdFilter = None,
+    journey_id: RowIdFilter = None,
     state: str | None = None,
     has_gps: bool | None = None,
     has_detections: bool | None = None,
@@ -165,7 +184,7 @@ async def list_recordings(
 
 
 @router.get("/recordings/{recording_id}", response_model=RecordingOut)
-async def get_recording(recording_id: int, session: SessionDep):
+async def get_recording(recording_id: RowId, session: SessionDep):
     recording = (
         await session.execute(
             select(Recording)
@@ -179,7 +198,7 @@ async def get_recording(recording_id: int, session: SessionDep):
 
 
 @router.get("/recordings/{recording_id}/telemetry", response_model=list[TelemetryPointOut])
-async def get_telemetry(recording_id: int, session: SessionDep):
+async def get_telemetry(recording_id: RowId, session: SessionDep):
     rows = (
         (
             await session.execute(
@@ -195,7 +214,7 @@ async def get_telemetry(recording_id: int, session: SessionDep):
 
 
 @router.get("/recordings/{recording_id}/detections", response_model=list[TrackedObjectOut])
-async def get_detections(recording_id: int, session: SessionDep):
+async def get_detections(recording_id: RowId, session: SessionDep):
     rows = (
         (
             await session.execute(
@@ -211,7 +230,7 @@ async def get_detections(recording_id: int, session: SessionDep):
 
 
 @router.get("/recordings/{recording_id}/plates", response_model=list[PlateObservationOut])
-async def get_recording_plates(recording_id: int, session: SessionDep):
+async def get_recording_plates(recording_id: RowId, session: SessionDep):
     rows = (
         await session.execute(
             select(PlateObservation, Recording.filename, Camera.name)
@@ -232,7 +251,7 @@ def _observation_out(obs: PlateObservation, filename: str | None, camera: str | 
 
 
 @router.post("/recordings/{recording_id}/reprocess")
-async def reprocess_recording(recording_id: int, body: ReprocessRequest, session: SessionDep):
+async def reprocess_recording(recording_id: RowId, body: ReprocessRequest, session: SessionDep):
     recording = await session.get(Recording, recording_id)
     if recording is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording not found")
@@ -282,7 +301,7 @@ async def list_journeys(
 
 
 @router.get("/journeys/{journey_id}", response_model=JourneyDetailOut)
-async def get_journey(journey_id: int, session: SessionDep):
+async def get_journey(journey_id: RowId, session: SessionDep):
     journey = await session.get(Journey, journey_id)
     if journey is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Journey not found")
@@ -387,7 +406,7 @@ async def merge_journeys(body: MergeRequest, session: SessionDep):
 
 
 @router.post("/journeys/{journey_id}/split", response_model=list[JourneyOut])
-async def split_journey(journey_id: int, body: SplitRequest, session: SessionDep):
+async def split_journey(journey_id: RowId, body: SplitRequest, session: SessionDep):
     result = await JourneyBuilder().split(session, journey_id, body.at_recording_id)
     if result is None:
         raise HTTPException(
@@ -398,7 +417,7 @@ async def split_journey(journey_id: int, body: SplitRequest, session: SessionDep
 
 
 @router.post("/journeys/{journey_id}/reprocess")
-async def reprocess_journey(journey_id: int, body: ReprocessRequest, session: SessionDep):
+async def reprocess_journey(journey_id: RowId, body: ReprocessRequest, session: SessionDep):
     recordings = (
         (await session.execute(select(Recording.id).where(Recording.journey_id == journey_id)))
         .scalars()
@@ -510,7 +529,7 @@ async def _attach_representative(session, plate: Plate) -> PlateOut:
 
 
 @router.get("/plates/{plate_id}", response_model=PlateOut)
-async def get_plate(plate_id: int, session: SessionDep):
+async def get_plate(plate_id: RowId, session: SessionDep):
     plate = await session.get(Plate, plate_id)
     if plate is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Plate not found")
@@ -518,7 +537,7 @@ async def get_plate(plate_id: int, session: SessionDep):
 
 
 @router.get("/plates/{plate_id}/observations", response_model=Paginated[PlateObservationOut])
-async def get_plate_observations(plate_id: int, session: SessionDep, page: PaginationDep):
+async def get_plate_observations(plate_id: RowId, session: SessionDep, page: PaginationDep):
     base = (
         select(PlateObservation, Recording.filename, Camera.name)
         .join(Recording, Recording.id == PlateObservation.recording_id)
@@ -546,7 +565,7 @@ async def get_plate_observations(plate_id: int, session: SessionDep, page: Pagin
 
 
 @router.patch("/plates/{plate_id}", response_model=PlateOut)
-async def patch_plate(plate_id: int, body: PlatePatch, session: SessionDep):
+async def patch_plate(plate_id: RowId, body: PlatePatch, session: SessionDep):
     plate = await session.get(Plate, plate_id)
     if plate is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Plate not found")
@@ -677,7 +696,7 @@ async def list_vehicles(
 
 
 @router.get("/vehicles/{vehicle_id}", response_model=VehicleOut)
-async def get_vehicle(vehicle_id: int, session: SessionDep):
+async def get_vehicle(vehicle_id: RowId, session: SessionDep):
     """One sighting. Ids here are ``tracked_objects`` ids, matching the list above."""
     track = await session.get(TrackedObject, vehicle_id)
     if track is not None:
@@ -773,7 +792,7 @@ async def retry_failed_jobs(session: SessionDep):
 
 
 @router.post("/jobs/{job_id}/retry", response_model=JobOut)
-async def retry_job(job_id: int, session: SessionDep):
+async def retry_job(job_id: RowId, session: SessionDep):
     job = await session.get(ProcessingJob, job_id)
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
@@ -795,7 +814,7 @@ async def retry_job(job_id: int, session: SessionDep):
     status_code=status.HTTP_204_NO_CONTENT,
     response_model=None,
 )
-async def cancel_job(job_id: int, session: SessionDep) -> Response:
+async def cancel_job(job_id: RowId, session: SessionDep) -> Response:
     if not await queue.cancel(session, job_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found or already finished")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

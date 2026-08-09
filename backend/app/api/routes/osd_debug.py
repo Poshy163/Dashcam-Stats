@@ -21,7 +21,7 @@ import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from sqlalchemy import select
 
-from app.api.deps import SessionDep
+from app.api.deps import RowId, SessionDep
 from app.core.logging import get_logger
 from app.core.paths import resolve_footage_path
 from app.core.settings_service import get_settings_service
@@ -46,7 +46,7 @@ async def _active_region(session) -> OsdRegion:
     return OsdRegion(x=row.region_x, y=row.region_y, w=row.region_w, h=row.region_h)
 
 
-async def _read(recording_id: int, session, offset_s: float):
+async def _read(recording_id: RowId, session, offset_s: float):
     """The frame at *offset_s*, the region, and the loaded extractor."""
     recording = await session.get(Recording, recording_id)
     if recording is None:
@@ -98,7 +98,7 @@ def _crop_strip(frame: np.ndarray, crop) -> np.ndarray:
 
 @router.get("/recordings/{recording_id}/osd-debug")
 async def osd_debug(
-    recording_id: int,
+    recording_id: RowId,
     session: SessionDep,
     t: float = Query(0.0, ge=0.0, description="Offset into the recording, in seconds."),
 ):
@@ -146,7 +146,7 @@ async def osd_debug(
 
 @router.get("/recordings/{recording_id}/osd-debug.png")
 async def osd_debug_image(
-    recording_id: int,
+    recording_id: RowId,
     session: SessionDep,
     t: float = Query(0.0, ge=0.0, description="Offset into the recording, in seconds."),
 ):

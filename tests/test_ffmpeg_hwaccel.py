@@ -343,6 +343,7 @@ class TestProbeIsNotRepeated:
     """
 
     async def test_a_second_probe_of_an_unchanged_file_costs_nothing(self, tmp_path, monkeypatch):
+
         from app.hardware import ffmpeg as ffmpeg_module
 
         clip = tmp_path / "probe_me.ts"
@@ -412,3 +413,83 @@ class TestProbeIsNotRepeated:
         await ffmpeg_module.probe(clip)
 
         assert calls["count"] == 2, "a rewritten file was served from the probe cache"
+
+
+class TestAProvenFileIsNotDemoted:
+    """A GPU that decoded this file once can decode it again.
+
+    This is the case the returncode check does not cover, and it is the one that was
+    actually costing throughput. A 62 MB clip decodes on VAAPI for its whole detection
+    stage - 134 tracked vehicles, thousands of frames - and then the plates stage takes one
+    0.5 s seek per vehicle. One of those exits non-zero having produced nothing, which is a
+    fact about that window, and the file was demoted to software decoding for the rest of
+    the run while the Queue page went on reporting "Decoder: vaapi".
+
+    Live evidence: 20260731154309_camera_0.ts, 62.4 MB, 65 s, 134 vehicles tracked, then
+    "hardware decode failed; using software for this file from now on".
+    """
+
+    async def test_a_later_failure_does_not_condemn_a_file_that_already_decoded(self, monkeypatch):
+        import numpy as np
+
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_refused", set())
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_proven", set())
+        monkeypatch.setattr(
+            ffmpeg_module, "select_hwaccel", lambda *a, **k: (["-hwaccel", "vaapi"], "vaapi")
+        )
+
+        state = {"fail": False}
+
+        async def decode(path, **kwargs):
+            if state["fail"] and kwargs.get("hwaccel") != "cpu":
+                # Non-zero exit, so _is_empty_window deliberately does not apply.
+                raise ffmpeg_module.DecodeError(
+                    "no frames decoded from clip.ts", stderr="", returncode=1
+                )
+            yield 0.0, np.zeros((4, 4, 3), dtype=np.uint8)
+
+        monkeypatch.setattr(ffmpeg_module, "_decode_frames", decode)
+
+        # The detection stage: a long successful hardware pass over the whole file.
+        async for _ in ffmpeg_module.iter_frames("clip.ts", fps=5.0):
+            pass
+        assert "clip.ts" in ffmpeg_module._hwaccel_proven
+
+        # The plates stage: one short seek that comes back with nothing.
+        state["fail"] = True
+        frames = [f async for f in ffmpeg_module.iter_frames("clip.ts", start=64.9, duration=0.5)]
+
+        assert frames, "the software fallback should still answer this particular call"
+        assert "clip.ts" not in ffmpeg_module._hwaccel_refused, (
+            "one bad 0.5s window demoted a file that had already decoded thousands of "
+            "frames on the GPU; the rest of the recording will now run on the CPU"
+        )
+
+    async def test_a_file_that_never_decoded_on_hardware_is_still_demoted(self, monkeypatch):
+        """The original behaviour has to survive: a genuinely broken GPU path is sticky."""
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_refused", set())
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_proven", set())
+        monkeypatch.setattr(
+            ffmpeg_module, "select_hwaccel", lambda *a, **k: (["-hwaccel", "vaapi"], "vaapi")
+        )
+
+        import numpy as np
+
+        async def decode(path, **kwargs):
+            if kwargs.get("hwaccel") != "cpu":
+                raise ffmpeg_module.DecodeError(
+                    "no frames decoded",
+                    stderr="Failed to initialise VAAPI connection",
+                    returncode=1,
+                )
+            yield 0.0, np.zeros((4, 4, 3), dtype=np.uint8)
+
+        monkeypatch.setattr(ffmpeg_module, "_decode_frames", decode)
+
+        frames = [f async for f in ffmpeg_module.iter_frames("broken.ts", fps=1.0)]
+        assert frames, "software decode should have answered"
+        assert "broken.ts" in ffmpeg_module._hwaccel_refused

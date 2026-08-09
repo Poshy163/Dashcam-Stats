@@ -54,6 +54,13 @@ PTS_WRAP_THRESHOLD_S = PTS_WRAP_SECONDS - 3600.0
 #: answer. 802 bps for 1080p video, as one of these files reports, is the tell.
 MIN_PLAUSIBLE_BITRATE = 100_000
 
+#: Ceiling on a plausible bitrate, used the same way and for the opposite failure.
+#:
+#: A container can also claim a duration far too *short* for the data behind it -- one 87.7
+#: MB clip in this corpus reports 0.373 s, which works out at 1,879 Mbps. The busiest real
+#: recording here runs at 43 Mbps, so this sits nearly five times above anything genuine.
+MAX_PLAUSIBLE_BITRATE = 200_000_000
+
 #: Beyond this a "frame rate" is ffprobe's estimator misfiring, not a real camera.
 MAX_PLAUSIBLE_FPS = 120.0
 MIN_PLAUSIBLE_FPS = 1.0
@@ -61,6 +68,15 @@ MIN_PLAUSIBLE_FPS = 1.0
 #: Files that failed hardware decode this run, so the attempt is not repeated per stage.
 _hwaccel_refused: set[str] = set()
 _HWACCEL_REFUSED_MAX = 512
+
+#: Files that have handed back at least one frame on hardware this run.
+#:
+#: Positive proof, and it outranks any later failure on the same file: a GPU that decoded
+#: this clip once can decode it again, so a subsequent empty or failed window is about the
+#: window. Without this, a single bad seek among the hundreds the plates stage performs
+#: demoted an entire recording to software decoding partway through.
+_hwaccel_proven: set[str] = set()
+_HWACCEL_PROVEN_MAX = 512
 
 DEFAULT_PROBE_TIMEOUT = 60.0
 DEFAULT_DECODE_TIMEOUT = 900.0
@@ -383,6 +399,42 @@ async def probe(path: Path | str, *, timeout: float = DEFAULT_PROBE_TIMEOUT) -> 
         )
         duration = recovered
 
+    # Whatever the duration came from, it has to be possible for a file this size.
+    #
+    # The wrap check above catches one specific way of being wrong. This catches the rest,
+    # from either direction, using the one piece of evidence that cannot itself be derived
+    # from the duration: how many bytes are actually there. On this corpus a real clip runs
+    # between 2.9 and 43 Mbps, so the band below clears the nearest genuine recording by a
+    # factor of five at the top and twenty-eight at the bottom -- while the three files it
+    # rejects sit at 0.0008, 0.0009 and 1,879 Mbps.
+    #
+    # The last of those is an 87.7 MB clip the container claims lasts 0.373 s. The wrap
+    # check cannot see it, because being far too *short* is not a wrap; it is a header the
+    # camera never finished writing. Left alone it made the clip unplayable past the first
+    # frame and gave the plates stage a seek window with nothing in it.
+    if duration is not None and duration > 0 and result.size_bytes > 0:
+        implied = result.size_bytes * 8 / duration
+        if not (MIN_PLAUSIBLE_BITRATE <= implied <= MAX_PLAUSIBLE_BITRATE):
+            measured = await _measure_duration(p)
+            plausible = (
+                measured is not None
+                and measured > 0
+                and result.size_bytes * 8 / measured >= MIN_PLAUSIBLE_BITRATE
+                and result.size_bytes * 8 / measured <= MAX_PLAUSIBLE_BITRATE
+            )
+            result.warnings.append(
+                f"container duration {duration:.3f}s implies {implied / 1e6:.4f} Mbps for "
+                f"{result.size_bytes / 1e6:.1f} MB; using the measured {measured:.1f}s"
+                if plausible
+                else f"container duration {duration:.3f}s implies {implied / 1e6:.4f} Mbps "
+                f"for {result.size_bytes / 1e6:.1f} MB and could not be recovered"
+            )
+            # An unknown duration is worse than a wrong one only if you believe the wrong
+            # one. Everything downstream -- the footage total, the seek bar, realtime
+            # speed, the thumbnail offsets -- treats None as "do not know" and a number as
+            # fact, so None is the honest answer when decoding cannot supply a better one.
+            duration = measured if plausible else None
+
     result.duration_s = duration
     if duration is not None and duration <= 0:
         result.warnings.append("duration is zero or negative")
@@ -395,24 +447,32 @@ async def probe(path: Path | str, *, timeout: float = DEFAULT_PROBE_TIMEOUT) -> 
 
 
 async def _measure_duration(path: Path | str) -> float | None:
-    """Last resort: decode the stream and report where it ended."""
-    cmd = [
-        ffmpeg_path(),
-        "-hide_banner",
-        "-v",
-        "error",
-        "-i",
-        str(path),
-        "-map",
-        "0:v:0",
-        "-f",
-        "null",
-        "-",
-        "-progress",
-        "pipe:1",
-        "-nostats",
-    ]
+    """Last resort: decode the stream and report where it ended.
+
+    Every failure returns None rather than raising. This is called from inside ``probe``
+    to second-guess a duration the container got wrong, and a fallback that can itself
+    raise turns "we could not improve on this number" into "this file cannot be probed at
+    all". Resolving the binary is inside the guard for exactly that reason: it was outside
+    it, so an ffmpeg missing from PATH -- which is a supported state, ffprobe and ffmpeg
+    are found independently -- propagated out of probing an otherwise readable file.
+    """
     try:
+        cmd = [
+            ffmpeg_path(),
+            "-hide_banner",
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-map",
+            "0:v:0",
+            "-f",
+            "null",
+            "-",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+        ]
         code, out, _ = await _run(cmd, DEFAULT_DECODE_TIMEOUT)
     except FFmpegError:
         return None
@@ -672,6 +732,9 @@ async def iter_frames(
     try:
         async for item in _decode_frames(path, hwaccel=hwaccel, **kwargs):
             yielded += 1
+            if yielded == 1 and label != "software":
+                # This file and this GPU demonstrably work together. Remember it.
+                _remember_hwaccel_success(path)
             yield item
         return
     except FFmpegError as exc:
@@ -683,18 +746,39 @@ async def iter_frames(
             # ffmpeg ran to completion and simply found nothing in the window asked for.
             # That is a fact about the window, not about the GPU, and software decode
             # would find exactly the same nothing. Retrying wastes a process launch;
-            # memoising it is worse -- it condemned the rest of the file to the CPU. The
-            # plates stage takes hundreds of short seeks per recording, so one landing
-            # past the last frame, or in a damaged GOP, was enough to lose hardware
-            # decoding for a file that had already been decoding on the iGPU for minutes.
+            # memoising it is worse -- it condemned the rest of the file to the CPU.
             raise
-        _remember_hwaccel_failure(path)
-        log.warning(
-            "hardware decode failed; using software for this file from now on",
-            file=Path(path).name,
-            decoder=label,
-            error=str(exc),
-        )
+        if str(path) in _hwaccel_proven:
+            # The strongest evidence available, and it beats reading stderr: this file has
+            # already handed back frames on this GPU in this process. Whatever just went
+            # wrong with a 0.5 s window in the middle of it, "the GPU cannot decode this
+            # file" is not it.
+            #
+            # This is the case that survived the returncode check. A 62 MB clip would
+            # decode on VAAPI for its entire detection stage, tracking 134 vehicles, and
+            # then one of the 134 per-track seeks in the plates stage would exit non-zero
+            # with no frames -- and that single window sent the rest of the recording to
+            # the CPU while the Queue page still read "Decoder: vaapi".
+            log.debug(
+                "a hardware decode failed on a file that has already decoded on hardware",
+                file=Path(path).name,
+                decoder=label,
+                error=str(exc),
+                start=kwargs.get("start"),
+                duration=kwargs.get("duration"),
+            )
+        else:
+            _remember_hwaccel_failure(path)
+            log.warning(
+                "hardware decode failed; using software for this file from now on",
+                file=Path(path).name,
+                decoder=label,
+                error=str(exc),
+                # Without these the warning cannot be acted on: "no frames decoded" reads
+                # identically whether the driver refused or the window was simply empty.
+                returncode=getattr(exc, "returncode", None),
+                stderr=(getattr(exc, "stderr", "") or "")[-400:],
+            )
 
     async for item in _decode_frames(path, hwaccel="cpu", **kwargs):
         yield item
@@ -726,6 +810,16 @@ def _is_empty_window(exc: FFmpegError) -> bool:
         return False
     lowered = exc.stderr.lower()
     return not any(marker in lowered for marker in _HWACCEL_STDERR_MARKERS)
+
+
+def _remember_hwaccel_success(path: Path | str) -> None:
+    """Note that this file has decoded on hardware, so a later failure is not the GPU."""
+    key = str(path)
+    if key in _hwaccel_proven:
+        return
+    _hwaccel_proven.add(key)
+    while len(_hwaccel_proven) > _HWACCEL_PROVEN_MAX:
+        _hwaccel_proven.pop()
 
 
 def _remember_hwaccel_failure(path: Path | str) -> None:

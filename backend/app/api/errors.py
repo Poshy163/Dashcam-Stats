@@ -41,6 +41,23 @@ def install_error_handlers(app: FastAPI) -> None:
     async def _bad_value(_request: Request, exc: ValueError) -> JSONResponse:
         return _envelope("invalid_request", str(exc), status.HTTP_400_BAD_REQUEST)
 
+    @app.exception_handler(OverflowError)
+    async def _out_of_range(request: Request, exc: OverflowError) -> JSONResponse:
+        """The backstop, not the fix.
+
+        ``OverflowError`` is an ``ArithmeticError``, not a ``ValueError``, so the handler
+        above never sees it and every instance landed on the catch-all below: HTTP 500 with
+        a stack trace, written into the log table, for input as ordinary as a date picker
+        scrolled back to year one. The parameter bounds in ``deps.py`` are what actually
+        prevent it; this catches whatever is added later without them.
+        """
+        log.warning("value out of range", path=str(request.url.path), error=str(exc))
+        return _envelope(
+            "out_of_range",
+            "A value in the request is out of range.",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
         log.exception(
