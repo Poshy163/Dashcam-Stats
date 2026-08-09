@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -47,6 +47,15 @@ log = get_logger(__name__)
 #: samples is not a leg, it is a misread digit, and admitting one put 154,701 km on an
 #: eighteen-minute drive.
 _MAX_LEG_M = 50_000.0
+
+#: Metres a vehicle could cover in a second. Mirrors the per-point ceiling in
+#: :mod:`app.osd.engine` so the two cannot disagree about what counts as travel.
+_MAX_STEP_M_PER_S = 400.0 * 1000.0 / 3600.0
+
+#: Average speed over a whole journey beyond which its distance is not believable. Well
+#: above any real drive -- the fastest genuine journey in this corpus averages about 60 --
+#: so it only ever catches a distance that arithmetic already rules out.
+_IMPLAUSIBLE_M_PER_S = 200.0 * 1000.0 / 3600.0
 
 
 def as_utc(value: datetime | None) -> datetime | None:
@@ -194,11 +203,23 @@ class JourneyBuilder:
         correctly refreshed journey can be in: `refresh` sets both from the same rows, so
         either there are fixes and both are populated, or there are none and neither is.
         """
+        # Two shapes of wrong, both self-evident from the row alone.
+        never_computed = and_(Journey.has_gps.is_(True), Journey.distance_m.is_(None))
+        # A distance no vehicle could cover in the time the journey lasted. Recomputing is
+        # what applies the current guards to a number produced by an older, looser one --
+        # without this, a journey that already holds a bad distance keeps it forever,
+        # because nothing would ever ask it to try again.
+        impossible = and_(
+            Journey.distance_m.is_not(None),
+            Journey.duration_s > 0,
+            Journey.distance_m / Journey.duration_s > _IMPLAUSIBLE_M_PER_S,
+        )
+
         stale = list(
             (
                 await session.execute(
                     select(Journey)
-                    .where(Journey.has_gps.is_(True), Journey.distance_m.is_(None))
+                    .where(or_(never_computed, impossible))
                     .order_by(Journey.started_at.desc())
                     .limit(limit)
                 )
@@ -333,6 +354,14 @@ class JourneyBuilder:
         )
 
         recording_ids = [r.id for r in recordings]
+
+        # Re-point the denormalised journey ids every time, not only when a recording is
+        # first attached. The route map and the heat map's journey filter read
+        # telemetry_points.journey_id, so a journey whose telemetry was written before it
+        # existed -- or attached by a path that only set recordings.journey_id -- draws
+        # nothing at all. Idempotent, four statements, and it makes refresh the one place
+        # that puts a journey right.
+        await self._attach(session, recording_ids, journey.id)
 
         # Before anything is derived from the fixes, drop the ones that cannot belong to
         # this drive. Doing it here rather than in each consumer is the point: bounds,
@@ -483,7 +512,12 @@ class JourneyBuilder:
     ) -> tuple[float | None, float | None]:
         """Distance and moving average, streamed so memory stays bounded."""
         rows = await session.stream(
-            select(TelemetryPoint.lat, TelemetryPoint.lon, TelemetryPoint.speed_kmh)
+            select(
+                TelemetryPoint.lat,
+                TelemetryPoint.lon,
+                TelemetryPoint.speed_kmh,
+                TelemetryPoint.captured_at,
+            )
             .where(
                 TelemetryPoint.recording_id.in_(recording_ids),
                 TelemetryPoint.has_fix.is_(True),
@@ -494,11 +528,12 @@ class JourneyBuilder:
         distance = 0.0
         skipped = 0
         anchor: tuple[float, float] | None = None
+        anchor_time: datetime | None = None
         moving_sum = 0.0
         moving_count = 0
         any_point = False
 
-        async for lat, lon, speed in rows:
+        async for lat, lon, speed, captured in rows:
             any_point = True
             if speed is not None and speed > 1.0:
                 moving_sum += speed
@@ -507,6 +542,7 @@ class JourneyBuilder:
                 continue
             if anchor is None:
                 anchor = (lat, lon)
+                anchor_time = captured
                 continue
             step = haversine_m(anchor[0], anchor[1], lat, lon)
 
@@ -514,10 +550,25 @@ class JourneyBuilder:
             # needs three points and a majority to act, so a short journey can still carry
             # a coordinate it could not judge -- and without this, one such point put
             # 154,701 km on an eighteen-minute drive and 21 of 45 journeys reported a
-            # distance no car could cover. Skip the leg rather than the point: the anchor
-            # is the last position still trusted, and moving it to a coordinate this one
-            # disagrees with would corrupt every leg after it too.
-            if step > _MAX_LEG_M:
+            # distance no car could cover.
+            #
+            # The ceiling is how far the vehicle could have travelled in the time that
+            # actually elapsed, not a flat distance. A flat one has to be set loose enough
+            # for a legitimate leg across a long dropout, which leaves it far too loose for
+            # two fixes a second apart: a journey of exactly two fixes, 36 km apart because
+            # one longitude digit was misread, reported 36.7 km covered in 120 seconds and
+            # slipped under a 50 km cap untouched.
+            #
+            # Skip the leg rather than the point: the anchor is the last position still
+            # trusted, and moving it to a coordinate this one disagrees with would corrupt
+            # every leg after it too.
+            gap_s = None
+            if captured is not None and anchor_time is not None:
+                gap_s = abs((as_utc(captured) - as_utc(anchor_time)).total_seconds())
+            # Without both timestamps there is no elapsed time to reason from, so fall back
+            # to the flat cap rather than inventing one.
+            limit = _MAX_STEP_M_PER_S * max(1.0, gap_s) if gap_s is not None else _MAX_LEG_M
+            if step > limit:
                 skipped += 1
                 continue
 
@@ -527,6 +578,7 @@ class JourneyBuilder:
             if step >= min_move_m:
                 distance += step
                 anchor = (lat, lon)
+                anchor_time = captured
 
         if skipped:
             log.warning(

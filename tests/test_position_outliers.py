@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.db.models import Journey, Recording, RecordingState, TelemetryPoint
 from app.db.session import session_scope
@@ -452,6 +452,237 @@ class TestJourneyRollupsStayTrue:
                 started_at=base, ended_at=base + timedelta(minutes=2), duration_s=120.0
             )
             session.add(journey)
+            await session.flush()
+            await session.commit()
+
+        async with session_scope() as session:
+            assert await JourneyBuilder().repair_stale(session) == 0
+
+
+class TestTwoFixesCannotInventADistance:
+    """A journey with only two fixes, one of them wrong.
+
+    Taken from the live library: journey 52 held a single 120-second recording with exactly
+    two usable fixes, at longitudes 138.6403 and 139.0422 — one misread digit, 36 km apart.
+    It reported 36.7 km covered in 120 seconds, an implied 1,100 km/h.
+
+    Neither existing guard could see it. `spatial_outliers` declines below three points on
+    purpose, because two fixes cannot vote on which of them is wrong. And a flat leg cap has
+    to be loose enough for a genuine leg across a long dropout, which leaves it far too
+    loose for two fixes moments apart.
+
+    Elapsed time is what separates the two cases, and it is available on the rows already.
+    """
+
+    @pytest.fixture
+    async def two_fix_journey(self, db_session):
+        base = datetime(2026, 8, 4, 8, 51, tzinfo=UTC)
+        async with session_scope() as session:
+            journey = Journey(
+                started_at=base, ended_at=base + timedelta(seconds=120), duration_s=120.0
+            )
+            session.add(journey)
+            await session.flush()
+            rec = Recording(
+                rel_path="two.ts",
+                filename="two.ts",
+                size_bytes=1,
+                state=RecordingState.COMPLETED,
+                journey_id=journey.id,
+                started_at=base,
+                ended_at=base + timedelta(seconds=120),
+            )
+            session.add(rec)
+            await session.flush()
+            for offset, lon in ((0.0, 138.6403), (1.0, 139.0422)):
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec.id,
+                        journey_id=journey.id,
+                        t_offset_s=offset,
+                        captured_at=base + timedelta(seconds=offset),
+                        lat=-34.8147,
+                        lon=lon,
+                        has_fix=True,
+                        speed_kmh=30.0,
+                    )
+                )
+            await session.flush()
+            return journey.id
+
+    async def test_the_impossible_leg_is_not_counted(self, two_fix_journey):
+        async with session_scope() as session:
+            journey = (
+                await session.execute(select(Journey).where(Journey.id == two_fix_journey))
+            ).scalar_one()
+            await JourneyBuilder().refresh(session, journey)
+            await session.commit()
+
+        async with session_scope() as session:
+            journey = (
+                await session.execute(select(Journey).where(Journey.id == two_fix_journey))
+            ).scalar_one()
+            km = (journey.distance_m or 0) / 1000
+            implied = km / (journey.duration_s / 3600)
+        assert implied < 200, f"{km:.1f} km in {journey.duration_s:.0f}s is {implied:.0f} km/h"
+
+    async def test_a_real_leg_over_a_long_gap_still_counts(self, db_session):
+        """The cap must scale with elapsed time, not forbid distance outright.
+
+        Two fixes four minutes apart across a tunnel are 4 km apart at road speed, and that
+        is real travel that must survive.
+        """
+        base = datetime(2026, 8, 4, 8, 51, tzinfo=UTC)
+        async with session_scope() as session:
+            journey = Journey(
+                started_at=base, ended_at=base + timedelta(minutes=5), duration_s=300.0
+            )
+            session.add(journey)
+            await session.flush()
+            rec = Recording(
+                rel_path="gap.ts",
+                filename="gap.ts",
+                size_bytes=1,
+                state=RecordingState.COMPLETED,
+                journey_id=journey.id,
+                started_at=base,
+                ended_at=base + timedelta(minutes=5),
+            )
+            session.add(rec)
+            await session.flush()
+            for offset, lat in ((0.0, LAT), (240.0, LAT + 0.036)):  # ~4 km in 4 minutes
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec.id,
+                        journey_id=journey.id,
+                        t_offset_s=offset,
+                        captured_at=base + timedelta(seconds=offset),
+                        lat=lat,
+                        lon=LON,
+                        has_fix=True,
+                        speed_kmh=60.0,
+                    )
+                )
+            await session.flush()
+            journey_id = journey.id
+            await session.commit()
+
+        async with session_scope() as session:
+            journey = (
+                await session.execute(select(Journey).where(Journey.id == journey_id))
+            ).scalar_one()
+            await JourneyBuilder().refresh(session, journey)
+            await session.commit()
+
+        async with session_scope() as session:
+            journey = (
+                await session.execute(select(Journey).where(Journey.id == journey_id))
+            ).scalar_one()
+        assert (journey.distance_m or 0) > 3_000, "a real 4 km leg was thrown away"
+
+    async def test_refresh_repoints_the_telemetry(self, two_fix_journey):
+        """Routes heal wherever refresh runs, not only on first attach."""
+        async with session_scope() as session:
+            await session.execute(
+                update(TelemetryPoint)
+                .where(TelemetryPoint.journey_id == two_fix_journey)
+                .values(journey_id=None)
+            )
+            await session.commit()
+
+        async with session_scope() as session:
+            journey = (
+                await session.execute(select(Journey).where(Journey.id == two_fix_journey))
+            ).scalar_one()
+            await JourneyBuilder().refresh(session, journey)
+            await session.commit()
+
+        async with session_scope() as session:
+            attached = (
+                await session.execute(
+                    select(func.count(TelemetryPoint.id)).where(
+                        TelemetryPoint.journey_id == two_fix_journey
+                    )
+                )
+            ).scalar()
+        assert attached == 2, "refresh left the telemetry orphaned; the route map stays empty"
+
+
+class TestRepairRevisitsBadDistances:
+    """A wrong number already in the database has to be reachable again.
+
+    Recomputing on "never computed" alone is not enough: a journey that already holds an
+    impossible distance is not null, so nothing would ever ask it to try again, and the
+    fix for the bug that produced it would never reach the row it produced.
+    """
+
+    @pytest.fixture
+    async def journey_with_a_bad_distance(self, db_session):
+        base = datetime(2026, 8, 4, 8, 51, tzinfo=UTC)
+        async with session_scope() as session:
+            journey = Journey(
+                started_at=base,
+                ended_at=base + timedelta(seconds=120),
+                duration_s=120.0,
+                # What the live library actually held: 36.7 km in two minutes.
+                distance_m=36_700.0,
+                has_gps=True,
+            )
+            session.add(journey)
+            await session.flush()
+            rec = Recording(
+                rel_path="bad.ts",
+                filename="bad.ts",
+                size_bytes=1,
+                state=RecordingState.COMPLETED,
+                journey_id=journey.id,
+                started_at=base,
+                ended_at=base + timedelta(seconds=120),
+            )
+            session.add(rec)
+            await session.flush()
+            for offset, lon in ((0.0, 138.6403), (1.0, 139.0422)):
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec.id,
+                        journey_id=journey.id,
+                        t_offset_s=offset,
+                        captured_at=base + timedelta(seconds=offset),
+                        lat=-34.8147,
+                        lon=lon,
+                        has_fix=True,
+                        speed_kmh=30.0,
+                    )
+                )
+            await session.flush()
+            return journey.id
+
+    async def test_an_impossible_distance_is_recomputed(self, journey_with_a_bad_distance):
+        async with session_scope() as session:
+            assert await JourneyBuilder().repair_stale(session) == 1
+            await session.commit()
+
+        async with session_scope() as session:
+            journey = (
+                await session.execute(
+                    select(Journey).where(Journey.id == journey_with_a_bad_distance)
+                )
+            ).scalar_one()
+            implied = ((journey.distance_m or 0) / 1000) / (journey.duration_s / 3600)
+        assert implied < 200, f"still reporting {implied:.0f} km/h"
+
+    async def test_a_believable_distance_is_left_alone(self, db_session):
+        base = datetime(2026, 8, 4, 8, 51, tzinfo=UTC)
+        async with session_scope() as session:
+            session.add(
+                Journey(
+                    started_at=base,
+                    ended_at=base + timedelta(minutes=20),
+                    duration_s=1200.0,
+                    distance_m=16_000.0,  # 48 km/h
+                    has_gps=True,
+                )
+            )
             await session.flush()
             await session.commit()
 
