@@ -126,6 +126,65 @@ _FLAT_FRAME_STDDEV = 12.0
 #: rather than a genuinely green scene. Real foliage never comes close.
 _GREEN_DOMINANCE = 1.6
 
+#: Fraction of rows that may look like a column smear before the frame is rejected.
+#:
+#: Measured over 185 thumbnails sampled across the whole library plus decoded frames from
+#: the two broken clips: legitimate content peaks at 0.008 and averages 0.0002, while the
+#: smeared frames score 0.88 and 0.57. The threshold sits twelve times above anything real.
+_SMEAR_ROW_FRACTION = 0.10
+
+#: A row counts as smeared when it has horizontal detail, almost no vertical difference
+#: from the row below it, and the second is small even relative to the first. All three
+#: are needed: the first two alone would catch a genuinely flat sky.
+_SMEAR_MIN_DX = 2.0
+_SMEAR_MAX_DY = 1.0
+_SMEAR_DY_DX_RATIO = 0.25
+
+#: Columns to reduce to before measuring, so the score does not depend on resolution.
+_SMEAR_SAMPLE_COLUMNS = 480
+
+#: The burnt-in telemetry banner runs along the bottom and is legitimately low-contrast
+#: vertically, so it is excluded rather than allowed to bias the measurement.
+_SMEAR_IGNORE_BOTTOM = 0.08
+
+
+def smear_fraction(frame: np.ndarray) -> float:
+    """How much of the frame is a replicated row rather than a picture.
+
+    When a transport stream is cut short, the decoder still emits frames for the missing
+    tail: it takes the last macroblock row it managed to decode and repeats it downwards.
+    The result is a field of vertical stripes, which is the single most common bad
+    thumbnail in this library -- and it is invisible to a variance test, because it is not
+    flat. It is the opposite of flat. Measured on the live server, one such frame scored
+    80.01 on ``frame_quality`` while the clean frame from the same file scored 34.41, so
+    the corruption was not merely tolerated, it was *preferred*.
+
+    What separates it is direction. A real scene varies both across and down; a smear
+    varies only across. Per row this compares the mean absolute difference to the row
+    below against the mean absolute difference along the row itself.
+    """
+    if frame is None or frame.size == 0:
+        return 0.0
+
+    grey = frame.mean(axis=2) if frame.ndim == 3 else frame.astype(np.float64)
+    height, width = grey.shape[:2]
+    if height < 8 or width < 8:
+        return 0.0
+
+    keep = max(4, int(height * (1.0 - _SMEAR_IGNORE_BOTTOM)))
+    grey = grey[:keep]
+    if width > _SMEAR_SAMPLE_COLUMNS:
+        columns = np.linspace(0, width - 1, _SMEAR_SAMPLE_COLUMNS).astype(np.int32)
+        grey = grey[:, columns]
+
+    dx = np.abs(np.diff(grey, axis=1)).mean(axis=1)[:-1]
+    dy = np.abs(np.diff(grey, axis=0)).mean(axis=1)
+    if dx.size == 0:
+        return 0.0
+
+    smeared = (dx > _SMEAR_MIN_DX) & (dy < _SMEAR_MAX_DY) & (dy < _SMEAR_DY_DX_RATIO * dx)
+    return float(smeared.mean())
+
 
 def frame_quality(frame: np.ndarray) -> float:
     """Score how much of a real picture a frame contains. Higher is better, 0 is unusable.
@@ -141,6 +200,11 @@ def frame_quality(frame: np.ndarray) -> float:
     # Detail. A real scene has structure at every scale; a fill has none.
     detail = float(frame.std())
     if detail < _FLAT_FRAME_STDDEV:
+        return 0.0
+
+    # Checked before the variance tests below, because a smear passes all of them with a
+    # high score. This is the failure the user actually sees in the recordings list.
+    if smear_fraction(frame) > _SMEAR_ROW_FRACTION:
         return 0.0
 
     if frame.ndim == 3 and frame.shape[2] >= 3:
@@ -174,8 +238,15 @@ async def _choose_thumbnail(
     most likely to be mid-GOP after a truncated write.
     """
     span = duration_s or 4.0
-    # Spread across the clip, skipping the very start where damage concentrates.
-    candidates = [t for t in (span * 0.25, span * 0.5, span * 0.75, 1.0, 0.0) if t < span]
+    # Spread across the clip, with the start second rather than last.
+    #
+    # The old order put 0.0 at the end, on the reasoning that damage concentrates in the
+    # first seconds. On this corpus the opposite is true: the files that produce a bad
+    # thumbnail are truncated at the *end*, so every offset derived from the span lands in
+    # the missing tail and only 0.0 has a picture. Combined with the early break below,
+    # 0.0 was then never reached -- the smear scored 80 and stopped the search on the first
+    # candidate, while the frame that would have worked sat unused at the end of the list.
+    candidates = [t for t in (span * 0.5, 0.0, span * 0.25, span * 0.75, 1.0) if t < span]
 
     best_frame: np.ndarray | None = None
     best_score = 0.0
@@ -278,6 +349,7 @@ async def stage_inspect(
     recording.probe_json = {
         "warnings": info.warnings,
         "pts_wrapped": info.pts_wrapped,
+        "truncated": info.truncated,
         "source_damaged": bool(info.warnings),
     }
 

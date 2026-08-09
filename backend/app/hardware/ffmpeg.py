@@ -61,6 +61,19 @@ MIN_PLAUSIBLE_BITRATE = 100_000
 #: recording here runs at 43 Mbps, so this sits nearly five times above anything genuine.
 MAX_PLAUSIBLE_BITRATE = 200_000_000
 
+#: The fixed packet size of an MPEG transport stream.
+#:
+#: A complete .ts is a whole number of these, so a file that ends part-way through one was
+#: cut short. It is the only evidence of truncation this application can see: everything
+#: else it checks is a self-consistency test, and truncation removes the bytes and the
+#: timestamps that referenced them together, so a partial file is perfectly self-consistent
+#: and reports a completely ordinary bitrate.
+#:
+#: Measured across the library: 551 of 678 files are packet-aligned and 127 are not -- and
+#: all 127 of the misaligned ones are an exact multiple of 64 KiB, against 7 of the 551
+#: aligned ones. That is a buffered copy that stopped, not a camera that wrote badly.
+TS_PACKET_BYTES = 188
+
 #: Beyond this a "frame rate" is ffprobe's estimator misfiring, not a real camera.
 MAX_PLAUSIBLE_FPS = 120.0
 MIN_PLAUSIBLE_FPS = 1.0
@@ -164,6 +177,8 @@ class ProbeResult:
 
     #: True when the reported duration was a wrapped 33-bit PTS and had to be recomputed.
     pts_wrapped: bool = False
+    #: True when the file ends part-way through a transport packet, i.e. it is incomplete.
+    truncated: bool = False
     #: Non-fatal oddities worth recording against the recording row.
     warnings: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
@@ -438,6 +453,17 @@ async def probe(path: Path | str, *, timeout: float = DEFAULT_PROBE_TIMEOUT) -> 
     result.duration_s = duration
     if duration is not None and duration <= 0:
         result.warnings.append("duration is zero or negative")
+
+    # Incomplete file, as opposed to a file that decodes badly. The distinction matters to
+    # the user: "damaged file" is an answer, whereas a thumbnail of decoder smear looks
+    # like the application misbehaving. Only meaningful for transport streams.
+    remainder = result.size_bytes % TS_PACKET_BYTES
+    if remainder and (p.suffix.lower() == ".ts" or "mpegts" in (result.container or "")):
+        result.truncated = True
+        result.warnings.append(
+            f"file ends {remainder} bytes into a {TS_PACKET_BYTES}-byte transport packet, "
+            "so the recording is incomplete"
+        )
 
     if identity is not None:
         if len(_probe_cache) >= _PROBE_CACHE_MAX:

@@ -51,7 +51,12 @@ def install_error_handlers(app: FastAPI) -> None:
         scrolled back to year one. The parameter bounds in ``deps.py`` are what actually
         prevent it; this catches whatever is added later without them.
         """
-        log.warning("value out of range", path=str(request.url.path), error=str(exc))
+        # log.exception, not log.warning: every diagnosis in this application is read out
+        # of the traceback this writes into log_entries.context.exception, and "OverflowError:
+        # Python int too large" alone does not say whether it came from a bound parameter
+        # or from arithmetic of our own. With the bounds in deps.py in front of it this
+        # should now fire only for the latter, which is exactly when the traceback matters.
+        log.exception("value out of range", path=str(request.url.path), error=str(exc))
         return _envelope(
             "out_of_range",
             "A value in the request is out of range.",
