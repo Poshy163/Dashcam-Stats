@@ -327,6 +327,40 @@ zoomed out and beads into disconnected blobs when zoomed in.
 
 ---
 
+## 5.2 Failures that reported success
+
+A theme worth naming, because it has now happened often enough to be the thing this
+codebase is actually prone to. Almost every serious defect found here has been a **write or
+a stage that did nothing and said it worked** — not a crash, not an exception, but a green
+log line over an empty result. They are invisible to smoke tests, which check that an
+operation returns, and to type checkers, which check that it could.
+
+The ones found so far, each caught only by comparing what the code claimed against what the
+database or the deployment actually held:
+
+| What reported success | What actually happened |
+| --- | --- |
+| `get_session` on every API write | Never committed; the reprocess the user asked for never ran |
+| Migration 0003's first version | `sa.JSON` applies its bind processor to the assignment but not the comparison, so the `WHERE` matched no rows |
+| `JourneyBuilder.rebuild` | Deleted every journey; SQLite reissued the freed row id, so the reassignment was a no-op to the unit of work and no `UPDATE` was emitted |
+| The PTS-wrap clamp | Tested for a duration *above* the wrap period, which a wrap never produces |
+| The detection stage | Weights 404'd on every attempt; recordings still finished as `completed` with zero objects |
+| Logs/Plates pagination | Set the page then deleted it on the next line |
+| Job diagnostics | Only the heartbeat wrote them, and it is cancelled before the final values exist |
+
+The lesson that generalises: **a test that asserts an operation returned proves nothing.**
+Every fix above is now pinned by a test that was first watched to fail with the fix
+reverted — and twice that check found the *test* was wrong rather than the code, which is
+the same class of error one level up.
+
+The design rule that follows: where a write must happen, express it as a statement whose
+effect does not depend on what the ORM believes, and assert on the resulting state rather
+than on the call. Where a count is shown to a user, carry enough context to say whether the
+thing producing it was working — see `FeatureStatus` in `/api/status` and `emptyStateFor`
+in the recording viewer, both of which exist so a zero cannot masquerade as a measurement.
+
+---
+
 ## 6. Retention safety
 
 Retention refuses to act unless **every** guard passes:
@@ -343,6 +377,26 @@ Retention refuses to act unless **every** guard passes:
 
 Failing any guard produces a report and a log entry, never a deletion. This is covered by
 dedicated tests, including the "share unmounted / empty / wrong filesystem" cases.
+
+**The scanner needs the same posture, and did not have it.** Retention refuses to delete
+files from a directory it cannot vouch for, but the scanner could do equivalent damage from
+the other side: marking a recording `file_missing` is a destructive conclusion drawn from an
+absence, and an absence is exactly what a broken mount looks like. Because `/dashcam` is a
+bind mount, an empty or unmounted host source still presents as an existing directory — the
+existence check passes, the walk yields nothing, no exception is raised, and every indexed
+recording is stamped missing with a `deleted_at` while the run is recorded as a clean
+success.
+
+The second-order effect is worse than the first. `evaluate_safety` counts only rows *not*
+flagged missing, and guard 4 passes trivially when the index is empty. So zeroing the index
+disarms the one retention check designed to notice a wrong mount, using precisely the event
+it exists to detect.
+
+The scanner now declines to reconcile deletions at all when its view of the share is not
+worth trusting: any directory it could not read, a walk that found nothing while recordings
+are indexed, or a file count that has fallen below half the index. It records why on the
+scan run rather than reporting a green scan, because "found nothing" and "could not look"
+must not look the same to an operator either.
 
 ---
 

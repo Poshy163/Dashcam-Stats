@@ -20,7 +20,7 @@ import {
   formatDuration,
   formatSpeed,
 } from '@/lib/format'
-import type { TelemetryPoint } from '@/lib/types'
+import type { StageState, TelemetryPoint } from '@/lib/types'
 
 const REPROCESS_OPTIONS = [
   ['everything', 'Everything'],
@@ -56,6 +56,28 @@ function findPoint(points: TelemetryPoint[], t: number): TelemetryPoint | null {
     }
   }
   return best ?? points[0]!
+}
+
+/**
+ * What an empty result actually means for a stage.
+ *
+ * "No objects detected in this recording" is a claim about the footage. When the stage
+ * never ran it is not merely unhelpful, it is false — and it is exactly the empty state
+ * that let a total detection outage sit unnoticed across 671 recordings, because nothing
+ * on any screen distinguished "analysed, found nothing" from "never analysed". The API has
+ * always sent the stage state; no component read it.
+ */
+function emptyStateFor(stage: StageState, noun: string): string {
+  switch (stage) {
+    case 'done':
+      return `No ${noun} in this recording.`
+    case 'failed':
+      return `Analysis failed for this recording, so no ${noun} were recorded. Reprocess to try again.`
+    case 'running':
+      return `Analysis is still running; ${noun} will appear when it finishes.`
+    default:
+      return `This recording has not been analysed for ${noun}. Reprocess it to fill this in.`
+  }
 }
 
 export default function RecordingViewer() {
@@ -223,7 +245,7 @@ export default function RecordingViewer() {
             </div>
 
             {tracks.length === 0 ? (
-              <p className="hint">No objects detected in this recording.</p>
+              <p className="hint">{emptyStateFor(r.detectionState, 'objects detected')}</p>
             ) : (
               <div className="relative h-14 w-full overflow-hidden rounded bg-surface-sunken">
                 {tracks.map((track) => {
@@ -319,7 +341,7 @@ export default function RecordingViewer() {
                 ))}
               </ul>
             ) : (
-              <p className="hint">No plates read in this recording.</p>
+              <p className="hint">{emptyStateFor(r.plateState, 'plates read')}</p>
             )}
           </section>
 

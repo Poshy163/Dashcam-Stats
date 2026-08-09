@@ -67,11 +67,73 @@ class ScanSummary:
     warnings: list[str] = field(default_factory=list)
 
 
+#: How far the file count may fall below the index before a scan refuses to conclude that
+#: the difference is deletion. Mirrors the retention guard in :mod:`app.retention.safety`
+#: on purpose: the two are answering the same question — does this directory look like the
+#: one we indexed? — and they should not be able to disagree.
+_DISK_VS_INDEX_MIN_RATIO = 0.5
+
+
 class Scanner:
     """Walks the footage root and keeps the ``recordings`` index in step with it."""
 
     def __init__(self, footage_dir: Path | None = None) -> None:
         self._footage_dir_override = footage_dir
+        #: Directories the walk could not read during the current scan.
+        self._walk_errors = 0
+
+    async def _reconciliation_blocked(self, summary: ScanSummary) -> str | None:
+        """Why this scan must not conclude anything is missing, or ``None`` if it may.
+
+        Marking a file missing is a destructive conclusion drawn from an absence, and an
+        absence is exactly what a broken mount looks like. The footage directory is bind
+        mounted, so if the host source is empty or unmounted when the container starts,
+        the path still exists, the walk yields nothing, no exception is raised — and every
+        indexed recording gets stamped ``file_missing`` with a ``deleted_at`` timestamp
+        while the run is recorded as a clean success.
+
+        The damage does not stop at the index. ``evaluate_safety`` counts only rows that
+        are *not* flagged missing, and its consistency guard passes when the index is
+        empty. So zeroing the index disarms the one retention check designed to notice a
+        wrong or partial mount, using the very event it exists to detect.
+
+        Retention already refuses to act on a directory it cannot vouch for. The scanner
+        needs the same posture from the other side: reconcile deletions only from a view
+        of the share that is worth trusting.
+        """
+        if summary.errors:
+            return (
+                f"{summary.errors} error(s) during the walk; the view of the share is "
+                "incomplete, so nothing is being marked missing"
+            )
+
+        indexed = await self._indexed_count()
+        if indexed == 0:
+            return None
+
+        if summary.seen == 0:
+            return (
+                f"the footage directory looks empty while {indexed} recordings are "
+                "indexed; treating that as an unavailable share rather than as deletions"
+            )
+        if summary.seen < indexed * _DISK_VS_INDEX_MIN_RATIO:
+            return (
+                f"only {summary.seen} files found against {indexed} indexed; a drop this "
+                "large is a mount problem far more often than it is real deletion"
+            )
+        return None
+
+    @staticmethod
+    async def _indexed_count() -> int:
+        async with session_scope() as session:
+            return int(
+                (
+                    await session.execute(
+                        select(func.count(Recording.id)).where(Recording.file_missing.is_(False))
+                    )
+                ).scalar()
+                or 0
+            )
 
     async def _footage_dir(self) -> Path:
         if self._footage_dir_override is not None:
@@ -115,6 +177,10 @@ class Scanner:
                             # A single unreadable entry must not abort the whole scan.
                             continue
             except OSError as exc:
+                # Counted, not just logged. A directory that becomes unreadable partway
+                # through leaves a partial view of the share, and the caller has to know
+                # that before it decides anything is missing.
+                self._walk_errors += 1
                 log.warning("could not read directory", path=str(current), error=str(exc))
 
     # -- scan --------------------------------------------------------------------------
@@ -122,6 +188,7 @@ class Scanner:
     async def scan(self, trigger: str = "scheduled") -> ScanSummary:
         started = time.monotonic()
         summary = ScanSummary()
+        self._walk_errors = 0
         settings = get_settings_service()
 
         root = await self._footage_dir()
@@ -167,7 +234,14 @@ class Scanner:
             summary.error_message = f"{type(exc).__name__}: {exc}"
             log.exception("scan failed", error=str(exc))
 
-        summary.missing = await self._mark_missing(seen_paths, summary)
+        summary.errors += self._walk_errors
+        skip_reason = await self._reconciliation_blocked(summary)
+        if skip_reason is None:
+            summary.missing = await self._mark_missing(seen_paths, summary)
+        else:
+            summary.error_message = summary.error_message or skip_reason
+            log.warning("skipped marking files missing", reason=skip_reason, seen=summary.seen)
+
         await self._finish_run(run_id, summary, started)
 
         # Exactly one line per scan. One per file would bury everything else in the log.

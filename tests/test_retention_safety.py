@@ -252,3 +252,93 @@ class TestExecution:
         assert run.deleted_count == 0
         for name in names:
             assert (footage / name).exists(), f"{name} was deleted without opt-in"
+
+
+class TestScannerDoesNotWipeTheIndex:
+    """The scanner must fail closed on a share it cannot vouch for.
+
+    Retention refuses to delete from a directory that looks wrong. The scanner had no such
+    posture, and it could do equivalent damage from the other side: an empty or unmounted
+    share makes every indexed recording look deleted.
+
+    The bind mount is what makes this so easy to hit. If the host source is empty or
+    unmounted when the container starts, Docker still presents ``/dashcam`` as an existing
+    directory — so the existence check passes, the walk yields nothing, no exception is
+    raised, and all 674 rows are stamped ``file_missing`` with a ``deleted_at`` while the
+    run is recorded as a clean success.
+
+    The second-order damage is worse than the first. ``evaluate_safety`` counts only rows
+    that are not flagged missing, and its consistency guard passes trivially when the index
+    is empty — so zeroing the index disarms the one retention check designed to notice a
+    wrong mount, using exactly the event it exists to detect.
+    """
+
+    @pytest.fixture
+    async def indexed_library(self, db_session, tmp_path):
+        from app.db.models import Recording, RecordingState
+        from app.db.session import session_scope
+
+        footage = tmp_path / "share"
+        footage.mkdir(exist_ok=True)
+        async with session_scope() as session:
+            for index in range(20):
+                session.add(
+                    Recording(
+                        rel_path=f"lib_{index}.ts",
+                        filename=f"lib_{index}.ts",
+                        size_bytes=1024,
+                        state=RecordingState.COMPLETED,
+                    )
+                )
+            await session.flush()
+        return footage
+
+    async def _still_indexed(self) -> int:
+        from sqlalchemy import func, select
+
+        from app.db.models import Recording
+        from app.db.session import session_scope
+
+        async with session_scope() as session:
+            return int(
+                (
+                    await session.execute(
+                        select(func.count(Recording.id)).where(Recording.file_missing.is_(False))
+                    )
+                ).scalar()
+                or 0
+            )
+
+    async def test_an_empty_share_does_not_delete_the_index(self, indexed_library):
+        from app.scanner.discovery import Scanner
+
+        assert await self._still_indexed() == 20
+        summary = await Scanner(footage_dir=indexed_library).scan(trigger="test")
+
+        assert await self._still_indexed() == 20, (
+            "an empty footage directory wiped the index; a share that failed to mount "
+            "looks exactly like this"
+        )
+        assert summary.missing == 0
+        assert summary.error_message, "the operator must be told the scan drew no conclusions"
+
+    async def test_a_large_unexplained_drop_is_treated_as_a_mount_problem(self, indexed_library):
+        from app.scanner.discovery import Scanner
+
+        # Two of twenty present: real deletion on that scale is far rarer than a share
+        # that came back half-mounted.
+        for index in range(2):
+            (indexed_library / f"lib_{index}.ts").write_bytes(b"\x00" * 16)
+
+        await Scanner(footage_dir=indexed_library).scan(trigger="test")
+        assert await self._still_indexed() == 20
+
+    async def test_ordinary_deletion_is_still_reconciled(self, indexed_library):
+        """The guard must not be so cautious that the index never keeps up."""
+        from app.scanner.discovery import Scanner
+
+        for index in range(18):
+            (indexed_library / f"lib_{index}.ts").write_bytes(b"\x00" * 16)
+
+        summary = await Scanner(footage_dir=indexed_library).scan(trigger="test")
+        assert summary.missing == 2, "two genuinely absent files should have been reconciled"
