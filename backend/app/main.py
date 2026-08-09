@@ -7,6 +7,7 @@ external services.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -25,6 +26,7 @@ from app.config import get_config
 from app.core.logging import configure_logging, get_logger, install_db_sink, shutdown_db_sink
 from app.core.settings_service import get_settings_service, init_settings_service
 from app.db.session import dispose_engine, get_session_factory, init_db
+from app.pipeline.stages import warm_models
 from app.workers.scheduler import get_scheduler
 from app.workers.worker import get_worker_pool
 
@@ -73,10 +75,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await pool.start()
     await scheduler.start()
 
+    # Deliberately not awaited: compiling the models takes about a minute on the iGPU, and
+    # blocking here would delay the health check and the UI for no benefit. The first job
+    # simply waits on the same shared cache this fills.
+    warm = asyncio.create_task(warm_models(), name="warm-models")
+
     try:
         yield
     finally:
         log.info("shutting down")
+        warm.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await warm
         await scheduler.stop()
         await pool.stop()
         await shutdown_db_sink()

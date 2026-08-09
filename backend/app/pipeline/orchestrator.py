@@ -140,6 +140,18 @@ async def run_stages(
 
         if attr:
             setattr(recording, attr, StageState.RUNNING)
+            # Commit the marker immediately, and do not carry it into the stage.
+            #
+            # Leaving the object dirty is enough to hold SQLite's write lock for the whole
+            # stage: autoflush fires on the stage's first query, takes the lock, and the
+            # transaction then stays open until the stage returns. With a model compiling
+            # for the iGPU that is two minutes, and everything else that writes -- the
+            # other worker claiming its next job, the scheduler reclaiming stale ones, the
+            # log sink -- blows past its busy timeout and fails with "database is locked".
+            #
+            # The stage's own writes take the lock when they happen, which is brief and
+            # near the end. What must not happen is taking it *before* the long work.
+            await session.commit()
         if progress:
             progress(name, index / total)
 

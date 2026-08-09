@@ -298,7 +298,16 @@ class TestTheWriteLockIsNotHeldAcrossAStage:
         observed: dict[str, object] = {}
 
         async def slow_stage(session, recording, *, progress=None):
-            """Stands in for a decode: does no database work, takes real time."""
+            """Stands in for a real stage: reads first, then does long non-database work.
+
+            The read is the point. Marking the stage RUNNING leaves the recording dirty,
+            and the stage's first query autoflushes it -- taking the write lock before the
+            long work rather than after it. A fake stage that never queries misses the bug
+            entirely, which is exactly what this test used to do.
+            """
+            from app.db.models import Camera
+
+            await session.execute(select(Camera).limit(1))
             try:
                 async with session_scope() as other:
                     other.add(

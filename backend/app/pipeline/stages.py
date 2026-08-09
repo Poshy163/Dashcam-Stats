@@ -410,6 +410,28 @@ async def _shared_plate_models() -> tuple[PlateDetector, PlateOCR] | None:
         return (detector, ocr) if detector.available and ocr.available else None
 
 
+async def warm_models() -> None:
+    """Build the inference sessions before any job needs one.
+
+    Compiling a network for the iGPU takes on the order of a minute the first time, and
+    the OpenVINO cache only helps on subsequent starts. Doing it here means that cost lands
+    once, in the background, on a process that has just started -- rather than inside the
+    first recording's detection stage, where it looks exactly like a stalled job.
+
+    Failures are deliberately swallowed. This is an optimisation: if a model cannot be
+    built now, the stage that needs it will report itself unavailable in the normal way,
+    and the container must still start.
+    """
+    settings = get_settings_service()
+    try:
+        if bool(settings.get_nowait("processing.detection_enabled")):
+            await _shared_detector(str(settings.get_nowait("processing.detection_model")))
+        if bool(settings.get_nowait("plates.enabled")):
+            await _shared_plate_models()
+    except Exception as exc:
+        log.warning("could not warm inference models", error=f"{type(exc).__name__}: {exc}")
+
+
 async def stage_telemetry(
     session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
 ) -> StageResult:

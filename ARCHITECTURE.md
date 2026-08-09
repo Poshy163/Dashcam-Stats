@@ -365,6 +365,37 @@ It loads the *same* active region and learned templates the telemetry stage uses
 discrepancy is real rather than an artefact of the tool — a debug view that quietly does
 something slightly different sends you looking in the wrong place.
 
+### The write lock is the scarcest thing in the process
+
+SQLite allows one writer. In WAL mode readers never block, so the only real contention is
+how long any single transaction holds the write lock — and `busy_timeout` does not save you,
+because a transaction that already holds the lock is not going to release it just because
+someone else is waiting.
+
+"database is locked" has surfaced three times here, each from a different route to the same
+mistake:
+
+1. **Reading before writing.** `claim_next` selected a candidate then updated it. A lock
+   *upgrade* returns `SQLITE_BUSY` immediately rather than waiting, so it failed instantly
+   under load. Fixed by making the claim a single `UPDATE ... WHERE id IN (SELECT ...)`.
+2. **Holding it across the work.** Marking a recording `PROCESSING` flushed, and the worker
+   kept that transaction open across every decode. Fixed by committing between stages.
+3. **Autoflush holding it across the work.** Setting a stage to `RUNNING` leaves the ORM
+   object dirty; the stage's *first query* then autoflushes it, taking the lock before the
+   long work rather than after. With a model compiling for the iGPU that is two minutes,
+   during which the other worker cannot claim a job, the scheduler cannot reclaim stale
+   ones, and the log sink drops entries. Fixed by committing the marker immediately.
+
+The third is the subtle one and it is worth stating as a rule: **an uncommitted ORM change
+is a write lock waiting to be taken.** It is not taken where the assignment is written, but
+at the next query anywhere in the call stack — which may be inside a function that has no
+idea a transaction is open. Anything that assigns to a mapped object and then does slow work
+should commit first.
+
+The corollary for tests: a fake stage that does no database work cannot reproduce this. The
+concurrency test only started catching it once its stage issued a query, which is what every
+real stage does.
+
 ---
 
 ## 5.2 Failures that reported success
