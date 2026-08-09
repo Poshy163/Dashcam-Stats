@@ -13,28 +13,13 @@ from __future__ import annotations
 
 from itertools import pairwise
 
-import httpx
 import pytest
-from httpx import ASGITransport
 from sqlalchemy import select
 
 from app.db.models import Plate, Recording, RecordingState
 from app.db.session import session_scope
 
-
-@pytest.fixture
-async def client(db_session):
-    """Talks to the real app over ASGI.
-
-    The lifespan is deliberately not run: it would start the worker pool and scheduler,
-    which these tests neither need nor want. `db_session` has already migrated the
-    database and initialised the settings service, which is what the routes depend on.
-    """
-    from app.main import app
-
-    transport = ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
+# The `client` fixture lives in conftest.py; several test modules now need it.
 
 
 @pytest.fixture
@@ -248,7 +233,30 @@ class TestDetailEndpoints:
         body = response.json()
         assert body["id"] == journey
         assert len(body["recordings"]) == 1
-        assert len(body["route"]) >= 2, "the map needs the route geometry"
+        assert body["route"], "the map needs the route geometry"
+        # Segments of points, not one flat line: the breaks between them are real.
+        assert sum(len(segment) for segment in body["route"]) >= 2
+
+    async def test_every_route_point_says_where_it_came_from(self, client, journey):
+        """The map's only interactive control depends on this.
+
+        Clicking the route opens the moment that was clicked, which is only possible if
+        each point still knows its recording and offset after simplification. Without it
+        the handler had to guess from the point's position in the array, and guessed the
+        first recording at *index* seconds every time.
+        """
+        body = (await client.get(f"/api/journeys/{journey}")).json()
+        recording_ids = {r["id"] for r in body["recordings"]}
+        assert recording_ids
+
+        points = [point for segment in body["route"] for point in segment]
+        assert points
+        for lat, lon, recording_id, offset in points:
+            assert isinstance(lat, float) and isinstance(lon, float)
+            assert recording_id in recording_ids, (
+                f"route point claims recording {recording_id}, which is not in this journey"
+            )
+            assert offset >= 0.0
 
     async def test_every_listed_journey_can_be_opened(self, client, journey):
         """Whatever the list offers, the detail route must serve — that is the link."""

@@ -129,8 +129,17 @@ class JourneyOut(ApiModel):
 
 class JourneyDetailOut(JourneyOut):
     recordings: list[RecordingOut] = Field(default_factory=list)
-    #: Simplified [lat, lon] pairs, fixes only. Gaps mean lost signal, not a straight line.
-    route: list[tuple[float, float]] = Field(default_factory=list)
+    #: Drawable segments, each ``[lat, lon, recording_id, t_offset_s]``.
+    #:
+    #: Segments rather than one line, because a journey is not one unbroken road: signal is
+    #: lost under cover, readings that fail validation are dropped, and clips can have
+    #: minutes between them. Joining across those draws a road that was never taken.
+    #:
+    #: Each point carries where it came from. Without that the map could only guess, and it
+    #: guessed badly — the click handler treated a point's position in the array as elapsed
+    #: seconds into the journey's first recording, so clicking the far end of a drive
+    #: opened the wrong clip at a time that had nothing to do with the place clicked.
+    route: list[list[tuple[float, float, int, float]]] = Field(default_factory=list)
 
 
 class TrackedObjectOut(ApiModel):
@@ -191,6 +200,15 @@ class VehicleOut(ApiModel):
     id: int
     class_label: str | None = None
     primary_plate: PlateOut | None = None
+    #: Where and when this was seen, so the sighting leads back to the footage.
+    #:
+    #: The row always carried these; the schema simply dropped them, which left the
+    #: Vehicles page showing ten thousand crops with no way to reach any of the recordings
+    #: they came from.
+    recording_id: int | None = None
+    first_seen_offset_s: float | None = None
+    lat: float | None = None
+    lon: float | None = None
     #: Null unless a classifier actually produced them. Nothing is inferred.
     make: str | None = None
     model: str | None = None

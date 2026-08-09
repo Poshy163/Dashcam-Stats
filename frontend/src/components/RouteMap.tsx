@@ -13,7 +13,8 @@ export interface MapMarker {
 }
 
 interface Props {
-  route?: [number, number][]
+  /** One line, or several. Several is the honest shape for a route with gaps in it. */
+  route?: [number, number][] | [number, number][][]
   markers?: MapMarker[]
   start?: [number, number] | null
   end?: [number, number] | null
@@ -21,7 +22,8 @@ interface Props {
   attribution?: string
   maxZoom?: number
   className?: string
-  onPointClick?: (lat: number, lon: number, index: number) => void
+  /** Index is within its segment, so the caller can look the point back up. */
+  onPointClick?: (lat: number, lon: number, index: number, segment: number) => void
 }
 
 const DEFAULT_TILES = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'
@@ -97,12 +99,29 @@ export default function RouteMap({
   className,
   onPointClick,
 }: Props) {
-  // Defend against callers passing points with no fix: the camera prints zeros when it
-  // has no lock, and plotting those would drag the map into the Atlantic.
-  const cleanRoute = useMemo(
-    () => route.filter(([lat, lon]) => Number.isFinite(lat) && Number.isFinite(lon) && (lat !== 0 || lon !== 0)),
+  // A route arrives either as one line or as several, and the several are the truthful
+  // shape: signal drops under cover and clips can be minutes apart, so a journey is a set
+  // of segments. A flat array is accepted as a single segment for callers that have one.
+  const segments = useMemo<[number, number][][]>(
+    () => (route.length > 0 && Array.isArray(route[0]![0]) ? route : [route]) as [number, number][][],
     [route],
   )
+
+  // Defend against callers passing points with no fix: the camera prints zeros when it
+  // has no lock, and plotting those would drag the map into the Atlantic.
+  const cleanSegments = useMemo(
+    () =>
+      segments
+        .map((segment) =>
+          segment.filter(
+            ([lat, lon]) =>
+              Number.isFinite(lat) && Number.isFinite(lon) && (lat !== 0 || lon !== 0),
+          ),
+        )
+        .filter((segment) => segment.length > 0),
+    [segments],
+  )
+  const cleanRoute = useMemo(() => cleanSegments.flat(), [cleanSegments])
   const cleanMarkers = useMemo(
     () => decimate(markers.filter((m) => Number.isFinite(m.lat) && Number.isFinite(m.lon) && (m.lat !== 0 || m.lon !== 0))),
     [markers],
@@ -131,33 +150,36 @@ export default function RouteMap({
       <TileLayer url={tileUrl} attribution={attribution} maxZoom={maxZoom} />
       <FitBounds points={allPoints} />
 
-      {cleanRoute.length > 1 && (
-        <Polyline
-          positions={cleanRoute}
-          pathOptions={{ color: '#3b82f6', weight: 4, opacity: 0.85 }}
-          eventHandlers={
-            onPointClick
-              ? {
-                  click: (e) => {
-                    // Snap to the nearest recorded fix so the caller can map the click
-                    // back to a specific moment in a recording.
-                    const { lat, lng } = e.latlng
-                    let best = 0
-                    let bestDistance = Infinity
-                    cleanRoute.forEach(([plat, plon], index) => {
-                      const d = (plat - lat) ** 2 + (plon - lng) ** 2
-                      if (d < bestDistance) {
-                        bestDistance = d
-                        best = index
-                      }
-                    })
-                    const point = cleanRoute[best]!
-                    onPointClick(point[0], point[1], best)
-                  },
-                }
-              : undefined
-          }
-        />
+      {cleanSegments.map((segment, segmentIndex) =>
+        segment.length > 1 ? (
+          <Polyline
+            key={segmentIndex}
+            positions={segment}
+            pathOptions={{ color: '#3b82f6', weight: 4, opacity: 0.85 }}
+            eventHandlers={
+              onPointClick
+                ? {
+                    click: (e) => {
+                      // Snap to the nearest recorded fix so the caller can map the click
+                      // back to a specific moment in a recording.
+                      const { lat, lng } = e.latlng
+                      let best = 0
+                      let bestDistance = Infinity
+                      segment.forEach(([plat, plon], index) => {
+                        const d = (plat - lat) ** 2 + (plon - lng) ** 2
+                        if (d < bestDistance) {
+                          bestDistance = d
+                          best = index
+                        }
+                      })
+                      const point = segment[best]!
+                      onPointClick(point[0], point[1], best, segmentIndex)
+                    },
+                  }
+                : undefined
+            }
+          />
+        ) : null,
       )}
 
       {start && <Marker position={start} icon={ICONS.start}><Popup>Start</Popup></Marker>}

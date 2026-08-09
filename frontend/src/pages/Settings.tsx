@@ -264,7 +264,7 @@ function Field({
     <div className="flex flex-wrap items-baseline gap-2">
       <span className="label">{setting.label}</span>
       {setting.unit && <span className="text-2xs text-content-faint">({setting.unit})</span>}
-      {!setting.isDefault && (
+      {setting.is_default === false && (
         <button className="text-2xs text-content-faint hover:text-accent" onClick={onReset}>
           reset to default
         </button>

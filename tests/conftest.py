@@ -179,6 +179,24 @@ async def db_session(app_config) -> AsyncIterator:
         await dispose_engine()
 
 
+@pytest.fixture
+async def client(db_session):
+    """Talks to the real app over ASGI.
+
+    The lifespan is deliberately not run: it would start the worker pool and scheduler,
+    which these tests neither need nor want. `db_session` has already migrated the
+    database and initialised the settings service, which is what the routes depend on.
+    """
+    import httpx
+    from httpx import ASGITransport
+
+    from app.main import app
+
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+
+
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "needs_ffmpeg: requires a real ffmpeg binary")
     config.addinivalue_line("markers", "slow: decodes video and takes a few seconds")

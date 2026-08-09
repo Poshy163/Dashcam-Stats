@@ -29,7 +29,11 @@ from app.api.schemas import (
 )
 from app.config import get_config
 from app.core.logging import get_logger
-from app.core.settings_service import SettingValidationError, get_settings_service
+from app.core.settings_service import (
+    SettingValidationError,
+    get_settings_service,
+    local_midnight_utc,
+)
 from app.db.models import (
     JobKind,
     Journey,
@@ -162,7 +166,13 @@ async def get_status(session: SessionDep):
         or 0
     )
 
-    midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    # "Today" is the user's day, not UTC's.
+    #
+    # UTC midnight is 09:30 in Adelaide, so counting from it filed the whole morning's
+    # driving as "not today" and pulled in the previous night's late drives instead. On
+    # 2026-08-08 the tile read 28 when 50 recordings were made that day. The pipeline
+    # already localises every OSD timestamp with this same setting.
+    midnight = local_midnight_utc()
     processing = StatusProcessing(
         completed=counts.get("completed", 0),
         pending=counts.get("discovered", 0)

@@ -107,10 +107,17 @@ export interface Journey {
   manual: boolean
 }
 
+/** One fix on a route: where it was, and which clip and moment it came from. */
+export type RoutePoint = [lat: number, lon: number, recordingId: number, offsetS: number]
+
 export interface JourneyDetail extends Journey {
   recordings: Recording[]
-  /** Simplified [lat, lon] pairs; fixes only, so gaps mean lost signal. */
-  route: [number, number][]
+  /**
+   * Drawable segments. Separate lines rather than one, because the breaks between them
+   * are real — lost signal or a gap between clips — and joining across them draws a road
+   * that was never taken.
+   */
+  route: RoutePoint[][]
 }
 
 export interface TrackedObject {
@@ -180,6 +187,11 @@ export interface Vehicle {
   lastSeenAt: string | null
   observationCount: number
   representativeCropPath: string | null
+  /** Where the sighting came from, so the crop leads back to the footage. */
+  recordingId: number | null
+  firstSeenOffsetS: number | null
+  lat: number | null
+  lon: number | null
 }
 
 export interface Job {
@@ -307,10 +319,16 @@ export interface SettingDef {
   choices: { value: string; label: string }[]
   unit: string | null
   dangerous: boolean
-  readOnly: boolean
   /** Key of a boolean setting that gates this one; used to grey out dependents. */
   requires: string | null
-  isDefault: boolean
+  // snake_case on purpose. Unlike every other response, settings are fetched with
+  // `rawKeys` so the dotted setting identifiers survive the round trip, which means these
+  // two arrive exactly as the backend spells them. Declaring them camelCase made both
+  // permanently `undefined`, and `!setting.isDefault` therefore always true — so a "reset
+  // to default" link appeared beside all forty controls on a fresh install, next to
+  // settings nobody had touched.
+  read_only: boolean
+  is_default: boolean
 }
 
 export interface SettingCategory {

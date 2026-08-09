@@ -56,6 +56,13 @@ export default function JourneyDetail() {
     }
   }, [settings.data])
 
+  // Coordinates only, for the map; the recording and offset on each point stay behind for
+  // the click handler to resolve.
+  const drawable = useMemo<[number, number][][]>(
+    () => (query.data?.route ?? []).map((segment) => segment.map(([lat, lon]) => [lat, lon])),
+    [query.data],
+  )
+
   if (query.isLoading) return <Spinner label="Loading journey…" className="py-24" />
   if (query.isError) return <ErrorState error={query.error} retry={() => query.refetch()} />
   if (!query.data) return null
@@ -105,16 +112,20 @@ export default function JourneyDetail() {
 
       {journey.hasGps ? (
         <RouteMap
-          route={journey.route}
+          route={drawable}
           start={start}
           end={end}
           className="h-[26rem] w-full"
           {...mapSettings}
-          onPointClick={(_lat, _lon, index) => {
-            // Map the clicked fix back to a moment: the route is time-ordered, so the
-            // index approximates elapsed seconds at the telemetry sample rate.
-            const first = journey.recordings[0]
-            if (first) navigate(`/recordings/${first.id}?t=${index}`)
+          onPointClick={(_lat, _lon, index, segment) => {
+            // Every point says which recording it came from and how far into it. It used
+            // to say neither: the click handler read the point's position in the array as
+            // elapsed seconds into the journey's *first* recording, so on a nine-clip
+            // journey every click anywhere on the route opened clip one within the first
+            // few seconds — and past that clip's length the browser silently clamped to
+            // its last frame. It looked like it worked every time.
+            const point = journey.route[segment]?.[index]
+            if (point) navigate(`/recordings/${point[2]}?t=${point[3]}`)
           }}
         />
       ) : (

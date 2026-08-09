@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import aliased, selectinload
 
 from app.api.deps import PaginationDep, SessionDep
+from app.api.geometry import build_polyline_indices
 from app.api.schemas import (
     JobOut,
     JourneyDetailOut,
@@ -29,10 +29,12 @@ from app.api.schemas import (
     VehicleOut,
 )
 from app.core.logging import get_logger
-from app.core.settings_service import get_settings_service
+from app.core.settings_service import get_settings_service, local_zone
 from app.db.models import (
     Camera,
+    CameraRole,
     JobKind,
+    JobState,
     Journey,
     Plate,
     PlateObservation,
@@ -50,14 +52,6 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/api", tags=["content"])
 
 
-def _local_zone() -> ZoneInfo:
-    """The timezone the user's date picker is expressing dates in."""
-    try:
-        return ZoneInfo(str(get_settings_service().get_nowait("general.timezone")))
-    except Exception:
-        return ZoneInfo("UTC")
-
-
 def _is_date_only(value: datetime) -> bool:
     return (value.hour, value.minute, value.second, value.microsecond) == (0, 0, 0, 0)
 
@@ -71,7 +65,7 @@ def _day_start(value: datetime) -> datetime:
     before being converted.
     """
     if value.tzinfo is None:
-        value = value.replace(tzinfo=_local_zone() if _is_date_only(value) else UTC)
+        value = value.replace(tzinfo=local_zone() if _is_date_only(value) else UTC)
     return value.astimezone(UTC)
 
 
@@ -287,38 +281,6 @@ async def list_journeys(
     return await _paginate(session, stmt.order_by(order), page, JourneyOut)
 
 
-def _simplify(points: list[tuple[float, float]], tolerance_m: float) -> list[tuple[float, float]]:
-    """Douglas-Peucker in degrees, with the tolerance converted from metres.
-
-    A long journey is tens of thousands of 1 Hz fixes; sending them all makes the map
-    sluggish for a line that looks identical at any usable zoom.
-    """
-    if len(points) < 3 or tolerance_m <= 0:
-        return points
-    tolerance = tolerance_m / 111_320.0
-
-    def rdp(subset: list[tuple[float, float]]) -> list[tuple[float, float]]:
-        if len(subset) < 3:
-            return subset
-        start, end = subset[0], subset[-1]
-        dx, dy = end[0] - start[0], end[1] - start[1]
-        norm = (dx * dx + dy * dy) ** 0.5
-        worst_index, worst = 0, -1.0
-        for i in range(1, len(subset) - 1):
-            px, py = subset[i]
-            if norm == 0:
-                distance = ((px - start[0]) ** 2 + (py - start[1]) ** 2) ** 0.5
-            else:
-                distance = abs(dy * px - dx * py + end[0] * start[1] - end[1] * start[0]) / norm
-            if distance > worst:
-                worst_index, worst = i, distance
-        if worst <= tolerance:
-            return [start, end]
-        return rdp(subset[: worst_index + 1])[:-1] + rdp(subset[worst_index:])
-
-    return rdp(points)
-
-
 @router.get("/journeys/{journey_id}", response_model=JourneyDetailOut)
 async def get_journey(journey_id: int, session: SessionDep):
     journey = await session.get(Journey, journey_id)
@@ -338,19 +300,68 @@ async def get_journey(journey_id: int, session: SessionDep):
         .all()
     )
 
+    # Ordered by clip, then by offset within it. Never by captured_at.
+    #
+    # SQLite sorts NULLs first, and a fix whose overlay carried a position but no readable
+    # timestamp has no captured_at — so every one of those was hoisted to the front of the
+    # route and then ordered by offset alone, interleaving clips recorded minutes and
+    # kilometres apart. On this library that was 120 of one journey's 740 fixes, from eight
+    # different recordings, and it turned a 9 km drive into a 200 km scribble of false
+    # chords across the city. Two thirds of the journeys with GPS were drawn that way.
+    #
+    # The camera and the clip are what actually order these points, and both are known.
     fixes = (
         await session.execute(
-            select(TelemetryPoint.lat, TelemetryPoint.lon)
+            select(
+                TelemetryPoint.lat,
+                TelemetryPoint.lon,
+                TelemetryPoint.captured_at,
+                TelemetryPoint.recording_id,
+                TelemetryPoint.t_offset_s,
+            )
+            .join(Recording, TelemetryPoint.recording_id == Recording.id)
+            .outerjoin(Camera, Recording.camera_id == Camera.id)
             .where(
                 TelemetryPoint.journey_id == journey_id,
                 TelemetryPoint.has_fix.is_(True),
+                TelemetryPoint.lat.is_not(None),
+                TelemetryPoint.lon.is_not(None),
+                # Front and rear film the same road; drawing both doubles every line.
+                (Camera.role == CameraRole.FRONT) | (Camera.id.is_(None)),
             )
-            .order_by(TelemetryPoint.captured_at.asc(), TelemetryPoint.t_offset_s.asc())
+            .order_by(
+                Recording.started_at.asc().nullslast(),
+                TelemetryPoint.recording_id.asc(),
+                TelemetryPoint.t_offset_s.asc(),
+            )
         )
     ).all()
 
     tolerance = float(get_settings_service().get_nowait("maps.route_simplify_m"))
-    route = _simplify([(lat, lon) for lat, lon in fixes if lat is not None], tolerance)
+    samples = [
+        (
+            float(row.lat),
+            float(row.lon),
+            row.captured_at.timestamp() if row.captured_at is not None else None,
+        )
+        for row in fixes
+    ]
+    # Segments, not one line: the shared helper breaks the route wherever joining two
+    # fixes would draw a road that was never taken. /api/map/routes has always done this;
+    # the journey view had its own copy of a simplifier and none of the splitting, so the
+    # same drive was drawn differently depending on which page asked for it.
+    route = [
+        [
+            (
+                round(fixes[i].lat, 6),
+                round(fixes[i].lon, 6),
+                fixes[i].recording_id,
+                round(fixes[i].t_offset_s or 0.0, 2),
+            )
+            for i in run
+        ]
+        for run in build_polyline_indices(samples, tolerance_m=tolerance)
+    ]
 
     # Validate against JourneyOut, not JourneyDetailOut. They differ by one field, and that
     # field is the whole problem: JourneyDetailOut declares `recordings`, so validating the
@@ -566,6 +577,10 @@ def _sighting_out(track: TrackedObject, plate: Plate | None) -> VehicleOut:
         primary_plate=PlateOut.model_validate(plate) if plate is not None else None,
         # make/model/colour stay null: nothing in this pipeline classifies them, and
         # inventing them would be worse than leaving the fields empty.
+        recording_id=track.recording_id,
+        first_seen_offset_s=track.first_seen_offset_s,
+        lat=track.lat,
+        lon=track.lon,
         first_seen_at=track.first_seen_at,
         last_seen_at=track.last_seen_at,
         observation_count=track.frame_count,
@@ -593,7 +608,14 @@ async def _plates_for_tracks(session, track_ids: list[int]) -> dict[int, Plate]:
 
 
 @router.get("/vehicles", response_model=Paginated[VehicleOut])
-async def list_vehicles(session: SessionDep, page: PaginationDep, class_label: str | None = None):
+async def list_vehicles(
+    session: SessionDep,
+    page: PaginationDep,
+    class_label: str | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    has_plate: bool | None = None,
+):
     """Vehicles actually seen, which live in ``tracked_objects``.
 
     This used to select from ``vehicles``, a table for *identity across sightings* that
@@ -612,6 +634,18 @@ async def list_vehicles(session: SessionDep, page: PaginationDep, class_label: s
         if class_label
         else TrackedObject.class_label.in_(_VEHICLE_CLASSES)
     )
+    # Filters, because ten thousand sightings at 24 to a page is 420 pages of Next.
+    if date_from:
+        stmt = stmt.where(TrackedObject.first_seen_at >= _day_start(date_from))
+    if date_to:
+        stmt = stmt.where(_before_end_of(TrackedObject.first_seen_at, date_to))
+    if has_plate is not None:
+        read = (
+            select(PlateObservation.id)
+            .where(PlateObservation.tracked_object_id == TrackedObject.id)
+            .exists()
+        )
+        stmt = stmt.where(read if has_plate else ~read)
 
     total = int(
         (
@@ -668,7 +702,32 @@ async def list_jobs(session: SessionDep, page: PaginationDep, state: str | None 
     )
     if state:
         stmt = stmt.where(ProcessingJob.state == state)
-    stmt = stmt.order_by(ProcessingJob.queued_at.desc())
+
+    # Newest-queued-first put the running job at the bottom of a 2,000-row list.
+    #
+    # The queue claims work oldest-first, so ordering the list newest-first placed the job
+    # actually running as far from page one as it is possible to be -- structurally, not by
+    # coincidence. With a backlog of any size the Queue page showed fifty identical jobs
+    # that had never started, the "Currently processing" panel rendered nothing, and the
+    # Running tile directly above it said 2.
+    recency = func.coalesce(
+        ProcessingJob.finished_at, ProcessingJob.started_at, ProcessingJob.queued_at
+    )
+    state_rank = case(
+        (ProcessingJob.state == JobState.RUNNING, 0),
+        (ProcessingJob.state == JobState.FAILED, 1),
+        (ProcessingJob.state == JobState.QUEUED, 3),
+        else_=2,
+    )
+    stmt = stmt.order_by(
+        state_rank,
+        # Pending work reads in the order it will be claimed, so the top of that section
+        # is what runs next; everything else reads newest first.
+        case((ProcessingJob.state == JobState.QUEUED, ProcessingJob.priority), else_=None).asc(),
+        case((ProcessingJob.state == JobState.QUEUED, ProcessingJob.queued_at), else_=None).asc(),
+        recency.desc(),
+        ProcessingJob.id.desc(),
+    )
 
     count_stmt = select(func.count(ProcessingJob.id))
     if state:

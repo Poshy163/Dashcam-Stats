@@ -26,6 +26,14 @@ export default function Logs() {
   const page = Number(params.get('page') ?? 1)
   const level = params.get('level') ?? ''
   const search = params.get('search') ?? ''
+  // Follows the URL as well as leading it — see the note in Recordings.tsx. Back, forward
+  // and an inbound filtered link all change the filter without touching this box.
+  const [draft, setDraft] = useState(search)
+  const [lastSearch, setLastSearch] = useState(search)
+  if (search !== lastSearch) {
+    setLastSearch(search)
+    setDraft(search)
+  }
 
   const query = useQuery({
     queryKey: ['logs', page, level, search],
@@ -85,7 +93,8 @@ export default function Logs() {
           <span className="label mb-1 block text-xs">Message contains</span>
           <input
             className="input"
-            defaultValue={search}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && update('search', e.currentTarget.value)}
             onBlur={(e) => update('search', e.target.value)}
           />

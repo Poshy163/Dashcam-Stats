@@ -7,6 +7,7 @@ import {
   ErrorState,
   JobStateBadge,
   PageHeader,
+  Pagination,
   ProgressBar,
   StatTile,
 } from '@/components/ui'
@@ -18,6 +19,7 @@ const STATES = ['', 'queued', 'running', 'failed', 'completed', 'cancelled']
 export default function Queue() {
   const [params, setParams] = useSearchParams()
   const state = params.get('state') ?? ''
+  const page = Number(params.get('page') ?? 1)
   const client = useQueryClient()
 
   const stats = useQuery({
@@ -28,9 +30,21 @@ export default function Queue() {
   const running = (stats.data?.running ?? 0) > 0
 
   const jobs = useQuery({
-    queryKey: ['jobs', state],
-    queryFn: () => api.jobs.list({ state: state || undefined, pageSize: 50 }),
+    queryKey: ['jobs', state, page],
+    queryFn: () => api.jobs.list({ state: state || undefined, page, pageSize: 50 }),
     // Poll quickly while something is in flight, slowly when idle.
+    refetchInterval: running ? 3_000 : 15_000,
+  })
+
+  // Its own query, not a filter over the table.
+  //
+  // "Currently processing" used to pick the running jobs out of whichever page of the
+  // table happened to be loaded, which meant it showed nothing whenever the user filtered
+  // by another state, paged away, or — as was true for the entire life of a backlog — the
+  // running job simply was not on page one.
+  const activeJobs = useQuery({
+    queryKey: ['jobs', 'running'],
+    queryFn: () => api.jobs.list({ state: 'running', pageSize: 20 }),
     refetchInterval: running ? 3_000 : 15_000,
   })
 
@@ -46,7 +60,14 @@ export default function Queue() {
   const retryOne = useMutation({ mutationFn: api.jobs.retry, onSuccess: invalidate })
   const cancel = useMutation({ mutationFn: api.jobs.cancel, onSuccess: invalidate })
 
-  const active = jobs.data?.items.filter((j) => j.state === 'running') ?? []
+  const active = activeJobs.data?.items ?? []
+
+  const setPage = (next: number) => {
+    const updated = new URLSearchParams(params)
+    if (next > 1) updated.set('page', String(next))
+    else updated.delete('page')
+    setParams(updated)
+  }
 
   return (
     <div className="space-y-4">
@@ -137,6 +158,8 @@ export default function Queue() {
             const next = new URLSearchParams(params)
             if (e.target.value) next.set('state', e.target.value)
             else next.delete('state')
+            // Page 4 of "failed" is rarely page 4 of "all".
+            next.delete('page')
             setParams(next)
           }}
         >
@@ -203,6 +226,15 @@ export default function Queue() {
             </tbody>
           </table>
         </div>
+      )}
+
+      {jobs.data && (
+        <Pagination
+          page={jobs.data.page}
+          pages={jobs.data.pages}
+          total={jobs.data.total}
+          onChange={setPage}
+        />
       )}
     </div>
   )

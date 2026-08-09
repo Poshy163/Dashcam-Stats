@@ -34,23 +34,16 @@ DEFAULT_MAX_GAP_S = 10.0
 DEFAULT_MAX_JUMP_M = 200.0
 
 
-def simplify(
-    points: Sequence[tuple[float, float]], tolerance_m: float
-) -> list[tuple[float, float]]:
-    """Douglas-Peucker with the tolerance given in metres.
+def simplify_indices(points: Sequence[tuple[float, float]], tolerance_m: float) -> list[int]:
+    """Which points Douglas-Peucker keeps, as indices into *points*.
 
-    A long journey is tens of thousands of 1 Hz fixes, and sending them all makes the map
-    sluggish to draw a line that is identical at any zoom a person can read.
-
-    Iterative rather than recursive. The textbook formulation recurses once per split, and
-    on a trace that is nearly straight — a motorway, exactly the case that produces the
-    most points — it degenerates towards one frame per point. A continuous twenty-minute
-    drive is over a thousand fixes, which is close enough to CPython's default limit that
-    a route overlay of a whole library would eventually raise ``RecursionError`` while
-    rendering a map.
+    Indices rather than points, because the caller often has more to say about a fix than
+    where it was — which recording it came from and how far into it — and that has to
+    survive simplification if a click on the map is to lead anywhere. See :func:`simplify`
+    for the algorithm and why it is iterative.
     """
     if len(points) < 3 or tolerance_m <= 0:
-        return list(points)
+        return list(range(len(points)))
 
     tolerance = tolerance_m / _METRES_PER_DEGREE
     keep = [False] * len(points)
@@ -83,7 +76,78 @@ def simplify(
             stack.append((first, worst_index))
             stack.append((worst_index, last))
 
-    return [point for point, kept in zip(points, keep, strict=True) if kept]
+    return [index for index, kept in enumerate(keep) if kept]
+
+
+def simplify(
+    points: Sequence[tuple[float, float]], tolerance_m: float
+) -> list[tuple[float, float]]:
+    """Douglas-Peucker with the tolerance given in metres.
+
+    A long journey is tens of thousands of 1 Hz fixes, and sending them all makes the map
+    sluggish to draw a line that is identical at any zoom a person can read.
+
+    Iterative rather than recursive. The textbook formulation recurses once per split, and
+    on a trace that is nearly straight — a motorway, exactly the case that produces the
+    most points — it degenerates towards one frame per point. A continuous twenty-minute
+    drive is over a thousand fixes, which is close enough to CPython's default limit that
+    a route overlay of a whole library would eventually raise ``RecursionError`` while
+    rendering a map.
+    """
+    return [points[index] for index in simplify_indices(points, tolerance_m)]
+
+
+def split_indices(
+    samples: Sequence[tuple[float, float, float | None]],
+    *,
+    max_gap_s: float = DEFAULT_MAX_GAP_S,
+    max_jump_m: float = DEFAULT_MAX_JUMP_M,
+) -> list[list[int]]:
+    """Runs of indices that should each be drawn as one unbroken line.
+
+    See :func:`split_at_gaps`, which is this with the indices resolved to points.
+    """
+    runs: list[list[int]] = []
+    current: list[int] = []
+    previous: tuple[float, float, float | None] | None = None
+
+    for index, sample in enumerate(samples):
+        lat, lon, seconds = sample
+        if previous is not None:
+            prev_lat, prev_lon, prev_seconds = previous
+            gapped = (
+                seconds is not None
+                and prev_seconds is not None
+                and (seconds - prev_seconds) > max_gap_s
+            )
+            jumped = haversine_m(prev_lat, prev_lon, lat, lon) > max_jump_m
+            if gapped or jumped:
+                if len(current) > 1:
+                    runs.append(current)
+                current = []
+        current.append(index)
+        previous = sample
+
+    if len(current) > 1:
+        runs.append(current)
+    return runs
+
+
+def build_polyline_indices(
+    samples: Sequence[tuple[float, float, float | None]],
+    *,
+    tolerance_m: float,
+    max_gap_s: float = DEFAULT_MAX_GAP_S,
+    max_jump_m: float = DEFAULT_MAX_JUMP_M,
+) -> list[list[int]]:
+    """:func:`build_polylines` as indices, for callers carrying more than coordinates."""
+    lines: list[list[int]] = []
+    for run in split_indices(samples, max_gap_s=max_gap_s, max_jump_m=max_jump_m):
+        points = [(samples[i][0], samples[i][1]) for i in run]
+        kept = [run[i] for i in simplify_indices(points, tolerance_m)]
+        if len(kept) > 1:
+            lines.append(kept)
+    return lines
 
 
 def split_at_gaps(
@@ -100,30 +164,10 @@ def split_at_gaps(
     breaking the line there would punch a hole in a real route to no purpose — so distance
     is what decides in that case.
     """
-    segments: list[list[tuple[float, float]]] = []
-    current: list[tuple[float, float]] = []
-    previous: tuple[float, float, float | None] | None = None
-
-    for sample in samples:
-        lat, lon, seconds = sample
-        if previous is not None:
-            prev_lat, prev_lon, prev_seconds = previous
-            gapped = (
-                seconds is not None
-                and prev_seconds is not None
-                and (seconds - prev_seconds) > max_gap_s
-            )
-            jumped = haversine_m(prev_lat, prev_lon, lat, lon) > max_jump_m
-            if gapped or jumped:
-                if len(current) > 1:
-                    segments.append(current)
-                current = []
-        current.append((lat, lon))
-        previous = sample
-
-    if len(current) > 1:
-        segments.append(current)
-    return segments
+    return [
+        [(samples[i][0], samples[i][1]) for i in run]
+        for run in split_indices(samples, max_gap_s=max_gap_s, max_jump_m=max_jump_m)
+    ]
 
 
 def build_polylines(
@@ -151,7 +195,10 @@ def build_polylines(
 __all__ = [
     "DEFAULT_MAX_GAP_S",
     "DEFAULT_MAX_JUMP_M",
+    "build_polyline_indices",
     "build_polylines",
     "simplify",
+    "simplify_indices",
     "split_at_gaps",
+    "split_indices",
 ]

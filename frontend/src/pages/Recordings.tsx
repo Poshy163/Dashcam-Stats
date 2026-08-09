@@ -51,6 +51,20 @@ export default function Recordings() {
     setParams(next)
   }
 
+  // The filename box is the one input that cannot be driven straight from the URL, because
+  // it only commits on blur or Enter. It still has to follow the URL rather than only lead
+  // it: Clear, the browser's Back button and an inbound filtered link all change the
+  // filters without touching the box. Left uncontrolled, it kept showing "TRUCK" and a date
+  // range over a list of all 678 recordings, while the three dropdowns beside it visibly
+  // reset — the form claiming one thing and the results below it another.
+  const urlSearch = params.get('search') ?? ''
+  const [search, setSearch] = useState(urlSearch)
+  const [lastUrlSearch, setLastUrlSearch] = useState(urlSearch)
+  if (urlSearch !== lastUrlSearch) {
+    setLastUrlSearch(urlSearch)
+    setSearch(urlSearch)
+  }
+
   const setView_ = (v: 'grid' | 'table') => {
     setView(v)
     localStorage.setItem('dashcam-recordings-view', v)
@@ -85,7 +99,8 @@ export default function Recordings() {
           <input
             className="input"
             placeholder="Search…"
-            defaultValue={params.get('search') ?? ''}
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
             onBlur={(e) => update('search', e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && update('search', e.currentTarget.value)}
           />
@@ -120,11 +135,11 @@ export default function Recordings() {
         </label>
         <label>
           <span className="label mb-1 block text-xs">From</span>
-          <input type="date" className="input" defaultValue={params.get('date_from') ?? ''} onChange={(e) => update('date_from', e.target.value)} />
+          <input type="date" className="input" value={params.get('date_from') ?? ''} onChange={(e) => update('date_from', e.target.value)} />
         </label>
         <label>
           <span className="label mb-1 block text-xs">To</span>
-          <input type="date" className="input" defaultValue={params.get('date_to') ?? ''} onChange={(e) => update('date_to', e.target.value)} />
+          <input type="date" className="input" value={params.get('date_to') ?? ''} onChange={(e) => update('date_to', e.target.value)} />
         </label>
         <button className="btn" onClick={() => setParams(new URLSearchParams())}>
           Clear
