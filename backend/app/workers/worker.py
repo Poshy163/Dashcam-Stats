@@ -178,6 +178,20 @@ class WorkerPool:
                 log.exception("worker loop error", worker=worker_id, error=str(exc))
                 await asyncio.sleep(_IDLE_SLEEP_S)
 
+    @staticmethod
+    def _device_from(report) -> str | None:
+        """The inference device a stage reported using, if any ran.
+
+        Stages record it in their own stats rather than on the report, because only the
+        stages that actually run a model know one. Telemetry-only work legitimately has
+        no answer.
+        """
+        for stage in reversed(report.stages):
+            device = (stage.stats or {}).get("device")
+            if device:
+                return str(device)
+        return None
+
     async def _run_job(
         self, job_id: int, recording_id: int | None, stages: list[str] | None, filename: str
     ) -> None:
@@ -215,11 +229,22 @@ class WorkerPool:
 
                 report = await run_stages(session, recording, selected, progress=on_progress)
                 active.speed_realtime = report.realtime_factor
+                # Which device actually ran inference is only known once a stage has used
+                # one, and it is worth surfacing: it is the difference between the iGPU
+                # doing the work and the CPU quietly doing it instead.
+                active.inference_device = self._device_from(report) or active.inference_device
 
                 job = await session.get(ProcessingJob, job_id)
                 if job is not None:
                     if report.ok:
-                        await queue.complete(session, job, report.as_dict())
+                        await queue.complete(
+                            session,
+                            job,
+                            report.as_dict(),
+                            speed=active.speed_realtime,
+                            decoder=active.decoder,
+                            device=active.inference_device,
+                        )
                     else:
                         await queue.fail(
                             session,

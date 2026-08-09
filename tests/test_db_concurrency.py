@@ -185,3 +185,85 @@ class TestClaimIsOneStatement:
             "a 'begin' handler is installed; if it forces BEGIN IMMEDIATE it will starve "
             "readers behind the workers' write transactions"
         )
+
+
+class TestJobDiagnosticsArePersisted:
+    """How a job ran, not just that it ran.
+
+    The Queue page shows throughput, decoder and inference device per job. All three used
+    to be written only by the heartbeat, which is cancelled the moment the job finishes —
+    and realtime speed is not even known until the last stage returns, so persisting it
+    was a race against the `finally` that kills the heartbeat. On a real library that race
+    was lost every time: `speed_realtime` was empty on all 200 jobs sampled and `decoder`
+    on 195, so three columns were blank for every recording ever processed.
+    """
+
+    async def test_completion_records_how_the_job_ran(self, db_session):
+        rec = Recording(
+            rel_path="diag.ts",
+            filename="diag.ts",
+            size_bytes=1024,
+            state=RecordingState.QUEUED,
+        )
+        db_session.add(rec)
+        await db_session.flush()
+        # Release the fixture session's write lock before another session writes, or the
+        # two deadlock and the failure looks like a queue bug rather than a test one.
+        await db_session.commit()
+        recording_id = rec.id
+
+        async with session_scope() as session:
+            await queue.enqueue(session, recording_id)
+        async with session_scope() as session:
+            job = await queue.claim_next(session, "w1")
+            assert job is not None
+            await queue.complete(
+                session,
+                job,
+                {"ok": True},
+                speed=27.7,
+                decoder="vaapi",
+                device="GPU",
+            )
+            job_id = job.id
+
+        async with session_scope() as session:
+            stored = await session.get(ProcessingJob, job_id)
+            assert stored is not None
+            assert stored.state is JobState.COMPLETED
+            assert stored.speed_realtime == pytest.approx(27.7)
+            assert stored.decoder == "vaapi"
+            assert stored.inference_device == "GPU"
+
+    async def test_completion_without_diagnostics_keeps_what_the_heartbeat_wrote(self, db_session):
+        # A telemetry-only job runs no model, so it has no device to report. Passing None
+        # must leave the heartbeat's earlier values alone rather than blanking them.
+        rec = Recording(
+            rel_path="diag2.ts",
+            filename="diag2.ts",
+            size_bytes=1024,
+            state=RecordingState.QUEUED,
+        )
+        db_session.add(rec)
+        await db_session.flush()
+        # Release the fixture session's write lock before another session writes, or the
+        # two deadlock and the failure looks like a queue bug rather than a test one.
+        await db_session.commit()
+        recording_id = rec.id
+
+        async with session_scope() as session:
+            await queue.enqueue(session, recording_id)
+        async with session_scope() as session:
+            job = await queue.claim_next(session, "w1")
+            assert job is not None
+            job_id = job.id
+            await queue.heartbeat(session, job_id, decoder="vaapi", progress=0.5)
+
+        async with session_scope() as session:
+            job = await session.get(ProcessingJob, job_id)
+            await queue.complete(session, job, {"ok": True})
+
+        async with session_scope() as session:
+            stored = await session.get(ProcessingJob, job_id)
+            assert stored.decoder == "vaapi"
+            assert stored.inference_device is None
