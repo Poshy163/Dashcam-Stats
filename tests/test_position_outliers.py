@@ -349,3 +349,111 @@ class TestRebuildPreservesTheIndex:
             )
         assert orphaned == 0, f"{orphaned} telemetry points lost their journey"
         assert pointed <= journey_ids, "telemetry points at a journey that no longer exists"
+
+
+class TestJourneyRollupsStayTrue:
+    """A journey that claims GPS must be able to say how far it went.
+
+    Both failures below were live at the same time: 123 of 128 journeys reporting
+    `has_gps=True` with `distance_m=None`, one of them holding 1,654 perfectly good fixes,
+    and every incrementally built journey showing an empty route on the map.
+    """
+
+    @pytest.fixture
+    async def journey_with_telemetry(self, db_session):
+        base = datetime(2026, 8, 4, 17, 43, tzinfo=UTC)
+        async with session_scope() as session:
+            rec = Recording(
+                rel_path="inc.ts",
+                filename="inc.ts",
+                size_bytes=1,
+                state=RecordingState.COMPLETED,
+                started_at=base,
+                ended_at=base + timedelta(minutes=2),
+            )
+            session.add(rec)
+            await session.flush()
+            for step in range(60):
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec.id,
+                        t_offset_s=float(step),
+                        captured_at=base + timedelta(seconds=step),
+                        lat=LAT + step * 2e-4,
+                        lon=LON + step * 2e-4,
+                        has_fix=True,
+                        speed_kmh=55.0,
+                    )
+                )
+            await session.flush()
+            return rec.id
+
+    async def test_incremental_attach_carries_the_telemetry(self, journey_with_telemetry):
+        """The route map reads telemetry_points.journey_id, not recordings.journey_id.
+
+        Setting only the latter attached the recording and orphaned its telemetry, so the
+        journey listed its recordings correctly and drew nothing on the map.
+        """
+        async with session_scope() as session:
+            recording = await session.get(Recording, journey_with_telemetry)
+            journey = await JourneyBuilder().assign_recording(session, recording)
+            assert journey is not None
+            journey_id = journey.id
+            await session.commit()
+
+        async with session_scope() as session:
+            attached = (
+                await session.execute(
+                    select(func.count(TelemetryPoint.id)).where(
+                        TelemetryPoint.journey_id == journey_id
+                    )
+                )
+            ).scalar()
+        assert attached == 60, (
+            f"{attached} of 60 telemetry points were attached to the journey; the route "
+            "map would be empty"
+        )
+
+    async def test_a_stale_rollup_is_recomputed(self, journey_with_telemetry):
+        """ "Claims GPS, has no distance" is a state no refreshed journey can be in.
+
+        `refresh` sets both from the same rows: either there are fixes and both are
+        populated, or there are none and neither is. Anything in between means the rollup
+        was invalidated and never recomputed.
+        """
+        async with session_scope() as session:
+            recording = await session.get(Recording, journey_with_telemetry)
+            journey = await JourneyBuilder().assign_recording(session, recording)
+            journey_id = journey.id
+            # Exactly what migration 0004 left behind.
+            journey.distance_m = None
+            journey.has_gps = True
+            await session.commit()
+
+        async with session_scope() as session:
+            repaired = await JourneyBuilder().repair_stale(session)
+            await session.commit()
+        assert repaired == 1
+
+        async with session_scope() as session:
+            journey = (
+                await session.execute(select(Journey).where(Journey.id == journey_id))
+            ).scalar_one()
+            assert journey.distance_m is not None and journey.distance_m > 0, (
+                "a journey with 60 good fixes still reports no distance"
+            )
+
+    async def test_repair_leaves_a_genuinely_gps_less_journey_alone(self, db_session):
+        # No fixes at all is a real state -- a parked car with no lock -- and must not be
+        # mistaken for a stale rollup.
+        base = datetime(2026, 8, 4, 17, 43, tzinfo=UTC)
+        async with session_scope() as session:
+            journey = Journey(
+                started_at=base, ended_at=base + timedelta(minutes=2), duration_s=120.0
+            )
+            session.add(journey)
+            await session.flush()
+            await session.commit()
+
+        async with session_scope() as session:
+            assert await JourneyBuilder().repair_stale(session) == 0

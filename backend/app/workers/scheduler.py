@@ -157,6 +157,12 @@ class Scheduler:
             async with session_scope() as session:
                 await JourneyBuilder().rebuild(session)
 
+        # Self-heal journeys whose rollups were invalidated and never recomputed -- by a
+        # migration, a decoder fix, or telemetry that arrived after the journey did. Cheap
+        # when there is nothing to do, which is the normal case.
+        async with session_scope() as session:
+            await JourneyBuilder().repair_stale(session)
+
     async def _run_retention(self) -> None:
         async with session_scope() as session:
             plan = await plan_retention(session)

@@ -177,6 +177,39 @@ class JourneyBuilder:
                 .execution_options(synchronize_session=False)
             )
 
+    async def repair_stale(self, session: AsyncSession, *, limit: int = 200) -> int:
+        """Recompute journeys whose rollups are unset but whose telemetry says otherwise.
+
+        Rollups are derived, so anything that invalidates them -- a migration correcting
+        stored positions, a decoder fix, a journey attached before its telemetry existed --
+        leaves them stale until that journey happens to be refreshed again. Nothing
+        guaranteed that: a rebuild only touches journeys it reclusters, and `refresh` runs
+        for one journey at a time as recordings finish.
+
+        The result was a library where five journeys had a distance and a route and a
+        hundred and twenty-three had neither, while their telemetry held thousands of
+        perfectly good fixes.
+
+        The test is deliberately "claims GPS but has no distance", which is a state no
+        correctly refreshed journey can be in: `refresh` sets both from the same rows, so
+        either there are fixes and both are populated, or there are none and neither is.
+        """
+        stale = list(
+            (
+                await session.execute(
+                    select(Journey)
+                    .where(Journey.has_gps.is_(True), Journey.distance_m.is_(None))
+                    .order_by(Journey.started_at.desc())
+                    .limit(limit)
+                )
+            ).scalars()
+        )
+        for journey in stale:
+            await self.refresh(session, journey)
+        if stale:
+            log.info("recomputed journeys with stale rollups", journeys=len(stale))
+        return len(stale)
+
     @staticmethod
     async def _drop_empty(session: AsyncSession) -> int:
         """Delete journeys that no longer hold any recordings.
@@ -538,7 +571,11 @@ class JourneyBuilder:
             session.add(journey)
             await session.flush()
 
-        recording.journey_id = journey.id
+        # Through _attach, not a bare assignment: the route map and the heat map's journey
+        # filter read telemetry_points.journey_id, not recordings.journey_id. Setting only
+        # the latter attached the recording while leaving its telemetry orphaned, so an
+        # incrementally built journey had a correct recording list and an empty route.
+        await self._attach(session, [recording.id], journey.id)
         await session.flush()
         await self.refresh(session, journey)
         return journey
