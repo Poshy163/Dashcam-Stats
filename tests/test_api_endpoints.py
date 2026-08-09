@@ -736,3 +736,71 @@ class TestDateFiltering:
         # A full timestamp is not a bare date and must not be widened to a whole day.
         body = (await client.get("/api/recordings?date_to=2026-08-08T03:00:00%2B00:00")).json()
         assert body["total"] == 2
+
+
+@pytest.mark.needs_ffmpeg
+@pytest.mark.slow
+class TestOsdDebugView:
+    """The overlay debug view has to answer at whatever offset it is asked for.
+
+    It is the one screen that shows what the pipeline actually reads, so an intermittent
+    failure here is worse than most bugs: it is taken as evidence about the footage. The
+    endpoint hand-rolled its frame grab, pairing `fps=1` with a one-second window; the
+    frame-selection filter emits nothing whenever the instant it picks falls outside that
+    window, which depends on where the seek lands. On the live deployment it answered at
+    t=0 and t=10 and returned 422 at t=1, for a recording that decodes perfectly.
+
+    **What these do and do not prove.** Reverting the fix was tried, and the offset cases
+    below still passed: the synthetic fixtures' frame timing happens to yield a frame at
+    every offset asked for, so they document the requirement without reproducing the
+    original failure, which needed the real clip's timing. `test_past_the_end_explains
+    _itself` does catch the other half — the hand-rolled loop let an FFmpegError escape as
+    a 500, where a diagnostic must answer "could not decode" rather than crash.
+
+    Reproducing the timing-dependent half would mean committing a fixture chosen for its
+    awkward PTS layout, which is a lot of weight for one branch that the shared helper now
+    covers anyway. Left as it is, honestly labelled, rather than implied to be a guard it
+    is not.
+    """
+
+    @pytest.fixture
+    async def clip_recording(self, db_session, app_config, fixture_dir):
+        import shutil
+
+        source = fixture_dir / "20260804174353_camera_0.ts"
+        target = app_config.footage_dir / source.name
+        shutil.copy(source, target)
+
+        async with session_scope() as session:
+            rec = Recording(
+                rel_path=source.name,
+                filename=source.name,
+                size_bytes=target.stat().st_size,
+                state=RecordingState.COMPLETED,
+            )
+            session.add(rec)
+            await session.flush()
+            return rec.id
+
+    @pytest.mark.parametrize("offset", [0, 0.5, 1, 1.5, 2, 3])
+    async def test_it_answers_at_any_offset(self, client, clip_recording, offset):
+        response = await client.get(f"/api/recordings/{clip_recording}/osd-debug?t={offset}")
+        assert response.status_code == 200, (
+            f"t={offset} returned {response.status_code}: {response.text[:200]}"
+        )
+        body = response.json()
+        assert body["region"]["width"] > 0 and body["region"]["height"] > 0
+        assert "decoded_text" in body and "parsed" in body
+
+    async def test_the_composite_image_renders(self, client, clip_recording):
+        response = await client.get(f"/api/recordings/{clip_recording}/osd-debug.png?t=1")
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"] == "image/png"
+        assert len(response.content) > 1000
+
+    async def test_past_the_end_explains_itself(self, client, clip_recording):
+        # A diagnostic that answers a decode failure with a stack trace is worse than
+        # useless: the thing being diagnosed is often that the file will not decode.
+        response = await client.get(f"/api/recordings/{clip_recording}/osd-debug?t=99999")
+        assert response.status_code == 422
+        assert "decoded" in response.text.lower()

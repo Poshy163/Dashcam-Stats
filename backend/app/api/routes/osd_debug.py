@@ -26,7 +26,7 @@ from app.core.logging import get_logger
 from app.core.paths import resolve_footage_path
 from app.core.settings_service import get_settings_service
 from app.db.models import OsdProfile, Recording
-from app.hardware.ffmpeg import FFmpegError, iter_frames, probe
+from app.hardware.ffmpeg import extract_frame, probe
 from app.osd.engine import TelemetryExtractor
 from app.osd.glyphs import binarise, decode_line, segment_glyphs
 from app.osd.parser import parse_osd_text
@@ -67,30 +67,24 @@ async def _read(recording_id: int, session, offset_s: float):
     settings = get_settings_service()
     hwaccel = "auto" if await settings.hardware_acceleration() else "cpu"
 
-    frame = None
-    try:
-        async for _offset, decoded in iter_frames(
-            path,
-            fps=1.0,
-            crop=None,
-            grayscale=False,
-            hwaccel=hwaccel,
-            start=offset_s,
-            duration=1.0,
-        ):
-            frame = decoded
-            break
-    except FFmpegError as exc:
+    # extract_frame, not a hand-rolled loop over iter_frames. Asking for one frame at an
+    # offset is what it is for, and doing it again here got it wrong: pairing `fps=1` with
+    # a one-second window makes the frame-selection filter emit *nothing* whenever the
+    # chosen instant falls outside the window, which depends on where the seek lands. The
+    # symptom was a debug view that worked at t=0 and t=10 and returned 422 at t=1 -- on a
+    # recording that decodes perfectly.
+    frame = await extract_frame(path, offset_s, hwaccel=hwaccel)
+    if frame is None:
         # A diagnostic that answers a decode failure with a stack trace is worse than
         # useless: the thing being diagnosed is often precisely that the file will not
         # decode, and that is an answer, not a crash.
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, f"could not decode this frame: {exc}"
-        ) from exc
-    if frame is None:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND,
-            "no frame could be decoded at that offset; it may be past the end of the file",
+            # The literal rather than the constant: starlette renamed it to
+            # HTTP_422_UNPROCESSABLE_CONTENT and deprecated the old spelling, and the
+            # number is stable across both.
+            422,
+            f"no frame could be decoded at {offset_s:g}s; the file may be damaged there, "
+            "or that offset may be past its end",
         )
 
     return recording, frame, crop, extractor

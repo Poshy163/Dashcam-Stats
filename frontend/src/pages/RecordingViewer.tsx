@@ -91,9 +91,24 @@ function emptyStateFor(stage: StageState, noun: string): string {
  * Fetched on demand rather than as the video plays: it decodes a frame server-side, which
  * is far too expensive to run on every timeupdate.
  */
-function OsdDebugPanel({ recordingId, time }: { recordingId: number; time: number }) {
-  const [pinned, setPinned] = useState<number | null>(null)
+function OsdDebugPanel({
+  recordingId,
+  time,
+  autoOpen,
+  openAt,
+}: {
+  recordingId: number
+  time: number
+  /** Arrived from a link that asked for this panel, so read a frame without being asked. */
+  autoOpen: boolean
+  /** Offset the link asked for, when it named one. */
+  openAt?: number
+}) {
+  const [pinned, setPinned] = useState<number | null>(
+    autoOpen ? (Number.isFinite(openAt) ? Number(openAt) : 0) : null,
+  )
   const at = pinned ?? 0
+  const section = useRef<HTMLElement>(null)
 
   const debug = useQuery({
     queryKey: ['osd-debug', recordingId, at],
@@ -102,8 +117,14 @@ function OsdDebugPanel({ recordingId, time }: { recordingId: number; time: numbe
     staleTime: 60_000,
   })
 
+  useEffect(() => {
+    // The panel sits well below the player, so a deep link that only opened it would land
+    // at the top of the page and leave the reader hunting for what they clicked on.
+    if (autoOpen) section.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [autoOpen])
+
   return (
-    <section className="card p-3">
+    <section id="overlay-reader" ref={section} className="card p-3">
       <div className="mb-2 flex items-baseline justify-between gap-2">
         <h2 className="text-sm font-semibold">Overlay reader</h2>
         <button className="btn text-xs" onClick={() => setPinned(Number(time.toFixed(2)))}>
@@ -181,6 +202,12 @@ export default function RecordingViewer() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const [currentTime, setCurrentTime] = useState(0)
   const [stage, setStage] = useState<string>('everything')
+
+  // `?debug=1` opens the overlay reader and scrolls to it; `&t=` picks the frame. That
+  // link is what the queue points at for the job running right now, so arriving here
+  // should land on the panel rather than at the top of a page the reader must then search.
+  const wantsDebug = params.get('debug') === '1'
+  const debugAt = Number(params.get('t') ?? 0)
 
   const recording = useQuery({
     queryKey: ['recording', recordingId],
@@ -437,7 +464,12 @@ export default function RecordingViewer() {
             )}
           </section>
 
-          <OsdDebugPanel recordingId={r.id} time={currentTime} />
+          <OsdDebugPanel
+            recordingId={r.id}
+            time={currentTime}
+            autoOpen={wantsDebug}
+            openAt={debugAt}
+          />
 
           <section className="card p-3">
             <h2 className="mb-2 text-sm font-semibold">Details</h2>

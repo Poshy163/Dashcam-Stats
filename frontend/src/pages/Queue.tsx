@@ -105,11 +105,23 @@ export default function Queue() {
               <div className="mt-2">
                 <ProgressBar value={job.progress} />
               </div>
-              <div className="tabular mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-content-muted">
+              <div className="tabular mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-content-muted">
                 <span>Stage: {job.stageCurrent ?? '—'}</span>
                 <span>{realtimeFactor(job.speedRealtime)}</span>
                 {job.decoder && <span>Decoder: {job.decoder}</span>}
                 {job.inferenceDevice && <span>AI: {job.inferenceDevice}</span>}
+                {job.recordingId && (
+                  // The one question worth asking about a job in flight is what the
+                  // pipeline is actually reading, and until now the only route to that
+                  // answer was to know the overlay reader existed, open the recording, and
+                  // scroll for it. Straight from the job that raised the question instead.
+                  <Link
+                    to={`/recordings/${job.recordingId}?debug=1`}
+                    className="text-accent hover:underline"
+                  >
+                    See what it sees
+                  </Link>
+                )}
               </div>
             </div>
           ))}
