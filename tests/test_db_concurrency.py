@@ -267,3 +267,79 @@ class TestJobDiagnosticsArePersisted:
             stored = await session.get(ProcessingJob, job_id)
             assert stored.decoder == "vaapi"
             assert stored.inference_device is None
+
+
+class TestTheWriteLockIsNotHeldAcrossAStage:
+    """A job must not hold SQLite's write lock for its whole duration.
+
+    `run_stages` marks the recording PROCESSING and flushes, which takes the write lock,
+    and the worker holds that session across every stage. Without a commit in between, the
+    lock is held through all of the ffmpeg decoding and inference — tens of seconds — while
+    the second worker, the scheduler and the log sink block on their next write. Two
+    workers become one, and any contention surfaces as "database is locked" rather than as
+    a wait.
+    """
+
+    async def test_another_session_can_write_while_a_stage_runs(self, db_session):
+        from app.pipeline import orchestrator
+
+        rec = Recording(
+            rel_path="lock.ts",
+            filename="lock.ts",
+            size_bytes=1024,
+            state=RecordingState.QUEUED,
+            duration_s=60.0,
+        )
+        db_session.add(rec)
+        await db_session.flush()
+        await db_session.commit()
+        recording_id = rec.id
+
+        observed: dict[str, object] = {}
+
+        async def slow_stage(session, recording, *, progress=None):
+            """Stands in for a decode: does no database work, takes real time."""
+            try:
+                async with session_scope() as other:
+                    other.add(
+                        Recording(
+                            rel_path="written-during-stage.ts",
+                            filename="written-during-stage.ts",
+                            size_bytes=1,
+                            state=RecordingState.DISCOVERED,
+                        )
+                    )
+                    await other.flush()
+                observed["wrote"] = True
+            except Exception as exc:
+                observed["error"] = f"{type(exc).__name__}: {exc}"
+            from app.pipeline.orchestrator import StageResult
+
+            return StageResult("metadata", True)
+
+        async def noop_stage(session, recording, *, progress=None):
+            from app.pipeline.orchestrator import StageResult
+
+            return StageResult("summarise", True)
+
+        # "metadata" stands in for a decode: expand_stages only accepts real stage names,
+        # and an unknown one silently falls back to running the entire pipeline.
+        original = dict(orchestrator.STAGES)
+        try:
+            orchestrator.STAGES["metadata"] = slow_stage
+            orchestrator.STAGES["summarise"] = noop_stage
+            async with session_scope() as session:
+                recording = await session.get(Recording, recording_id)
+                report = await asyncio.wait_for(
+                    orchestrator.run_stages(session, recording, ["metadata"]),
+                    timeout=20,
+                )
+            assert report.ok, report.error
+        finally:
+            orchestrator.STAGES.clear()
+            orchestrator.STAGES.update(original)
+
+        assert observed.get("wrote"), (
+            "a second session could not write while a stage was running: the job is "
+            f"holding the write lock across the whole stage. {observed.get('error')}"
+        )

@@ -33,9 +33,26 @@ from app.hardware.detect import detect_hardware
 
 log = get_logger(__name__)
 
-#: 2**33 / 90000. A reported duration at or beyond this is a wrapped timestamp, not a
-#: 26-hour recording.
+#: 2**33 / 90000 — the period of a 33-bit PTS counter at 90 kHz.
 PTS_WRAP_SECONDS = 95443.717
+
+#: Above this a reported duration is a wrapped timestamp rather than a real recording.
+#:
+#: Deliberately *below* the wrap period. A wrap makes the last timestamp smaller than the
+#: first, so the container reports ``wrap - elapsed`` — a minute-long clip comes back as
+#: 95,376 s. Testing for a duration at or beyond the wrap point therefore never fires, and
+#: on a real library it never did: both affected files sat a minute under it and their
+#: durations went straight into the dashboard's footage total.
+#:
+#: The margin is one hour, which no dashcam segment approaches and every wrapped one clears.
+PTS_WRAP_THRESHOLD_S = PTS_WRAP_SECONDS - 3600.0
+
+#: Floor on a bitrate before it is trusted to reconstruct a duration.
+#:
+#: ffprobe computes the bitrate from the duration, so on a file with a wrapped timestamp
+#: the two are wrong together and reconstructing one from the other returns the same wrong
+#: answer. 802 bps for 1080p video, as one of these files reports, is the tell.
+MIN_PLAUSIBLE_BITRATE = 100_000
 
 #: Beyond this a "frame rate" is ffprobe's estimator misfiring, not a real camera.
 MAX_PLAUSIBLE_FPS = 120.0
@@ -291,14 +308,31 @@ async def probe(path: Path | str, *, timeout: float = DEFAULT_PROBE_TIMEOUT) -> 
     if duration is None:
         duration = stream_duration
 
-    if duration is not None and duration >= PTS_WRAP_SECONDS - 1.0:
-        # 33-bit PTS wrapped. Re-derive from size and bitrate, which stays sane.
+    if duration is not None and duration >= PTS_WRAP_THRESHOLD_S:
+        # A wrapped 33-bit PTS lands just *below* the wrap period, not above it. When the
+        # last timestamp has wrapped past the first, the container reports
+        # ``wrap - elapsed``, so a one-minute clip comes back as 95,376 s rather than
+        # 95,444. The original test required the duration to exceed the wrap point, which
+        # nothing ever does, so the clamp never fired for either of the two files it was
+        # written for. Their bogus durations were stored, and between them they accounted
+        # for 190,753 of the 260,817 s the dashboard reported as the library's footage --
+        # 72 hours claimed against about 19 real ones.
         result.pts_wrapped = True
         recovered = None
-        if result.bitrate and result.bitrate > 0:
+
+        # The bitrate is not independent evidence here and must not be trusted as if it
+        # were: ffprobe derives it from the same broken duration. One of these files
+        # reports 802 bps for 1080p video, and ``size * 8 / 802`` comes back as 95,441 s --
+        # the wrap period again, wearing a different hat and comfortably inside any naive
+        # sanity check.
+        if result.bitrate and result.bitrate >= MIN_PLAUSIBLE_BITRATE:
             recovered = result.size_bytes * 8 / result.bitrate
-        if recovered is None or not (0 < recovered < PTS_WRAP_SECONDS):
+        if recovered is None or not (0 < recovered < PTS_WRAP_THRESHOLD_S):
             recovered = await _measure_duration(p)
+        if recovered is not None and not (0 < recovered < PTS_WRAP_THRESHOLD_S):
+            # Decoding did not help either. Better to admit the duration is unknown than
+            # to store a number that inflates every rollup built on top of it.
+            recovered = None
         result.warnings.append(
             f"container duration {duration:.0f}s exceeds the 33-bit PTS wrap point; "
             f"using {recovered:.1f}s"

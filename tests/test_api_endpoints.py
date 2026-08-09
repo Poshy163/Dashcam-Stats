@@ -14,6 +14,7 @@ from __future__ import annotations
 import httpx
 import pytest
 from httpx import ASGITransport
+from sqlalchemy import select
 
 from app.db.models import Plate, Recording, RecordingState
 from app.db.session import session_scope
@@ -366,6 +367,91 @@ class TestHeatmap:
         assert body["total_points"] == 0
 
 
+class TestHeatmapStatistics:
+    """Two numbers on the heat map that were quietly wrong.
+
+    Both were found by comparing the same data at different grid resolutions, which is
+    something a user does casually with a dropdown.
+    """
+
+    @pytest.fixture
+    async def both_cameras(self, db_session):
+        from datetime import UTC, datetime, timedelta
+
+        from app.db.models import Camera, CameraRole, TelemetryPoint
+
+        async with session_scope() as session:
+            cameras = {}
+            for key, role in (("camera_0", CameraRole.FRONT), ("camera_1", CameraRole.REAR)):
+                cam = (
+                    await session.execute(select(Camera).where(Camera.key == key))
+                ).scalar_one_or_none()
+                if cam is None:
+                    cam = Camera(key=key, name=key, role=role)
+                    session.add(cam)
+                    await session.flush()
+                cameras[key] = cam
+
+            base = datetime(2026, 8, 4, 17, 43, tzinfo=UTC)
+            # The same 60 seconds of driving, filmed by both cameras at once.
+            for key, cam in cameras.items():
+                rec = Recording(
+                    rel_path=f"{key}.ts",
+                    filename=f"{key}.ts",
+                    size_bytes=1,
+                    state=RecordingState.COMPLETED,
+                    camera_id=cam.id,
+                    started_at=base,
+                )
+                session.add(rec)
+                await session.flush()
+                for step in range(60):
+                    session.add(
+                        TelemetryPoint(
+                            recording_id=rec.id,
+                            t_offset_s=float(step),
+                            captured_at=base + timedelta(seconds=step),
+                            # A wide spread of speeds, concentrated in a few cells, so a
+                            # mean-of-means and a true mean differ visibly.
+                            lat=-34.8088 + (step % 5) * 1e-3,
+                            lon=138.6769 + (step % 5) * 1e-3,
+                            has_fix=True,
+                            speed_kmh=10.0 if step % 5 else 100.0,
+                        )
+                    )
+            await session.flush()
+
+    async def test_average_speed_does_not_move_with_the_grid(self, client, both_cameras):
+        """It reported 25.3 km/h at one zoom and 49.9 at another, on identical data."""
+        seen = {}
+        for precision in (1, 2, 3, 4):
+            body = (await client.get(f"/api/map/heatmap?precision={precision}")).json()
+            seen[precision] = body["average_speed_kmh"]
+        distinct_values = {v for v in seen.values() if v is not None}
+        assert len(distinct_values) == 1, (
+            f"average speed changes with the grid resolution: {seen}. It is a mean of "
+            "per-cell means, so a cell holding one fix counts as much as a cell holding "
+            "thousands."
+        )
+
+    async def test_the_true_mean_is_reported(self, client, both_cameras):
+        body = (await client.get("/api/map/heatmap?precision=4")).json()
+        # 60 s per camera: one fix in five at 100 km/h, the rest at 10.
+        assert body["average_speed_kmh"] == pytest.approx(28.0, abs=0.5)
+
+    async def test_time_represented_is_not_doubled_by_the_second_camera(self, client, both_cameras):
+        """Both cameras film the same seconds; counting rows counted each one twice.
+
+        On the live library that made the map claim more hours of driving than the sum of
+        every journey's elapsed time, which is not a thing that can be true.
+        """
+        body = (await client.get("/api/map/heatmap?precision=4")).json()
+        assert body["total_points"] == 60, (
+            f"60 seconds of driving filmed by two cameras reported as "
+            f"{body['total_points']} seconds"
+        )
+
+
 class TestNotFound:
     async def test_missing_recording_is_404_not_500(self, client):
         assert (await client.get("/api/recordings/999999")).status_code == 404
@@ -375,3 +461,61 @@ class TestNotFound:
 
     async def test_unknown_api_path_is_404(self, client):
         assert (await client.get("/api/definitely-not-a-route")).status_code == 404
+
+
+class TestDateFiltering:
+    """Picking one day must return that day.
+
+    `<input type="date">` sends "2026-08-08", which parses to midnight, so an inclusive
+    `<=` comparison excluded the entire day. On the live library filtering to a single
+    date returned "No recordings match. Adjust the filters, or run a scan" while 24
+    recordings sat under it — the user was told their footage was not indexed.
+
+    The timezone half matters just as much: `started_at` is UTC and the picker speaks
+    local time, which for Adelaide is nine and a half hours apart.
+    """
+
+    @pytest.fixture
+    async def across_a_day(self, db_session):
+        from datetime import UTC, datetime
+
+        async with session_scope() as session:
+            # 2026-08-08 in Adelaide (UTC+9:30) runs 2026-08-07 14:30Z .. 2026-08-08 14:30Z.
+            for when in (
+                datetime(2026, 8, 7, 15, 0, tzinfo=UTC),  # early on the 8th, local
+                datetime(2026, 8, 8, 3, 0, tzinfo=UTC),  # midday on the 8th, local
+                datetime(2026, 8, 8, 14, 0, tzinfo=UTC),  # late on the 8th, local
+                datetime(2026, 8, 8, 15, 0, tzinfo=UTC),  # already the 9th, local
+            ):
+                session.add(
+                    Recording(
+                        rel_path=f"{when.isoformat()}.ts",
+                        filename=f"{when.isoformat()}.ts",
+                        size_bytes=1,
+                        state=RecordingState.COMPLETED,
+                        started_at=when,
+                    )
+                )
+            await session.flush()
+
+    async def test_a_single_day_is_not_empty(self, client, across_a_day):
+        await client.put("/api/settings", json={"values": {"general.timezone": "UTC"}})
+        body = (await client.get("/api/recordings?date_from=2026-08-08&date_to=2026-08-08")).json()
+        assert body["total"] > 0, (
+            "selecting a single date returned nothing; the end of the range excluded the whole day"
+        )
+
+    async def test_the_day_is_bounded_by_the_configured_timezone(self, client, across_a_day):
+        await client.put(
+            "/api/settings", json={"values": {"general.timezone": "Australia/Adelaide"}}
+        )
+        body = (await client.get("/api/recordings?date_from=2026-08-08&date_to=2026-08-08")).json()
+        # Three of the four fixtures fall on the 8th in Adelaide; the last is the 9th.
+        assert body["total"] == 3, (
+            f"expected the three recordings that fall on 2026-08-08 locally, got {body['total']}"
+        )
+
+    async def test_an_explicit_instant_is_still_respected(self, client, across_a_day):
+        # A full timestamp is not a bare date and must not be widened to a whole day.
+        body = (await client.get("/api/recordings?date_to=2026-08-08T03:00:00%2B00:00")).json()
+        assert body["total"] == 2

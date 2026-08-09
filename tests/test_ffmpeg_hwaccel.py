@@ -88,3 +88,67 @@ class TestDecodeFallback:
             if path.name != "ffmpeg.py" and "_decode_frames" in path.read_text(encoding="utf-8")
         ]
         assert not offenders, f"these bypass the software fallback: {offenders}"
+
+
+class TestPtsWrapClamp:
+    """The two files this clamp was written for, and why it never caught them.
+
+    MPEG-TS timestamps are 33 bits at 90 kHz, so they wrap every ~95,443 s. When they do,
+    the last timestamp is *smaller* than the first and the container reports
+    ``wrap - elapsed`` — a one-minute clip comes back as 95,376 s, just under the wrap
+    period rather than over it. The original guard asked for a duration at or beyond the
+    wrap point, which nothing ever reports, so it never fired.
+
+    Real values, measured from the deployment:
+
+        20260804085744_camera_0.ts  duration 95376.184  size 9,568,256  bit_rate 802
+        20260804085744_camera_1.ts  duration 95377.157  size 10,878,976 bit_rate 912
+
+    Between them they contributed 190,753 of the 260,817 s the dashboard called the
+    library's footage — 72 hours claimed against about 19 real ones — and produced a
+    26-hour "journey" that overlapped the one after it.
+    """
+
+    def test_the_threshold_sits_below_the_wrap_period(self):
+        from app.hardware.ffmpeg import PTS_WRAP_SECONDS, PTS_WRAP_THRESHOLD_S
+
+        assert PTS_WRAP_THRESHOLD_S < PTS_WRAP_SECONDS, (
+            "a wrapped duration lands under the wrap period, so a threshold at or above "
+            "it can never fire"
+        )
+
+    @pytest.mark.parametrize("duration", [95376.184456, 95377.156767])
+    def test_the_real_wrapped_durations_are_caught(self, duration):
+        from app.hardware.ffmpeg import PTS_WRAP_THRESHOLD_S
+
+        assert duration >= PTS_WRAP_THRESHOLD_S
+
+    @pytest.mark.parametrize("duration", [59.9, 67.5, 120.0, 3600.0])
+    def test_ordinary_segments_are_untouched(self, duration):
+        from app.hardware.ffmpeg import PTS_WRAP_THRESHOLD_S
+
+        assert duration < PTS_WRAP_THRESHOLD_S
+
+    @pytest.mark.parametrize(
+        ("size_bytes", "bitrate"),
+        [(9568256, 802), (10878976, 912)],
+    )
+    def test_a_bitrate_derived_from_the_bad_duration_is_refused(self, size_bytes, bitrate):
+        """The recovery path's own trap.
+
+        ffprobe computes the bitrate from the duration, so on these files both are wrong
+        together. Reconstructing the duration as ``size * 8 / bitrate`` returns ~95,441 s —
+        the wrap period again — which is inside any naive "is it less than the wrap point"
+        check and would have been stored as the answer.
+        """
+        from app.hardware.ffmpeg import MIN_PLAUSIBLE_BITRATE, PTS_WRAP_THRESHOLD_S
+
+        reconstructed = size_bytes * 8 / bitrate
+        assert reconstructed > PTS_WRAP_THRESHOLD_S, "this bitrate reproduces the bad duration"
+        assert bitrate < MIN_PLAUSIBLE_BITRATE, "and must therefore be refused as evidence"
+
+    def test_a_genuine_bitrate_is_still_usable(self):
+        from app.hardware.ffmpeg import MIN_PLAUSIBLE_BITRATE
+
+        # The healthy files in this corpus run about 13 Mbps.
+        assert MIN_PLAUSIBLE_BITRATE <= 13_000_000

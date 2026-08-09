@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from sqlalchemy import func, or_, select
@@ -47,6 +48,48 @@ from app.workers import queue
 log = get_logger(__name__)
 
 router = APIRouter(prefix="/api", tags=["content"])
+
+
+def _local_zone() -> ZoneInfo:
+    """The timezone the user's date picker is expressing dates in."""
+    try:
+        return ZoneInfo(str(get_settings_service().get_nowait("general.timezone")))
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _is_date_only(value: datetime) -> bool:
+    return (value.hour, value.minute, value.second, value.microsecond) == (0, 0, 0, 0)
+
+
+def _day_start(value: datetime) -> datetime:
+    """Interpret a bare date as local midnight, in UTC.
+
+    ``started_at`` is stored in UTC while the picker speaks the user's local time, and for
+    Adelaide those differ by nine and a half hours. Comparing the raw value against UTC
+    would slide every boundary by that much, so a date is anchored in the configured zone
+    before being converted.
+    """
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=_local_zone() if _is_date_only(value) else UTC)
+    return value.astimezone(UTC)
+
+
+def _before_end_of(column, value: datetime):
+    """Upper-bound condition for a date filter.
+
+    A bare date means the whole of that day, so the bound becomes the start of the day
+    after it, exclusive. ``<input type="date">`` sends ``2026-08-08``, which parses to
+    midnight, and comparing ``<=`` against that excluded the entire day: picking a single
+    date returned "No recordings match" while two dozen recordings sat under it.
+
+    An explicit timestamp is left alone and stays inclusive. Someone who supplied a precise
+    instant meant that instant, and silently widening it to the end of the day would be a
+    different bug in the other direction.
+    """
+    if _is_date_only(value):
+        return column < _day_start(value) + timedelta(days=1)
+    return column <= _day_start(value)
 
 
 async def _paginate(session, stmt, page, schema):
@@ -104,9 +147,15 @@ async def list_recordings(
         condition = (Recording.vehicle_count > 0) | (Recording.plate_count > 0)
         stmt = stmt.where(condition if has_detections else ~condition)
     if date_from:
-        stmt = stmt.where(Recording.started_at >= date_from)
+        stmt = stmt.where(Recording.started_at >= _day_start(date_from))
     if date_to:
-        stmt = stmt.where(Recording.started_at <= date_to)
+        # Exclusive upper bound on the *next* day, not inclusive on midnight of this one.
+        # The picker sends "2026-08-08", which parses to 00:00, so comparing `<=` against
+        # it excluded the whole day: choosing a single date — the most obvious thing to do
+        # with a date filter — returned "No recordings match. Adjust the filters, or run a
+        # scan", telling the user their footage was not indexed while 24 recordings sat
+        # under that date.
+        stmt = stmt.where(_before_end_of(Recording.started_at, date_to))
     if search:
         stmt = stmt.where(Recording.filename.ilike(f"%{search}%"))
 
@@ -221,9 +270,10 @@ async def list_journeys(
 ):
     stmt = select(Journey)
     if date_from:
-        stmt = stmt.where(Journey.started_at >= date_from)
+        stmt = stmt.where(Journey.started_at >= _day_start(date_from))
     if date_to:
-        stmt = stmt.where(Journey.started_at <= date_to)
+        # Same inclusive-day handling as the recordings filter above.
+        stmt = stmt.where(_before_end_of(Journey.started_at, date_to))
     if has_gps is not None:
         stmt = stmt.where(Journey.has_gps.is_(has_gps))
 

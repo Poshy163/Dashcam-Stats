@@ -117,18 +117,23 @@ class JourneyBuilder:
             await session.execute(
                 delete(Journey).where(Journey.id.in_(stale_ids), Journey.manual.is_(False))
             )
+            # Deliberately no ``expire_all()`` here. The DELETE has cascaded through
+            # ``ondelete="SET NULL"`` and the in-memory ``journey_id`` values are now
+            # stale, but expiring them makes the very next read of ``started_at`` a lazy
+            # load, and the clusters are read after this point — under the async engine
+            # that raises MissingGreenlet. Nothing reassigns those attributes in Python
+            # any more, so leaving them stale is harmless: :meth:`_attach` writes through
+            # a statement that owes nothing to what the ORM believes.
 
         created = 0
         for cluster in clusters:
             if len(cluster.recordings) < min_recordings:
-                for recording in cluster.recordings:
-                    recording.journey_id = None
+                await self._attach(session, [r.id for r in cluster.recordings], None)
                 continue
             journey = Journey(started_at=cluster.started_at, ended_at=cluster.ended_at)
             session.add(journey)
             await session.flush()
-            for recording in cluster.recordings:
-                recording.journey_id = journey.id
+            await self._attach(session, [r.id for r in cluster.recordings], journey.id)
             await self.refresh(session, journey)
             created += 1
 
@@ -136,6 +141,41 @@ class JourneyBuilder:
         removed = await self._drop_empty(session)
         log.info("rebuilt journeys", journeys=created, recordings=len(movable), removed=removed)
         return created
+
+    @staticmethod
+    async def _attach(
+        session: AsyncSession, recording_ids: list[int], journey_id: int | None
+    ) -> None:
+        """Point recordings at a journey with a statement, never by ORM assignment.
+
+        ``recording.journey_id = journey.id`` looks equivalent and destroyed the entire
+        journey index on a real library. The sequence: journeys are deleted, the foreign
+        key's ``ON DELETE SET NULL`` nulls every ``recordings.journey_id`` in the database,
+        a replacement journey is inserted and **SQLite reissues the row id that was just
+        freed** — so the new journey is id 1 exactly as the old one was. The assignment
+        then writes 1 over an in-memory 1, the unit of work sees no change, no UPDATE is
+        emitted, and the database keeps its NULL. ``refresh`` finds a journey with no
+        recordings, ``_drop_empty`` deletes it as an empty leftover, and the whole thing
+        logs "rebuilt journeys" and returns a success count.
+
+        The result was that one press of "Scan now" emptied all 45 journeys, and every
+        signal said it had worked.
+
+        An explicit UPDATE cannot be optimised away by change detection, because there is
+        no in-memory state for it to compare against. The denormalised copies of the id go
+        with it: they are what the per-journey map and heat map read, and leaving them
+        behind outlives the rebuild that orphaned them.
+        """
+        if not recording_ids:
+            return
+        for model in (Recording, TelemetryPoint, TrackedObject, PlateObservation):
+            column = Recording.id if model is Recording else model.recording_id
+            await session.execute(
+                update(model)
+                .where(column.in_(recording_ids))
+                .values(journey_id=journey_id)
+                .execution_options(synchronize_session=False)
+            )
 
     @staticmethod
     async def _drop_empty(session: AsyncSession) -> int:

@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Query
-from sqlalchemy import Float, func, select
+from sqlalchemy import Float, String, distinct, func, select
 from sqlalchemy import cast as sa_cast
 
 from app.api.deps import SessionDep
@@ -76,12 +76,33 @@ async def heatmap(
     lat_cell = func.round(TelemetryPoint.lat, precision)
     lon_cell = func.round(TelemetryPoint.lon, precision)
 
+    # Distinct *seconds*, not rows. Front and rear record the same drive, both burn the same
+    # GPS overlay and both are sampled at 1 Hz, so one real second of driving produces two
+    # rows wherever both cameras had a lock. Counting rows made the map claim 12 h 45 m of
+    # driving against about 10 h 56 m of actual elapsed journey time — arithmetically
+    # impossible — and doubled the heat on exactly the roads with the best coverage.
+    #
+    # Counting seconds instead of dropping a camera keeps stretches where only the rear
+    # had a fix. The coalesce is what makes that safe: a reading can now carry a position
+    # without a timestamp, and those rows would otherwise count as nothing at all.
+    second = func.coalesce(
+        func.strftime("%s", TelemetryPoint.captured_at),
+        "row:" + sa_cast(TelemetryPoint.id, String),
+    )
+    weight = func.count(distinct(second))
+
     stmt = (
         select(
             sa_cast(lat_cell, Float).label("lat"),
             sa_cast(lon_cell, Float).label("lon"),
-            func.count().label("weight"),
-            func.avg(TelemetryPoint.speed_kmh).label("speed"),
+            weight.label("weight"),
+            # Summed rather than averaged per cell. An average of per-cell averages weights
+            # a cell holding one fix the same as a cell holding four thousand, so the
+            # reported figure moved from 25.3 to 49.9 km/h on identical data purely by
+            # changing the grid resolution. Totals divided at the end are invariant under
+            # it, which is the property the number needs to mean anything.
+            func.sum(TelemetryPoint.speed_kmh).label("speed_sum"),
+            func.count(TelemetryPoint.speed_kmh).label("speed_count"),
         )
         # has_fix alone is not enough: a row can carry the flag with null coordinates if a
         # reading was rejected after the flag was set, and null coordinates would round to
@@ -94,7 +115,7 @@ async def heatmap(
         .group_by(lat_cell, lon_cell)
         # Densest first, so a truncated response still shows the places most driven rather
         # than an arbitrary slice.
-        .order_by(func.count().desc())
+        .order_by(weight.desc())
         .limit(limit + 1)
     )
 
@@ -130,7 +151,10 @@ async def heatmap(
         for row in rows
     ]
     weights = [p[2] for p in points]
-    speeds = [float(row.speed) for row in rows if row.speed is not None]
+    # Speed is averaged over fixes, not over cells, so the answer does not move when the
+    # grid does.
+    speed_sum = sum(float(row.speed_sum) for row in rows if row.speed_sum is not None)
+    speed_count = sum(int(row.speed_count) for row in rows if row.speed_count)
 
     return HeatmapOut(
         points=points,
@@ -141,7 +165,7 @@ async def heatmap(
         # pages or filters.
         max_weight=max(weights) if weights else 0,
         total_points=sum(weights),
-        average_speed_kmh=round(sum(speeds) / len(speeds), 1) if speeds else None,
+        average_speed_kmh=round(speed_sum / speed_count, 1) if speed_count else None,
         truncated=truncated,
     )
 

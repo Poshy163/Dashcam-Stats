@@ -39,11 +39,23 @@ export default function Logs() {
     refetchInterval: live ? 5_000 : false,
   })
 
+  /**
+   * Changing a *filter* resets to page 1, which is right — the old page number means
+   * nothing against a different result set. Changing the page must not go through here:
+   * it would set `page` and then delete it on the next line, leaving the URL untouched
+   * and the Next button apparently inert. Use `setPage` for that.
+   */
   const update = (key: string, value: string) => {
     const next = new URLSearchParams(params)
     if (value) next.set(key, value)
     else next.delete(key)
     next.delete('page')
+    setParams(next)
+  }
+
+  const setPage = (value: number) => {
+    const next = new URLSearchParams(params)
+    next.set('page', String(value))
     setParams(next)
   }
 
@@ -126,7 +138,7 @@ export default function Logs() {
           page={query.data.page}
           pages={query.data.pages}
           total={query.data.total}
-          onChange={(p) => update('page', String(p))}
+          onChange={setPage}
         />
       )}
     </div>

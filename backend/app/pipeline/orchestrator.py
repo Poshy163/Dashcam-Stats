@@ -114,6 +114,16 @@ async def run_stages(
 
     recording.state = RecordingState.PROCESSING
     await session.flush()
+    # Commit, do not merely flush. A flush takes SQLite's write lock and a transaction
+    # holds it until it ends, so without this the lock is held for the *entire* job --
+    # every ffmpeg decode, every inference pass, tens of seconds of it. Meanwhile the
+    # second worker, the scheduler and the log sink all block on their next write, which
+    # turns two workers into one and is where "database is locked" came from.
+    #
+    # Committing between stages instead keeps each write transaction to the length of a
+    # write. It also means a run that fails at stage four keeps the three stages that
+    # succeeded, which is what the per-stage state columns are for.
+    await session.commit()
 
     total = len(selected)
     for index, name in enumerate(selected):
@@ -137,6 +147,9 @@ async def run_stages(
             result = await stage(session, recording, progress=stage_progress)
             report.stages.append(result)
             await session.flush()
+            # Release the write lock between stages rather than holding it across the
+            # next decode. See the note above the first commit.
+            await session.commit()
         except StageError as exc:
             if attr:
                 setattr(recording, attr, StageState.FAILED)

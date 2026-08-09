@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.db.models import Journey, Recording, RecordingState, TelemetryPoint
 from app.db.session import session_scope
@@ -247,3 +247,105 @@ class TestJourneyMetrics:
         assert journey.min_lat is not None and journey.max_lat is not None
         assert journey.max_lat - journey.min_lat < 1.0
         assert journey.max_lat < 0, "bounds still reach into the northern hemisphere"
+
+
+class TestRebuildPreservesTheIndex:
+    """Rebuilding journeys must not empty the library, and must say so if it does.
+
+    The failure this guards was reported by every signal as a success. Deleting the stale
+    journeys cascades through ``ON DELETE SET NULL`` and nulls every
+    ``recordings.journey_id`` in the database; SQLite then reissues the row id that was
+    just freed, so the replacement journey is id 1 exactly as the old one was. Assigning
+    ``recording.journey_id = journey.id`` writes 1 over an in-memory 1, the unit of work
+    sees no change and emits no UPDATE, the database keeps its NULL, and ``_drop_empty``
+    removes the "empty" new journey. The log line read "rebuilt journeys" and the return
+    value was a positive count.
+
+    On the live library one press of Scan now would have emptied all 45 journeys.
+    """
+
+    @pytest.fixture
+    async def clustered(self, db_session):
+        base = datetime(2026, 8, 4, 8, 0, tzinfo=UTC)
+        async with session_scope() as session:
+            for index in range(6):
+                # Two clusters of three, an hour apart — well beyond the gap threshold.
+                start = base + timedelta(hours=index // 3, minutes=(index % 3) * 2)
+                rec = Recording(
+                    rel_path=f"r{index}.ts",
+                    filename=f"r{index}.ts",
+                    size_bytes=1,
+                    state=RecordingState.COMPLETED,
+                    started_at=start,
+                    ended_at=start + timedelta(minutes=1),
+                )
+                session.add(rec)
+                await session.flush()
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec.id,
+                        t_offset_s=0.0,
+                        captured_at=start,
+                        lat=LAT,
+                        lon=LON,
+                        has_fix=True,
+                        speed_kmh=60.0,
+                    )
+                )
+            await session.flush()
+
+        async with session_scope() as session:
+            await JourneyBuilder().rebuild(session)
+
+    async def test_a_second_rebuild_keeps_every_journey(self, clustered):
+        """The first rebuild creates journeys; the second must not destroy them.
+
+        The second is where row ids get reused, which is the whole mechanism.
+        """
+        async with session_scope() as session:
+            before = list((await session.execute(select(Journey.id))).scalars())
+        assert before, "fixture produced no journeys to begin with"
+
+        async with session_scope() as session:
+            await JourneyBuilder().rebuild(session)
+
+        async with session_scope() as session:
+            after = list((await session.execute(select(Journey.id))).scalars())
+            linked = list(
+                (
+                    await session.execute(
+                        select(func.count(Recording.id)).where(Recording.journey_id.is_not(None))
+                    )
+                ).scalars()
+            )
+        assert after, "rebuilding deleted every journey and reported success"
+        assert len(after) == len(before)
+        assert linked[0] == 6, f"{linked[0]} of 6 recordings are still attached to a journey"
+
+    async def test_denormalised_journey_ids_follow_the_rebuild(self, clustered):
+        """Telemetry carries its own copy of journey_id, and the map reads that copy.
+
+        Leaving it behind outlives the rebuild that orphaned it: the per-journey route and
+        the heat map's journey filter stay empty even once journeys exist again.
+        """
+        async with session_scope() as session:
+            await JourneyBuilder().rebuild(session)
+
+        async with session_scope() as session:
+            orphaned = (
+                await session.execute(
+                    select(func.count(TelemetryPoint.id)).where(TelemetryPoint.journey_id.is_(None))
+                )
+            ).scalar()
+            journey_ids = set((await session.execute(select(Journey.id))).scalars())
+            pointed = set(
+                (
+                    await session.execute(
+                        select(TelemetryPoint.journey_id).where(
+                            TelemetryPoint.journey_id.is_not(None)
+                        )
+                    )
+                ).scalars()
+            )
+        assert orphaned == 0, f"{orphaned} telemetry points lost their journey"
+        assert pointed <= journey_ids, "telemetry points at a journey that no longer exists"
