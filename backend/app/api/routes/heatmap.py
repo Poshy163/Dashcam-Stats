@@ -18,6 +18,7 @@ Rounding is honest about the source data. The overlay prints four decimal places
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime
 
 from fastapi import APIRouter, Query
@@ -25,9 +26,10 @@ from sqlalchemy import Float, String, distinct, func, select
 from sqlalchemy import cast as sa_cast
 
 from app.api.deps import SessionDep
-from app.api.schemas import HeatmapOut
+from app.api.geometry import build_polylines
+from app.api.schemas import HeatmapOut, RoutesOut
 from app.core.logging import get_logger
-from app.db.models import Camera, Journey, Recording, TelemetryPoint
+from app.db.models import Camera, CameraRole, Journey, Recording, TelemetryPoint
 
 log = get_logger(__name__)
 
@@ -46,6 +48,18 @@ DEFAULT_PRECISION = 3
 #: fine precision; the response says when it bites rather than quietly returning a partial
 #: picture that looks complete.
 MAX_CELLS = 20_000
+
+#: Default Douglas-Peucker tolerance for the route overlay, in metres.
+#:
+#: Coarser than the journey view's 5 m because the two are answering different questions.
+#: One drive at full zoom deserves every bend; an overlay of every drive ever taken is read
+#: at city scale, where 15 m is well under a pixel and only costs payload.
+DEFAULT_SIMPLIFY_M = 15.0
+
+#: Ceiling on coordinates returned for the overlay. Past this the browser spends longer
+#: drawing than the map is worth, so the response says it was cut rather than quietly
+#: handing back a partial road network that looks complete.
+MAX_ROUTE_POINTS = 250_000
 
 
 @router.get("/map/heatmap", response_model=HeatmapOut)
@@ -166,6 +180,98 @@ async def heatmap(
         max_weight=max(weights) if weights else 0,
         total_points=sum(weights),
         average_speed_kmh=round(speed_sum / speed_count, 1) if speed_count else None,
+        truncated=truncated,
+    )
+
+
+@router.get("/map/routes", response_model=RoutesOut)
+async def routes(
+    session: SessionDep,
+    start: datetime | None = Query(None, description="Only fixes at or after this instant."),
+    end: datetime | None = Query(None, description="Only fixes at or before this instant."),
+    journey_id: int | None = Query(None, description="Restrict to one journey."),
+    simplify_m: float = Query(
+        DEFAULT_SIMPLIFY_M,
+        ge=0.0,
+        le=200.0,
+        description=(
+            "Douglas-Peucker tolerance in metres. Larger sends less and looks identical "
+            "until you zoom past it."
+        ),
+    ),
+    max_points: int = Query(MAX_ROUTE_POINTS, ge=1_000, le=MAX_ROUTE_POINTS),
+):
+    """Every drive as drawable lines, for tracing the roads under the heat.
+
+    The heat map answers "how much time here"; it deliberately blurs, so at any useful zoom
+    a road and the car park beside it are one warm smudge. These are the paths themselves,
+    and the two are complementary rather than alternatives — drawn together, the lines say
+    which roads and the heat says how often.
+
+    Front camera only by default. Both cameras record the same drive and both burn the same
+    overlay, so including each would draw every road twice with a metre or two of OCR
+    disagreement between the copies — visible as a doubled line, and twice the payload for
+    no extra information.
+    """
+    stmt = (
+        select(
+            TelemetryPoint.journey_id,
+            TelemetryPoint.lat,
+            TelemetryPoint.lon,
+            TelemetryPoint.captured_at,
+            TelemetryPoint.t_offset_s,
+            TelemetryPoint.recording_id,
+        )
+        .join(Recording, TelemetryPoint.recording_id == Recording.id)
+        .outerjoin(Camera, Recording.camera_id == Camera.id)
+        .where(
+            TelemetryPoint.has_fix.is_(True),
+            TelemetryPoint.lat.is_not(None),
+            TelemetryPoint.lon.is_not(None),
+            # A rear-camera-only stretch is rare and not worth a second copy of every road.
+            (Camera.role == CameraRole.FRONT) | (Camera.id.is_(None)),
+        )
+        .order_by(
+            TelemetryPoint.journey_id.asc(),
+            TelemetryPoint.captured_at.asc(),
+            TelemetryPoint.recording_id.asc(),
+            TelemetryPoint.t_offset_s.asc(),
+        )
+    )
+    if start is not None:
+        stmt = stmt.where(TelemetryPoint.captured_at >= start)
+    if end is not None:
+        stmt = stmt.where(TelemetryPoint.captured_at <= end)
+    if journey_id is not None:
+        stmt = stmt.where(TelemetryPoint.journey_id == journey_id)
+
+    # Grouped in Python rather than by a query per journey: one ordered pass over the
+    # fixes costs a single round trip, where a query per journey is 45 of them on this
+    # library and grows with every drive taken.
+    by_journey: dict[int | None, list[tuple[float, float, float | None]]] = defaultdict(list)
+    for row in (await session.execute(stmt)).all():
+        seconds = row.captured_at.timestamp() if row.captured_at is not None else None
+        by_journey[row.journey_id].append((float(row.lat), float(row.lon), seconds))
+
+    lines: list[list[list[float]]] = []
+    points_sent = 0
+    truncated = False
+    for fixes in by_journey.values():
+        for segment in build_polylines(fixes, tolerance_m=simplify_m):
+            if points_sent + len(segment) > max_points:
+                truncated = True
+                break
+            lines.append([[round(lat, 4), round(lon, 4)] for lat, lon in segment])
+            points_sent += len(segment)
+        if truncated:
+            break
+
+    return RoutesOut(
+        lines=lines,
+        journeys=len(by_journey),
+        segments=len(lines),
+        points=points_sent,
+        simplify_m=simplify_m,
         truncated=truncated,
     )
 

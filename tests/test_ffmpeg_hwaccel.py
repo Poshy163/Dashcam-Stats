@@ -152,3 +152,84 @@ class TestPtsWrapClamp:
 
         # The healthy files in this corpus run about 13 Mbps.
         assert MIN_PLAUSIBLE_BITRATE <= 13_000_000
+
+
+class TestInferenceProviders:
+    """Naming the OpenVINO provider is not the same as reaching the iGPU.
+
+    ``OpenVINOExecutionProvider`` takes a ``device_type`` and, left unset, compiles for the
+    CPU. The provider then shows up in diagnostics and everything looks accelerated while
+    the GPU sits idle — which is exactly what a real deployment showed: intel_gpu_top with
+    a quiet render engine and a pinned Python process, pacing a 674-recording queue at
+    around three minutes each.
+    """
+
+    def test_the_device_is_requested_explicitly(self, monkeypatch):
+        import app.ai.runtime as runtime
+
+        runtime.onnx_providers.cache_clear()
+        monkeypatch.setattr(runtime, "_openvino_device", lambda: "GPU")
+
+        class _Ort:
+            @staticmethod
+            def get_available_providers():
+                return ["OpenVINOExecutionProvider", "CPUExecutionProvider"]
+
+        monkeypatch.setitem(__import__("sys").modules, "onnxruntime", _Ort)
+        try:
+            providers = runtime.onnx_providers()
+        finally:
+            runtime.onnx_providers.cache_clear()
+
+        first = providers[0]
+        assert isinstance(first, tuple), "the provider must carry options, not be a bare name"
+        assert first[0] == "OpenVINOExecutionProvider"
+        assert first[1]["device_type"] == "GPU", (
+            "without device_type the provider silently compiles for the CPU"
+        )
+
+    def test_a_missing_device_falls_back_rather_than_failing(self, monkeypatch):
+        """Naming a device OpenVINO cannot see fails session creation outright.
+
+        That would take the whole feature down instead of merely making it slower, so an
+        absent device means falling through to the next provider.
+        """
+        import app.ai.runtime as runtime
+
+        runtime.onnx_providers.cache_clear()
+        monkeypatch.setattr(runtime, "_openvino_device", lambda: None)
+
+        class _Ort:
+            @staticmethod
+            def get_available_providers():
+                return ["OpenVINOExecutionProvider", "CPUExecutionProvider"]
+
+        monkeypatch.setitem(__import__("sys").modules, "onnxruntime", _Ort)
+        try:
+            providers = runtime.onnx_providers()
+        finally:
+            runtime.onnx_providers.cache_clear()
+
+        assert providers == ("CPUExecutionProvider",)
+
+    def test_diagnostics_report_the_device_not_just_the_provider(self, monkeypatch):
+        # "OpenVINOExecutionProvider" alone does not say whether the work is on the iGPU or
+        # back on the CPU, which is the only thing anyone wants to know from this.
+        import app.ai.runtime as runtime
+
+        runtime.onnx_providers.cache_clear()
+        monkeypatch.setattr(runtime, "_openvino_device", lambda: "GPU")
+
+        class _Ort:
+            @staticmethod
+            def get_available_providers():
+                return ["OpenVINOExecutionProvider", "CPUExecutionProvider"]
+
+        monkeypatch.setitem(__import__("sys").modules, "onnxruntime", _Ort)
+        try:
+            described = runtime.describe_runtime()
+        finally:
+            runtime.onnx_providers.cache_clear()
+
+        assert described["device"] == "GPU"
+        assert described["accelerated"] is True

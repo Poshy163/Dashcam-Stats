@@ -8,7 +8,10 @@
  */
 import type {
   Heatmap,
+  OsdDebug,
   HeatmapFilters,
+  RouteFilters,
+  Routes,
   Job,
   Journey,
   JourneyDetail,
@@ -150,6 +153,12 @@ export const api = {
       request<Paginated<Recording>>('/recordings', { query: filters }),
     get: (id: number) => request<Recording>(`/recordings/${id}`),
     telemetry: (id: number) => request<TelemetryPoint[]>(`/recordings/${id}/telemetry`),
+    /** What the overlay reader saw at this instant, and what it made of it. */
+    osdDebug: (id: number, t: number) =>
+      request<OsdDebug>(`/recordings/${id}/osd-debug`, { query: { t } }),
+    /** The rendered composite: frame, cropped strip, and the thresholded mask. */
+    osdDebugImage: (id: number, t: number) =>
+      `/api/recordings/${id}/osd-debug.png?t=${encodeURIComponent(t)}`,
     detections: (id: number) => request<TrackedObject[]>(`/recordings/${id}/detections`),
     plates: (id: number) => request<PlateObservation[]>(`/recordings/${id}/plates`),
     reprocess: (id: number, stages: string[]) =>
@@ -189,6 +198,8 @@ export const api = {
   map: {
     /** Grid-aggregated fixes, ready for a heat layer. See the `Heatmap` type. */
     heatmap: (filters?: HeatmapFilters) => request<Heatmap>('/map/heatmap', { query: filters }),
+    /** The paths themselves, split at signal gaps. See the `Routes` type. */
+    routes: (filters?: RouteFilters) => request<Routes>('/map/routes', { query: filters }),
   },
 
   jobs: {

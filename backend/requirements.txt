@@ -25,11 +25,16 @@ numpy>=1.26,<3
 Pillow>=11.0,<12
 
 # --- inference -------------------------------------------------------------------------
-# OpenVINO drives the Intel iGPU through the same /dev/dri render node as VAAPI, and is
-# what hardware probing reports on. onnxruntime runs the detection and OCR models; see
-# app/ai/runtime.py for why the plain build is used rather than onnxruntime-openvino.
-openvino>=2024.4,<2026
-onnxruntime>=1.19,<2
+# The OpenVINO build of onnxruntime, not the plain one. The plain build offers only the
+# CPU provider, which left every detection and plate model running on the CPU while the
+# iGPU idled -- visible in intel_gpu_top as a busy Python process and a quiet render
+# engine, and worth roughly thirty-three hours on a 674-recording queue.
+#
+# The two OpenVINO copies this introduces are deliberately kept on the same release: the
+# wheel bundles 2025.4.1 on Linux, so `openvino` is pinned to that series rather than left
+# free to drift onto a different build of the same native library in one process.
+openvino>=2025.4,<2026
+onnxruntime-openvino>=1.22,<2
 
 # Model weights and their inference code, both MIT. Fetching weights from the projects
 # that publish them replaces release assets on this repository that never existed, and

@@ -80,6 +80,98 @@ function emptyStateFor(stage: StageState, noun: string): string {
   }
 }
 
+/**
+ * What the overlay reader saw, for the frame currently on screen.
+ *
+ * Every telemetry bug in this project was found by pulling a frame, cropping the strip and
+ * looking at the thresholded mask. That loop lived in throwaway scripts against a mounted
+ * share; putting it in the app means the next one can be diagnosed from the page that
+ * shows the problem, by whoever is looking at it.
+ *
+ * Fetched on demand rather than as the video plays: it decodes a frame server-side, which
+ * is far too expensive to run on every timeupdate.
+ */
+function OsdDebugPanel({ recordingId, time }: { recordingId: number; time: number }) {
+  const [pinned, setPinned] = useState<number | null>(null)
+  const at = pinned ?? 0
+
+  const debug = useQuery({
+    queryKey: ['osd-debug', recordingId, at],
+    queryFn: () => api.recordings.osdDebug(recordingId, at),
+    enabled: pinned !== null,
+    staleTime: 60_000,
+  })
+
+  return (
+    <section className="card p-3">
+      <div className="mb-2 flex items-baseline justify-between gap-2">
+        <h2 className="text-sm font-semibold">Overlay reader</h2>
+        <button className="btn text-xs" onClick={() => setPinned(Number(time.toFixed(2)))}>
+          {pinned === null ? 'Inspect this frame' : 'Re-read at ' + formatClock(time)}
+        </button>
+      </div>
+
+      {pinned === null && (
+        <p className="hint">
+          Shows the frame, the strip cropped from it, and the thresholded image the glyph
+          classifier actually reads &mdash; the three places a telemetry problem can hide.
+        </p>
+      )}
+
+      {debug.isLoading && <Spinner label="Decoding that frame…" className="py-6" />}
+      {debug.isError && <ErrorState error={debug.error} retry={() => debug.refetch()} />}
+
+      {debug.data && (
+        <div className="space-y-2">
+          <img
+            src={api.recordings.osdDebugImage(recordingId, at)}
+            alt="Frame, cropped overlay strip, and the thresholded mask"
+            className="w-full rounded border border-border"
+          />
+          <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs sm:grid-cols-3">
+            <div>
+              <dt className="text-content-faint">Decoded</dt>
+              <dd className="tabular break-all">{debug.data.decodedText || '—'}</dd>
+            </div>
+            <div>
+              <dt className="text-content-faint">Confidence</dt>
+              <dd className="tabular">{debug.data.confidence.toFixed(2)}</dd>
+            </div>
+            <div>
+              <dt className="text-content-faint">Glyphs found</dt>
+              <dd className="tabular">{debug.data.glyphs}</dd>
+            </div>
+            <div>
+              <dt className="text-content-faint">Position</dt>
+              <dd className="tabular">
+                {debug.data.parsed.hasFix
+                  ? formatCoords(debug.data.parsed.lat, debug.data.parsed.lon)
+                  : 'no fix'}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-content-faint">Speed</dt>
+              <dd className="tabular">{formatSpeed(debug.data.parsed.speedKmh)}</dd>
+            </div>
+            <div>
+              <dt className="text-content-faint">Templates</dt>
+              <dd>{debug.data.templatesLoaded ? 'loaded' : 'missing'}</dd>
+            </div>
+          </dl>
+          {debug.data.parsed.problems.length > 0 && (
+            <ul className="space-y-0.5 text-xs text-state-warn">
+              {debug.data.parsed.problems.map((problem) => (
+                <li key={problem}>{problem}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </section>
+  )
+}
+
+
 export default function RecordingViewer() {
   const { id } = useParams()
   const recordingId = Number(id)
@@ -344,6 +436,8 @@ export default function RecordingViewer() {
               <p className="hint">{emptyStateFor(r.plateState, 'plates read')}</p>
             )}
           </section>
+
+          <OsdDebugPanel recordingId={r.id} time={currentTime} />
 
           <section className="card p-3">
             <h2 className="mb-2 text-sm font-semibold">Details</h2>

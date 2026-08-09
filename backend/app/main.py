@@ -19,7 +19,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app.api.errors import install_error_handlers
-from app.api.routes import content, heatmap, media, system
+from app.api.routes import content, heatmap, media, osd_debug, system
 from app.api.schemas import HealthOut
 from app.config import get_config
 from app.core.logging import configure_logging, get_logger, install_db_sink, shutdown_db_sink
@@ -112,6 +112,7 @@ def create_app() -> FastAPI:
     app.include_router(content.router)
     app.include_router(media.router)
     app.include_router(heatmap.router)
+    app.include_router(osd_debug.router)
 
     @app.get("/health", response_model=HealthOut, tags=["health"])
     async def health() -> Response:

@@ -430,3 +430,25 @@ class HeatmapOut(BaseModel):
     average_speed_kmh: float | None = None
     #: True when the cell cap was hit, so the map is showing the densest cells only.
     truncated: bool = False
+
+
+class RoutesOut(BaseModel):
+    """Every drive as drawable lines, to trace the roads under the heat map.
+
+    ``lines`` is a list of polylines, each a list of ``[lat, lon]`` pairs. Bare pairs
+    rather than objects because there are tens of thousands of them and field names would
+    be most of the payload.
+
+    A drive is several lines, not one. The camera loses its lock in tunnels, rejected
+    readings leave holes, and a journey stitches together clips minutes apart — joining
+    across any of those draws a road that does not exist.
+    """
+
+    lines: list[list[list[float]]] = Field(default_factory=list)
+    journeys: int = 0
+    segments: int = 0
+    points: int = 0
+    #: Simplification tolerance actually applied, in metres.
+    simplify_m: float = 0.0
+    #: True when the point cap was reached, so the network shown is incomplete.
+    truncated: bool = False

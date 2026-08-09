@@ -120,7 +120,7 @@ OCR confidence: 94%
 | **Recordings** | Filterable grid with thumbnails, camera, GPS availability and detection counts |
 | **Viewer** | Video player with telemetry, a detection timeline, and click-to-seek |
 | **Journeys** | Grouped drives with route, distance, speeds and detection counts |
-| **Heatmap** | Every road ever driven, on OpenStreetMap, weighted by how often |
+| **Heatmap** | Every road ever driven, on OpenStreetMap: heat for how often, traced lines for which |
 | **Plates** | Searchable plate database — full or partial (`ABC` matches `ABC123`) |
 | **Vehicles** | Vehicle sightings independent of plates |
 | **Queue** | What is processing now, what is queued, what failed, with retry |
@@ -164,6 +164,9 @@ GET  /api/recordings/{id}         details, telemetry and detections
 GET  /api/journeys                journeys with route geometry
 GET  /api/map/heatmap             grid-aggregated GPS fixes, weighted by time spent
 GET  /api/map/coverage            per-journey bounds and distance
+GET  /api/map/routes              every drive as polylines, split at signal gaps
+GET  /api/recordings/{id}/osd-debug     what the overlay reader saw at one frame
+GET  /api/recordings/{id}/osd-debug.png frame + cropped strip + thresholded mask
 GET  /api/plates?q=ABC            full or partial plate search
 GET  /api/plates/{id}/observations every sighting, with location and confidence
 GET  /api/vehicles                vehicle sightings

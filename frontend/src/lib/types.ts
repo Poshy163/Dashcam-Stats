@@ -400,3 +400,57 @@ export interface HeatmapFilters {
   camera?: string
   minSpeedKmh?: number
 }
+
+/**
+ * Every drive as drawable lines, to trace the roads under the heat map.
+ *
+ * A drive is several lines, not one. The camera loses its lock in tunnels, rejected
+ * readings leave holes, and a journey stitches together clips minutes apart — joining
+ * across any of those would draw a road that does not exist.
+ */
+export interface Routes {
+  /** Polylines, each a list of [lat, lon] pairs. */
+  lines: number[][][]
+  journeys: number
+  segments: number
+  points: number
+  /** Simplification tolerance actually applied, in metres. */
+  simplifyM: number
+  /** True when the point cap was reached, so the network shown is incomplete. */
+  truncated: boolean
+}
+
+export interface RouteFilters {
+  [key: string]: string | number | boolean | null | undefined
+  start?: string
+  end?: string
+  journeyId?: number
+  simplifyM?: number
+}
+
+/**
+ * What the overlay reader extracted from one frame.
+ *
+ * `decodedText` and `parsed` are separate on purpose: text that decoded wrongly looks
+ * nothing like text that decoded fine and then failed validation, and telling those two
+ * apart is most of diagnosing a telemetry problem.
+ */
+export interface OsdDebug {
+  recordingId: number
+  filename: string
+  offsetS: number
+  region: { x: number; y: number; width: number; height: number }
+  templatesLoaded: boolean
+  decodedText: string
+  confidence: number
+  glyphs: number
+  parsed: {
+    capturedAt: string | null
+    lat: number | null
+    lon: number | null
+    hasFix: boolean
+    speedKmh: number | null
+    problems: string[]
+  }
+  imageUrl: string
+}

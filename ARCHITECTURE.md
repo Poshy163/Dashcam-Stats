@@ -325,6 +325,46 @@ Blur radius is derived from how large a grid cell currently is on screen rather 
 because cells are a fixed size on the *ground*: a constant radius collapses to specks when
 zoomed out and beads into disconnected blobs when zoomed in.
 
+### Tracing the routes as well as the heat
+
+The heat layer blurs by design, so at a readable zoom a road and the car park beside it are
+one warm smudge: it answers *how often*, not *which road*. `GET /api/map/routes` returns the
+paths themselves as polylines, drawn thin and semi-transparent so overlapping drives
+accumulate — a commute taken two hundred times reads brighter than a road taken once, which
+gives the overlay its own sense of frequency without a second colour scale.
+
+One property matters more than the rest: **a drive is several lines, not one.** The camera
+loses its lock in tunnels, rejected readings leave holes, and a journey stitches together
+clips minutes apart. Joining across any of those draws a road that does not exist. Measured
+on a synthetic drive with a 60-second dropout, joining blindly produced a 1,055 m chord
+through whatever the vehicle actually went around; splitting first caps the longest drawn
+step at 17 m. On one journey that is a visible glitch, and on an overlay of every drive ever
+taken it is a spray of false chords indistinguishable from real roads.
+
+Splitting must also come *before* simplification, or Douglas-Peucker treats the two ends of
+a gap as collinear with everything between them and collapses the dropout back into a single
+straight line. The simplification itself is iterative rather than recursive: the textbook
+formulation recurses once per split, and a nearly straight motorway trace — exactly the case
+that produces the most points — approaches one stack frame per point.
+
+At this library's scale (45 journeys, both cameras) the default 15 m tolerance sends 26 KB.
+
+### Seeing what the overlay reader sees
+
+Every telemetry defect in this project was found by pulling a frame, cropping the strip and
+looking at the thresholded mask. That loop lived in throwaway scripts pointed at a mounted
+share. `GET /api/recordings/{id}/osd-debug.png` puts it in the application: the frame with
+the region outlined, the cropped strip, and the mask the classifier actually reads.
+
+Three panels because the failures live between them. A clean strip and a solid-black mask
+means the threshold is wrong; a clean mask that decodes to nonsense means the templates are;
+a strip showing road instead of overlay means the region is. The final text alone cannot
+distinguish those, which is why each of those bugs previously required a frame dump.
+
+It loads the *same* active region and learned templates the telemetry stage uses, so a
+discrepancy is real rather than an artefact of the tool — a debug view that quietly does
+something slightly different sends you looking in the wrong place.
+
 ---
 
 ## 5.2 Failures that reported success

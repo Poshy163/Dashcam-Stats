@@ -11,6 +11,8 @@ Nothing caught it because no test had ever called the endpoint. These do.
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import httpx
 import pytest
 from httpx import ASGITransport
@@ -67,6 +69,7 @@ READ_ENDPOINTS = [
     "/api/search?q=ABC",
     "/api/map/heatmap",
     "/api/map/coverage",
+    "/api/map/routes",
 ]
 
 
@@ -450,6 +453,154 @@ class TestHeatmapStatistics:
             f"60 seconds of driving filmed by two cameras reported as "
             f"{body['total_points']} seconds"
         )
+
+
+class TestPlateCrops:
+    """The Plates grid is the page with the pictures on it.
+
+    Crops are written to disk, recorded on the observation, and served correctly. The grid
+    still showed "no vehicle image" under every card, because the list route builds its rows
+    through the generic paginator — which validates the ORM row and stops — while the crops
+    live on the observations. The detail route filled them in; the list route never did.
+
+    A detail endpoint returning the right thing says nothing about the list that links to it.
+    """
+
+    @pytest.fixture
+    async def plate_with_crops(self, db_session):
+        from datetime import UTC, datetime
+
+        from app.db.models import Plate, PlateObservation
+
+        async with session_scope() as session:
+            rec = Recording(
+                rel_path="p.ts", filename="p.ts", size_bytes=1, state=RecordingState.COMPLETED
+            )
+            plate = Plate(normalised_text="S233AKF", display_text="S233AKF", best_confidence=0.99)
+            session.add_all([rec, plate])
+            await session.flush()
+            base = datetime(2026, 7, 28, 9, 4, tzinfo=UTC)
+            # Two observations; the better one owns the crops that should represent the plate.
+            for index, (confidence, suffix) in enumerate(((0.72, "worse"), (0.99, "best"))):
+                session.add(
+                    PlateObservation(
+                        plate_id=plate.id,
+                        recording_id=rec.id,
+                        t_offset_s=float(index),
+                        captured_at=base,
+                        raw_text="S233AKF",
+                        normalised_text="S233AKF",
+                        ocr_confidence=confidence,
+                        detection_confidence=0.9,
+                        vote_count=1,
+                        plate_crop_path=f"plates/00000001/{suffix}.jpg",
+                        vehicle_crop_path=f"plates/00000001/{suffix}_vehicle.jpg",
+                    )
+                )
+            await session.flush()
+            return plate.id
+
+    async def test_the_list_carries_the_crops(self, client, plate_with_crops):
+        body = (await client.get("/api/plates")).json()
+        assert body["items"], "no plates returned"
+        item = body["items"][0]
+        assert item["representative_vehicle_path"], (
+            "the Plates grid renders this field; empty means every card shows "
+            '"no vehicle image" while the file sits on disk'
+        )
+        assert item["representative_crop_path"]
+
+    async def test_the_list_and_the_detail_agree(self, client, plate_with_crops):
+        listed = (await client.get("/api/plates")).json()["items"][0]
+        detail = (await client.get(f"/api/plates/{plate_with_crops}")).json()
+        assert listed["representative_crop_path"] == detail["representative_crop_path"]
+        assert listed["representative_vehicle_path"] == detail["representative_vehicle_path"]
+
+    async def test_the_best_observation_represents_the_plate(self, client, plate_with_crops):
+        item = (await client.get("/api/plates")).json()["items"][0]
+        assert "best" in item["representative_crop_path"], (
+            f"expected the highest-confidence crop, got {item['representative_crop_path']}"
+        )
+
+
+class TestRouteOverlay:
+    """The paths driven, drawn as lines under the heat.
+
+    The heat blurs by design, so it says how often but not which road. These are the roads.
+    """
+
+    @pytest.fixture
+    async def a_drive_with_a_tunnel(self, db_session):
+        from datetime import UTC, datetime, timedelta
+
+        from app.db.models import Journey, TelemetryPoint
+
+        async with session_scope() as session:
+            base = datetime(2026, 8, 4, 17, 43, tzinfo=UTC)
+            j = Journey(started_at=base, ended_at=base + timedelta(minutes=5), duration_s=300.0)
+            session.add(j)
+            await session.flush()
+            rec = Recording(
+                rel_path="drive.ts",
+                filename="drive.ts",
+                size_bytes=1,
+                state=RecordingState.COMPLETED,
+                journey_id=j.id,
+                started_at=base,
+            )
+            session.add(rec)
+            await session.flush()
+            for step in range(240):
+                if 100 <= step < 160:
+                    continue  # 60 seconds with no lock
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec.id,
+                        journey_id=j.id,
+                        t_offset_s=float(step),
+                        captured_at=base + timedelta(seconds=step),
+                        lat=-34.8088 + step * 1.5e-4,
+                        lon=138.6769 + step * 0.5e-4,
+                        has_fix=True,
+                        speed_kmh=55.0,
+                    )
+                )
+            await session.flush()
+
+    async def test_a_dropout_breaks_the_line_instead_of_crossing_it(
+        self, client, a_drive_with_a_tunnel
+    ):
+        """The artefact this must never produce.
+
+        Joining the fix before a gap to the fix after it draws a road straight through
+        whatever the vehicle actually went around. One drive makes that a visible glitch;
+        an overlay of every drive ever recorded makes it a spray of false chords that are
+        indistinguishable from real roads.
+        """
+        from app.osd.engine import haversine_m
+
+        body = (await client.get("/api/map/routes?simplify_m=0")).json()
+        assert body["segments"] == 2, (
+            f"the dropout should split the drive in two, got {body['segments']} segment(s)"
+        )
+        worst = 0.0
+        for line in body["lines"]:
+            for (a_lat, a_lon), (b_lat, b_lon) in pairwise(line):
+                worst = max(worst, haversine_m(a_lat, a_lon, b_lat, b_lon))
+        assert worst < 100, f"a {worst:.0f} m chord was drawn across the gap"
+
+    async def test_simplification_does_not_reunite_the_gap(self, client, a_drive_with_a_tunnel):
+        # Splitting has to happen before simplifying: run the other way round,
+        # Douglas-Peucker treats the two ends of a dropout as collinear with everything
+        # between them and collapses it back into one straight line.
+        body = (await client.get("/api/map/routes?simplify_m=25")).json()
+        assert body["segments"] == 2
+
+    async def test_simplification_reduces_the_payload(self, client, a_drive_with_a_tunnel):
+        raw = (await client.get("/api/map/routes?simplify_m=0")).json()
+        simplified = (await client.get("/api/map/routes")).json()
+        assert simplified["points"] < raw["points"]
+        assert simplified["points"] > 0
 
 
 class TestNotFound:

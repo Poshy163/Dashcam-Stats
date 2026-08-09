@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from app.api.deps import PaginationDep, SessionDep
 from app.api.schemas import (
@@ -441,24 +441,61 @@ async def list_plates(
         "alpha": Plate.normalised_text.asc(),
     }.get(sort, Plate.last_seen_at.desc().nullslast())
 
-    return await _paginate(session, stmt.order_by(order), page, PlateOut)
+    page_out = await _paginate(session, stmt.order_by(order), page, PlateOut)
+    # The crops live on the observations, not on the plate, so the generic paginator
+    # cannot know about them: it validates the ORM row and stops. Without this the Plates
+    # grid showed "no vehicle image" under every card while the images sat on disk and
+    # served perfectly — the detail route filled them in, the list route never did, and
+    # the list is the page with the pictures on it.
+    page_out.items = await _with_representative(session, page_out.items)
+    return page_out
+
+
+async def _best_observations(session, plate_ids: list[int]) -> dict[int, PlateObservation]:
+    """The highest-confidence observation for each plate, in one query.
+
+    A window function rather than a query per plate. A page holds two dozen cards and this
+    runs on every load, so the obvious loop is two dozen round trips for something the
+    database can rank in a single pass.
+    """
+    if not plate_ids:
+        return {}
+
+    ranked = (
+        select(
+            PlateObservation,
+            func.row_number()
+            .over(
+                partition_by=PlateObservation.plate_id,
+                order_by=PlateObservation.ocr_confidence.desc(),
+            )
+            .label("rank"),
+        )
+        .where(PlateObservation.plate_id.in_(plate_ids))
+        .subquery()
+    )
+    observations = (
+        (await session.execute(select(aliased(PlateObservation, ranked)).where(ranked.c.rank == 1)))
+        .scalars()
+        .all()
+    )
+    return {obs.plate_id: obs for obs in observations}
+
+
+async def _with_representative(session, items: list[PlateOut]) -> list[PlateOut]:
+    """Attach each plate's representative crops to an already-built page of results."""
+    best = await _best_observations(session, [item.id for item in items])
+    for item in items:
+        observation = best.get(item.id)
+        if observation is not None:
+            item.representative_crop_path = observation.plate_crop_path
+            item.representative_vehicle_path = observation.vehicle_crop_path
+    return items
 
 
 async def _attach_representative(session, plate: Plate) -> PlateOut:
-    """Pick the highest-confidence observation's crops to represent the plate."""
-    best = (
-        await session.execute(
-            select(PlateObservation)
-            .where(PlateObservation.plate_id == plate.id)
-            .order_by(PlateObservation.ocr_confidence.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    out = PlateOut.model_validate(plate)
-    if best is not None:
-        out.representative_crop_path = best.plate_crop_path
-        out.representative_vehicle_path = best.vehicle_crop_path
-    return out
+    """Pick the highest-confidence observation's crops to represent one plate."""
+    return (await _with_representative(session, [PlateOut.model_validate(plate)]))[0]
 
 
 @router.get("/plates/{plate_id}", response_model=PlateOut)
