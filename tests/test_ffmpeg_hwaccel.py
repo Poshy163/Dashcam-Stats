@@ -233,3 +233,38 @@ class TestInferenceProviders:
 
         assert described["device"] == "GPU"
         assert described["accelerated"] is True
+
+
+class TestReportedDevice:
+    """The Queue page's device column has to be readable.
+
+    A provider entry is a ``(name, options)`` pair once it carries a device, so returning
+    it whole wrote the entire tuple repr into the column -- accurate and unreadable.
+    """
+
+    def test_the_device_is_a_plain_name(self, monkeypatch):
+        import app.ai.runtime as runtime
+        from app.ai.detector import ObjectDetector
+
+        runtime.onnx_providers.cache_clear()
+        monkeypatch.setattr(
+            runtime,
+            "onnx_providers",
+            lambda: (("OpenVINOExecutionProvider", {"device_type": "GPU"}), "CPUExecutionProvider"),
+        )
+        import app.ai.detector as detector_module
+
+        monkeypatch.setattr(detector_module, "onnx_providers", runtime.onnx_providers)
+
+        detector = ObjectDetector()
+        detector._detector = object()  # stand in for a loaded session
+        assert detector.device == "GPU"
+
+    def test_a_bare_provider_name_still_works(self, monkeypatch):
+        import app.ai.detector as detector_module
+        from app.ai.detector import ObjectDetector
+
+        monkeypatch.setattr(detector_module, "onnx_providers", lambda: ("CPUExecutionProvider",))
+        detector = ObjectDetector()
+        detector._detector = object()
+        assert detector.device == "CPUExecutionProvider"

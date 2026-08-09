@@ -135,8 +135,20 @@ class ObjectDetector:
 
     @property
     def device(self) -> str | None:
+        """Where inference runs, as something a person can read.
+
+        A provider entry is a ``(name, options)`` pair once it carries a device, so
+        returning it whole put the entire tuple repr into the Queue page's device column.
+        The useful answer is the device itself -- GPU or CPU -- because that is the one
+        thing anyone checks this for.
+        """
         providers = onnx_providers()
-        return providers[0] if providers and self._detector is not None else None
+        if not providers or self._detector is None:
+            return None
+        first = providers[0]
+        if isinstance(first, tuple):
+            return str(first[1].get("device_type") or first[0])
+        return str(first)
 
     async def load(self) -> bool:
         if self._loaded:
