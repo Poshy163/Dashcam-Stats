@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -230,6 +231,43 @@ class JourneyBuilder:
         if stale:
             log.info("recomputed journeys with stale rollups", journeys=len(stale))
         return len(stale)
+
+    async def needs_recluster(self, session: AsyncSession) -> bool:
+        """Do two automatic journeys sit close enough together to be one drive?
+
+        Journeys are built two ways. A rebuild clusters the whole library at once and gets
+        the boundaries right; ``assign_recording`` attaches one recording as it finishes and
+        creates a journey when it finds no neighbour to join. The queue does not process
+        recordings in chronological order, so a segment routinely finishes before the ones
+        either side of it and starts a journey of its own -- and once the import is done the
+        scanner reports no new files, the rebuild never runs, and those fragments are
+        permanent.
+
+        Measured on a real library: 129 journeys of which 65 held a single recording, 77
+        adjacent pairs sat inside the five-minute threshold that is supposed to join them,
+        and some overlapped in time. One pair was split by a gap of one second.
+
+        Asking the data rather than tracking state: if any two consecutive automatic
+        journeys are within the gap, the clustering is stale by its own definition. That is
+        false as soon as a rebuild has run, so this cannot loop, and it needs nothing
+        remembered between restarts.
+        """
+        gap = timedelta(minutes=float(get_settings_service().get_nowait("journeys.gap_minutes")))
+        rows = list(
+            (
+                await session.execute(
+                    select(Journey.started_at, Journey.ended_at)
+                    .where(Journey.manual.is_(False))
+                    .order_by(Journey.started_at.asc())
+                )
+            ).all()
+        )
+        for (_, prev_end), (next_start, _) in pairwise(rows):
+            if prev_end is None or next_start is None:
+                continue
+            if as_utc(next_start) - as_utc(prev_end) <= gap:
+                return True
+        return False
 
     @staticmethod
     async def _drop_empty(session: AsyncSession) -> int:

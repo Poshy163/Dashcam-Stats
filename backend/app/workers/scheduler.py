@@ -157,6 +157,16 @@ class Scheduler:
             async with session_scope() as session:
                 await JourneyBuilder().rebuild(session)
 
+        # Recluster when the journey boundaries have drifted. Recordings finishing out of
+        # chronological order each create their own journey, and on a library that has
+        # finished importing the scanner never reports a new file, so nothing above would
+        # ever put them back together.
+        async with session_scope() as session:
+            builder = JourneyBuilder()
+            if await builder.needs_recluster(session):
+                log.info("journey boundaries look stale; reclustering")
+                await builder.rebuild(session)
+
         # Self-heal journeys whose rollups were invalidated and never recomputed -- by a
         # migration, a decoder fix, or telemetry that arrived after the journey did. Cheap
         # when there is nothing to do, which is the normal case.

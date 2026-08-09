@@ -688,3 +688,107 @@ class TestRepairRevisitsBadDistances:
 
         async with session_scope() as session:
             assert await JourneyBuilder().repair_stale(session) == 0
+
+
+class TestJourneyBoundariesRecluster:
+    """Journeys built one recording at a time must not stay fragmented.
+
+    Two paths build journeys. A rebuild clusters the whole library and gets the boundaries
+    right; `assign_recording` attaches one recording as it finishes and creates a journey
+    when it finds no neighbour. The queue does not run recordings in chronological order,
+    so a segment routinely finishes before the ones either side of it and starts a journey
+    of its own. Once the import is done the scanner reports no new files, the rebuild never
+    runs, and those fragments become permanent.
+
+    On the live library that produced 129 journeys of which 65 held a single recording, 77
+    adjacent pairs inside the five-minute threshold meant to join them, and journeys that
+    overlapped in time. One pair was split by a gap of one second.
+    """
+
+    @pytest.fixture
+    async def fragments(self, db_session):
+        """Six consecutive recordings, attached in shuffled order — as the queue does."""
+        base = datetime(2026, 8, 4, 8, 0, tzinfo=UTC)
+        async with session_scope() as session:
+            ids = []
+            for index in range(6):
+                start = base + timedelta(seconds=index * 121)
+                rec = Recording(
+                    rel_path=f"f{index}.ts",
+                    filename=f"f{index}.ts",
+                    size_bytes=1,
+                    state=RecordingState.COMPLETED,
+                    started_at=start,
+                    ended_at=start + timedelta(seconds=120),
+                )
+                session.add(rec)
+                await session.flush()
+                ids.append(rec.id)
+            await session.flush()
+
+        builder = JourneyBuilder()
+        # Out of order on purpose: this is what makes each one create its own journey.
+        for index in (3, 0, 5, 1, 4, 2):
+            async with session_scope() as session:
+                recording = await session.get(Recording, ids[index])
+                await builder.assign_recording(session, recording)
+                await session.commit()
+
+    async def test_the_fragments_are_detected(self, fragments):
+        async with session_scope() as session:
+            journeys = list((await session.execute(select(Journey.id))).scalars())
+            assert len(journeys) > 1, "fixture did not fragment; nothing to detect"
+            assert await JourneyBuilder().needs_recluster(session) is True
+
+    async def test_reclustering_joins_them(self, fragments):
+        async with session_scope() as session:
+            await JourneyBuilder().rebuild(session)
+            await session.commit()
+
+        async with session_scope() as session:
+            journeys = list((await session.execute(select(Journey.id))).scalars())
+            attached = (
+                await session.execute(
+                    select(func.count(Recording.id)).where(Recording.journey_id.is_not(None))
+                )
+            ).scalar()
+        assert len(journeys) == 1, (
+            f"six consecutive recordings two minutes apart became {len(journeys)} journeys"
+        )
+        assert attached == 6
+
+    async def test_a_scan_that_finds_nothing_new_still_reclusters(self, fragments, app_config):
+        """The wiring, not just the detection.
+
+        This is where the bug actually lived: the rebuild was gated on the scanner finding
+        a new or changed file, and a library that has finished importing never reports one.
+        Running the scan over an empty footage directory reproduces exactly that -- nothing
+        new, nothing changed -- and the fragments must still be put back together.
+        """
+        from app.scanner.discovery import Scanner
+        from app.workers.scheduler import Scheduler
+
+        scheduler = Scheduler()
+        # Points at the configured (empty) footage dir, so the scan finds nothing at all.
+        scheduler._scanner = Scanner(footage_dir=app_config.footage_dir)
+        await scheduler._run_scan()
+
+        async with session_scope() as session:
+            journeys = list((await session.execute(select(Journey.id))).scalars())
+        assert len(journeys) == 1, (
+            f"a scan finding no new files left {len(journeys)} fragmented journeys"
+        )
+
+    async def test_a_settled_library_is_left_alone(self, fragments):
+        """Having reclustered once, it must not keep doing so.
+
+        The check is a property of the data, so it has to go false as soon as the shape is
+        right — otherwise every scan would delete and recreate every journey, renumbering
+        them and churning the ids the UI links to.
+        """
+        async with session_scope() as session:
+            await JourneyBuilder().rebuild(session)
+            await session.commit()
+
+        async with session_scope() as session:
+            assert await JourneyBuilder().needs_recluster(session) is False
