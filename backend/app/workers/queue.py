@@ -16,7 +16,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
-from app.core.settings_service import get_settings_service
+from app.core.settings_service import get_settings_service, local_midnight_utc
 from app.db.models import JobKind, JobState, ProcessingJob, Recording, RecordingState
 
 log = get_logger(__name__)
@@ -160,7 +160,12 @@ async def heartbeat(
     speed: float | None = None,
     decoder: str | None = None,
     device: str | None = None,
-) -> None:
+) -> JobState | None:
+    """Publish progress, and report the job's state back to the caller.
+
+    The state is returned because this is the pool's only regular tick, so it is also how
+    a cancellation request reaches a run that is already in flight.
+    """
     values: dict[str, object] = {"heartbeat_at": datetime.now(UTC)}
     if progress is not None:
         values["progress"] = max(0.0, min(1.0, progress))
@@ -179,6 +184,9 @@ async def heartbeat(
         .values(**values)
         .execution_options(synchronize_session=False)
     )
+    return (
+        await session.execute(select(ProcessingJob.state).where(ProcessingJob.id == job_id))
+    ).scalar_one_or_none()
 
 
 async def complete(
@@ -246,11 +254,19 @@ async def fail(
 
 
 async def cancel(session: AsyncSession, job_id: int) -> bool:
+    """Cancel a job, whether it is queued or already running.
+
+    For a running job this only records the request; the worker pool picks it up on its
+    next heartbeat and stops the run. The worker will then decline to write a result over
+    the top of it, which it previously did — so a cancelled job came back a few minutes
+    later as COMPLETED, or as QUEUED with a retry pending.
+    """
     job = await session.get(ProcessingJob, job_id)
     if job is None or job.state not in (JobState.QUEUED, JobState.RUNNING):
         return False
     job.state = JobState.CANCELLED
     job.finished_at = datetime.now(UTC)
+    job.worker_id = None
     await session.flush()
     return True
 
@@ -307,7 +323,9 @@ async def stats(session: AsyncSession) -> dict[str, object]:
     ).all()
     counts = {state.value: int(count) for state, count in rows}
 
-    midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    # The user's day, not UTC's — see local_midnight_utc. Adelaide is nine and a half
+    # hours ahead, so "Completed today" reset itself at half past nine in the morning.
+    midnight = local_midnight_utc()
     completed_today = int(
         (
             await session.execute(

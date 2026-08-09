@@ -3,6 +3,7 @@
 Runs both from the command line (``alembic -c backend/alembic.ini upgrade head``) and
 in-process from ``app.db.session.upgrade_to_head`` during startup.
 """
+
 from __future__ import annotations
 
 import sys

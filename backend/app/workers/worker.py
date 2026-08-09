@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
-from app.db.models import ProcessingJob, Recording
+from app.db.models import JobState, ProcessingJob, Recording
 from app.db.session import session_scope
 from app.hardware.detect import detect_hardware
 from app.pipeline.orchestrator import pending_stages, run_stages
@@ -32,6 +32,18 @@ _HEARTBEAT_INTERVAL_S = 3.0
 #: Idle poll interval. The queue is not latency-critical — new work arrives from a scan.
 _IDLE_SLEEP_S = 2.0
 
+#: Attempts at recording a finished job's outcome, and the pause between them.
+#:
+#: Losing this write throws away the entire run: the row stays RUNNING with no worker, is
+#: reclaimed five minutes later, and the recording is decoded again from the first frame.
+#: Retrying is cheap and the work it protects is not.
+_FINISH_ATTEMPTS = 4
+_FINISH_RETRY_S = 3.0
+
+#: Consecutive heartbeat failures before saying so at a level anyone will see. One is a
+#: blip; a run of them means the job is on its way to being reclaimed.
+_HEARTBEAT_WARN_AFTER = 3
+
 
 @dataclass(slots=True)
 class ActiveJob:
@@ -44,6 +56,8 @@ class ActiveJob:
     speed_realtime: float | None = None
     decoder: str | None = None
     inference_device: str | None = None
+    #: Set once the job has been cancelled in the database, so the run can be stopped.
+    cancelled: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -65,6 +79,8 @@ class WorkerPool:
     def __init__(self) -> None:
         self._workers: dict[int, asyncio.Task[None]] = {}
         self._active: dict[int, ActiveJob] = {}
+        #: The in-flight run for each job, so a cancellation can interrupt it.
+        self._work: dict[int, asyncio.Task] = {}
         self._running = False
         self._supervisor: asyncio.Task[None] | None = None
         self._pool_id = uuid.uuid4().hex[:8]
@@ -207,52 +223,30 @@ class WorkerPool:
         heartbeat_task = asyncio.create_task(self._heartbeat(active))
         try:
             if recording_id is None:
-                async with session_scope() as session:
-                    job = await session.get(ProcessingJob, job_id)
-                    if job is not None:
-                        await queue.complete(session, job, {"note": "no recording attached"})
+                await self._finish(job_id, active, note="no recording attached")
                 return
 
-            async with session_scope() as session:
-                recording = await session.get(Recording, recording_id)
-                if recording is None:
-                    job = await session.get(ProcessingJob, job_id)
-                    if job is not None:
-                        await queue.fail(session, job, "recording no longer exists", permanent=True)
-                    return
+            # The run happens in its own task so the heartbeat can stop it. Cancelling is
+            # the only way to interrupt work that is inside a model or an ffmpeg read;
+            # without it the Cancel button changed a badge and nothing else, and the run
+            # then wrote its own result over the top and un-cancelled itself.
+            work = asyncio.create_task(self._process(recording_id, stages, active))
+            self._work[job_id] = work
+            try:
+                report = await work
+            except asyncio.CancelledError:
+                if not active.cancelled:
+                    raise
+                log.info("job cancelled", job_id=job_id, file=filename)
+                return
 
-                selected = stages or list(pending_stages(recording)) or None
+            if report is None:
+                await self._finish(
+                    job_id, active, fail="recording no longer exists", permanent=True
+                )
+                return
 
-                def on_progress(stage: str, fraction: float) -> None:
-                    active.stage = stage
-                    active.progress = fraction
-
-                report = await run_stages(session, recording, selected, progress=on_progress)
-                active.speed_realtime = report.realtime_factor
-                # Which device actually ran inference is only known once a stage has used
-                # one, and it is worth surfacing: it is the difference between the iGPU
-                # doing the work and the CPU quietly doing it instead.
-                active.inference_device = self._device_from(report) or active.inference_device
-
-                job = await session.get(ProcessingJob, job_id)
-                if job is not None:
-                    if report.ok:
-                        await queue.complete(
-                            session,
-                            job,
-                            report.as_dict(),
-                            speed=active.speed_realtime,
-                            decoder=active.decoder,
-                            device=active.inference_device,
-                        )
-                    else:
-                        await queue.fail(
-                            session,
-                            job,
-                            report.error or "processing failed",
-                            permanent=report.permanent,
-                        )
-
+            await self._finish(job_id, active, report=report)
             log.info(
                 "processed recording",
                 file=filename,
@@ -265,14 +259,113 @@ class WorkerPool:
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task
             self._active.pop(job_id, None)
+            self._work.pop(job_id, None)
+
+    async def _process(self, recording_id: int, stages: list[str] | None, active: ActiveJob):
+        """Run the stages. Returns the report, or None if the recording has gone."""
+        async with session_scope() as session:
+            recording = await session.get(Recording, recording_id)
+            if recording is None:
+                return None
+
+            selected = stages or list(pending_stages(recording)) or None
+
+            def on_progress(stage: str, fraction: float) -> None:
+                active.stage = stage
+                active.progress = fraction
+
+            report = await run_stages(session, recording, selected, progress=on_progress)
+            active.speed_realtime = report.realtime_factor
+            # Which device actually ran inference is only known once a stage has used
+            # one, and it is worth surfacing: it is the difference between the iGPU
+            # doing the work and the CPU quietly doing it instead.
+            active.inference_device = self._device_from(report) or active.inference_device
+
+            # Flush the recording's own outcome here, in the session that owns it. Left
+            # dirty, it was flushed later by the first query of the bookkeeping below --
+            # an autoflush that took the write lock at the worst possible moment and
+            # failed, taking the finished run down with it.
+            await session.flush()
+            return report
+
+    async def _finish(
+        self,
+        job_id: int,
+        active: ActiveJob,
+        *,
+        report=None,
+        fail: str | None = None,
+        permanent: bool = False,
+        note: str | None = None,
+    ) -> None:
+        """Record how a job ended, in a session of its own, retrying if the write fails.
+
+        Separate from the run on purpose. These few writes are the only durable trace that
+        minutes of decoding and inference happened at all, and they used to share both the
+        session and the error handling with the work itself -- so a lock held elsewhere
+        turned a completed job into a stranded RUNNING row, five idle minutes, a burned
+        attempt, and a full reprocess from the first frame.
+        """
+        last: Exception | None = None
+        for attempt in range(_FINISH_ATTEMPTS):
+            try:
+                async with session_scope() as session:
+                    job = await session.get(ProcessingJob, job_id)
+                    if job is None:
+                        return
+                    if job.state == JobState.CANCELLED:
+                        # Someone asked for this to stop. Writing the result now would
+                        # resurrect it -- as COMPLETED, or as QUEUED with a retry pending.
+                        log.info("job was cancelled; not recording its outcome", job_id=job_id)
+                        return
+                    if fail is not None:
+                        await queue.fail(session, job, fail, permanent=permanent)
+                    elif report is not None and not report.ok:
+                        await queue.fail(
+                            session,
+                            job,
+                            report.error or "processing failed",
+                            permanent=report.permanent,
+                        )
+                    else:
+                        await queue.complete(
+                            session,
+                            job,
+                            report.as_dict() if report is not None else {"note": note},
+                            speed=active.speed_realtime,
+                            decoder=active.decoder,
+                            device=active.inference_device,
+                        )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last = exc
+                if attempt < _FINISH_ATTEMPTS - 1:
+                    await asyncio.sleep(_FINISH_RETRY_S * (attempt + 1))
+
+        # Out of attempts. Say so plainly: the row is now stranded RUNNING and will be
+        # reclaimed, and this line is the only explanation of why the work was repeated.
+        log.error(
+            "could not record job outcome; it will be reclaimed and run again",
+            job_id=job_id,
+            attempts=_FINISH_ATTEMPTS,
+            error=str(last),
+        )
 
     async def _heartbeat(self, active: ActiveJob) -> None:
-        """Publish progress so the queue page can show it and the job is not reclaimed."""
+        """Publish progress, and notice if the job has been cancelled underneath us.
+
+        This is also where a cancellation request is picked up. The pool has no other
+        regular tick, and the alternative — polling from inside the stages — would put a
+        database read in the middle of every decode loop.
+        """
+        consecutive_failures = 0
         while True:
             await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
             try:
                 async with session_scope() as session:
-                    await queue.heartbeat(
+                    state = await queue.heartbeat(
                         session,
                         active.job_id,
                         progress=active.progress,
@@ -281,10 +374,26 @@ class WorkerPool:
                         decoder=active.decoder,
                         device=active.inference_device,
                     )
+                consecutive_failures = 0
+                if state == JobState.CANCELLED and not active.cancelled:
+                    active.cancelled = True
+                    task = self._work.get(active.job_id)
+                    if task is not None:
+                        task.cancel()
+                    return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.debug("heartbeat failed", job_id=active.job_id, error=str(exc))
+                consecutive_failures += 1
+                # A heartbeat that keeps failing is the only warning before the job is
+                # reclaimed and its work thrown away. At debug level nobody ever saw it.
+                report = log.warning if consecutive_failures >= _HEARTBEAT_WARN_AFTER else log.debug
+                report(
+                    "heartbeat failed",
+                    job_id=active.job_id,
+                    consecutive=consecutive_failures,
+                    error=str(exc),
+                )
 
     # -- introspection -----------------------------------------------------------------
 

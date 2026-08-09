@@ -268,3 +268,147 @@ class TestReportedDevice:
         detector = ObjectDetector()
         detector._detector = object()
         assert detector.device == "CPUExecutionProvider"
+
+
+class TestEmptyWindowIsNotAHardwareFailure:
+    """An empty seek window says nothing about the GPU.
+
+    The plates stage takes one short ``-ss t -t 0.5`` seek per tracked vehicle — up to 410
+    per recording — and a window that lands past the last frame or inside a damaged GOP
+    legitimately yields nothing. That arrived as the same ``DecodeError`` as a driver
+    failure, so ``iter_frames`` concluded hardware decode was broken *for that file* and
+    forced software decoding for the rest of the process. One unlucky seek cost the iGPU
+    the remainder of a recording it had already been decoding on VAAPI for minutes, and the
+    Queue page went on reporting "Decoder: vaapi" throughout.
+    """
+
+    def test_a_clean_exit_with_no_frames_is_a_window_not_a_device(self):
+        from app.hardware.ffmpeg import DecodeError, _is_empty_window
+
+        exc = DecodeError("no frames decoded from clip.ts", stderr="", returncode=0)
+        assert _is_empty_window(exc)
+
+    def test_a_failed_decoder_is_still_a_device_failure(self):
+        from app.hardware.ffmpeg import DecodeError, _is_empty_window
+
+        assert not _is_empty_window(DecodeError("no frames decoded", stderr="", returncode=1))
+        assert not _is_empty_window(
+            DecodeError(
+                "no frames decoded",
+                stderr="Failed to initialise VAAPI connection: -1 (unknown libva error)",
+                returncode=0,
+            )
+        )
+
+    async def test_an_empty_window_does_not_condemn_the_file_to_software(self, monkeypatch):
+        """The behaviour that actually cost throughput, asserted end to end."""
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_refused", set())
+        monkeypatch.setattr(
+            ffmpeg_module, "select_hwaccel", lambda *a, **k: (["-hwaccel", "vaapi"], "vaapi")
+        )
+
+        attempts = []
+
+        async def empty_decode(path, **kwargs):
+            attempts.append(kwargs.get("hwaccel"))
+            raise ffmpeg_module.DecodeError(
+                "no frames decoded from clip.ts", stderr="", returncode=0
+            )
+            yield  # pragma: no cover - makes this an async generator
+
+        monkeypatch.setattr(ffmpeg_module, "_decode_frames", empty_decode)
+
+        with pytest.raises(ffmpeg_module.DecodeError):
+            async for _ in ffmpeg_module.iter_frames("clip.ts", start=119.9, duration=0.5):
+                pass
+
+        assert "clip.ts" not in ffmpeg_module._hwaccel_refused, (
+            "an empty seek window was remembered as a hardware failure, so the rest of "
+            "this file will be decoded on the CPU"
+        )
+        assert len(attempts) == 1, (
+            "software decode was retried for a window that is empty either way"
+        )
+
+
+class TestProbeIsNotRepeated:
+    """Probing is a subprocess against an SMB share; the answer cannot change mid-run.
+
+    The plates stage asked for one frame per tracked vehicle, and every one of those seeks
+    fell through to ``probe()`` to re-learn the frame size — up to 410 ffprobe launches per
+    recording, each reading both ends of an unindexed MPEG-TS over the network, before the
+    ffmpeg process that actually decodes the frame.
+    """
+
+    async def test_a_second_probe_of_an_unchanged_file_costs_nothing(self, tmp_path, monkeypatch):
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        clip = tmp_path / "probe_me.ts"
+        clip.write_bytes(b"\x47" * 4096)
+
+        calls = {"count": 0}
+
+        async def fake_raw(path, **kwargs):
+            calls["count"] += 1
+            return {
+                "format": {"format_name": "mpegts", "duration": "60.0", "bit_rate": "8000000"},
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "width": 1920,
+                        "height": 1080,
+                        "r_frame_rate": "30/1",
+                    }
+                ],
+            }
+
+        ffmpeg_module.clear_probe_cache()
+        monkeypatch.setattr(ffmpeg_module, "ffprobe_raw", fake_raw)
+
+        first = await ffmpeg_module.probe(clip)
+        second = await ffmpeg_module.probe(clip)
+
+        assert calls["count"] == 1, f"ffprobe ran {calls['count']} times for one unchanged file"
+        assert second is first
+        assert second.width == 1920
+
+    async def test_a_rewritten_file_is_probed_again(self, tmp_path, monkeypatch):
+        """Caching must not outlive the file it describes."""
+        import os
+
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        clip = tmp_path / "rewritten.ts"
+        clip.write_bytes(b"\x47" * 4096)
+
+        calls = {"count": 0}
+
+        async def fake_raw(path, **kwargs):
+            calls["count"] += 1
+            return {
+                "format": {"format_name": "mpegts", "duration": "60.0"},
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "width": 1920,
+                        "height": 1080,
+                        "r_frame_rate": "30/1",
+                    }
+                ],
+            }
+
+        ffmpeg_module.clear_probe_cache()
+        monkeypatch.setattr(ffmpeg_module, "ffprobe_raw", fake_raw)
+
+        await ffmpeg_module.probe(clip)
+        clip.write_bytes(b"\x47" * 8192)
+        # Same-second writes can leave mtime unchanged on a coarse clock; make the change
+        # unambiguous so this asserts the invalidation rather than the filesystem.
+        os.utime(clip, (0, 0))
+        await ffmpeg_module.probe(clip)
+
+        assert calls["count"] == 2, "a rewritten file was served from the probe cache"

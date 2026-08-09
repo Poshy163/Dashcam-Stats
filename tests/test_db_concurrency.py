@@ -352,3 +352,110 @@ class TestTheWriteLockIsNotHeldAcrossAStage:
             "a second session could not write while a stage was running: the job is "
             f"holding the write lock across the whole stage. {observed.get('error')}"
         )
+
+
+class TestPlateStageWriteLock:
+    """The plates stage must not hold the write lock across its per-track loop.
+
+    This was the surviving cause of "database is locked" after the orchestrator fix. The
+    stage opened its write transaction with a ``DELETE FROM plate_observations`` and then
+    ran an ffmpeg seek, a plate detector and an OCR pass *per tracked vehicle* — up to 410
+    of them, about 150 seconds — before anything committed. Everything else that writes
+    queued behind it, and the other worker's detection stage lost 150 seconds of finished
+    GPU work on its first write after the busy timeout expired.
+
+    Same shape as the orchestrator test above: run the stage for real, and try to write
+    from an independent session while it is in the middle of its loop.
+    """
+
+    async def test_other_writers_are_not_blocked_during_the_track_loop(
+        self, db_session, monkeypatch
+    ):
+        import numpy as np
+
+        from app.db.models import StageState, TrackedObject
+        from app.pipeline import stages
+
+        recording = Recording(
+            rel_path="plates_lock.ts",
+            filename="plates_lock.ts",
+            size_bytes=1024,
+            state=RecordingState.PROCESSING,
+            duration_s=60.0,
+        )
+        db_session.add(recording)
+        await db_session.flush()
+        for index in range(3):
+            db_session.add(
+                TrackedObject(
+                    recording_id=recording.id,
+                    track_key=index,
+                    class_label="car",
+                    confidence_max=0.9,
+                    confidence_avg=0.8,
+                    first_seen_offset_s=float(index),
+                    last_seen_offset_s=float(index) + 1.0,
+                    duration_s=1.0,
+                    frame_count=10,
+                    best_frame_offset_s=float(index),
+                    best_bbox=[10, 10, 110, 110],
+                )
+            )
+        await db_session.flush()
+        await db_session.commit()
+        recording_id = recording.id
+
+        observed: dict[str, object] = {}
+        seen_tracks = {"count": 0}
+
+        class FakeDetector:
+            async def detect(self, image, *, min_width_px=0):
+                return []
+
+        class FakeOCR:
+            async def read(self, image):  # pragma: no cover - no boxes to read
+                return "", 0.0
+
+        async def fake_models():
+            return FakeDetector(), FakeOCR()
+
+        async def fake_iter_frames(path, **kwargs):
+            """Stands in for the decode: the expensive, non-database part of the loop."""
+            seen_tracks["count"] += 1
+            if seen_tracks["count"] == 1:
+                # Mid-loop, exactly where the 150 seconds of real work happen.
+                try:
+                    async with session_scope() as other:
+                        other.add(
+                            Recording(
+                                rel_path="written-during-plates.ts",
+                                filename="written-during-plates.ts",
+                                size_bytes=1,
+                                state=RecordingState.DISCOVERED,
+                            )
+                        )
+                        await other.flush()
+                    observed["wrote"] = True
+                except Exception as exc:
+                    observed["error"] = f"{type(exc).__name__}: {exc}"
+            yield 0.0, np.zeros((200, 200, 3), dtype=np.uint8)
+
+        monkeypatch.setattr(stages, "_shared_plate_models", fake_models)
+        monkeypatch.setattr(stages, "iter_frames", fake_iter_frames)
+        monkeypatch.setattr(stages, "resolve_footage_path", lambda *a, **k: "plates_lock.ts")
+
+        async with session_scope() as session:
+            rec = await session.get(Recording, recording_id)
+            result = await asyncio.wait_for(stages.stage_plates(session, rec), timeout=30)
+
+        assert result.ok, result.detail
+        assert seen_tracks["count"] == 3, "the loop did not run over every track"
+        assert observed.get("wrote"), (
+            "a second session could not write while the plates stage was reading tracks: "
+            "the stage is holding the write lock across its whole loop. "
+            f"{observed.get('error')}"
+        )
+        # The stage still did its job.
+        async with session_scope() as session:
+            rec = await session.get(Recording, recording_id)
+            assert rec.plate_state is StageState.DONE

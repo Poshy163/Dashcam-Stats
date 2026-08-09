@@ -161,6 +161,32 @@ class ProbeResult:
         return f"{self.width}x{self.height}" if self.width and self.height else None
 
 
+#: Probes already run this session, keyed by path, holding ``(identity, result)``.
+#:
+#: Probing is not cheap here: ffprobe is a subprocess, the footage lives on an SMB share,
+#: and MPEG-TS carries no index, so establishing a duration means reading from both ends
+#: of the file. When the frame rate has to be recounted it is a second subprocess again.
+#: Nothing in a file changes while it is being processed, yet the plates stage probed once
+#: per tracked vehicle -- up to 410 times for one recording, purely to re-learn the frame
+#: size it already had.
+_probe_cache: dict[str, tuple[tuple[int, int], ProbeResult]] = {}
+_PROBE_CACHE_MAX = 256
+
+
+def _probe_identity(p: Path) -> tuple[int, int] | None:
+    """Size and mtime, so a file rewritten in place is not served from the cache."""
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    return st.st_size, st.st_mtime_ns
+
+
+def clear_probe_cache() -> None:
+    """Forget every cached probe. For tests, and for a rescan that must not trust it."""
+    _probe_cache.clear()
+
+
 async def _run(
     cmd: list[str], timeout: float, stdin: bytes | None = None
 ) -> tuple[int, bytes, bytes]:
@@ -247,8 +273,20 @@ async def _count_fps(path: Path | str, *, sample_s: float = 10.0) -> float | Non
 
 
 async def probe(path: Path | str, *, timeout: float = DEFAULT_PROBE_TIMEOUT) -> ProbeResult:
-    """Inspect a recording, correcting the container's unreliable claims."""
+    """Inspect a recording, correcting the container's unreliable claims.
+
+    Results are memoised against the file's size and mtime for the life of the process,
+    because the answer cannot change while the file does not and the stages ask for it
+    repeatedly. Failures are deliberately not cached: an unreadable file is usually
+    unreadable because of the share rather than the file, and that is worth retrying.
+    """
     p = Path(path)
+    identity = _probe_identity(p)
+    if identity is not None:
+        cached = _probe_cache.get(str(p))
+        if cached is not None and cached[0] == identity:
+            return cached[1]
+
     result = ProbeResult(path=str(p))
 
     try:
@@ -349,6 +387,10 @@ async def probe(path: Path | str, *, timeout: float = DEFAULT_PROBE_TIMEOUT) -> 
     if duration is not None and duration <= 0:
         result.warnings.append("duration is zero or negative")
 
+    if identity is not None:
+        if len(_probe_cache) >= _PROBE_CACHE_MAX:
+            _probe_cache.pop(next(iter(_probe_cache)), None)
+        _probe_cache[str(p)] = (identity, result)
     return result
 
 
@@ -637,6 +679,15 @@ async def iter_frames(
         # consumer has already seen frames and would receive them twice.
         if label == "software" or yielded:
             raise
+        if _is_empty_window(exc):
+            # ffmpeg ran to completion and simply found nothing in the window asked for.
+            # That is a fact about the window, not about the GPU, and software decode
+            # would find exactly the same nothing. Retrying wastes a process launch;
+            # memoising it is worse -- it condemned the rest of the file to the CPU. The
+            # plates stage takes hundreds of short seeks per recording, so one landing
+            # past the last frame, or in a damaged GOP, was enough to lose hardware
+            # decoding for a file that had already been decoding on the iGPU for minutes.
+            raise
         _remember_hwaccel_failure(path)
         log.warning(
             "hardware decode failed; using software for this file from now on",
@@ -647,6 +698,34 @@ async def iter_frames(
 
     async for item in _decode_frames(path, hwaccel="cpu", **kwargs):
         yield item
+
+
+#: Words that mean the decoder or the device gave up, as opposed to an empty window.
+_HWACCEL_STDERR_MARKERS = (
+    "vaapi",
+    "qsv",
+    "cuda",
+    "nvdec",
+    "hwaccel",
+    "hardware",
+    "device",
+    "drm",
+    "/dev/dri",
+)
+
+
+def _is_empty_window(exc: FFmpegError) -> bool:
+    """True when ffmpeg exited cleanly having decoded nothing.
+
+    The distinction matters because both cases arrive as the same exception. A returncode
+    of zero means ffmpeg was satisfied: it opened the file, applied the filter graph and
+    reached the end of the requested range without producing a frame. The stderr check is
+    belt and braces for a driver that complains loudly and still exits zero.
+    """
+    if not isinstance(exc, DecodeError) or exc.returncode != 0:
+        return False
+    lowered = exc.stderr.lower()
+    return not any(marker in lowered for marker in _HWACCEL_STDERR_MARKERS)
 
 
 def _remember_hwaccel_failure(path: Path | str) -> None:

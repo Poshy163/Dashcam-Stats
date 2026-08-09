@@ -27,7 +27,7 @@ import threading
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from datetime import UTC, tzinfo
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -894,3 +894,23 @@ async def shutdown_settings_service() -> None:
 def describe_settings() -> list[dict[str, Any]]:
     """Module-level catalogue export for the settings API."""
     return get_settings_service().describe_settings()
+
+
+def local_zone() -> tzinfo:
+    """The configured timezone, resolved without awaiting. UTC if it cannot be read."""
+    try:
+        return ZoneInfo(str(get_settings_service().get_nowait("general.timezone")).strip())
+    except Exception:
+        return UTC
+
+
+def local_midnight_utc(now: datetime | None = None) -> datetime:
+    """The start of *now*'s local day, expressed in UTC.
+
+    Every "today" in the application means the user's today. Adelaide is UTC+9:30, so a
+    boundary taken in UTC lands at 09:30 local and files an entire morning under the wrong
+    day -- which is exactly what the dashboard's "Recordings today" tile did.
+    """
+    zone = local_zone()
+    moment = (now or datetime.now(UTC)).astimezone(zone)
+    return moment.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)

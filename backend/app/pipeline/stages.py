@@ -620,11 +620,15 @@ async def stage_detect(
 
     tracks = tracker.finish(min_frames=int(settings.get_nowait("processing.track_min_frames")))
 
-    await session.execute(delete(TrackedObject).where(TrackedObject.recording_id == recording.id))
-
     keep_detections = bool(settings.get_nowait("advanced.keep_sparse_detections"))
     stride = max(1, int(settings.get_nowait("advanced.detection_store_stride")))
+    quality = int(settings.get_nowait("general.thumbnail_quality"))
 
+    # Position lookups and JPEG encoding first, both outside the write transaction. With
+    # 410 tracks on a busy clip that is 410 queries and 410 encodes, and doing them after
+    # the delete meant holding SQLite's write lock for all of it. See the longer note in
+    # stage_plates: the same mistake there was costing whole recordings.
+    prepared = []
     for track in tracks:
         lat, lon, captured = await _nearest_fix(session, recording.id, track.first_offset_s)
         crop_path = None
@@ -632,9 +636,13 @@ async def stage_detect(
             crop_path = _save_jpeg(
                 track.best_crop,
                 _media_path("vehicles", f"{recording.id:08d}", f"{track.track_key:04d}.jpg"),
-                int(settings.get_nowait("general.thumbnail_quality")),
+                quality,
             )
+        prepared.append((track, lat, lon, captured, crop_path))
 
+    await session.execute(delete(TrackedObject).where(TrackedObject.recording_id == recording.id))
+
+    for track, lat, lon, captured, crop_path in prepared:
         stored = TrackedObject(
             recording_id=recording.id,
             journey_id=recording.journey_id,
@@ -693,6 +701,17 @@ async def stage_detect(
 # --------------------------------------------------------------------------------------
 
 
+@dataclass(slots=True)
+class _PlateHit:
+    """A confirmed read, held until the stage's single write phase at the end."""
+
+    track: TrackedObject
+    result: object
+    vote: object
+    #: Kept only when crops are being saved, since it is the one large field here.
+    vehicle_crop: np.ndarray | None
+
+
 async def stage_plates(
     session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
 ) -> StageResult:
@@ -735,12 +754,21 @@ async def stage_plates(
     region_setting = str(settings.get_nowait("plates.region"))
     quality = int(settings.get_nowait("general.thumbnail_quality"))
 
-    # One observation per plate per tracked vehicle -- reprocessing updates in place.
-    await session.execute(
-        delete(PlateObservation).where(PlateObservation.recording_id == recording.id)
-    )
-
-    stored = 0
+    # Read every plate first, write them all at the end.
+    #
+    # The delete used to sit here, at the top. It opens SQLite's write transaction, and
+    # nothing commits until the stage returns, so the loop below -- an ffmpeg seek, a
+    # detector pass and an OCR pass per tracked vehicle, up to 410 of them, about 150
+    # seconds -- ran with the write lock held the entire time. Everything else that writes
+    # queued behind it: the other worker's detection stage lost 150 seconds of finished GPU
+    # work on its first write, the scheduler's reclaim task failed a third of the time, the
+    # log sink stalled so the Logs page went quiet exactly when it was needed, and two
+    # recordings burned all four attempts and were marked permanently failed for a reason
+    # that had nothing to do with the footage. Two workers behaved as one.
+    #
+    # Holding results in memory costs little: only readings that beat min_store are kept,
+    # which is around one track in a hundred.
+    hits: list[_PlateHit] = []
     for index, track in enumerate(tracks):
         if track.best_frame_offset_s is None or not track.best_bbox:
             continue
@@ -801,7 +829,23 @@ async def stage_plates(
         if vote is None or vote.ocr_confidence < min_store:
             continue
 
-        result = normalise(vote.text, region=region_setting)
+        hits.append(
+            _PlateHit(
+                track=track,
+                result=normalise(vote.text, region=region_setting),
+                vote=vote,
+                vehicle_crop=vehicle_crop if save_crops else None,
+            )
+        )
+
+    # Everything below writes, and only what is below. One observation per plate per
+    # tracked vehicle, so reprocessing replaces rather than accumulates.
+    await session.execute(
+        delete(PlateObservation).where(PlateObservation.recording_id == recording.id)
+    )
+
+    for hit in hits:
+        track, vote, result = hit.track, hit.vote, hit.result
         plate = await _upsert_plate(session, result, vote.ocr_confidence)
 
         plate_crop_path = vehicle_crop_path = None
@@ -817,15 +861,16 @@ async def stage_plates(
                 if vote.best.crop is not None
                 else None
             )
-            vehicle_crop_path = _save_jpeg(
-                vehicle_crop,
-                _media_path(
-                    "plates",
-                    f"{plate.id:08d}",
-                    f"{recording.id:08d}_{track.track_key:04d}_vehicle.jpg",
-                ),
-                quality,
-            )
+            if hit.vehicle_crop is not None:
+                vehicle_crop_path = _save_jpeg(
+                    hit.vehicle_crop,
+                    _media_path(
+                        "plates",
+                        f"{plate.id:08d}",
+                        f"{recording.id:08d}_{track.track_key:04d}_vehicle.jpg",
+                    ),
+                    quality,
+                )
 
         session.add(
             PlateObservation(
@@ -850,8 +895,8 @@ async def stage_plates(
                 bbox={"box": list(vote.best.bbox)},
             )
         )
-        stored += 1
 
+    stored = len(hits)
     await session.flush()
     await _refresh_plate_rollups(session, recording.id)
 
