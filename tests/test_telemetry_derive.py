@@ -43,6 +43,77 @@ def derive(samples, *, min_move_m: float = 12.0) -> TelemetryResult:
     return result
 
 
+class TestTheFirstFixIsNotAutomaticallyTrusted:
+    """The sequential walk's blind spot, and the bug it produced.
+
+    The anchor starts on the first fix with nothing to check it against, so a misread
+    *there* is kept and every good fix after it is rejected for disagreeing with it. On a
+    real drive that produced a single stored position of ``-34.8040, -8.6845`` -- a
+    plausible Adelaide latitude with the ``13`` gone from its longitude, in the South
+    Atlantic -- and every detection in the recording was stamped with it.
+
+    A median cannot be dragged by the outlier it is looking for, which is why the whole
+    recording gets a say before the walk starts.
+    """
+
+    def test_a_corrupt_first_fix_is_rejected_not_enthroned(self):
+        samples = [
+            # 138.6845 with the leading digits lost: legal, and 11,000 km away.
+            sample(0, -34.8040, -8.6845),
+            sample(1, LAT, LON),
+            sample(2, LAT + 0.0004, LON + 0.0004),
+            sample(3, LAT + 0.0008, LON + 0.0008),
+            sample(4, LAT + 0.0012, LON + 0.0012),
+        ]
+        result = derive(samples)
+
+        assert samples[0].has_fix is False, "the misread first fix was kept as the anchor"
+        assert samples[0].lat is None and samples[0].lon is None
+        assert [s.has_fix for s in samples[1:]] == [True] * 4, (
+            "good fixes were discarded for disagreeing with a corrupt starting point"
+        )
+        assert result.first_fix is samples[1]
+
+    def test_a_majority_verdict_from_the_walk_is_not_acted_on(self):
+        """Too few points for the median to judge, and the walk condemning most of what it
+        saw. That is a bad anchor rather than a field of outliers, and throwing away the
+        majority on the authority of one unchecked point is the more expensive mistake."""
+        samples = [
+            sample(0, -34.8040, -8.6845),
+            sample(1, LAT, LON),
+            sample(2, LAT + 0.0004, LON + 0.0004),
+        ]
+        result = derive(samples)
+        kept = [s for s in samples if s.has_fix]
+        assert len(kept) >= 2, "a three-point recording lost most of its positions"
+        assert result.distance_m < 1000
+
+    def test_a_genuinely_long_drive_is_left_alone(self):
+        """Generic, not regional: the reference is the drive's own centre and its own
+        elapsed time, so a real run in a straight line is not corruption anywhere on Earth.
+
+        Ten minutes at about 100 km/h -- 16.7 km end to end, so the far ends sit 8.3 km
+        from the centre against a radius the elapsed time puts at 10.8 km.
+        """
+        # 0.00025 degrees of latitude is ~27.8 m, i.e. 100 km/h at one sample per second.
+        samples = [sample(i, LAT + i * 0.00025, LON) for i in range(600)]
+        derive(samples)
+        assert all(s.has_fix for s in samples), "a legitimate continuous drive was discarded"
+
+
+class TestNonFiniteCoordinatesNeverSurvive:
+    def test_a_nan_is_stripped_before_anything_derives_from_it(self):
+        """NaN passes every range check ever written -- `abs(nan) > 90` is False."""
+        samples = [
+            sample(0, LAT, LON),
+            sample(1, float("nan"), LON),
+            sample(2, LAT + 0.0004, LON + 0.0004),
+        ]
+        derive(samples)
+        assert samples[1].has_fix is False
+        assert samples[1].lat is None and samples[1].lon is None
+
+
 class TestImplausibleJumps:
     def test_a_misread_digit_does_not_become_a_journey(self):
         """The 31,768 km bug: one bad longitude in an otherwise clean track."""

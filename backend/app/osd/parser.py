@@ -24,23 +24,13 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
-#: Latitude/longitude below this magnitude are treated as the no-fix placeholder.
-#:
-#: The overlay prints exactly ``00.0000`` when it has no satellite lock, so an exact-zero
-#: test looks sufficient and is not. The placeholder goes through the same OCR as
-#: everything else, and one misread digit turns it into ``00.0001`` — still obviously the
-#: placeholder, but no longer within a hair of zero. On a real 674-recording library that
-#: let fourteen "coordinates" through: ``0.0001, 0.0000``, ``0.0000, 0.0009``,
-#: ``0.0100, 0.0000`` at 77 km/h. Each was stored as a genuine position in the Gulf of
-#: Guinea, and each added roughly 14,000 km to whatever journey it landed in.
-#:
-#: A tenth of a degree is about 11 km, which is a wide net for a placeholder and no net at
-#: all for a real coordinate: the nearest land to (0, 0) is 600 km away. Nothing legitimate
-#: is being discarded, because nothing legitimate is there.
-NO_FIX_EPSILON = 0.1
-
-MAX_LATITUDE = 90.0
-MAX_LONGITUDE = 180.0
+#: Re-exported rather than redefined. These are the rules for what may be stored as a
+#: position anywhere in the application, and having the parser own its own copy is how a
+#: coordinate could pass one layer's idea of valid and fail another's.
+from app.osd.validate import (
+    coordinate_problem,
+    is_no_fix_placeholder,
+)
 
 #: Anything faster is an OCR error. Overridable via ``telemetry.max_speed_kmh``.
 DEFAULT_MAX_SPEED_KMH = 300.0
@@ -275,11 +265,12 @@ def parse_osd_text(
             problems.append(
                 "coordinate sign ambiguous; refused rather than risk a wrong hemisphere"
             )
-        elif abs(lat) < NO_FIX_EPSILON and abs(lon) < NO_FIX_EPSILON:
-            # The no-fix placeholder. Deliberately not stored as (0, 0).
-            reading.has_fix = False
-        elif abs(lat) > MAX_LATITUDE or abs(lon) > MAX_LONGITUDE:
-            problems.append(f"coordinates out of range (lat={lat}, lon={lon})")
+        elif (problem := coordinate_problem(lat, lon)) is not None:
+            # One gate for every way a pair of numbers can fail to be a place: the no-fix
+            # placeholder, out of range, and -- the one no previous version caught -- NaN
+            # or infinity, which pass every magnitude comparison ever written.
+            if not is_no_fix_placeholder(lat, lon):
+                problems.append(problem)
             reading.has_fix = False
         else:
             reading.lat = lat

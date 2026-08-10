@@ -180,6 +180,8 @@ async def get_status(session: SessionDep):
         + counts.get("queued", 0),
         processing=counts.get("processing", 0),
         failed=counts.get("failed", 0),
+        invalid=counts.get("invalid", 0),
+        settling=counts.get("settling", 0),
         recordings_today=int(
             (
                 await session.execute(
@@ -260,6 +262,7 @@ async def scan_now():
         "new": summary.new,
         "changed": summary.changed,
         "unsettled": summary.unsettled,
+        "invalid": summary.invalid,
         "missing": summary.missing,
         "queued": summary.queued,
         "errors": summary.errors,
@@ -286,6 +289,12 @@ async def reprocess_all(body: ReprocessAllRequest, session: SessionDep):
     stmt = select(Recording.id).where(
         Recording.ignored.is_(False),
         Recording.file_missing.is_(False),
+        # A file with no bytes in it, or with no video stream, cannot be processed by any
+        # number of attempts. Including it here is what let three zero-byte segments
+        # reappear in the failure list after every bulk requeue, each one with a fresh
+        # four attempts against a file that will never produce a frame. Reprocessing one
+        # deliberately is still possible per recording, which is where that belongs.
+        Recording.state != RecordingState.INVALID,
     )
     if body.only_failed:
         stmt = stmt.where(Recording.state == RecordingState.FAILED)

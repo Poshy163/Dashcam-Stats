@@ -87,12 +87,27 @@ class Base(DeclarativeBase):
 
 
 class RecordingState(str, enum.Enum):
+    """Lifecycle of one file, from being noticed on disk to being analysed.
+
+    ``FAILED`` and ``INVALID`` are deliberately different answers. ``FAILED`` means an
+    attempt did not succeed and another one might -- a busy share, a lock, a decoder that
+    fell over -- so the recording stays in the retry population. ``INVALID`` means the
+    source itself cannot ever be processed: zero bytes, no video stream, not media. There
+    is no attempt count that turns one of those into a result, so they leave the queue
+    entirely rather than consuming a slot on every bulk requeue.
+    """
+
     DISCOVERED = "discovered"
+    #: On disk but still growing, or not yet observed twice with the same size. Nothing
+    #: is analysed from this state -- see :mod:`app.scanner.stability`.
+    SETTLING = "settling"
     METADATA_EXTRACTED = "metadata_extracted"
     QUEUED = "queued"
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    #: Permanently unprocessable. `error_message` says why.
+    INVALID = "invalid"
     IGNORED = "ignored"
     DELETED = "deleted"
 

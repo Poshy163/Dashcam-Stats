@@ -800,6 +800,11 @@ async def retry_job(job_id: RowId, session: SessionDep):
     job.attempts = 0
     job.not_before = None
     job.error_message = None
+    job.worker_id = None
+    # A clean slate includes the free-retry budget the queue grants for database
+    # contention. Leaving it behind meant a job that had once been unlucky started its
+    # manual retry with fewer of them than a job that had not.
+    job.result = None
     await session.flush()
     return JobOut.model_validate(job)
 

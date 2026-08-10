@@ -52,6 +52,7 @@ from app.db.models import (
     TelemetryPoint,
     TrackedObject,
 )
+from app.db.retry import write_with_retry
 from app.hardware.ffmpeg import (
     DecodeError,
     FFmpegError,
@@ -61,10 +62,13 @@ from app.hardware.ffmpeg import (
 )
 from app.journeys.builder import JourneyBuilder
 from app.osd import (
+    FixTrack,
     GlyphTemplates,
+    Located,
     OsdRegion,
     TelemetryExtractor,
     expected_time_from_filename,
+    is_valid_coordinate,
     missing_characters,
     select_training_set,
 )
@@ -82,12 +86,41 @@ _templates_cache: GlyphTemplates | None = None
 _MAX_OSD_FILENAME_DRIFT_S = 15 * 60
 
 
-class StageError(RuntimeError):
-    """A stage failed for this recording. Carries whether retrying could ever help."""
+#: Why no stage writes ``journey_id`` on the rows it inserts.
+#:
+#: It is a denormalised pointer, and ``JourneyBuilder._attach`` owns it: ``stage_summarise``
+#: backfills it the moment the journey is known, and every ``refresh`` re-points it. Setting
+#: it at insert time as well bought nothing and cost correctness, because the value came
+#: from ``recording.journey_id`` -- a number read into memory when the job started and
+#: **stale by the time the row is written**.
+#:
+#: A rebuild deletes every automatic journey and creates new ones. It runs on the
+#: scheduler's thread while a worker is mid-recording, so the worker's in-memory
+#: ``journey_id`` routinely names a journey that no longer exists. The insert then fails
+#: with ``FOREIGN KEY constraint failed`` -- observed seven times on the live library, most
+#: recently while this was being written, each one costing a full reprocess of the
+#: recording.
+#:
+#: The general rule this is an instance of: a derived value should have exactly one writer.
+#: Two writers means one of them is working from a copy, and the copy is always the one
+#: that goes stale.
+_JOURNEY_ID_IS_DERIVED = True
 
-    def __init__(self, message: str, *, permanent: bool = False) -> None:
+
+class StageError(RuntimeError):
+    """A stage failed for this recording. Carries whether retrying could ever help.
+
+    Three outcomes, not two. ``permanent`` means no attempt will ever succeed, so the
+    recording leaves the queue. ``transient`` means the fault was contention rather than
+    the recording -- a write lock held elsewhere -- so it is retried *without* spending an
+    attempt, because four collisions with a busy database must not add up to a permanently
+    failed recording. Neither set is the ordinary case: retry, and count it.
+    """
+
+    def __init__(self, message: str, *, permanent: bool = False, transient: bool = False) -> None:
         super().__init__(message)
         self.permanent = permanent
+        self.transient = transient
 
 
 @dataclass(slots=True)
@@ -314,7 +347,12 @@ async def stage_inspect(
     path = resolve_footage_path(recording.rel_path)
     if not path.exists():
         recording.file_missing = True
-        raise StageError(f"{recording.filename} is no longer on disk", permanent=True)
+        # Retryable, not permanent. An absent file is very often an absent *share* -- the
+        # same event the scanner refuses to read as deletion -- and the file itself may be
+        # perfectly good. Condemning it here would take it out of the retry population and
+        # out of every bulk requeue, so a mount that came back a minute later would leave
+        # the recording unprocessed for good.
+        raise StageError(f"{recording.filename} is no longer on disk")
 
     try:
         info = await probe(path)
@@ -340,17 +378,22 @@ async def stage_inspect(
     recording.size_bytes = info.size_bytes
     recording.probe_json = {"warnings": info.warnings, "pts_wrapped": info.pts_wrapped}
 
+    settings = get_settings_service()
+
     if recording.started_at is None:
         parsed = expected_time_from_filename(recording.filename)
         if parsed is not None:
-            recording.started_at = parsed.replace(tzinfo=UTC)
+            # Through the configured zone, exactly as the scanner does it. Stamping UTC on
+            # a filename that carries local wall-clock time put the recording nine and a
+            # half hours from where it belonged here, which tore its journey in half and
+            # moved every detection in it to the wrong day. Two places parsed the same
+            # filename and only one of them knew what timezone it was in.
+            recording.started_at = parsed.replace(tzinfo=await settings.timezone()).astimezone(UTC)
     if recording.started_at and info.duration_s:
         recording.ended_at = recording.started_at + timedelta(seconds=info.duration_s)
 
     if progress:
         progress("metadata", 0.6)
-
-    settings = get_settings_service()
     if not recording.thumbnail_path:
         thumb = _media_path("thumbnails", f"{recording.id:08d}.jpg")
         chosen = await _choose_thumbnail(
@@ -558,9 +601,6 @@ async def stage_telemetry(
         hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
     )
 
-    # Reprocessing replaces the previous pass rather than appending to it.
-    await session.execute(delete(TelemetryPoint).where(TelemetryPoint.recording_id == recording.id))
-
     tz = await settings.timezone()
     rows = []
     for sample in result.samples:
@@ -572,7 +612,8 @@ async def stage_telemetry(
         rows.append(
             {
                 "recording_id": recording.id,
-                "journey_id": recording.journey_id,
+                # Deliberately not stamped here -- see _JOURNEY_ID_IS_DERIVED below.
+                "journey_id": None,
                 "t_offset_s": sample.t_offset_s,
                 "captured_at": captured,
                 "lat": sample.lat,
@@ -585,8 +626,40 @@ async def stage_telemetry(
             }
         )
 
-    if rows:
-        await session.execute(TelemetryPoint.__table__.insert(), rows)
+    # Last gate before the database. Everything upstream refuses a bad coordinate already,
+    # but this is the only place that is true of *every* route into `telemetry_points`, and
+    # a row carrying has_fix with a coordinate that is not a place is the shape of defect
+    # that then propagates into tracks, observations, journey bounds and the heat map --
+    # each of which had grown its own filter for it.
+    dropped = 0
+    for row in rows:
+        if row["has_fix"] and not is_valid_coordinate(row["lat"], row["lon"]):
+            row["has_fix"] = False
+            row["lat"] = row["lon"] = row["heading_deg"] = None
+            dropped += 1
+    if dropped:
+        log.warning(
+            "refused to store coordinates that are not a place",
+            recording=recording.filename,
+            dropped=dropped,
+            of=len(rows),
+        )
+
+    # Delete then insert, as one retryable unit.
+    #
+    # ``DELETE FROM telemetry_points WHERE recording_id = ?`` is the first write of this
+    # stage, so it is where the transaction opens and where the write lock is taken -- and
+    # it is verbatim the statement that failed four times running on a real recording while
+    # a journey rebuild held the lock for longer than the busy timeout. Everything it needs
+    # is already in ``rows``, so re-running it produces exactly the same result.
+    async def write() -> None:
+        await session.execute(
+            delete(TelemetryPoint).where(TelemetryPoint.recording_id == recording.id)
+        )
+        if rows:
+            await session.execute(TelemetryPoint.__table__.insert(), rows)
+
+    await write_with_retry(session, write, what=f"store telemetry for {recording.filename}")
 
     recording.telemetry_point_count = len(rows)
     recording.gps_point_count = result.fix_count
@@ -627,6 +700,22 @@ async def stage_telemetry(
                 recording.ended_at = localised + timedelta(seconds=recording.duration_s)
 
     recording.telemetry_state = StageState.DONE
+    log.info(
+        "read telemetry from the overlay",
+        recording=recording.filename,
+        recording_id=recording.id,
+        points=len(rows),
+        fixes=result.fix_count,
+        # Both counts, because "few fixes" and "many rejected fixes" call for opposite
+        # investigations -- the overlay region and the templates against the weather.
+        rejected_positions=result.implausible_jumps + dropped,
+        parse_failures=result.parse_failures,
+        first_fix_at=result.first_fix.captured_at.isoformat()
+        if result.first_fix and result.first_fix.captured_at
+        else None,
+        clock_source="overlay" if recording.time_from_osd else "filename",
+        started_at=recording.started_at.isoformat() if recording.started_at else None,
+    )
     return StageResult(
         "telemetry",
         True,
@@ -635,6 +724,7 @@ async def stage_telemetry(
             "fixes": result.fix_count,
             "distance_m": result.distance_m,
             "parse_failures": result.parse_failures,
+            "rejected_positions": result.implausible_jumps + dropped,
             "warnings": result.warnings,
         },
     )
@@ -653,22 +743,61 @@ def _should_analyse(recording: Recording, camera: Camera | None) -> bool:
     return True
 
 
-async def _nearest_fix(
-    session: AsyncSession, recording_id: int, offset_s: float
-) -> tuple[float | None, float | None, datetime | None]:
-    """The telemetry fix closest to an offset, for stamping a detection with a location."""
-    row = (
+async def _fix_track(session: AsyncSession, recording_id: int) -> FixTrack:
+    """Every usable fix of one recording, indexed for lookup by frame offset.
+
+    One query per recording, not one per track. The previous shape --
+    ``ORDER BY abs(t_offset_s - ?) LIMIT 1``, run once per tracked vehicle -- was both 410
+    round trips on a busy clip and unable to express the only rules that matter: that a
+    fix too far from the detection in time is not a location for it, and that the point
+    between two fixes is a better answer than either of them.
+
+    Scoped to this recording's own id, so telemetry can never migrate between recordings
+    or between the front and rear stream of the same moment. They are separate files with
+    separate overlays, sampled at their own rates, and each detection is placed by the
+    clip it was detected in.
+    """
+    settings = get_settings_service()
+    rows = (
         await session.execute(
-            select(TelemetryPoint.lat, TelemetryPoint.lon, TelemetryPoint.captured_at)
+            select(
+                TelemetryPoint.t_offset_s,
+                TelemetryPoint.lat,
+                TelemetryPoint.lon,
+                TelemetryPoint.captured_at,
+                TelemetryPoint.speed_kmh,
+            )
             .where(
                 TelemetryPoint.recording_id == recording_id,
                 TelemetryPoint.has_fix.is_(True),
+                TelemetryPoint.lat.is_not(None),
+                TelemetryPoint.lon.is_not(None),
             )
-            .order_by(func.abs(TelemetryPoint.t_offset_s - offset_s))
-            .limit(1)
+            .order_by(TelemetryPoint.t_offset_s.asc())
         )
-    ).first()
-    return row if row else (None, None, None)
+    ).all()
+    return FixTrack.from_rows(
+        rows,
+        max_fix_age_s=float(settings.get_nowait("telemetry.max_fix_age_s")),
+        max_bracket_s=float(settings.get_nowait("telemetry.max_interpolation_gap_s")),
+    )
+
+
+def _moment(recording: Recording, offset_s: float, located: Located | None) -> datetime | None:
+    """Wall-clock time of a frame, preferring the overlay clock over the filename.
+
+    Both are available and they answer slightly different questions. The overlay clock is
+    the camera's own reading at that second and is what the telemetry carries; the
+    recording's start time plus the offset works even where the overlay was unreadable or
+    the GPS was not locked, which is exactly when a sighting would otherwise have no time
+    at all. Before this a track in a recording with no fixes got ``first_seen_at = None``
+    and vanished from every date filter in the UI.
+    """
+    if located is not None and located.captured_at is not None:
+        return located.captured_at
+    if recording.started_at is None:
+        return None
+    return recording.started_at + timedelta(seconds=offset_s)
 
 
 async def stage_detect(
@@ -721,12 +850,19 @@ async def stage_detect(
     quality = int(settings.get_nowait("general.thumbnail_quality"))
 
     # Position lookups and JPEG encoding first, both outside the write transaction. With
-    # 410 tracks on a busy clip that is 410 queries and 410 encodes, and doing them after
-    # the delete meant holding SQLite's write lock for all of it. See the longer note in
-    # stage_plates: the same mistake there was costing whole recordings.
+    # 410 tracks on a busy clip that is 410 encodes, and doing them after the delete meant
+    # holding SQLite's write lock for all of it. See the longer note in stage_plates: the
+    # same mistake there was costing whole recordings.
+    fixes = await _fix_track(session, recording.id)
+    unlocated = 0
     prepared = []
     for track in tracks:
-        lat, lon, captured = await _nearest_fix(session, recording.id, track.first_offset_s)
+        # Located at the moment it was first seen, which is the offset the UI deep-links
+        # to and the offset `first_seen_at` describes. Nothing here reuses one track's
+        # answer for another: each is placed independently at its own time.
+        located = fixes.at(track.first_offset_s)
+        if located is None:
+            unlocated += 1
         crop_path = None
         if track.best_crop is not None and track.best_crop.size:
             crop_path = _save_jpeg(
@@ -734,59 +870,102 @@ async def stage_detect(
                 _media_path("vehicles", f"{recording.id:08d}", f"{track.track_key:04d}.jpg"),
                 quality,
             )
-        prepared.append((track, lat, lon, captured, crop_path))
-
-    await session.execute(delete(TrackedObject).where(TrackedObject.recording_id == recording.id))
-
-    for track, lat, lon, captured, crop_path in prepared:
-        stored = TrackedObject(
-            recording_id=recording.id,
-            journey_id=recording.journey_id,
+        prepared.append((track, located, crop_path))
+        log.debug(
+            "located a tracked object",
+            # Never persisted: one row per tracked vehicle would make log_entries the
+            # largest table in the schema. It is here for a live trace at debug level.
+            db_log=False,
+            recording=recording.filename,
+            camera=camera.key if camera else None,
             track_key=track.track_key,
             class_label=track.class_label,
-            confidence_max=track.confidence_max,
-            confidence_avg=track.confidence_avg,
-            first_seen_offset_s=track.first_offset_s,
-            last_seen_offset_s=track.last_offset_s,
-            duration_s=track.duration_s,
-            frame_count=track.frame_count,
-            first_seen_at=captured,
-            last_seen_at=captured,
-            lat=lat,
-            lon=lon,
-            best_frame_offset_s=track.best_offset_s,
-            best_bbox=list(track.best_box) if track.best_box else None,
-            crop_path=crop_path,
+            confidence=round(track.confidence_max, 3),
+            first_offset_s=round(track.first_offset_s, 3),
+            **(located.as_log() if located else {"gps_source": "none"}),
         )
-        session.add(stored)
-        await session.flush()
 
-        if keep_detections:
-            for index, (offset, confidence, x, y, w, h) in enumerate(track.samples):
-                if index % stride:
-                    continue
-                session.add(
-                    Detection(
-                        tracked_object_id=stored.id,
-                        recording_id=recording.id,
-                        t_offset_s=offset,
-                        class_label=track.class_label,
-                        confidence=confidence,
-                        x=x,
-                        y=y,
-                        w=w,
-                        h=h,
+    # Delete then insert, as one retryable unit. ``DELETE FROM tracked_objects WHERE
+    # recording_id = ?`` opens this stage's transaction and is the other statement that
+    # failed its way through all four attempts on a real recording. Everything it needs is
+    # in ``prepared``, so a retry writes exactly the same rows.
+    async def write() -> None:
+        await session.execute(
+            delete(TrackedObject).where(TrackedObject.recording_id == recording.id)
+        )
+
+        for track, located, crop_path in prepared:
+            stored = TrackedObject(
+                recording_id=recording.id,
+                # Deliberately not stamped here -- see _JOURNEY_ID_IS_DERIVED below.
+                track_key=track.track_key,
+                class_label=track.class_label,
+                confidence_max=track.confidence_max,
+                confidence_avg=track.confidence_avg,
+                first_seen_offset_s=track.first_offset_s,
+                last_seen_offset_s=track.last_offset_s,
+                duration_s=track.duration_s,
+                frame_count=track.frame_count,
+                first_seen_at=_moment(recording, track.first_offset_s, located),
+                # Its own offset, not a copy of the first. Both were stamped with the same
+                # telemetry timestamp, so every track in the library claimed to have been
+                # last seen at the instant it was first seen and every duration read as
+                # zero in the timeline.
+                last_seen_at=_moment(recording, track.last_offset_s, fixes.at(track.last_offset_s)),
+                lat=located.lat if located else None,
+                lon=located.lon if located else None,
+                best_frame_offset_s=track.best_offset_s,
+                best_bbox=list(track.best_box) if track.best_box else None,
+                crop_path=crop_path,
+            )
+            session.add(stored)
+            await session.flush()
+
+            if keep_detections:
+                for index, (offset, confidence, x, y, w, h) in enumerate(track.samples):
+                    if index % stride:
+                        continue
+                    session.add(
+                        Detection(
+                            tracked_object_id=stored.id,
+                            recording_id=recording.id,
+                            t_offset_s=offset,
+                            class_label=track.class_label,
+                            confidence=confidence,
+                            x=x,
+                            y=y,
+                            w=w,
+                            h=h,
+                        )
                     )
-                )
+
+    await write_with_retry(session, write, what=f"store detections for {recording.filename}")
 
     recording.vehicle_count = len(tracks)
     recording.detection_state = StageState.DONE
+    if unlocated:
+        log.info(
+            "some sightings have no position",
+            recording=recording.filename,
+            unlocated=unlocated,
+            of=len(tracks),
+            fixes=len(fixes),
+            reason=(
+                "the recording has no GPS fix at all"
+                if len(fixes) == 0
+                else "no fix close enough in time to the detection"
+            ),
+        )
     return StageResult(
         "detection",
         True,
         stats={
             "frames_analysed": frames,
             "tracks": len(tracks),
+            # Surfaced rather than inferred from a null: "no location" and "we never
+            # looked" are different answers and the recording page shows them differently.
+            "gps_fixes": len(fixes),
+            "tracks_without_position": unlocated,
             "device": detector.device,
         },
     )
@@ -866,17 +1045,53 @@ class _PlateOrientation:
             return flipped
         return flipped if flipped[1] > as_is[1] and self._flipped > self._as_is else as_is
 
+    def resolve(self) -> bool:
+        """Settle the question for good, on however many samples there were.
+
+        Needed because the crops are saved after the reading loop, and a recording with
+        fewer than ``_ORIENTATION_SAMPLE`` readable plates never reached the decision point
+        inside ``read`` -- so ``mirrored`` was still ``None`` and the previews were saved
+        the way the camera produced them. On a short rear clip with two or three plates in
+        it, that is every preview in the recording.
+
+        The same evidence and the same ratio; only the sample count is relaxed, and the
+        default when nothing decisive was seen is still "not mirrored".
+        """
+        if self.mirrored is None:
+            self.mirrored = self._flipped >= max(1.0, self._as_is * _ORIENTATION_RATIO)
+        return self.mirrored
+
     def describe(self) -> dict[str, object]:
         return {
             "mirrored": self.mirrored,
             "votes_as_is": self._as_is,
             "votes_mirrored": self._flipped,
+            "orientation_samples": self._sampled,
         }
 
 
 def _flip(crop: np.ndarray) -> np.ndarray:
     """Horizontally mirrored, contiguous because the recogniser wants a real array."""
     return np.ascontiguousarray(crop[:, ::-1])
+
+
+def _readable(crop: np.ndarray | None, mirrored: bool) -> np.ndarray | None:
+    """A crop the right way round for a human to look at.
+
+    The orientation decision was applied to what the recogniser saw and to nothing else,
+    so on a mirrored rear channel the OCR read ``S192DKX`` from a flipped copy while the
+    preview beside it on the plate page was still the mirror image -- the plate backwards,
+    with the text under it reading correctly, which looks like the *text* is wrong.
+
+    Applied to the saved image only, and deliberately not to the frame. Detection,
+    tracking and every stored bounding box stay in the source video's coordinate space,
+    which is the space the player draws in; flipping the frame would put every box on the
+    wrong side of it. A crop is a standalone picture with no coordinates in it, so turning
+    it round costs nothing and changes nothing else.
+    """
+    if crop is None or not mirrored:
+        return crop
+    return _flip(crop)
 
 
 @dataclass(slots=True)
@@ -930,7 +1145,6 @@ async def stage_plates(
     min_store = float(settings.get_nowait("plates.min_store_confidence"))
     save_crops = bool(settings.get_nowait("plates.save_crops"))
     region_setting = str(settings.get_nowait("plates.region"))
-    quality = int(settings.get_nowait("general.thumbnail_quality"))
 
     # Read every plate first, write them all at the end.
     #
@@ -1030,68 +1244,47 @@ async def stage_plates(
             )
         )
 
+    # Settle the orientation before any crop is written. Until this call a recording with
+    # fewer readable plates than the sample size never reached a verdict at all.
+    mirrored = orientation.resolve()
+
+    # Positions are resolved here, at the offset each plate was actually read from, rather
+    # than copied off the track. The track's coordinate belongs to its *first* frame,
+    # which on a vehicle followed for twenty seconds is up to twenty seconds and several
+    # hundred metres from the frame the plate was legible in -- and the observation then
+    # carried that as the place the plate was seen.
+    fixes = await _fix_track(session, recording.id)
+    placed = [(hit, fixes.at(float(hit.track.best_frame_offset_s or 0.0))) for hit in hits]
+
     # Everything below writes, and only what is below. One observation per plate per
     # tracked vehicle, so reprocessing replaces rather than accumulates.
-    await session.execute(
-        delete(PlateObservation).where(PlateObservation.recording_id == recording.id)
+    #
+    # The plates that are about to lose an observation are collected first. Rollups were
+    # refreshed only for plates still present after the rewrite, so a plate that this
+    # recording no longer sees kept a count that included the observation just deleted --
+    # and reprocessing a recording whose reads improved left the old plate claiming
+    # sightings that no longer exist anywhere.
+    touched_plate_ids = set(
+        (
+            await session.execute(
+                select(PlateObservation.plate_id.distinct()).where(
+                    PlateObservation.recording_id == recording.id
+                )
+            )
+        ).scalars()
     )
 
-    for hit in hits:
-        track, vote, result = hit.track, hit.vote, hit.result
-        plate = await _upsert_plate(session, result, vote.ocr_confidence)
-
-        plate_crop_path = vehicle_crop_path = None
-        if save_crops:
-            plate_crop_path = (
-                _save_jpeg(
-                    vote.best.crop,
-                    _media_path(
-                        "plates", f"{plate.id:08d}", f"{recording.id:08d}_{track.track_key:04d}.jpg"
-                    ),
-                    quality,
-                )
-                if vote.best.crop is not None
-                else None
-            )
-            if hit.vehicle_crop is not None:
-                vehicle_crop_path = _save_jpeg(
-                    hit.vehicle_crop,
-                    _media_path(
-                        "plates",
-                        f"{plate.id:08d}",
-                        f"{recording.id:08d}_{track.track_key:04d}_vehicle.jpg",
-                    ),
-                    quality,
-                )
-
-        session.add(
-            PlateObservation(
-                plate_id=plate.id,
-                recording_id=recording.id,
-                journey_id=recording.journey_id,
-                camera_id=recording.camera_id,
-                tracked_object_id=track.id,
-                t_offset_s=track.best_frame_offset_s,
-                captured_at=track.first_seen_at,
-                first_seen_offset_s=track.first_seen_offset_s,
-                last_seen_offset_s=track.last_seen_offset_s,
-                raw_text=vote.best.raw_text,
-                normalised_text=result.normalised,
-                ocr_confidence=vote.ocr_confidence,
-                detection_confidence=vote.detection_confidence,
-                vote_count=vote.vote_count,
-                lat=track.lat,
-                lon=track.lon,
-                plate_crop_path=plate_crop_path,
-                vehicle_crop_path=vehicle_crop_path,
-                bbox={"box": list(vote.best.bbox)},
-            )
+    async def write() -> None:
+        await session.execute(
+            delete(PlateObservation).where(PlateObservation.recording_id == recording.id)
         )
+        await _write_observations(session, recording, placed, touched_plate_ids, camera, mirrored)
+        await session.flush()
+        await _refresh_plate_rollups(session, touched_plate_ids)
+
+    await write_with_retry(session, write, what=f"store plates for {recording.filename}")
 
     stored = len(hits)
-    await session.flush()
-    await _refresh_plate_rollups(session, recording.id)
-
     recording.plate_count = stored
     recording.plate_state = StageState.DONE
     return StageResult(
@@ -1100,13 +1293,109 @@ async def stage_plates(
         stats={
             "observations": stored,
             "tracks": len(tracks),
-            # Both surfaced deliberately: "0 plates" is otherwise indistinguishable from
-            # "read plenty and refused them all", and the orientation vote is the kind of
-            # automatic decision that must be visible when it goes wrong.
+            # All surfaced deliberately: "0 plates" is otherwise indistinguishable from
+            # "read plenty and refused them all", the orientation vote is the kind of
+            # automatic decision that must be visible when it goes wrong, and a sighting
+            # with no location is a result rather than a gap.
             "rejected_unmatched": rejected,
+            "without_position": sum(1 for _, located in placed if located is None),
             **orientation.describe(),
         },
     )
+
+
+async def _write_observations(
+    session: AsyncSession,
+    recording: Recording,
+    placed: list,
+    touched_plate_ids: set[int],
+    camera: Camera | None,
+    mirrored: bool,
+) -> None:
+    """Turn confirmed readings into rows. Split out so the write phase is one callable.
+
+    Everything it needs was decided before the transaction opened, so re-running it after
+    a lock collision produces the same rows -- which is what makes the retry safe.
+    """
+    settings = get_settings_service()
+    save_crops = bool(settings.get_nowait("plates.save_crops"))
+    quality = int(settings.get_nowait("general.thumbnail_quality"))
+
+    for hit, located in placed:
+        track, vote, result = hit.track, hit.vote, hit.result
+        plate = await _upsert_plate(session, result, vote.ocr_confidence)
+        touched_plate_ids.add(plate.id)
+
+        plate_crop_path = vehicle_crop_path = None
+        if save_crops:
+            preview = _readable(vote.best.crop, mirrored)
+            plate_crop_path = (
+                _save_jpeg(
+                    preview,
+                    _media_path(
+                        "plates", f"{plate.id:08d}", f"{recording.id:08d}_{track.track_key:04d}.jpg"
+                    ),
+                    quality,
+                )
+                if preview is not None
+                else None
+            )
+            vehicle_preview = _readable(hit.vehicle_crop, mirrored)
+            if vehicle_preview is not None:
+                vehicle_crop_path = _save_jpeg(
+                    vehicle_preview,
+                    _media_path(
+                        "plates",
+                        f"{plate.id:08d}",
+                        f"{recording.id:08d}_{track.track_key:04d}_vehicle.jpg",
+                    ),
+                    quality,
+                )
+
+        offset = float(track.best_frame_offset_s or 0.0)
+        session.add(
+            PlateObservation(
+                plate_id=plate.id,
+                recording_id=recording.id,
+                # Deliberately not stamped here -- see _JOURNEY_ID_IS_DERIVED below.
+                camera_id=recording.camera_id,
+                tracked_object_id=track.id,
+                t_offset_s=offset,
+                # The moment the plate was read, not the moment the vehicle first appeared.
+                captured_at=_moment(recording, offset, located),
+                first_seen_offset_s=track.first_seen_offset_s,
+                last_seen_offset_s=track.last_seen_offset_s,
+                raw_text=vote.best.raw_text,
+                normalised_text=result.normalised,
+                ocr_confidence=vote.ocr_confidence,
+                detection_confidence=vote.detection_confidence,
+                vote_count=vote.vote_count,
+                lat=located.lat if located else None,
+                lon=located.lon if located else None,
+                plate_crop_path=plate_crop_path,
+                vehicle_crop_path=vehicle_crop_path,
+                # `mirrored` records that the saved crop was turned round relative to the
+                # frame, so the box and the picture can never be read as being in the same
+                # coordinate space by mistake.
+                bbox={"box": list(vote.best.bbox), "mirrored": mirrored},
+            )
+        )
+
+        log.info(
+            "plate sighting recorded",
+            recording=recording.filename,
+            recording_id=recording.id,
+            camera=camera.key if camera else None,
+            plate=result.normalised,
+            raw_text=vote.best.raw_text,
+            ocr_confidence=round(vote.ocr_confidence, 3),
+            detection_confidence=round(vote.detection_confidence, 3),
+            votes=vote.vote_count,
+            track_key=track.track_key,
+            frame_offset_s=round(offset, 3),
+            mirrored_preview=mirrored,
+            **(located.as_log() if located else {"gps_source": "none"}),
+        )
 
 
 def _as_detection(x1, y1, x2, y2, label, confidence):
@@ -1149,16 +1438,15 @@ async def _upsert_plate(session: AsyncSession, result, confidence: float) -> Pla
     return plate
 
 
-async def _refresh_plate_rollups(session: AsyncSession, recording_id: int) -> None:
-    plate_ids = list(
-        (
-            await session.execute(
-                select(PlateObservation.plate_id.distinct()).where(
-                    PlateObservation.recording_id == recording_id
-                )
-            )
-        ).scalars()
-    )
+async def _refresh_plate_rollups(session: AsyncSession, plate_ids: set[int]) -> None:
+    """Recompute the stored counts for every plate this run touched.
+
+    The caller passes the plates whose observations were *removed* as well as those
+    written, which is the whole point: a plate that this recording no longer sees is
+    exactly the one whose count is now wrong, and it is the one a "refresh what is here
+    now" query cannot find.
+    """
+    orphaned: list[int] = []
     for plate_id in plate_ids:
         row = (
             await session.execute(
@@ -1174,11 +1462,22 @@ async def _refresh_plate_rollups(session: AsyncSession, recording_id: int) -> No
         plate = await session.get(Plate, plate_id)
         if plate is None:
             continue
-        plate.observation_count = int(row[0] or 0)
+        count = int(row[0] or 0)
+        if count == 0 and not plate.flagged and not plate.notes:
+            # No observation anywhere refers to this plate any more, so it is a reading
+            # that a reprocess corrected. Kept only if a user has invested something in it
+            # -- a flag or a note -- because deleting that is not ours to do.
+            orphaned.append(plate_id)
+            continue
+        plate.observation_count = count
         plate.first_seen_at = row[1]
         plate.last_seen_at = row[2]
         plate.journey_count = int(row[3] or 0)
         plate.best_confidence = float(row[4] or 0.0)
+
+    if orphaned:
+        await session.execute(delete(Plate).where(Plate.id.in_(orphaned)))
+        log.info("removed plates left with no observations", count=len(orphaned))
 
 
 # --------------------------------------------------------------------------------------

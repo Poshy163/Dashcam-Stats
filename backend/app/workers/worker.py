@@ -15,7 +15,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from app.core.logging import get_logger
+from app.core.logging import get_logger, log_context
 from app.core.settings_service import get_settings_service
 from app.db.models import JobState, ProcessingJob, Recording
 from app.db.session import session_scope
@@ -94,9 +94,11 @@ class WorkerPool:
         self._running = True
 
         # Anything left RUNNING belongs to a previous process that did not shut down
-        # cleanly; reclaim it before taking new work.
+        # cleanly; reclaim it before taking new work. Both halves: the job, and the
+        # recording that the job was halfway through, which nothing else puts right.
         async with session_scope() as session:
             await queue.reclaim_stale(session)
+            await queue.release_stranded_recordings(session)
 
         self._supervisor = asyncio.create_task(self._supervise(), name="worker-supervisor")
         settings = get_settings_service()
@@ -209,6 +211,16 @@ class WorkerPool:
         return None
 
     async def _run_job(
+        self, job_id: int, recording_id: int | None, stages: list[str] | None, filename: str
+    ) -> None:
+        # Everything logged from here down carries the job and the recording, including
+        # lines raised from inside a thread executor. This is what makes a sighting
+        # traceable: the coordinate a stage chose, the job that chose it and the file it
+        # came from end up on the same rows of `log_entries`.
+        with log_context(recording_id=recording_id, job_id=job_id, file=filename):
+            await self._run_job_inner(job_id, recording_id, stages, filename)
+
+    async def _run_job_inner(
         self, job_id: int, recording_id: int | None, stages: list[str] | None, filename: str
     ) -> None:
         hardware = detect_hardware()
@@ -326,6 +338,7 @@ class WorkerPool:
                             job,
                             report.error or "processing failed",
                             permanent=report.permanent,
+                            transient=report.transient,
                         )
                     else:
                         await queue.complete(

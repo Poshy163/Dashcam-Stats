@@ -76,7 +76,7 @@ About 2.5 % of the corpus is broken, which the pipeline must absorb without stal
 
 | Failure | Count | Behaviour required |
 | --- | --- | --- |
-| Zero-byte files | 3 | Fail fast, mark `Failed`, do not retry forever |
+| Zero-byte files | 3 | Mark `Invalid` and leave the queue — see §5.3. Marking them `Failed` is what kept handing them fresh attempts |
 | Unparseable stream table | 1 | Detect missing video stream |
 | Decodes to green garbage (mis-detected as HEVC, broken PPS refs) | 4 | Survive decoder errors |
 | **PTS wraparound** — reports 95,377 s duration for a 9 MB file | 2 | Clamp against 2³³/90000 ≈ 95,443 s |
@@ -230,9 +230,16 @@ Stages are independent and separately re-runnable, so "reprocess telemetry only"
 re-runs detection.
 
 ```
-Discovered → Inspected → Telemetry → Detected → Plates → Completed
-                  ↘ Failed (per-stage, with attempt counter) ↙
+Settling → Discovered → Queued → Processing ─ Inspect ─ Telemetry ─ Detect ─ Plates ─ Summarise → Completed
+    │                                 │
+    │                                 ├→ Failed   (per-stage, attempt counter, retried)
+    └→ Invalid                        └→ Invalid  (permanent: 0 bytes, no video stream)
 ```
+
+Both ends of that diagram are load-bearing and neither used to exist. `Settling` is a file
+the camera may still be writing; `Invalid` is a file no number of attempts can help. See
+§5.3 — collapsing either into `Failed` is what let three zero-byte segments consume four
+processing attempts on every bulk requeue, forever.
 
 | Stage | Work | Cost control |
 | --- | --- | --- |
@@ -396,6 +403,53 @@ The corollary for tests: a fake stage that does no database work cannot reproduc
 concurrency test only started catching it once its stage issued a query, which is what every
 real stage does.
 
+### What was actually holding the lock
+
+The three routes above were all inside a worker. A fourth was not, and it is the one that
+produced `database is locked` on `DELETE FROM tracked_objects` and `DELETE FROM
+telemetry_points` — each the *first write* of its stage, i.e. exactly where a transaction
+opens.
+
+`JourneyBuilder.refresh` took the write lock with its first `UPDATE` and then did all of
+its reading: every telemetry point of the journey, three separate times. `rebuild` called
+it for all forty-five journeys inside one transaction. That is minutes of held lock, and
+`busy_timeout` is thirty seconds, so both workers' next write failed outright.
+
+Two changes, and they are not alternatives:
+
+* **Read everything, decide everything, then write.** `refresh` now makes one pass over
+  the journey's telemetry and derives the outliers, bounds, distance and endpoints from it
+  in memory — fewer queries than the four passes it replaces, and a write phase measured in
+  statements rather than seconds. `rebuild` commits per journey.
+* **Contention is not a failure of the recording.** The stage write phases are wrapped in
+  `write_with_retry`, which re-runs delete-then-insert from data already in memory, and a
+  lock that survives that is reported to the queue as `transient` — requeued with the
+  attempt **refunded**, bounded by `MAX_CONTENTION_RETRIES` so a permanently locked
+  database still surfaces. Two recordings had been marked permanently failed at 4/4 without
+  ever being given a reason that had anything to do with the footage.
+
+`commit_with_retry` deliberately does *not* roll back between attempts. Rolling back and
+committing again is the obvious shape and it is catastrophic here: it discards the work,
+commits an empty transaction, and reports success — §5.2 again, one level down.
+
+### One recording, one worker
+
+`enqueue(force=True)` — what every bulk reprocess uses — created a second job for a
+recording a worker was already running, and the claim had no opinion about that. Both runs
+then deleted and rewrote the same rows, and whichever delete landed between the other's
+delete and its inserts took those inserts with it.
+
+The claim now carries a correlated `NOT EXISTS` against `RUNNING` jobs for the same
+recording, in the same statement for the same reason the claim itself is one statement.
+`force` supersedes queued jobs rather than stacking them, so three presses of "reprocess
+everything" no longer decode the library three times.
+
+The other half of the pair had no owner at all: `reclaim_stale` returned the *job* but left
+the *recording* stamped `processing`, and `queue_unprocessed` does not look at that state.
+A hard restart mid-run stranded that recording permanently. Both halves are now healed, and
+a stage left `RUNNING` counts as pending — treating it as done let a reclaimed recording
+finish as `completed` with the stage it died in silently skipped.
+
 ---
 
 ## 5.2 Failures that reported success
@@ -429,6 +483,239 @@ effect does not depend on what the ORM believes, and assert on the resulting sta
 than on the call. Where a count is shown to a user, carry enough context to say whether the
 thing producing it was working — see `FeatureStatus` in `/api/status` and `emptyStateFor`
 in the recording viewer, both of which exist so a zero cannot masquerade as a measurement.
+
+---
+
+## 5.3 Discovered, settling, invalid
+
+A file being written and a file with nothing in it look identical from one `stat()` at the
+wrong moment, and the pipeline treated both as "try again later". For the three zero-byte
+segments in this corpus that meant a permanent place in the retry population: they failed
+on attempt 1 of 4 with `is empty (0 bytes)`, and every bulk requeue handed them a fresh
+four.
+
+`RecordingState` now distinguishes them, and the distinction is the whole point:
+
+| | Means | Consequence |
+| --- | --- | --- |
+| `settling` | Still moving, or not yet seen twice | Asked about again next scan; never queued |
+| `failed` | An attempt did not work | Stays in the retry population |
+| `invalid` | The source cannot be processed at all | Leaves the queue; excluded from bulk requeues |
+
+The test for readiness is *stability*, not delay: the mtime must be older than the settle
+window **and** the size and mtime must be the ones the previous scan recorded. Nothing
+sleeps — the second observation arrives with the next scan, whenever that is. Only once a
+file has proved it is not moving is its size read as a verdict, so a zero-byte file written
+a second ago is a copy that has just started and a zero-byte file unchanged since the last
+scan is a zero-byte file.
+
+A first sighting is not automatically held back, because an initial import is hundreds of
+files whose mtimes are days old and making each wait a scan interval would be a delay with
+nothing behind it. A future mtime — clock skew against the share — is deliberately not
+treated as "recently written", which would stall such a share forever; it falls through to
+the cross-scan comparison, which needs no clocks to agree.
+
+Finding this also turned up its mirror image. A file first seen mid-write is stored with no
+fingerprint, which is the marker for "never read" — but if it was then never touched again,
+its size and mtime matched on every later scan and the cheap-path early return fired before
+anything noticed the fingerprint was still missing. That recording was never processed at
+all, with no error and nothing in the UI to suggest anything was wrong.
+
+---
+
+## 5.4 Where a sighting happened
+
+Every position on a track or a plate observation is chosen from the recording's own
+telemetry, and the choosing was one line:
+
+```sql
+ORDER BY abs(t_offset_s - ?) LIMIT 1
+```
+
+which has no tolerance, no interpolation and no validation. Three consequences, all of
+which produce a confident coordinate rather than an error:
+
+* A recording whose lock died ten seconds in still had a "nearest" fix for a detection two
+  minutes later — the last known position, up to a couple of kilometres away.
+* The point *between* two fixes a second apart is a better answer than either of them; at
+  60 km/h picking one is up to 8 m of avoidable error on every sighting.
+* `has_fix` was the only filter, so a row carrying the flag with a corrupt coordinate was
+  as eligible as any other.
+
+`app/osd/locate.py` answers the same question with a fourth possible answer: **no idea**.
+It brackets the moment, interpolates when the two fixes either side are close enough
+together and consistent with each other, falls back to a single fix within
+`telemetry.max_fix_age_s`, and otherwise returns nothing. A sighting with no location is
+honest and the UI already has a place for it; a sighting with someone else's location is a
+wrong answer that looks exactly like a right one.
+
+Two related mistakes went with it. Plate observations copied the track's coordinate, which
+belongs to the frame the vehicle was *first* seen in rather than the frame its plate was
+read in — up to twenty seconds apart on a followed vehicle. And `first_seen_at` and
+`last_seen_at` were stamped with the same telemetry timestamp, so every track in the
+library claimed to have been last seen at the instant it was first seen.
+
+### Coordinates are refused, not repaired — and refusal has to reach every copy
+
+`app/osd/validate.py` is now the single definition of what may be stored as a position:
+finite, in range, and not the camera's `00.0000` no-fix marker. Four layers had grown their
+own version of that question and none of them checked for NaN, which passes every magnitude
+comparison ever written.
+
+The sequential jump check also has a blind spot worth naming. The walk trusts its starting
+point absolutely: the first fix becomes the anchor with nothing to check it against, so
+when *that* one is the misread it is kept and every good fix after it is rejected for
+disagreeing with it. A median cannot be dragged by the outlier it is looking for, so the
+whole recording now gets a say before the walk starts, and a walk that condemns a majority
+is treated as evidence of a bad anchor rather than a field of outliers.
+
+### Tracing `-34.8040, -8.6845` on the live library
+
+Worth writing down in full, because the obvious explanation was wrong and the measurement
+said so.
+
+That coordinate sits on **110 tracked objects and one plate observation** in
+`20260803130528_camera_0.ts` (recording 268) — every sighting in the clip, at one identical
+position. The recording stores **zero** telemetry fixes while its rollup still claims
+`has_gps` with `gps_point_count = 1`.
+
+Re-decoding all 121 frames through the deployed reader shows why the value is *shaped* the
+way it is: this clip's overlay loses the leading digits of its longitude constantly.
+`138.6845` comes back as `38.6845`, `28.6845` and — at t=2 — exactly `-8.6845`, against 92
+frames that read it correctly. So the misread is real and reproducible.
+
+But running both the deployed and the fixed derivation over those 121 real frames keeps the
+same 92 good fixes and rejects the same bad ones. **The anchor bug did not produce this
+value**; an older parser did, at the time this recording was processed, and the parser fixes
+recorded in `app/osd/parser.py` have since closed that route. Claiming otherwise would have
+been a tidy story that the evidence contradicts.
+
+What is still live, and what actually kept the wrong coordinate on the map, is the pair
+below:
+
+1. **No tolerance.** Whatever single fix survived was stamped on all 110 tracks by
+   `ORDER BY abs(t_offset_s - ?) LIMIT 1`, from t=0 to t=120, because nothing asked how far
+   away in time it was.
+2. **No cleanup of the copies.** The journey builder later recognised that fix as impossible
+   and cleared it from `telemetry_points` — leaving the recording with zero fixes — but
+   `tracked_objects` and `plate_observations` keep their own coordinate and nothing has ever
+   gone back for them.
+
+Measured across the whole library: **2,575 of 84,329 sightings** sit at a coordinate that
+is physically impossible for this footage, and in **44 recordings** every sighting shares a
+single position. Both are now judged by the same journey centre and radius as the telemetry,
+and migration 0005 applies that to the rows already stored.
+
+With the fix, S192DKX in recording 268 is placed by interpolation between the fixes 0.75 s
+either side of the frame its plate was read in, and moves from `-34.8040, -8.6845` to
+`-34.8040, 138.6845` — 11,565 km, onto the road the rest of that journey is on.
+
+Nothing in any of this knows where this dashcam drives. The reference is always the drive's
+own centre and its own elapsed time, so the same rules hold anywhere on Earth.
+
+---
+
+## 5.5 Reprocessing has to clean up after itself
+
+Every stage deletes its own rows before writing, so duplication was never the risk. What
+was left behind was the other half — rows derived from the rows just deleted:
+
+* `plate_observations` point at `tracked_objects` with `ON DELETE SET NULL`, so reprocessing
+  detection alone left every observation pointing at nothing while still carrying the
+  coordinates and offsets of tracks that no longer existed. Stage selections are now closed
+  over their dependants: re-running telemetry re-runs detection and plates, and re-running
+  detection re-runs plates.
+* Plate rollups were refreshed only for plates the recording *still* sees, so a plate whose
+  reading a reprocess corrected kept a count including the observation just deleted, and a
+  plate left with no observations anywhere stayed in the catalogue forever. The plates about
+  to lose an observation are collected before the delete, and one with nothing left pointing
+  at it is removed — unless a user has flagged it or written a note, which is not ours to
+  discard.
+
+---
+
+## 5.6 The rear channel is mirrored, and the picture is not the coordinate space
+
+The orientation vote already existed and is what lets the recogniser read a mirrored rear
+channel at all. What it was never applied to was the *picture*: OCR read a flipped copy of
+the crop and the crop was saved exactly as the camera produced it, so the plate page showed
+a backwards plate above correctly-read text — which reads as the text being wrong.
+
+The flip stops at the saved crop. Flipping the frame instead would put every stored bounding
+box on the wrong side of a video the player still shows unmirrored, so detection, tracking
+and every `bbox` stay in the source's coordinate space and only the standalone preview image
+is turned round. The observation records that it was, so the two can never be mistaken for
+the same space.
+
+The vote also had to be settled earlier. It was decided after eight sampled readings, and
+the crops are written after the loop — so a recording with fewer readable plates than that
+reached the write phase with the question still open and saved every preview unflipped. On a
+short rear clip that is every preview in the recording.
+
+---
+
+## 5.7 What only the running system could show
+
+Four defects below were invisible from the source and obvious from a live server. They are
+recorded together because they turned out to be one chain: a misread coordinate splits a
+drive, the split makes the scheduler rebuild for ever, the rebuilds hold the write lock, and
+the lock is what was failing recordings.
+
+**A frozen coordinate decides where drives split.** `recordings.start_lat` is written once,
+by the telemetry stage, from that recording's first fix — and nothing ever revisits it.
+Cleaning `telemetry_points` updates the *journey's* rollups and never the recording's, so a
+rear segment whose latitude lost its minus sign keeps a start position 7,700 km from the
+front segment recorded at the same instant. Clustering reads exactly that field, so the pair
+is never put in the same journey. This is the third copy of a coordinate that nothing
+revisited, after `tracked_objects` and `plate_observations`, and it is the expensive one.
+`rebuild` now re-derives every start position from the surviving telemetry *before* it
+clusters: derive, then decide.
+
+**The staleness test could never be satisfied.** `needs_recluster` asked whether two
+automatic journeys sat closer together in time than the gap. `_cluster` splits on time
+**and** GPS continuity — so a pair the rebuild had deliberately separated over a 7,700 km
+jump looked, to a time-only test, exactly like a pair that ought to be joined. The old
+docstring claimed "this cannot loop". On the live library it had looped 12,626 times: every
+scan deleted and recreated all 85 journeys, and the write lock went with it. The check now
+runs the clustering and compares the grouping against what is stored, which cannot disagree
+with the rebuild it triggers.
+
+That loop is also the answer to a question §5.1 left open — what was holding the lock long
+enough to blow past a thirty-second `busy_timeout`. It was this, on a permanent cycle.
+
+**A rebuild deletes journeys out from under the workers.** Every stage stamped
+`journey_id` on the rows it inserted, from `recording.journey_id` — a value read into memory
+when the job started. The scheduler deletes and recreates every automatic journey while
+workers are mid-recording, so that number routinely names a journey that no longer exists
+and the insert fails with `FOREIGN KEY constraint failed`. No stage writes it now:
+`_attach` owns it, `stage_summarise` backfills it, and a derived value with two writers
+always has one working from a stale copy.
+
+**And the failure handler failed.** A stage that dies inside a flush leaves the session
+refusing everything until it is rolled back, so `recording.state = FAILED` was discarded —
+SQLAlchemy says so, in a warning nobody was reading: *"Session's state has been changed on a
+non-active transaction - this state will be discarded"* — and the commit after it raised
+`PendingRollbackError`, which escaped `run_stages` entirely. The job was never marked failed
+at all: it stayed RUNNING with no worker until the heartbeat reclaimed it, then decoded the
+whole recording again to fail the same way. Seven of those, each logged as a bare "worker
+loop error" naming neither the recording nor the job.
+
+The repair has a trap of its own worth recording, because the first version of it fell in:
+rolling back expires every mapped object, so reading `recording.id` afterwards fires a lazy
+load, and under the async engine that raises `MissingGreenlet`. The id is captured before
+the rollback for that reason.
+
+### Measured on the live library
+
+| | |
+| --- | --- |
+| Sightings at a coordinate this footage cannot reach | 2,575 of 84,329 |
+| Recordings where every sighting shares one position | 44 |
+| Journeys, against what clustering says | 85 vs 44 |
+| Journeys holding a single recording | 31 |
+| Rebuild/recluster log entries | 12,626 |
+| `database is locked` in the worker loop | 128 |
+| Jobs spent on three zero-byte files | 9, across three bulk requeues |
 
 ---
 

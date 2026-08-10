@@ -15,9 +15,8 @@ from app.osd.engine import (
     TelemetryExtractor,
     TelemetryResult,
     TelemetrySample,
-    bearing_deg,
-    haversine_m,
 )
+from app.osd.geo import bearing_deg, haversine_m
 from app.osd.glyphs import (
     GlyphTemplates,
     TemplateLearner,
@@ -28,12 +27,17 @@ from app.osd.glyphs import (
     segment_glyphs,
     select_training_set,
 )
+from app.osd.locate import FixSample, FixTrack, Located
 from app.osd.parser import OsdReading, enforce_monotonic, parse_osd_text
 from app.osd.region import DEFAULT_REGION, OsdRegion, calibrate
+from app.osd.validate import coordinate_problem, is_valid_coordinate
 
 __all__ = [
     "DEFAULT_REGION",
+    "FixSample",
+    "FixTrack",
     "GlyphTemplates",
+    "Located",
     "OsdReading",
     "OsdRegion",
     "TelemetryExtractor",
@@ -43,10 +47,12 @@ __all__ = [
     "bearing_deg",
     "binarise",
     "calibrate",
+    "coordinate_problem",
     "decode_line",
     "enforce_monotonic",
     "expected_time_from_filename",
     "haversine_m",
+    "is_valid_coordinate",
     "missing_characters",
     "parse_osd_text",
     "segment_glyphs",

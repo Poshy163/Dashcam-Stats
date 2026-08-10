@@ -379,6 +379,34 @@ SETTINGS: tuple[SettingDef, ...] = (
         maximum=100.0,
         unit="m",
     ),
+    SettingDef(
+        "telemetry.max_fix_age_s",
+        "Maximum GPS age for a sighting",
+        "float",
+        3.0,
+        "telemetry",
+        "How far in time a GPS reading may sit from a detection and still be used as its "
+        "location. The overlay updates every second, so this only ever bites when the "
+        "camera had lost its lock — and then the last known position is not where the "
+        "vehicle was. Sightings beyond this are recorded with no location rather than a "
+        "wrong one.",
+        minimum=0.5,
+        maximum=120.0,
+        unit="seconds",
+    ),
+    SettingDef(
+        "telemetry.max_interpolation_gap_s",
+        "Maximum gap to interpolate across",
+        "float",
+        15.0,
+        "telemetry",
+        "When a detection falls between two GPS readings closer together than this, its "
+        "position is interpolated between them, which is more accurate than picking the "
+        "nearer one. Wider gaps are treated as a dropout and left unlocated.",
+        minimum=0.0,
+        maximum=300.0,
+        unit="seconds",
+    ),
     # ----------------------------------------------------------------- plates
     SettingDef(
         "plates.enabled",

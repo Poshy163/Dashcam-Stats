@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from itertools import pairwise
 
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +30,7 @@ from app.db.models import (
     TelemetryPoint,
     TrackedObject,
 )
+from app.db.retry import commit_with_retry
 from app.osd import haversine_m
 from app.osd.outliers import (
     looks_like_sign_loss,
@@ -118,6 +118,14 @@ class JourneyBuilder:
         )
         movable = [r for r in recordings if r.journey_id not in manual_ids]
 
+        # Derive, then decide. Clustering reads `start_lat`/`start_lon`, and `refresh`
+        # rewrites them from the surviving telemetry -- so clustering on the stored values
+        # and correcting them afterwards means the next pass clusters differently and the
+        # rebuild has to run again to settle. Recomputing first collapses that to one pass
+        # and, more importantly, makes the result a function of the telemetry rather than
+        # of whatever the last run happened to leave behind.
+        await self._refresh_start_positions(session, movable)
+
         clusters = self._cluster(movable, gap, use_gps, max_jump_m)
 
         # Automatic journeys are rebuilt from scratch; the alternative is trying to
@@ -146,11 +154,71 @@ class JourneyBuilder:
             await self._attach(session, [r.id for r in cluster.recordings], journey.id)
             await self.refresh(session, journey)
             created += 1
+            # One journey, one transaction. Forty-five journeys' worth of refreshing in a
+            # single transaction is minutes of held write lock, and everything else that
+            # writes -- both workers, the scheduler, the log sink -- waits behind it and
+            # then fails on its busy timeout. Committing per journey also means a rebuild
+            # interrupted halfway leaves the journeys it finished intact rather than
+            # discarding all of them.
+            await commit_with_retry(session, what="rebuild journey")
 
         await session.flush()
         removed = await self._drop_empty(session)
         log.info("rebuilt journeys", journeys=created, recordings=len(movable), removed=removed)
         return created
+
+    @staticmethod
+    async def _refresh_start_positions(session: AsyncSession, recordings: list[Recording]) -> int:
+        """Re-derive each recording's start position from its earliest surviving fix.
+
+        ``recordings.start_lat`` is written once by the telemetry stage and never revisited,
+        so a first fix that was a misread stays frozen there -- and clustering reads it. On
+        the live library a rear segment whose latitude had lost its minus sign sat 7,700 km
+        from the front segment recorded at the same instant, so the two were never put in
+        the same journey: about 44 real drives became 85, 31 of them holding one recording.
+
+        A window function rather than SQLite's bare-column ``MIN()`` trick, which would pick
+        the right row here and silently pick an arbitrary one on any other database.
+        """
+        if not recordings:
+            return 0
+        ids = [r.id for r in recordings]
+
+        ranked = (
+            select(
+                TelemetryPoint.recording_id,
+                TelemetryPoint.lat,
+                TelemetryPoint.lon,
+                func.row_number()
+                .over(
+                    partition_by=TelemetryPoint.recording_id,
+                    order_by=TelemetryPoint.t_offset_s.asc(),
+                )
+                .label("rank"),
+            )
+            .where(
+                TelemetryPoint.recording_id.in_(ids),
+                TelemetryPoint.has_fix.is_(True),
+                TelemetryPoint.lat.is_not(None),
+                TelemetryPoint.lon.is_not(None),
+            )
+            .subquery()
+        )
+        first = {
+            row.recording_id: (row.lat, row.lon)
+            for row in (await session.execute(select(ranked).where(ranked.c.rank == 1))).all()
+        }
+
+        changed = 0
+        for recording in recordings:
+            lat, lon = first.get(recording.id, (None, None))
+            if (recording.start_lat, recording.start_lon) != (lat, lon):
+                recording.start_lat, recording.start_lon = lat, lon
+                changed += 1
+        if changed:
+            await session.flush()
+            log.info("re-derived recording start positions", corrected=changed, of=len(recordings))
+        return changed
 
     @staticmethod
     async def _attach(
@@ -233,7 +301,7 @@ class JourneyBuilder:
         return len(stale)
 
     async def needs_recluster(self, session: AsyncSession) -> bool:
-        """Do two automatic journeys sit close enough together to be one drive?
+        """Would a rebuild actually group these recordings differently?
 
         Journeys are built two ways. A rebuild clusters the whole library at once and gets
         the boundaries right; ``assign_recording`` attaches one recording as it finishes and
@@ -243,30 +311,63 @@ class JourneyBuilder:
         scanner reports no new files, the rebuild never runs, and those fragments are
         permanent.
 
-        Measured on a real library: 129 journeys of which 65 held a single recording, 77
-        adjacent pairs sat inside the five-minute threshold that is supposed to join them,
-        and some overlapped in time. One pair was split by a gap of one second.
+        This asks the question by *doing* the clustering and comparing it against what is
+        stored, which is the only formulation that cannot disagree with the rebuild it
+        triggers.
 
-        Asking the data rather than tracking state: if any two consecutive automatic
-        journeys are within the gap, the clustering is stale by its own definition. That is
-        false as soon as a rebuild has run, so this cannot loop, and it needs nothing
-        remembered between restarts.
+        The previous one did disagree, permanently. It looked for two automatic journeys
+        closer together in time than the gap, and reasoned that a rebuild would have joined
+        them -- but ``_cluster`` splits on GPS continuity as well as on time, so a pair the
+        rebuild had deliberately separated over a 7,700 km jump looked, to a time-only test,
+        exactly like a pair that should be joined. The result was a rebuild on *every*
+        scan, for ever: 12,626 log entries on the live library, each one deleting and
+        recreating all 85 journeys and holding SQLite's write lock while it did. That load
+        is where the workers' "database is locked" failures came from, so this loop was not
+        merely wasteful -- it was the thing breaking recordings.
+
+        Comparing the grouping itself is immune to that by construction: whatever
+        ``_cluster`` decides, and for whatever reason, the stored assignment matches it
+        immediately after a rebuild.
         """
-        gap = timedelta(minutes=float(get_settings_service().get_nowait("journeys.gap_minutes")))
-        rows = list(
+        settings = get_settings_service()
+        gap = timedelta(minutes=float(settings.get_nowait("journeys.gap_minutes")))
+        use_gps = bool(settings.get_nowait("journeys.use_gps_continuity"))
+        max_jump_m = float(settings.get_nowait("journeys.max_jump_km")) * 1000.0
+        min_recordings = int(settings.get_nowait("journeys.min_recordings"))
+
+        manual_ids = set(
+            (await session.execute(select(Journey.id).where(Journey.manual.is_(True)))).scalars()
+        )
+        recordings = list(
             (
                 await session.execute(
-                    select(Journey.started_at, Journey.ended_at)
-                    .where(Journey.manual.is_(False))
-                    .order_by(Journey.started_at.asc())
+                    select(Recording)
+                    .where(Recording.started_at.isnot(None), Recording.ignored.is_(False))
+                    .order_by(Recording.started_at.asc(), Recording.id.asc())
                 )
-            ).all()
+            ).scalars()
         )
-        for (_, prev_end), (next_start, _) in pairwise(rows):
-            if prev_end is None or next_start is None:
+        movable = [r for r in recordings if r.journey_id not in manual_ids]
+        if not movable:
+            return False
+
+        claimed: set[int] = set()
+        for cluster in self._cluster(movable, gap, use_gps, max_jump_m):
+            ids = {r.journey_id for r in cluster.recordings}
+            if len(cluster.recordings) < min_recordings:
+                # These would be detached; they are stale unless they already are.
+                if ids != {None}:
+                    return True
                 continue
-            if as_utc(next_start) - as_utc(prev_end) <= gap:
+            # One cluster is one journey. Several ids means the drive is currently split
+            # across journeys; an id already claimed by another cluster means two drives
+            # are currently sharing one.
+            if len(ids) != 1 or None in ids:
                 return True
+            journey_id = ids.pop()
+            if journey_id in claimed:
+                return True
+            claimed.add(journey_id)
         return False
 
     @staticmethod
@@ -363,7 +464,23 @@ class JourneyBuilder:
     # -- rollups -----------------------------------------------------------------------
 
     async def refresh(self, session: AsyncSession, journey: Journey) -> Journey:
-        """Recompute a journey's aggregates from its recordings and telemetry."""
+        """Recompute a journey's aggregates from its recordings and telemetry.
+
+        Read everything, decide everything, *then* write. The order is load-bearing rather
+        than tidy. Under SQLite a transaction holds the write lock from its first write
+        until it ends, and this method used to open one with ``_attach`` and then spend the
+        rest of its time reading -- every telemetry point of the journey, twice, plus a
+        streamed pass for distance. On a library where a rebuild refreshes forty-five
+        journeys inside one transaction that is minutes of held lock, and the workers'
+        first write of a stage (``DELETE FROM telemetry_points``, ``DELETE FROM
+        tracked_objects``) blew straight past its thirty second ``busy_timeout`` and failed
+        the whole recording. Those two statements are exactly the ones that showed up in
+        the failure log.
+
+        One read of the journey's telemetry now serves the outlier pass, the bounds, the
+        distance and the endpoints -- which is fewer queries than the four separate passes
+        it replaces, as well as a far shorter write.
+        """
         settings = get_settings_service()
         min_move_m = float(settings.get_nowait("telemetry.min_move_metres"))
 
@@ -393,6 +510,130 @@ class JourneyBuilder:
 
         recording_ids = [r.id for r in recordings]
 
+        # -- reads -----------------------------------------------------------------------
+        points = list(
+            (
+                await session.execute(
+                    select(
+                        TelemetryPoint.id,
+                        TelemetryPoint.recording_id,
+                        TelemetryPoint.lat,
+                        TelemetryPoint.lon,
+                        TelemetryPoint.speed_kmh,
+                        TelemetryPoint.captured_at,
+                        TelemetryPoint.t_offset_s,
+                    )
+                    .where(
+                        TelemetryPoint.recording_id.in_(recording_ids),
+                        TelemetryPoint.has_fix.is_(True),
+                    )
+                    .order_by(
+                        TelemetryPoint.captured_at.asc().nullslast(),
+                        TelemetryPoint.recording_id.asc(),
+                        TelemetryPoint.t_offset_s.asc(),
+                    )
+                )
+            ).all()
+        )
+
+        # Which of those coordinates cannot belong to this drive at all. Computed here,
+        # applied in the write phase below.
+        rejected_ids, centre, radius_m = self._find_outliers(points, journey.duration_s)
+        good = [p for p in points if p.id not in rejected_ids]
+
+        # Positions copied onto sightings when they were processed are stale the moment a
+        # telemetry point behind one is rejected -- and nothing used to go back for them,
+        # which is why a coordinate cleared out of `telemetry_points` went on being drawn
+        # on the map as a detection long afterwards.
+        stale_tracks, stale_observations = await self._find_stale_sighting_positions(
+            session, recording_ids, centre, radius_m
+        )
+
+        counts = (
+            await session.execute(
+                select(
+                    select(func.count(TrackedObject.id))
+                    .where(TrackedObject.recording_id.in_(recording_ids))
+                    .scalar_subquery(),
+                    select(func.count(func.distinct(PlateObservation.plate_id)))
+                    .where(PlateObservation.recording_id.in_(recording_ids))
+                    .scalar_subquery(),
+                )
+            )
+        ).one()
+
+        # -- derivations, in memory ------------------------------------------------------
+        located = [p for p in good if p.lat is not None and p.lon is not None]
+        speeds = [float(p.speed_kmh) for p in good if p.speed_kmh is not None]
+
+        journey.has_gps = bool(located)
+        journey.min_lat = min((p.lat for p in located), default=None)
+        journey.max_lat = max((p.lat for p in located), default=None)
+        journey.min_lon = min((p.lon for p in located), default=None)
+        journey.max_lon = max((p.lon for p in located), default=None)
+        journey.max_speed_kmh = max(speeds, default=None)
+
+        if located:
+            journey.start_lat, journey.start_lon = located[0].lat, located[0].lon
+            journey.end_lat, journey.end_lon = located[-1].lat, located[-1].lon
+
+        # Each recording's own start position, re-derived from the fixes that survived.
+        #
+        # This is the third copy of a coordinate that nothing ever revisited, and it is the
+        # most expensive of the three. `recordings.start_lat` is written once, in the
+        # telemetry stage, from that recording's first fix -- and when the first fix is a
+        # misread the value is frozen there forever, because cleaning `telemetry_points`
+        # updates the journey's rollups and never the recording's.
+        #
+        # Clustering reads it. A rear segment whose first fix lost its minus sign sits
+        # 7,700 km from the front segment recorded at the same instant, so `_same_journey`
+        # refuses to put the pair together and the drive is split in half. On the live
+        # library that turned about 44 real drives into 85 journeys, 31 of them holding a
+        # single recording.
+        # Earliest surviving fix *within each recording*, by its own offset -- not by the
+        # journey-wide ordering above, which puts rows with no readable clock at the end.
+        first_by_recording: dict[int, object] = {}
+        for point in located:
+            current = first_by_recording.get(point.recording_id)
+            if current is None or (point.t_offset_s or 0.0) < (current.t_offset_s or 0.0):
+                first_by_recording[point.recording_id] = point
+        for recording in recordings:
+            point = first_by_recording.get(recording.id)
+            recording.start_lat = point.lat if point else None
+            recording.start_lon = point.lon if point else None
+
+        journey.distance_m, journey.avg_speed_kmh = self._measure(good, min_move_m)
+        journey.vehicle_count = int(counts[0] or 0)
+        journey.unique_plate_count = int(counts[1] or 0)
+
+        # -- writes ----------------------------------------------------------------------
+        if rejected_ids:
+            await self._clear_positions(session, rejected_ids)
+        if stale_tracks:
+            await session.execute(
+                update(TrackedObject)
+                .where(TrackedObject.id.in_(stale_tracks))
+                .values(lat=None, lon=None)
+                .execution_options(synchronize_session=False)
+            )
+        if stale_observations:
+            await session.execute(
+                update(PlateObservation)
+                .where(PlateObservation.id.in_(stale_observations))
+                .values(lat=None, lon=None)
+                .execution_options(synchronize_session=False)
+            )
+        if rejected_ids or stale_tracks or stale_observations:
+            log.info(
+                "discarded positions that cannot belong to this journey",
+                journey_id=journey.id,
+                telemetry=len(rejected_ids),
+                of=len(points),
+                sightings=len(stale_tracks),
+                plate_observations=len(stale_observations),
+                radius_km=round(radius_m / 1000.0, 1) if radius_m else None,
+            )
+
         # Re-point the denormalised journey ids every time, not only when a recording is
         # first attached. The route map and the heat map's journey filter read
         # telemetry_points.journey_id, so a journey whose telemetry was written before it
@@ -401,95 +642,14 @@ class JourneyBuilder:
         # that puts a journey right.
         await self._attach(session, recording_ids, journey.id)
 
-        # Before anything is derived from the fixes, drop the ones that cannot belong to
-        # this drive. Doing it here rather than in each consumer is the point: bounds,
-        # start/end, distance, the map and the recording viewer all read the same rows, so
-        # cleaning them once leaves every view agreeing rather than each filtering to its
-        # own taste. It also self-heals -- a journey rebuilt after a decoder improvement
-        # re-examines its own history.
-        await self._reject_outliers(session, recording_ids, journey.duration_s)
-
-        # Aggregate bounds and max speed in SQL rather than pulling every point back:
-        # a long journey has tens of thousands of telemetry rows.
-        bounds = (
-            await session.execute(
-                select(
-                    func.min(TelemetryPoint.lat),
-                    func.max(TelemetryPoint.lat),
-                    func.min(TelemetryPoint.lon),
-                    func.max(TelemetryPoint.lon),
-                    func.max(TelemetryPoint.speed_kmh),
-                ).where(
-                    TelemetryPoint.recording_id.in_(recording_ids),
-                    TelemetryPoint.has_fix.is_(True),
-                )
-            )
-        ).one()
-        journey.min_lat, journey.max_lat, journey.min_lon, journey.max_lon = bounds[:4]
-        journey.max_speed_kmh = bounds[4]
-        journey.has_gps = journey.min_lat is not None
-
-        journey.distance_m, journey.avg_speed_kmh = await self._track_metrics(
-            session, recording_ids, min_move_m
-        )
-
-        if journey.has_gps:
-            first = (
-                await session.execute(
-                    select(TelemetryPoint.lat, TelemetryPoint.lon)
-                    .where(
-                        TelemetryPoint.recording_id.in_(recording_ids),
-                        TelemetryPoint.has_fix.is_(True),
-                    )
-                    .order_by(TelemetryPoint.captured_at.asc())
-                    .limit(1)
-                )
-            ).first()
-            last = (
-                await session.execute(
-                    select(TelemetryPoint.lat, TelemetryPoint.lon)
-                    .where(
-                        TelemetryPoint.recording_id.in_(recording_ids),
-                        TelemetryPoint.has_fix.is_(True),
-                    )
-                    .order_by(TelemetryPoint.captured_at.desc())
-                    .limit(1)
-                )
-            ).first()
-            if first:
-                journey.start_lat, journey.start_lon = first
-            if last:
-                journey.end_lat, journey.end_lon = last
-
-        journey.vehicle_count = int(
-            (
-                await session.execute(
-                    select(func.count(TrackedObject.id)).where(
-                        TrackedObject.recording_id.in_(recording_ids)
-                    )
-                )
-            ).scalar()
-            or 0
-        )
-        journey.unique_plate_count = int(
-            (
-                await session.execute(
-                    select(func.count(func.distinct(PlateObservation.plate_id))).where(
-                        PlateObservation.recording_id.in_(recording_ids)
-                    )
-                )
-            ).scalar()
-            or 0
-        )
-
         await session.flush()
         return journey
 
     @staticmethod
-    async def _reject_outliers(
-        session: AsyncSession, recording_ids: list[int], span_s: float
-    ) -> int:
-        """Clear coordinates that cannot belong to this journey. Returns how many.
+    def _find_outliers(
+        rows: list, span_s: float
+    ) -> tuple[set[int], tuple[float, float] | None, float]:
+        """Which stored positions cannot belong to this journey, and where its centre is.
 
         The journey is the smallest scope at which the worst failure mode is visible. When
         the rear camera loses the minus sign in front of a latitude it usually loses it for
@@ -497,72 +657,93 @@ class JourneyBuilder:
         confidence while sitting 7,700 km away. Nothing inside the recording contradicts it;
         only its neighbours in the drive do.
 
+        Pure, and returns the centre and radius as well as the verdict, because the same
+        two numbers judge the positions copied onto sightings — one definition of "could
+        the vehicle have been here", applied to every table that stores a coordinate.
+        """
+        located = [r for r in rows if r.lat is not None and r.lon is not None]
+        if len(located) < 3:
+            return set(), None, plausible_radius_m(span_s)
+
+        points = [(float(r.lat), float(r.lon)) for r in located]
+        outliers = spatial_outliers(points, span_s=span_s)
+        radius = plausible_radius_m(span_s)
+        centre = robust_centre([p for i, p in enumerate(points) if i not in outliers])
+
+        if outliers and centre is not None:
+            sign_losses = sum(
+                1 for i in outliers if looks_like_sign_loss(points[i], centre, radius)
+            )
+            if sign_losses:
+                # Worth separating: a dropped minus sign points at the overlay region or
+                # the glyph templates, where a mangled digit points at the weather.
+                log.info("some rejected positions look like a lost minus sign", count=sign_losses)
+
+        return {located[i].id for i in outliers}, centre, radius
+
+    @staticmethod
+    async def _clear_positions(session: AsyncSession, ids: set[int]) -> None:
+        """Strip the coordinates off telemetry rows, keeping everything else.
+
         Rejected rows keep their timestamp, speed and raw text and lose only the position,
         because the rest of the reading was never in doubt — the speed on a sign-flipped
         line is perfectly good, and discarding it would trade one wrong number for a
         missing one.
         """
-        rows = (
-            await session.execute(
-                select(TelemetryPoint.id, TelemetryPoint.lat, TelemetryPoint.lon).where(
-                    TelemetryPoint.recording_id.in_(recording_ids),
-                    TelemetryPoint.has_fix.is_(True),
-                    TelemetryPoint.lat.is_not(None),
-                    TelemetryPoint.lon.is_not(None),
-                )
-            )
-        ).all()
-        if len(rows) < 3:
-            return 0
-
-        points = [(float(r.lat), float(r.lon)) for r in rows]
-        outliers = spatial_outliers(points, span_s=span_s)
-        if not outliers:
-            return 0
-
-        centre = robust_centre([p for i, p in enumerate(points) if i not in outliers])
-        radius = plausible_radius_m(span_s)
-        sign_losses = (
-            sum(1 for i in outliers if looks_like_sign_loss(points[i], centre, radius))
-            if centre
-            else 0
-        )
-
         await session.execute(
             update(TelemetryPoint)
-            .where(TelemetryPoint.id.in_([rows[i].id for i in outliers]))
+            .where(TelemetryPoint.id.in_(ids))
             .values(has_fix=False, lat=None, lon=None, heading_deg=None)
+            .execution_options(synchronize_session=False)
         )
-        log.info(
-            "discarded positions that cannot belong to this journey",
-            rejected=len(outliers),
-            of=len(rows),
-            # Worth separating: a dropped minus sign points at the overlay region or the
-            # glyph templates, where a mangled digit points at the weather.
-            sign_losses=sign_losses,
-            radius_km=round(radius / 1000.0, 1),
-        )
-        return len(outliers)
 
     @staticmethod
-    async def _track_metrics(
-        session: AsyncSession, recording_ids: list[int], min_move_m: float
-    ) -> tuple[float | None, float | None]:
-        """Distance and moving average, streamed so memory stays bounded."""
-        rows = await session.stream(
-            select(
-                TelemetryPoint.lat,
-                TelemetryPoint.lon,
-                TelemetryPoint.speed_kmh,
-                TelemetryPoint.captured_at,
-            )
-            .where(
-                TelemetryPoint.recording_id.in_(recording_ids),
-                TelemetryPoint.has_fix.is_(True),
-            )
-            .order_by(TelemetryPoint.captured_at.asc(), TelemetryPoint.t_offset_s.asc())
-        )
+    async def _find_stale_sighting_positions(
+        session: AsyncSession,
+        recording_ids: list[int],
+        centre: tuple[float, float] | None,
+        radius_m: float,
+    ) -> tuple[list[int], list[int]]:
+        """Sightings holding a coordinate this journey says the vehicle was never at.
 
+        ``tracked_objects`` and ``plate_observations`` each keep their own copy of the
+        position, stamped when the recording was processed. Cleaning ``telemetry_points``
+        never touched them, so a coordinate that had been recognised as impossible and
+        cleared at the source went on being drawn on the map as a detection — which is
+        exactly how one sighting kept reporting a longitude eleven thousand kilometres from
+        the drive it belonged to, long after the telemetry point behind it was gone.
+
+        Judged by the same centre and radius as the telemetry, so the two cannot disagree.
+        """
+        if centre is None:
+            return [], []
+
+        stale: dict[str, list[int]] = {"tracks": [], "observations": []}
+        for model, key in ((TrackedObject, "tracks"), (PlateObservation, "observations")):
+            rows = (
+                await session.execute(
+                    select(model.id, model.lat, model.lon).where(
+                        model.recording_id.in_(recording_ids),
+                        model.lat.is_not(None),
+                        model.lon.is_not(None),
+                    )
+                )
+            ).all()
+            stale[key] = [
+                row.id
+                for row in rows
+                if haversine_m(centre[0], centre[1], float(row.lat), float(row.lon)) > radius_m
+            ]
+        return stale["tracks"], stale["observations"]
+
+    @staticmethod
+    def _measure(rows: list, min_move_m: float) -> tuple[float | None, float | None]:
+        """Distance and moving average over already-cleaned fixes, in journey order.
+
+        Takes the rows rather than fetching them: they have already been read once for the
+        outlier pass, and reading them again inside the write transaction is what made this
+        method the longest-held lock in the process.
+        """
         distance = 0.0
         skipped = 0
         anchor: tuple[float, float] | None = None
@@ -571,7 +752,8 @@ class JourneyBuilder:
         moving_count = 0
         any_point = False
 
-        async for lat, lon, speed, captured in rows:
+        for row in rows:
+            lat, lon, speed, captured = row.lat, row.lon, row.speed_kmh, row.captured_at
             any_point = True
             if speed is not None and speed > 1.0:
                 moving_sum += speed

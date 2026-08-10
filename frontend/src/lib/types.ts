@@ -8,13 +8,21 @@
  * position must check `hasFix` rather than testing for non-null numbers.
  */
 
+/**
+ * `settling` and `invalid` are the two ends of "not being processed, and that is fine".
+ * A settling file is still being written and will be picked up on a later scan; an invalid
+ * one is empty or has no video stream and never will be. `failed` sits between them: it
+ * was tried, it did not work, and it will be tried again.
+ */
 export type RecordingState =
   | 'discovered'
+  | 'settling'
   | 'metadata_extracted'
   | 'queued'
   | 'processing'
   | 'completed'
   | 'failed'
+  | 'invalid'
   | 'ignored'
   | 'deleted'
 
@@ -280,6 +288,10 @@ export interface Status {
     pending: number
     processing: number
     failed: number
+    /** Empty, or carrying no video stream. Never retried; see RecordingState. */
+    invalid: number
+    /** Still being written, so not yet work that is waiting. */
+    settling: number
     recordingsToday: number
     throughputPerHour: number | null
   }

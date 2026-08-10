@@ -12,11 +12,11 @@ from datetime import datetime
 import pytest
 
 from app.osd.parser import (
-    NO_FIX_EPSILON,
     OsdReading,
     enforce_monotonic,
     parse_osd_text,
 )
+from app.osd.validate import NO_FIX_EPSILON
 
 # Exactly as decoded from real frames, including the wide inter-field spacing.
 REAL_LINE = "2026-08-04 17:44:39   E:138.6769 N:-34.8088  68 km/h"

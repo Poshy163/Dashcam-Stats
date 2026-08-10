@@ -116,6 +116,21 @@ export default function Dashboard() {
           tone={processing.failed ? 'error' : 'default'}
           href={processing.failed ? '/queue?state=failed' : undefined}
         />
+        {/*
+          Shown only when there are any, and never folded into Failures. These are files
+          nothing can do anything with — empty, or with no video stream — so they are not
+          waiting for a retry and counting them as failures invited exactly the reprocess
+          that kept handing them fresh attempts. Links to the recordings list rather than
+          the queue, because the answer is on the file, not on a job.
+        */}
+        {processing.invalid > 0 && (
+          <StatTile
+            label="Unusable files"
+            value={processing.invalid}
+            tone="warn"
+            href="/recordings?state=invalid"
+          />
+        )}
         <StatTile label="Recordings today" value={processing.recordingsToday} />
       </div>
 

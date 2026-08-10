@@ -16,6 +16,10 @@ const STATES = [
   ['queued', 'Queued'],
   ['discovered', 'Discovered'],
   ['failed', 'Failed'],
+  // Its own filter because it is the answer to "why has nothing happened to these": they
+  // are empty or carry no video stream, and no amount of waiting or retrying changes that.
+  ['invalid', 'Unusable file'],
+  ['settling', 'Still writing'],
 ] as const
 
 export default function Recordings() {

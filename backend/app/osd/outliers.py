@@ -27,7 +27,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from statistics import median
 
-from app.osd.engine import haversine_m
+from app.osd.geo import haversine_m
+from app.osd.validate import NO_FIX_EPSILON, is_no_fix_placeholder
 
 #: Sustained speed used to bound how far a drive can reach in its own duration.
 #:
@@ -44,10 +45,9 @@ SUSTAINED_SPEED_KMH = 130.0
 MIN_RADIUS_M = 5_000.0
 
 #: Half-width of the box around (0, 0) that is the camera's no-fix marker rather than a
-#: place. Mirrors ``parser.NO_FIX_EPSILON`` and exists separately so callers that do not
-#: hold a parsed reading -- a migration cleaning rows already in the database -- can apply
-#: the same rule without importing the parser.
-NO_FIX_EPSILON_FALLBACK = 0.1
+#: place. Re-exported from :mod:`app.osd.validate` under its historical name, which the
+#: migrations import; it was a second copy of the same number until that module existed.
+NO_FIX_EPSILON_FALLBACK = NO_FIX_EPSILON
 
 
 def plausible_radius_m(span_s: float) -> float:
@@ -123,17 +123,6 @@ def looks_like_sign_loss(
     if haversine_m(centre[0], centre[1], point[0], point[1]) <= radius_m:
         return False
     return haversine_m(centre[0], centre[1], -point[0], point[1]) <= radius_m
-
-
-def is_no_fix_placeholder(lat: float, lon: float, epsilon: float) -> bool:
-    """Is this the camera's ``E:00.0000 N:00.0000`` marker rather than a coordinate?
-
-    Both components have to be near zero. A real coordinate with one component genuinely
-    close to zero exists — the equator and the Greenwich meridian are real places — but
-    both at once is 600 km off the African coast in the Gulf of Guinea, which no dashcam
-    is driving through.
-    """
-    return abs(lat) < epsilon and abs(lon) < epsilon
 
 
 __all__ = [

@@ -15,7 +15,6 @@ Two derivations happen here that the dashcam does not provide:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +23,7 @@ import numpy as np
 
 from app.core.logging import get_logger
 from app.hardware.ffmpeg import DecodeError, FFmpegError, iter_frames, probe
+from app.osd.geo import bearing_deg, haversine_m
 from app.osd.glyphs import (
     GlyphTemplates,
     TemplateLearner,
@@ -34,32 +34,15 @@ from app.osd.glyphs import (
     merge_templates,
     missing_characters,
 )
+from app.osd.outliers import plausible_radius_m, robust_centre, spatial_outliers
 from app.osd.parser import OsdReading, enforce_monotonic, parse_osd_text
 from app.osd.region import OsdRegion, calibrate
+from app.osd.validate import MAX_PLAUSIBLE_SPEED_KMH, MAX_PLAUSIBLE_SPEED_MS, is_valid_coordinate
 
 log = get_logger(__name__)
 
-EARTH_RADIUS_M = 6_371_008.8
-
-#: Ceiling on how fast the vehicle could actually be moving between two fixes. Well
-#: above any road speed, so it only ever catches OCR damage rather than fast driving.
-_MAX_PLAUSIBLE_SPEED_KMH = 400.0
-
-
-def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp = p2 - p1
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
-
-
-def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dl = math.radians(lon2 - lon1)
-    y = math.sin(dl) * math.cos(p2)
-    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
-    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+#: Kept as module attributes because ``app.osd`` and the migrations import them from here.
+_MAX_PLAUSIBLE_SPEED_KMH = MAX_PLAUSIBLE_SPEED_KMH
 
 
 @dataclass(slots=True)
@@ -343,14 +326,70 @@ class TelemetryExtractor:
         return max(0.0, b.t_offset_s - a.t_offset_s)
 
     @staticmethod
+    def _discard(sample: TelemetrySample) -> None:
+        """Strip a position off a sample, keeping the time and speed that were fine."""
+        sample.has_fix = False
+        sample.lat = None
+        sample.lon = None
+        sample.heading_deg = None
+
+    @staticmethod
+    def _reject_by_consensus(fixes: list[TelemetrySample]) -> list[TelemetrySample]:
+        """Drop fixes the rest of the recording disagrees with, before anything is derived.
+
+        This has to happen before the sequential walk below, and the reason is the walk's
+        one blind spot: it trusts its starting point absolutely. The first fix becomes the
+        anchor with nothing to check it against, so when *that* one is the misread -- a
+        longitude of ``-8.6845`` on a drive whose every other reading says ``138.68`` --
+        the walk keeps it and rejects all 118 good fixes that follow for disagreeing with
+        it. The recording then reports a single position, in the wrong ocean, and every
+        detection in it is stamped with that.
+
+        A median cannot be dragged by the outlier it is looking for, so asking the whole
+        recording where it was is the check the first fix never had. ``spatial_outliers``
+        refuses to act when it needs fewer than three points or when a majority look wrong,
+        which is what keeps this from throwing away a genuinely long drive.
+        """
+        points = [(float(s.lat), float(s.lon)) for s in fixes]  # type: ignore[arg-type]
+        span_s = fixes[-1].t_offset_s - fixes[0].t_offset_s if fixes else 0.0
+        outliers = spatial_outliers(points, span_s=span_s)
+        if not outliers:
+            return []
+
+        centre = robust_centre([p for i, p in enumerate(points) if i not in outliers])
+        radius = plausible_radius_m(span_s)
+        rejected = [fixes[i] for i in outliers]
+        for sample in rejected:
+            TelemetryExtractor._discard(sample)
+        log.warning(
+            "discarded positions the rest of the recording disagrees with",
+            rejected=len(rejected),
+            of=len(fixes),
+            centre_lat=round(centre[0], 4) if centre else None,
+            centre_lon=round(centre[1], 4) if centre else None,
+            radius_km=round(radius / 1000.0, 1),
+        )
+        return rejected
+
+    @staticmethod
     def _derive(result: TelemetryResult, *, min_move_m: float) -> None:
         """Fill in heading and the journey rollups, discarding impossible movement."""
         # Metres a vehicle could plausibly cover in one second. Anything beyond this
         # between consecutive fixes is a misread coordinate, not travel.
-        max_step_m = _MAX_PLAUSIBLE_SPEED_KMH * 1000.0 / 3600.0
+        max_step_m = MAX_PLAUSIBLE_SPEED_MS
         rejected: list[TelemetrySample] = []
 
+        # Belt and braces against a coordinate that is not a number at all. The parser
+        # already refuses those, but this is the last point before they become rows, and a
+        # NaN reaching the database is invisible everywhere downstream.
+        for sample in result.samples:
+            if sample.has_fix and not is_valid_coordinate(sample.lat, sample.lon):
+                TelemetryExtractor._discard(sample)
+
         fixes = [s for s in result.samples if s.has_fix and s.lat is not None and s.lon is not None]
+        rejected.extend(TelemetryExtractor._reject_by_consensus(fixes))
+        fixes = [s for s in fixes if s.has_fix]
+
         if fixes:
             result.first_fix, result.last_fix = fixes[0], fixes[-1]
 
@@ -358,6 +397,7 @@ class TelemetryExtractor:
         # every sample instead would re-admit the jitter this threshold exists to reject,
         # since each individual hop clears nothing but they sum to hundreds of metres.
         anchor: TelemetrySample | None = None
+        stepwise: list[TelemetrySample] = []
         for sample in fixes:
             if anchor is None:
                 anchor = sample
@@ -373,10 +413,7 @@ class TelemetryExtractor:
             # last position we still trust.
             gap_s = TelemetryExtractor._seconds_between(anchor, sample)
             if step > max_step_m * max(1.0, gap_s):
-                sample.has_fix = False
-                sample.lat = None
-                sample.lon = None
-                rejected.append(sample)
+                stepwise.append(sample)
                 continue
 
             if step < min_move_m:
@@ -390,11 +427,27 @@ class TelemetryExtractor:
             )
             anchor = sample
 
+        # A walk that condemns most of what it saw has not found outliers, it has found a
+        # bad anchor -- the same failure the consensus pass exists to prevent, in the case
+        # where there were too few points for it to judge. Discarding the majority on the
+        # authority of one unchecked point is the more expensive mistake, so the walk's
+        # verdict is dropped instead.
+        if stepwise and len(stepwise) * 2 < len(fixes):
+            for sample in stepwise:
+                TelemetryExtractor._discard(sample)
+            rejected.extend(stepwise)
+        elif stepwise:
+            result.warnings.append(
+                f"{len(stepwise)} of {len(fixes)} positions disagreed with the fix before "
+                "them; keeping them all rather than trusting one unverified starting point"
+            )
+
         if rejected:
             result.implausible_jumps = len(rejected)
             result.warnings.append(
-                f"discarded {len(rejected)} position(s) implying travel faster than "
-                f"{_MAX_PLAUSIBLE_SPEED_KMH:.0f} km/h; these are misread coordinates"
+                f"discarded {len(rejected)} misread position(s): either implying travel "
+                f"faster than {MAX_PLAUSIBLE_SPEED_KMH:.0f} km/h, or naming a place the "
+                "rest of the recording disagrees with"
             )
             # first/last fix may have just been invalidated.
             still_fixed = [s for s in result.samples if s.has_fix]

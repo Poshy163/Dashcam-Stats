@@ -36,6 +36,7 @@ from app.db.models import (
 from app.db.session import session_scope
 from app.scanner.fingerprint import fingerprint_file
 from app.scanner.naming import parse_recording_name, resolve_camera
+from app.scanner.stability import assess
 
 log = get_logger(__name__)
 
@@ -59,6 +60,9 @@ class ScanSummary:
     new: int = 0
     changed: int = 0
     unsettled: int = 0
+    #: Files that are stable and unusable -- zero bytes, most often. Counted apart from
+    #: `errors` because the scan worked perfectly; the file is what is wrong.
+    invalid: int = 0
     missing: int = 0
     errors: int = 0
     duration_s: float = 0.0
@@ -252,6 +256,7 @@ class Scanner:
             new=summary.new,
             changed=summary.changed,
             unsettled=summary.unsettled,
+            invalid=summary.invalid,
             missing=summary.missing,
             errors=summary.errors,
             duration_s=round(summary.duration_s, 2),
@@ -307,10 +312,18 @@ class Scanner:
         tz: tzinfo,
     ) -> None:
         now = datetime.now(UTC)
-        # A file whose mtime is inside the settle window may still be growing. The dashcam
-        # writes to this share directly, so processing one now would analyse a partial
-        # segment and cache the wrong duration and telemetry.
-        unsettled = settle_ns > 0 and (now_ns - entry.mtime_ns) < settle_ns
+        # Three answers, not two: ready, still moving, or stable and unusable. See
+        # app.scanner.stability -- the distinction between the last two is what stops a
+        # zero-byte segment consuming four processing attempts on every bulk requeue while
+        # a file the dashcam is still writing is merely asked about again next scan.
+        verdict = assess(
+            size=entry.size,
+            mtime_ns=entry.mtime_ns,
+            now_ns=now_ns,
+            settle_ns=settle_ns,
+            previous_size=row.size_bytes if row is not None else None,
+            previous_mtime_ns=row.mtime_ns if row is not None else None,
+        )
 
         if row is None:
             parsed = parse_recording_name(entry.path.name)
@@ -326,12 +339,16 @@ class Scanner:
                 first_seen_at=now,
                 last_scanned_at=now,
             )
-            if not unsettled:
+            if verdict.ready:
                 recording.fingerprint = await fingerprint_file(entry.path, sample_bytes)
+            elif verdict.invalid:
+                self._mark_invalid(recording, verdict.reason, now)
+                summary.invalid += 1
+            else:
+                recording.state = RecordingState.SETTLING
+                summary.unsettled += 1
             session.add(recording)
             summary.new += 1
-            if unsettled:
-                summary.unsettled += 1
             return
 
         row.last_scanned_at = now
@@ -339,25 +356,59 @@ class Scanner:
             # Reappeared — most often a share that was briefly unmounted.
             row.file_missing = False
             row.deleted_at = None
+            if row.state is RecordingState.FAILED:
+                # It failed because it was not there, and now it is. Nothing else was ever
+                # going to notice: the fingerprint has not changed, so every later scan
+                # took the cheap path and the recording stayed failed for the lifetime of
+                # the index over a mount that came back a minute later.
+                row.state = RecordingState.DISCOVERED
+                row.error_message = None
 
-        if unsettled:
-            summary.unsettled += 1
-            # Record the new size so the next scan can tell whether it is still growing.
-            row.size_bytes = entry.size
-            row.mtime_ns = entry.mtime_ns
-            return
-
-        if row.size_bytes == entry.size and row.mtime_ns == entry.mtime_ns:
-            # The overwhelmingly common path: nothing to do, and nothing was read.
-            return
-
-        # Cheap metadata changed, so escalate to content. A touched file whose bytes are
-        # identical must not trigger a re-analysis of the whole recording.
-        fingerprint = await fingerprint_file(entry.path, sample_bytes)
+        # Always record what was just seen, whatever the verdict: the next scan's
+        # stability comparison is made against these two numbers, so failing to update
+        # them would freeze a growing file's assessment at its first sighting.
+        size_changed = row.size_bytes != entry.size or row.mtime_ns != entry.mtime_ns
         row.size_bytes = entry.size
         row.mtime_ns = entry.mtime_ns
 
+        if verdict.settling:
+            summary.unsettled += 1
+            if row.state in (RecordingState.DISCOVERED, RecordingState.INVALID):
+                # A file that has started moving again is no longer a verdict, whatever it
+                # was before -- a zero-byte segment the camera came back and filled in is
+                # exactly this case.
+                row.state = RecordingState.SETTLING
+                row.error_message = None
+            return
+
+        if verdict.invalid:
+            if row.state is not RecordingState.INVALID or size_changed:
+                self._mark_invalid(row, verdict.reason, now)
+                summary.invalid += 1
+            return
+
+        # Ready. The fast path is a file whose bytes we have already fingerprinted and
+        # whose stat has not moved -- one stat and nothing else, which is what makes a
+        # scan over a large share affordable.
+        #
+        # `fingerprint is None` is what pulls a file out of the settle window, and it is
+        # also what separates the two kinds of invalid. It is withheld while a file is
+        # still moving and cleared when the *scanner* condemns a file, so its absence
+        # means "these bytes have never been read" -- which is true of a segment that was
+        # empty last time and is exactly what should be looked at again now.
+        #
+        # A recording the *pipeline* condemned keeps its fingerprint, so it takes the
+        # cheap path below and stays invalid. Without that distinction every scan would
+        # resurrect a file with no video stream, requeue it, and watch it fail again.
+        #
+        # Without the test at all, a file first seen mid-write and then never touched again
+        # matched on size and mtime forever and was never processed at all.
+        if not size_changed and row.fingerprint is not None:
+            return
+
+        fingerprint = await fingerprint_file(entry.path, sample_bytes)
         if row.fingerprint == fingerprint:
+            # A touched file whose bytes are identical must not re-analyse the recording.
             return
 
         row.fingerprint = fingerprint
@@ -369,6 +420,24 @@ class Scanner:
         row.error_message = None
         row.error_count = 0
         summary.changed += 1
+
+    @staticmethod
+    def _mark_invalid(row: Recording, reason: str | None, now: datetime) -> None:
+        """Record that this file can never be processed, and why.
+
+        The reason is stored where the recordings list already shows it. A user looking at
+        a file that is not being analysed has to be able to see the difference between "we
+        have not got to it" and "there is nothing in it", and the queue has to see the same
+        difference so it stops handing out attempts.
+        """
+        row.state = RecordingState.INVALID
+        row.error_message = reason
+        row.last_error_at = now
+        # Deliberately left unfingerprinted. The fingerprint is what says "these bytes have
+        # been read"; withholding it means a file that later gains content is picked up by
+        # the ordinary changed-content path rather than needing a special case.
+        row.fingerprint = None
+        log.info("recording cannot be processed", file=row.filename, reason=reason)
 
     async def _mark_missing(self, seen: set[str], summary: ScanSummary) -> int:
         """Flag indexed files that are no longer on disk.
@@ -416,7 +485,11 @@ async def queue_unprocessed(session: AsyncSession, limit: int | None = None) -> 
     """Create processing jobs for recordings that need work.
 
     Skips anything that already has a queued or running job, so calling this repeatedly —
-    which the scheduler does — never stacks duplicates.
+    which the scheduler does on every scan — never stacks duplicates.
+
+    ``SETTLING`` and ``INVALID`` recordings are absent from the state filter rather than
+    excluded by a special case: neither is work that is waiting, and a file with no bytes
+    in it must not be handed a processing attempt however many times this runs.
     """
     active = select(ProcessingJob.recording_id).where(
         ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),

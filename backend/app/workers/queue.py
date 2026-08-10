@@ -25,6 +25,15 @@ log = get_logger(__name__)
 #: momentarily unavailable mount, which clear in seconds to minutes.
 _BACKOFF_S = (30, 300, 1800)
 
+#: Backoff for a retry that does not spend an attempt -- see :func:`fail`. Short, because
+#: the thing being waited out is another writer finishing, not a mount coming back.
+_CONTENTION_BACKOFF_S = 20
+
+#: Ceiling on those free retries. Without one, a database that is permanently locked --
+#: an external process holding the file, a full disk -- would requeue the same job every
+#: twenty seconds until the container is restarted, with nothing ever appearing as failed.
+MAX_CONTENTION_RETRIES = 6
+
 _paused = False
 
 
@@ -58,21 +67,43 @@ async def enqueue(
     ``force`` is for explicit user-requested reprocessing, where an existing queued job
     should be superseded rather than silently swallowing the request.
     """
-    if recording_id is not None and not force:
-        existing = (
-            (
-                await session.execute(
-                    select(ProcessingJob).where(
-                        ProcessingJob.recording_id == recording_id,
-                        ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),
+    if recording_id is not None:
+        if not force:
+            existing = (
+                (
+                    await session.execute(
+                        select(ProcessingJob).where(
+                            ProcessingJob.recording_id == recording_id,
+                            ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),
+                        )
                     )
                 )
+                .scalars()
+                .first()
             )
-            .scalars()
-            .first()
-        )
-        if existing is not None:
-            return existing
+            if existing is not None:
+                return existing
+        else:
+            # Supersede, which is what "force" has always meant, rather than stack. Two
+            # presses of "reprocess everything" used to leave two queued jobs per
+            # recording and the whole library decoded twice; a third press, three times.
+            # A job already RUNNING is left alone -- cancelling it would throw away work
+            # in progress, and `claim_next` will not let the replacement start until it
+            # has finished.
+            await session.execute(
+                update(ProcessingJob)
+                .where(
+                    ProcessingJob.recording_id == recording_id,
+                    ProcessingJob.state == JobState.QUEUED,
+                )
+                .values(
+                    state=JobState.CANCELLED,
+                    finished_at=datetime.now(UTC),
+                    worker_id=None,
+                    error_message="superseded by a newer request",
+                )
+                .execution_options(synchronize_session=False)
+            )
 
     settings = get_settings_service()
     job = ProcessingJob(
@@ -113,11 +144,34 @@ async def claim_next(session: AsyncSession, worker_id: str) -> ProcessingJob | N
     #
     # The `state == QUEUED` predicate still does the mutual exclusion: whichever worker
     # lands first flips the row, and the other matches zero rows and asks again.
+    # A second job for a recording that is already running is not runnable yet, whichever
+    # worker gets to it. `enqueue(force=True)` creates exactly that -- a bulk reprocess
+    # queues every recording, including the one a worker is halfway through -- and without
+    # this predicate the other worker claimed it and two runs decoded, deleted and
+    # rewrote the same recording's rows at once. Both then wrote a result, the second over
+    # the first, and whichever delete landed between the other's delete and its inserts
+    # took those inserts with it.
+    #
+    # Expressed as a correlated NOT EXISTS inside the same statement rather than as a
+    # filter applied afterwards, for the same reason the claim itself is one statement:
+    # anything read separately is a snapshot that can be stale by the time the UPDATE runs.
+    busy = ProcessingJob.__table__.alias("busy")
+    already_running = (
+        select(busy.c.id)
+        .where(
+            busy.c.state == JobState.RUNNING,
+            busy.c.recording_id.is_not(None),
+            busy.c.recording_id == ProcessingJob.recording_id,
+        )
+        .exists()
+    )
+
     next_queued = (
         select(ProcessingJob.id)
         .where(
             ProcessingJob.state == JobState.QUEUED,
             (ProcessingJob.not_before.is_(None)) | (ProcessingJob.not_before <= now),
+            ~already_running,
         )
         .order_by(ProcessingJob.priority.asc(), ProcessingJob.queued_at.asc())
         .limit(1)
@@ -224,19 +278,68 @@ async def complete(
 
 
 async def fail(
-    session: AsyncSession, job: ProcessingJob, message: str, *, permanent: bool = False
+    session: AsyncSession,
+    job: ProcessingJob,
+    message: str,
+    *,
+    permanent: bool = False,
+    transient: bool = False,
 ) -> None:
-    """Fail a job, scheduling a retry unless it cannot possibly succeed."""
+    """Fail a job, scheduling a retry unless it cannot possibly succeed.
+
+    ``transient`` marks a failure that was contention rather than a fault in the work --
+    in practice SQLite's write lock held by another writer. Those retries are *free*: the
+    attempt counter is wound back, so a run of collisions cannot add up to a permanently
+    failed recording. Two of the recordings in this library were marked failed after four
+    attempts having never once been given a reason that had anything to do with the
+    footage; each attempt died on the first ``DELETE`` of a stage while the scheduler's
+    journey rebuild held the lock.
+
+    A separate ceiling stops that becoming an unbounded loop -- see
+    ``MAX_CONTENTION_RETRIES``.
+    """
     job.error_message = message[:2000]
     job.finished_at = datetime.now(UTC)
     job.stage_current = None
+    job.worker_id = None
 
-    retriable = not permanent and job.attempts < job.max_attempts
-    if retriable:
-        delay = _BACKOFF_S[min(job.attempts - 1, len(_BACKOFF_S) - 1)]
+    if permanent:
+        job.state = JobState.FAILED
+        # Spending three attempts on a zero-byte file helps nobody.
+        log.info("job failed permanently", job_id=job.id, error=message[:200])
+        await session.flush()
+        return
+
+    if transient:
+        # Refund the attempt. `attempts` is incremented by the claim, so decrementing it
+        # here leaves the counter exactly where it was before this run -- and `result`
+        # carries how many refunds have been granted, so the ceiling is durable across
+        # restarts rather than living in the worker's memory.
+        granted = int((job.result or {}).get("contention_retries", 0)) + 1
+        if granted <= MAX_CONTENTION_RETRIES:
+            job.attempts = max(0, job.attempts - 1)
+            job.state = JobState.QUEUED
+            job.not_before = datetime.now(UTC) + timedelta(seconds=_CONTENTION_BACKOFF_S)
+            job.result = {**(job.result or {}), "contention_retries": granted}
+            log.warning(
+                "the database was busy; requeuing without spending an attempt",
+                job_id=job.id,
+                contention_retries=granted,
+                of=MAX_CONTENTION_RETRIES,
+                retry_in_s=_CONTENTION_BACKOFF_S,
+            )
+            await session.flush()
+            return
+        log.error(
+            "the database has stayed busy across every free retry; failing normally",
+            job_id=job.id,
+            contention_retries=granted,
+        )
+
+    if job.attempts < job.max_attempts:
+        delay = _BACKOFF_S[min(max(0, job.attempts - 1), len(_BACKOFF_S) - 1)]
         job.state = JobState.QUEUED
         job.not_before = datetime.now(UTC) + timedelta(seconds=delay)
-        job.worker_id = None
         log.info(
             "job will retry",
             job_id=job.id,
@@ -246,9 +349,6 @@ async def fail(
         )
     else:
         job.state = JobState.FAILED
-        if permanent:
-            # Spending three attempts on a zero-byte file helps nobody.
-            log.info("job failed permanently", job_id=job.id, error=message[:200])
 
     await session.flush()
 
@@ -283,6 +383,10 @@ async def retry_failed(session: AsyncSession) -> int:
             error_message=None,
             worker_id=None,
             finished_at=None,
+            # Including the free-retry budget the queue grants for database contention:
+            # "retry" from the UI means start again, not resume with whatever allowances
+            # the previous run had already spent.
+            result=None,
         )
         .execution_options(synchronize_session=False)
     )
@@ -306,11 +410,61 @@ async def reclaim_stale(session: AsyncSession) -> int:
             (ProcessingJob.heartbeat_at.is_(None)) | (ProcessingJob.heartbeat_at < cutoff),
         )
         .values(state=JobState.QUEUED, worker_id=None, progress=0.0, stage_current=None)
+        .returning(ProcessingJob.recording_id)
+        .execution_options(synchronize_session=False)
+    )
+    recording_ids = [rid for rid in result.scalars() if rid is not None]
+    count = len(recording_ids)
+    if count:
+        # The recording has to come back with the job. Reclaiming only the job left the
+        # recording stamped PROCESSING, and nothing anywhere puts that right: the queue
+        # would run the job again, but if the job were also lost -- cancelled, pruned, or
+        # never re-created -- the recording sat in PROCESSING forever, invisible to
+        # `queue_unprocessed`, which looks for DISCOVERED and METADATA_EXTRACTED.
+        await session.execute(
+            update(Recording)
+            .where(
+                Recording.id.in_(recording_ids),
+                Recording.state == RecordingState.PROCESSING,
+            )
+            .values(state=RecordingState.QUEUED)
+            .execution_options(synchronize_session=False)
+        )
+        log.warning("reclaimed stale jobs", count=count, timeout_s=timeout)
+    await session.flush()
+    return count
+
+
+async def release_stranded_recordings(session: AsyncSession) -> int:
+    """Un-stick recordings left PROCESSING with no job to finish them.
+
+    A process killed between claiming a job and writing its outcome leaves the pair out of
+    step, and the two halves are healed by different things: the job by ``reclaim_stale``,
+    the recording by nothing at all. So a hard restart during a run stranded that recording
+    permanently -- ``queue_unprocessed`` does not look at PROCESSING, the queue had no job
+    for it, and the only visible symptom was a recording that showed as processing with no
+    worker and never changed again.
+
+    Demoted rather than requeued directly: the state it goes back to is the one the
+    scanner would have left it in, so the ordinary queueing path picks it up and there is
+    no second place that decides what work a recording needs.
+    """
+    active = select(ProcessingJob.recording_id).where(
+        ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),
+        ProcessingJob.recording_id.isnot(None),
+    )
+    result = await session.execute(
+        update(Recording)
+        .where(
+            Recording.state.in_([RecordingState.PROCESSING, RecordingState.QUEUED]),
+            Recording.id.notin_(active),
+        )
+        .values(state=RecordingState.DISCOVERED)
         .execution_options(synchronize_session=False)
     )
     count = int(result.rowcount or 0)
     if count:
-        log.warning("reclaimed stale jobs", count=count, timeout_s=timeout)
+        log.warning("released recordings that were left mid-processing", count=count)
     await session.flush()
     return count
 

@@ -142,13 +142,13 @@ class Scheduler:
     async def _run_scan(self) -> None:
         summary = await self._scanner.scan(trigger="scheduled")
         settings = get_settings_service()
-        # `changed` matters as much as `new`. A file the camera rewrote, or one the settle
-        # window held back last time, is reset to DISCOVERED with its stage states cleared
-        # but is never enqueued by the scan itself. Gating on `new` alone left it demoted
-        # and unprocessed -- showing stale telemetry as if current -- until some unrelated
-        # new file happened to arrive. On a library that has finished importing, that is
-        # never: this one reported `new: 0` on all twenty scans since its initial import.
-        if (summary.new or summary.changed) and await settings.auto_process():
+        # Unconditional, because every attempt to predict when there is nothing to queue
+        # has been wrong. Gating on `new` alone stranded files the camera rewrote; gating
+        # on `new or changed` still strands a file that left the settle window on a scan
+        # where its stat did not move, and a recording whose job was cancelled or lost.
+        # `queue_unprocessed` is one indexed query that normally matches nothing, so the
+        # gate was buying nothing and costing correctness.
+        if await settings.auto_process():
             async with session_scope() as session:
                 summary.queued = await queue_unprocessed(session)
 

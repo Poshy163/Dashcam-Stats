@@ -67,11 +67,17 @@ export function StatTile({
 
 const RECORDING_STATE_STYLE: Record<RecordingState, { label: string; className: string }> = {
   discovered: { label: 'Discovered', className: 'bg-surface-sunken text-content-muted' },
+  // Deliberately neutral rather than a warning colour: a file the camera is still writing
+  // is the system working, not a problem, and the next scan picks it up.
+  settling: { label: 'Still writing', className: 'bg-surface-sunken text-content-muted' },
   metadata_extracted: { label: 'Inspected', className: 'bg-surface-sunken text-content-muted' },
   queued: { label: 'Queued', className: 'bg-accent-muted text-accent' },
   processing: { label: 'Processing', className: 'bg-accent-muted text-state-busy' },
   completed: { label: 'Completed', className: 'bg-state-ok/15 text-state-ok' },
   failed: { label: 'Failed', className: 'bg-state-error/15 text-state-error' },
+  // Distinct from Failed on purpose. Failed will be retried; this will not, and a user
+  // looking at the list has to be able to tell which of the two they are seeing.
+  invalid: { label: 'Unusable file', className: 'bg-state-warn/15 text-state-warn' },
   ignored: { label: 'Ignored', className: 'bg-surface-sunken text-content-faint' },
   deleted: { label: 'Deleted', className: 'bg-surface-sunken text-content-faint' },
 }

@@ -380,6 +380,14 @@ class StatusProcessing(BaseModel):
     pending: int = 0
     processing: int = 0
     failed: int = 0
+    #: Files that can never be processed -- empty, or carrying no video stream. Counted
+    #: separately from `failed` and shown separately, because they used to be counted as
+    #: failures and were then removed from the retry population: without a home of their
+    #: own they would simply disappear from the dashboard, which is the one place an
+    #: operator would look to find out why three files never finish.
+    invalid: int = 0
+    #: On disk but still being written, so not yet work that is waiting.
+    settling: int = 0
     recordings_today: int = 0
     throughput_per_hour: float | None = None
 
