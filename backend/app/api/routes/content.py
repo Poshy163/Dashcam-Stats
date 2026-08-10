@@ -45,6 +45,7 @@ from app.db.models import (
     Vehicle,
 )
 from app.journeys.builder import JourneyBuilder
+from app.journeys.track import single_track
 from app.workers import queue
 
 log = get_logger(__name__)
@@ -319,52 +320,40 @@ async def get_journey(journey_id: RowId, session: SessionDep):
         .all()
     )
 
-    # Ordered by clip, then by offset within it. Never by captured_at.
+    # The drive's path, assembled exactly the way the journey's own distance and start/end
+    # markers are — one position per second, in time order, from whichever camera saw it.
     #
-    # SQLite sorts NULLs first, and a fix whose overlay carried a position but no readable
-    # timestamp has no captured_at — so every one of those was hoisted to the front of the
-    # route and then ordered by offset alone, interleaving clips recorded minutes and
-    # kilometres apart. On this library that was 120 of one journey's 740 fixes, from eight
-    # different recordings, and it turned a 9 km drive into a 200 km scribble of false
-    # chords across the city. Two thirds of the journeys with GPS were drawn that way.
-    #
-    # The camera and the clip are what actually order these points, and both are known.
+    # It used to be its own third answer: front camera only, ordered by clip. That drew
+    # nothing at all for a stretch the front camera could not read, while the distance
+    # counted both cameras and the markers came from a `captured_at` ordering, so the line,
+    # the pins and the number beside them were each describing a different set of rows.
+    # Sharing `single_track` is what stops them disagreeing.
     fixes = (
         await session.execute(
             select(
                 TelemetryPoint.lat,
                 TelemetryPoint.lon,
+                TelemetryPoint.speed_kmh,
                 TelemetryPoint.captured_at,
                 TelemetryPoint.recording_id,
                 TelemetryPoint.t_offset_s,
-            )
-            .join(Recording, TelemetryPoint.recording_id == Recording.id)
-            .outerjoin(Camera, Recording.camera_id == Camera.id)
-            .where(
+            ).where(
                 TelemetryPoint.journey_id == journey_id,
                 TelemetryPoint.has_fix.is_(True),
                 TelemetryPoint.lat.is_not(None),
                 TelemetryPoint.lon.is_not(None),
-                # Front and rear film the same road; drawing both doubles every line.
-                (Camera.role == CameraRole.FRONT) | (Camera.id.is_(None)),
-            )
-            .order_by(
-                Recording.started_at.asc().nullslast(),
-                TelemetryPoint.recording_id.asc(),
-                TelemetryPoint.t_offset_s.asc(),
             )
         )
     ).all()
 
+    starts = {r.id: r.started_at for r in recordings}
+    front_ids = {
+        r.id for r in recordings if r.camera is not None and r.camera.role is CameraRole.FRONT
+    }
+    path = single_track(fixes, starts, front_ids)
+
     tolerance = float(get_settings_service().get_nowait("maps.route_simplify_m"))
-    samples = [
-        (
-            float(row.lat),
-            float(row.lon),
-            row.captured_at.timestamp() if row.captured_at is not None else None,
-        )
-        for row in fixes
-    ]
+    samples = [(float(p.lat), float(p.lon), p.at.timestamp()) for p in path]
     # Segments, not one line: the shared helper breaks the route wherever joining two
     # fixes would draw a road that was never taken. /api/map/routes has always done this;
     # the journey view had its own copy of a simplifier and none of the splitting, so the
@@ -372,10 +361,10 @@ async def get_journey(journey_id: RowId, session: SessionDep):
     route = [
         [
             (
-                round(fixes[i].lat, 6),
-                round(fixes[i].lon, 6),
-                fixes[i].recording_id,
-                round(fixes[i].t_offset_s or 0.0, 2),
+                round(path[i].lat, 6),
+                round(path[i].lon, 6),
+                path[i].recording_id,
+                round(path[i].t_offset_s, 2),
             )
             for i in run
         ]

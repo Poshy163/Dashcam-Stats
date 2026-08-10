@@ -735,6 +735,79 @@ a side effect of some other trigger is not a correction.** It has to be somethin
 asks itself unconditionally, or the one state that stops the trigger firing is the one state
 it was needed for.
 
+## 5.8 One drive, one journey, one path
+
+The Journeys tab showed one Aug 3 drive as **five** journeys — 12:45→13:05 with nineteen
+recordings, then three holding a single recording each, then a pair. It was not
+reprocessing and it was not the front/rear split, which were the two obvious suspects.
+
+Two clips in the middle of that drive had exactly **one** surviving GPS fix each, and that
+fix was a misread. `recordings.start_lat` therefore held a coordinate thousands of
+kilometres away, and the GPS-continuity check cut the drive on both sides of each of them.
+One damaged clip makes two cuts, which is precisely the "three journeys for one drive".
+
+The deeper mistake was what the continuity check believed. It exists for the case where the
+car genuinely moved without recording — parked in a garage, driven onto a ferry, GPS
+reacquired a suburb away — and all of those are journeys the vehicle could have made. A
+latitude that has lost its minus sign is 7,700 km away in under two minutes, which is not a
+journey, it is a bad digit. **A jump that is physically impossible for the elapsed time is
+evidence about the coordinate, not about the drive**, and cutting a drive on it is the worse
+of the two available mistakes.
+
+### The line, the pins and the distance were three different answers
+
+Each consumer of a journey's telemetry coped with the two cameras differently, and no two
+agreed:
+
+| | What it used | What went wrong |
+| --- | --- | --- |
+| Distance | every stored fix | both cameras measured, median **2.05×** the distance the drive can have covered |
+| Drawn route | front camera only, ordered by clip | a stretch the front could not read vanished from the map |
+| Start/end markers | first and last row by `captured_at` | 10 of 59 journeys had a marker >500 m from the end of their own route, worst 4.7 km |
+
+So a journey reported 37.7 km for a 21-minute drive averaging 49 km/h — which is 17.7 km of
+road — drew a line that stopped short of the pin at the end of it, and put the pin somewhere
+neither the line nor the distance agreed with.
+
+`app/journeys/track.py` is the single answer all three now share: **one position per second
+of the drive, in time order, from whichever camera saw it.** The front wins a tie because it
+is the more useful picture; the rear fills any second the front could not read. It is the
+same idea the heat map already relied on — counting distinct seconds rather than rows —
+applied to everything else that describes a journey. Distance on that drive comes to 11.8 km.
+
+Ordering had two wrong answers before this one. By clip puts a whole rear segment after the
+front segment covering the same minutes, so the walk runs to the end of the road and jumps
+back to the start of it. By `captured_at` fails differently, and worse.
+
+### A clock is read glyph by glyph too
+
+`captured_at` comes off the same overlay strip as everything else, so one misread digit
+moves a sample a day out of its own recording. A single fix in this library reads
+`2026-08-08 05:49:20` inside a clip recorded on `2026-08-05` — one wrong day digit — and
+because it then sorted after every other point in its journey it became that journey's end
+marker, 3 km from where the drive actually finished.
+
+Nothing had ever compared a sample's clock against the clip it came from. The recording's
+own start plus the sample's offset is the cross-check, because it owes nothing to the
+glyphs, and where the two disagree by more than the clock could plausibly drift the offset
+wins. Applied both at the source, so new rows are never stored wrong, and in the journey
+builder, so the rows already stored heal without a reprocess.
+
+### What the counts actually count
+
+`journeys.vehicle_count` sums `tracked_objects` rows: one per vehicle, per clip it appears
+in, per camera that saw it. A car followed across two clips and seen by both cameras is
+four. The aggregation is correct — it matches the sum of its recordings exactly — but the
+label said "Vehicles", which promises unique vehicles, and 3,575 of them on a twenty-minute
+drive reads as an error rather than as 3,575 sightings.
+
+Nothing in this pipeline re-identifies a vehicle between clips; the `vehicles` table has no
+writer, which §5 already says. So a unique count is not something the data can answer, and
+the honest fix is the label rather than the number: **vehicle sightings**, and **video
+files** rather than "recordings" for a count where one minute of driving is two files.
+
+---
+
 ### Measured on the live library
 
 | | |

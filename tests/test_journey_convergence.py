@@ -105,16 +105,20 @@ class TestTheRebuildSettles:
     async def _library(self, session, *, split_on_gps: bool = False):
         """Three front/rear pairs, each overlapping the next in time.
 
-        With ``split_on_gps`` the middle pair is genuinely 55 km away -- backed by its own
-        telemetry, so it survives the start-position recompute and clustering separates it
-        for a real reason. That leaves journeys *seconds* apart in time that a rebuild will
-        never join, which is exactly the arrangement a time-only staleness test can never be
-        satisfied by.
+        With ``split_on_gps`` the drive stops for four minutes and resumes 6.7 km away --
+        105 km/h, so a jump the vehicle really could have made, and clustering separates it
+        for a genuine reason. Both halves of that matter: the gap has to stay under the
+        five-minute threshold or it splits on time instead, and the jump has to be
+        physically possible or it is dismissed as a misread coordinate and never splits at
+        all. What is left is journeys a few minutes apart that a rebuild will never join,
+        which is exactly the arrangement a time-only staleness test can never be satisfied
+        by.
         """
         recs = []
         for i in range(3):
-            start = BASE + timedelta(seconds=120 * i)
-            lat = LAT + (0.5 if split_on_gps and i == 1 else 0.0)
+            pause = 240 if split_on_gps and i >= 1 else 0
+            start = BASE + timedelta(seconds=120 * i + pause)
+            lat = LAT + (0.06 if split_on_gps and i >= 1 else 0.0)
             for camera, offset in (("camera_0", 0), ("camera_1", 8)):
                 rec = clip(
                     session, 2 * i + (offset and 1), camera, start + timedelta(seconds=offset)
@@ -210,7 +214,7 @@ class TestTheLibraryHealsWithoutBeingPoked:
         """A damaged clip sitting alone, with its neighbours in a journey of their own."""
         neighbours = Journey(started_at=BASE, ended_at=BASE + timedelta(seconds=240))
         alone = Journey(
-            started_at=BASE + timedelta(seconds=240), ended_at=BASE + timedelta(seconds=360)
+            started_at=BASE + timedelta(seconds=480), ended_at=BASE + timedelta(seconds=600)
         )
         session.add_all([neighbours, alone])
         await session.flush()
@@ -232,11 +236,16 @@ class TestTheLibraryHealsWithoutBeingPoked:
                     )
                 )
 
-        # The damaged one: no telemetry left at all, a frozen bogus start position, and
-        # 110 sightings stamped with a coordinate 11,000 km away.
-        damaged = clip(session, 2, "camera_0", BASE + timedelta(seconds=240))
+        # The damaged one: no telemetry left at all, a frozen start position ~6.7 km from
+        # its neighbours, and 110 sightings stamped with a coordinate 11,000 km away.
+        #
+        # The frozen position has to be somewhere the vehicle could plausibly have reached
+        # in the four minutes since the last clip, or clustering would dismiss it as a
+        # misread and never split the drive in the first place -- and then there would be
+        # no stable-but-wrong grouping for this test to be about.
+        damaged = clip(session, 2, "camera_0", BASE + timedelta(seconds=480))
         damaged.journey_id = alone.id
-        damaged.start_lat, damaged.start_lon = LAT, -8.6845
+        damaged.start_lat, damaged.start_lon = LAT + 0.06, LON
         await session.flush()
         for k in range(110):
             session.add(

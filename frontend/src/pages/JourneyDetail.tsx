@@ -105,8 +105,23 @@ export default function JourneyDetail() {
           hint="while moving"
         />
         <StatTile label="Maximum speed" value={formatSpeed(journey.maxSpeedKmh)} />
-        <StatTile label="Recordings" value={journey.recordingCount} />
-        <StatTile label="Vehicles" value={journey.vehicleCount} />
+        {/*
+          "Video files", not "recordings": a two-minute stretch of driving is two files,
+          one per camera, and calling that 2 recordings reads as two minutes of footage.
+        */}
+        <StatTile label="Video files" value={journey.recordingCount} hint="front and rear" />
+        {/*
+          Sightings, not vehicles. This counts tracked_objects rows: one per vehicle per
+          clip it appears in, per camera that saw it. A car followed across two clips and
+          seen by both cameras is four. Nothing in this pipeline re-identifies a vehicle
+          between clips, so a unique count is not something the data can answer -- and a
+          label promising one would be the lie, not the number.
+        */}
+        <StatTile
+          label="Vehicle sightings"
+          value={journey.vehicleCount}
+          hint="not unique vehicles"
+        />
         <StatTile label="Unique plates" value={journey.uniquePlateCount} />
       </div>
 

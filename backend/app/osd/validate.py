@@ -16,6 +16,7 @@ fix from anyone else's. What is checked is only what is impossible anywhere on E
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime
 
 #: Latitude/longitude below this magnitude are treated as the no-fix placeholder.
 #:
@@ -43,6 +44,42 @@ MAX_PLAUSIBLE_SPEED_KMH = 400.0
 
 #: The same in metres per second, which is the form every caller actually wants.
 MAX_PLAUSIBLE_SPEED_MS = MAX_PLAUSIBLE_SPEED_KMH * 1000.0 / 3600.0
+
+
+#: How far a sample's overlay clock may sit from where its own offset says it should be.
+#:
+#: The clock is read glyph by glyph like everything else, so a single misread digit moves it
+#: by a day, a month or an hour. One fix in the live library reads ``2026-08-08 05:49:20``
+#: inside a recording made on ``2026-08-05`` -- one wrong day digit, three days out. Nothing
+#: compared a sample's time against the clip it came from, so it sorted after every other
+#: point in its journey and became that journey's *end marker*, 3 km from where the drive
+#: actually finished.
+#:
+#: Fifteen minutes matches the tolerance already used to decide whether the overlay clock
+#: may override the filename: generous enough for a camera whose clock drifts, far tighter
+#: than any misread digit can produce.
+MAX_CLOCK_DRIFT_S = 15 * 60
+
+
+def clock_is_plausible(
+    captured_at: datetime | None,
+    expected_at: datetime | None,
+    tolerance_s: float = MAX_CLOCK_DRIFT_S,
+) -> bool:
+    """Could this sample really have been taken when its overlay says it was?
+
+    ``expected_at`` is where the sample sits by construction -- the recording's start plus
+    the sample's own offset -- which is independent of the glyphs and therefore the thing
+    worth checking against. Missing values are not implausible, merely unknown, and are
+    left for the caller to handle.
+    """
+    if captured_at is None or expected_at is None:
+        return True
+    if captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=UTC)
+    if expected_at.tzinfo is None:
+        expected_at = expected_at.replace(tzinfo=UTC)
+    return abs((captured_at - expected_at).total_seconds()) <= tolerance_s
 
 
 def coordinate_problem(lat: object, lon: object) -> str | None:
@@ -115,11 +152,13 @@ def is_plausible_step(distance_m: float, seconds: float) -> bool:
 
 
 __all__ = [
+    "MAX_CLOCK_DRIFT_S",
     "MAX_LATITUDE",
     "MAX_LONGITUDE",
     "MAX_PLAUSIBLE_SPEED_KMH",
     "MAX_PLAUSIBLE_SPEED_MS",
     "NO_FIX_EPSILON",
+    "clock_is_plausible",
     "coordinate_problem",
     "implied_speed_ms",
     "is_no_fix_placeholder",

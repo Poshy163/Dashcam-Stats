@@ -106,8 +106,9 @@ export default function Journeys() {
                 ) : (
                   <span className="text-content-faint">No GPS</span>
                 )}
-                <span>{journey.recordingCount} recordings</span>
-                <span>{journey.vehicleCount} vehicles</span>
+                {/* Files and sightings — see the notes on the journey detail tiles. */}
+                <span>{journey.recordingCount} files</span>
+                <span>{journey.vehicleCount} sightings</span>
                 <span>{journey.uniquePlateCount} plates</span>
               </div>
             </Link>

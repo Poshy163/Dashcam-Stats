@@ -24,6 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
 from app.db.models import (
+    Camera,
+    CameraRole,
     Journey,
     PlateObservation,
     Recording,
@@ -31,6 +33,7 @@ from app.db.models import (
     TrackedObject,
 )
 from app.db.retry import commit_with_retry
+from app.journeys.track import single_track
 from app.osd import haversine_m
 from app.osd.outliers import (
     looks_like_sign_loss,
@@ -38,6 +41,7 @@ from app.osd.outliers import (
     robust_centre,
     spatial_outliers,
 )
+from app.osd.validate import is_plausible_step
 
 log = get_logger(__name__)
 
@@ -492,7 +496,22 @@ class JourneyBuilder:
                     candidate.start_lat,
                     candidate.start_lon,
                 )
-                if jump > max_jump_m:
+                elapsed = (candidate_start - prev_end).total_seconds()
+                # A jump the vehicle could not physically have made is a misread
+                # coordinate, not a new drive -- and cutting the drive there is the worse
+                # of the two mistakes by far.
+                #
+                # This check exists for the case where the car really did move without
+                # recording: parked in a garage, driven onto a ferry, GPS reacquired a
+                # suburb away. All of those are *possible* journeys between the two
+                # points. A latitude that lost its minus sign is 7,700 km away in under
+                # two minutes, which is not a journey, it is a bad digit.
+                #
+                # On the live library two clips with a single misread fix each cut one
+                # Aug 3 drive into five journeys, three of them holding one recording --
+                # and one bad clip cuts twice, before it and after it, which is where the
+                # "three journeys for one drive" came from.
+                if jump > max_jump_m and is_plausible_step(jump, elapsed):
                     return False
         return True
 
@@ -557,24 +576,30 @@ class JourneyBuilder:
                         TelemetryPoint.speed_kmh,
                         TelemetryPoint.captured_at,
                         TelemetryPoint.t_offset_s,
-                    )
-                    .where(
+                    ).where(
                         TelemetryPoint.recording_id.in_(recording_ids),
                         TelemetryPoint.has_fix.is_(True),
-                    )
-                    .order_by(
-                        TelemetryPoint.captured_at.asc().nullslast(),
-                        TelemetryPoint.recording_id.asc(),
-                        TelemetryPoint.t_offset_s.asc(),
                     )
                 )
             ).all()
         )
 
-        # Which of those coordinates cannot belong to this drive at all. Computed here,
-        # applied in the write phase below.
+        front_ids = set(
+            (
+                await session.execute(
+                    select(Recording.id)
+                    .join(Camera, Camera.id == Recording.camera_id)
+                    .where(Recording.id.in_(recording_ids), Camera.role == CameraRole.FRONT)
+                )
+            ).scalars()
+        )
+
+        # Which of those coordinates cannot belong to this drive at all. Computed over
+        # *every* point, so the write phase below clears every copy of a bad one; the
+        # single track assembled next is only for measuring.
         rejected_ids, centre, radius_m = self._find_outliers(points, journey.duration_s)
         good = [p for p in points if p.id not in rejected_ids]
+        track = self._one_track(good, recordings, front_ids)
 
         # Positions copied onto sightings when they were processed are stale the moment a
         # telemetry point behind one is rejected -- and nothing used to go back for them,
@@ -598,8 +623,12 @@ class JourneyBuilder:
         ).one()
 
         # -- derivations, in memory ------------------------------------------------------
+        # Bounds come from every surviving fix, because they only have to contain the drive
+        # and a missing corner would crop the map. Everything else is measured along the
+        # single deduplicated track, in time order.
         located = [p for p in good if p.lat is not None and p.lon is not None]
-        speeds = [float(p.speed_kmh) for p in good if p.speed_kmh is not None]
+        on_track = [p for p in track if p.lat is not None and p.lon is not None]
+        speeds = [float(p.speed_kmh) for p in track if p.speed_kmh is not None]
 
         journey.has_gps = bool(located)
         journey.min_lat = min((p.lat for p in located), default=None)
@@ -608,9 +637,12 @@ class JourneyBuilder:
         journey.max_lon = max((p.lon for p in located), default=None)
         journey.max_speed_kmh = max(speeds, default=None)
 
-        if located:
-            journey.start_lat, journey.start_lon = located[0].lat, located[0].lon
-            journey.end_lat, journey.end_lon = located[-1].lat, located[-1].lon
+        # The first and last position of the drive itself. Null when the journey has no
+        # valid fix at all, which the UI shows as unknown rather than guessing.
+        journey.start_lat = on_track[0].lat if on_track else None
+        journey.start_lon = on_track[0].lon if on_track else None
+        journey.end_lat = on_track[-1].lat if on_track else None
+        journey.end_lon = on_track[-1].lon if on_track else None
 
         # Each recording's own start position, re-derived from the fixes that survived.
         #
@@ -637,7 +669,7 @@ class JourneyBuilder:
             recording.start_lat = point.lat if point else None
             recording.start_lon = point.lon if point else None
 
-        journey.distance_m, journey.avg_speed_kmh = self._measure(good, min_move_m)
+        journey.distance_m, journey.avg_speed_kmh = self._measure(track, min_move_m)
         journey.vehicle_count = int(counts[0] or 0)
         journey.unique_plate_count = int(counts[1] or 0)
 
@@ -679,6 +711,16 @@ class JourneyBuilder:
 
         await session.flush()
         return journey
+
+    @staticmethod
+    def _one_track(points: list, recordings: list[Recording], front_ids: set[int]) -> list:
+        """The drive's path, deduplicated to one position per second. See :mod:`.track`.
+
+        Shared with the API rather than reimplemented there, so the distance, the markers
+        and the line drawn on the map are all measuring the same thing. They were three
+        different populations before, and disagreed accordingly.
+        """
+        return single_track(points, {r.id: as_utc(r.started_at) for r in recordings}, front_ids)
 
     @staticmethod
     def _find_outliers(
@@ -788,7 +830,10 @@ class JourneyBuilder:
         any_point = False
 
         for row in rows:
-            lat, lon, speed, captured = row.lat, row.lon, row.speed_kmh, row.captured_at
+            # `at` rather than the raw overlay clock: it has already been checked against
+            # the recording the sample came from, so a misread digit cannot stretch the
+            # elapsed time the leg ceiling below is measured against.
+            lat, lon, speed, captured = row.lat, row.lon, row.speed_kmh, row.at
             any_point = True
             if speed is not None and speed > 1.0:
                 moving_sum += speed

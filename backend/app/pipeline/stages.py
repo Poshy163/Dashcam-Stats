@@ -67,6 +67,7 @@ from app.osd import (
     Located,
     OsdRegion,
     TelemetryExtractor,
+    clock_is_plausible,
     expected_time_from_filename,
     is_valid_coordinate,
     missing_characters,
@@ -631,12 +632,33 @@ async def stage_telemetry(
     # a row carrying has_fix with a coordinate that is not a place is the shape of defect
     # that then propagates into tracks, observations, journey bounds and the heat map --
     # each of which had grown its own filter for it.
-    dropped = 0
+    dropped = unclocked = 0
     for row in rows:
         if row["has_fix"] and not is_valid_coordinate(row["lat"], row["lon"]):
             row["has_fix"] = False
             row["lat"] = row["lon"] = row["heading_deg"] = None
             dropped += 1
+        # The clock is read glyph by glyph like everything else, so one misread digit moves
+        # a sample days out of its own recording -- and a sample that claims to be three
+        # days after the drive it belongs to sorts last in its journey and becomes that
+        # journey's end marker. The offset is the honest cross-check: it owes nothing to
+        # the glyphs. Only the timestamp is discarded; the position on that line was never
+        # in doubt, which is the same field-independence the parser is built on.
+        expected = (
+            recording.started_at + timedelta(seconds=row["t_offset_s"] or 0.0)
+            if recording.started_at
+            else None
+        )
+        if not clock_is_plausible(row["captured_at"], expected):
+            row["captured_at"] = None
+            unclocked += 1
+    if unclocked:
+        log.warning(
+            "discarded overlay timestamps that disagree with their own recording",
+            recording=recording.filename,
+            discarded=unclocked,
+            of=len(rows),
+        )
     if dropped:
         log.warning(
             "refused to store coordinates that are not a place",
