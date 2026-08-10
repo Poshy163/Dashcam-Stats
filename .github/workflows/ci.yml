@@ -38,8 +38,17 @@ jobs:
 
       # Run from the repo root: the package is under backend/ but the suite is at the
       # root, and ruff.toml at the root covers both.
+      #
+      # The version is printed because it is load-bearing. `ruff format --check` compares
+      # the tree against whatever version is installed, so when this step failed for three
+      # commits running while the same command passed locally, the answer was not in the
+      # diff -- it was that CI had resolved 0.14.14 and the developer had 0.16.2. It is
+      # pinned exactly in requirements-dev.txt now, and tests/test_code_style.py fails if
+      # the two ever drift apart again.
       - name: Ruff
-        run: ruff check backend/app backend/scripts tests
+        run: |
+          ruff --version
+          ruff check backend/app backend/scripts tests
 
       - name: Ruff format check
         run: ruff format --check backend/app backend/scripts tests

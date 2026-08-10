@@ -8,6 +8,12 @@ anyio>=4.6,<5
 # so dependency wiring and middleware are actually covered.
 asgi-lifespan>=2.1,<3
 
-ruff>=0.8,<0.15
+# Pinned exactly, not to a range. A formatter is only useful if everyone runs the same
+# one: `ruff format --check` is a comparison against whatever version happens to be
+# installed, so a range means CI and a developer can both be "correctly formatted" and
+# still disagree. That is not hypothetical -- CI resolved 0.14.14 while the machine the
+# code was written on had 0.16.2, and the two differ over a blank line after a function
+# signature. Three commits went red for a reason no local check could reproduce.
+ruff==0.16.2
 mypy>=1.13,<2
 types-requests

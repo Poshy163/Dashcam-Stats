@@ -343,11 +343,17 @@ class TestProbeIsNotRepeated:
     """
 
     async def test_a_second_probe_of_an_unchanged_file_costs_nothing(self, tmp_path, monkeypatch):
+        import os
 
         from app.hardware import ffmpeg as ffmpeg_module
 
+        # Sized like the clip it claims to be: 60 MB for 60 s is 8 Mbps, which sits inside
+        # the plausible band. At 4 KB it implied 546 bps, so probe() would rightly call the
+        # duration impossible and go off to measure it by decoding -- exercising the
+        # recovery path in a test about caching, and passing for the wrong reason.
         clip = tmp_path / "probe_me.ts"
         clip.write_bytes(b"\x47" * 4096)
+        os.truncate(clip, 60_000_000)
 
         calls = {"count": 0}
 
@@ -384,6 +390,7 @@ class TestProbeIsNotRepeated:
 
         clip = tmp_path / "rewritten.ts"
         clip.write_bytes(b"\x47" * 4096)
+        os.truncate(clip, 60_000_000)
 
         calls = {"count": 0}
 
@@ -406,7 +413,7 @@ class TestProbeIsNotRepeated:
         monkeypatch.setattr(ffmpeg_module, "ffprobe_raw", fake_raw)
 
         await ffmpeg_module.probe(clip)
-        clip.write_bytes(b"\x47" * 8192)
+        os.truncate(clip, 90_000_000)
         # Same-second writes can leave mtime unchanged on a coarse clock; make the change
         # unambiguous so this asserts the invalidation rather than the filesystem.
         os.utime(clip, (0, 0))

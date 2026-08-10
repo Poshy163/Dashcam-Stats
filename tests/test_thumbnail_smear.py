@@ -108,3 +108,66 @@ class TestTheSearchReachesTheGoodFrame:
         offsets = source.split("candidates = [t for t in (")[1].split(")")[0]
         order = [o.strip() for o in offsets.split(",")]
         assert order.index("0.0") <= 1, f"0.0 is not tried early enough: {order}"
+
+
+@pytest.mark.needs_ffmpeg
+class TestAgainstRealDecodedFrames:
+    """The synthetic frames above nearly let a false positive through.
+
+    Counting every flat row wherever it appeared, the project's own fixture clips scored
+    0.10 to 0.18 -- above the threshold -- so ``frame_quality`` returned 0.0 for perfectly
+    good frames and the thumbnail search fell through to whichever offset happened to
+    squeak past. The whole suite still passed, because one offset always did.
+
+    Test-pattern video is about as adversarial as this measurement gets: hard vertical
+    colour bars with no sensor noise, which is exactly the shape the artefact has. Real
+    footage sits three orders of magnitude below the threshold either way, so it could
+    never have shown this. These assertions run against actually decoded frames for that
+    reason.
+    """
+
+    async def test_no_real_frame_is_mistaken_for_a_smear(self, front_clip, rear_clip):
+        from app.hardware.ffmpeg import extract_frame
+
+        checked = 0
+        for clip in (front_clip, rear_clip):
+            for offset in (0.0, 1.0, 2.0, 3.0):
+                frame = await extract_frame(clip, offset)
+                if frame is None:
+                    continue
+                checked += 1
+                score = smear_fraction(frame)
+                assert score < _SMEAR_ROW_FRACTION, (
+                    f"{clip.name} at t={offset} scored {score:.4f} against a threshold of "
+                    f"{_SMEAR_ROW_FRACTION}; a real frame is being thrown away"
+                )
+                assert frame_quality(frame) > 0.0
+        assert checked >= 6, f"only {checked} frames decoded; the fixtures may be missing"
+
+    async def test_a_real_frame_with_its_tail_replicated_is_caught(self, front_clip):
+        """The artefact, built from real decoded pixels rather than a synthetic pattern.
+
+        The replicated row is the most horizontally detailed one in the frame, not an
+        arbitrary one, because the fixture is a test pattern: only 26 of its 1080 rows
+        carry enough detail to look like anything at all, the rest being flat colour bars
+        whose mean horizontal gradient is 0.24. Replicating a flat row downwards produces
+        a flat frame, which is a different artefact that the variance test already
+        catches. The decoder repeats whatever it last decoded, and on real footage that is
+        always scene detail -- which is what makes the smear invisible to variance and
+        needs this check.
+        """
+        from app.hardware.ffmpeg import extract_frame
+
+        frame = await extract_frame(front_clip, 1.0)
+        assert frame is not None
+
+        grey = frame.mean(axis=2)
+        detailed = int(np.argmax(np.abs(np.diff(grey, axis=1)).mean(axis=1)))
+
+        damaged = frame.copy()
+        intact = int(damaged.shape[0] * 0.2)
+        damaged[intact:] = frame[detailed]
+
+        assert smear_fraction(damaged) > _SMEAR_ROW_FRACTION
+        assert frame_quality(damaged) == 0.0
+        assert frame_quality(frame) > 0.0, "the undamaged frame must still be usable"

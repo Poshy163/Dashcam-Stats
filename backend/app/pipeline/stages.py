@@ -126,12 +126,19 @@ _FLAT_FRAME_STDDEV = 12.0
 #: rather than a genuinely green scene. Real foliage never comes close.
 _GREEN_DOMINANCE = 1.6
 
-#: Fraction of rows that may look like a column smear before the frame is rejected.
+#: Fraction of the frame the smear may occupy before the frame is rejected.
 #:
-#: Measured over 185 thumbnails sampled across the whole library plus decoded frames from
-#: the two broken clips: legitimate content peaks at 0.008 and averages 0.0002, while the
-#: smeared frames score 0.88 and 0.57. The threshold sits twelve times above anything real.
+#: Measured both ways. Over 185 thumbnails sampled across the library, legitimate content
+#: peaks at 0.008 while the two broken frames score 0.88 and 0.57. But the synthetic test
+#: fixtures -- hard-edged colour bars with no sensor noise, which is about as adversarial
+#: as this measurement gets -- score 0.10 to 0.18 when every flat row in the frame is
+#: counted, which is why the count below is anchored to the bottom edge instead. Anchored,
+#: the same fixture frames score 0.0000 and the artefact still scores 0.879.
 _SMEAR_ROW_FRACTION = 0.10
+
+#: Non-smeared rows tolerated before the run is considered ended, walking up from the
+#: bottom. A couple of rows at the very edge often survive with real content in them.
+_SMEAR_MAX_GAP = 8
 
 #: A row counts as smeared when it has horizontal detail, almost no vertical difference
 #: from the row below it, and the second is small even relative to the first. All three
@@ -162,6 +169,13 @@ def smear_fraction(frame: np.ndarray) -> float:
     What separates it is direction. A real scene varies both across and down; a smear
     varies only across. Per row this compares the mean absolute difference to the row
     below against the mean absolute difference along the row itself.
+
+    Only rows in an unbroken run reaching the bottom of the frame are counted, because
+    that is what the artefact physically is: the decoder ran out of data and repeated
+    downwards, so the smear always ends at the last row. Counting flat rows wherever they
+    appeared caught the test fixtures instead -- synthetic colour bars with no sensor
+    noise score 0.10 to 0.18 that way, above the threshold, so real frames were being
+    thrown away. Anchored to the bottom the same frames score zero.
     """
     if frame is None or frame.size == 0:
         return 0.0
@@ -183,7 +197,17 @@ def smear_fraction(frame: np.ndarray) -> float:
         return 0.0
 
     smeared = (dx > _SMEAR_MIN_DX) & (dy < _SMEAR_MAX_DY) & (dy < _SMEAR_DY_DX_RATIO * dx)
-    return float(smeared.mean())
+
+    counted = gap = 0
+    for flag in smeared[::-1]:
+        if flag:
+            counted += 1
+            gap = 0
+        else:
+            gap += 1
+            if gap > _SMEAR_MAX_GAP:
+                break
+    return counted / float(smeared.size)
 
 
 def frame_quality(frame: np.ndarray) -> float:
