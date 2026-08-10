@@ -158,6 +158,14 @@ class Scheduler:
             async with session_scope() as session:
                 await JourneyBuilder().rebuild(session)
 
+        # Correct the derived start positions *before* asking whether anything needs
+        # reclustering, because clustering reads them and the staleness check clusters to
+        # decide. Left until the rebuild, they are only ever corrected by a rebuild that a
+        # correct-looking grouping means never happens -- a library grouped consistently
+        # with wrong coordinates is stable, wrong, and has nothing left to disturb it.
+        async with session_scope() as session:
+            await JourneyBuilder().repair_start_positions(session)
+
         # Recluster when the journey boundaries have drifted. Recordings finishing out of
         # chronological order each create their own journey, and on a library that has
         # finished importing the scanner never reports a new file, so nothing above would

@@ -167,9 +167,44 @@ class JourneyBuilder:
         log.info("rebuilt journeys", journeys=created, recordings=len(movable), removed=removed)
         return created
 
+    async def repair_start_positions(self, session: AsyncSession) -> int:
+        """Re-derive every recording's start position, whether or not anything reclusters.
+
+        This has to be self-healing rather than only a step inside ``rebuild``, and the live
+        server proved why within two minutes of the fix being deployed. ``needs_recluster``
+        compares the stored grouping against what clustering would produce, so once the two
+        agree it stops asking -- which is the whole point of it. But a library whose start
+        positions are *wrong* is grouped consistently with those wrong values: 85 journeys,
+        31 holding a single recording, and clustering agreeing with every one of them.
+        Nothing was left to trigger the rebuild that would have corrected the positions, so
+        the fragmentation froze the moment the loop was fixed.
+
+        The fragmentation also hides its own cause. Rejecting an impossible coordinate is
+        journey-scoped, because a whole clip can be sign-flipped and agree with itself -- so
+        a recording marooned in a journey of one has no reference frame, and its sightings
+        keep coordinates nothing is able to see are wrong. That is exactly what stopped
+        migration 0005 clearing recording 268: its journey held one recording with no fixes,
+        so the pass had nothing to judge against and skipped it.
+
+        Correcting the positions first breaks the deadlock. The damaged clips lose their
+        bogus start coordinate, cluster back with their neighbours on time alone, and the
+        ordinary journey refresh then has the neighbours' telemetry to recognise their
+        sightings as impossible.
+        """
+        recordings = list(
+            (
+                await session.execute(
+                    select(Recording).where(
+                        Recording.started_at.isnot(None), Recording.ignored.is_(False)
+                    )
+                )
+            ).scalars()
+        )
+        return await self._refresh_start_positions(session, recordings)
+
     @staticmethod
     async def _refresh_start_positions(session: AsyncSession, recordings: list[Recording]) -> int:
-        """Re-derive each recording's start position from its earliest surviving fix.
+        """Re-derive the given recordings' start positions from their earliest surviving fix.
 
         ``recordings.start_lat`` is written once by the telemetry stage and never revisited,
         so a first fix that was a misread stays frozen there -- and clustering reads it. On

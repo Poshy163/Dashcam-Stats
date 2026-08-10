@@ -705,6 +705,36 @@ rolling back expires every mapped object, so reading `recording.id` afterwards f
 load, and under the async engine that raises `MissingGreenlet`. The id is captured before
 the rollback for that reason.
 
+### Stopping a loop can freeze the thing it was churning
+
+Deploying the above and probing the server two minutes later found the fix incomplete, in a
+way that is worth recording because it is a general hazard.
+
+`needs_recluster` now compares the stored grouping against what clustering would produce,
+so once they agree it stops asking — which is the point. But a library grouped *consistently
+with wrong start positions* satisfies that check: 85 journeys, 31 holding a single
+recording, and clustering agreeing with every one of them. The correction lived inside
+`rebuild`, and nothing was left to trigger a rebuild. The grouping was now stable, and
+stably wrong.
+
+The fragmentation then hides its own cause. Rejecting an impossible coordinate is
+journey-scoped, because a whole clip can be sign-flipped and agree with itself — so a
+recording marooned in a journey of one has no reference frame at all. That is precisely why
+migration 0005 cleared nothing: recording 268's journey held one recording with no fixes, so
+the pass had nothing to judge against and skipped it. The 110 sightings it was written to
+clean were invisible to it.
+
+Correcting the start positions is therefore a *self-healing repair* on the scan, alongside
+`repair_stale` and `repair_durations`, not a step inside the rebuild. Ordered before the
+staleness check, it breaks the deadlock in one pass: the damaged clips lose their bogus
+start coordinate, cluster back with their neighbours on time alone, and the ordinary journey
+refresh then has the neighbours' telemetry to recognise their sightings as impossible.
+
+The general shape, which this codebase keeps rediscovering: **a correction that only runs as
+a side effect of some other trigger is not a correction.** It has to be something the system
+asks itself unconditionally, or the one state that stops the trigger firing is the one state
+it was needed for.
+
 ### Measured on the live library
 
 | | |

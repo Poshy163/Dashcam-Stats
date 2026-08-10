@@ -193,6 +193,152 @@ class TestTheRebuildSettles:
         assert await builder.needs_recluster(db_session) is True
 
 
+class TestTheLibraryHealsWithoutBeingPoked:
+    """Stopping the rebuild loop must not freeze a wrong grouping in place.
+
+    Found on the live server two minutes after the loop fix was deployed. A library grouped
+    *consistently* with wrong start positions satisfies the staleness check, so no rebuild
+    is triggered, so the positions are never corrected -- 85 journeys, 31 of them holding a
+    single recording, permanently stable and permanently wrong.
+
+    And the fragmentation hides its own cause: rejecting an impossible coordinate is
+    journey-scoped, so a recording marooned alone has no reference frame and its sightings
+    keep coordinates nothing can see are wrong.
+    """
+
+    async def _marooned(self, session):
+        """A damaged clip sitting alone, with its neighbours in a journey of their own."""
+        neighbours = Journey(started_at=BASE, ended_at=BASE + timedelta(seconds=240))
+        alone = Journey(
+            started_at=BASE + timedelta(seconds=240), ended_at=BASE + timedelta(seconds=360)
+        )
+        session.add_all([neighbours, alone])
+        await session.flush()
+
+        for i in range(2):
+            rec = clip(session, i, "camera_0", BASE + timedelta(seconds=120 * i))
+            rec.journey_id = neighbours.id
+            rec.start_lat, rec.start_lon = LAT, LON
+            await session.flush()
+            for n in range(5):
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec.id,
+                        t_offset_s=float(n),
+                        captured_at=BASE + timedelta(seconds=120 * i + n),
+                        lat=LAT,
+                        lon=LON,
+                        has_fix=True,
+                    )
+                )
+
+        # The damaged one: no telemetry left at all, a frozen bogus start position, and
+        # 110 sightings stamped with a coordinate 11,000 km away.
+        damaged = clip(session, 2, "camera_0", BASE + timedelta(seconds=240))
+        damaged.journey_id = alone.id
+        damaged.start_lat, damaged.start_lon = LAT, -8.6845
+        await session.flush()
+        for k in range(110):
+            session.add(
+                TrackedObject(
+                    recording_id=damaged.id,
+                    track_key=k,
+                    class_label="car",
+                    confidence_max=0.9,
+                    confidence_avg=0.8,
+                    first_seen_offset_s=float(k),
+                    last_seen_offset_s=float(k) + 1,
+                    duration_s=1.0,
+                    frame_count=3,
+                    lat=LAT,
+                    lon=-8.6845,
+                )
+            )
+        await session.flush()
+        return damaged
+
+    async def test_a_marooned_recording_rejoins_and_its_sightings_are_cleaned(self, db_session):
+        builder = JourneyBuilder()
+        damaged = await self._marooned(db_session)
+
+        # The state the live server was in: everything agrees, nothing asks for a rebuild.
+        assert await builder.needs_recluster(db_session) is False, (
+            "this fixture is meant to reproduce a *stable* wrong grouping; if the staleness "
+            "check already objects, the deadlock below is not being tested"
+        )
+
+        # The scan's self-healing step, which runs whether or not anything looks stale.
+        assert await builder.repair_start_positions(db_session) > 0
+
+        assert await builder.needs_recluster(db_session) is True, (
+            "correcting the start positions should change what clustering wants, which is "
+            "what gets the marooned recording rebuilt back into its drive"
+        )
+        await builder.rebuild(db_session)
+
+        journeys = list((await db_session.execute(select(Journey.id))).scalars())
+        assert len(journeys) == 1, f"the drive did not come back together: {journeys}"
+
+        remaining = list(
+            (
+                await db_session.execute(
+                    select(TrackedObject.lon).where(
+                        TrackedObject.recording_id == damaged.id,
+                        TrackedObject.lon.is_not(None),
+                    )
+                )
+            ).scalars()
+        )
+        assert remaining == [], (
+            f"{len(remaining)} sightings kept an impossible coordinate; rejoining the drive "
+            "is what gives the outlier pass a reference frame to judge them against"
+        )
+
+    async def test_the_repair_is_quiet_once_it_has_nothing_to_do(self, db_session):
+        """It runs on every scan, so a settled library must cost nothing and change nothing."""
+        builder = JourneyBuilder()
+        await self._marooned(db_session)
+        await builder.repair_start_positions(db_session)
+        assert await builder.repair_start_positions(db_session) == 0
+
+    async def test_a_scan_heals_it_without_anything_being_asked_for(self, db_session, app_config):
+        """The wiring, not just the mechanism.
+
+        The repair existing is worth nothing if the scan does not call it -- and the scan is
+        the only thing that runs on a library which has finished importing, reports no new
+        files, and looks internally consistent. Runs the real scan over an empty footage
+        directory, which is exactly that situation.
+        """
+        from app.db.session import session_scope
+        from app.scanner.discovery import Scanner
+        from app.workers.scheduler import Scheduler
+
+        damaged = await self._marooned(db_session)
+        damaged_id = damaged.id
+        await db_session.commit()
+
+        scheduler = Scheduler()
+        scheduler._scanner = Scanner(footage_dir=app_config.footage_dir)
+        await scheduler._run_scan()
+
+        async with session_scope() as session:
+            journeys = list((await session.execute(select(Journey.id))).scalars())
+            stranded = list(
+                (
+                    await session.execute(
+                        select(TrackedObject.lon).where(
+                            TrackedObject.recording_id == damaged_id,
+                            TrackedObject.lon.is_not(None),
+                        )
+                    )
+                ).scalars()
+            )
+        assert len(journeys) == 1, f"the scan left the drive in {len(journeys)} journeys"
+        assert stranded == [], (
+            f"{len(stranded)} sightings kept an impossible coordinate after a full scan"
+        )
+
+
 class TestNoStageStampsAJourneyItCannotSee:
     def test_the_stages_never_write_journey_id(self):
         """A rebuild deletes journeys while a worker is mid-recording, so the worker's
