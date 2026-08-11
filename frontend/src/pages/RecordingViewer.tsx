@@ -83,6 +83,21 @@ function emptyStateFor(stage: StageState, noun: string): string {
   }
 }
 
+function detectionCoverageLabel(stage: StageState): string {
+  switch (stage) {
+    case 'done':
+      return 'Full clip analysed'
+    case 'running':
+      return 'Analysis still running; coverage is incomplete'
+    case 'failed':
+      return 'Analysis failed; coverage may be incomplete'
+    case 'skipped':
+      return 'Object detection was skipped'
+    default:
+      return 'Object detection has not run yet'
+  }
+}
+
 /**
  * What the overlay reader saw, for the frame currently on screen.
  *
@@ -449,33 +464,62 @@ export default function RecordingViewer() {
             {tracks.length === 0 ? (
               <p className="hint">{emptyStateFor(r.detectionState, 'objects detected')}</p>
             ) : (
-              <div className="relative h-14 w-full overflow-hidden rounded bg-surface-sunken">
-                {tracks.map((track) => {
-                  const left = duration ? (track.firstSeenOffsetS / duration) * 100 : 0
-                  const width = duration
-                    ? Math.max(0.8, ((track.lastSeenOffsetS - track.firstSeenOffsetS) / duration) * 100)
-                    : 1
-                  const row = ['car', 'truck', 'bus'].includes(track.classLabel) ? 0 : 1
-                  return (
-                    <button
-                      key={track.id}
-                      className={cn(
-                        'absolute h-4 rounded-sm opacity-80 transition-opacity hover:opacity-100',
-                        CLASS_COLOUR[track.classLabel] ?? 'bg-state-idle',
-                      )}
-                      style={{ left: `${left}%`, width: `${width}%`, top: row === 0 ? 6 : 30 }}
-                      title={`${track.classLabel} · ${formatClock(track.firstSeenOffsetS)}`}
-                      onClick={() => seek(track.firstSeenOffsetS)}
-                      aria-label={`Seek to ${track.classLabel} at ${formatClock(track.firstSeenOffsetS)}`}
-                    />
-                  )
-                })}
-                {duration > 0 && (
+              <div className="space-y-2">
+                <div
+                  className="relative h-16 w-full overflow-hidden rounded bg-surface-sunken"
+                  aria-label="Object activity timeline"
+                >
+                  {tracks.map((track) => {
+                    const left = duration ? (track.firstSeenOffsetS / duration) * 100 : 0
+                    const width = duration
+                      ? Math.max(0.8, ((track.lastSeenOffsetS - track.firstSeenOffsetS) / duration) * 100)
+                      : 1
+                    const row = ['car', 'truck', 'bus'].includes(track.classLabel) ? 0 : 1
+                    return (
+                      <button
+                        key={track.id}
+                        className={cn(
+                          'absolute h-4 rounded-sm opacity-80 transition-opacity hover:opacity-100',
+                          CLASS_COLOUR[track.classLabel] ?? 'bg-state-idle',
+                        )}
+                        style={{ left: `${left}%`, width: `${width}%`, top: row === 0 ? 6 : 30 }}
+                        title={`${track.classLabel} · ${formatClock(track.firstSeenOffsetS)}`}
+                        onClick={() => seek(track.firstSeenOffsetS)}
+                        aria-label={`Seek to ${track.classLabel} at ${formatClock(track.firstSeenOffsetS)}`}
+                      />
+                    )
+                  })}
                   <div
-                    className="pointer-events-none absolute top-0 h-full w-px bg-content"
-                    style={{ left: `${(currentTime / duration) * 100}%` }}
-                  />
-                )}
+                    className="absolute inset-x-1 bottom-1.5 h-1 overflow-hidden rounded-full bg-border"
+                    title={detectionCoverageLabel(r.detectionState)}
+                  >
+                    {r.detectionState === 'done' && <div className="h-full w-full bg-state-ok" />}
+                  </div>
+                  {duration > 0 && (
+                    <div
+                      className="pointer-events-none absolute top-0 h-full w-px bg-content"
+                      style={{ left: `${(currentTime / duration) * 100}%` }}
+                    />
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-content-faint">
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="h-2.5 w-3 rounded-sm bg-state-busy" />
+                    Object activity
+                  </span>
+                  <span className="inline-flex items-center gap-1.5">
+                    <span
+                      className={cn(
+                        'h-1 w-3 rounded-full',
+                        r.detectionState === 'done' ? 'bg-state-ok' : 'bg-border',
+                      )}
+                    />
+                    {detectionCoverageLabel(r.detectionState)}
+                  </span>
+                  {r.detectionState === 'done' && (
+                    <span>Blank areas mean no objects were detected.</span>
+                  )}
+                </div>
               </div>
             )}
           </section>
