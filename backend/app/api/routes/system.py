@@ -9,7 +9,6 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 
-from app.ai.backend import get_backend
 from app.ai.models import describe_models, is_present
 from app.ai.runtime import describe_runtime
 from app.api.deps import PaginationDep, RowIdFilter, SessionDep
@@ -263,7 +262,7 @@ async def get_status(session: SessionDep):
 
     hardware = await detect_hardware_async()
     hardware_dict = hardware.as_dict()
-    hardware_dict["inference"]["backend_name"] = get_backend().backend_name
+    hardware_dict["inference"]["backend_name"] = describe_runtime().get("using")
 
     return StatusOut(
         totals=totals,
@@ -554,7 +553,7 @@ async def list_logs(
 async def system_hardware():
     hardware = await detect_hardware_async()
     data = hardware.as_dict()
-    data["inference"]["backend"] = get_backend().describe()
+    data["inference"]["backend"] = describe_runtime()
     # What actually executes the detection and OCR graphs, which is not the same thing as
     # the OpenVINO devices probed above: those describe the hardware, this describes where
     # inference is really scheduled.

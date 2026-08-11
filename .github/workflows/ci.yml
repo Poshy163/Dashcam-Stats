@@ -120,10 +120,15 @@ jobs:
           docker run --rm --entrypoint python dashcam-analyser:ci -c '
           import onnxruntime as ort
           from onnxruntime.datasets import get_example
+          from app.ai.runtime import onnx_providers
+          from app.hardware.detect import detect_hardware
 
+          # Reproduce application startup order. Importing the standalone OpenVINO runtime
+          # here used to load an ABI-incompatible core before ORT created its first session.
+          detect_hardware()
           session = ort.InferenceSession(
               get_example("mul_1.onnx"),
-              providers=[("OpenVINOExecutionProvider", {"device_type": "CPU"})],
+              providers=list(onnx_providers()),
           )
           assert session.get_providers()[0] == "OpenVINOExecutionProvider", session.get_providers()
           print("OpenVINO execution provider loaded successfully")

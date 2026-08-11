@@ -34,30 +34,33 @@ _CACHE_DIRNAME = "openvino_cache"
 
 
 def _openvino_device() -> str | None:
-    """The best device OpenVINO can actually see, or ``None`` if it cannot see any.
+    """The best OpenVINO EP device inferred from the host, or ``None`` if unavailable.
 
-    Asked of OpenVINO rather than assumed, because the answer depends on whether
-    ``/dev/dri`` was passed into the container and whether the render node is readable by
-    the user the process dropped to. Guessing ``GPU`` where there is none makes session
-    creation fail outright, which would take the whole feature down rather than making it
-    slow.
+    The standalone ``openvino`` Python wheel must not be imported here. It ships a second,
+    ABI-distinct copy of the same native libraries bundled by ``onnxruntime-openvino``;
+    whichever core loads first poisons the other runtime's frontend. Hardware detection
+    already knows whether this is an Intel render node and does not load either copy.
     """
     try:
-        import openvino as ov
+        from app.core.settings_service import get_settings_service
+        from app.hardware.detect import detect_hardware
 
-        devices = list(ov.Core().available_devices)
+        requested = str(get_settings_service().get_nowait("processing.inference_device"))
+        info = detect_hardware()
     except Exception as exc:
-        log.debug("could not probe OpenVINO devices", error=str(exc))
+        log.debug("could not infer OpenVINO device", error=str(exc))
         return None
 
-    # Exact match first, then any enumerated variant such as GPU.0 on a multi-GPU host.
-    for candidate in ("GPU", "NPU"):
-        if candidate in devices:
-            return candidate
-        match = next((d for d in devices if d.startswith(f"{candidate}.")), None)
-        if match:
-            return match
-    return "CPU" if "CPU" in devices else None
+    devices = list(info.openvino_devices)
+    if requested != "auto":
+        if requested in devices:
+            return requested
+        log.warning(
+            "requested inference device is not available; falling back",
+            requested=requested,
+            available=devices,
+        )
+    return info.preferred_inference_device
 
 
 @cache

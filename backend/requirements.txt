@@ -30,13 +30,12 @@ Pillow>=11.0,<12
 # iGPU idled -- visible in intel_gpu_top as a busy Python process and a quiet render
 # engine, and worth roughly thirty-three hours on a 674-recording queue.
 #
-# ``onnxruntime-openvino`` and the standalone ``openvino`` package load the same native
-# OpenVINO libraries into one process. They must be the exact pair from ONNX Runtime's
-# compatibility table: ORT 1.24.1 is built for OpenVINO 2025.4.1. Broad ranges previously
-# allowed ORT 1.23.0 (built for OpenVINO 2025.3) beside OpenVINO 2025.4.1; the provider was
-# listed as available but failed at session creation with an undefined C++ symbol, then
-# silently ran every model on CPU.
-openvino==2025.4.1
+# Do not install the standalone ``openvino`` wheel beside this one. Both distributions
+# ship libraries named ``libopenvino.so.2541``, but they are different builds with different
+# ABIs. Importing standalone OpenVINO for hardware discovery loads its core first; the ORT
+# provider then binds its own frontend to that core, fails on an undefined C++ symbol and
+# silently falls back to CPU. The ORT wheel is the sole owner of OpenVINO native libraries
+# in this process; hardware discovery deliberately avoids importing a second runtime.
 onnxruntime-openvino==1.24.1
 
 # Model weights and their inference code, both MIT. Fetching weights from the projects
