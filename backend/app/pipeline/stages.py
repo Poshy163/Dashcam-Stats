@@ -1623,6 +1623,15 @@ async def stage_summarise(
         or 0
     )
 
+    # Completion is part of the same transaction as the journey refresh. Public derived
+    # views deliberately exclude queued/processing recordings, while JourneyBuilder
+    # excludes invalidated retained memberships. Mark this recording complete before
+    # refreshing so the rebuilt rollup and its visibility become true atomically. A later
+    # failure rolls this transaction back and the orchestrator records the failure instead.
+    recording.processed_at = datetime.now(UTC)
+    recording.state = RecordingState.COMPLETED
+    recording.error_message = None
+
     journey = await JourneyBuilder().assign_recording(session, recording)
 
     # Detections and telemetry are written before the journey is known, so backfill the
@@ -1635,9 +1644,6 @@ async def stage_summarise(
                 .values(journey_id=journey.id)
             )
 
-    recording.processed_at = datetime.now(UTC)
-    recording.state = RecordingState.COMPLETED
-    recording.error_message = None
     return StageResult("summarise", True, stats={"journey_id": journey.id if journey else None})
 
 

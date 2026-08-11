@@ -494,7 +494,11 @@ async def get_journey(journey_id: RowId, session: SessionDep):
             await session.execute(
                 select(Recording)
                 .options(selectinload(Recording.camera))
-                .where(Recording.journey_id == journey_id, Recording.ignored.is_(False))
+                .where(
+                    Recording.journey_id == journey_id,
+                    Recording.ignored.is_(False),
+                    visible_revision(Recording.telemetry_revision),
+                )
                 .order_by(Recording.started_at.asc())
             )
         )

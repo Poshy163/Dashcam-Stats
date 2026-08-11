@@ -63,6 +63,30 @@ _MAX_STEP_M_PER_S = 400.0 * 1000.0 / 3600.0
 _IMPLAUSIBLE_M_PER_S = 200.0 * 1000.0 / 3600.0
 
 
+def _journey_ready_recording():
+    """A recording with no retained stage waiting to be rebuilt."""
+    # Imported lazily because ``app.pipeline.__init__`` imports the stages, which import
+    # this builder. Importing the revision module while the builder itself is initialising
+    # would therefore close a cycle through ``stages -> builder``.
+    from app.pipeline.revisions import INVALIDATED_REVISION
+
+    # Legacy databases predate revision columns and therefore contain NULL here; those
+    # rows remain valid. During current reanalysis, however, every requested stage is
+    # stamped ``invalidated`` until its replacement commits. Requiring every derived
+    # revision to be usable excludes retained membership for both full and partial runs.
+    return and_(
+        *(
+            or_(column.is_(None), column != INVALIDATED_REVISION)
+            for column in (
+                Recording.metadata_revision,
+                Recording.telemetry_revision,
+                Recording.detection_revision,
+                Recording.plate_revision,
+            )
+        )
+    )
+
+
 def as_utc(value: datetime | None) -> datetime | None:
     """Force a datetime to timezone-aware UTC.
 
@@ -105,7 +129,11 @@ class JourneyBuilder:
 
         stmt = (
             select(Recording)
-            .where(Recording.started_at.isnot(None), Recording.ignored.is_(False))
+            .where(
+                Recording.started_at.isnot(None),
+                Recording.ignored.is_(False),
+                _journey_ready_recording(),
+            )
             .order_by(Recording.started_at.asc(), Recording.id.asc())
         )
         if since is not None:
@@ -199,7 +227,9 @@ class JourneyBuilder:
             (
                 await session.execute(
                     select(Recording).where(
-                        Recording.started_at.isnot(None), Recording.ignored.is_(False)
+                        Recording.started_at.isnot(None),
+                        Recording.ignored.is_(False),
+                        _journey_ready_recording(),
                     )
                 )
             ).scalars()
@@ -381,7 +411,11 @@ class JourneyBuilder:
             (
                 await session.execute(
                     select(Recording)
-                    .where(Recording.started_at.isnot(None), Recording.ignored.is_(False))
+                    .where(
+                        Recording.started_at.isnot(None),
+                        Recording.ignored.is_(False),
+                        _journey_ready_recording(),
+                    )
                     .order_by(Recording.started_at.asc(), Recording.id.asc())
                 )
             ).scalars()
@@ -542,7 +576,10 @@ class JourneyBuilder:
             (
                 await session.execute(
                     select(Recording)
-                    .where(Recording.journey_id == journey.id)
+                    .where(
+                        Recording.journey_id == journey.id,
+                        _journey_ready_recording(),
+                    )
                     .order_by(Recording.started_at.asc())
                 )
             ).scalars()

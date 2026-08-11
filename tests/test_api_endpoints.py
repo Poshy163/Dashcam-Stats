@@ -300,6 +300,71 @@ class TestDetailEndpoints:
         assert status["totals"]["journeys"] == 1
         assert status["latest_journey"]["id"] == journey
 
+    async def test_partial_reanalysis_cannot_revive_stale_journey_membership(self, client, journey):
+        """One rebuilt clip must not bring every retained member of its drive back.
+
+        The live failure showed a 44-file, 446-sighting journey after only one recording
+        had finished reanalysis. Old memberships are intentionally retained while queued,
+        so both the visibility gate and the rollup must distinguish retained rows from
+        completed results.
+        """
+        from datetime import timedelta
+
+        from app.db.models import Journey
+        from app.pipeline.revisions import CURRENT_REVISIONS, INVALIDATED_REVISION
+        from app.pipeline.stages import stage_summarise
+
+        async with session_scope() as session:
+            current = (
+                await session.execute(select(Recording).where(Recording.journey_id == journey))
+            ).scalar_one()
+            current.state = RecordingState.PROCESSING
+            current.metadata_revision = CURRENT_REVISIONS["metadata"]
+            current.telemetry_revision = CURRENT_REVISIONS["telemetry"]
+            current.detection_revision = CURRENT_REVISIONS["detection"]
+            current.plate_revision = CURRENT_REVISIONS["plates"]
+            current_id = current.id
+
+            stale = Recording(
+                rel_path="retained-during-reanalysis.ts",
+                filename="retained-during-reanalysis.ts",
+                size_bytes=1024,
+                state=RecordingState.QUEUED,
+                journey_id=journey,
+                started_at=current.started_at + timedelta(minutes=1),
+                ended_at=current.started_at + timedelta(minutes=2),
+                metadata_revision=INVALIDATED_REVISION,
+                telemetry_revision=INVALIDATED_REVISION,
+                detection_revision=INVALIDATED_REVISION,
+                plate_revision=INVALIDATED_REVISION,
+            )
+            session.add(stale)
+            await session.flush()
+            retained_id = stale.id
+
+            old = await session.get(Journey, journey)
+            old.recording_count = 44
+            old.vehicle_count = 446
+
+        assert (await client.get("/api/journeys")).json()["total"] == 0
+
+        async with session_scope() as session:
+            current = (
+                await session.execute(
+                    select(Recording).where(
+                        Recording.journey_id == journey,
+                        Recording.state == RecordingState.PROCESSING,
+                    )
+                )
+            ).scalar_one()
+            await stage_summarise(session, current)
+
+        body = (await client.get(f"/api/journeys/{journey}")).json()
+        assert body["recording_count"] == 1
+        assert body["vehicle_count"] == 0
+        assert [recording["id"] for recording in body["recordings"]] == [current_id]
+        assert retained_id not in {recording["id"] for recording in body["recordings"]}
+
     async def test_recording_detail_and_its_sub_resources_load(self, client, journey):
         listed = (await client.get("/api/recordings")).json()["items"]
         assert listed
