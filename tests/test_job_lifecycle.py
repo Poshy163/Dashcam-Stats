@@ -21,7 +21,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import func, select
 
-from app.db.models import JobState, ProcessingJob, Recording, RecordingState
+from app.db.models import JobState, ProcessingJob, Recording, RecordingState, StageState
 from app.db.session import session_scope
 from app.workers import queue
 
@@ -207,6 +207,68 @@ class TestLegacyContentionFailures:
 
         assert await queue.reconcile_legacy_contention_failures(db_session) == (0, 0)
         assert job.state is JobState.FAILED
+
+
+class TestMisclassifiedProbeCrashes:
+    async def test_legacy_abort_is_unhidden_and_requeued_once(self, db_session):
+        legacy = Recording(
+            rel_path="legacy.ts",
+            filename="legacy.ts",
+            size_bytes=1024,
+            state=RecordingState.INVALID,
+            metadata_state=StageState.FAILED,
+            ignored=True,
+            error_message="ffprobe produced no output for legacy.ts",
+            probe_json={
+                "source_damaged": True,
+                "damaged_policy": {
+                    "action": "hide",
+                    "reason": "ffprobe produced no output for legacy.ts",
+                },
+            },
+        )
+        conclusive = Recording(
+            rel_path="bad.ts",
+            filename="bad.ts",
+            size_bytes=1024,
+            state=RecordingState.INVALID,
+            metadata_state=StageState.FAILED,
+            ignored=True,
+            error_message="ffprobe produced no output for bad.ts",
+            probe_json={
+                "source_damaged": True,
+                "probe_failure": {
+                    "permanent": True,
+                    "returncode": 1,
+                    "stderr": "Invalid data found when processing input",
+                },
+            },
+        )
+        db_session.add_all([legacy, conclusive])
+        await db_session.flush()
+        legacy_job = ProcessingJob(
+            recording_id=legacy.id,
+            state=JobState.FAILED,
+            attempts=1,
+            error_message="ffprobe produced no output for legacy.ts",
+        )
+        db_session.add(legacy_job)
+        await db_session.flush()
+
+        restored = await queue.reconcile_misclassified_probe_crashes(db_session)
+
+        assert restored == 1
+        assert legacy.ignored is False
+        assert legacy.state is RecordingState.QUEUED
+        assert legacy.metadata_state is StageState.PENDING
+        assert legacy.error_message is None
+        assert "damaged_policy" not in legacy.probe_json
+        assert legacy_job.state is JobState.QUEUED
+        assert legacy_job.attempts == 0
+        assert conclusive.ignored is True
+        assert conclusive.state is RecordingState.INVALID
+
+        assert await queue.reconcile_misclassified_probe_crashes(db_session) == 0
 
 
 class TestOneRecordingAtATime:

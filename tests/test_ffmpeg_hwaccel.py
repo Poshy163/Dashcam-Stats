@@ -714,6 +714,60 @@ class TestBoundedProcessCleanup:
         assert process.killed
 
 
+class TestProbeProcessSafety:
+    async def test_ffprobe_processes_are_serialised(self, monkeypatch):
+        import asyncio
+
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        active = 0
+        maximum = 0
+
+        class Process:
+            pid = 789
+            returncode = 0
+
+            async def communicate(self, stdin):
+                nonlocal active, maximum
+                active += 1
+                maximum = max(maximum, active)
+                await asyncio.sleep(0.01)
+                active -= 1
+                return b"{}", b""
+
+        async def create_process(*args, **kwargs):
+            return Process()
+
+        monkeypatch.setattr(ffmpeg_module.asyncio, "create_subprocess_exec", create_process)
+
+        await asyncio.gather(
+            ffmpeg_module._run(["ffprobe", "one.ts"], 1),
+            ffmpeg_module._run(["ffprobe", "two.ts"], 1),
+        )
+
+        assert maximum == 1, "concurrent ffprobe processes can trigger the Intel abort"
+
+    def test_only_source_verdicts_are_permanent(self):
+        from app.hardware.ffmpeg import ProbeError
+        from app.pipeline.stages import _probe_failure_is_permanent
+
+        assert not _probe_failure_is_permanent(
+            ProbeError("ffprobe produced no output", returncode=-6)
+        )
+        assert not _probe_failure_is_permanent(
+            ProbeError("ffprobe produced no output", returncode=1)
+        )
+        assert _probe_failure_is_permanent(ProbeError("clip.ts is empty (0 bytes)"))
+        assert _probe_failure_is_permanent(ProbeError("clip.ts contains no video stream"))
+        assert _probe_failure_is_permanent(
+            ProbeError(
+                "ffprobe produced no output",
+                returncode=1,
+                stderr="Invalid data found when processing input",
+            )
+        )
+
+
 class TestAProvenFileIsNotDemoted:
     """A GPU that decoded this file once can decode it again.
 

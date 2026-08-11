@@ -58,6 +58,7 @@ from app.db.retry import write_with_retry
 from app.hardware.ffmpeg import (
     DecodeError,
     FFmpegError,
+    ProbeError,
     extract_frame,
     iter_frames,
     probe,
@@ -363,6 +364,36 @@ async def _choose_thumbnail(
 # --------------------------------------------------------------------------------------
 
 
+def _probe_failure_is_permanent(exc: FFmpegError) -> bool:
+    """True only when the source itself is proven to be unprocessable.
+
+    A negative return code means ffprobe was killed by a signal. In particular, ``-6`` is
+    SIGABRT, seen when the deployed Intel media stack races during process startup. Empty
+    output from a crashed tool says nothing about the bytes it was meant to inspect.
+    """
+    if exc.returncode is not None and exc.returncode < 0:
+        return False
+
+    message = str(exc).lower()
+    if " is empty (0 bytes)" in message or " contains no video stream" in message:
+        return True
+
+    # A normal ffprobe failure accompanied by one of its conclusive demuxer errors is
+    # evidence about the file. Other failures (timeouts, missing mounts, malformed tool
+    # output, or empty stderr) remain retryable because infrastructure can recover.
+    if isinstance(exc, ProbeError) and (exc.returncode or 0) > 0:
+        stderr = exc.stderr.lower()
+        return any(
+            marker in stderr
+            for marker in (
+                "invalid data found when processing input",
+                "moov atom not found",
+                "could not find codec parameters",
+            )
+        )
+    return False
+
+
 async def stage_inspect(
     session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
 ) -> StageResult:
@@ -382,9 +413,25 @@ async def stage_inspect(
     try:
         info = await probe(path)
     except FFmpegError as exc:
-        # Empty files and files with no video stream will never succeed, however many
-        # times we retry them.
-        raise StageError(str(exc), permanent=True) from exc
+        # Only a verdict about the source is permanent. A killed/aborted probe, timeout,
+        # inaccessible share or broken tool invocation may work on the next attempt and
+        # must never blacklist the recording it happened to be looking at.
+        permanent = _probe_failure_is_permanent(exc)
+        if permanent:
+            # Preserve the evidence separately from the display message. Older releases
+            # stored only "ffprobe produced no output", which made a conclusive demuxer
+            # rejection indistinguishable from SIGABRT during later reconciliation.
+            prior = dict(recording.probe_json) if isinstance(recording.probe_json, dict) else {}
+            prior["probe_failure"] = {
+                "permanent": True,
+                "returncode": exc.returncode,
+                "stderr": exc.stderr[-2000:],
+            }
+            recording.probe_json = prior
+        detail = str(exc)
+        if exc.returncode is not None:
+            detail += f" (ffprobe return code {exc.returncode})"
+        raise StageError(detail, permanent=permanent) from exc
 
     recording.container = info.container
     recording.video_codec = info.video_codec

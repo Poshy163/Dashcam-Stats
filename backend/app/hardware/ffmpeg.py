@@ -103,6 +103,17 @@ _vaapi_decode_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asynci
     weakref.WeakKeyDictionary()
 )
 
+# ffprobe is normally a cheap software-only reader, but the deployment's FFmpeg build
+# aborts inside the Intel media stack when two probes initialise together. An abort has
+# return code -6 and no stderr, which used to make a burst of perfectly valid recordings
+# look corrupt. Metadata inspection is tiny beside decoding, so serialising probe
+# processes costs virtually nothing and keeps that process-level driver race out of the
+# queue. Keep this separate from the VAAPI lock: a probe must not wait behind an entire
+# two-minute decode, only another short probe.
+_ffprobe_process_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+    weakref.WeakKeyDictionary()
+)
+
 
 def _vaapi_decode_lock() -> asyncio.Lock:
     loop = asyncio.get_running_loop()
@@ -110,6 +121,15 @@ def _vaapi_decode_lock() -> asyncio.Lock:
     if lock is None:
         lock = asyncio.Lock()
         _vaapi_decode_locks[loop] = lock
+    return lock
+
+
+def _ffprobe_process_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _ffprobe_process_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ffprobe_process_locks[loop] = lock
     return lock
 
 
@@ -232,7 +252,10 @@ _PROBE_CACHE_MAX = 256
 _probe_failures: dict[
     str, tuple[tuple[int, int] | None, float, type[FFmpegError], str, str, int | None]
 ] = {}
-_PROBE_FAILURE_BACKOFF_S = 60.0
+# Longer than any accidental same-stage repeat, but shorter than the queue's first retry
+# (30 s). A 60-second cache made that first retry replay SIGABRT without launching a new
+# process, spending two of four attempts on one crash.
+_PROBE_FAILURE_BACKOFF_S = 10.0
 
 
 def _probe_identity(p: Path) -> tuple[int, int] | None:
@@ -267,7 +290,7 @@ async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def _run(
+async def _run_process(
     cmd: list[str], timeout: float, stdin: bytes | None = None
 ) -> tuple[int, bytes, bytes]:
     proc = await asyncio.create_subprocess_exec(
@@ -284,6 +307,17 @@ async def _run(
         await _terminate_process(proc)
         raise FFmpegError(f"timed out after {timeout:.0f}s: {' '.join(cmd[:3])}") from None
     return proc.returncode or 0, out, err
+
+
+async def _run(
+    cmd: list[str], timeout: float, stdin: bytes | None = None
+) -> tuple[int, bytes, bytes]:
+    """Run FFmpeg tooling, allowing only one short ffprobe process at a time."""
+    executable = Path(cmd[0]).name.lower() if cmd else ""
+    if executable.startswith("ffprobe"):
+        async with _ffprobe_process_lock():
+            return await _run_process(cmd, timeout, stdin)
+    return await _run_process(cmd, timeout, stdin)
 
 
 async def ffprobe_raw(

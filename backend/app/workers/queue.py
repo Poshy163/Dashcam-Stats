@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_config
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service, local_midnight_utc
-from app.db.models import JobKind, JobState, ProcessingJob, Recording, RecordingState
+from app.db.models import JobKind, JobState, ProcessingJob, Recording, RecordingState, StageState
 
 log = get_logger(__name__)
 
@@ -529,6 +529,98 @@ async def reconcile_legacy_contention_failures(session: AsyncSession) -> tuple[i
         )
     await session.flush()
     return requeued, superseded
+
+
+async def reconcile_misclassified_probe_crashes(session: AsyncSession) -> int:
+    """Restore recordings hidden when an aborted ffprobe was called source damage.
+
+    Releases before the probe classifier was tightened marked every ``FFmpegError`` as
+    permanent. The live Intel/FFmpeg build can exit with SIGABRT and no output, so one
+    driver race blacklisted the recording and made its failed job invisible. Retrying all
+    rows with this exact historical message is safe: a genuinely bad file will be probed
+    again and receive a conclusive permanent verdict, while a valid file continues.
+    """
+    recordings = list(
+        (
+            await session.execute(
+                select(Recording).where(
+                    Recording.state == RecordingState.INVALID,
+                    Recording.file_missing.is_(False),
+                    Recording.error_message.ilike("ffprobe produced no output for %"),
+                )
+            )
+        ).scalars()
+    )
+    if not recordings:
+        return 0
+
+    for recording in recordings:
+        probe = dict(recording.probe_json) if isinstance(recording.probe_json, dict) else {}
+        failure = probe.get("probe_failure")
+        if isinstance(failure, dict) and failure.get("permanent") is True:
+            # A newer release reached a positive source verdict. Its short display error
+            # can match the legacy text, but the stored evidence says not to resurrect it.
+            continue
+        policy = probe.get("damaged_policy")
+        if isinstance(policy, dict):
+            probe.pop("damaged_policy", None)
+        # This flag was added by the automatic hide, not by a successful probe. Preserve
+        # genuine warning evidence should an old row happen to carry any.
+        if not probe.get("source_unusable") and not probe.get("warnings"):
+            probe.pop("source_damaged", None)
+        recording.probe_json = probe
+        recording.ignored = False
+        recording.state = RecordingState.QUEUED
+        recording.metadata_state = StageState.PENDING
+        recording.error_message = None
+
+        failed_job = (
+            (
+                await session.execute(
+                    select(ProcessingJob)
+                    .where(
+                        ProcessingJob.recording_id == recording.id,
+                        ProcessingJob.state == JobState.FAILED,
+                        ProcessingJob.error_message.ilike("ffprobe produced no output for %"),
+                    )
+                    .order_by(ProcessingJob.id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if failed_job is not None:
+            failed_job.state = JobState.QUEUED
+            failed_job.attempts = 0
+            failed_job.progress = 0.0
+            failed_job.stage_current = None
+            failed_job.not_before = None
+            failed_job.error_message = None
+            failed_job.worker_id = None
+            failed_job.started_at = None
+            failed_job.finished_at = None
+            failed_job.result = None
+        else:
+            await enqueue(
+                session,
+                recording.id,
+                kind=JobKind.REPROCESS if recording.processed_at is not None else JobKind.PROCESS,
+                stages=None,
+                priority=200 if recording.processed_at is not None else 100,
+            )
+
+    restored = sum(
+        recording.state is RecordingState.QUEUED and recording.error_message is None
+        for recording in recordings
+    )
+    if restored:
+        log.warning(
+            "restored recordings misclassified after ffprobe aborts",
+            recordings=restored,
+        )
+    await session.flush()
+    return restored
 
 
 async def reclaim_stale(session: AsyncSession) -> int:
