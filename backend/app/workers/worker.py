@@ -98,7 +98,7 @@ class WorkerPool:
         # cleanly; reclaim it before taking new work. Both halves: the job, and the
         # recording that the job was halfway through, which nothing else puts right.
         async with session_scope() as session:
-            await queue.reclaim_stale(session)
+            await queue.reclaim_interrupted(session)
             await queue.release_stranded_recordings(session)
             await queue.reconcile_legacy_contention_failures(session)
             await queue.reconcile_misclassified_probe_crashes(session)
@@ -134,7 +134,7 @@ class WorkerPool:
         # Hand back anything still in flight so the next start picks it up immediately
         # rather than waiting for the heartbeat timeout.
         async with session_scope() as session:
-            await queue.reclaim_stale(session)
+            await queue.reclaim_interrupted(session)
         log.info("worker pool stopped", pool=self._pool_id)
 
     async def _supervise(self) -> None:

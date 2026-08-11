@@ -52,11 +52,17 @@ class TestHiding:
         assert "damaged_policy" not in row.probe_json
 
     async def test_scan_reconciles_known_damaged_rows(self, db_session):
-        await _recording(db_session, "known.ts")
+        row = await _recording(db_session, "known.ts")
 
         summary = await apply_known_damaged_policy(db_session)
 
         assert summary.hidden == 1
+        first_applied_at = row.probe_json["damaged_policy"]["applied_at"]
+
+        unchanged = await apply_known_damaged_policy(db_session)
+
+        assert unchanged.hidden == 0
+        assert row.probe_json["damaged_policy"]["applied_at"] == first_applied_at
 
     async def test_recoverable_transport_warning_is_not_blacklisted(self, db_session):
         row = await _recording(db_session, "playable.ts")

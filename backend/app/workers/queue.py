@@ -664,6 +664,51 @@ async def reclaim_stale(session: AsyncSession) -> int:
     return count
 
 
+async def reclaim_interrupted(session: AsyncSession) -> int:
+    """Immediately return every RUNNING job owned by the previous app process.
+
+    This is called only while the worker pool is starting or after all of its tasks have
+    stopped, so no live worker can own these rows. Waiting for the heartbeat timeout here
+    left freshly claimed jobs looking active for five minutes after a native GPU crash;
+    the replacement process then claimed more work and the Queue page showed four running
+    jobs for two workers.
+    """
+    result = await session.execute(
+        update(ProcessingJob)
+        .where(ProcessingJob.state == JobState.RUNNING)
+        .values(
+            state=JobState.QUEUED,
+            worker_id=None,
+            attempts=func.max(0, ProcessingJob.attempts - 1),
+            progress=0.0,
+            stage_current=None,
+            resource_state=None,
+            not_before=None,
+            started_at=None,
+            heartbeat_at=None,
+            speed_realtime=None,
+            decoder=None,
+            inference_device=None,
+        )
+        .returning(ProcessingJob.recording_id)
+        .execution_options(synchronize_session=False)
+    )
+    recording_ids = [rid for rid in result.scalars() if rid is not None]
+    if recording_ids:
+        await session.execute(
+            update(Recording)
+            .where(
+                Recording.id.in_(recording_ids),
+                Recording.state == RecordingState.PROCESSING,
+            )
+            .values(state=RecordingState.QUEUED)
+            .execution_options(synchronize_session=False)
+        )
+        log.warning("reclaimed jobs interrupted by application restart", count=len(recording_ids))
+    await session.flush()
+    return len(recording_ids)
+
+
 async def release_stranded_recordings(session: AsyncSession) -> int:
     """Un-stick recordings left PROCESSING with no job to finish them.
 

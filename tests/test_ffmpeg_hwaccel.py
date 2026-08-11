@@ -358,6 +358,51 @@ class TestInferenceProviders:
 
         settings.workers = 2
         assert selected_performance_hint() == "THROUGHPUT"
+        assert selected_performance_hint("GPU") == "LATENCY"
+
+    def test_gpu_requests_across_models_are_serialised(self):
+        import concurrent.futures
+        import threading
+        import time
+
+        import numpy as np
+
+        from app.ai.openvino_session import OpenVINOSession, TensorInfo
+
+        active = 0
+        maximum = 0
+        counter_lock = threading.Lock()
+        output_port = object()
+
+        class Request:
+            def infer(self, input_feed):
+                nonlocal active, maximum
+                with counter_lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                time.sleep(0.02)
+                with counter_lock:
+                    active -= 1
+                return {output_port: np.asarray([1])}
+
+        def session():
+            value = object.__new__(OpenVINOSession)
+            value.device = "GPU"
+            value._outputs = (TensorInfo("output", (1,)),)
+            value._output_ports = {"output": output_port}
+            value._request = lambda: Request()
+            return value
+
+        first, second = session(), session()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(item.run, None, {"input": np.asarray([1])})
+                for item in (first, second)
+            ]
+            for future in futures:
+                future.result()
+
+        assert maximum == 1, "separate GPU models submitted concurrently to the Intel driver"
 
     def test_a_missing_device_falls_back_rather_than_failing(self, monkeypatch):
         """Naming a device OpenVINO cannot see fails session creation outright.

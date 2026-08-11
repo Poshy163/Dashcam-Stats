@@ -129,6 +129,13 @@ async def apply_damaged_policy(
     if recording.file_missing:
         return "kept"
     if selected == "hide":
+        probe = _probe(recording)
+        existing = probe.get(_POLICY_KEY)
+        if recording.ignored and isinstance(existing, dict) and existing.get("status") == "hidden":
+            # Reconciliation runs after every scan. Reapplying the same hide inflated the
+            # scan summary, logged the same files and triggered a full journey rebuild on
+            # every interval even though nothing had changed.
+            return "kept"
         _hide(recording, status="hidden")
         log.info("damaged footage hidden", file=recording.filename, reason=_reason(recording))
         return "hidden"

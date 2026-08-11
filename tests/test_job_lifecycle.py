@@ -380,6 +380,26 @@ class TestNothingIsLeftStranded:
         async with session_scope() as session:
             assert (await session.get(Recording, recording_id)).state is RecordingState.QUEUED
 
+    async def test_restart_immediately_reclaims_recent_running_jobs(self, recording_id):
+        async with session_scope() as session:
+            await queue.enqueue(session, recording_id)
+        async with session_scope() as session:
+            job = await queue.claim_next(session, "dead-process")
+            job_id = job.id
+            recording = await session.get(Recording, recording_id)
+            recording.state = RecordingState.PROCESSING
+
+        async with session_scope() as session:
+            assert await queue.reclaim_interrupted(session) == 1
+
+        async with session_scope() as session:
+            job = await session.get(ProcessingJob, job_id)
+            recording = await session.get(Recording, recording_id)
+            assert job.state is JobState.QUEUED
+            assert job.attempts == 0, "an application crash spent a footage retry attempt"
+            assert job.worker_id is None
+            assert recording.state is RecordingState.QUEUED
+
 
 class TestPermanentFailuresLeaveTheQueue:
     async def test_an_unusable_source_marks_the_recording_invalid(self, db_session):

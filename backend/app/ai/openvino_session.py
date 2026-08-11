@@ -29,6 +29,14 @@ _module_patch_lock = threading.RLock()
 _core_lock = threading.Lock()
 _core: Any | None = None
 
+# Alder Lake's iGPU shares memory and execution resources between VAAPI and OpenVINO. The
+# driver advertises multiple infer requests, but two pipeline workers issuing requests
+# through different compiled models produced CL_OUT_OF_RESOURCES / event failures and then
+# aborted the entire process. One GPU request at a time is still substantially faster than
+# CPU inference and lets the second worker overlap decode, telemetry and database work.
+# CPU/NPU sessions remain concurrent.
+_gpu_inference_lock = threading.Lock()
+
 
 @dataclass(frozen=True, slots=True)
 class TensorInfo:
@@ -95,8 +103,13 @@ def selected_device() -> str | None:
     return devices[0]
 
 
-def selected_performance_hint() -> str:
+def selected_performance_hint(device: str | None = None) -> str:
     """Optimise for the configured workload rather than one synthetic request."""
+    # A global single-request lane is intentional on this iGPU. LATENCY asks OpenVINO not
+    # to reserve extra GPU streams behind that lane, reducing both memory pressure and the
+    # chance of a native driver abort.
+    if device and device.upper().startswith("GPU"):
+        return "LATENCY"
     workers = 2
     try:
         from app.core.settings_service import get_settings_service
@@ -151,7 +164,7 @@ class OpenVINOSession:
         model_path = Path(model_path)
         model = core.read_model(str(model_path))
         target = requested
-        performance_hint = selected_performance_hint()
+        performance_hint = selected_performance_hint(target)
         config: dict[str, str] = {"PERFORMANCE_HINT": performance_hint}
         try:
             from app.config import get_config
@@ -175,6 +188,8 @@ class OpenVINOSession:
                 error=f"{type(exc).__name__}: {exc}",
             )
             target = "CPU"
+            performance_hint = selected_performance_hint(target)
+            config["PERFORMANCE_HINT"] = performance_hint
             compiled = core.compile_model(model, target, config)
 
         self.device = target
@@ -226,7 +241,11 @@ class OpenVINOSession:
         output_names: Sequence[str] | None,
         input_feed: dict[str, np.ndarray],
     ) -> list[np.ndarray]:
-        result = self._request().infer(input_feed)
+        if self.device.upper().startswith("GPU"):
+            with _gpu_inference_lock:
+                result = self._request().infer(input_feed)
+        else:
+            result = self._request().infer(input_feed)
         wanted = list(output_names) if output_names else [item.name for item in self._outputs]
         arrays: list[np.ndarray] = []
         for name in wanted:
