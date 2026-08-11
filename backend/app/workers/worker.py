@@ -100,6 +100,7 @@ class WorkerPool:
         async with session_scope() as session:
             await queue.reclaim_stale(session)
             await queue.release_stranded_recordings(session)
+            await queue.reconcile_legacy_contention_failures(session)
 
         self._supervisor = asyncio.create_task(self._supervise(), name="worker-supervisor")
         settings = get_settings_service()

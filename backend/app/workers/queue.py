@@ -406,6 +406,97 @@ async def retry_failed(session: AsyncSession) -> int:
     return int(result.rowcount or 0)
 
 
+async def reconcile_legacy_contention_failures(session: AsyncSession) -> tuple[int, int]:
+    """Retire or requeue lock failures created before contention retries existed.
+
+    Old versions charged ``database is locked`` against the ordinary attempt budget. Those
+    rows remain FAILED forever even after a later bulk re-analysis has superseded them, so
+    the Queue page continues reporting an active fault that was fixed days ago.
+
+    Only rows with no retry metadata are legacy. A current job that exhausts its bounded
+    contention allowance carries ``contention_retries`` in ``result`` and must stay failed;
+    otherwise every container restart would silently defeat that ceiling.
+
+    Returns ``(requeued, superseded)``.
+    """
+    candidates = (
+        (
+            await session.execute(
+                select(ProcessingJob)
+                .where(
+                    ProcessingJob.state == JobState.FAILED,
+                    ProcessingJob.result.is_(None),
+                    ProcessingJob.error_message.ilike("%database is locked%"),
+                )
+                .order_by(ProcessingJob.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    requeued = superseded = 0
+    for job in candidates:
+        recording = (
+            await session.get(Recording, job.recording_id) if job.recording_id is not None else None
+        )
+        newer = None
+        if job.recording_id is not None:
+            newer = (
+                await session.execute(
+                    select(ProcessingJob.id)
+                    .where(
+                        ProcessingJob.recording_id == job.recording_id,
+                        ProcessingJob.id > job.id,
+                        ProcessingJob.state != JobState.CANCELLED,
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+
+        if newer is not None or (recording is not None and recording.ignored):
+            job.state = JobState.CANCELLED
+            job.worker_id = None
+            job.stage_current = None
+            job.error_message = (
+                "superseded by a newer processing job after a historical database lock"
+                if newer is not None
+                else "recording was blacklisted after a historical database lock"
+            )
+            if (
+                recording is not None
+                and recording.error_message
+                and "database is locked" in recording.error_message.lower()
+                and recording.state in (RecordingState.QUEUED, RecordingState.PROCESSING)
+            ):
+                recording.error_message = None
+            superseded += 1
+            continue
+
+        job.state = JobState.QUEUED
+        job.attempts = 0
+        job.progress = 0.0
+        job.stage_current = None
+        job.not_before = None
+        job.error_message = None
+        job.worker_id = None
+        job.started_at = None
+        job.finished_at = None
+        if recording is not None:
+            recording.state = RecordingState.QUEUED
+            recording.error_message = None
+        requeued += 1
+
+    if candidates:
+        log.info(
+            "reconciled historical database lock failures",
+            found=len(candidates),
+            requeued=requeued,
+            superseded=superseded,
+        )
+    await session.flush()
+    return requeued, superseded
+
+
 async def reclaim_stale(session: AsyncSession) -> int:
     """Return jobs whose worker stopped reporting back to the queue.
 

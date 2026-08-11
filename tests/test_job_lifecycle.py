@@ -107,6 +107,88 @@ class TestTransientFailuresDoNotSpendAttempts:
             assert (await session.get(ProcessingJob, job_id)).attempts == 1
 
 
+class TestLegacyContentionFailures:
+    async def test_old_lock_failures_are_reconciled_without_duplicating_new_work(self, db_session):
+        superseded_recording = Recording(
+            rel_path="superseded.ts",
+            filename="superseded.ts",
+            size_bytes=1024,
+            state=RecordingState.QUEUED,
+            error_message="OperationalError: database is locked",
+        )
+        retry_recording = Recording(
+            rel_path="retry.ts",
+            filename="retry.ts",
+            size_bytes=1024,
+            state=RecordingState.FAILED,
+            error_message="OperationalError: database is locked",
+        )
+        ordinary_recording = Recording(
+            rel_path="ordinary.ts",
+            filename="ordinary.ts",
+            size_bytes=1024,
+            state=RecordingState.FAILED,
+        )
+        db_session.add_all([superseded_recording, retry_recording, ordinary_recording])
+        await db_session.flush()
+
+        old_superseded = ProcessingJob(
+            recording_id=superseded_recording.id,
+            state=JobState.FAILED,
+            attempts=4,
+            error_message="OperationalError: database is locked",
+        )
+        old_retry = ProcessingJob(
+            recording_id=retry_recording.id,
+            state=JobState.FAILED,
+            attempts=4,
+            progress=0.7,
+            error_message="OperationalError: database is locked",
+        )
+        ordinary_failure = ProcessingJob(
+            recording_id=ordinary_recording.id,
+            state=JobState.FAILED,
+            attempts=3,
+            error_message="decoder failed",
+        )
+        db_session.add_all([old_superseded, old_retry, ordinary_failure])
+        await db_session.flush()
+        newer = ProcessingJob(
+            recording_id=superseded_recording.id,
+            state=JobState.QUEUED,
+        )
+        db_session.add(newer)
+        await db_session.flush()
+
+        requeued, superseded = await queue.reconcile_legacy_contention_failures(db_session)
+
+        assert (requeued, superseded) == (1, 1)
+        assert old_superseded.state is JobState.CANCELLED
+        assert "superseded" in (old_superseded.error_message or "")
+        assert old_retry.state is JobState.QUEUED
+        assert old_retry.attempts == 0
+        assert old_retry.progress == 0.0
+        assert old_retry.error_message is None
+        assert ordinary_failure.state is JobState.FAILED
+        assert superseded_recording.error_message is None
+        assert retry_recording.state is RecordingState.QUEUED
+
+    async def test_current_bounded_lock_failure_stays_failed(self, db_session):
+        recording_id = await make_recording(db_session, "bounded.ts")
+        job = ProcessingJob(
+            recording_id=recording_id,
+            state=JobState.FAILED,
+            attempts=3,
+            result={"contention_retries": queue.MAX_CONTENTION_RETRIES},
+            error_message="database is locked",
+        )
+        db_session.add(job)
+        await db_session.flush()
+
+        assert await queue.reconcile_legacy_contention_failures(db_session) == (0, 0)
+        assert job.state is JobState.FAILED
+
+
 class TestOneRecordingAtATime:
     async def test_a_second_job_cannot_start_while_the_first_runs(self, recording_id):
         """A bulk reprocess queues everything, including whatever is running right now."""

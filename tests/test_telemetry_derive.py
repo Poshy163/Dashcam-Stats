@@ -105,6 +105,24 @@ class TestTheFirstFixIsNotAutomaticallyTrusted:
         derive(samples)
         assert all(s.has_fix for s in samples), "a legitimate continuous drive was discarded"
 
+    def test_a_lost_southern_minus_is_recovered_from_the_track(self):
+        samples = [
+            sample(0, LAT, LON),
+            sample(1, LAT + 0.0002, LON + 0.0002),
+            # OCR read N::34.8084: legal coordinates, but in the wrong hemisphere.
+            sample(2, 34.8084, LON + 0.0004),
+            sample(3, LAT + 0.0006, LON + 0.0006),
+            sample(4, LAT + 0.0008, LON + 0.0008),
+        ]
+
+        result = derive(samples)
+
+        assert samples[2].has_fix is True
+        assert samples[2].lat == -34.8084
+        assert samples[2].gps_status == "recovered"
+        assert samples[2].gps_source == "context_repaired"
+        assert result.implausible_jumps == 0
+
 
 class TestNonFiniteCoordinatesNeverSurvive:
     def test_a_nan_is_stripped_before_anything_derives_from_it(self):
@@ -288,6 +306,15 @@ class TestConservativeGapRecovery:
         TelemetryExtractor._recover_short_gaps(samples, max_gap_s=3.0)
 
         assert samples[1].has_fix is False
+
+    def test_a_gap_within_the_configured_limit_is_interpolated(self):
+        samples = [sample(0, LAT, LON), sample(5, None, None), sample(10, LAT, LON + 0.001)]
+        samples[1].gps_status = "parse_failed"
+
+        TelemetryExtractor._recover_short_gaps(samples, max_gap_s=15.0)
+
+        assert samples[1].has_fix is True
+        assert samples[1].gps_source == "interpolated"
 
 
 def test_clock_origin_subtracts_the_video_offset():

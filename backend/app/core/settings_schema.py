@@ -422,9 +422,9 @@ SETTINGS: tuple[SettingDef, ...] = (
         "float",
         15.0,
         "telemetry",
-        "When a detection falls between two GPS readings closer together than this, its "
-        "position is interpolated between them, which is more accurate than picking the "
-        "nearer one. Wider gaps are treated as a dropout and left unlocated.",
+        "When overlay OCR misses positions between two trustworthy GPS readings closer "
+        "together than this, route samples and detections are interpolated between them. "
+        "Explicit camera no-fix readings are never filled, and wider gaps stay unlocated.",
         minimum=0.0,
         maximum=300.0,
         unit="seconds",

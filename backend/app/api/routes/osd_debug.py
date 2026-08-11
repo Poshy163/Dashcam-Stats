@@ -20,7 +20,7 @@ from datetime import timedelta
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Response, status
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.api.deps import RowId, SessionDep
 from app.core.logging import get_logger
@@ -28,6 +28,7 @@ from app.core.paths import resolve_footage_path
 from app.core.settings_service import get_settings_service
 from app.db.models import OsdProfile, Recording, TelemetryPoint
 from app.hardware.ffmpeg import extract_frame, probe
+from app.media import ensure_playable
 from app.osd.engine import TelemetryExtractor
 from app.osd.glyphs import binarise, decode_line, segment_glyphs
 from app.osd.parser import parse_osd_text
@@ -74,7 +75,12 @@ async def _read(recording_id: RowId, session, offset_s: float):
     # chosen instant falls outside the window, which depends on where the seek lands. The
     # symptom was a debug view that worked at t=0 and t=10 and returned 422 at t=1 -- on a
     # recording that decodes perfectly.
-    frame = await extract_frame(path, offset_s, hwaccel=hwaccel)
+    # Read the same normalised MP4 timeline as the browser. Seeking the original MPEG-TS
+    # directly is unreliable because its rolling PTS can start above zero or wrap: a debug
+    # request for 1:34 has returned the frame from 1:31, which made correct stored telemetry
+    # look wrong. The cached remux copies every frame and only repairs the container clock.
+    playable = await ensure_playable(path, int(recording.id))
+    frame = await extract_frame(playable.path, offset_s, hwaccel=hwaccel)
     return recording, frame, crop, extractor, info
 
 
@@ -120,8 +126,11 @@ async def osd_debug(
     stored = (
         await session.execute(
             select(TelemetryPoint)
-            .where(TelemetryPoint.recording_id == recording.id)
-            .order_by(func.abs(TelemetryPoint.t_offset_s - t), TelemetryPoint.t_offset_s)
+            .where(
+                TelemetryPoint.recording_id == recording.id,
+                TelemetryPoint.t_offset_s <= t,
+            )
+            .order_by(TelemetryPoint.t_offset_s.desc())
             .limit(1)
         )
     ).scalar_one_or_none()

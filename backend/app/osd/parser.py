@@ -126,6 +126,26 @@ _FIX_LOOSE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+#: A final, labelled fallback for the failure that dominates sunlit rear-camera footage.
+#:
+#: Road texture survives the white-text threshold and touches the overlay's thinnest marks,
+#: so the classifier commonly reads a decimal point as ``:`` or ``k`` and a minus as ``h``::
+#:
+#:     E:138:7013 N:-34:8056
+#:     E:h138.7014 N:-h34.8056
+#:
+#: The field labels and every digit are still present. Requiring ``E`` then ``N``, the
+#: camera's fixed four fraction digits, and a non-digit in the decimal cell is much tighter
+#: than globally replacing punctuation. The ordinary patterns always run first; this only
+#: recovers an otherwise missing pair.
+_LABELLED_DAMAGED_FIX_RE = re.compile(
+    r"E(?P<lonprefix>[^\d]{1,5})(?P<lonwhole>\d{1,3})(?P<lonpoint>[^\d]{1,2})"
+    rf"(?P<lonfrac>\d{{{_COORD_DECIMALS}}}).{{0,6}}?N"
+    r"(?P<latprefix>[^\d]{1,6})(?P<latwhole>\d{1,3})(?P<latpoint>[^\d]{1,2})"
+    rf"(?P<latfrac>\d{{{_COORD_DECIMALS}}})",
+    re.IGNORECASE | re.DOTALL,
+)
+
 #: Speed on its own, anchored on the trailing ``km/h``. That literal is four glyphs at a
 #: fixed place on the line and decodes reliably, which makes it a dependable anchor when
 #: the coordinates in front of it did not survive.
@@ -216,6 +236,32 @@ def _parse_timestamp(groups: dict[str, str], problems: list[str]) -> datetime | 
         return None
 
 
+def _recover_labelled_coordinates(compact: str, start: int) -> dict[str, str | None] | None:
+    """Recover labelled coordinates whose punctuation cells were OCR'd as other glyphs.
+
+    No digit is corrected, inserted or removed here. The only inference is that the one or
+    two non-digits between the whole and fractional parts occupy the camera's decimal cell.
+    That keeps this useful for ``138:7013`` without turning arbitrary numbers in the scene
+    or timestamp into a location.
+    """
+    match = _LABELLED_DAMAGED_FIX_RE.search(compact, start)
+    if match is None:
+        return None
+    found = match.groupdict()
+
+    def number(prefix: str, whole: str, fraction: str) -> str:
+        sign = "-" if "-" in prefix else "+" if "+" in prefix else ""
+        return f"{sign}{whole}.{fraction}"
+
+    return {
+        "lon": number(found["lonprefix"], found["lonwhole"], found["lonfrac"]),
+        "lat": number(found["latprefix"], found["latwhole"], found["latfrac"]),
+        "lonsep": found["lonprefix"],
+        "latsep": found["latprefix"],
+        "speed": None,
+    }
+
+
 def parse_osd_text(
     text: str,
     *,
@@ -250,9 +296,12 @@ def parse_osd_text(
     # shape of a coordinate, and matching that would invent a position from the clock.
     search_from = stamp.end() if stamp else 0
     match = _FIX_RE.search(compact, search_from) or _FIX_LOOSE_RE.search(compact, search_from)
-    groups = match.groupdict() if match else {}
-    if match is None:
+    recovered_groups = None if match else _recover_labelled_coordinates(compact, search_from)
+    groups = match.groupdict() if match else recovered_groups or {}
+    if match is None and recovered_groups is None:
         problems.append("GPS fields unreadable")
+    elif recovered_groups is not None:
+        problems.append("coordinate punctuation recovered from labelled overlay fields")
 
     lat = lon = None
     if groups:

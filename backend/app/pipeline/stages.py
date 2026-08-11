@@ -603,6 +603,7 @@ async def stage_telemetry(
         min_confidence=float(settings.get_nowait("telemetry.min_confidence")),
         max_speed_kmh=float(settings.get_nowait("telemetry.max_speed_kmh")),
         min_move_m=float(settings.get_nowait("telemetry.min_move_metres")),
+        max_recovery_gap_s=float(settings.get_nowait("telemetry.max_interpolation_gap_s")),
         hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
     )
 

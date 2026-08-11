@@ -39,7 +39,12 @@ const CLASS_COLOUR: Record<string, string> = {
   person: 'bg-state-error',
 }
 
-/** Nearest telemetry sample to `t`. Binary search: this runs on every player tick. */
+/** Latest telemetry sample at or before `t`. Binary search: this runs on every player tick.
+ *
+ * The overlay is piecewise constant for a second. Choosing the mathematically nearest row
+ * switches to the next row half a second early, so the telemetry card can say 09:42:57
+ * while the pixels in the player still plainly say 09:42:56.
+ */
 function findPoint(points: TelemetryPoint[], t: number): TelemetryPoint | null {
   if (points.length === 0) return null
   let low = 0
@@ -53,11 +58,7 @@ function findPoint(points: TelemetryPoint[], t: number): TelemetryPoint | null {
       high = mid - 1
     }
   }
-  const before = high >= 0 ? points[high]! : null
-  const after = low < points.length ? points[low]! : null
-  if (!before) return after
-  if (!after) return before
-  return Math.abs(before.tOffsetS - t) <= Math.abs(after.tOffsetS - t) ? before : after
+  return high >= 0 ? points[high]! : points[0]!
 }
 
 /**

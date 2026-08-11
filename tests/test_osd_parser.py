@@ -173,6 +173,20 @@ class TestOcrTolerance:
         assert r.has_fix is True
         assert r.lon == pytest.approx(138.6769)
 
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "2026-07-31 09:41:54 E:138:7013 N:-34:8056 15 km/h",
+            "2026-07-31 09:41:54 E:h138.7013 N:-h34k8056 15 km/h",
+        ],
+    )
+    def test_labelled_coordinates_survive_corrupt_punctuation(self, line):
+        r = parse_osd_text(line)
+        assert r.has_position is True
+        assert r.lon == pytest.approx(138.7013)
+        assert r.lat == pytest.approx(-34.8056)
+        assert r.problems and any("punctuation recovered" in problem for problem in r.problems)
+
     def test_missing_unit_suffix_still_parses(self):
         r = parse_osd_text("2026-08-04 17:44:39 E:138.6769 N:-34.8088 68")
         assert r.speed_kmh == pytest.approx(68.0)

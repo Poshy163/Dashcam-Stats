@@ -38,7 +38,12 @@ from app.osd.glyphs import (
     missing_characters,
 )
 from app.osd.locate import FixSample, FixTrack
-from app.osd.outliers import plausible_radius_m, robust_centre, spatial_outliers
+from app.osd.outliers import (
+    looks_like_sign_loss,
+    plausible_radius_m,
+    robust_centre,
+    spatial_outliers,
+)
 from app.osd.parser import OsdReading, parse_osd_text
 from app.osd.region import OsdRegion, calibrate
 from app.osd.validate import MAX_PLAUSIBLE_SPEED_KMH, MAX_PLAUSIBLE_SPEED_MS, is_valid_coordinate
@@ -546,17 +551,39 @@ class TelemetryExtractor:
 
         centre = robust_centre([p for i, p in enumerate(points) if i not in outliers])
         radius = plausible_radius_m(span_s)
-        rejected = [fixes[i] for i in outliers]
+        repaired: list[TelemetrySample] = []
+        rejected: list[TelemetrySample] = []
+        for index in outliers:
+            sample = fixes[index]
+            point = (float(sample.lat), float(sample.lon))  # type: ignore[arg-type]
+            if centre is not None and looks_like_sign_loss(point, centre, radius):
+                # A southern-hemisphere minus sign is the thinnest glyph in the overlay.
+                # Repair it only when the unmodified coordinate is an outlier and negating
+                # latitude puts it inside the recording's independently established track.
+                sample.lat = -float(sample.lat)  # type: ignore[arg-type]
+                sample.gps_status = "recovered"
+                sample.gps_source = "context_repaired"
+                sample.problems.append("latitude sign recovered from recording consensus")
+                repaired.append(sample)
+            else:
+                rejected.append(sample)
         for sample in rejected:
             TelemetryExtractor._discard(sample)
-        log.warning(
-            "discarded positions the rest of the recording disagrees with",
-            rejected=len(rejected),
-            of=len(fixes),
-            centre_lat=round(centre[0], 4) if centre else None,
-            centre_lon=round(centre[1], 4) if centre else None,
-            radius_km=round(radius / 1000.0, 1),
-        )
+        if repaired:
+            log.info(
+                "recovered latitude signs from recording consensus",
+                repaired=len(repaired),
+                of=len(fixes),
+            )
+        if rejected:
+            log.warning(
+                "discarded positions the rest of the recording disagrees with",
+                rejected=len(rejected),
+                of=len(fixes),
+                centre_lat=round(centre[0], 4) if centre else None,
+                centre_lon=round(centre[1], 4) if centre else None,
+                radius_km=round(radius / 1000.0, 1),
+            )
         return rejected
 
     @staticmethod
