@@ -29,6 +29,7 @@ from app.api.schemas import (
     StatusStorage,
     StatusTotals,
 )
+from app.api.visibility import visible_journey_ids
 from app.config import get_config
 from app.core.logging import get_logger
 from app.core.settings_service import (
@@ -136,7 +137,14 @@ async def get_status(session: SessionDep):
             ).scalar()
             or 0
         ),
-        journeys=int((await session.execute(select(func.count(Journey.id)))).scalar() or 0),
+        journeys=int(
+            (
+                await session.execute(
+                    select(func.count(Journey.id)).where(Journey.id.in_(visible_journey_ids()))
+                )
+            ).scalar()
+            or 0
+        ),
         telemetry_points=int(
             (await session.execute(select(func.count(TelemetryPoint.id)))).scalar() or 0
         ),
@@ -220,7 +228,12 @@ async def get_status(session: SessionDep):
     )
 
     latest = (
-        await session.execute(select(Journey).order_by(Journey.started_at.desc()).limit(1))
+        await session.execute(
+            select(Journey)
+            .where(Journey.id.in_(visible_journey_ids()))
+            .order_by(Journey.started_at.desc())
+            .limit(1)
+        )
     ).scalar_one_or_none()
 
     hardware = await detect_hardware_async()

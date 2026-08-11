@@ -36,6 +36,7 @@ from app.api.schemas import (
     TrackedObjectOut,
     VehicleOut,
 )
+from app.api.visibility import visible_journey_ids
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service, local_zone
 from app.db.models import (
@@ -456,7 +457,7 @@ async def list_journeys(
     has_gps: bool | None = None,
     sort: str = Query("started_desc"),
 ):
-    stmt = select(Journey)
+    stmt = select(Journey).where(Journey.id.in_(visible_journey_ids()))
     if date_from:
         stmt = stmt.where(Journey.started_at >= _day_start(date_from))
     if date_to:
@@ -477,7 +478,14 @@ async def list_journeys(
 
 @router.get("/journeys/{journey_id}", response_model=JourneyDetailOut)
 async def get_journey(journey_id: RowId, session: SessionDep):
-    journey = await session.get(Journey, journey_id)
+    journey = (
+        await session.execute(
+            select(Journey).where(
+                Journey.id == journey_id,
+                Journey.id.in_(visible_journey_ids()),
+            )
+        )
+    ).scalar_one_or_none()
     if journey is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Journey not found")
 
@@ -1231,7 +1239,12 @@ async def search(session: SessionDep, q: str = Query(..., min_length=1)):
 
     # A bare date is the most natural way to look for a drive, so try to read the term as
     # one before falling back to nothing.
-    journey_stmt = select(Journey).order_by(Journey.started_at.desc()).limit(20)
+    journey_stmt = (
+        select(Journey)
+        .where(Journey.id.in_(visible_journey_ids()))
+        .order_by(Journey.started_at.desc())
+        .limit(20)
+    )
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y%m%d"):
         try:
             day = datetime.strptime(term, fmt)

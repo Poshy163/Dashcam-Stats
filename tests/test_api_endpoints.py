@@ -14,7 +14,7 @@ from __future__ import annotations
 from itertools import pairwise
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.db.models import Plate, Recording, RecordingState
 from app.db.session import session_scope
@@ -268,6 +268,37 @@ class TestDetailEndpoints:
                 f"journey {item['id']} is listed but its page returns "
                 f"{response.status_code}: {response.text[:200]}"
             )
+
+    async def test_reanalysis_hides_then_repopulates_the_journey(self, client, journey):
+        """Retained journey rows must not keep the old count visible during a rebuild."""
+        from app.pipeline.revisions import CURRENT_REVISIONS, INVALIDATED_REVISION
+
+        async with session_scope() as session:
+            await session.execute(
+                update(Recording)
+                .where(Recording.journey_id == journey)
+                .values(telemetry_revision=INVALIDATED_REVISION)
+            )
+
+        listing = (await client.get("/api/journeys")).json()
+        status = (await client.get("/api/status")).json()
+        assert listing["total"] == 0
+        assert status["totals"]["journeys"] == 0
+        assert status["latest_journey"] is None
+        assert (await client.get(f"/api/journeys/{journey}")).status_code == 404
+
+        async with session_scope() as session:
+            await session.execute(
+                update(Recording)
+                .where(Recording.journey_id == journey)
+                .values(telemetry_revision=CURRENT_REVISIONS["telemetry"])
+            )
+
+        listing = (await client.get("/api/journeys")).json()
+        status = (await client.get("/api/status")).json()
+        assert listing["total"] == 1
+        assert status["totals"]["journeys"] == 1
+        assert status["latest_journey"]["id"] == journey
 
     async def test_recording_detail_and_its_sub_resources_load(self, client, journey):
         listed = (await client.get("/api/recordings")).json()["items"]
