@@ -1108,8 +1108,12 @@ async def list_jobs(session: SessionDep, page: PaginationDep, state: str | None 
     state_rank = case(
         (ProcessingJob.state == JobState.RUNNING, 0),
         (ProcessingJob.state == JobState.FAILED, 1),
-        (ProcessingJob.state == JobState.QUEUED, 3),
-        else_=2,
+        (ProcessingJob.state == JobState.QUEUED, 2),
+        # Completed and cancelled rows are history. In particular, a second bulk request
+        # can supersede hundreds of queued jobs at once; putting that history before the
+        # replacement queue made the page look as though every job had been cancelled and
+        # nothing was going to run, even while the workers were active above it.
+        else_=3,
     )
     stmt = stmt.order_by(
         state_rank,

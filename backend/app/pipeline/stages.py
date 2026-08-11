@@ -1208,6 +1208,15 @@ class _PlateHit:
     vehicle_crop: np.ndarray | None
 
 
+# Each plate candidate asks FFmpeg for one frame from a half-second window. The general
+# decoder timeout is deliberately fifteen minutes for long sequential reads, but applying
+# it to this tiny random seek lets one damaged GOP monopolise the single shared VAAPI slot
+# for the full fifteen minutes while every other worker waits behind it. Normal live seeks
+# complete in well under a second; fifteen seconds leaves ample SMB/decoder headroom and
+# turns an unreadable candidate into a skipped frame rather than a stopped queue.
+_PLATE_FRAME_SEEK_TIMEOUT_S = 15.0
+
+
 async def stage_plates(
     session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
 ) -> StageResult:
@@ -1283,6 +1292,7 @@ async def stage_plates(
                 fps=None,
                 hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
                 codec=recording.video_codec,
+                timeout=_PLATE_FRAME_SEEK_TIMEOUT_S,
                 on_decoder=decoders_used.add,
             ):
                 frame = decoded

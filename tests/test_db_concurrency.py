@@ -422,6 +422,7 @@ class TestPlateStageWriteLock:
         async def fake_iter_frames(path, **kwargs):
             """Stands in for the decode: the expensive, non-database part of the loop."""
             seen_tracks["count"] += 1
+            observed.setdefault("decode_timeouts", []).append(kwargs.get("timeout"))
             if seen_tracks["count"] == 1:
                 # Mid-loop, exactly where the 150 seconds of real work happen.
                 try:
@@ -450,6 +451,10 @@ class TestPlateStageWriteLock:
 
         assert result.ok, result.detail
         assert seen_tracks["count"] == 3, "the loop did not run over every track"
+        assert observed["decode_timeouts"] == [stages._PLATE_FRAME_SEEK_TIMEOUT_S] * 3, (
+            "a half-second plate seek inherited the fifteen-minute full-decode timeout; "
+            "one bad GOP can hold VAAPI and stop every worker behind it"
+        )
         assert observed.get("wrote"), (
             "a second session could not write while the plates stage was reading tracks: "
             "the stage is holding the write lock across its whole loop. "

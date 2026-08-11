@@ -63,6 +63,18 @@ class TestTheRunningJobIsReachable:
                     queued_at=base + timedelta(seconds=10 + i),
                 )
             )
+            # A repeated bulk request creates exactly this shape: one replacement queued
+            # job plus one cancelled predecessor per recording. The predecessors are
+            # newer history, but must not crowd the active queue off the first page.
+            db_session.add(
+                ProcessingJob(
+                    recording_id=recording.id,
+                    state=JobState.CANCELLED,
+                    queued_at=base + timedelta(seconds=500 + i),
+                    finished_at=base + timedelta(seconds=500 + i),
+                    error_message="superseded by a newer request",
+                )
+            )
         await db_session.flush()
         await db_session.commit()
         return running.id
@@ -77,6 +89,9 @@ class TestTheRunningJobIsReachable:
             "renders nothing while the Running tile says otherwise"
         )
         assert ids[0] == backlog, "in-flight work should lead the list"
+        assert {item["state"] for item in body["items"][1:]} == {"queued"}, (
+            "cancelled bulk-request history crowded the real pending work off page 1"
+        )
 
     async def test_the_rest_of_the_history_can_be_paged_to(self, client, backlog):
         first = (await client.get("/api/jobs", params={"page_size": 50})).json()
