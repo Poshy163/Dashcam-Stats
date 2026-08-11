@@ -21,6 +21,7 @@ import contextlib
 import json
 import math
 import shutil
+import weakref
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -91,6 +92,26 @@ _HWACCEL_REFUSED_MAX = 512
 #: demoted an entire recording to software decoding partway through.
 _hwaccel_proven: set[str] = set()
 _HWACCEL_PROVEN_MAX = 512
+
+# The Intel media driver on the deployment accepts one long-running VAAPI reader beside
+# OpenVINO, but a second reader fails during initialisation with ``HW busy``. Two pipeline
+# workers used to race here: one kept the iGPU and the other permanently condemned its file
+# to software decoding, pinning the CPU for every remaining stage. Coordinate VAAPI at the
+# process boundary instead. Locks are per event loop so isolated asyncio test loops never
+# inherit a lock bound by an earlier test.
+_vaapi_decode_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _vaapi_decode_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _vaapi_decode_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _vaapi_decode_locks[loop] = lock
+    return lock
+
 
 DEFAULT_PROBE_TIMEOUT = 60.0
 DEFAULT_DECODE_TIMEOUT = 900.0
@@ -776,12 +797,23 @@ async def iter_frames(
     for attempt in range(3):
         yielded = 0
         try:
-            async for item in _decode_frames(path, hwaccel=hwaccel, **kwargs):
-                yielded += 1
-                if yielded == 1 and label != "software":
-                    # This file and this GPU demonstrably work together. Remember it.
-                    _remember_hwaccel_success(path)
-                yield item
+            guard = _vaapi_decode_lock() if label == "vaapi" else contextlib.nullcontext()
+            if label == "vaapi" and guard.locked():
+                log.info(
+                    "waiting for the shared VAAPI decoder",
+                    file=Path(path).name,
+                    decoder=label,
+                )
+            # Keep the slot for the life of ffmpeg, not merely process startup. On this
+            # Intel driver a second session can initialise only after the first reader has
+            # closed; releasing after its first frame still sends the other worker to CPU.
+            async with guard:
+                async for item in _decode_frames(path, hwaccel=hwaccel, **kwargs):
+                    yielded += 1
+                    if yielded == 1 and label != "software":
+                        # This file and this GPU demonstrably work together. Remember it.
+                        _remember_hwaccel_success(path)
+                    yield item
             return
         except FFmpegError as exc:
             # Retrying is only safe before anything reached the caller; mid-stream the
@@ -806,6 +838,7 @@ async def iter_frames(
             break
 
     assert failure is not None
+    transient_failure = _is_transient_hwaccel_failure(failure)
     if str(path) in _hwaccel_proven:
         # A short seek may fail inside a damaged GOP even after a successful full-file
         # hardware pass. Fall back for this window only; do not condemn the whole file.
@@ -817,10 +850,22 @@ async def iter_frames(
             start=kwargs.get("start"),
             duration=kwargs.get("duration"),
         )
-    else:
+    elif not transient_failure:
         _remember_hwaccel_failure(path)
         log.warning(
             "hardware decode failed; using software for this file from now on",
+            file=Path(path).name,
+            decoder=label,
+            error=str(failure),
+            returncode=getattr(failure, "returncode", None),
+            stderr=(getattr(failure, "stderr", "") or "")[-400:],
+        )
+    else:
+        # A busy device says nothing about this file. Falling back keeps the current stage
+        # moving, but the next stage should try the iGPU again once the contending reader
+        # has finished instead of inheriting a permanent software-only verdict.
+        log.warning(
+            "hardware decoder remained busy; using software for this stage",
             file=Path(path).name,
             decoder=label,
             error=str(failure),

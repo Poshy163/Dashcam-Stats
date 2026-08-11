@@ -127,6 +127,98 @@ class TestDecodeFallback:
         assert reported == ["vaapi"]
         assert "busy.ts" not in ffmpeg_module._hwaccel_refused
 
+    async def test_concurrent_vaapi_readers_wait_for_one_shared_slot(self, monkeypatch):
+        """A second worker waits instead of turning a temporary Intel limit into CPU load."""
+        import asyncio
+        import weakref
+
+        import numpy as np
+
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_refused", set())
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_proven", set())
+        monkeypatch.setattr(ffmpeg_module, "_vaapi_decode_locks", weakref.WeakKeyDictionary())
+        monkeypatch.setattr(
+            ffmpeg_module, "select_hwaccel", lambda *a, **k: (["-hwaccel", "vaapi"], "vaapi")
+        )
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        starts: list[str] = []
+        active = 0
+        most_active = 0
+
+        async def decode(path, **kwargs):
+            nonlocal active, most_active
+            assert kwargs.get("hwaccel") == "auto"
+            starts.append(str(path))
+            active += 1
+            most_active = max(most_active, active)
+            try:
+                if str(path) == "front.ts":
+                    first_started.set()
+                    await release_first.wait()
+                yield 0.0, np.zeros((4, 4, 3), dtype=np.uint8)
+            finally:
+                active -= 1
+
+        monkeypatch.setattr(ffmpeg_module, "_decode_frames", decode)
+
+        async def consume(path):
+            return [frame async for frame in ffmpeg_module.iter_frames(path)]
+
+        front = asyncio.create_task(consume("front.ts"))
+        await first_started.wait()
+        rear = asyncio.create_task(consume("rear.ts"))
+        await asyncio.sleep(0)
+
+        assert starts == ["front.ts"], "the rear worker entered VAAPI while front held it"
+        release_first.set()
+        front_frames, rear_frames = await asyncio.gather(front, rear)
+
+        assert front_frames and rear_frames
+        assert starts == ["front.ts", "rear.ts"]
+        assert most_active == 1
+
+    async def test_persistent_busy_fallback_is_not_remembered_as_a_bad_file(self, monkeypatch):
+        import weakref
+
+        import numpy as np
+
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_refused", set())
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_proven", set())
+        monkeypatch.setattr(ffmpeg_module, "_vaapi_decode_locks", weakref.WeakKeyDictionary())
+        monkeypatch.setattr(
+            ffmpeg_module, "select_hwaccel", lambda *a, **k: (["-hwaccel", "vaapi"], "vaapi")
+        )
+
+        attempts: list[str | None] = []
+
+        async def decode(path, **kwargs):
+            attempts.append(kwargs.get("hwaccel"))
+            if kwargs.get("hwaccel") != "cpu":
+                raise ffmpeg_module.DecodeError(
+                    "decoder busy",
+                    stderr="hwaccel initialisation returned error",
+                    returncode=1,
+                )
+            yield 0.0, np.zeros((4, 4, 3), dtype=np.uint8)
+
+        async def no_wait(_delay):
+            return None
+
+        monkeypatch.setattr(ffmpeg_module, "_decode_frames", decode)
+        monkeypatch.setattr(ffmpeg_module.asyncio, "sleep", no_wait)
+
+        frames = [frame async for frame in ffmpeg_module.iter_frames("busy.ts")]
+
+        assert frames
+        assert attempts == ["auto", "auto", "auto", "cpu"]
+        assert "busy.ts" not in ffmpeg_module._hwaccel_refused
+
     async def test_permanent_failure_reports_the_software_fallback(self, monkeypatch):
         import numpy as np
 
