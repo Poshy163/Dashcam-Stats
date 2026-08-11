@@ -27,6 +27,9 @@ services:
     environment:
       - TZ=Australia/Adelaide
       # - DASHCAM_LOG_LEVEL=INFO
+      # Optional browser/API password. Enable both and place the app behind TLS.
+      # - DASHCAM_AUTH_USERNAME=dashcam
+      # - DASHCAM_AUTH_PASSWORD=change-me
 
 volumes:
   dashcam-data:

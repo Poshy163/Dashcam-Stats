@@ -219,6 +219,7 @@ async def heartbeat(
     speed: float | None = None,
     decoder: str | None = None,
     device: str | None = None,
+    resource: str | None = None,
 ) -> JobState | None:
     """Publish progress, and report the job's state back to the caller.
 
@@ -236,6 +237,8 @@ async def heartbeat(
         values["decoder"] = decoder
     if device is not None:
         values["inference_device"] = device
+    if resource is not None:
+        values["resource_state"] = resource
 
     await session.execute(
         update(ProcessingJob)
@@ -273,6 +276,7 @@ async def complete(
     job.stage_current = None
     job.result = result
     job.error_message = None
+    job.resource_state = None
     if speed is not None:
         job.speed_realtime = speed
     if decoder is not None:
@@ -604,6 +608,34 @@ async def stats(session: AsyncSession) -> dict[str, object]:
         or 0
     )
 
+    recent = (
+        await session.execute(
+            select(ProcessingJob.started_at, ProcessingJob.finished_at)
+            .where(
+                ProcessingJob.state == JobState.COMPLETED,
+                ProcessingJob.started_at.is_not(None),
+                ProcessingJob.finished_at.is_not(None),
+                ProcessingJob.finished_at >= datetime.now(UTC) - timedelta(hours=24),
+                ProcessingJob.recording_id.is_not(None),
+            )
+            .order_by(ProcessingJob.finished_at.desc())
+            .limit(100)
+        )
+    ).all()
+    durations = [
+        (finished - started).total_seconds()
+        for started, finished in recent
+        if started is not None and finished is not None and finished > started
+    ]
+    throughput = None
+    eta_minutes = None
+    if durations:
+        average_s = sum(durations) / len(durations)
+        workers = int(get_settings_service().get_nowait("processing.max_workers"))
+        throughput = round(workers * 3600.0 / average_s, 1)
+        if throughput > 0:
+            eta_minutes = round((counts.get("queued", 0) / throughput) * 60.0, 1)
+
     return {
         "queued": counts.get("queued", 0),
         "running": counts.get("running", 0),
@@ -612,4 +644,6 @@ async def stats(session: AsyncSession) -> dict[str, object]:
         "cancelled": counts.get("cancelled", 0),
         "completed_today": completed_today,
         "paused": _paused,
+        "throughput_per_hour": throughput,
+        "estimated_minutes_remaining": eta_minutes,
     }

@@ -13,11 +13,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
-from app.db.models import Recording, RecordingState, StageState
+from app.db.models import Journey, Recording, RecordingState, StageState
 from app.db.retry import commit_with_retry, is_locked_error
+from app.pipeline.revisions import CURRENT_REVISIONS, INVALIDATED_REVISION, REVISION_FIELDS
 from app.pipeline.stages import STAGE_ORDER, STAGES, StageError, StageResult
 
 log = get_logger(__name__)
@@ -149,6 +151,74 @@ def pending_stages(recording: Recording) -> tuple[str, ...]:
     return tuple(name for name in STAGE_ORDER if name in needed)
 
 
+async def invalidate_recordings(
+    session: AsyncSession, recording_ids: list[int], stages: list[str] | None
+) -> tuple[str, ...]:
+    """Hide stale derived output as soon as reanalysis is queued.
+
+    Rows are retained until their stage replaces them, but stage-aware APIs stop serving
+    them. This gives bulk reanalysis one clean reset followed by incremental repopulation
+    without a destructive library-wide delete or a long SQLite write lock.
+    """
+    selected = expand_stages(stages)
+    values: dict[str, object] = {}
+    for name in selected:
+        field = _STAGE_FIELDS.get(name)
+        if field:
+            values[field] = StageState.PENDING
+            values[REVISION_FIELDS[name]] = INVALIDATED_REVISION
+    if "telemetry" in selected:
+        values.update(
+            has_gps=False,
+            gps_point_count=0,
+            telemetry_point_count=0,
+            distance_m=None,
+            avg_speed_kmh=None,
+            max_speed_kmh=None,
+            start_lat=None,
+            start_lon=None,
+            gps_gap_count=0,
+            gps_longest_gap_s=0.0,
+            gps_recovered_count=0,
+            gps_no_fix_count=0,
+            gps_ocr_gap_count=0,
+            gps_rejected_count=0,
+            telemetry_problem_count=0,
+        )
+    if "detection" in selected:
+        values["vehicle_count"] = 0
+    if "plates" in selected:
+        values["plate_count"] = 0
+    if recording_ids and values:
+        await session.execute(
+            update(Recording)
+            .where(Recording.id.in_(recording_ids))
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        await session.flush()
+        if "telemetry" in selected:
+            journey_ids = select(Recording.journey_id).where(
+                Recording.id.in_(recording_ids), Recording.journey_id.is_not(None)
+            )
+            await session.execute(
+                update(Journey)
+                .where(Journey.id.in_(journey_ids))
+                .values(
+                    has_gps=False,
+                    distance_m=None,
+                    avg_speed_kmh=None,
+                    max_speed_kmh=None,
+                    start_lat=None,
+                    start_lon=None,
+                    end_lat=None,
+                    end_lon=None,
+                )
+                .execution_options(synchronize_session=False)
+            )
+    return selected
+
+
 async def _revive(session: AsyncSession, recording_id: int) -> Recording | None:
     """Get the session back into a state where the failure can actually be recorded.
 
@@ -251,6 +321,10 @@ async def run_stages(
                 result.stats = {}
             result.stats["elapsed_s"] = elapsed
             report.stages.append(result)
+            if attr:
+                # The stage itself owns DONE/SKIPPED; the revision says which code wrote
+                # the stored result and is committed atomically with that state.
+                setattr(recording, REVISION_FIELDS[name], CURRENT_REVISIONS[name])
             if stage_complete:
                 stage_complete(result)
             log.info(

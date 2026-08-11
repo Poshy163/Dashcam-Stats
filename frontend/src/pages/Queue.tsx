@@ -12,7 +12,7 @@ import {
   StatTile,
 } from '@/components/ui'
 import { api } from '@/lib/api'
-import { formatDateTime, realtimeFactor } from '@/lib/format'
+import { formatDateTime, formatDuration, realtimeFactor } from '@/lib/format'
 
 const STATES = ['', 'queued', 'running', 'failed', 'completed', 'cancelled']
 
@@ -107,6 +107,18 @@ export default function Queue() {
         <StatTile label="Completed today" value={stats.data?.completedToday ?? 0} tone="ok" />
       </div>
 
+      {(stats.data?.throughputPerHour != null || stats.data?.estimatedMinutesRemaining != null) && (
+        <div className="card flex flex-wrap gap-x-6 gap-y-1 p-3 text-sm text-content-muted">
+          {stats.data.throughputPerHour != null && (
+            <span><strong className="text-content">{stats.data.throughputPerHour}</strong> recordings/hour recently</span>
+          )}
+          {stats.data.estimatedMinutesRemaining != null && (
+            <span>Estimated backlog: <strong className="text-content">{formatDuration(stats.data.estimatedMinutesRemaining * 60)}</strong></span>
+          )}
+          <span className="text-xs">Estimate adapts to the last 100 completed jobs and current worker count.</span>
+        </div>
+      )}
+
       {active.length > 0 && (
         <section className="space-y-2">
           <h2 className="text-sm font-semibold">Currently processing</h2>
@@ -130,6 +142,9 @@ export default function Queue() {
                 <span>Stage: {job.stageCurrent ?? '—'}</span>
                 <span>{realtimeFactor(job.speedRealtime)}</span>
                 {job.decoder && <span>Decoder: {job.decoder}</span>}
+                {job.resourceState === 'waiting_for_vaapi' && (
+                  <span className="text-state-warn">Waiting for shared VAAPI decoder</span>
+                )}
                 {job.inferenceDevice && <span>AI: {job.inferenceDevice}</span>}
                 {job.recordingId && (
                   // The one question worth asking about a job in flight is what the

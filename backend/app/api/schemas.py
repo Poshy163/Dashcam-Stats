@@ -64,6 +64,10 @@ class RecordingOut(ApiModel):
     telemetry_state: str
     detection_state: str
     plate_state: str
+    metadata_revision: str | None = None
+    telemetry_revision: str | None = None
+    detection_revision: str | None = None
+    plate_revision: str | None = None
     error_message: str | None = None
 
     has_gps: bool = False
@@ -71,12 +75,22 @@ class RecordingOut(ApiModel):
     distance_m: float | None = None
     avg_speed_kmh: float | None = None
     max_speed_kmh: float | None = None
+    gps_gap_count: int = 0
+    gps_longest_gap_s: float = 0.0
+    gps_recovered_count: int = 0
+    gps_no_fix_count: int = 0
+    gps_ocr_gap_count: int = 0
+    gps_rejected_count: int = 0
+    telemetry_problem_count: int = 0
 
     vehicle_count: int = 0
     plate_count: int = 0
     thumbnail_path: str | None = None
     file_missing: bool = False
     ignored: bool = False
+    protected: bool = False
+    event_type: str | None = None
+    event_notes: str | None = None
 
     #: Carried only so the two fields below can be derived from it; the raw probe output
     #: is internal detail and never reaches a client.
@@ -178,6 +192,7 @@ class PlateOut(ApiModel):
     journey_count: int = 0
     best_confidence: float = 0.0
     flagged: bool = False
+    dismissed: bool = False
     notes: str | None = None
     representative_crop_path: str | None = None
     representative_vehicle_path: str | None = None
@@ -240,6 +255,7 @@ class JobOut(ApiModel):
     speed_realtime: float | None = None
     decoder: str | None = None
     inference_device: str | None = None
+    resource_state: str | None = None
     attempts: int = 0
     max_attempts: int = 3
     queued_at: datetime
@@ -255,6 +271,8 @@ class QueueStatsOut(BaseModel):
     completed: int = 0
     completed_today: int = 0
     paused: bool = False
+    throughput_per_hour: float | None = None
+    estimated_minutes_remaining: float | None = None
 
 
 class LogEntryOut(ApiModel):
@@ -308,6 +326,8 @@ class ReprocessRequest(BaseModel):
 class ReprocessAllRequest(ReprocessRequest):
     #: Limit the rerun to recordings that previously failed, rather than the whole library.
     only_failed: bool = False
+    #: Queue only recordings whose stored stage revision is older than this release.
+    only_outdated: bool = False
 
 
 #: A row id inside a request body. Path and query bounds do not reach here, and
@@ -328,6 +348,48 @@ class SplitRequest(BaseModel):
 class PlatePatch(BaseModel):
     flagged: bool | None = None
     notes: str | None = None
+    dismissed: bool | None = None
+
+
+class PlateCorrectRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=32)
+
+
+class PlateMergeRequest(BaseModel):
+    target_plate_id: BodyRowId
+
+
+class RecordingEventPatch(BaseModel):
+    protected: bool | None = None
+    event_type: str | None = Field(default=None, max_length=64)
+    event_notes: str | None = Field(default=None, max_length=4000)
+
+
+class TelemetryQualityRecordingOut(BaseModel):
+    recording_id: int
+    filename: str
+    started_at: datetime | None = None
+    points: int = 0
+    fixes: int = 0
+    gaps: int = 0
+    longest_gap_s: float = 0.0
+    recovered: int = 0
+    real_gps_loss: int = 0
+    ocr_unreadable: int = 0
+    rejected: int = 0
+    problems: int = 0
+    status: str
+
+
+class TelemetryQualityOut(BaseModel):
+    recordings: int = 0
+    healthy: int = 0
+    degraded: int = 0
+    no_fix: int = 0
+    pending: int = 0
+    total_gaps: int = 0
+    paired_recoveries: int = 0
+    issues: list[TelemetryQualityRecordingOut] = Field(default_factory=list)
 
 
 class SafetyCheckOut(BaseModel):

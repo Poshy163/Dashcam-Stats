@@ -8,7 +8,9 @@ external services.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hmac
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -104,6 +106,31 @@ def create_app() -> FastAPI:
         docs_url="/api/docs",
         redoc_url="/api/redoc",
     )
+
+    if config.auth_username and config.auth_password:
+
+        @app.middleware("http")
+        async def optional_basic_auth(request: Request, call_next):
+            if request.url.path == "/health":
+                return await call_next(request)
+            supplied = request.headers.get("Authorization", "")
+            valid = False
+            if supplied.startswith("Basic "):
+                try:
+                    decoded = base64.b64decode(supplied[6:], validate=True).decode("utf-8")
+                    username, password = decoded.split(":", 1)
+                    valid = hmac.compare_digest(
+                        username, config.auth_username or ""
+                    ) and hmac.compare_digest(password, config.auth_password or "")
+                except (ValueError, UnicodeDecodeError):
+                    valid = False
+            if not valid:
+                return Response(
+                    "Authentication required",
+                    status_code=401,
+                    headers={"WWW-Authenticate": 'Basic realm="Dashcam Analyser"'},
+                )
+            return await call_next(request)
 
     # Permissive because the intended deployment is a trusted LAN with no auth and users
     # may hit the API from Home Assistant or a script on another host. Tighten this before

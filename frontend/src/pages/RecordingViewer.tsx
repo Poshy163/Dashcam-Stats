@@ -336,6 +336,11 @@ export default function RecordingViewer() {
       navigate('/queue')
     },
   })
+  const updateEvent = useMutation({
+    mutationFn: (patch: { protected?: boolean; eventType?: string | null }) =>
+      api.recordings.updateEvent(recordingId, patch),
+    onSuccess: (updated) => client.setQueryData(['recording', recordingId], updated),
+  })
 
   const seek = useCallback((t: number) => {
     const video = videoRef.current
@@ -390,6 +395,7 @@ export default function RecordingViewer() {
             <StateBadge state={r.state} />
             <span>{r.camera?.name ?? 'Unknown camera'}</span>
             <span>{formatDateTime(r.startedAt)}</span>
+            {r.protected && <span className="rounded-full bg-state-ok/15 px-2 py-0.5 text-xs text-state-ok">Protected event</span>}
             {r.timeFromOsd && (
               <span className="text-xs text-content-faint" title="Time read from the camera's on-screen overlay">
                 clock from overlay
@@ -399,6 +405,25 @@ export default function RecordingViewer() {
         }
         actions={
           <>
+            <button
+              className={cn('btn', r.protected && 'btn-primary')}
+              onClick={() => updateEvent.mutate({ protected: !r.protected })}
+              disabled={updateEvent.isPending}
+            >
+              {r.protected ? 'Protected' : 'Protect clip'}
+            </button>
+            <a
+              className="btn"
+              href={api.recordings.exportClipUrl(
+                r.id,
+                Math.max(0, currentTime - 15),
+                duration > 0 ? Math.min(duration, currentTime + 15) : undefined,
+              )}
+              title="Download 30 seconds around the current playback position"
+            >
+              Export 30s
+            </a>
+            <a className="btn" href={api.recordings.exportMetadataUrl(r.id)}>GPS + plate data</a>
             <select className="input w-auto" value={stage} onChange={(e) => setStage(e.target.value)}>
               {REPROCESS_OPTIONS.map(([value, label]) => (
                 <option key={value} value={value}>{label}</option>
@@ -410,6 +435,18 @@ export default function RecordingViewer() {
           </>
         }
       />
+
+      {r.eventType && (
+        <div className="card flex items-center gap-3 border-state-warn/40 p-3 text-sm">
+          <span className="font-medium text-state-warn">Event detected:</span>
+          <span>{r.eventType.replaceAll('_', ' ')}</span>
+          {!r.protected && (
+            <button className="btn ml-auto text-xs" onClick={() => updateEvent.mutate({ protected: true })}>
+              Keep permanently
+            </button>
+          )}
+        </div>
+      )}
 
       {r.state === 'failed' && r.errorMessage && (
         <div className="card border-state-error/40 p-3">

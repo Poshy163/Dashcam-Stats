@@ -62,6 +62,10 @@ export interface Recording {
   telemetryState: StageState
   detectionState: StageState
   plateState: StageState
+  metadataRevision: string | null
+  telemetryRevision: string | null
+  detectionRevision: string | null
+  plateRevision: string | null
   errorMessage: string | null
 
   hasGps: boolean
@@ -69,6 +73,13 @@ export interface Recording {
   distanceM: number | null
   avgSpeedKmh: number | null
   maxSpeedKmh: number | null
+  gpsGapCount: number
+  gpsLongestGapS: number
+  gpsRecoveredCount: number
+  gpsNoFixCount: number
+  gpsOcrGapCount: number
+  gpsRejectedCount: number
+  telemetryProblemCount: number
 
   vehicleCount: number
   plateCount: number
@@ -77,6 +88,9 @@ export interface Recording {
   fileMissing: boolean
   /** Hidden from normal library views by the damaged-footage policy. */
   ignored: boolean
+  protected: boolean
+  eventType: string | null
+  eventNotes: string | null
 
   /** Problems in the source file itself — a wrapped PTS, frames that will not decode. */
   warnings: string[]
@@ -175,6 +189,7 @@ export interface Plate {
   journeyCount: number
   bestConfidence: number
   flagged: boolean
+  dismissed: boolean
   notes: string | null
   representativeCropPath: string | null
   representativeVehiclePath: string | null
@@ -233,6 +248,7 @@ export interface Job {
   speedRealtime: number | null
   decoder: string | null
   inferenceDevice: string | null
+  resourceState: string | null
   attempts: number
   maxAttempts: number
   queuedAt: string
@@ -247,6 +263,35 @@ export interface QueueStats {
   failed: number
   completedToday: number
   paused: boolean
+  throughputPerHour: number | null
+  estimatedMinutesRemaining: number | null
+}
+
+export interface TelemetryQualityRecording {
+  recordingId: number
+  filename: string
+  startedAt: string | null
+  points: number
+  fixes: number
+  gaps: number
+  longestGapS: number
+  recovered: number
+  realGpsLoss: number
+  ocrUnreadable: number
+  rejected: number
+  problems: number
+  status: 'healthy' | 'degraded' | 'no_fix' | 'pending'
+}
+
+export interface TelemetryQuality {
+  recordings: number
+  healthy: number
+  degraded: number
+  noFix: number
+  pending: number
+  totalGaps: number
+  pairedRecoveries: number
+  issues: TelemetryQualityRecording[]
 }
 
 export interface HardwareInfo {

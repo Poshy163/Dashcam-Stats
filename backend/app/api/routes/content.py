@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import aliased, selectinload
 
+from app.ai.normalise_au import normalise
 from app.api.deps import PaginationDep, RowId, RowIdFilter, SessionDep
 from app.api.geometry import build_polyline_indices
 from app.api.schemas import (
@@ -16,15 +19,20 @@ from app.api.schemas import (
     JourneyOut,
     MergeRequest,
     Paginated,
+    PlateCorrectRequest,
+    PlateMergeRequest,
     PlateObservationOut,
     PlateOut,
     PlatePatch,
     QueueStatsOut,
+    RecordingEventPatch,
     RecordingOut,
     ReprocessRequest,
     SearchResults,
     SplitRequest,
     TelemetryPointOut,
+    TelemetryQualityOut,
+    TelemetryQualityRecordingOut,
     TrackedObjectOut,
     VehicleOut,
 )
@@ -40,12 +48,15 @@ from app.db.models import (
     PlateObservation,
     ProcessingJob,
     Recording,
+    StageState,
     TelemetryPoint,
     TrackedObject,
     Vehicle,
 )
 from app.journeys.builder import JourneyBuilder
 from app.journeys.track import single_track
+from app.pipeline.orchestrator import invalidate_recordings
+from app.pipeline.revisions import CURRENT_REVISIONS, INVALIDATED_REVISION
 from app.workers import queue
 
 log = get_logger(__name__)
@@ -208,6 +219,11 @@ async def get_recording(recording_id: RowId, session: SessionDep):
 
 @router.get("/recordings/{recording_id}/telemetry", response_model=list[TelemetryPointOut])
 async def get_telemetry(recording_id: RowId, session: SessionDep):
+    recording = await session.get(Recording, recording_id)
+    if recording is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording not found")
+    if recording.telemetry_revision == INVALIDATED_REVISION:
+        return []
     rows = (
         (
             await session.execute(
@@ -242,6 +258,11 @@ async def get_telemetry(recording_id: RowId, session: SessionDep):
 
 @router.get("/recordings/{recording_id}/detections", response_model=list[TrackedObjectOut])
 async def get_detections(recording_id: RowId, session: SessionDep):
+    recording = await session.get(Recording, recording_id)
+    if recording is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording not found")
+    if recording.detection_revision == INVALIDATED_REVISION:
+        return []
     rows = (
         (
             await session.execute(
@@ -258,6 +279,11 @@ async def get_detections(recording_id: RowId, session: SessionDep):
 
 @router.get("/recordings/{recording_id}/plates", response_model=list[PlateObservationOut])
 async def get_recording_plates(recording_id: RowId, session: SessionDep):
+    recording = await session.get(Recording, recording_id)
+    if recording is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording not found")
+    if recording.plate_revision == INVALIDATED_REVISION:
+        return []
     rows = (
         await session.execute(
             select(PlateObservation, Recording.filename, Camera.name)
@@ -283,6 +309,7 @@ async def reprocess_recording(recording_id: RowId, body: ReprocessRequest, sessi
     if recording is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording not found")
 
+    selected = await invalidate_recordings(session, [recording_id], body.stages)
     job = await queue.enqueue(
         session,
         recording_id,
@@ -291,7 +318,128 @@ async def reprocess_recording(recording_id: RowId, body: ReprocessRequest, sessi
         priority=50,
         force=True,
     )
-    return {"job_id": job.id if job else None, "stages": body.stages}
+    return {"job_id": job.id if job else None, "stages": list(selected)}
+
+
+@router.patch("/recordings/{recording_id}/event", response_model=RecordingOut)
+async def patch_recording_event(
+    recording_id: RowId, body: RecordingEventPatch, session: SessionDep
+):
+    recording = await session.get(Recording, recording_id, options=[selectinload(Recording.camera)])
+    if recording is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording not found")
+    if body.protected is not None:
+        recording.protected = body.protected
+    if "event_type" in body.model_fields_set:
+        recording.event_type = body.event_type.strip() if body.event_type else None
+    if "event_notes" in body.model_fields_set:
+        recording.event_notes = body.event_notes.strip() if body.event_notes else None
+    await session.flush()
+    return RecordingOut.model_validate(recording)
+
+
+@router.get("/telemetry/quality", response_model=TelemetryQualityOut)
+async def telemetry_quality(session: SessionDep):
+    recordings = list(
+        (
+            await session.execute(
+                select(Recording).where(
+                    Recording.ignored.is_(False), Recording.file_missing.is_(False)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    counts = {"healthy": 0, "degraded": 0, "no_fix": 0, "pending": 0}
+    issues: list[TelemetryQualityRecordingOut] = []
+    for recording in recordings:
+        if recording.telemetry_state != StageState.DONE:
+            quality_status = "pending"
+        elif recording.telemetry_revision != CURRENT_REVISIONS["telemetry"]:
+            quality_status = "degraded"
+        elif (
+            recording.telemetry_point_count
+            and not recording.gps_point_count
+            and recording.gps_no_fix_count == recording.telemetry_point_count
+        ):
+            quality_status = "no_fix"
+        elif recording.gps_gap_count or recording.telemetry_problem_count:
+            quality_status = "degraded"
+        else:
+            quality_status = "healthy"
+        counts[quality_status] += 1
+        if quality_status != "healthy":
+            issues.append(
+                TelemetryQualityRecordingOut(
+                    recording_id=recording.id,
+                    filename=recording.filename,
+                    started_at=recording.started_at,
+                    points=recording.telemetry_point_count,
+                    fixes=recording.gps_point_count,
+                    gaps=recording.gps_gap_count,
+                    longest_gap_s=recording.gps_longest_gap_s,
+                    recovered=recording.gps_recovered_count,
+                    real_gps_loss=recording.gps_no_fix_count,
+                    ocr_unreadable=recording.gps_ocr_gap_count,
+                    rejected=recording.gps_rejected_count,
+                    problems=recording.telemetry_problem_count,
+                    status=quality_status,
+                )
+            )
+    issues.sort(key=lambda item: (item.longest_gap_s, item.problems, item.points), reverse=True)
+    return TelemetryQualityOut(
+        recordings=len(recordings),
+        **counts,
+        total_gaps=sum(recording.gps_gap_count for recording in recordings),
+        paired_recoveries=sum(recording.gps_recovered_count for recording in recordings),
+        issues=issues[:250],
+    )
+
+
+@router.get("/recordings/{recording_id}/export.json", response_model=None)
+async def export_recording_metadata(recording_id: RowId, session: SessionDep) -> Response:
+    recording = await session.get(Recording, recording_id)
+    if recording is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording not found")
+    telemetry = list(
+        (
+            await session.execute(
+                select(TelemetryPoint)
+                .where(TelemetryPoint.recording_id == recording_id)
+                .order_by(TelemetryPoint.t_offset_s)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    observations = list(
+        (
+            await session.execute(
+                select(PlateObservation)
+                .where(PlateObservation.recording_id == recording_id)
+                .order_by(PlateObservation.t_offset_s)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    payload = {
+        "recording": RecordingOut.model_validate(recording).model_dump(),
+        "telemetry": [
+            TelemetryPointOut.model_validate(point)
+            .model_copy(update={"quality": point.quality_json or {}})
+            .model_dump()
+            for point in telemetry
+        ],
+        "plates": [PlateObservationOut.model_validate(obs).model_dump() for obs in observations],
+    }
+    stem = recording.filename.rsplit(".", 1)[0]
+    return Response(
+        json.dumps(jsonable_encoder(payload), indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{stem}-metadata.json"'},
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -363,9 +511,15 @@ async def get_journey(journey_id: RowId, session: SessionDep):
                 TelemetryPoint.captured_at,
                 TelemetryPoint.recording_id,
                 TelemetryPoint.t_offset_s,
-            ).where(
+            )
+            .join(Recording, Recording.id == TelemetryPoint.recording_id)
+            .where(
                 TelemetryPoint.journey_id == journey_id,
                 TelemetryPoint.has_fix.is_(True),
+                or_(
+                    Recording.telemetry_revision.is_(None),
+                    Recording.telemetry_revision != INVALIDATED_REVISION,
+                ),
                 TelemetryPoint.lat.is_not(None),
                 TelemetryPoint.lon.is_not(None),
             )
@@ -444,6 +598,7 @@ async def reprocess_journey(journey_id: RowId, body: ReprocessRequest, session: 
         .scalars()
         .all()
     )
+    selected = await invalidate_recordings(session, list(recordings), body.stages)
     for recording_id in recordings:
         await queue.enqueue(
             session,
@@ -453,7 +608,7 @@ async def reprocess_journey(journey_id: RowId, body: ReprocessRequest, session: 
             priority=60,
             force=True,
         )
-    return {"queued": len(recordings)}
+    return {"queued": len(recordings), "stages": list(selected)}
 
 
 # --------------------------------------------------------------------------------------
@@ -470,7 +625,18 @@ async def list_plates(
     min_confidence: float | None = None,
     sort: str = Query("last_seen_desc"),
 ):
-    stmt = select(Plate)
+    visible = (
+        select(PlateObservation.id)
+        .join(Recording, Recording.id == PlateObservation.recording_id)
+        .where(
+            PlateObservation.plate_id == Plate.id,
+            or_(
+                Recording.plate_revision.is_(None), Recording.plate_revision != INVALIDATED_REVISION
+            ),
+        )
+        .exists()
+    )
+    stmt = select(Plate).where(Plate.dismissed.is_(False), visible)
     if q:
         # Partial matching is the point: "ABC" must find "ABC123". Both the normalised
         # and the display text are searched, since a plate that failed normalisation is
@@ -522,7 +688,13 @@ async def _best_observations(session, plate_ids: list[int]) -> dict[int, PlateOb
             )
             .label("rank"),
         )
+        .join(Recording, Recording.id == PlateObservation.recording_id)
         .where(PlateObservation.plate_id.in_(plate_ids))
+        .where(
+            or_(
+                Recording.plate_revision.is_(None), Recording.plate_revision != INVALIDATED_REVISION
+            )
+        )
         .subquery()
     )
     observations = (
@@ -535,12 +707,46 @@ async def _best_observations(session, plate_ids: list[int]) -> dict[int, PlateOb
 
 async def _with_representative(session, items: list[PlateOut]) -> list[PlateOut]:
     """Attach each plate's representative crops to an already-built page of results."""
-    best = await _best_observations(session, [item.id for item in items])
+    if not items:
+        return items
+    plate_ids = [item.id for item in items]
+    best = await _best_observations(session, plate_ids)
+    visible_rollups = {
+        row.plate_id: row
+        for row in (
+            await session.execute(
+                select(
+                    PlateObservation.plate_id,
+                    func.count(PlateObservation.id).label("observations"),
+                    func.count(func.distinct(PlateObservation.journey_id)).label("journeys"),
+                    func.min(PlateObservation.captured_at).label("first_seen"),
+                    func.max(PlateObservation.captured_at).label("last_seen"),
+                    func.max(PlateObservation.ocr_confidence).label("confidence"),
+                )
+                .join(Recording, Recording.id == PlateObservation.recording_id)
+                .where(
+                    PlateObservation.plate_id.in_(plate_ids),
+                    or_(
+                        Recording.plate_revision.is_(None),
+                        Recording.plate_revision != INVALIDATED_REVISION,
+                    ),
+                )
+                .group_by(PlateObservation.plate_id)
+            )
+        ).all()
+    }
     for item in items:
         observation = best.get(item.id)
         if observation is not None:
             item.representative_crop_path = observation.plate_crop_path
             item.representative_vehicle_path = observation.vehicle_crop_path
+        rollup = visible_rollups.get(item.id)
+        if rollup is not None:
+            item.observation_count = int(rollup.observations)
+            item.journey_count = int(rollup.journeys)
+            item.first_seen_at = rollup.first_seen
+            item.last_seen_at = rollup.last_seen
+            item.best_confidence = float(rollup.confidence or 0.0)
     return items
 
 
@@ -563,13 +769,26 @@ async def get_plate_observations(plate_id: RowId, session: SessionDep, page: Pag
         select(PlateObservation, Recording.filename, Camera.name)
         .join(Recording, Recording.id == PlateObservation.recording_id)
         .outerjoin(Camera, Camera.id == PlateObservation.camera_id)
-        .where(PlateObservation.plate_id == plate_id)
+        .where(
+            PlateObservation.plate_id == plate_id,
+            or_(
+                Recording.plate_revision.is_(None), Recording.plate_revision != INVALIDATED_REVISION
+            ),
+        )
         .order_by(PlateObservation.captured_at.desc().nullslast())
     )
     total = int(
         (
             await session.execute(
-                select(func.count(PlateObservation.id)).where(PlateObservation.plate_id == plate_id)
+                select(func.count(PlateObservation.id))
+                .join(Recording, Recording.id == PlateObservation.recording_id)
+                .where(
+                    PlateObservation.plate_id == plate_id,
+                    or_(
+                        Recording.plate_revision.is_(None),
+                        Recording.plate_revision != INVALIDATED_REVISION,
+                    ),
+                )
             )
         ).scalar()
         or 0
@@ -594,8 +813,111 @@ async def patch_plate(plate_id: RowId, body: PlatePatch, session: SessionDep):
         plate.flagged = body.flagged
     if body.notes is not None:
         plate.notes = body.notes
+    if body.dismissed is not None:
+        plate.dismissed = body.dismissed
     await session.flush()
     return await _attach_representative(session, plate)
+
+
+async def _recount_plate(session, plate: Plate) -> None:
+    row = (
+        await session.execute(
+            select(
+                func.count(PlateObservation.id),
+                func.min(PlateObservation.captured_at),
+                func.max(PlateObservation.captured_at),
+                func.count(func.distinct(PlateObservation.journey_id)),
+                func.max(PlateObservation.ocr_confidence),
+            ).where(PlateObservation.plate_id == plate.id)
+        )
+    ).one()
+    plate.observation_count = int(row[0] or 0)
+    plate.first_seen_at = row[1]
+    plate.last_seen_at = row[2]
+    plate.journey_count = int(row[3] or 0)
+    plate.best_confidence = float(row[4] or 0.0)
+
+
+async def _move_plate_observations(session, source_id: int, target: Plate) -> None:
+    observations = list(
+        (
+            await session.execute(
+                select(PlateObservation).where(PlateObservation.plate_id == source_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for observation in observations:
+        duplicate = (
+            await session.execute(
+                select(PlateObservation).where(
+                    PlateObservation.plate_id == target.id,
+                    PlateObservation.recording_id == observation.recording_id,
+                    PlateObservation.tracked_object_id == observation.tracked_object_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if duplicate is not None:
+            if observation.ocr_confidence > duplicate.ocr_confidence:
+                duplicate.raw_text = observation.raw_text
+                duplicate.ocr_confidence = observation.ocr_confidence
+                duplicate.plate_crop_path = observation.plate_crop_path
+                duplicate.vehicle_crop_path = observation.vehicle_crop_path
+            duplicate.vote_count += observation.vote_count
+            await session.delete(observation)
+        else:
+            observation.plate_id = target.id
+            observation.normalised_text = target.normalised_text
+
+
+@router.post("/plates/{plate_id}/correct", response_model=PlateOut)
+async def correct_plate(plate_id: RowId, body: PlateCorrectRequest, session: SessionDep):
+    plate = await session.get(Plate, plate_id)
+    if plate is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Plate not found")
+    parsed = normalise(body.text, str(get_settings_service().get_nowait("plates.region")))
+    if not parsed.normalised:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Plate text is not valid")
+    target = (
+        await session.execute(select(Plate).where(Plate.normalised_text == parsed.normalised))
+    ).scalar_one_or_none()
+    if target is not None and target.id != plate.id:
+        await _move_plate_observations(session, plate.id, target)
+        target.flagged = target.flagged or plate.flagged
+        target.notes = "\n".join(filter(None, (target.notes, plate.notes))) or None
+        await session.delete(plate)
+        plate = target
+    else:
+        plate.normalised_text = parsed.normalised
+        plate.display_text = parsed.display_text
+        plate.pattern_name = parsed.pattern_name
+        plate.region = parsed.state_hint
+        await session.execute(
+            PlateObservation.__table__.update()
+            .where(PlateObservation.plate_id == plate.id)
+            .values(normalised_text=parsed.normalised)
+        )
+    await _recount_plate(session, plate)
+    await session.flush()
+    return await _attach_representative(session, plate)
+
+
+@router.post("/plates/{plate_id}/merge", response_model=PlateOut)
+async def merge_plate(plate_id: RowId, body: PlateMergeRequest, session: SessionDep):
+    source = await session.get(Plate, plate_id)
+    target = await session.get(Plate, body.target_plate_id)
+    if source is None or target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Plate not found")
+    if source.id == target.id:
+        return await _attach_representative(session, target)
+    await _move_plate_observations(session, source.id, target)
+    target.flagged = target.flagged or source.flagged
+    target.notes = "\n".join(filter(None, (target.notes, source.notes))) or None
+    await session.delete(source)
+    await _recount_plate(session, target)
+    await session.flush()
+    return await _attach_representative(session, target)
 
 
 # --------------------------------------------------------------------------------------
@@ -668,7 +990,17 @@ async def list_vehicles(
     exists today: one row per physical vehicle followed across a recording, which is what
     the UI already described itself as showing.
     """
-    stmt = select(TrackedObject).where(TrackedObject.crop_path.is_not(None))
+    stmt = (
+        select(TrackedObject)
+        .join(Recording, Recording.id == TrackedObject.recording_id)
+        .where(
+            TrackedObject.crop_path.is_not(None),
+            or_(
+                Recording.detection_revision.is_(None),
+                Recording.detection_revision != INVALIDATED_REVISION,
+            ),
+        )
+    )
     stmt = stmt.where(
         TrackedObject.class_label == class_label
         if class_label

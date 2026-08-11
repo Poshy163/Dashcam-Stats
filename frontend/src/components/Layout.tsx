@@ -18,6 +18,7 @@ const LIBRARY_NAV: NavItem[] = [
   { to: '/recordings', label: 'Recordings', icon: FilmIcon },
   { to: '/journeys', label: 'Journeys', icon: RouteIcon },
   { to: '/heatmap', label: 'Map', icon: HeatIcon },
+  { to: '/telemetry-health', label: 'Telemetry health', icon: PulseIcon },
   { to: '/plates', label: 'Plates', icon: PlateIcon },
   { to: '/vehicles', label: 'Vehicles', icon: CarIcon },
 ]
@@ -236,6 +237,9 @@ function RouteIcon({ className }: IconProps) {
 }
 function HeatIcon({ className }: IconProps) {
   return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M3 4.5 7.5 2l5 2.5L17 2v13.5L12.5 18l-5-2.5L3 18z" /><path d="M7.5 2v13.5m5-11V18" /></svg>
+}
+function PulseIcon({ className }: IconProps) {
+  return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M2 10h3l2-5 3.5 10 2.5-7 1.5 2H18" strokeLinecap="round" strokeLinejoin="round" /></svg>
 }
 function PlateIcon({ className }: IconProps) {
   return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><rect x="1.5" y="5" width="17" height="10" rx="1.5" /><path d="M5 9v2M8 9v2M11 9v2M14 9v2" strokeLinecap="round" /></svg>

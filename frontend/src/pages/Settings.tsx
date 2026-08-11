@@ -44,9 +44,11 @@ export default function Settings() {
   const processNew = useMutation({ mutationFn: api.scan.processNew })
   const [reprocessStage, setReprocessStage] = useState('everything')
   const reprocessAll = useMutation({
-    mutationFn: (onlyFailed: boolean) => api.scan.reprocessAll([reprocessStage], onlyFailed),
+    mutationFn: ({ onlyFailed = false, onlyOutdated = false }: { onlyFailed?: boolean; onlyOutdated?: boolean }) =>
+      api.scan.reprocessAll([reprocessStage], onlyFailed, onlyOutdated),
     onSuccess: () => client.invalidateQueries({ queryKey: ['jobs'] }),
   })
+  const restore = useMutation({ mutationFn: api.system.restore })
   const plan = useMutation({ mutationFn: api.retention.plan })
 
   const hardware = useQuery({
@@ -183,17 +185,24 @@ export default function Settings() {
                   </select>
                   <button
                     className="btn"
-                    onClick={() => reprocessAll.mutate(false)}
+                    onClick={() => reprocessAll.mutate({})}
                     disabled={reprocessAll.isPending}
                   >
                     Reprocess all footage
                   </button>
                   <button
                     className="btn"
-                    onClick={() => reprocessAll.mutate(true)}
+                    onClick={() => reprocessAll.mutate({ onlyFailed: true })}
                     disabled={reprocessAll.isPending}
                   >
                     Reprocess failed only
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => reprocessAll.mutate({ onlyOutdated: true })}
+                    disabled={reprocessAll.isPending}
+                  >
+                    Reprocess outdated only
                   </button>
                 </div>
                 {reprocessAll.data && (
@@ -215,7 +224,7 @@ export default function Settings() {
           )}
 
           {category.key === 'advanced' && (
-            <section className="card space-y-3 p-4">
+            <section className="card space-y-4 p-4">
               <h3 className="text-sm font-semibold">Diagnostics</h3>
               {hardware.data && (
                 <pre className="overflow-x-auto rounded bg-surface-sunken p-2 text-2xs text-content-muted">
@@ -227,6 +236,33 @@ export default function Settings() {
                   {JSON.stringify(database.data, null, 2)}
                 </pre>
               )}
+              <div className="border-t border-border pt-3">
+                <h3 className="text-sm font-semibold">Backup and recovery</h3>
+                <p className="hint mt-1">
+                  Backups are consistent while analysis is running. A validated restore is applied on the next container restart, and the current database is retained as a pre-restore backup.
+                </p>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <a className="btn" href={api.system.backupUrl()}>Download database backup</a>
+                  <label className="btn cursor-pointer">
+                    Validate restore…
+                    <input
+                      className="sr-only"
+                      type="file"
+                      accept=".db,.sqlite,.sqlite3,application/vnd.sqlite3"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0]
+                        if (file && window.confirm('Validate and stage this database for restore on the next restart?')) {
+                          restore.mutate(file)
+                        }
+                        event.target.value = ''
+                      }}
+                    />
+                  </label>
+                </div>
+                {restore.isPending && <p className="hint mt-2">Validating backup…</p>}
+                {restore.data && <p className="mt-2 text-sm text-state-ok">{restore.data.message}</p>}
+                {restore.isError && <p className="mt-2 text-sm text-state-error">{restore.error.message}</p>}
+              </div>
             </section>
           )}
         </div>

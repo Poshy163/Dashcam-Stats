@@ -241,6 +241,13 @@ async def init_db(*, run_migrations: bool = True, seed: bool = True) -> None:
     config = get_config()
     await asyncio.to_thread(config.ensure_dirs)
 
+    # Restore is staged by the API and applied before the first database connection on
+    # the next restart. Replacing a live WAL database would risk a split-brain process.
+    if not config.database_url:
+        from app.db.backup import apply_pending_restore
+
+        await asyncio.to_thread(apply_pending_restore)
+
     if run_migrations:
         # Alembic is synchronous all the way down, so it never touches the event loop.
         await asyncio.to_thread(upgrade_to_head)

@@ -423,6 +423,9 @@ class WorkerPool:
                         speed=active.speed_realtime,
                         decoder=active.decoder,
                         device=active.inference_device,
+                        resource=(
+                            "waiting_for_vaapi" if active.decoder == "vaapi-waiting" else "running"
+                        ),
                     )
                 consecutive_failures = 0
                 if state == JobState.CANCELLED and not active.cancelled:

@@ -27,6 +27,7 @@ import type {
   SettingCategory,
   Status,
   TelemetryPoint,
+  TelemetryQuality,
   TrackedObject,
   Vehicle,
 } from './types'
@@ -167,6 +168,14 @@ export const api = {
     plates: (id: number) => request<PlateObservation[]>(`/recordings/${id}/plates`),
     reprocess: (id: number, stages: string[]) =>
       post<{ jobId: number }>(`/recordings/${id}/reprocess`, { stages }),
+    updateEvent: (id: number, patch: { protected?: boolean; eventType?: string | null; eventNotes?: string | null }) =>
+      request<Recording>(`/recordings/${id}/event`, {
+        method: 'PATCH',
+        body: JSON.stringify(convertKeys(patch, camelToSnake)),
+      }),
+    exportClipUrl: (id: number, start = 0, end?: number) =>
+      `/api/recordings/${id}/export.mp4${buildQuery({ start, end })}`,
+    exportMetadataUrl: (id: number) => `/api/recordings/${id}/export.json`,
     /** Streamed with HTTP range support so the player can seek. */
     streamUrl: (id: number) => `/stream/${id}`,
   },
@@ -187,11 +196,14 @@ export const api = {
     get: (id: number) => request<Plate>(`/plates/${id}`),
     observations: (id: number, query?: Query) =>
       request<Paginated<PlateObservation>>(`/plates/${id}/observations`, { query }),
-    update: (id: number, patch: { flagged?: boolean; notes?: string }) =>
+    update: (id: number, patch: { flagged?: boolean; notes?: string; dismissed?: boolean }) =>
       request<Plate>(`/plates/${id}`, {
         method: 'PATCH',
         body: JSON.stringify(convertKeys(patch, camelToSnake)),
       }),
+    correct: (id: number, text: string) => post<Plate>(`/plates/${id}/correct`, { text }),
+    merge: (id: number, targetPlateId: number) =>
+      post<Plate>(`/plates/${id}/merge`, { targetPlateId }),
   },
 
   vehicles: {
@@ -233,9 +245,11 @@ export const api = {
     now: () => post<ScanResult>('/scan'),
     processNew: () => post<{ queued: number }>('/process'),
     /** Requeue the library — or just the failures — after a processing change. */
-    reprocessAll: (stages: string[], onlyFailed = false) =>
-      post<{ queued: number; stages: string[] }>('/reprocess', { stages, onlyFailed }),
+    reprocessAll: (stages: string[], onlyFailed = false, onlyOutdated = false) =>
+      post<{ queued: number; stages: string[] }>('/reprocess', { stages, onlyFailed, onlyOutdated }),
   },
+
+  telemetryQuality: () => request<TelemetryQuality>('/telemetry/quality'),
 
   retention: {
     plan: () => post<RetentionPlan>('/retention/plan'),
@@ -254,6 +268,17 @@ export const api = {
     hardware: () => request<Status['hardware']>('/system/hardware'),
     info: () => request<Record<string, unknown>>('/system/info'),
     database: () => request<Record<string, unknown>>('/system/database'),
+    backupUrl: () => '/api/system/database/backup',
+    restore: (file: File) =>
+      fetch('/api/system/database/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: file,
+      }).then(async (response) => {
+        const data = await response.json()
+        if (!response.ok) throw new ApiError(data.detail ?? 'Restore failed', response.status, data)
+        return convertKeys<{ validated: boolean; restartRequired: boolean; message: string }>(data, snakeToCamel)
+      }),
   },
 }
 

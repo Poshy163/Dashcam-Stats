@@ -23,7 +23,7 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Query
-from sqlalchemy import Float, String, distinct, func, select
+from sqlalchemy import Float, String, distinct, func, or_, select
 from sqlalchemy import cast as sa_cast
 
 from app.api.deps import SQLITE_MAX_INT, SessionDep
@@ -31,6 +31,7 @@ from app.api.geometry import build_polylines
 from app.api.schemas import HeatmapOut, RoutesOut
 from app.core.logging import get_logger
 from app.db.models import Camera, CameraRole, Journey, Recording, TelemetryPoint
+from app.pipeline.revisions import INVALIDATED_REVISION
 
 log = get_logger(__name__)
 
@@ -126,6 +127,10 @@ async def heatmap(
         # a cell at Null Island.
         .where(
             TelemetryPoint.has_fix.is_(True),
+            or_(
+                Recording.telemetry_revision.is_(None),
+                Recording.telemetry_revision != INVALIDATED_REVISION,
+            ),
             TelemetryPoint.lat.is_not(None),
             TelemetryPoint.lon.is_not(None),
         )
@@ -231,6 +236,10 @@ async def routes(
         .outerjoin(Camera, Recording.camera_id == Camera.id)
         .where(
             TelemetryPoint.has_fix.is_(True),
+            or_(
+                Recording.telemetry_revision.is_(None),
+                Recording.telemetry_revision != INVALIDATED_REVISION,
+            ),
             TelemetryPoint.lat.is_not(None),
             TelemetryPoint.lon.is_not(None),
             # A rear-camera-only stretch is rare and not worth a second copy of every road.

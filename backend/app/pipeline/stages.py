@@ -14,6 +14,7 @@ Cost discipline, which is what makes this viable over terabytes:
 from __future__ import annotations
 
 import asyncio
+import itertools
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -74,6 +75,7 @@ from app.osd import (
     missing_characters,
     select_training_set,
 )
+from app.pipeline.telemetry_quality import quality_rollup, recover_from_paired_camera
 
 log = get_logger(__name__)
 
@@ -755,7 +757,37 @@ async def stage_telemetry(
         recording.start_lat = result.first_fix.lat
         recording.start_lon = result.first_fix.lon
 
+    gaps, longest_gap, problem_count, no_fix_count, ocr_gap_count, rejected_count = quality_rollup(
+        rows
+    )
+    recording.gps_gap_count = gaps
+    recording.gps_longest_gap_s = longest_gap
+    recording.telemetry_problem_count = problem_count
+    recording.gps_no_fix_count = no_fix_count
+    recording.gps_ocr_gap_count = ocr_gap_count
+    recording.gps_rejected_count = rejected_count
+    recording.gps_recovered_count = 0
+
+    if bool(settings.get_nowait("events.detect_harsh_braking")):
+        speeds = [
+            (float(row["t_offset_s"]), float(row["speed_kmh"]))
+            for row in rows
+            if row["speed_kmh"] is not None
+        ]
+        threshold = float(settings.get_nowait("events.harsh_braking_kmh_s"))
+        harshest = max(
+            (
+                (before_speed - after_speed) / max(0.1, after_t - before_t)
+                for (before_t, before_speed), (after_t, after_speed) in itertools.pairwise(speeds)
+                if after_t > before_t
+            ),
+            default=0.0,
+        )
+        if harshest >= threshold and not recording.event_type:
+            recording.event_type = "harsh_braking"
+
     recording.telemetry_state = StageState.DONE
+    paired_recoveries = await recover_from_paired_camera(session, recording)
     log.info(
         "read telemetry from the overlay",
         recording=recording.filename,
@@ -784,6 +816,9 @@ async def stage_telemetry(
             "timeline_recoveries": recovered_clocks,
             "interpolated_fixes": sum(s.gps_source == "interpolated" for s in result.samples),
             "rejected_positions": result.implausible_jumps + dropped,
+            "gps_gaps": recording.gps_gap_count,
+            "longest_gps_gap_s": recording.gps_longest_gap_s,
+            "paired_recoveries": paired_recoveries,
             "warnings": result.warnings,
             "decoder": result.decoder,
         },

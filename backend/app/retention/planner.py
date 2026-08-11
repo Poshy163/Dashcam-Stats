@@ -209,14 +209,8 @@ async def plan(session: AsyncSession) -> RetentionPlan:
 
 
 def _is_event(recording: Recording) -> bool:
-    """Whether a recording counts as an event.
-
-    This dashcam does not mark events itself — there are no G-force or emergency flags in
-    the footage — so nothing is an event unless something else has said so. The hook stays
-    because the setting exists and a heuristic (harsh braking derived from OSD speed) can
-    populate it later without changing this code.
-    """
-    return False
+    """Whether manual protection or an analysis rule marked this as an event."""
+    return bool(recording.protected or recording.event_type)
 
 
 async def execute(

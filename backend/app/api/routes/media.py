@@ -11,7 +11,7 @@ from __future__ import annotations
 import mimetypes
 import re
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from app.api.deps import RowId, SessionDep
@@ -19,6 +19,7 @@ from app.core.logging import get_logger
 from app.core.paths import PathTraversalError, resolve_footage_path, resolve_media_path
 from app.db.models import Recording
 from app.media import ensure_playable
+from app.media.playback import ensure_export_clip
 
 log = get_logger(__name__)
 
@@ -142,3 +143,28 @@ async def stream_recording(
             "Content-Length": str(length),
         },
     )
+
+
+@router.get("/api/recordings/{recording_id}/export.mp4", summary="Download an MP4 clip")
+async def export_recording(
+    recording_id: RowId,
+    session: SessionDep,
+    start: float = Query(0.0, ge=0.0),
+    end: float | None = Query(None, gt=0.0),
+) -> FileResponse:
+    recording = await session.get(Recording, recording_id)
+    if recording is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording not found")
+    if recording.file_missing:
+        raise HTTPException(status.HTTP_410_GONE, "This recording is no longer on disk")
+    if end is not None and end <= start:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "End must be after start")
+    if recording.duration_s is not None and start >= recording.duration_s:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Start is outside the recording")
+    try:
+        source = resolve_footage_path(recording.rel_path, must_exist=True)
+        clip = await ensure_export_clip(source, recording.id, start_s=start, end_s=end)
+    except (PathTraversalError, FileNotFoundError):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording file not found") from None
+    name = f"{recording.filename.rsplit('.', 1)[0]}-{start:.0f}s.mp4"
+    return FileResponse(clip, media_type="video/mp4", filename=name)

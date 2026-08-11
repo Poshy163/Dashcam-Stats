@@ -51,8 +51,9 @@ interval, detection thresholds, retention limits, map tiles — is on the Settin
 | `/data` | Database, settings, thumbnails, plate crops and models. **Never** touched by retention. Back this up. |
 | `/dev/dri` | The iGPU, used for hardware video decode and AI inference. Optional — without it everything still works on CPU, just slower. |
 
-The only environment variables that exist are `DASHCAM_DATA_DIR`, `DASHCAM_FOOTAGE_DIR`,
-`DASHCAM_PORT`, `DASHCAM_LOG_LEVEL` and `TZ`, and all of them have working defaults.
+Deployment variables are `DASHCAM_DATA_DIR`, `DASHCAM_FOOTAGE_DIR`, `DASHCAM_PORT`,
+`DASHCAM_LOG_LEVEL`, `TZ`, plus the optional `DASHCAM_AUTH_USERNAME` and
+`DASHCAM_AUTH_PASSWORD`. Authentication stays disabled unless both credentials are set.
 
 ---
 
@@ -176,9 +177,15 @@ POST /api/scan                    scan now
 POST /api/retention/plan          evaluate retention (report-only unless enabled)
 ```
 
-The app currently has **no authentication** and assumes a trusted LAN. Do not expose it
-directly to the internet — put it behind a reverse proxy with auth if you need remote
-access. The API is structured so auth can be added without reworking the routes.
+The default deployment assumes a trusted LAN. Optional HTTP Basic authentication can be
+enabled by setting both `DASHCAM_AUTH_USERNAME` and `DASHCAM_AUTH_PASSWORD`; use it behind
+TLS because Basic credentials are encoded, not encrypted. Do not expose the app directly
+to the internet without a TLS reverse proxy. The `/health` endpoint remains unauthenticated
+so Docker can monitor the container.
+
+Settings > Advanced can download a consistent SQLite backup while analysis is running.
+A restore upload is integrity-checked and staged, then applied on the next container
+restart; the replaced database is retained in `/data/backups` as a pre-restore copy.
 
 ---
 

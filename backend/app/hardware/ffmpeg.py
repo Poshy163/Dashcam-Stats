@@ -798,16 +798,21 @@ async def iter_frames(
         yielded = 0
         try:
             guard = _vaapi_decode_lock() if label == "vaapi" else contextlib.nullcontext()
-            if label == "vaapi" and guard.locked():
+            waited_for_decoder = label == "vaapi" and guard.locked()
+            if waited_for_decoder:
                 log.info(
                     "waiting for the shared VAAPI decoder",
                     file=Path(path).name,
                     decoder=label,
                 )
+                if on_decoder:
+                    on_decoder("vaapi-waiting")
             # Keep the slot for the life of ffmpeg, not merely process startup. On this
             # Intel driver a second session can initialise only after the first reader has
             # closed; releasing after its first frame still sends the other worker to CPU.
             async with guard:
+                if waited_for_decoder and on_decoder:
+                    on_decoder(label)
                 async for item in _decode_frames(path, hwaccel=hwaccel, **kwargs):
                     yielded += 1
                     if yielded == 1 and label != "software":

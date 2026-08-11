@@ -275,6 +275,14 @@ class Recording(Base):
     )
     plate_state: Mapped[StageState] = mapped_column(Enum(StageState), default=StageState.PENDING)
 
+    # Version stamps make analysis changes explicit. A completed stage whose stored
+    # revision differs from the current pipeline can be requeued without decoding the
+    # rest of the recording again.
+    metadata_revision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    telemetry_revision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    detection_revision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    plate_revision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_count: Mapped[int] = mapped_column(Integer, default=0)
     last_error_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
@@ -289,6 +297,16 @@ class Recording(Base):
     start_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
     start_lon: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # Telemetry health rollups keep the quality dashboard cheap even for libraries with
+    # millions of one-second samples.
+    gps_gap_count: Mapped[int] = mapped_column(Integer, default=0)
+    gps_longest_gap_s: Mapped[float] = mapped_column(Float, default=0.0)
+    gps_recovered_count: Mapped[int] = mapped_column(Integer, default=0)
+    gps_no_fix_count: Mapped[int] = mapped_column(Integer, default=0)
+    gps_ocr_gap_count: Mapped[int] = mapped_column(Integer, default=0)
+    gps_rejected_count: Mapped[int] = mapped_column(Integer, default=0)
+    telemetry_problem_count: Mapped[int] = mapped_column(Integer, default=0)
+
     vehicle_count: Mapped[int] = mapped_column(Integer, default=0, index=True)
     plate_count: Mapped[int] = mapped_column(Integer, default=0, index=True)
 
@@ -296,6 +314,10 @@ class Recording(Base):
 
     # --- bookkeeping ------------------------------------------------------------------
     ignored: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    # A protected/event recording is never eligible for retention cleanup.
+    protected: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    event_type: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    event_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
     last_scanned_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     processed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
@@ -485,6 +507,7 @@ class Plate(Base):
 
     # Future expansion: known/flagged plates and notifications.
     flagged: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    dismissed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
@@ -578,6 +601,7 @@ class ProcessingJob(Base):
     speed_realtime: Mapped[float | None] = mapped_column(Float, nullable=True)
     decoder: Mapped[str | None] = mapped_column(String(32), nullable=True)
     inference_device: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    resource_state: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Lets a crashed worker's claim be reclaimed after a heartbeat timeout.

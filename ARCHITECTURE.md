@@ -137,7 +137,7 @@ volumes:
 ```
 
 Environment variables are deliberately minimal — `DASHCAM_DATA_DIR`, `DASHCAM_FOOTAGE_DIR`,
-`DASHCAM_PORT`, `DASHCAM_LOG_LEVEL`. Everything else is a row in `app_settings`, edited
+`DASHCAM_PORT`, `DASHCAM_LOG_LEVEL`, and optional authentication credentials. Everything else is a row in `app_settings`, edited
 through the UI and applied without a restart.
 
 ---

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 
 from app.ai.backend import get_backend
@@ -34,6 +36,7 @@ from app.core.settings_service import (
     get_settings_service,
     local_midnight_utc,
 )
+from app.db.backup import create_backup, stage_restore
 from app.db.models import (
     JobKind,
     Journey,
@@ -47,6 +50,8 @@ from app.db.models import (
 )
 from app.db.session import current_revision
 from app.hardware.detect import detect_hardware_async
+from app.pipeline.orchestrator import expand_stages, invalidate_recordings
+from app.pipeline.revisions import outdated_stages
 from app.retention import current_usage, evaluate_safety
 from app.retention import execute as run_retention
 from app.retention import plan as plan_retention
@@ -302,7 +307,7 @@ async def reprocess_all(body: ReprocessAllRequest, session: SessionDep):
 
     Queued at a lower priority than new footage so a bulk rerun never starves the scanner.
     """
-    stmt = select(Recording.id).where(
+    stmt = select(Recording).where(
         Recording.ignored.is_(False),
         Recording.file_missing.is_(False),
         # A file with no bytes in it, or with no video stream, cannot be processed by any
@@ -315,24 +320,48 @@ async def reprocess_all(body: ReprocessAllRequest, session: SessionDep):
     if body.only_failed:
         stmt = stmt.where(Recording.state == RecordingState.FAILED)
 
-    recording_ids = list((await session.execute(stmt)).scalars())
-    for recording_id in recording_ids:
+    candidates = list((await session.execute(stmt)).scalars())
+    work: list[tuple[Recording, list[str]]] = []
+    if body.only_outdated:
+        requested = expand_stages(body.stages)
+        for recording in candidates:
+            stale = [name for name in requested if name in outdated_stages(recording)]
+            if stale:
+                work.append((recording, stale))
+    else:
+        work = [(recording, body.stages) for recording in candidates]
+
+    selected: set[str] = set()
+    if not body.only_outdated:
+        selected.update(
+            await invalidate_recordings(
+                session, [recording.id for recording, _ in work], body.stages
+            )
+        )
+    else:
+        grouped: dict[tuple[str, ...], list[int]] = {}
+        for recording, stages in work:
+            grouped.setdefault(tuple(stages), []).append(recording.id)
+        for stages, recording_ids in grouped.items():
+            selected.update(await invalidate_recordings(session, recording_ids, list(stages)))
+    for recording, stages in work:
         await queue.enqueue(
             session,
-            recording_id,
+            recording.id,
             kind=JobKind.REPROCESS,
-            stages=body.stages,
+            stages=stages,
             priority=200,
             force=True,
         )
 
     log.info(
         "queued bulk reprocess",
-        recordings=len(recording_ids),
+        recordings=len(work),
         stages=body.stages,
         only_failed=body.only_failed,
+        only_outdated=body.only_outdated,
     )
-    return {"queued": len(recording_ids), "stages": body.stages}
+    return {"queued": len(work), "stages": list(expand_stages(list(selected)))}
 
 
 # --------------------------------------------------------------------------------------
@@ -518,4 +547,43 @@ async def system_database(session: SessionDep):
         "size_bytes": size,
         "migration_revision": current_revision(),
         "row_counts": counts,
+    }
+
+
+@router.get("/system/database/backup", response_model=None)
+async def download_database_backup():
+    if get_config().database_url:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "Backups require the built-in SQLite database"
+        )
+    try:
+        path = await asyncio.to_thread(create_backup)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from None
+    return FileResponse(path, media_type="application/vnd.sqlite3", filename=path.name)
+
+
+@router.post("/system/database/restore")
+async def upload_database_restore(request: Request):
+    """Validate and stage a database restore for the next container restart."""
+    if get_config().database_url:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "Restore requires the built-in SQLite database"
+        )
+    length = int(request.headers.get("content-length", "0") or 0)
+    if length > 512 * 1024 * 1024:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Backup exceeds 512 MiB")
+    data = await request.body()
+    if not data:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Backup is empty")
+    if len(data) > 512 * 1024 * 1024:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Backup exceeds 512 MiB")
+    try:
+        await asyncio.to_thread(stage_restore, data)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from None
+    return {
+        "validated": True,
+        "restart_required": True,
+        "message": "Restore validated and staged. Restart the container to apply it.",
     }

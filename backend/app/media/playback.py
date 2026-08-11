@@ -204,6 +204,63 @@ async def ensure_playable(source: Path, recording_id: int) -> Playable:
     return Playable(path=target, media_type="video/mp4", from_cache=True)
 
 
+async def ensure_export_clip(
+    source: Path, recording_id: int, *, start_s: float = 0.0, end_s: float | None = None
+) -> Path:
+    """Create a cached, lossless MP4 excerpt suitable for downloading."""
+    playable = await ensure_playable(source, recording_id)
+    export_dir = get_config().cache_dir / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    end_key = "end" if end_s is None else f"{end_s:.2f}"
+    target = export_dir / f"{recording_id:08d}-{start_s:.2f}-{end_key}.mp4"
+    if target.is_file() and target.stat().st_size > 0:
+        return target
+    lock = await _lock_for(-recording_id)
+    async with lock:
+        if target.is_file() and target.stat().st_size > 0:
+            return target
+        partial = target.with_suffix(".part.mp4")
+        cmd = [
+            ffmpeg_path(),
+            "-hide_banner",
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-ss",
+            str(start_s),
+            "-i",
+            str(playable.path),
+        ]
+        if end_s is not None:
+            cmd.extend(["-t", str(max(0.01, end_s - start_s))])
+        cmd.extend(
+            [
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(partial),
+            ]
+        )
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not partial.is_file() or partial.stat().st_size == 0:
+            partial.unlink(missing_ok=True)
+            raise FFmpegError(stderr.decode("utf-8", "replace")[-1000:])
+        partial.replace(target)
+    return target
+
+
 def cache_usage() -> tuple[int, int]:
     """``(bytes, files)`` currently held in the playback cache."""
     total = count = 0

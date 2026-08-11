@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import RouteMap, { type MapMarker } from '@/components/RouteMap'
 import Spinner from '@/components/Spinner'
@@ -20,8 +20,11 @@ export default function PlateDetail() {
   const { id } = useParams()
   const plateId = Number(id)
   const client = useQueryClient()
+  const navigate = useNavigate()
   const [page, setPage] = useState(1)
   const [notes, setNotes] = useState<string | null>(null)
+  const [correctedText, setCorrectedText] = useState('')
+  const [mergeTarget, setMergeTarget] = useState('')
 
   const plate = useQuery({
     queryKey: ['plate', plateId],
@@ -36,8 +39,23 @@ export default function PlateDetail() {
   })
 
   const patch = useMutation({
-    mutationFn: (body: { flagged?: boolean; notes?: string }) => api.plates.update(plateId, body),
+    mutationFn: (body: { flagged?: boolean; notes?: string; dismissed?: boolean }) => api.plates.update(plateId, body),
     onSuccess: () => client.invalidateQueries({ queryKey: ['plate', plateId] }),
+  })
+  const correct = useMutation({
+    mutationFn: () => api.plates.correct(plateId, correctedText),
+    onSuccess: (updated) => {
+      client.invalidateQueries({ queryKey: ['plates'] })
+      navigate(`/plates/${updated.id}`, { replace: updated.id !== plateId })
+      client.setQueryData(['plate', updated.id], updated)
+    },
+  })
+  const merge = useMutation({
+    mutationFn: () => api.plates.merge(plateId, Number(mergeTarget)),
+    onSuccess: (updated) => {
+      client.invalidateQueries({ queryKey: ['plates'] })
+      navigate(`/plates/${updated.id}`, { replace: true })
+    },
   })
 
   if (plate.isLoading) return <Spinner label="Loading plate…" className="py-24" />
@@ -72,13 +90,22 @@ export default function PlateDetail() {
           </span>
         }
         actions={
-          <button
-            className={p.flagged ? 'btn btn-danger' : 'btn'}
-            onClick={() => patch.mutate({ flagged: !p.flagged })}
-            disabled={patch.isPending}
-          >
-            {p.flagged ? 'Remove flag' : 'Flag this plate'}
-          </button>
+          <>
+            <button
+              className={p.flagged ? 'btn btn-danger' : 'btn'}
+              onClick={() => patch.mutate({ flagged: !p.flagged })}
+              disabled={patch.isPending}
+            >
+              {p.flagged ? 'Remove flag' : 'Flag this plate'}
+            </button>
+            <button
+              className="btn"
+              onClick={() => patch.mutate({ dismissed: !p.dismissed })}
+              disabled={patch.isPending}
+            >
+              {p.dismissed ? 'Restore to plate list' : 'Dismiss false read'}
+            </button>
+          </>
         }
       />
 
@@ -114,6 +141,40 @@ export default function PlateDetail() {
           >
             Save notes
           </button>
+        )}
+      </section>
+
+      <section className="card space-y-3 p-3">
+        <div>
+          <h2 className="text-sm font-semibold">Review this reading</h2>
+          <p className="hint">Corrections preserve every raw OCR observation. If the corrected plate already exists, the sightings are merged.</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <input
+            className="input max-w-xs font-mono uppercase"
+            value={correctedText}
+            onChange={(event) => setCorrectedText(event.target.value)}
+            placeholder="Correct plate text"
+          />
+          <button className="btn btn-primary" disabled={!correctedText.trim() || correct.isPending} onClick={() => correct.mutate()}>
+            Apply correction
+          </button>
+        </div>
+        <div className="flex flex-wrap gap-2 border-t border-border pt-3">
+          <input
+            className="input max-w-xs"
+            type="number"
+            min="1"
+            value={mergeTarget}
+            onChange={(event) => setMergeTarget(event.target.value)}
+            placeholder="Target plate ID"
+          />
+          <button className="btn" disabled={!Number(mergeTarget) || merge.isPending} onClick={() => merge.mutate()}>
+            Merge into plate
+          </button>
+        </div>
+        {(correct.isError || merge.isError) && (
+          <p className="text-sm text-state-error">{correct.error?.message ?? merge.error?.message}</p>
         )}
       </section>
 

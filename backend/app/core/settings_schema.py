@@ -43,6 +43,7 @@ CATEGORIES: tuple[tuple[str, str, str], ...] = (
     ("telemetry", "Telemetry", "Reading the burned-in GPS/speed overlay"),
     ("plates", "Licence Plates", "Plate detection, OCR and deduplication"),
     ("journeys", "Journeys", "How recordings are grouped into drives"),
+    ("events", "Events", "Protection and automatic driving-event rules"),
     ("storage", "Storage", "Retention limits and cleanup behaviour"),
     ("maps", "Maps", "Map tiles and rendering"),
     ("advanced", "Advanced", "Logging, database and diagnostics"),
@@ -317,6 +318,28 @@ SETTINGS: tuple[SettingDef, ...] = (
         "How many times a transiently failing recording is retried before giving up.",
         minimum=0,
         maximum=10,
+    ),
+    # --------------------------------------------------------------- events
+    SettingDef(
+        "events.detect_harsh_braking",
+        "Detect harsh braking",
+        "bool",
+        False,
+        "events",
+        "Mark clips where decoded speed drops unusually quickly. Marked events are kept "
+        "when the retention setting to keep events is enabled.",
+    ),
+    SettingDef(
+        "events.harsh_braking_kmh_s",
+        "Harsh braking threshold",
+        "float",
+        10.0,
+        "events",
+        "Speed reduction per second that marks a harsh-braking event.",
+        minimum=3.0,
+        maximum=30.0,
+        unit="km/h/s",
+        requires="events.detect_harsh_braking",
     ),
     # -------------------------------------------------------------- telemetry
     SettingDef(

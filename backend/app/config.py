@@ -33,6 +33,11 @@ class AppConfig(BaseSettings):
     #: Escape hatch for tests and unusual deployments; normally left alone.
     database_url: str | None = None
 
+    #: Optional HTTP Basic authentication. Disabled unless both are set. Intended for a
+    #: reverse-proxy/TLS deployment; the trusted-LAN default stays zero-configuration.
+    auth_username: str | None = None
+    auth_password: str | None = None
+
     @field_validator("data_dir", "footage_dir", mode="before")
     @classmethod
     def _expand(cls, v: object) -> object:
