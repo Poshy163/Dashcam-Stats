@@ -315,20 +315,12 @@ class TestPtsWrapClamp:
 
 
 class TestInferenceProviders:
-    """Naming the OpenVINO provider is not the same as reaching the iGPU.
+    """Direct OpenVINO and the ONNX Runtime emergency fallback remain separate."""
 
-    ``OpenVINOExecutionProvider`` takes a ``device_type`` and, left unset, compiles for the
-    CPU. The provider then shows up in diagnostics and everything looks accelerated while
-    the GPU sits idle — which is exactly what a real deployment showed: intel_gpu_top with
-    a quiet render engine and a pinned Python process, pacing a 674-recording queue at
-    around three minutes each.
-    """
-
-    def test_the_device_is_requested_explicitly(self, monkeypatch):
+    def test_onnx_fallback_never_selects_the_old_openvino_provider(self, monkeypatch):
         import app.ai.runtime as runtime
 
         runtime.onnx_providers.cache_clear()
-        monkeypatch.setattr(runtime, "_openvino_device", lambda: "GPU")
 
         class _Ort:
             @staticmethod
@@ -341,12 +333,31 @@ class TestInferenceProviders:
         finally:
             runtime.onnx_providers.cache_clear()
 
-        first = providers[0]
-        assert isinstance(first, tuple), "the provider must carry options, not be a bare name"
-        assert first[0] == "OpenVINOExecutionProvider"
-        assert first[1]["device_type"] == "GPU", (
-            "without device_type the provider silently compiles for the CPU"
-        )
+        assert providers == ("CPUExecutionProvider",)
+
+    def test_an_enumerated_gpu_is_still_preferred(self):
+        from app.hardware.detect import HardwareInfo
+
+        info = HardwareInfo(openvino_available=True, openvino_devices=["GPU.0", "CPU"])
+        assert info.preferred_inference_device == "GPU.0"
+
+    def test_performance_hint_matches_worker_concurrency(self, monkeypatch):
+        import app.core.settings_service as settings_module
+        from app.ai.openvino_session import selected_performance_hint
+
+        class _Settings:
+            workers = 1
+
+            def get_nowait(self, key):
+                assert key == "processing.max_workers"
+                return self.workers
+
+        settings = _Settings()
+        monkeypatch.setattr(settings_module, "get_settings_service", lambda: settings)
+        assert selected_performance_hint() == "LATENCY"
+
+        settings.workers = 2
+        assert selected_performance_hint() == "THROUGHPUT"
 
     def test_a_missing_device_falls_back_rather_than_failing(self, monkeypatch):
         """Naming a device OpenVINO cannot see fails session creation outright.
@@ -396,37 +407,34 @@ class TestInferenceProviders:
 
 
 class TestReportedDevice:
-    """The Queue page's device column has to be readable.
+    """The Queue page's device column has to remain readable after the migration."""
 
-    A provider entry is a ``(name, options)`` pair once it carries a device, so returning
-    it whole wrote the entire tuple repr into the column -- accurate and unreadable.
-    """
-
-    def test_the_device_is_a_plain_name(self, monkeypatch):
-        import app.ai.runtime as runtime
+    def test_the_device_is_a_plain_name(self):
         from app.ai.detector import ObjectDetector
 
-        runtime.onnx_providers.cache_clear()
-        monkeypatch.setattr(
-            runtime,
-            "onnx_providers",
-            lambda: (("OpenVINOExecutionProvider", {"device_type": "GPU"}), "CPUExecutionProvider"),
-        )
-        import app.ai.detector as detector_module
+        class _Model:
+            device = "GPU"
 
-        monkeypatch.setattr(detector_module, "onnx_providers", runtime.onnx_providers)
+        class _Detector:
+            model = _Model()
 
         detector = ObjectDetector()
-        detector._detector = object()  # stand in for a loaded session
+        detector._detector = _Detector()
         assert detector.device == "GPU"
 
-    def test_a_bare_provider_name_still_works(self, monkeypatch):
-        import app.ai.detector as detector_module
+    def test_a_bare_provider_name_still_works(self):
         from app.ai.detector import ObjectDetector
 
-        monkeypatch.setattr(detector_module, "onnx_providers", lambda: ("CPUExecutionProvider",))
+        class _Model:
+            @staticmethod
+            def get_providers():
+                return ["CPUExecutionProvider"]
+
+        class _Detector:
+            model = _Model()
+
         detector = ObjectDetector()
-        detector._detector = object()
+        detector._detector = _Detector()
         assert detector.device == "CPUExecutionProvider"
 
 

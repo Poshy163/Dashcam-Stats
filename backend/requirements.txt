@@ -25,18 +25,13 @@ numpy>=1.26,<3
 Pillow>=11.0,<12
 
 # --- inference -------------------------------------------------------------------------
-# The OpenVINO build of onnxruntime, not the plain one. The plain build offers only the
-# CPU provider, which left every detection and plate model running on the CPU while the
-# iGPU idled -- visible in intel_gpu_top as a busy Python process and a quiet render
-# engine, and worth roughly thirty-three hours on a 674-recording queue.
-#
-# Do not install the standalone ``openvino`` wheel beside this one. Both distributions
-# ship libraries named ``libopenvino.so.2541``, but they are different builds with different
-# ABIs. Importing standalone OpenVINO for hardware discovery loads its core first; the ORT
-# provider then binds its own frontend to that core, fails on an undefined C++ symbol and
-# silently falls back to CPU. The ORT wheel is the sole owner of OpenVINO native libraries
-# in this process; hardware discovery deliberately avoids importing a second runtime.
-onnxruntime-openvino==1.24.1
+# Execute ONNX models directly with OpenVINO. The separate ONNX Runtime OpenVINO wheel is
+# intentionally not installed: its newest Linux build still bundles OpenVINO 2025.4.1 and
+# cannot safely coexist with the newer runtime because both packages ship ABI-distinct
+# libraries under the same SONAMEs. Plain ONNX Runtime remains for the public types used by
+# the upstream preprocessing/postprocessing libraries and as a CPU-only emergency fallback.
+openvino==2026.3.0
+onnxruntime==1.27.0
 
 # Model weights and their inference code, both MIT. Fetching weights from the projects
 # that publish them replaces release assets on this repository that never existed, and

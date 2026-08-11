@@ -99,10 +99,17 @@ class HardwareInfo:
 
     @property
     def preferred_inference_device(self) -> str:
-        if self.openvino_available and "GPU" in self.openvino_devices:
-            return "GPU"
         if self.openvino_available:
-            return "CPU"
+            for kind in ("GPU", "NPU", "CPU"):
+                exact = next((device for device in self.openvino_devices if device == kind), None)
+                if exact:
+                    return exact
+                variant = next(
+                    (device for device in self.openvino_devices if device.startswith(f"{kind}.")),
+                    None,
+                )
+                if variant:
+                    return variant
         return "CPU"
 
     def as_dict(self) -> dict[str, object]:
@@ -336,64 +343,34 @@ def _probe_qsv(info: HardwareInfo) -> None:
 
 
 def _probe_openvino(info: HardwareInfo) -> None:
-    """Describe the OpenVINO EP without importing a second OpenVINO runtime.
-
-    ``onnxruntime-openvino`` bundles the runtime and plugins the provider was built with.
-    The separately packaged Python API contains libraries with the same SONAMEs but a
-    different ABI, so importing it here before session creation breaks the provider.
-    """
-    if "OpenVINOExecutionProvider" not in info.onnxruntime_providers:
-        info.notes.append("OpenVINO execution provider is unavailable; inference will use CPU")
-        return
-
+    """Probe the standalone OpenVINO runtime and the devices it can actually open."""
     try:
-        from importlib.metadata import version
-
-        info.openvino_version = (
-            f"bundled with onnxruntime-openvino {version('onnxruntime-openvino')}"
-        )
-    except Exception:
-        info.openvino_version = "bundled with ONNX Runtime"
-
-    try:
-        import onnxruntime as ort
-        from onnxruntime.datasets import get_example
+        import openvino as ov
     except Exception as exc:
-        info.notes.append(f"OpenVINO provider probe could not start: {exc}")
+        info.notes.append(f"OpenVINO not available ({type(exc).__name__}); inference will use CPU")
         return
 
-    def provider_accepts(device: str) -> bool:
-        try:
-            session = ort.InferenceSession(
-                get_example("mul_1.onnx"),
-                providers=[
-                    ("OpenVINOExecutionProvider", {"device_type": device}),
-                    "CPUExecutionProvider",
-                ],
-            )
-            return session.get_providers()[0] == "OpenVINOExecutionProvider"
-        except Exception as exc:
-            log.debug("OpenVINO device probe failed", device=device, error=str(exc))
-            return False
+    try:
+        core = ov.Core()
+        info.openvino_version = getattr(ov, "__version__", None)
+        info.openvino_devices = list(core.available_devices)
+        info.openvino_available = bool(info.openvino_devices)
+        for device in info.openvino_devices:
+            try:
+                info.openvino_device_names[device] = str(
+                    core.get_property(device, "FULL_DEVICE_NAME")
+                )
+            except Exception:
+                info.openvino_device_names[device] = device
+    except Exception as exc:
+        info.notes.append(f"OpenVINO present but failed to initialise: {exc}")
+        return
 
-    # A render node only makes the GPU a candidate. Creating a real provider session is
-    # the important part: it also validates device permissions, the OpenCL runtime and the
-    # native OpenVINO libraries before a large model tries to use them.
-    if info.gpu_vendor == "Intel" and info.render_nodes and provider_accepts("GPU"):
-        info.openvino_devices.append("GPU")
-        info.openvino_device_names["GPU"] = info.gpu_name or "Intel GPU"
-    if provider_accepts("CPU"):
-        info.openvino_devices.append("CPU")
-        info.openvino_device_names["CPU"] = info.cpu_model or "CPU"
-
-    info.openvino_available = bool(info.openvino_devices)
-    if "GPU" not in info.openvino_devices:
+    if not any(device == "GPU" or device.startswith("GPU.") for device in info.openvino_devices):
         info.notes.append(
-            "OpenVINO provider could not open an Intel GPU; inference will run on CPU. "
+            "OpenVINO could not open an Intel GPU; inference will run on CPU. "
             "Check the OpenCL runtime and /dev/dri permissions."
         )
-    if not info.openvino_available:
-        info.notes.append("OpenVINO provider could not create a session on any device.")
 
 
 def _probe_onnxruntime(info: HardwareInfo) -> None:

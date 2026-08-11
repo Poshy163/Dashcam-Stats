@@ -515,8 +515,8 @@ async def _get_templates(
 
 # Loaded models, kept for the life of the process and shared by every worker.
 #
-# Building an inference session is not cheap: ONNX Runtime parses the graph and the
-# OpenVINO provider compiles it for the target device, which takes seconds on the iGPU.
+# Building an inference session is not cheap: OpenVINO parses the ONNX graph and compiles
+# it for the target device, which takes seconds on the iGPU.
 # Constructing the detector per recording paid that on all 678 of them, twice over with two
 # workers -- most of the wall-clock cost of a short clip, and a large allocation churned
 # each time, which is the shape of the container being OOM-killed mid-run.

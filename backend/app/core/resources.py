@@ -56,11 +56,11 @@ def configure_opencv_threads() -> int:
 
 
 def onnx_session_options():
-    """Build conservative ONNX Runtime options for GPU use with CPU fallback.
+    """Build conservative options for the emergency ONNX Runtime CPU fallback.
 
-    The OpenVINO provider owns accelerated graph execution. These settings bound the
-    CPU execution provider when a graph contains unsupported nodes and stop idle worker
-    threads from spinning between inference calls.
+    Direct OpenVINO sessions ignore these options. They are passed through to the upstream
+    model helpers so a graph that OpenVINO cannot compile can still run on ONNX Runtime
+    without its worker threads spinning between inference calls.
     """
     import onnxruntime as ort
 

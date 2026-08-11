@@ -21,7 +21,7 @@ import numpy as np
 
 from app.ai.detector import Detection2D, load_detector
 from app.ai.models import OCR_CONFIG_FILE, ensure_model, model_dir
-from app.ai.runtime import onnx_providers
+from app.ai.openvino_session import use_openvino_session
 from app.ai.tracker import sharpness
 from app.core.logging import get_logger
 from app.core.resources import configure_opencv_threads, onnx_session_options
@@ -166,12 +166,13 @@ class PlateOCR:
 
         def build() -> Any:
             configure_opencv_threads()
-            return LicensePlateRecognizer(
-                onnx_model_path=path,
-                plate_config_path=config_path,
-                providers=list(onnx_providers()),
-                sess_options=onnx_session_options(),
-            )
+            with use_openvino_session(LicensePlateRecognizer):
+                return LicensePlateRecognizer(
+                    onnx_model_path=path,
+                    plate_config_path=config_path,
+                    providers=["CPUExecutionProvider"],
+                    sess_options=onnx_session_options(),
+                )
 
         try:
             self._recogniser = await asyncio.to_thread(build)

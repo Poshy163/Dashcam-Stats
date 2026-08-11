@@ -274,14 +274,15 @@ across five separate frames of one drive, normalising to a South Australian patt
 confidence tracks crop size honestly — a 128×53 crop reads at 1.00, a 35×17 crop at 0.15 —
 so `plates.min_store_confidence` (0.3) discards the unreadable rather than storing guesses.
 
-Inference runs on ONNX Runtime. The image ships the plain build, whose only provider is
-CPU: `onnxruntime-openvino` installs under the same module name *and* bundles its own copy
-of the OpenVINO runtime that hardware probing already loads, and two builds of one native
-library in a single process is not a risk worth taking here. `app/ai/runtime.py` picks the
-best available provider rather than hard-coding CPU, so installing that package later is
-enough to move inference onto the iGPU with no code change. Cost measured on an i9-class
-CPU: ~104 ms/frame for RF-DETR nano, so a 60 s clip sampled at 4 fps spends roughly 25 s in
-detection.
+Inference runs directly on OpenVINO 2026.3. The upstream model packages still own image
+preprocessing and output decoding; `app/ai/openvino_session.py` provides the small
+`InferenceSession` surface they require while compiling the ONNX graphs with OpenVINO.
+Plain ONNX Runtime remains a CPU-only emergency fallback. Its OpenVINO provider wheel is
+deliberately excluded because its latest Linux build bundles OpenVINO 2025.4.1, and loading
+that native runtime beside 2026.3 causes an ABI collision. Compiled blobs live under the
+data volume, and shared models use OpenVINO's throughput hint plus one infer request per
+worker thread so concurrent recordings can use multiple GPU streams without duplicating
+weights.
 
 **Object tracking.** ByteTrack over sampled frames produces one `tracked_objects` row per
 physical vehicle with first/last seen, rather than hundreds of independent detections.

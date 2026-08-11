@@ -115,23 +115,26 @@ jobs:
       # Merely listing OpenVINOExecutionProvider is insufficient: an ABI-mismatched
       # OpenVINO library still appears in get_available_providers(), but fails only when
       # an actual session is created and ONNX Runtime silently falls back to CPU.
-      - name: Verify OpenVINO provider can create a session
+      - name: Verify OpenVINO 2026.3 direct inference
         run: |
           docker run --rm --entrypoint python dashcam-analyser:ci -c '
-          import onnxruntime as ort
+          import openvino as ov
+          import numpy as np
           from onnxruntime.datasets import get_example
-          from app.ai.runtime import onnx_providers
+          from app.ai.openvino_session import OpenVINOSession
           from app.hardware.detect import detect_hardware
 
-          # Reproduce application startup order. Importing the standalone OpenVINO runtime
-          # here used to load an ABI-incompatible core before ORT created its first session.
-          detect_hardware()
-          session = ort.InferenceSession(
-              get_example("mul_1.onnx"),
-              providers=list(onnx_providers()),
+          hardware = detect_hardware()
+          session = OpenVINOSession(get_example("mul_1.onnx"), device="CPU")
+          model_input = session.get_inputs()[0]
+          output = session.run(
+              None,
+              {model_input.name: np.ones(model_input.shape, dtype=np.float32)},
           )
-          assert session.get_providers()[0] == "OpenVINOExecutionProvider", session.get_providers()
-          print("OpenVINO execution provider loaded successfully")
+          assert ov.__version__.startswith("2026.3."), ov.__version__
+          assert session.get_providers() == ["OpenVINO:CPU"]
+          assert output
+          print("OpenVINO 2026.3 direct inference loaded successfully", hardware.openvino_devices)
           '
 
       # A container that starts but cannot serve /health is a broken release, and that

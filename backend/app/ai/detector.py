@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 
 from app.ai.models import DEFAULT_DETECTION_MODEL, REGISTRY, ROAD_CLASSES, ensure_model
-from app.ai.runtime import onnx_providers
+from app.ai.openvino_session import use_openvino_session
 from app.core.logging import get_logger
 from app.core.resources import configure_opencv_threads, onnx_session_options
 from app.core.settings_service import get_settings_service
@@ -101,14 +101,26 @@ async def load_detector(name: str, *, conf_thresh: float | None = None) -> Any |
 
     def build() -> Any:
         configure_opencv_threads()
-        return create_detector(
-            path,
-            backend=spec.runtime,
-            class_labels=labels,
-            conf_thresh=conf_thresh,
-            providers=list(onnx_providers()),
-            sess_options=onnx_session_options(),
-        )
+        if spec.runtime == "rf_detr":
+            from open_image_models.detection.core.rf_detr.inference import RFDETRDetector
+
+            owner = RFDETRDetector
+        elif spec.runtime == "yolo_v9":
+            from open_image_models.detection.core.yolo_v9.inference import YoloV9Detector
+
+            owner = YoloV9Detector
+        else:
+            raise ValueError(f"unsupported detector runtime: {spec.runtime}")
+
+        with use_openvino_session(owner):
+            return create_detector(
+                path,
+                backend=spec.runtime,
+                class_labels=labels,
+                conf_thresh=conf_thresh,
+                providers=["CPUExecutionProvider"],
+                sess_options=onnx_session_options(),
+            )
 
     try:
         # Building a session compiles the graph and can take seconds on first use; off the
@@ -145,13 +157,16 @@ class ObjectDetector:
         The useful answer is the device itself -- GPU or CPU -- because that is the one
         thing anyone checks this for.
         """
-        providers = onnx_providers()
-        if not providers or self._detector is None:
+        if self._detector is None:
             return None
-        first = providers[0]
-        if isinstance(first, tuple):
-            return str(first[1].get("device_type") or first[0])
-        return str(first)
+        model = getattr(self._detector, "model", None)
+        if model is None:
+            return None
+        device = getattr(model, "device", None)
+        if device:
+            return str(device)
+        providers = getattr(model, "get_providers", lambda: [])()
+        return str(providers[0]) if providers else None
 
     async def load(self) -> bool:
         if self._loaded:
