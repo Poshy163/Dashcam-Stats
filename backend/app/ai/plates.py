@@ -24,6 +24,7 @@ from app.ai.models import OCR_CONFIG_FILE, ensure_model, model_dir
 from app.ai.runtime import onnx_providers
 from app.ai.tracker import sharpness
 from app.core.logging import get_logger
+from app.core.resources import configure_opencv_threads, onnx_session_options
 from app.core.settings_service import get_settings_service
 
 log = get_logger(__name__)
@@ -164,10 +165,12 @@ class PlateOCR:
             return False
 
         def build() -> Any:
+            configure_opencv_threads()
             return LicensePlateRecognizer(
                 onnx_model_path=path,
                 plate_config_path=config_path,
                 providers=list(onnx_providers()),
+                sess_options=onnx_session_options(),
             )
 
         try:

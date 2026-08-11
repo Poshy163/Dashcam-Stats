@@ -782,7 +782,8 @@ SETTINGS: tuple[SettingDef, ...] = (
         "int",
         0,
         "advanced",
-        "0 lets FFmpeg decide.",
+        "Threads available to each processing job for FFmpeg, OpenCV and CPU inference. "
+        "0 automatically shares CPU capacity between workers, capped at four threads per job.",
         minimum=0,
         maximum=64,
     ),

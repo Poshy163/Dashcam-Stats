@@ -34,6 +34,7 @@ from app.ai.plates import (
     select_ocr_candidates,
     vote_track_plate,
 )
+from app.ai.runtime import describe_runtime
 from app.ai.tracker import ByteTracker
 from app.config import get_config
 from app.core.logging import get_logger
@@ -748,6 +749,7 @@ async def stage_telemetry(
             "parse_failures": result.parse_failures,
             "rejected_positions": result.implausible_jumps + dropped,
             "warnings": result.warnings,
+            "decoder": result.decoder,
         },
     )
 
@@ -846,6 +848,12 @@ async def stage_detect(
     tracker = ByteTracker()
     duration = recording.duration_s or 0.0
     frames = 0
+    decoder_used: str | None = None
+
+    def note_decoder(decoder: str) -> None:
+        nonlocal decoder_used
+        if decoder_used != "software":
+            decoder_used = decoder
 
     try:
         async for offset, frame in iter_frames(
@@ -853,6 +861,7 @@ async def stage_detect(
             fps=sample_fps,
             hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
             codec=recording.video_codec,
+            on_decoder=note_decoder,
         ):
             detections = await detector.detect(frame)
             tracker.update(detections, offset, frame)
@@ -989,6 +998,7 @@ async def stage_detect(
             "gps_fixes": len(fixes),
             "tracks_without_position": unlocated,
             "device": detector.device,
+            "decoder": decoder_used,
         },
     )
 
@@ -1186,6 +1196,7 @@ async def stage_plates(
     orientation = _PlateOrientation()
     store_unmatched = bool(settings.get_nowait("plates.store_unmatched"))
     rejected = 0
+    decoders_used: set[str] = set()
     for index, track in enumerate(tracks):
         if track.best_frame_offset_s is None or not track.best_bbox:
             continue
@@ -1201,6 +1212,7 @@ async def stage_plates(
                 fps=None,
                 hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
                 codec=recording.video_codec,
+                on_decoder=decoders_used.add,
             ):
                 frame = decoded
                 break
@@ -1321,6 +1333,14 @@ async def stage_plates(
             # with no location is a result rather than a gap.
             "rejected_unmatched": rejected,
             "without_position": sum(1 for _, located in placed if located is None),
+            "decoder": (
+                "software"
+                if "software" in decoders_used
+                else "vaapi"
+                if "vaapi" in decoders_used
+                else None
+            ),
+            "device": describe_runtime().get("device"),
             **orientation.describe(),
         },
     )

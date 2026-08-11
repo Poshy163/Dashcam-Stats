@@ -89,6 +89,74 @@ class TestDecodeFallback:
         ]
         assert not offenders, f"these bypass the software fallback: {offenders}"
 
+    async def test_a_busy_gpu_is_retried_before_software_fallback(self, monkeypatch):
+        import numpy as np
+
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_refused", set())
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_proven", set())
+        monkeypatch.setattr(
+            ffmpeg_module, "select_hwaccel", lambda *a, **k: (["-hwaccel", "vaapi"], "vaapi")
+        )
+
+        attempts: list[str | None] = []
+
+        async def decode(path, **kwargs):
+            attempts.append(kwargs.get("hwaccel"))
+            if len(attempts) < 3:
+                raise ffmpeg_module.DecodeError(
+                    "decoder busy", stderr="Failed to sync surface: HW busy now", returncode=1
+                )
+            yield 0.0, np.zeros((4, 4, 3), dtype=np.uint8)
+
+        async def no_wait(_delay):
+            return None
+
+        monkeypatch.setattr(ffmpeg_module, "_decode_frames", decode)
+        monkeypatch.setattr(ffmpeg_module.asyncio, "sleep", no_wait)
+        reported: list[str] = []
+
+        frames = [
+            frame
+            async for frame in ffmpeg_module.iter_frames("busy.ts", on_decoder=reported.append)
+        ]
+
+        assert frames
+        assert attempts == ["auto", "auto", "auto"]
+        assert reported == ["vaapi"]
+        assert "busy.ts" not in ffmpeg_module._hwaccel_refused
+
+    async def test_permanent_failure_reports_the_software_fallback(self, monkeypatch):
+        import numpy as np
+
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_refused", set())
+        monkeypatch.setattr(ffmpeg_module, "_hwaccel_proven", set())
+        monkeypatch.setattr(
+            ffmpeg_module, "select_hwaccel", lambda *a, **k: (["-hwaccel", "vaapi"], "vaapi")
+        )
+
+        async def decode(path, **kwargs):
+            if kwargs.get("hwaccel") != "cpu":
+                raise ffmpeg_module.DecodeError(
+                    "decoder failed", stderr="unsupported profile", returncode=1
+                )
+            yield 0.0, np.zeros((4, 4, 3), dtype=np.uint8)
+
+        monkeypatch.setattr(ffmpeg_module, "_decode_frames", decode)
+        reported: list[str] = []
+
+        frames = [
+            frame
+            async for frame in ffmpeg_module.iter_frames("broken.ts", on_decoder=reported.append)
+        ]
+
+        assert frames
+        assert reported == ["vaapi", "software"]
+        assert "broken.ts" in ffmpeg_module._hwaccel_refused
+
 
 class TestPtsWrapClamp:
     """The two files this clamp was written for, and why it never caught them.

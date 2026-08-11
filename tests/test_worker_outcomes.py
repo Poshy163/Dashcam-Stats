@@ -12,6 +12,7 @@ only at debug level, where nobody saw it.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,17 @@ from app.db.session import session_scope
 from app.pipeline.orchestrator import RunReport
 from app.workers import queue
 from app.workers.worker import ActiveJob, WorkerPool
+
+
+def test_reported_decoder_prefers_any_software_fallback():
+    report = SimpleNamespace(
+        stages=[
+            SimpleNamespace(stats={"decoder": "vaapi"}),
+            SimpleNamespace(stats={"decoder": "software"}),
+        ]
+    )
+
+    assert WorkerPool._decoder_from(report) == "software"
 
 
 class RecordingLog:

@@ -15,6 +15,7 @@ Two derivations happen here that the dashcam does not provide:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -78,6 +79,8 @@ class TelemetryResult:
     #: Fixes discarded for implying impossible movement -- misread coordinates.
     implausible_jumps: int = 0
     warnings: list[str] = field(default_factory=list)
+    #: The decoder that actually produced frames, after any hardware fallback.
+    decoder: str | None = None
 
     @property
     def fix_count(self) -> int:
@@ -206,6 +209,7 @@ class TelemetryExtractor:
         width: int | None = None,
         height: int | None = None,
         hwaccel: str = "auto",
+        on_decoder: Callable[[str], None] | None = None,
     ):
         if width is None or height is None:
             info = await probe(path)
@@ -213,7 +217,12 @@ class TelemetryExtractor:
         crop = region.to_crop(width, height)
         count = 0
         async for offset, frame in iter_frames(
-            path, fps=fps, crop=crop, grayscale=True, hwaccel=hwaccel
+            path,
+            fps=fps,
+            crop=crop,
+            grayscale=True,
+            hwaccel=hwaccel,
+            on_decoder=on_decoder,
         ):
             yield offset, frame
             count += 1
@@ -254,6 +263,11 @@ class TelemetryExtractor:
         Sampling faster costs proportionally more decode time and returns duplicates.
         """
         result = TelemetryResult()
+
+        def note_decoder(decoder: str) -> None:
+            if result.decoder != "software":
+                result.decoder = decoder
+
         if self._templates is None:
             result.warnings.append("no OSD glyph templates available")
             return result
@@ -269,7 +283,13 @@ class TelemetryExtractor:
 
         try:
             async for offset, frame in self._iter_strips(
-                path, region, fps=sample_fps, width=width, height=height, hwaccel=hwaccel
+                path,
+                region,
+                fps=sample_fps,
+                width=width,
+                height=height,
+                hwaccel=hwaccel,
+                on_decoder=note_decoder,
             ):
                 result.frames_read += 1
                 text, confidence = decode_line(binarise(frame), self._templates)

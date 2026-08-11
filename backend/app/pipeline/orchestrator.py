@@ -23,6 +23,7 @@ from app.pipeline.stages import STAGE_ORDER, STAGES, StageError, StageResult
 log = get_logger(__name__)
 
 ProgressCallback = Callable[[str, float], None]
+StageCompleteCallback = Callable[[StageResult], None]
 
 #: What the reprocess options in the UI expand to.
 REPROCESS_PRESETS: dict[str, tuple[str, ...]] = {
@@ -188,6 +189,7 @@ async def run_stages(
     stages: list[str] | None = None,
     *,
     progress: ProgressCallback | None = None,
+    stage_complete: StageCompleteCallback | None = None,
 ) -> RunReport:
     """Execute the requested stages against one recording."""
     selected = expand_stages(stages)
@@ -241,9 +243,24 @@ async def run_stages(
         if progress:
             progress(name, index / total)
 
+        stage_started = time.monotonic()
         try:
             result = await stage(session, recording, progress=stage_progress)
+            elapsed = round(time.monotonic() - stage_started, 3)
+            if result.stats is None:
+                result.stats = {}
+            result.stats["elapsed_s"] = elapsed
             report.stages.append(result)
+            if stage_complete:
+                stage_complete(result)
+            log.info(
+                "processing stage complete",
+                recording=recording.filename,
+                stage=name,
+                elapsed_s=elapsed,
+                decoder=result.stats.get("decoder"),
+                device=result.stats.get("device"),
+            )
             await session.flush()
             # Release the write lock between stages rather than holding it across the
             # next decode. See the note above the first commit.

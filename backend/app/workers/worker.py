@@ -210,6 +210,18 @@ class WorkerPool:
                 return str(device)
         return None
 
+    @staticmethod
+    def _decoder_from(report) -> str | None:
+        """Summarise the decoder actually used, preferring any software fallback."""
+        found: str | None = None
+        for stage in report.stages:
+            decoder = (stage.stats or {}).get("decoder")
+            if decoder == "software":
+                return "software"
+            if decoder:
+                found = str(decoder)
+        return found
+
     async def _run_job(
         self, job_id: int, recording_id: int | None, stages: list[str] | None, filename: str
     ) -> None:
@@ -228,7 +240,9 @@ class WorkerPool:
             job_id=job_id,
             recording_id=recording_id,
             filename=filename,
-            decoder="vaapi" if hardware.vaapi_available else "software",
+            # Availability is not usage. The stage callback fills this with the decoder
+            # that actually produced frames, including a VAAPI-to-software fallback.
+            decoder=None if hardware.vaapi_available else "software",
         )
         self._active[job_id] = active
 
@@ -286,12 +300,28 @@ class WorkerPool:
                 active.stage = stage
                 active.progress = fraction
 
-            report = await run_stages(session, recording, selected, progress=on_progress)
+            def on_stage_complete(result) -> None:
+                stats = result.stats or {}
+                decoder = stats.get("decoder")
+                if decoder == "software" or (decoder and active.decoder is None):
+                    active.decoder = str(decoder)
+                device = stats.get("device")
+                if device:
+                    active.inference_device = str(device)
+
+            report = await run_stages(
+                session,
+                recording,
+                selected,
+                progress=on_progress,
+                stage_complete=on_stage_complete,
+            )
             active.speed_realtime = report.realtime_factor
             # Which device actually ran inference is only known once a stage has used
             # one, and it is worth surfacing: it is the difference between the iGPU
             # doing the work and the CPU quietly doing it instead.
             active.inference_device = self._device_from(report) or active.inference_device
+            active.decoder = self._decoder_from(report) or active.decoder
 
             # Flush the recording's own outcome here, in the session that owns it. Left
             # dirty, it was flushed later by the first query of the bookkeeping below --

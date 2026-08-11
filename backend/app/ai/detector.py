@@ -25,6 +25,7 @@ import numpy as np
 from app.ai.models import DEFAULT_DETECTION_MODEL, REGISTRY, ROAD_CLASSES, ensure_model
 from app.ai.runtime import onnx_providers
 from app.core.logging import get_logger
+from app.core.resources import configure_opencv_threads, onnx_session_options
 from app.core.settings_service import get_settings_service
 
 log = get_logger(__name__)
@@ -99,12 +100,14 @@ async def load_detector(name: str, *, conf_thresh: float | None = None) -> Any |
         return None
 
     def build() -> Any:
+        configure_opencv_threads()
         return create_detector(
             path,
             backend=spec.runtime,
             class_labels=labels,
             conf_thresh=conf_thresh,
             providers=list(onnx_providers()),
+            sess_options=onnx_session_options(),
         )
 
     try:

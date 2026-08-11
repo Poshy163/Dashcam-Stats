@@ -21,7 +21,7 @@ import contextlib
 import json
 import math
 import shutil
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 
 from app.core.logging import get_logger
+from app.core.resources import native_thread_budget
 from app.hardware.detect import detect_hardware
 
 log = get_logger(__name__)
@@ -639,12 +640,26 @@ async def _decode_frames(
         fps=fps, crop=crop, scale=scale, hwaccel_label=label, pix_fmt=pix_fmt
     )
 
-    cmd = [ffmpeg_path(), "-hide_banner", "-v", "error", "-nostdin"]
+    threads = native_thread_budget()
+    cmd = [
+        ffmpeg_path(),
+        "-hide_banner",
+        "-v",
+        "error",
+        "-nostdin",
+        # FFmpeg otherwise creates one filter thread per available CPU for every worker.
+        # With two jobs this host had forty runnable filter threads before OpenCV or ONNX
+        # Runtime did any work of their own.
+        "-filter_threads",
+        str(threads),
+    ]
     if start:
         # Before -i so the seek is done by demuxing rather than decode-and-discard.
         cmd += ["-ss", f"{start:g}"]
     cmd += hw_args
-    cmd += ["-i", str(path)]
+    # This is an input codec option here, so software fallback cannot quietly create a
+    # full-machine decoder pool after VAAPI gives up.
+    cmd += ["-threads", str(threads), "-i", str(path)]
     if duration:
         cmd += ["-t", f"{duration:g}"]
     cmd += ["-map", "0:v:0", "-vf", chain, "-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"]
@@ -722,6 +737,7 @@ async def iter_frames(
     codec: str | None = None,
     grayscale: bool = False,
     timeout: float = DEFAULT_DECODE_TIMEOUT,
+    on_decoder: Callable[[str], None] | None = None,
 ) -> AsyncIterator[tuple[float, np.ndarray]]:
     """Yield ``(offset_seconds, frame)`` decoded from *path*, falling back to software.
 
@@ -745,7 +761,6 @@ async def iter_frames(
         "timeout": timeout,
     }
     _, label = select_hwaccel(hwaccel, codec)
-    yielded = 0
 
     # A file that already refused to decode on the GPU will refuse again. Without this,
     # every stage that reads it pays a failed ffmpeg launch first, and a damaged file is
@@ -754,58 +769,67 @@ async def iter_frames(
     # already known.
     if label != "software" and str(path) in _hwaccel_refused:
         hwaccel, label = "cpu", "software"
+    if on_decoder:
+        on_decoder(label)
 
-    try:
-        async for item in _decode_frames(path, hwaccel=hwaccel, **kwargs):
-            yielded += 1
-            if yielded == 1 and label != "software":
-                # This file and this GPU demonstrably work together. Remember it.
-                _remember_hwaccel_success(path)
-            yield item
-        return
-    except FFmpegError as exc:
-        # Retrying is only safe before anything reached the caller; mid-stream the
-        # consumer has already seen frames and would receive them twice.
-        if label == "software" or yielded:
-            raise
-        if _is_empty_window(exc):
-            # ffmpeg ran to completion and simply found nothing in the window asked for.
-            # That is a fact about the window, not about the GPU, and software decode
-            # would find exactly the same nothing. Retrying wastes a process launch;
-            # memoising it is worse -- it condemned the rest of the file to the CPU.
-            raise
-        if str(path) in _hwaccel_proven:
-            # The strongest evidence available, and it beats reading stderr: this file has
-            # already handed back frames on this GPU in this process. Whatever just went
-            # wrong with a 0.5 s window in the middle of it, "the GPU cannot decode this
-            # file" is not it.
-            #
-            # This is the case that survived the returncode check. A 62 MB clip would
-            # decode on VAAPI for its entire detection stage, tracking 134 vehicles, and
-            # then one of the 134 per-track seeks in the plates stage would exit non-zero
-            # with no frames -- and that single window sent the rest of the recording to
-            # the CPU while the Queue page still read "Decoder: vaapi".
-            log.debug(
-                "a hardware decode failed on a file that has already decoded on hardware",
-                file=Path(path).name,
-                decoder=label,
-                error=str(exc),
-                start=kwargs.get("start"),
-                duration=kwargs.get("duration"),
-            )
-        else:
-            _remember_hwaccel_failure(path)
-            log.warning(
-                "hardware decode failed; using software for this file from now on",
-                file=Path(path).name,
-                decoder=label,
-                error=str(exc),
-                # Without these the warning cannot be acted on: "no frames decoded" reads
-                # identically whether the driver refused or the window was simply empty.
-                returncode=getattr(exc, "returncode", None),
-                stderr=(getattr(exc, "stderr", "") or "")[-400:],
-            )
+    failure: FFmpegError | None = None
+    for attempt in range(3):
+        yielded = 0
+        try:
+            async for item in _decode_frames(path, hwaccel=hwaccel, **kwargs):
+                yielded += 1
+                if yielded == 1 and label != "software":
+                    # This file and this GPU demonstrably work together. Remember it.
+                    _remember_hwaccel_success(path)
+                yield item
+            return
+        except FFmpegError as exc:
+            # Retrying is only safe before anything reached the caller; mid-stream the
+            # consumer has already seen frames and would receive them twice.
+            if label == "software" or yielded:
+                raise
+            if _is_empty_window(exc):
+                # ffmpeg ran to completion and simply found nothing in the window asked for.
+                # That is a fact about the window, not about the GPU, and software decode
+                # would find exactly the same nothing.
+                raise
+            if _is_transient_hwaccel_failure(exc) and attempt < 2:
+                log.info(
+                    "hardware decoder was busy; retrying before software fallback",
+                    file=Path(path).name,
+                    decoder=label,
+                    attempt=attempt + 1,
+                )
+                await asyncio.sleep(0.25 * (attempt + 1))
+                continue
+            failure = exc
+            break
 
+    assert failure is not None
+    if str(path) in _hwaccel_proven:
+        # A short seek may fail inside a damaged GOP even after a successful full-file
+        # hardware pass. Fall back for this window only; do not condemn the whole file.
+        log.debug(
+            "a hardware decode failed on a file that has already decoded on hardware",
+            file=Path(path).name,
+            decoder=label,
+            error=str(failure),
+            start=kwargs.get("start"),
+            duration=kwargs.get("duration"),
+        )
+    else:
+        _remember_hwaccel_failure(path)
+        log.warning(
+            "hardware decode failed; using software for this file from now on",
+            file=Path(path).name,
+            decoder=label,
+            error=str(failure),
+            returncode=getattr(failure, "returncode", None),
+            stderr=(getattr(failure, "stderr", "") or "")[-400:],
+        )
+
+    if on_decoder:
+        on_decoder("software")
     async for item in _decode_frames(path, hwaccel="cpu", **kwargs):
         yield item
 
@@ -822,6 +846,19 @@ _HWACCEL_STDERR_MARKERS = (
     "drm",
     "/dev/dri",
 )
+
+_TRANSIENT_HWACCEL_MARKERS = (
+    "hw busy",
+    "device busy",
+    "resource temporarily unavailable",
+    "failed to sync surface",
+    "hwaccel initialisation returned error",
+)
+
+
+def _is_transient_hwaccel_failure(exc: FFmpegError) -> bool:
+    stderr = (getattr(exc, "stderr", "") or "").lower()
+    return any(marker in stderr for marker in _TRANSIENT_HWACCEL_MARKERS)
 
 
 def _is_empty_window(exc: FFmpegError) -> bool:
