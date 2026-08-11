@@ -382,6 +382,8 @@ class TestPlateStageWriteLock:
             size_bytes=1024,
             state=RecordingState.PROCESSING,
             duration_s=60.0,
+            width=1920,
+            height=1080,
         )
         db_session.add(recording)
         await db_session.flush()
@@ -423,6 +425,7 @@ class TestPlateStageWriteLock:
             """Stands in for the decode: the expensive, non-database part of the loop."""
             seen_tracks["count"] += 1
             observed.setdefault("decode_timeouts", []).append(kwargs.get("timeout"))
+            observed.setdefault("frame_sizes", []).append(kwargs.get("frame_size"))
             if seen_tracks["count"] == 1:
                 # Mid-loop, exactly where the 150 seconds of real work happen.
                 try:
@@ -454,6 +457,10 @@ class TestPlateStageWriteLock:
         assert observed["decode_timeouts"] == [stages._PLATE_FRAME_SEEK_TIMEOUT_S] * 3, (
             "a half-second plate seek inherited the fifteen-minute full-decode timeout; "
             "one bad GOP can hold VAAPI and stop every worker behind it"
+        )
+        assert observed["frame_sizes"] == [(1920, 1080)] * 3, (
+            "the plates stage ignored geometry already stored by metadata and will run "
+            "ffprobe once per vehicle against the network share"
         )
         assert observed.get("wrote"), (
             "a second session could not write while the plates stage was reading tracks: "

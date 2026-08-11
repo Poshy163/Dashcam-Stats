@@ -1290,6 +1290,11 @@ async def stage_plates(
                 start=track.best_frame_offset_s,
                 duration=0.5,
                 fps=None,
+                # Metadata already established this geometry. Supplying it prevents every
+                # plate candidate from launching ffprobe against the unindexed TS over NFS.
+                frame_size=(recording.width, recording.height)
+                if recording.width and recording.height
+                else None,
                 hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
                 codec=recording.video_codec,
                 timeout=_PLATE_FRAME_SEEK_TIMEOUT_S,

@@ -115,6 +115,9 @@ def _vaapi_decode_lock() -> asyncio.Lock:
 
 DEFAULT_PROBE_TIMEOUT = 60.0
 DEFAULT_DECODE_TIMEOUT = 900.0
+#: A process in uninterruptible network-filesystem I/O cannot honour SIGKILL until the
+#: kernel call returns. Never let cleanup of that child pin the application indefinitely.
+PROCESS_EXIT_GRACE_S = 2.0
 
 
 class FFmpegError(RuntimeError):
@@ -216,7 +219,7 @@ class ProbeResult:
 
 #: Probes already run this session, keyed by path, holding ``(identity, result)``.
 #:
-#: Probing is not cheap here: ffprobe is a subprocess, the footage lives on an SMB share,
+#: Probing is not cheap here: ffprobe is a subprocess, the footage lives on a network share,
 #: and MPEG-TS carries no index, so establishing a duration means reading from both ends
 #: of the file. When the frame rate has to be recounted it is a second subprocess again.
 #: Nothing in a file changes while it is being processed, yet the plates stage probed once
@@ -224,6 +227,12 @@ class ProbeResult:
 #: size it already had.
 _probe_cache: dict[str, tuple[tuple[int, int], ProbeResult]] = {}
 _PROBE_CACHE_MAX = 256
+#: Retrying later is useful; retrying once per tracked vehicle turns one NFS outage into
+#: hundreds of identical ffprobe jobs.
+_probe_failures: dict[
+    str, tuple[tuple[int, int] | None, float, type[FFmpegError], str, str, int | None]
+] = {}
+_PROBE_FAILURE_BACKOFF_S = 60.0
 
 
 def _probe_identity(p: Path) -> tuple[int, int] | None:
@@ -238,6 +247,24 @@ def _probe_identity(p: Path) -> tuple[int, int] | None:
 def clear_probe_cache() -> None:
     """Forget every cached probe. For tests, and for a rescan that must not trust it."""
     _probe_cache.clear()
+    _probe_failures.clear()
+
+
+async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
+    """Kill *proc* without waiting forever for a blocked NFS syscall to return."""
+    if proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=PROCESS_EXIT_GRACE_S)
+    except TimeoutError:
+        log.warning(
+            "subprocess did not exit after SIGKILL; leaving it for the child watcher",
+            pid=proc.pid,
+        )
+    except Exception:
+        # Cleanup must not replace the useful probe/decode error being raised by caller.
+        pass
 
 
 async def _run(
@@ -252,11 +279,9 @@ async def _run(
     try:
         out, err = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout)
     except TimeoutError:
-        # A hung ffmpeg holds a decoder and a file handle; kill it rather than leak it.
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
+        # SIGKILL cannot immediately release a process sleeping in an NFS kernel call, so
+        # cleanup is bounded as well as the actual ffprobe/ffmpeg work.
+        await _terminate_process(proc)
         raise FFmpegError(f"timed out after {timeout:.0f}s: {' '.join(cmd[:3])}") from None
     return proc.returncode or 0, out, err
 
@@ -330,20 +355,32 @@ async def probe(path: Path | str, *, timeout: float = DEFAULT_PROBE_TIMEOUT) -> 
 
     Results are memoised against the file's size and mtime for the life of the process,
     because the answer cannot change while the file does not and the stages ask for it
-    repeatedly. Failures are deliberately not cached: an unreadable file is usually
-    unreadable because of the share rather than the file, and that is worth retrying.
+    repeatedly. Failures get a short backoff rather than a permanent cache: a share outage
+    is worth retrying, but not hundreds of times inside one plate-analysis loop.
     """
     p = Path(path)
-    identity = _probe_identity(p)
+    # A stat against a hard NFS mount may sleep for seconds or minutes. It used to run on
+    # Uvicorn's event loop, taking /health and every UI route down with the worker.
+    identity = await asyncio.to_thread(_probe_identity, p)
     if identity is not None:
         cached = _probe_cache.get(str(p))
         if cached is not None and cached[0] == identity:
             return cached[1]
 
+    failed = _probe_failures.get(str(p))
+    now = asyncio.get_running_loop().time()
+    if failed is not None:
+        failed_identity, retry_at, error_type, message, stderr, returncode = failed
+        if failed_identity == identity and now < retry_at:
+            raise error_type(message, stderr=stderr, returncode=returncode)
+        _probe_failures.pop(str(p), None)
+
     result = ProbeResult(path=str(p))
 
     try:
-        result.size_bytes = p.stat().st_size
+        result.size_bytes = (
+            identity[0] if identity is not None else (await asyncio.to_thread(p.stat)).st_size
+        )
     except OSError as exc:
         raise ProbeError(f"cannot stat {p.name}: {exc}") from exc
 
@@ -351,7 +388,21 @@ async def probe(path: Path | str, *, timeout: float = DEFAULT_PROBE_TIMEOUT) -> 
     if result.size_bytes == 0:
         raise ProbeError(f"{p.name} is empty (0 bytes)")
 
-    data = await ffprobe_raw(p, timeout=timeout)
+    try:
+        data = await ffprobe_raw(p, timeout=timeout)
+    except FFmpegError as exc:
+        if len(_probe_failures) >= _PROBE_CACHE_MAX:
+            _probe_failures.pop(next(iter(_probe_failures)))
+        _probe_failures[str(p)] = (
+            identity,
+            asyncio.get_running_loop().time() + _PROBE_FAILURE_BACKOFF_S,
+            type(exc),
+            str(exc),
+            exc.stderr,
+            exc.returncode,
+        )
+        raise
+    _probe_failures.pop(str(p), None)
     result.raw = data
 
     fmt = data.get("format") or {}
@@ -633,6 +684,7 @@ async def _decode_frames(
     fps: float | None = None,
     crop: Crop | None = None,
     scale: tuple[int, int] | None = None,
+    frame_size: tuple[int, int] | None = None,
     start: float | None = None,
     duration: float | None = None,
     hwaccel: str = "auto",
@@ -651,6 +703,8 @@ async def _decode_frames(
         width, height = scale
     elif crop:
         width, height = crop.width, crop.height
+    elif frame_size:
+        width, height = frame_size
     else:
         info = await probe(path)
         if not info.width or not info.height:
@@ -725,12 +779,10 @@ async def _decode_frames(
             yield offset, frame
             index += 1
     finally:
-        if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        with contextlib.suppress(Exception):
+        await _terminate_process(proc)
+        if not drainer.done():
+            drainer.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await drainer
 
     stderr = b"".join(stderr_chunks).decode("utf-8", "replace")
@@ -752,6 +804,7 @@ async def iter_frames(
     fps: float | None = None,
     crop: Crop | None = None,
     scale: tuple[int, int] | None = None,
+    frame_size: tuple[int, int] | None = None,
     start: float | None = None,
     duration: float | None = None,
     hwaccel: str = "auto",
@@ -775,6 +828,7 @@ async def iter_frames(
         "fps": fps,
         "crop": crop,
         "scale": scale,
+        "frame_size": frame_size,
         "start": start,
         "duration": duration,
         "codec": codec,

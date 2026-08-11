@@ -589,6 +589,130 @@ class TestProbeIsNotRepeated:
 
         assert calls["count"] == 2, "a rewritten file was served from the probe cache"
 
+    async def test_a_failed_probe_is_not_relaunched_for_every_vehicle(self, tmp_path, monkeypatch):
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        clip = tmp_path / "unavailable.ts"
+        clip.write_bytes(b"not media")
+        calls = {"count": 0}
+
+        async def failed_raw(path, **kwargs):
+            calls["count"] += 1
+            raise ffmpeg_module.ProbeError(
+                "ffprobe produced no output for unavailable.ts",
+                stderr="network input/output error",
+                returncode=-6,
+            )
+
+        ffmpeg_module.clear_probe_cache()
+        monkeypatch.setattr(ffmpeg_module, "ffprobe_raw", failed_raw)
+
+        with pytest.raises(ffmpeg_module.ProbeError):
+            await ffmpeg_module.probe(clip)
+        with pytest.raises(ffmpeg_module.ProbeError):
+            await ffmpeg_module.probe(clip)
+
+        assert calls["count"] == 1, (
+            "one failed network probe was immediately repeated instead of observing backoff"
+        )
+
+
+class TestKnownFrameGeometry:
+    async def test_iter_frames_passes_known_geometry_to_the_decoder(self, monkeypatch):
+        import numpy as np
+
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        seen = []
+
+        async def decode(path, **kwargs):
+            seen.append(kwargs.get("frame_size"))
+            yield 0.0, np.zeros((4, 4, 3), dtype=np.uint8)
+
+        monkeypatch.setattr(ffmpeg_module, "_decode_frames", decode)
+
+        frames = [
+            frame async for frame in ffmpeg_module.iter_frames("clip.ts", frame_size=(1920, 1080))
+        ]
+
+        assert frames
+        assert seen == [(1920, 1080)]
+
+    async def test_known_geometry_bypasses_probe_inside_the_decoder(self, monkeypatch):
+        import asyncio
+
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        class Stdout:
+            def __init__(self):
+                self.sent = False
+
+            async def readexactly(self, size):
+                if not self.sent:
+                    self.sent = True
+                    return b"\x00" * size
+                raise asyncio.IncompleteReadError(b"", size)
+
+        class Stderr:
+            async def read(self, size):
+                return b""
+
+        class Process:
+            pid = 123
+            returncode = 0
+            stdout = Stdout()
+            stderr = Stderr()
+
+            async def wait(self):
+                return 0
+
+        async def create_process(*args, **kwargs):
+            return Process()
+
+        async def forbidden_probe(path, **kwargs):
+            raise AssertionError("stored frame geometry should make ffprobe unnecessary")
+
+        monkeypatch.setattr(ffmpeg_module, "probe", forbidden_probe)
+        monkeypatch.setattr(ffmpeg_module, "ffmpeg_path", lambda: "ffmpeg")
+        monkeypatch.setattr(
+            ffmpeg_module, "select_hwaccel", lambda *args, **kwargs: ([], "software")
+        )
+        monkeypatch.setattr(ffmpeg_module.asyncio, "create_subprocess_exec", create_process)
+
+        frames = [
+            frame
+            async for frame in ffmpeg_module._decode_frames(
+                "clip.ts", frame_size=(2, 2), hwaccel="cpu"
+            )
+        ]
+
+        assert len(frames) == 1
+
+
+class TestBoundedProcessCleanup:
+    async def test_a_child_stuck_after_sigkill_does_not_pin_the_caller(self, monkeypatch):
+        import asyncio
+
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        class StuckProcess:
+            pid = 456
+            returncode = None
+            killed = False
+
+            def kill(self):
+                self.killed = True
+
+            async def wait(self):
+                await asyncio.Event().wait()
+
+        process = StuckProcess()
+        monkeypatch.setattr(ffmpeg_module, "PROCESS_EXIT_GRACE_S", 0.01)
+
+        await asyncio.wait_for(ffmpeg_module._terminate_process(process), timeout=0.2)
+
+        assert process.killed
+
 
 class TestAProvenFileIsNotDemoted:
     """A GPU that decoded this file once can decode it again.
