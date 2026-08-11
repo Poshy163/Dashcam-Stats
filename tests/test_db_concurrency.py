@@ -471,3 +471,82 @@ class TestPlateStageWriteLock:
         async with session_scope() as session:
             rec = await session.get(Recording, recording_id)
             assert rec.plate_state is StageState.DONE
+
+
+class TestPlateStageReusesDetectionCrops:
+    async def test_stored_vehicle_crops_avoid_ffmpeg_and_the_footage_mount(
+        self, db_session, monkeypatch
+    ):
+        import numpy as np
+
+        from app.db.models import TrackedObject
+        from app.pipeline import stages
+
+        recording = Recording(
+            rel_path="stored_crop.ts",
+            filename="stored_crop.ts",
+            size_bytes=1024,
+            state=RecordingState.PROCESSING,
+            duration_s=60.0,
+            width=1920,
+            height=1080,
+        )
+        db_session.add(recording)
+        await db_session.flush()
+        db_session.add(
+            TrackedObject(
+                recording_id=recording.id,
+                track_key=1,
+                class_label="car",
+                confidence_max=0.9,
+                confidence_avg=0.8,
+                first_seen_offset_s=1.0,
+                last_seen_offset_s=2.0,
+                duration_s=1.0,
+                frame_count=5,
+                best_frame_offset_s=1.0,
+                best_bbox=[0.1, 0.2, 0.5, 0.7],
+                crop_path="vehicles/00000001/0001.jpg",
+            )
+        )
+        await db_session.flush()
+
+        stored = np.full((120, 240, 3), 80, dtype=np.uint8)
+        observed: dict[str, object] = {}
+
+        class FakeDetector:
+            async def detect(self, image, *, min_width_px=0):
+                observed["image"] = image
+                return []
+
+        class FakeOCR:
+            async def read(self, image):  # pragma: no cover - detector returns no boxes
+                return "", 0.0
+
+        async def fake_models():
+            return FakeDetector(), FakeOCR()
+
+        async def fake_load(path):
+            observed["path"] = path
+            return stored
+
+        async def forbidden_decode(*args, **kwargs):
+            raise AssertionError("stored crop unexpectedly fell back to FFmpeg")
+            yield  # pragma: no cover - keeps this an async generator
+
+        def forbidden_footage_path(*args, **kwargs):
+            raise AssertionError("stored crop unexpectedly touched the NFS footage mount")
+
+        monkeypatch.setattr(stages, "_shared_plate_models", fake_models)
+        monkeypatch.setattr(stages, "_load_jpeg", fake_load)
+        monkeypatch.setattr(stages, "iter_frames", forbidden_decode)
+        monkeypatch.setattr(stages, "resolve_footage_path", forbidden_footage_path)
+
+        result = await stages.stage_plates(db_session, recording)
+
+        assert result.ok
+        assert observed["path"] == "vehicles/00000001/0001.jpg"
+        assert observed["image"] is stored
+        assert result.stats["stored_vehicle_crops"] == 1
+        assert result.stats["decoded_vehicle_frames"] == 0
+        assert result.stats["missing_vehicle_frames"] == 0

@@ -39,7 +39,7 @@ from app.ai.runtime import describe_runtime
 from app.ai.tracker import ByteTracker
 from app.config import get_config
 from app.core.logging import get_logger
-from app.core.paths import relative_to_media, resolve_footage_path
+from app.core.paths import relative_to_media, resolve_footage_path, resolve_media_path
 from app.core.settings_service import get_settings_service
 from app.db.models import (
     Camera,
@@ -152,6 +152,25 @@ def _save_jpeg(image: np.ndarray, path: Path, quality: int = 85) -> str | None:
     except Exception as exc:
         log.debug("could not write crop", path=str(path), error=str(exc))
     return None
+
+
+async def _load_jpeg(rel_path: str | None) -> np.ndarray | None:
+    """Read a media crop without blocking the application loop on local filesystem I/O."""
+    if not rel_path:
+        return None
+
+    def load() -> np.ndarray | None:
+        import cv2
+
+        path = resolve_media_path(rel_path, must_exist=True)
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        return image if image is not None and image.size else None
+
+    try:
+        return await asyncio.to_thread(load)
+    except Exception as exc:
+        log.debug("could not read stored crop", path=rel_path, error=str(exc))
+        return None
 
 
 #: A frame this flat carries no picture. Decoders emit a solid fill -- classically green
@@ -1208,12 +1227,12 @@ class _PlateHit:
     vehicle_crop: np.ndarray | None
 
 
-# Each plate candidate asks FFmpeg for one frame from a half-second window. The general
+# New detections carry a stored vehicle crop and do not decode here. Older/incomplete rows
+# still need a frame from a half-second window as a compatibility fallback. The general
 # decoder timeout is deliberately fifteen minutes for long sequential reads, but applying
-# it to this tiny random seek lets one damaged GOP monopolise the single shared VAAPI slot
-# for the full fifteen minutes while every other worker waits behind it. Normal live seeks
-# complete in well under a second; fifteen seconds leaves ample SMB/decoder headroom and
-# turns an unreadable candidate into a skipped frame rather than a stopped queue.
+# it to that tiny random seek lets one damaged GOP monopolise the shared VAAPI slot. Normal
+# seeks complete in well under a second; fifteen seconds turns an unreadable candidate into
+# a skipped frame rather than a stopped queue.
 _PLATE_FRAME_SEEK_TIMEOUT_S = 15.0
 
 
@@ -1251,7 +1270,6 @@ async def stage_plates(
         recording.plate_state = StageState.DONE
         return StageResult("plates", True, "no vehicles to inspect")
 
-    path = resolve_footage_path(recording.rel_path)
     min_width = int(settings.get_nowait("plates.min_plate_width"))
     max_reads = int(settings.get_nowait("plates.max_ocr_per_track"))
     min_store = float(settings.get_nowait("plates.min_store_confidence"))
@@ -1277,50 +1295,69 @@ async def stage_plates(
     store_unmatched = bool(settings.get_nowait("plates.store_unmatched"))
     rejected = 0
     decoders_used: set[str] = set()
+    stored_crops = 0
+    decoded_fallbacks = 0
+    missing_frames = 0
+    footage_path: Path | None = None
     for index, track in enumerate(tracks):
         if track.best_frame_offset_s is None or not track.best_bbox:
             continue
         if progress:
             progress("plates", (index + 1) / max(1, len(tracks)))
 
-        frame = None
-        try:
-            async for _, decoded in iter_frames(
-                path,
-                start=track.best_frame_offset_s,
-                duration=0.5,
-                fps=None,
-                # Metadata already established this geometry. Supplying it prevents every
-                # plate candidate from launching ffprobe against the unindexed TS over NFS.
-                frame_size=(recording.width, recording.height)
-                if recording.width and recording.height
-                else None,
-                hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
-                codec=recording.video_codec,
-                timeout=_PLATE_FRAME_SEEK_TIMEOUT_S,
-                on_decoder=decoders_used.add,
-            ):
-                frame = decoded
-                break
-        except FFmpegError:
-            continue
-        if frame is None:
-            continue
-
-        height, width = frame.shape[:2]
         bx1, by1, bx2, by2 = track.best_bbox
         vehicle = _as_detection(bx1, by1, bx2, by2, track.class_label, track.confidence_max)
-        vehicle_crop = crop_with_margin(
-            frame, (vehicle.x, vehicle.y, vehicle.x + vehicle.w, vehicle.y + vehicle.h), 0.02
-        )
+        # Detection already selected and saved the sharpest crop for this track. Reusing it
+        # avoids one random NFS seek and one VAAPI process lifecycle per vehicle. On the live
+        # corpus that was 143 launches for a 60-second clip, and the repeated initialisation
+        # eventually made iHD report the decoder busy and sent the remainder to software.
+        vehicle_crop = await _load_jpeg(track.crop_path)
+        if vehicle_crop is not None:
+            stored_crops += 1
+        else:
+            frame = None
+            if footage_path is None:
+                # Resolution of a hard NFS path can itself block; keep even the compatibility
+                # fallback away from Uvicorn's event loop.
+                footage_path = await asyncio.to_thread(resolve_footage_path, recording.rel_path)
+            try:
+                async for _, decoded in iter_frames(
+                    footage_path,
+                    start=track.best_frame_offset_s,
+                    duration=0.5,
+                    fps=None,
+                    frame_size=(recording.width, recording.height)
+                    if recording.width and recording.height
+                    else None,
+                    hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
+                    codec=recording.video_codec,
+                    timeout=_PLATE_FRAME_SEEK_TIMEOUT_S,
+                    on_decoder=decoders_used.add,
+                ):
+                    frame = decoded
+                    break
+            except FFmpegError:
+                pass
+            if frame is not None:
+                # Exact track box, matching the coordinates persisted beside the crop. The
+                # previous 2% expansion also made plate_box_in_frame subtly mis-register.
+                vehicle_crop = crop_with_margin(
+                    frame,
+                    (vehicle.x, vehicle.y, vehicle.x + vehicle.w, vehicle.y + vehicle.h),
+                    0.0,
+                )
+                decoded_fallbacks += 1
         if vehicle_crop is None or vehicle_crop.size == 0:
+            missing_frames += 1
             continue
 
         boxes = await detector.detect(vehicle_crop, min_width_px=min_width)
         readings: list[PlateReading] = []
         for plate_box, confidence in boxes:
             frame_box = plate_box_in_frame(vehicle, plate_box)
-            crop = crop_with_margin(frame, frame_box)
+            # The detector's coordinates are relative to vehicle_crop; crop from that same
+            # image. Reapplying them to a separately expanded full-frame box shifted crops.
+            crop = crop_with_margin(vehicle_crop, plate_box)
             if crop is None:
                 continue
             readings.append(
@@ -1418,6 +1455,9 @@ async def stage_plates(
             # automatic decision that must be visible when it goes wrong, and a sighting
             # with no location is a result rather than a gap.
             "rejected_unmatched": rejected,
+            "stored_vehicle_crops": stored_crops,
+            "decoded_vehicle_frames": decoded_fallbacks,
+            "missing_vehicle_frames": missing_frames,
             "without_position": sum(1 for _, located in placed if located is None),
             "decoder": (
                 "software"
