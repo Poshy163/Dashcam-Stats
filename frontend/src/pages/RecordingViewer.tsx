@@ -39,23 +39,25 @@ const CLASS_COLOUR: Record<string, string> = {
   person: 'bg-state-error',
 }
 
-/** Nearest telemetry sample at or before `t`. Binary search: this runs on every tick. */
+/** Nearest telemetry sample to `t`. Binary search: this runs on every player tick. */
 function findPoint(points: TelemetryPoint[], t: number): TelemetryPoint | null {
   if (points.length === 0) return null
   let low = 0
   let high = points.length - 1
-  let best: TelemetryPoint | null = null
   while (low <= high) {
     const mid = (low + high) >> 1
     const point = points[mid]!
     if (point.tOffsetS <= t) {
-      best = point
       low = mid + 1
     } else {
       high = mid - 1
     }
   }
-  return best ?? points[0]!
+  const before = high >= 0 ? points[high]! : null
+  const after = low < points.length ? points[low]! : null
+  if (!before) return after
+  if (!after) return before
+  return Math.abs(before.tOffsetS - t) <= Math.abs(after.tOffsetS - t) ? before : after
 }
 
 /**
@@ -144,11 +146,87 @@ function OsdDebugPanel({
 
       {debug.data && (
         <div className="space-y-2">
-          <img
-            src={api.recordings.osdDebugImage(recordingId, at)}
-            alt="Frame, cropped overlay strip, and the thresholded mask"
-            className="w-full rounded border border-border"
-          />
+          {debug.data.rereadAvailable ? (
+            <img
+              src={api.recordings.osdDebugImage(recordingId, at)}
+              alt="Frame, cropped overlay strip, and the thresholded mask"
+              className="w-full rounded border border-border"
+            />
+          ) : (
+            <p className="rounded border border-state-warn/40 bg-state-warn/5 p-2 text-xs text-state-warn">
+              {debug.data.rereadError}. The stored processing sample below is still
+              available and is the authoritative result used by the application.
+            </p>
+          )}
+          <div className="rounded border border-border p-2">
+            <div className="mb-1 text-xs font-medium">Canonical timeline</div>
+            <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs sm:grid-cols-4">
+              <div>
+                <dt className="text-content-faint">Frame number</dt>
+                <dd className="tabular">{debug.data.timeline.frameNumber ?? 'â€”'}</dd>
+              </div>
+              <div>
+                <dt className="text-content-faint">Video PTS</dt>
+                <dd className="tabular">{debug.data.timeline.videoPtsS.toFixed(3)}s</dd>
+              </div>
+              <div>
+                <dt className="text-content-faint">Expected time</dt>
+                <dd className="tabular">{formatDateTime(debug.data.timeline.expectedAt)}</dd>
+              </div>
+              <div>
+                <dt className="text-content-faint">Stored sample delta</dt>
+                <dd className="tabular">
+                  {debug.data.storedSample ? `${debug.data.storedSample.dtS.toFixed(3)}s` : 'â€”'}
+                </dd>
+              </div>
+            </dl>
+          </div>
+          {debug.data.storedSample && (
+            <div className="rounded border border-border p-2">
+              <div className="mb-1 text-xs font-medium">Stored processing sample</div>
+              <div className="tabular break-all text-xs">
+                {debug.data.storedSample.rawText || '(nothing decoded)'}
+              </div>
+              <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-xs sm:grid-cols-3">
+                <div>
+                  <dt className="text-content-faint">Sample offset</dt>
+                  <dd className="tabular">{debug.data.storedSample.tOffsetS.toFixed(3)}s</dd>
+                </div>
+                <div>
+                  <dt className="text-content-faint">Time</dt>
+                  <dd>{debug.data.storedSample.quality.timeStatus ?? 'unknown'} Â· {debug.data.storedSample.quality.timeSource ?? 'unknown'}</dd>
+                </div>
+                <div>
+                  <dt className="text-content-faint">GPS</dt>
+                  <dd>{debug.data.storedSample.quality.gpsStatus ?? 'unknown'} Â· {debug.data.storedSample.quality.gpsSource ?? 'none'}</dd>
+                </div>
+                <div>
+                  <dt className="text-content-faint">Position</dt>
+                  <dd className="tabular">
+                    {debug.data.storedSample.hasFix
+                      ? formatCoords(debug.data.storedSample.lat, debug.data.storedSample.lon)
+                      : 'unavailable'}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-content-faint">Candidates</dt>
+                  <dd>{debug.data.storedSample.quality.candidateCount ?? 1}</dd>
+                </div>
+                <div>
+                  <dt className="text-content-faint">Interpolated</dt>
+                  <dd>{debug.data.storedSample.quality.interpolated ? 'yes' : 'no'}</dd>
+                </div>
+              </dl>
+              {(debug.data.storedSample.quality.problems?.length ?? 0) > 0 && (
+                <ul className="mt-2 space-y-0.5 text-xs text-state-warn">
+                  {debug.data.storedSample.quality.problems?.map((problem) => (
+                    <li key={problem}>{problem}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+          <div className="text-xs font-medium">Seeked frame re-read</div>
           <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs sm:grid-cols-3">
             <div>
               <dt className="text-content-faint">Decoded</dt>
@@ -169,6 +247,10 @@ function OsdDebugPanel({
                   ? formatCoords(debug.data.parsed.lat, debug.data.parsed.lon)
                   : 'no fix'}
               </dd>
+            </div>
+            <div>
+              <dt className="text-content-faint">Parse status</dt>
+              <dd>{debug.data.parsed.timeStatus} / {debug.data.parsed.gpsStatus}</dd>
             </div>
             <div>
               <dt className="text-content-faint">Speed</dt>
@@ -406,7 +488,20 @@ export default function RecordingViewer() {
                 <Row label="Time" value={point?.capturedAt ? formatDateTime(point.capturedAt) : '—'} />
                 <Row
                   label="Position"
-                  value={point?.hasFix ? formatCoords(point.lat, point.lon) : 'No GPS fix'}
+                  value={
+                    point?.hasFix ? (
+                      <span>
+                        {formatCoords(point.lat, point.lon)}
+                        {point.quality.interpolated && (
+                          <span className="ml-1 text-2xs text-content-faint">interpolated</span>
+                        )}
+                      </span>
+                    ) : point?.quality.gpsStatus === 'no_fix' ? (
+                      'No GPS fix'
+                    ) : (
+                      'Position unavailable'
+                    )
+                  }
                 />
                 <Row label="Speed" value={formatSpeed(point?.speedKmh)} />
                 <Row

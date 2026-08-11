@@ -151,6 +151,10 @@ class OsdReading:
     confidence: float = 0.0
     #: Why a field was rejected, for the job log. Empty on a clean read.
     problems: list[str] | None = None
+    #: ``valid``, ``parse_failed`` or ``rejected``. Kept independently from GPS.
+    time_status: str = "parse_failed"
+    #: ``valid``, ``no_fix``, ``parse_failed`` or ``rejected``.
+    gps_status: str = "parse_failed"
 
     @property
     def valid(self) -> bool:
@@ -236,6 +240,7 @@ def parse_osd_text(
     stamp = _TIMESTAMP_RE.search(compact)
     if stamp is not None:
         reading.captured_at = _parse_timestamp(stamp.groupdict(), problems)
+        reading.time_status = "valid" if reading.captured_at is not None else "rejected"
     else:
         problems.append("timestamp unreadable")
 
@@ -262,6 +267,7 @@ def parse_osd_text(
         if _sign_is_ambiguous(groups.get("latsep"), groups.get("lat")) or _sign_is_ambiguous(
             groups.get("lonsep"), groups.get("lon")
         ):
+            reading.gps_status = "rejected"
             problems.append(
                 "coordinate sign ambiguous; refused rather than risk a wrong hemisphere"
             )
@@ -271,11 +277,15 @@ def parse_osd_text(
             # or infinity, which pass every magnitude comparison ever written.
             if not is_no_fix_placeholder(lat, lon):
                 problems.append(problem)
+                reading.gps_status = "rejected"
+            else:
+                reading.gps_status = "no_fix"
             reading.has_fix = False
         else:
             reading.lat = lat
             reading.lon = lon
             reading.has_fix = True
+            reading.gps_status = "valid"
 
     # Speed comes from the coordinate match when the line held together that far, and from
     # the ``km/h`` anchor when it did not.
@@ -299,11 +309,12 @@ def parse_osd_text(
 
 
 def enforce_monotonic(readings: list[OsdReading]) -> list[OsdReading]:
-    """Drop readings whose clock runs backwards within a segment.
+    """Reject clocks that run backwards without dropping their other fields.
 
     Time inside one recording only moves forward. A timestamp that jumps backwards is a
-    misread digit, and it is cheaper and safer to discard that sample than to let it
-    reorder a journey or invent a negative time delta.
+    misread digit, but the GPS and speed on that same overlay line are independent. The
+    old implementation discarded the entire reading here, producing a missing database
+    row and throwing away a valid position because only its clock was bad.
 
     Equal timestamps are kept: the overlay updates at 1 Hz, so sampling at exactly 1 fps
     legitimately lands twice on the same second at segment boundaries.
@@ -317,7 +328,10 @@ def enforce_monotonic(readings: list[OsdReading]) -> list[OsdReading]:
         if last is not None and reading.captured_at < last:
             if reading.problems is None:
                 reading.problems = []
-            reading.problems.append("timestamp moved backwards; discarded")
+            reading.problems.append("timestamp moved backwards; clock rejected")
+            reading.captured_at = None
+            reading.time_status = "rejected"
+            out.append(reading)
             continue
         last = reading.captured_at
         out.append(reading)

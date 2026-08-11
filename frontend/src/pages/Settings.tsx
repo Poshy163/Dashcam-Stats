@@ -141,6 +141,18 @@ export default function Settings() {
                       {' '}&mdash; {scanNow.data.unsettled} skipped as still being written
                     </>
                   )}
+                  {scanNow.data.damagedHidden > 0 && (
+                    <> &mdash; {scanNow.data.damagedHidden} damaged hidden</>
+                  )}
+                  {scanNow.data.damagedDeleted > 0 && (
+                    <> &mdash; {scanNow.data.damagedDeleted} damaged deleted</>
+                  )}
+                  {scanNow.data.damagedDeleteBlocked > 0 && (
+                    <>
+                      {' '}&mdash; {scanNow.data.damagedDeleteBlocked} deletion blocked and
+                      hidden instead
+                    </>
+                  )}
                   .
                 </p>
               )}
@@ -258,7 +270,16 @@ function Field({
   onChange: (value: unknown) => void
   onReset: () => void
 }) {
-  const [confirming, setConfirming] = useState(false)
+  const [pendingDangerous, setPendingDangerous] = useState<unknown>(undefined)
+
+  const change = (next: unknown) => {
+    if (setting.dangerous && (next === true || next === 'delete')) {
+      setPendingDangerous(next)
+      return
+    }
+    setPendingDangerous(undefined)
+    onChange(next)
+  }
 
   const label = (
     <div className="flex flex-wrap items-baseline gap-2">
@@ -276,45 +297,16 @@ function Field({
     switch (setting.type) {
       case 'bool': {
         const checked = Boolean(value)
-        // A dangerous toggle asks first: enabling deletion is the one setting here that
-        // can destroy footage.
-        const handle = (next: boolean) => {
-          if (next && setting.dangerous && !confirming) {
-            setConfirming(true)
-            return
-          }
-          setConfirming(false)
-          onChange(next)
-        }
         return (
-          <>
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={checked}
-                disabled={disabled}
-                onChange={(e) => handle(e.target.checked)}
-              />
-              {checked ? 'Enabled' : 'Disabled'}
-            </label>
-            {confirming && (
-              <div className="mt-2 rounded border border-state-error/40 p-2 text-xs">
-                <p className="text-state-error">
-                  This permanently deletes footage from your dashcam directory once the
-                  storage limit is exceeded. It also requires the directory to be mounted
-                  writable — with a read-only mount nothing will be removed.
-                </p>
-                <div className="mt-2 flex gap-2">
-                  <button className="btn btn-danger px-2 py-1 text-xs" onClick={() => { setConfirming(false); onChange(true) }}>
-                    I understand, enable it
-                  </button>
-                  <button className="btn px-2 py-1 text-xs" onClick={() => setConfirming(false)}>
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            )}
-          </>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={checked}
+              disabled={disabled}
+              onChange={(e) => change(e.target.checked)}
+            />
+            {checked ? 'Enabled' : 'Disabled'}
+          </label>
         )
       }
       case 'select':
@@ -323,7 +315,7 @@ function Field({
             className="input"
             value={String(value ?? '')}
             disabled={disabled}
-            onChange={(e) => onChange(e.target.value)}
+            onChange={(e) => change(e.target.value)}
           >
             {setting.choices.map((choice) => (
               <option key={choice.value} value={choice.value}>{choice.label}</option>
@@ -363,6 +355,31 @@ function Field({
       {label}
       {setting.description && <p className="hint">{setting.description}</p>}
       <div className="max-w-md">{control()}</div>
+      {pendingDangerous !== undefined && (
+        <div className="max-w-md rounded border border-state-error/40 p-2 text-xs">
+          <p className="text-state-error">
+            This option can permanently delete source footage. Deletion cannot be undone;
+            path, mount and writability safety checks will still be enforced.
+          </p>
+          <div className="mt-2 flex gap-2">
+            <button
+              className="btn btn-danger px-2 py-1 text-xs"
+              onClick={() => {
+                onChange(pendingDangerous)
+                setPendingDangerous(undefined)
+              }}
+            >
+              I understand, apply it
+            </button>
+            <button
+              className="btn px-2 py-1 text-xs"
+              onClick={() => setPendingDangerous(undefined)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
       {disabled && setting.requires && (
         <p className="text-2xs text-content-faint">Requires “{setting.requires}” to be enabled.</p>
       )}

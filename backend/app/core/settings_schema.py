@@ -141,6 +141,24 @@ SETTINGS: tuple[SettingDef, ...] = (
         "Queue newly discovered recordings for analysis as soon as they are found.",
     ),
     SettingDef(
+        "scanner.damaged_footage_action",
+        "Damaged footage",
+        "select",
+        "hide",
+        "scanner",
+        "What to do after a stable file is positively classified as damaged. Hide keeps "
+        "the source and analysis history but removes it from normal library views. Delete "
+        "removes only the source footage, retains derived history, and is blocked unless "
+        "the footage mount passes all deletion safety checks and is writable. Existing "
+        "damaged files are reconciled on the next scan.",
+        choices=(
+            ("keep", "Keep and show"),
+            ("hide", "Hide / blacklist (recommended)"),
+            ("delete", "Permanently delete source footage"),
+        ),
+        dangerous=True,
+    ),
+    SettingDef(
         "scanner.settle_seconds",
         "File settle time",
         "int",
@@ -314,7 +332,8 @@ SETTINGS: tuple[SettingDef, ...] = (
         "float",
         1.0,
         "telemetry",
-        "The overlay updates once per second, so sampling faster gains nothing.",
+        "Stored telemetry points per second. The reader checks multiple candidate frames "
+        "inside each interval and keeps the best independently parsed fields.",
         minimum=0.1,
         maximum=5.0,
         unit="fps",
@@ -326,7 +345,8 @@ SETTINGS: tuple[SettingDef, ...] = (
         "float",
         0.6,
         "telemetry",
-        "Telemetry points read below this confidence are discarded.",
+        "Values below this confidence are retained for diagnostics but are not trusted as "
+        "direct telemetry.",
         minimum=0.0,
         maximum=1.0,
         requires="telemetry.enabled",

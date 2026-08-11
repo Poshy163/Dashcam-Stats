@@ -19,6 +19,7 @@ const STATES = [
   // Its own filter because it is the answer to "why has nothing happened to these": they
   // are empty or carry no video stream, and no amount of waiting or retrying changes that.
   ['invalid', 'Unusable file'],
+  ['hidden', 'Hidden / blacklisted'],
   ['settling', 'Still writing'],
 ] as const
 

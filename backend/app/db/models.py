@@ -344,6 +344,9 @@ class TelemetryPoint(Base):
 
     ocr_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     raw_text: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Field-level extraction/validation provenance. JSON keeps this extensible without
+    # widening the highest-cardinality table for every diagnostic status we learn to keep.
+    quality_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     recording: Mapped[Recording] = relationship(back_populates="telemetry")
 

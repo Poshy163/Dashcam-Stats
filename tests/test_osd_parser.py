@@ -236,12 +236,18 @@ class TestMonotonic:
     def _reading(self, second: int) -> OsdReading:
         return OsdReading(captured_at=datetime(2026, 8, 4, 17, 44, second))
 
-    def test_backwards_timestamps_are_discarded(self):
-        # Time only moves forward inside one segment; a backwards jump is a misread digit
-        # and is cheaper to drop than to let it reorder a journey.
+    def test_backwards_clock_is_rejected_without_discarding_the_reading(self):
+        # A bad clock must not take valid GPS or speed from the same line with it.
         readings = [self._reading(10), self._reading(11), self._reading(3), self._reading(12)]
         kept = enforce_monotonic(readings)
-        assert [r.captured_at.second for r in kept] == [10, 11, 12]
+        assert len(kept) == 4
+        assert [r.captured_at.second if r.captured_at else None for r in kept] == [
+            10,
+            11,
+            None,
+            12,
+        ]
+        assert kept[2].time_status == "rejected"
 
     def test_repeated_timestamps_survive(self):
         # The overlay ticks at 1 Hz, so sampling at 1 fps legitimately lands twice on the

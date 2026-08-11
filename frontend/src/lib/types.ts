@@ -75,6 +75,8 @@ export interface Recording {
   thumbnailPath: string | null
   /** The row is kept after the file goes, so history survives retention cleanup. */
   fileMissing: boolean
+  /** Hidden from normal library views by the damaged-footage policy. */
+  ignored: boolean
 
   /** Problems in the source file itself — a wrapped PTS, frames that will not decode. */
   warnings: string[]
@@ -93,6 +95,23 @@ export interface TelemetryPoint {
   /** Derived from consecutive fixes — a bearing, not a compass reading. */
   headingDeg: number | null
   ocrConfidence: number | null
+  rawText: string | null
+  quality: TelemetryQuality
+}
+
+export interface TelemetryQuality {
+  source?: string
+  ocrStatus?: string
+  timeStatus?: string
+  timeSource?: string
+  overlayCapturedAt?: string | null
+  expectedAt?: string | null
+  timeDeltaS?: number | null
+  gpsStatus?: string
+  gpsSource?: string
+  interpolated?: boolean
+  candidateCount?: number
+  problems?: string[]
 }
 
 export interface Journey {
@@ -474,6 +493,8 @@ export interface OsdDebug {
   decodedText: string
   confidence: number
   glyphs: number
+  rereadAvailable: boolean
+  rereadError: string | null
   parsed: {
     capturedAt: string | null
     lat: number | null
@@ -481,6 +502,15 @@ export interface OsdDebug {
     hasFix: boolean
     speedKmh: number | null
     problems: string[]
+    timeStatus: string
+    gpsStatus: string
   }
+  timeline: {
+    frameNumber: number | null
+    videoPtsS: number
+    relativeTimeS: number
+    expectedAt: string | null
+  }
+  storedSample: (TelemetryPoint & { dtS: number }) | null
   imageUrl: string
 }

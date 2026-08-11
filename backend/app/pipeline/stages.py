@@ -604,13 +604,86 @@ async def stage_telemetry(
     )
 
     tz = await settings.timezone()
+
+    # Establish one wall-clock origin for the recording before timestamping any sample.
+    # The overlay candidates are reconciled back to video offset zero by the extractor;
+    # the filename is the independent sanity check. Every row then uses origin + video
+    # offset, while the exact OCR clock and its delta are retained in quality_json.
+    filename_time = expected_time_from_filename(recording.filename)
+    osd_origin_ok = False
+    if result.osd_start_time is not None:
+        drift = (
+            abs((result.osd_start_time - filename_time).total_seconds())
+            if filename_time is not None
+            else 0.0
+        )
+        if filename_time is not None and drift > _MAX_OSD_FILENAME_DRIFT_S:
+            log.warning(
+                "ignoring overlay timestamp: it disagrees with the filename",
+                file=recording.filename,
+                osd=result.osd_start_time.isoformat(),
+                filename_time=filename_time.isoformat(),
+                drift_s=round(drift),
+            )
+        else:
+            recording.started_at = result.osd_start_time.replace(tzinfo=tz).astimezone(UTC)
+            recording.time_from_osd = True
+            osd_origin_ok = True
+    if not osd_origin_ok and filename_time is not None:
+        recording.started_at = filename_time.replace(tzinfo=tz).astimezone(UTC)
+        recording.time_from_osd = False
+    if recording.started_at is not None and recording.duration_s:
+        recording.ended_at = recording.started_at + timedelta(seconds=recording.duration_s)
+
     rows = []
+    recovered_clocks = 0
     for sample in result.samples:
-        captured = sample.captured_at
-        if captured is not None and captured.tzinfo is None:
-            # The overlay prints local wall-clock time with no zone; attach the configured
-            # one so every stored timestamp is comparable.
-            captured = captured.replace(tzinfo=tz).astimezone(UTC)
+        overlay_captured = sample.overlay_captured_at or sample.captured_at
+        if overlay_captured is not None and overlay_captured.tzinfo is None:
+            overlay_captured = overlay_captured.replace(tzinfo=tz).astimezone(UTC)
+        expected = (
+            recording.started_at + timedelta(seconds=sample.t_offset_s)
+            if recording.started_at
+            else None
+        )
+        clock_delta = (
+            (overlay_captured - expected).total_seconds()
+            if overlay_captured is not None and expected is not None
+            else None
+        )
+        overlay_clock_valid = clock_is_plausible(overlay_captured, expected) and (
+            clock_delta is None or abs(clock_delta) <= 2.5
+        )
+        captured = expected or overlay_captured
+        time_source = (
+            "overlay" if overlay_captured is not None and overlay_clock_valid else "timeline"
+        )
+        time_status = sample.time_status
+        problems = list(sample.problems)
+        if overlay_captured is not None and not overlay_clock_valid:
+            time_status = "rejected"
+            problems.append(
+                f"overlay clock differed from canonical timeline by {clock_delta:.3f}s"
+                if clock_delta is not None
+                else "overlay clock could not be reconciled"
+            )
+        if time_source == "timeline":
+            recovered_clocks += 1
+
+        quality = {
+            "source": "overlay_ocr",
+            "ocr_status": sample.ocr_status,
+            "time_status": time_status,
+            "time_source": time_source,
+            "overlay_captured_at": overlay_captured.isoformat() if overlay_captured else None,
+            "expected_at": expected.isoformat() if expected else None,
+            "time_delta_s": round(clock_delta, 3) if clock_delta is not None else None,
+            "gps_status": sample.gps_status,
+            "gps_source": sample.gps_source,
+            "interpolated": sample.gps_source == "interpolated",
+            "candidate_count": sample.candidate_count,
+            "problems": list(dict.fromkeys(problems)),
+        }
         rows.append(
             {
                 "recording_id": recording.id,
@@ -625,6 +698,7 @@ async def stage_telemetry(
                 "heading_deg": sample.heading_deg,
                 "ocr_confidence": sample.ocr_confidence,
                 "raw_text": sample.raw_text,
+                "quality_json": quality,
             }
         )
 
@@ -633,33 +707,16 @@ async def stage_telemetry(
     # a row carrying has_fix with a coordinate that is not a place is the shape of defect
     # that then propagates into tracks, observations, journey bounds and the heat map --
     # each of which had grown its own filter for it.
-    dropped = unclocked = 0
+    dropped = 0
     for row in rows:
         if row["has_fix"] and not is_valid_coordinate(row["lat"], row["lon"]):
             row["has_fix"] = False
             row["lat"] = row["lon"] = row["heading_deg"] = None
+            row["quality_json"]["gps_status"] = "rejected"
+            row["quality_json"]["gps_source"] = "none"
+            row["quality_json"]["interpolated"] = False
+            row["quality_json"]["problems"].append("coordinate failed final database validation")
             dropped += 1
-        # The clock is read glyph by glyph like everything else, so one misread digit moves
-        # a sample days out of its own recording -- and a sample that claims to be three
-        # days after the drive it belongs to sorts last in its journey and becomes that
-        # journey's end marker. The offset is the honest cross-check: it owes nothing to
-        # the glyphs. Only the timestamp is discarded; the position on that line was never
-        # in doubt, which is the same field-independence the parser is built on.
-        expected = (
-            recording.started_at + timedelta(seconds=row["t_offset_s"] or 0.0)
-            if recording.started_at
-            else None
-        )
-        if not clock_is_plausible(row["captured_at"], expected):
-            row["captured_at"] = None
-            unclocked += 1
-    if unclocked:
-        log.warning(
-            "discarded overlay timestamps that disagree with their own recording",
-            recording=recording.filename,
-            discarded=unclocked,
-            of=len(rows),
-        )
     if dropped:
         log.warning(
             "refused to store coordinates that are not a place",
@@ -694,34 +751,6 @@ async def stage_telemetry(
         recording.start_lat = result.first_fix.lat
         recording.start_lon = result.first_fix.lon
 
-    # The overlay clock is the camera's own time and beats the filename, which only
-    # records when the file was opened -- but only when the two agree. Both come from the
-    # same device, so a large disagreement means the overlay was misread, not that the
-    # filename is wrong. Accepting a bad reading here is expensive: started_at drives
-    # journey clustering, so one mangled digit can tear a drive apart and file a recording
-    # under a time it never happened.
-    if result.osd_start_time is not None:
-        filename_time = expected_time_from_filename(recording.filename)
-        drift = (
-            abs((result.osd_start_time - filename_time).total_seconds())
-            if filename_time is not None
-            else 0.0
-        )
-        if filename_time is not None and drift > _MAX_OSD_FILENAME_DRIFT_S:
-            log.warning(
-                "ignoring overlay timestamp: it disagrees with the filename",
-                file=recording.filename,
-                osd=result.osd_start_time.isoformat(),
-                filename_time=filename_time.isoformat(),
-                drift_s=round(drift),
-            )
-        else:
-            localised = result.osd_start_time.replace(tzinfo=tz).astimezone(UTC)
-            recording.started_at = localised
-            recording.time_from_osd = True
-            if recording.duration_s:
-                recording.ended_at = localised + timedelta(seconds=recording.duration_s)
-
     recording.telemetry_state = StageState.DONE
     log.info(
         "read telemetry from the overlay",
@@ -733,6 +762,7 @@ async def stage_telemetry(
         # investigations -- the overlay region and the templates against the weather.
         rejected_positions=result.implausible_jumps + dropped,
         parse_failures=result.parse_failures,
+        timeline_recoveries=recovered_clocks,
         first_fix_at=result.first_fix.captured_at.isoformat()
         if result.first_fix and result.first_fix.captured_at
         else None,
@@ -747,6 +777,8 @@ async def stage_telemetry(
             "fixes": result.fix_count,
             "distance_m": result.distance_m,
             "parse_failures": result.parse_failures,
+            "timeline_recoveries": recovered_clocks,
+            "interpolated_fixes": sum(s.gps_source == "interpolated" for s in result.samples),
             "rejected_positions": result.implausible_jumps + dropped,
             "warnings": result.warnings,
             "decoder": result.decoder,

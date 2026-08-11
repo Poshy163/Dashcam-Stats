@@ -149,11 +149,19 @@ async def list_recordings(
 ):
     stmt = select(Recording).options(selectinload(Recording.camera))
 
+    # Blacklisted footage stays directly addressable and can be deliberately selected
+    # with state=hidden, but it does not clutter the normal library. Its real lifecycle
+    # state remains intact (for example INVALID), because queue/recovery logic needs it.
+    if state == "hidden":
+        stmt = stmt.where(Recording.ignored.is_(True))
+    else:
+        stmt = stmt.where(Recording.ignored.is_(False))
+
     if camera_id is not None:
         stmt = stmt.where(Recording.camera_id == camera_id)
     if journey_id is not None:
         stmt = stmt.where(Recording.journey_id == journey_id)
-    if state:
+    if state and state != "hidden":
         stmt = stmt.where(Recording.state == state)
     if has_gps is not None:
         stmt = stmt.where(Recording.has_gps.is_(has_gps))
@@ -211,7 +219,25 @@ async def get_telemetry(recording_id: RowId, session: SessionDep):
         .scalars()
         .all()
     )
-    return [TelemetryPointOut.model_validate(r) for r in rows]
+    points = []
+    for row in rows:
+        quality = row.quality_json or {
+            "source": "overlay_ocr",
+            "ocr_status": "legacy",
+            "time_status": "valid" if row.captured_at is not None else "unknown",
+            "time_source": "overlay" if row.captured_at is not None else "unknown",
+            "gps_status": "valid" if row.has_fix else "unknown",
+            "gps_source": "direct" if row.has_fix else "none",
+            "interpolated": False,
+            "candidate_count": 1,
+            "problems": ["quality unavailable until telemetry is reprocessed"],
+        }
+        points.append(
+            TelemetryPointOut.model_validate(row).model_copy(
+                update={"raw_text": row.raw_text, "quality": quality}
+            )
+        )
+    return points
 
 
 @router.get("/recordings/{recording_id}/detections", response_model=list[TrackedObjectOut])
@@ -312,7 +338,7 @@ async def get_journey(journey_id: RowId, session: SessionDep):
             await session.execute(
                 select(Recording)
                 .options(selectinload(Recording.camera))
-                .where(Recording.journey_id == journey_id)
+                .where(Recording.journey_id == journey_id, Recording.ignored.is_(False))
                 .order_by(Recording.started_at.asc())
             )
         )
@@ -408,7 +434,13 @@ async def split_journey(journey_id: RowId, body: SplitRequest, session: SessionD
 @router.post("/journeys/{journey_id}/reprocess")
 async def reprocess_journey(journey_id: RowId, body: ReprocessRequest, session: SessionDep):
     recordings = (
-        (await session.execute(select(Recording.id).where(Recording.journey_id == journey_id)))
+        (
+            await session.execute(
+                select(Recording.id).where(
+                    Recording.journey_id == journey_id, Recording.ignored.is_(False)
+                )
+            )
+        )
         .scalars()
         .all()
     )
@@ -708,6 +740,8 @@ async def list_jobs(session: SessionDep, page: PaginationDep, state: str | None 
     stmt = select(ProcessingJob, Recording.filename).outerjoin(
         Recording, Recording.id == ProcessingJob.recording_id
     )
+    visible_job = or_(ProcessingJob.recording_id.is_(None), Recording.ignored.is_(False))
+    stmt = stmt.where(visible_job)
     if state:
         stmt = stmt.where(ProcessingJob.state == state)
 
@@ -737,7 +771,11 @@ async def list_jobs(session: SessionDep, page: PaginationDep, state: str | None 
         ProcessingJob.id.desc(),
     )
 
-    count_stmt = select(func.count(ProcessingJob.id))
+    count_stmt = (
+        select(func.count(ProcessingJob.id))
+        .outerjoin(Recording, Recording.id == ProcessingJob.recording_id)
+        .where(visible_job)
+    )
     if state:
         count_stmt = count_stmt.where(ProcessingJob.state == state)
     total = int((await session.execute(count_stmt)).scalar() or 0)
@@ -785,6 +823,10 @@ async def retry_job(job_id: RowId, session: SessionDep):
     job = await session.get(ProcessingJob, job_id)
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
+    if job.recording_id is not None:
+        recording = await session.get(Recording, job.recording_id)
+        if recording is not None and recording.ignored:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Recording is blacklisted")
     job.state = "queued"
     job.attempts = 0
     job.not_before = None
@@ -848,7 +890,7 @@ async def search(session: SessionDep, q: str = Query(..., min_length=1)):
             await session.execute(
                 select(Recording)
                 .options(selectinload(Recording.camera))
-                .where(Recording.filename.ilike(f"%{term}%"))
+                .where(Recording.filename.ilike(f"%{term}%"), Recording.ignored.is_(False))
                 .order_by(Recording.started_at.desc().nullslast())
                 .limit(20)
             )

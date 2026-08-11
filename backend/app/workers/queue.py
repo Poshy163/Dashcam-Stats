@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -165,6 +165,7 @@ async def claim_next(session: AsyncSession, worker_id: str) -> ProcessingJob | N
         )
         .exists()
     )
+    visible_recordings = select(Recording.id).where(Recording.ignored.is_(False))
 
     next_queued = (
         select(ProcessingJob.id)
@@ -172,6 +173,10 @@ async def claim_next(session: AsyncSession, worker_id: str) -> ProcessingJob | N
             ProcessingJob.state == JobState.QUEUED,
             (ProcessingJob.not_before.is_(None)) | (ProcessingJob.not_before <= now),
             ~already_running,
+            or_(
+                ProcessingJob.recording_id.is_(None),
+                ProcessingJob.recording_id.in_(visible_recordings),
+            ),
         )
         .order_by(ProcessingJob.priority.asc(), ProcessingJob.queued_at.asc())
         .limit(1)
@@ -372,10 +377,17 @@ async def cancel(session: AsyncSession, job_id: int) -> bool:
 
 
 async def retry_failed(session: AsyncSession) -> int:
-    """Requeue every failed job, resetting its attempt counter."""
+    """Requeue visible failed jobs, never resurrecting blacklisted footage."""
+    visible_recordings = select(Recording.id).where(Recording.ignored.is_(False))
     result = await session.execute(
         update(ProcessingJob)
-        .where(ProcessingJob.state == JobState.FAILED)
+        .where(
+            ProcessingJob.state == JobState.FAILED,
+            or_(
+                ProcessingJob.recording_id.is_(None),
+                ProcessingJob.recording_id.in_(visible_recordings),
+            ),
+        )
         .values(
             state=JobState.QUEUED,
             attempts=0,
@@ -472,7 +484,10 @@ async def release_stranded_recordings(session: AsyncSession) -> int:
 async def stats(session: AsyncSession) -> dict[str, object]:
     rows = (
         await session.execute(
-            select(ProcessingJob.state, func.count(ProcessingJob.id)).group_by(ProcessingJob.state)
+            select(ProcessingJob.state, func.count(ProcessingJob.id))
+            .outerjoin(Recording, Recording.id == ProcessingJob.recording_id)
+            .where(or_(ProcessingJob.recording_id.is_(None), Recording.ignored.is_(False)))
+            .group_by(ProcessingJob.state)
         )
     ).all()
     counts = {state.value: int(count) for state, count in rows}
@@ -486,6 +501,12 @@ async def stats(session: AsyncSession) -> dict[str, object]:
                 select(func.count(ProcessingJob.id)).where(
                     ProcessingJob.state == JobState.COMPLETED,
                     ProcessingJob.finished_at >= midnight,
+                    or_(
+                        ProcessingJob.recording_id.is_(None),
+                        ProcessingJob.recording_id.in_(
+                            select(Recording.id).where(Recording.ignored.is_(False))
+                        ),
+                    ),
                 )
             )
         ).scalar()

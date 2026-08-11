@@ -16,16 +16,17 @@ sends you looking in the wrong place.
 from __future__ import annotations
 
 import io
+from datetime import timedelta
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.deps import RowId, SessionDep
 from app.core.logging import get_logger
 from app.core.paths import resolve_footage_path
 from app.core.settings_service import get_settings_service
-from app.db.models import OsdProfile, Recording
+from app.db.models import OsdProfile, Recording, TelemetryPoint
 from app.hardware.ffmpeg import extract_frame, probe
 from app.osd.engine import TelemetryExtractor
 from app.osd.glyphs import binarise, decode_line, segment_glyphs
@@ -47,7 +48,7 @@ async def _active_region(session) -> OsdRegion:
 
 
 async def _read(recording_id: RowId, session, offset_s: float):
-    """The frame at *offset_s*, the region, and the loaded extractor."""
+    """The optional re-read frame, region, and loaded extractor at *offset_s*."""
     recording = await session.get(Recording, recording_id)
     if recording is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording not found")
@@ -74,20 +75,7 @@ async def _read(recording_id: RowId, session, offset_s: float):
     # symptom was a debug view that worked at t=0 and t=10 and returned 422 at t=1 -- on a
     # recording that decodes perfectly.
     frame = await extract_frame(path, offset_s, hwaccel=hwaccel)
-    if frame is None:
-        # A diagnostic that answers a decode failure with a stack trace is worse than
-        # useless: the thing being diagnosed is often precisely that the file will not
-        # decode, and that is an answer, not a crash.
-        raise HTTPException(
-            # The literal rather than the constant: starlette renamed it to
-            # HTTP_422_UNPROCESSABLE_CONTENT and deprecated the old spelling, and the
-            # number is stable across both.
-            422,
-            f"no frame could be decoded at {offset_s:g}s; the file may be damaged there, "
-            "or that offset may be past its end",
-        )
-
-    return recording, frame, crop, extractor
+    return recording, frame, crop, extractor, info
 
 
 def _crop_strip(frame: np.ndarray, crop) -> np.ndarray:
@@ -103,15 +91,23 @@ async def osd_debug(
     t: float = Query(0.0, ge=0.0, description="Offset into the recording, in seconds."),
 ):
     """What the overlay reader extracted at this moment, and what it made of it."""
-    recording, frame, crop, extractor = await _read(recording_id, session, t)
+    recording, frame, crop, extractor, info = await _read(recording_id, session, t)
+    duration = recording.duration_s if recording.duration_s is not None else info.duration_s
+    if duration is not None and t > duration + 0.05:
+        raise HTTPException(
+            422, f"frame cannot be decoded: offset {t:g}s is past the end of this recording"
+        )
 
-    gray = frame[..., 0] if frame.ndim == 3 else frame
-    strip = _crop_strip(gray, crop)
-    mask = binarise(strip)
-    glyphs = segment_glyphs(mask)
+    glyphs = []
+    mask = None
+    if frame is not None:
+        gray = frame[..., 0] if frame.ndim == 3 else frame
+        strip = _crop_strip(gray, crop)
+        mask = binarise(strip)
+        glyphs = segment_glyphs(mask)
 
     text, confidence = ("", 0.0)
-    if extractor.templates is not None:
+    if mask is not None and extractor.templates is not None:
         text, confidence = decode_line(mask, extractor.templates)
 
     settings = get_settings_service()
@@ -120,6 +116,39 @@ async def osd_debug(
         confidence=confidence,
         max_speed_kmh=float(settings.get_nowait("telemetry.max_speed_kmh")),
     )
+
+    stored = (
+        await session.execute(
+            select(TelemetryPoint)
+            .where(TelemetryPoint.recording_id == recording.id)
+            .order_by(func.abs(TelemetryPoint.t_offset_s - t), TelemetryPoint.t_offset_s)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    expected = recording.started_at + timedelta(seconds=t) if recording.started_at else None
+    stored_out = None
+    if stored is not None:
+        quality = stored.quality_json or {
+            "ocr_status": "legacy",
+            "time_status": "valid" if stored.captured_at else "unknown",
+            "gps_status": "valid" if stored.has_fix else "unknown",
+            "gps_source": "direct" if stored.has_fix else "none",
+            "interpolated": False,
+            "problems": ["quality unavailable until telemetry is reprocessed"],
+        }
+        stored_out = {
+            "t_offset_s": stored.t_offset_s,
+            "dt_s": round(abs(stored.t_offset_s - t), 3),
+            "captured_at": stored.captured_at.isoformat() if stored.captured_at else None,
+            "lat": stored.lat,
+            "lon": stored.lon,
+            "has_fix": stored.has_fix,
+            "speed_kmh": stored.speed_kmh,
+            "heading_deg": stored.heading_deg,
+            "ocr_confidence": stored.ocr_confidence,
+            "raw_text": stored.raw_text,
+            "quality": quality,
+        }
 
     return {
         "recording_id": recording.id,
@@ -130,6 +159,10 @@ async def osd_debug(
         "decoded_text": text,
         "confidence": round(confidence, 3),
         "glyphs": len(glyphs),
+        "reread_available": frame is not None,
+        "reread_error": None
+        if frame is not None
+        else "no frame could be decoded by the seeked re-reader at this offset",
         # The parsed result, so the two halves of a failure are distinguishable: text that
         # decoded wrongly looks nothing like text that decoded fine and failed validation.
         "parsed": {
@@ -139,7 +172,19 @@ async def osd_debug(
             "has_fix": reading.has_fix,
             "speed_kmh": reading.speed_kmh,
             "problems": reading.problems or [],
+            "time_status": reading.time_status,
+            "gps_status": reading.gps_status,
         },
+        # This is the canonical timeline used everywhere downstream. ``video_pts_s`` is
+        # the requested browser-media time; the stored sample gives its exact processing
+        # offset and delta rather than pretending a seek necessarily returned that frame.
+        "timeline": {
+            "frame_number": round(t * recording.fps) if recording.fps else None,
+            "video_pts_s": t,
+            "relative_time_s": t,
+            "expected_at": expected.isoformat() if expected else None,
+        },
+        "stored_sample": stored_out,
         "image_url": f"/api/recordings/{recording.id}/osd-debug.png?t={t}",
     }
 
@@ -160,7 +205,13 @@ async def osd_debug_image(
     """
     from PIL import Image, ImageDraw
 
-    _recording, frame, crop, extractor = await _read(recording_id, session, t)
+    _recording, frame, crop, extractor, _info = await _read(recording_id, session, t)
+    if frame is None:
+        raise HTTPException(
+            422,
+            f"no frame could be decoded at {t:g}s; use the stored processing sample in "
+            "the JSON diagnostic for the authoritative OCR result",
+        )
 
     gray = frame[..., 0] if frame.ndim == 3 else frame
     strip = _crop_strip(gray, crop)

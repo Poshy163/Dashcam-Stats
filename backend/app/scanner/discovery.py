@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
+from app.damaged_policy import apply_known_damaged_policy
 from app.db.models import (
     JobKind,
     JobState,
@@ -63,6 +64,9 @@ class ScanSummary:
     #: Files that are stable and unusable -- zero bytes, most often. Counted apart from
     #: `errors` because the scan worked perfectly; the file is what is wrong.
     invalid: int = 0
+    damaged_hidden: int = 0
+    damaged_deleted: int = 0
+    damaged_delete_blocked: int = 0
     missing: int = 0
     errors: int = 0
     duration_s: float = 0.0
@@ -246,6 +250,15 @@ class Scanner:
             summary.error_message = summary.error_message or skip_reason
             log.warning("skipped marking files missing", reason=skip_reason, seen=summary.seen)
 
+        # Reconcile after the walk so a stable zero-byte file condemned during this scan
+        # is handled immediately, while damage found by the processing worker is picked up
+        # here on the next scan. Deletion is independently safety-gated by the policy.
+        async with session_scope() as session:
+            damaged = await apply_known_damaged_policy(session)
+            summary.damaged_hidden = damaged.hidden
+            summary.damaged_deleted = damaged.deleted
+            summary.damaged_delete_blocked = damaged.blocked
+
         await self._finish_run(run_id, summary, started)
 
         # Exactly one line per scan. One per file would bury everything else in the log.
@@ -257,6 +270,9 @@ class Scanner:
             changed=summary.changed,
             unsettled=summary.unsettled,
             invalid=summary.invalid,
+            damaged_hidden=summary.damaged_hidden,
+            damaged_deleted=summary.damaged_deleted,
+            damaged_delete_blocked=summary.damaged_delete_blocked,
             missing=summary.missing,
             errors=summary.errors,
             duration_s=round(summary.duration_s, 2),

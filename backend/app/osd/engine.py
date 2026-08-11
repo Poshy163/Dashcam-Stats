@@ -15,9 +15,11 @@ Two derivations happen here that the dashcam does not provide:
 
 from __future__ import annotations
 
+import math
+import statistics
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -35,8 +37,9 @@ from app.osd.glyphs import (
     merge_templates,
     missing_characters,
 )
+from app.osd.locate import FixSample, FixTrack
 from app.osd.outliers import plausible_radius_m, robust_centre, spatial_outliers
-from app.osd.parser import OsdReading, enforce_monotonic, parse_osd_text
+from app.osd.parser import OsdReading, parse_osd_text
 from app.osd.region import OsdRegion, calibrate
 from app.osd.validate import MAX_PLAUSIBLE_SPEED_KMH, MAX_PLAUSIBLE_SPEED_MS, is_valid_coordinate
 
@@ -59,6 +62,14 @@ class TelemetrySample:
     heading_deg: float | None
     ocr_confidence: float
     raw_text: str
+    time_status: str = "parse_failed"
+    gps_status: str = "parse_failed"
+    gps_source: str = "none"
+    ocr_status: str = "failed"
+    problems: list[str] = field(default_factory=list)
+    candidate_count: int = 1
+    #: Raw parsed overlay clock, retained even when canonical validation rejects it.
+    overlay_captured_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -255,6 +266,7 @@ class TelemetryExtractor:
         min_confidence: float = 0.6,
         max_speed_kmh: float = 300.0,
         min_move_m: float = 12.0,
+        max_recovery_gap_s: float = 3.0,
         hwaccel: str = "auto",
     ) -> TelemetryResult:
         """Decode telemetry for one recording.
@@ -279,13 +291,17 @@ class TelemetryExtractor:
             return result
 
         width, height = info.width or 1920, info.height or 1080
-        readings: list[tuple[float, OsdReading]] = []
+        # The overlay is stable for a whole second. Looking twice during that second is
+        # inexpensive (only a 50-pixel strip crosses the pipe) and avoids making the
+        # entire sample depend on one frame whose road texture happens to touch a glyph.
+        candidate_fps = min(4.0, max(sample_fps, sample_fps * 2.0))
+        buckets: dict[int, list[tuple[float, OsdReading]]] = {}
 
         try:
             async for offset, frame in self._iter_strips(
                 path,
                 region,
-                fps=sample_fps,
+                fps=candidate_fps,
                 width=width,
                 height=height,
                 hwaccel=hwaccel,
@@ -294,13 +310,8 @@ class TelemetryExtractor:
                 result.frames_read += 1
                 text, confidence = decode_line(binarise(frame), self._templates)
                 reading = parse_osd_text(text, confidence=confidence, max_speed_kmh=max_speed_kmh)
-                if not reading.valid:
-                    result.parse_failures += 1
-                    continue
-                if confidence < min_confidence:
-                    result.low_confidence += 1
-                    continue
-                readings.append((offset, reading))
+                bucket = math.floor((offset * sample_fps) + 1e-6)
+                buckets.setdefault(bucket, []).append((offset, reading))
         except DecodeError as exc:
             # Partial telemetry from a damaged file is still worth keeping.
             result.warnings.append(f"decode ended early: {exc}")
@@ -308,29 +319,184 @@ class TelemetryExtractor:
             result.warnings.append(f"decode failed: {exc}")
             return result
 
-        ordered = enforce_monotonic([r for _, r in readings])
-        kept = {id(r) for r in ordered}
-        readings = [(o, r) for o, r in readings if id(r) in kept]
-
         result.samples = [
-            TelemetrySample(
-                t_offset_s=round(offset, 3),
-                captured_at=reading.captured_at,
-                lat=reading.lat,
-                lon=reading.lon,
-                has_fix=reading.has_fix,
-                speed_kmh=reading.speed_kmh,
-                heading_deg=None,
-                ocr_confidence=reading.confidence,
-                raw_text=reading.raw_text[:255],
+            self._combine_candidates(
+                round(bucket / sample_fps, 3), candidates, min_confidence=min_confidence
             )
-            for offset, reading in readings
+            for bucket, candidates in sorted(buckets.items())
         ]
+        result.parse_failures = sum(s.ocr_status == "failed" for s in result.samples)
+        result.low_confidence = sum(s.ocr_status == "low_confidence" for s in result.samples)
+
+        result.osd_start_time = self._clock_origin(result.samples, path)
+        if result.osd_start_time is not None:
+            for sample in result.samples:
+                if sample.captured_at is None:
+                    continue
+                expected = result.osd_start_time + timedelta(seconds=sample.t_offset_s)
+                delta_s = (sample.captured_at - expected).total_seconds()
+                if abs(delta_s) > 2.5:
+                    sample.problems.append(
+                        f"overlay clock differed from reconciled timeline by {delta_s:.3f}s"
+                    )
+                    sample.captured_at = None
+                    sample.time_status = "rejected"
+        self._recover_short_gaps(result.samples, max_gap_s=max_recovery_gap_s)
 
         self._derive(result, min_move_m=min_move_m)
-        if result.samples:
-            result.osd_start_time = result.samples[0].captured_at
+        recovered_rejections = self._recover_short_gaps(
+            result.samples, max_gap_s=max_recovery_gap_s
+        )
+        if recovered_rejections:
+            result.implausible_jumps = max(0, result.implausible_jumps - recovered_rejections)
         return result
+
+    @staticmethod
+    def _combine_candidates(
+        offset: float,
+        candidates: list[tuple[float, OsdReading]],
+        *,
+        min_confidence: float,
+    ) -> TelemetrySample:
+        """Choose each field from the best frame in one overlay-second.
+
+        This explicitly prevents a later failed OCR result replacing an earlier successful
+        one. Time, GPS and speed may come from different frames because their parse and
+        validation outcomes are independent.
+        """
+        trusted = [reading for _at, reading in candidates if reading.confidence >= min_confidence]
+        all_readings = [reading for _at, reading in candidates]
+        representative = max(
+            all_readings,
+            key=lambda r: (
+                int(r.captured_at is not None) + int(r.has_position) + int(r.speed_kmh is not None),
+                r.confidence,
+            ),
+        )
+        if not trusted:
+            problems = list(dict.fromkeys((representative.problems or []) + ["OCR confidence low"]))
+            return TelemetrySample(
+                t_offset_s=offset,
+                captured_at=None,
+                lat=None,
+                lon=None,
+                has_fix=False,
+                speed_kmh=None,
+                heading_deg=None,
+                ocr_confidence=representative.confidence,
+                raw_text=representative.raw_text[:255],
+                time_status="low_confidence",
+                gps_status="low_confidence",
+                ocr_status="low_confidence",
+                problems=problems,
+                candidate_count=len(candidates),
+                overlay_captured_at=representative.captured_at,
+            )
+
+        def best(predicate):
+            return max(
+                (r for r in trusted if predicate(r)), key=lambda r: r.confidence, default=None
+            )
+
+        time_reading = best(lambda r: r.captured_at is not None)
+        gps_reading = best(lambda r: r.has_position)
+        speed_reading = best(lambda r: r.speed_kmh is not None)
+        no_fix = best(lambda r: r.gps_status == "no_fix")
+
+        fields = sum(value is not None for value in (time_reading, gps_reading, speed_reading))
+        status = "valid" if fields == 3 else "partial" if fields else "failed"
+        problems = list(dict.fromkeys(problem for r in trusted for problem in (r.problems or [])))
+        if len(candidates) > 1 and fields:
+            problems.append(f"selected best fields from {len(candidates)} candidate frames")
+
+        time_status = (
+            "valid"
+            if time_reading is not None
+            else "rejected"
+            if any(r.time_status == "rejected" for r in trusted)
+            else "parse_failed"
+        )
+        gps_status = (
+            "valid"
+            if gps_reading is not None
+            else "no_fix"
+            if no_fix is not None
+            else "rejected"
+            if any(r.gps_status == "rejected" for r in trusted)
+            else "parse_failed"
+        )
+
+        return TelemetrySample(
+            t_offset_s=offset,
+            captured_at=time_reading.captured_at if time_reading else None,
+            lat=gps_reading.lat if gps_reading else None,
+            lon=gps_reading.lon if gps_reading else None,
+            has_fix=gps_reading is not None,
+            speed_kmh=speed_reading.speed_kmh if speed_reading else None,
+            heading_deg=None,
+            ocr_confidence=representative.confidence,
+            raw_text=representative.raw_text[:255],
+            time_status=time_status,
+            gps_status=gps_status,
+            gps_source="direct" if gps_reading else "none",
+            ocr_status=status,
+            problems=problems,
+            candidate_count=len(candidates),
+            overlay_captured_at=time_reading.captured_at if time_reading else None,
+        )
+
+    @staticmethod
+    def _recover_short_gaps(samples: list[TelemetrySample], *, max_gap_s: float) -> int:
+        """Interpolate only short OCR/parse gaps bracketed by plausible direct fixes."""
+        track = FixTrack(
+            [
+                FixSample(s.t_offset_s, float(s.lat), float(s.lon), s.captured_at, s.speed_kmh)
+                for s in samples
+                if s.has_fix and s.lat is not None and s.lon is not None
+            ],
+            max_fix_age_s=0.0,
+            max_bracket_s=max(0.0, max_gap_s),
+        )
+        recovered = 0
+        for sample in samples:
+            # An explicit zero-coordinate marker means the camera itself reported no lock.
+            # That is never an OCR dropout and must never be filled.
+            if sample.has_fix or sample.gps_status == "no_fix":
+                continue
+            located = track.at(sample.t_offset_s)
+            if located is None or located.source != "interpolated":
+                continue
+            sample.lat = located.lat
+            sample.lon = located.lon
+            sample.has_fix = True
+            sample.gps_status = "interpolated"
+            sample.gps_source = "interpolated"
+            sample.problems.append(f"GPS interpolated across {located.span_s:g}s OCR/parse gap")
+            recovered += 1
+        return recovered
+
+    @staticmethod
+    def _clock_origin(samples: list[TelemetrySample], path: Path) -> datetime | None:
+        """Reconcile overlay clocks into the wall-clock time at video offset zero."""
+        origins = [
+            sample.captured_at - timedelta(seconds=sample.t_offset_s)
+            for sample in samples
+            if sample.captured_at is not None
+        ]
+        if not origins:
+            return None
+        filename_origin = expected_time_from_filename(path.name)
+        if filename_origin is not None:
+            plausible = [
+                origin
+                for origin in origins
+                if abs((origin - filename_origin).total_seconds()) <= 15 * 60
+            ]
+            if plausible:
+                origins = plausible
+        anchor = origins[0]
+        delta = statistics.median((origin - anchor).total_seconds() for origin in origins)
+        return anchor + timedelta(seconds=delta)
 
     @staticmethod
     def _seconds_between(a: TelemetrySample, b: TelemetrySample) -> float:
@@ -352,6 +518,8 @@ class TelemetryExtractor:
         sample.lat = None
         sample.lon = None
         sample.heading_deg = None
+        sample.gps_status = "rejected"
+        sample.gps_source = "none"
 
     @staticmethod
     def _reject_by_consensus(fixes: list[TelemetrySample]) -> list[TelemetrySample]:

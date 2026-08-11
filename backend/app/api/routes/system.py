@@ -124,7 +124,9 @@ async def get_status(session: SessionDep):
         recordings=int(
             (
                 await session.execute(
-                    select(func.count(Recording.id)).where(Recording.file_missing.is_(False))
+                    select(func.count(Recording.id)).where(
+                        Recording.file_missing.is_(False), Recording.ignored.is_(False)
+                    )
                 )
             ).scalar()
             or 0
@@ -139,7 +141,11 @@ async def get_status(session: SessionDep):
         plates=int((await session.execute(select(func.count(Plate.id)))).scalar() or 0),
         duration_s=float(
             (
-                await session.execute(select(func.coalesce(func.sum(Recording.duration_s), 0.0)))
+                await session.execute(
+                    select(func.coalesce(func.sum(Recording.duration_s), 0.0)).where(
+                        Recording.ignored.is_(False)
+                    )
+                )
             ).scalar()
             or 0.0
         ),
@@ -151,7 +157,9 @@ async def get_status(session: SessionDep):
 
     state_rows = (
         await session.execute(
-            select(Recording.state, func.count(Recording.id)).group_by(Recording.state)
+            select(Recording.state, func.count(Recording.id))
+            .where(Recording.ignored.is_(False))
+            .group_by(Recording.state)
         )
     ).all()
     counts = {state.value: int(count) for state, count in state_rows}
@@ -160,7 +168,9 @@ async def get_status(session: SessionDep):
     processed_last_hour = int(
         (
             await session.execute(
-                select(func.count(Recording.id)).where(Recording.processed_at >= since)
+                select(func.count(Recording.id)).where(
+                    Recording.processed_at >= since, Recording.ignored.is_(False)
+                )
             )
         ).scalar()
         or 0
@@ -185,7 +195,9 @@ async def get_status(session: SessionDep):
         recordings_today=int(
             (
                 await session.execute(
-                    select(func.count(Recording.id)).where(Recording.started_at >= midnight)
+                    select(func.count(Recording.id)).where(
+                        Recording.started_at >= midnight, Recording.ignored.is_(False)
+                    )
                 )
             ).scalar()
             or 0
@@ -263,6 +275,9 @@ async def scan_now():
         "changed": summary.changed,
         "unsettled": summary.unsettled,
         "invalid": summary.invalid,
+        "damaged_hidden": summary.damaged_hidden,
+        "damaged_deleted": summary.damaged_deleted,
+        "damaged_delete_blocked": summary.damaged_delete_blocked,
         "missing": summary.missing,
         "queued": summary.queued,
         "errors": summary.errors,

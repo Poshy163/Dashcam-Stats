@@ -15,8 +15,13 @@ metres of travel.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
 
 from app.osd.engine import TelemetryExtractor, TelemetryResult, TelemetrySample
+from app.osd.parser import OsdReading
 
 BASE = datetime(2026, 8, 4, 17, 43, 53)
 # Adelaide, where the corpus was recorded.
@@ -191,3 +196,137 @@ class TestRollups:
         result = derive(samples)
         assert result.distance_m == 0.0
         assert result.first_fix is None
+
+
+class TestCandidateSelection:
+    def test_a_later_failed_frame_cannot_replace_successful_fields(self):
+        time = OsdReading(
+            captured_at=BASE,
+            raw_text="clock",
+            confidence=0.91,
+            time_status="valid",
+        )
+        gps = OsdReading(
+            lat=LAT,
+            lon=LON,
+            has_fix=True,
+            speed_kmh=61.0,
+            raw_text="gps",
+            confidence=0.96,
+            gps_status="valid",
+        )
+        failed = OsdReading(
+            raw_text="noise",
+            confidence=0.97,
+            problems=["no recognisable overlay content"],
+        )
+
+        combined = TelemetryExtractor._combine_candidates(
+            5.0,
+            [(5.0, time), (5.4, gps), (5.8, failed)],
+            min_confidence=0.6,
+        )
+
+        assert combined.captured_at == BASE
+        assert combined.has_fix is True
+        assert (combined.lat, combined.lon) == (LAT, LON)
+        assert combined.speed_kmh == 61.0
+        assert combined.ocr_status == "valid"
+        assert combined.candidate_count == 3
+
+    def test_all_low_confidence_candidates_are_retained_but_not_trusted(self):
+        reading = OsdReading(
+            captured_at=BASE,
+            lat=LAT,
+            lon=LON,
+            has_fix=True,
+            confidence=0.4,
+            raw_text="uncertain",
+            time_status="valid",
+            gps_status="valid",
+        )
+
+        combined = TelemetryExtractor._combine_candidates(0.0, [(0.0, reading)], min_confidence=0.6)
+
+        assert combined.ocr_status == "low_confidence"
+        assert combined.has_fix is False
+        assert combined.raw_text == "uncertain"
+
+
+class TestConservativeGapRecovery:
+    def test_short_parse_gap_is_interpolated(self):
+        samples = [
+            sample(0, LAT, LON),
+            sample(1, None, None),
+            sample(2, LAT + 0.0004, LON + 0.0004),
+        ]
+        samples[1].gps_status = "parse_failed"
+
+        TelemetryExtractor._recover_short_gaps(samples, max_gap_s=3.0)
+
+        assert samples[1].has_fix is True
+        assert samples[1].gps_source == "interpolated"
+        assert samples[1].gps_status == "interpolated"
+
+    def test_explicit_camera_no_fix_is_never_interpolated(self):
+        samples = [
+            sample(0, LAT, LON),
+            sample(1, None, None),
+            sample(2, LAT + 0.0004, LON + 0.0004),
+        ]
+        samples[1].gps_status = "no_fix"
+
+        TelemetryExtractor._recover_short_gaps(samples, max_gap_s=3.0)
+
+        assert samples[1].has_fix is False
+        assert samples[1].gps_source == "none"
+
+    def test_long_gap_is_not_fabricated(self):
+        samples = [sample(0, LAT, LON), sample(5, None, None), sample(10, LAT, LON + 0.01)]
+        samples[1].gps_status = "parse_failed"
+
+        TelemetryExtractor._recover_short_gaps(samples, max_gap_s=3.0)
+
+        assert samples[1].has_fix is False
+
+
+def test_clock_origin_subtracts_the_video_offset():
+    reading = sample(5, LAT, LON)
+    assert TelemetryExtractor._clock_origin([reading], Path("20260804174353_camera_0.ts")) == BASE
+
+
+async def test_extraction_keeps_failed_seconds_and_best_success(monkeypatch):
+    import app.osd.engine as engine_module
+
+    extractor = TelemetryExtractor(templates=object())  # type: ignore[arg-type]
+
+    async def strips(*args, **kwargs):
+        for offset in (0.0, 0.5, 1.0, 1.5):
+            yield offset, np.zeros((50, 1920), dtype=np.uint8)
+
+    texts = iter(
+        [
+            "2026-08-04 17:43:53 E:138.6769 N:-34.8088 61 km/h",
+            "unreadable",
+            "unreadable",
+            "also unreadable",
+        ]
+    )
+
+    async def fake_probe(path):
+        return SimpleNamespace(width=1920, height=1080)
+
+    monkeypatch.setattr(extractor, "_iter_strips", strips)
+    monkeypatch.setattr(engine_module, "probe", fake_probe)
+    monkeypatch.setattr(engine_module, "decode_line", lambda mask, templates: (next(texts), 0.95))
+
+    result = await extractor.extract(
+        Path("20260804174353_camera_0.ts"),
+        region=SimpleNamespace(),
+        sample_fps=1.0,
+    )
+
+    assert len(result.samples) == 2, "one failed OCR second disappeared from the timeline"
+    assert result.samples[0].has_fix is True, "the later failure replaced a valid candidate"
+    assert result.samples[1].ocr_status == "failed"
+    assert result.samples[1].raw_text, "failed OCR evidence was not retained"

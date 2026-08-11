@@ -127,6 +127,9 @@ export interface ScanResult {
   missing: number
   queued: number
   errors: number
+  damagedHidden: number
+  damagedDeleted: number
+  damagedDeleteBlocked: number
   errorMessage: string | null
 }
 

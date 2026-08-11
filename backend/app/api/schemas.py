@@ -76,6 +76,7 @@ class RecordingOut(ApiModel):
     plate_count: int = 0
     thumbnail_path: str | None = None
     file_missing: bool = False
+    ignored: bool = False
 
     #: Carried only so the two fields below can be derived from it; the raw probe output
     #: is internal detail and never reaches a client.
@@ -107,6 +108,11 @@ class TelemetryPointOut(ApiModel):
     #: Derived from consecutive fixes, not reported by the camera.
     heading_deg: float | None = None
     ocr_confidence: float | None = None
+    #: Exact production OCR text, retained so debug mode never substitutes a different
+    #: seeked frame for the sample that was actually stored.
+    raw_text: str | None = None
+    #: Field-level extraction, validation and interpolation provenance.
+    quality: dict[str, Any] = Field(default_factory=dict)
 
 
 class JourneyOut(ApiModel):

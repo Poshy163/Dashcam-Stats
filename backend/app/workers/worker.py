@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 from app.core.logging import get_logger, log_context
 from app.core.settings_service import get_settings_service
+from app.damaged_policy import apply_damaged_policy
 from app.db.models import JobState, ProcessingJob, Recording
 from app.db.session import session_scope
 from app.hardware.detect import detect_hardware
@@ -322,6 +323,11 @@ class WorkerPool:
             # doing the work and the CPU quietly doing it instead.
             active.inference_device = self._device_from(report) or active.inference_device
             active.decoder = self._decoder_from(report) or active.decoder
+
+            # Metadata inspection can discover playable-but-damaged footage, while a
+            # permanent stage failure identifies an unusable source. Apply the user's
+            # policy only after the run has stopped reading the file.
+            await apply_damaged_policy(session, recording)
 
             # Flush the recording's own outcome here, in the session that owns it. Left
             # dirty, it was flushed later by the first query of the bookkeeping below --

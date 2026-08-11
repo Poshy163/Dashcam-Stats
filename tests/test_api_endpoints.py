@@ -282,6 +282,11 @@ class TestDetailEndpoints:
             response = await client.get(path)
             assert response.status_code == 200, f"{path}: {response.text[:200]}"
 
+        telemetry = (await client.get(f"/api/recordings/{rid}/telemetry")).json()
+        assert telemetry
+        assert all("raw_text" in point and "quality" in point for point in telemetry)
+        assert all(point["quality"].get("gps_status") for point in telemetry)
+
 
 class TestHeatmap:
     """The heat map aggregates in SQL, so the aggregation itself needs checking.
