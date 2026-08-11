@@ -177,11 +177,13 @@ async def test_online_backup_is_a_valid_database(db_session):
 
 
 async def test_smart_reprocess_queues_only_the_requested_outdated_stage(client, db_session):
+    now = datetime.now(UTC)
     current = Recording(
         rel_path="current.ts",
         filename="current.ts",
         size_bytes=1,
         state=RecordingState.COMPLETED,
+        processed_at=now,
         metadata_revision=CURRENT_REVISIONS["metadata"],
         telemetry_revision=CURRENT_REVISIONS["telemetry"],
         detection_revision=CURRENT_REVISIONS["detection"],
@@ -192,6 +194,7 @@ async def test_smart_reprocess_queues_only_the_requested_outdated_stage(client, 
         filename="outdated.ts",
         size_bytes=1,
         state=RecordingState.COMPLETED,
+        processed_at=now,
         metadata_revision=CURRENT_REVISIONS["metadata"],
         telemetry_revision="telemetry-v1",
         detection_revision=CURRENT_REVISIONS["detection"],

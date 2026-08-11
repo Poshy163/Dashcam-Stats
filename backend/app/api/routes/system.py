@@ -29,7 +29,7 @@ from app.api.schemas import (
     StatusStorage,
     StatusTotals,
 )
-from app.api.visibility import visible_journey_ids
+from app.api.visibility import visible_journey_ids, visible_revision
 from app.config import get_config
 from app.core.logging import get_logger
 from app.core.settings_service import (
@@ -43,6 +43,7 @@ from app.db.models import (
     Journey,
     LogEntry,
     Plate,
+    PlateObservation,
     Recording,
     RecordingState,
     RetentionRun,
@@ -146,12 +147,36 @@ async def get_status(session: SessionDep):
             or 0
         ),
         telemetry_points=int(
-            (await session.execute(select(func.count(TelemetryPoint.id)))).scalar() or 0
+            (
+                await session.execute(
+                    select(func.count(TelemetryPoint.id))
+                    .join(Recording, Recording.id == TelemetryPoint.recording_id)
+                    .where(visible_revision(Recording.telemetry_revision))
+                )
+            ).scalar()
+            or 0
         ),
         tracked_objects=int(
-            (await session.execute(select(func.count(TrackedObject.id)))).scalar() or 0
+            (
+                await session.execute(
+                    select(func.count(TrackedObject.id))
+                    .join(Recording, Recording.id == TrackedObject.recording_id)
+                    .where(visible_revision(Recording.detection_revision))
+                )
+            ).scalar()
+            or 0
         ),
-        plates=int((await session.execute(select(func.count(Plate.id)))).scalar() or 0),
+        plates=int(
+            (
+                await session.execute(
+                    select(func.count(func.distinct(Plate.id)))
+                    .join(PlateObservation, PlateObservation.plate_id == Plate.id)
+                    .join(Recording, Recording.id == PlateObservation.recording_id)
+                    .where(visible_revision(Recording.plate_revision))
+                )
+            ).scalar()
+            or 0
+        ),
         duration_s=float(
             (
                 await session.execute(
@@ -332,6 +357,13 @@ async def reprocess_all(body: ReprocessAllRequest, session: SessionDep):
     )
     if body.only_failed:
         stmt = stmt.where(Recording.state == RecordingState.FAILED)
+    else:
+        # This action is explicitly "reprocess existing footage". A newly discovered file
+        # has no old analysis to invalidate; including it cancels its priority-100 process
+        # job and replaces it with a priority-200 bulk job. On the live queue that left
+        # hundreds of new clips (and therefore their thumbnails) waiting behind the whole
+        # library reanalysis.
+        stmt = stmt.where(Recording.processed_at.is_not(None))
 
     candidates = list((await session.execute(stmt)).scalars())
     work: list[tuple[Recording, list[str]]] = []

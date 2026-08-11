@@ -510,6 +510,29 @@ async def queue_unprocessed(session: AsyncSession, limit: int | None = None) -> 
     excluded by a special case: neither is work that is waiting, and a file with no bytes
     in it must not be handed a processing attempt however many times this runs.
     """
+    # Repair jobs that a bulk reanalysis incorrectly stole from the new-footage queue.
+    # A recording that has never reached ``summarise`` has no thumbnail and no prior
+    # analysis to redo. It must keep normal processing priority instead of waiting behind
+    # hundreds of already-analysed clips. This also repairs queues created by releases
+    # before the bulk endpoint stopped selecting these recordings.
+    never_processed = select(Recording.id).where(
+        Recording.processed_at.is_(None),
+        Recording.ignored.is_(False),
+        Recording.file_missing.is_(False),
+    )
+    promoted = await session.execute(
+        update(ProcessingJob)
+        .where(
+            ProcessingJob.recording_id.in_(never_processed),
+            ProcessingJob.state == JobState.QUEUED,
+            ProcessingJob.priority > 100,
+        )
+        .values(kind=JobKind.PROCESS, stages=None, priority=100)
+        .execution_options(synchronize_session=False)
+    )
+    if promoted.rowcount:
+        log.info("restored new-footage queue priority", jobs=promoted.rowcount)
+
     active = select(ProcessingJob.recording_id).where(
         ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),
         ProcessingJob.recording_id.isnot(None),

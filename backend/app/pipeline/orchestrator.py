@@ -213,6 +213,10 @@ async def invalidate_recordings(
                     start_lon=None,
                     end_lat=None,
                     end_lon=None,
+                    min_lat=None,
+                    min_lon=None,
+                    max_lat=None,
+                    max_lon=None,
                 )
                 .execution_options(synchronize_session=False)
             )

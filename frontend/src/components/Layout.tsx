@@ -1,9 +1,10 @@
-import { useEffect, useState, type ComponentType, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
+import { invalidateAnalysisQueries } from '@/lib/queryInvalidation'
 
 type IconProps = { className?: string }
 type NavItem = {
@@ -45,12 +46,13 @@ function useTheme() {
 }
 
 export default function Layout({ children }: { children: ReactNode }) {
+  const client = useQueryClient()
   const { theme, toggle } = useTheme()
   const [query, setQuery] = useState('')
   const [navOpen, setNavOpen] = useState(false)
   const navigate = useNavigate()
 
-  const { data: stats } = useQuery({
+  const { data: stats, dataUpdatedAt: statsUpdatedAt } = useQuery({
     queryKey: ['queue-stats'],
     queryFn: api.jobs.stats,
     refetchInterval: 5_000,
@@ -58,6 +60,25 @@ export default function Layout({ children }: { children: ReactNode }) {
 
   const busy = (stats?.running ?? 0) > 0
   const pending = (stats?.queued ?? 0) + (stats?.running ?? 0)
+  const wasBusy = useRef(false)
+  const lastMapRefresh = useRef(0)
+
+  useEffect(() => {
+    const isBusy = pending > 0
+    // Refresh on every queue poll while work is active, and once more on the transition
+    // to idle. This makes derived pages empty immediately and then repopulate, and lets a
+    // thumbnail written by metadata appear without a hard browser refresh.
+    if (isBusy || wasBusy.current) {
+      const now = Date.now()
+      // The heat aggregation is deliberately heavier than a list read. Thirty seconds is
+      // live enough to watch it repopulate without executing it every five seconds for a
+      // multi-hour library rebuild.
+      const includeMaps = !isBusy || now - lastMapRefresh.current >= 30_000
+      if (includeMaps) lastMapRefresh.current = now
+      void invalidateAnalysisQueries(client, { includeMaps })
+    }
+    wasBusy.current = isBusy
+  }, [client, pending, statsUpdatedAt])
 
   useEffect(() => {
     const close = (event: KeyboardEvent) => {

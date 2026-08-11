@@ -36,7 +36,7 @@ from app.api.schemas import (
     TrackedObjectOut,
     VehicleOut,
 )
-from app.api.visibility import visible_journey_ids
+from app.api.visibility import visible_journey_ids, visible_revision
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service, local_zone
 from app.db.models import (
@@ -1003,10 +1003,7 @@ async def list_vehicles(
         .join(Recording, Recording.id == TrackedObject.recording_id)
         .where(
             TrackedObject.crop_path.is_not(None),
-            or_(
-                Recording.detection_revision.is_(None),
-                Recording.detection_revision != INVALIDATED_REVISION,
-            ),
+            visible_revision(Recording.detection_revision),
         )
     )
     stmt = stmt.where(
@@ -1059,7 +1056,16 @@ async def list_vehicles(
 @router.get("/vehicles/{vehicle_id}", response_model=VehicleOut)
 async def get_vehicle(vehicle_id: RowId, session: SessionDep):
     """One sighting. Ids here are ``tracked_objects`` ids, matching the list above."""
-    track = await session.get(TrackedObject, vehicle_id)
+    track = (
+        await session.execute(
+            select(TrackedObject)
+            .join(Recording, Recording.id == TrackedObject.recording_id)
+            .where(
+                TrackedObject.id == vehicle_id,
+                visible_revision(Recording.detection_revision),
+            )
+        )
+    ).scalar_one_or_none()
     if track is not None:
         plates = await _plates_for_tracks(session, [track.id])
         return _sighting_out(track, plates.get(track.id))

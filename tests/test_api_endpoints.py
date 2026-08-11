@@ -403,6 +403,32 @@ class TestHeatmap:
         # Whatever the grid, every fix is still accounted for exactly once.
         assert fine["total_points"] == coarse["total_points"] == 7
 
+    async def test_invalidated_recording_cannot_leak_through_an_unrelated_one(
+        self, client, telemetry
+    ):
+        """The missing join made one valid recording expose every stale GPS point."""
+        from app.pipeline.revisions import CURRENT_REVISIONS, INVALIDATED_REVISION
+
+        async with session_scope() as session:
+            session.add(
+                Recording(
+                    rel_path="valid-without-points.ts",
+                    filename="valid-without-points.ts",
+                    size_bytes=1,
+                    state=RecordingState.COMPLETED,
+                    telemetry_revision=CURRENT_REVISIONS["telemetry"],
+                )
+            )
+            await session.execute(
+                update(Recording)
+                .where(Recording.rel_path == "20260804174353_camera_0.ts")
+                .values(telemetry_revision=INVALIDATED_REVISION)
+            )
+
+        body = (await client.get("/api/map/heatmap")).json()
+        assert body["points"] == []
+        assert body["total_points"] == 0
+
     async def test_precision_beyond_the_source_resolution_is_refused(self, client):
         # The overlay prints four decimals; offering more would invent precision.
         assert (await client.get("/api/map/heatmap?precision=7")).status_code == 422
@@ -563,6 +589,24 @@ class TestVehicleSightings:
         for item in listed:
             response = await client.get(f"/api/vehicles/{item['id']}")
             assert response.status_code == 200, response.text
+
+    async def test_reanalysis_hides_the_vehicle_list_and_direct_links(self, client, sightings):
+        from app.pipeline.revisions import INVALIDATED_REVISION
+
+        before = (await client.get("/api/vehicles")).json()
+        vehicle_id = before["items"][0]["id"]
+        async with session_scope() as session:
+            await session.execute(
+                update(Recording)
+                .where(Recording.rel_path == "v.ts")
+                .values(detection_revision=INVALIDATED_REVISION)
+            )
+
+        after = (await client.get("/api/vehicles")).json()
+        status = (await client.get("/api/status")).json()
+        assert after["total"] == 0
+        assert status["totals"]["tracked_objects"] == 0
+        assert (await client.get(f"/api/vehicles/{vehicle_id}")).status_code == 404
 
 
 class TestPlateCrops:

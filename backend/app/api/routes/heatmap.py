@@ -23,15 +23,15 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Query
-from sqlalchemy import Float, String, distinct, func, or_, select
+from sqlalchemy import Float, String, distinct, func, select
 from sqlalchemy import cast as sa_cast
 
 from app.api.deps import SQLITE_MAX_INT, SessionDep
 from app.api.geometry import build_polylines
 from app.api.schemas import HeatmapOut, RoutesOut
+from app.api.visibility import visible_journey_ids, visible_revision
 from app.core.logging import get_logger
 from app.db.models import Camera, CameraRole, Journey, Recording, TelemetryPoint
-from app.pipeline.revisions import INVALIDATED_REVISION
 
 log = get_logger(__name__)
 
@@ -122,15 +122,17 @@ async def heatmap(
             func.sum(TelemetryPoint.speed_kmh).label("speed_sum"),
             func.count(TelemetryPoint.speed_kmh).label("speed_count"),
         )
+        # This join is load-bearing. Referencing Recording only in the WHERE clause makes
+        # SQLAlchemy add it as a second, unrelated FROM item: a Cartesian product where
+        # one valid recording makes every invalidated telemetry row look valid. That is
+        # why reanalysis removed the route lines but left the heat layer behind.
+        .join(Recording, Recording.id == TelemetryPoint.recording_id)
         # has_fix alone is not enough: a row can carry the flag with null coordinates if a
         # reading was rejected after the flag was set, and null coordinates would round to
         # a cell at Null Island.
         .where(
             TelemetryPoint.has_fix.is_(True),
-            or_(
-                Recording.telemetry_revision.is_(None),
-                Recording.telemetry_revision != INVALIDATED_REVISION,
-            ),
+            visible_revision(Recording.telemetry_revision),
             TelemetryPoint.lat.is_not(None),
             TelemetryPoint.lon.is_not(None),
         )
@@ -154,11 +156,7 @@ async def heatmap(
     if journey_id is not None:
         stmt = stmt.where(TelemetryPoint.journey_id == journey_id)
     if camera is not None:
-        stmt = (
-            stmt.join(Recording, TelemetryPoint.recording_id == Recording.id)
-            .join(Camera, Recording.camera_id == Camera.id)
-            .where(Camera.key == camera)
-        )
+        stmt = stmt.join(Camera, Recording.camera_id == Camera.id).where(Camera.key == camera)
 
     rows = (await session.execute(stmt)).all()
     truncated = len(rows) > limit
@@ -236,10 +234,7 @@ async def routes(
         .outerjoin(Camera, Recording.camera_id == Camera.id)
         .where(
             TelemetryPoint.has_fix.is_(True),
-            or_(
-                Recording.telemetry_revision.is_(None),
-                Recording.telemetry_revision != INVALIDATED_REVISION,
-            ),
+            visible_revision(Recording.telemetry_revision),
             TelemetryPoint.lat.is_not(None),
             TelemetryPoint.lon.is_not(None),
             # A rear-camera-only stretch is rare and not worth a second copy of every road.
@@ -304,7 +299,11 @@ async def coverage(session: SessionDep):
             Journey.max_lat,
             Journey.max_lon,
         )
-        .where(Journey.min_lat.is_not(None), Journey.min_lon.is_not(None))
+        .where(
+            Journey.id.in_(visible_journey_ids()),
+            Journey.min_lat.is_not(None),
+            Journey.min_lon.is_not(None),
+        )
         .order_by(Journey.started_at.desc())
     )
     return [

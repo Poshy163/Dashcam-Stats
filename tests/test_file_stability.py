@@ -18,7 +18,7 @@ import time
 
 import pytest
 
-from app.db.models import Recording, RecordingState
+from app.db.models import JobKind, JobState, ProcessingJob, Recording, RecordingState
 from app.db.session import session_scope
 from app.scanner.discovery import Scanner, queue_unprocessed
 from app.scanner.stability import Readiness, assess
@@ -150,9 +150,9 @@ class TestAnEmptyRecordingLeavesTheQueue:
 
         response = await client.post("/api/reprocess", json={"stages": ["everything"]})
         assert response.status_code == 200
-        assert response.json()["queued"] == 1, (
-            "a zero-byte recording was requeued by a bulk reprocess and will burn another "
-            "four attempts on a file with nothing in it"
+        assert response.json()["queued"] == 0, (
+            "bulk reprocessing queued a zero-byte file or stole a never-processed file "
+            "from the higher-priority new-footage queue"
         )
 
     async def test_a_file_that_later_gains_content_is_picked_up(self, share):
@@ -171,6 +171,35 @@ class TestAnEmptyRecordingLeavesTheQueue:
         await Scanner(footage_dir=share).scan(trigger="test")
         await Scanner(footage_dir=share).scan(trigger="test")
         assert await _state("20260804111550_camera_1.ts") is RecordingState.DISCOVERED
+
+
+class TestNewFootageKeepsPriority:
+    async def test_an_old_bulk_job_is_repaired(self, db_session):
+        recording = Recording(
+            rel_path="new.ts",
+            filename="new.ts",
+            size_bytes=1024,
+            fingerprint="stable",
+            state=RecordingState.QUEUED,
+            processed_at=None,
+        )
+        db_session.add(recording)
+        await db_session.flush()
+        job = ProcessingJob(
+            recording_id=recording.id,
+            kind=JobKind.REPROCESS,
+            stages=["everything"],
+            state=JobState.QUEUED,
+            priority=200,
+        )
+        db_session.add(job)
+        await db_session.flush()
+
+        assert await queue_unprocessed(db_session) == 0
+        await db_session.refresh(job)
+        assert job.kind is JobKind.PROCESS
+        assert job.stages is None
+        assert job.priority == 100
 
 
 class TestTheTwoKindsOfInvalid:

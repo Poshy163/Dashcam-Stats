@@ -48,6 +48,7 @@ async def recording(db_session):
             size_bytes=2048,
             state=RecordingState.COMPLETED,
             started_at=datetime(2026, 8, 4, 8, 13, 53, tzinfo=UTC),
+            processed_at=datetime(2026, 8, 4, 8, 20, 0, tzinfo=UTC),
         )
         session.add(rec)
         await session.flush()

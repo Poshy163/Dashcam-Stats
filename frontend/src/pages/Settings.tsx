@@ -6,6 +6,7 @@ import { ErrorState, PageHeader } from '@/components/ui'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { formatBytes } from '@/lib/format'
+import { invalidateAnalysisQueries } from '@/lib/queryInvalidation'
 import type { RetentionPlan, SettingDef } from '@/lib/types'
 
 export default function Settings() {
@@ -40,13 +41,22 @@ export default function Settings() {
     onSuccess: () => client.invalidateQueries({ queryKey: ['settings'] }),
   })
 
-  const scanNow = useMutation({ mutationFn: api.scan.now })
-  const processNew = useMutation({ mutationFn: api.scan.processNew })
+  const refreshQueueAndAnalysis = () => {
+    void client.invalidateQueries({ queryKey: ['jobs'] })
+    void client.invalidateQueries({ queryKey: ['queue-stats'] })
+    void invalidateAnalysisQueries(client)
+  }
+
+  const scanNow = useMutation({ mutationFn: api.scan.now, onSuccess: refreshQueueAndAnalysis })
+  const processNew = useMutation({
+    mutationFn: api.scan.processNew,
+    onSuccess: refreshQueueAndAnalysis,
+  })
   const [reprocessStage, setReprocessStage] = useState('everything')
   const reprocessAll = useMutation({
     mutationFn: ({ onlyFailed = false, onlyOutdated = false }: { onlyFailed?: boolean; onlyOutdated?: boolean }) =>
       api.scan.reprocessAll([reprocessStage], onlyFailed, onlyOutdated),
-    onSuccess: () => client.invalidateQueries({ queryKey: ['jobs'] }),
+    onSuccess: refreshQueueAndAnalysis,
   })
   const restore = useMutation({ mutationFn: api.system.restore })
   const plan = useMutation({ mutationFn: api.retention.plan })

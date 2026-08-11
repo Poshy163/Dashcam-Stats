@@ -11,6 +11,11 @@ from app.db.models import Recording
 from app.pipeline.revisions import INVALIDATED_REVISION
 
 
+def visible_revision(column):
+    """A pre-revision result, or one not hidden by an active reanalysis."""
+    return or_(column.is_(None), column != INVALIDATED_REVISION)
+
+
 def visible_journey_ids():
     """Journey ids backed by at least one non-invalidated recording.
 
@@ -22,10 +27,7 @@ def visible_journey_ids():
         .where(
             Recording.journey_id.is_not(None),
             Recording.ignored.is_(False),
-            or_(
-                Recording.telemetry_revision.is_(None),
-                Recording.telemetry_revision != INVALIDATED_REVISION,
-            ),
+            visible_revision(Recording.telemetry_revision),
         )
         .distinct()
     )
