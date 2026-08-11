@@ -114,6 +114,28 @@ async def _state(filename: str) -> RecordingState:
         ).scalar_one()
 
 
+async def test_the_network_share_walk_runs_off_the_application_event_loop(share, monkeypatch):
+    import threading
+
+    scanner = Scanner(footage_dir=share)
+    original_walk = scanner._walk
+    event_loop_thread = threading.get_ident()
+    walk_threads: set[int] = set()
+
+    def observed_walk(*args, **kwargs):
+        walk_threads.add(threading.get_ident())
+        yield from original_walk(*args, **kwargs)
+
+    monkeypatch.setattr(scanner, "_walk", observed_walk)
+
+    await scanner.scan(trigger="test")
+
+    assert walk_threads
+    assert event_loop_thread not in walk_threads, (
+        "os.scandir/stat against NFS ran on Uvicorn's event loop and can freeze every route"
+    )
+
+
 class TestAnEmptyRecordingLeavesTheQueue:
     async def test_it_is_marked_invalid_rather_than_failed(self, share):
         summary = await Scanner(footage_dir=share).scan(trigger="test")

@@ -29,6 +29,7 @@ from app.core.logging import configure_logging, get_logger, install_db_sink, shu
 from app.core.settings_service import get_settings_service, init_settings_service
 from app.db.session import dispose_engine, get_session_factory, init_db
 from app.pipeline.stages import warm_models
+from app.workers import queue
 from app.workers.scheduler import get_scheduler
 from app.workers.worker import get_worker_pool
 
@@ -74,6 +75,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     pool = get_worker_pool()
     scheduler = get_scheduler()
+    # An explicit pause is an operator decision, not process-local state. Restore it before
+    # either worker can claim one of the hundreds of queued bulk-reprocess jobs.
+    queue.restore_pause_state()
     await pool.start()
     await scheduler.start()
 
@@ -177,11 +181,10 @@ def create_app() -> FastAPI:
         detail["active_jobs"] = len(pool.current_jobs())
         detail["workers"] = pool.worker_count
 
-        # The footage mount being absent is a misconfiguration worth surfacing, but it
-        # does not make the container unhealthy — the UI still works and says why.
-        footage = get_config().footage_dir
-        if not footage.exists():
-            detail["footage"] = f"{footage} is not mounted"
+        # Never stat the footage path here. It is a hard NFS mount in production, and one
+        # delayed metadata call inside the health endpoint blocks Uvicorn's only event loop.
+        # The scanner reports mount availability without making UI liveness depend on the
+        # storage server answering this request.
 
         components = {"database": database, "scanner": scanner, "worker": worker}
         unhealthy = [k for k, v in components.items() if v != "healthy"]

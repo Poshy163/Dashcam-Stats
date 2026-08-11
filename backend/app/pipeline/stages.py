@@ -367,8 +367,10 @@ async def stage_inspect(
     session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
 ) -> StageResult:
     """Read container metadata and generate a thumbnail."""
-    path = resolve_footage_path(recording.rel_path)
-    if not path.exists():
+    # Path resolution and existence checks can enter a hard NFS mount. Keep both away from
+    # the API/worker event loop so storage latency cannot freeze health and the whole UI.
+    path = await asyncio.to_thread(resolve_footage_path, recording.rel_path)
+    if not await asyncio.to_thread(path.exists):
         recording.file_missing = True
         # Retryable, not permanent. An absent file is very often an absent *share* -- the
         # same event the scanner refuses to read as deletion -- and the file itself may be
@@ -515,8 +517,12 @@ async def _get_templates(
         return None
 
     chosen = select_training_set(candidates, limit=10)
-    paths = [resolve_footage_path(by_name[name]) for name, _ in chosen]
-    paths = [p for p in paths if p.exists()]
+
+    def available_training_paths() -> list[Path]:
+        resolved = [resolve_footage_path(by_name[name]) for name, _ in chosen]
+        return [candidate for candidate in resolved if candidate.exists()]
+
+    paths = await asyncio.to_thread(available_training_paths)
     if not paths:
         return None
 
@@ -606,7 +612,7 @@ async def stage_telemetry(
         recording.telemetry_state = StageState.SKIPPED
         return StageResult("telemetry", True, "disabled")
 
-    path = resolve_footage_path(recording.rel_path)
+    path = await asyncio.to_thread(resolve_footage_path, recording.rel_path)
     region = await _active_profile(session)
     extractor = TelemetryExtractor()
 
@@ -933,7 +939,7 @@ async def stage_detect(
         recording.detection_state = StageState.SKIPPED
         return StageResult("detection", True, "detection model unavailable")
 
-    path = resolve_footage_path(recording.rel_path)
+    path = await asyncio.to_thread(resolve_footage_path, recording.rel_path)
     sample_fps = float(settings.get_nowait("processing.frame_sample_fps"))
     tracker = ByteTracker()
     duration = recording.duration_s or 0.0

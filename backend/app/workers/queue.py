@@ -11,10 +11,12 @@ workers racing for the same row cannot both win.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_config
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service, local_midnight_utc
 from app.db.models import JobKind, JobState, ProcessingJob, Recording, RecordingState
@@ -37,6 +39,24 @@ MAX_CONTENTION_RETRIES = 6
 _paused = False
 
 
+def _pause_marker() -> Path:
+    """A local-volume marker makes an operator's pause survive container replacement."""
+    return get_config().data_dir / ".queue-paused"
+
+
+def restore_pause_state() -> bool:
+    """Restore the durable pause flag before workers are allowed to claim jobs."""
+    global _paused
+    try:
+        _paused = _pause_marker().exists()
+    except OSError as exc:
+        _paused = False
+        log.warning("could not restore processing queue pause state", error=str(exc))
+    if _paused:
+        log.info("processing queue remains paused after restart")
+    return _paused
+
+
 def is_paused() -> bool:
     return _paused
 
@@ -44,12 +64,22 @@ def is_paused() -> bool:
 def pause() -> None:
     global _paused
     _paused = True
+    try:
+        marker = _pause_marker()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch(exist_ok=True)
+    except OSError as exc:
+        log.warning("could not persist processing queue pause", error=str(exc))
     log.info("processing queue paused")
 
 
 def resume() -> None:
     global _paused
     _paused = False
+    try:
+        _pause_marker().unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("could not clear processing queue pause", error=str(exc))
     log.info("processing queue resumed")
 
 

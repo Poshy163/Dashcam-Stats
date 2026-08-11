@@ -40,6 +40,26 @@ async def make_recording(session, name: str = "job.ts", **kwargs) -> int:
     return recording.id
 
 
+def test_an_operator_pause_survives_a_process_restart(tmp_path, monkeypatch):
+    marker = tmp_path / ".queue-paused"
+    original = queue._paused
+    monkeypatch.setattr(queue, "_pause_marker", lambda: marker)
+    try:
+        queue.pause()
+        assert marker.exists()
+
+        # Simulate a fresh module/process before startup restores durable runtime state.
+        queue._paused = False
+        assert queue.restore_pause_state()
+        assert queue.is_paused()
+
+        queue.resume()
+        assert not marker.exists()
+        assert not queue.is_paused()
+    finally:
+        queue._paused = original
+
+
 @pytest.fixture
 async def recording_id(db_session) -> int:
     return await make_recording(db_session)

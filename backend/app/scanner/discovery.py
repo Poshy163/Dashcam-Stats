@@ -12,6 +12,8 @@ to reprocessing.
 
 from __future__ import annotations
 
+import asyncio
+import itertools
 import os
 import time
 from collections.abc import Iterator
@@ -217,7 +219,8 @@ class Scanner:
             summary.scan_run_id = run.id
             run_id = run.id
 
-        if not root.exists() or not root.is_dir():
+        available = await asyncio.to_thread(lambda: root.exists() and root.is_dir())
+        if not available:
             summary.error_message = f"footage directory {root} is not available"
             log.error("scan aborted", reason=summary.error_message)
             await self._finish_run(run_id, summary, started)
@@ -226,22 +229,25 @@ class Scanner:
         now_ns = time.time_ns()
         settle_ns = int(settle_s * 1_000_000_000)
         seen_paths: set[str] = set()
-        batch: list[_Entry] = []
-
+        walker = self._walk(root, extensions, follow_symlinks)
         try:
-            for entry in self._walk(root, extensions, follow_symlinks):
-                summary.seen += 1
-                seen_paths.add(entry.rel_path)
-                batch.append(entry)
-                if len(batch) >= _BATCH_SIZE:
-                    await self._process_batch(batch, summary, now_ns, settle_ns, sample_bytes, tz)
-                    batch.clear()
-            if batch:
+            while True:
+                # os.scandir/stat on a hard NFS mount may block in the kernel. Pull one
+                # bounded batch in a worker thread, then return to the loop for database
+                # work and API traffic before touching the share again.
+                batch = await asyncio.to_thread(lambda: list(itertools.islice(walker, _BATCH_SIZE)))
+                if not batch:
+                    break
+                for entry in batch:
+                    summary.seen += 1
+                    seen_paths.add(entry.rel_path)
                 await self._process_batch(batch, summary, now_ns, settle_ns, sample_bytes, tz)
         except Exception as exc:
             summary.errors += 1
             summary.error_message = f"{type(exc).__name__}: {exc}"
             log.exception("scan failed", error=str(exc))
+        finally:
+            walker.close()
 
         summary.errors += self._walk_errors
         skip_reason = await self._reconciliation_blocked(summary)
