@@ -14,10 +14,10 @@ export function PageHeader({
   actions?: ReactNode
 }) {
   return (
-    <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
+    <div className="mb-7 flex flex-wrap items-start justify-between gap-4">
       <div className="min-w-0">
-        <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
-        {subtitle && <div className="mt-0.5 text-sm text-content-muted">{subtitle}</div>}
+        <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">{title}</h1>
+        {subtitle && <div className="mt-1.5 text-sm text-content-muted sm:text-base">{subtitle}</div>}
       </div>
       {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
     </div>
@@ -30,12 +30,14 @@ export function StatTile({
   hint,
   tone = 'default',
   href,
+  icon,
 }: {
   label: string
   value: ReactNode
   hint?: ReactNode
   tone?: 'default' | 'ok' | 'warn' | 'error' | 'busy'
   href?: string
+  icon?: ReactNode
 }) {
   const toneClass = {
     default: 'text-content',
@@ -46,16 +48,23 @@ export function StatTile({
   }[tone]
 
   const body = (
-    <>
-      <div className="text-xs font-medium uppercase tracking-wide text-content-muted">{label}</div>
-      <div className={cn('tabular mt-1.5 text-2xl font-semibold leading-none', toneClass)}>
-        {value}
+    <div className="flex items-start gap-3">
+      {icon && (
+        <div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-accent-muted text-accent">
+          {icon}
+        </div>
+      )}
+      <div className="min-w-0">
+        <div className={cn('tabular text-2xl font-bold leading-none tracking-tight sm:text-3xl', toneClass)}>
+          {value}
+        </div>
+        <div className="mt-2 text-sm font-medium text-content-muted">{label}</div>
+        {hint && <div className="mt-1 text-xs text-content-faint">{hint}</div>}
       </div>
-      {hint && <div className="mt-1.5 text-xs text-content-faint">{hint}</div>}
-    </>
+    </div>
   )
 
-  const className = cn('card p-3.5', href && 'transition-colors hover:border-accent/50')
+  const className = cn('card p-4 sm:p-5', href && 'transition-all hover:-translate-y-0.5 hover:border-accent/40 hover:shadow-md')
   return href ? (
     <a href={href} className={className}>
       {body}
@@ -165,8 +174,9 @@ export function EmptyState({
   action?: ReactNode
 }) {
   return (
-    <div className="card flex flex-col items-center gap-2 px-6 py-14 text-center">
-      <div className="text-sm font-medium">{title}</div>
+    <div className="card flex flex-col items-center gap-2 px-6 py-16 text-center">
+      <div className="grid h-12 w-12 place-items-center rounded-full bg-accent-muted text-xl text-accent">·</div>
+      <div className="mt-1 text-base font-semibold">{title}</div>
       {description && <div className="max-w-md text-sm text-content-muted">{description}</div>}
       {action && <div className="mt-2">{action}</div>}
     </div>
@@ -222,7 +232,7 @@ export function Pagination({
 export function ProgressBar({ value, className }: { value: number; className?: string }) {
   const pct = Math.max(0, Math.min(100, value * 100))
   return (
-    <div className={cn('h-1.5 w-full overflow-hidden rounded-full bg-surface-sunken', className)}>
+    <div className={cn('h-2.5 w-full overflow-hidden rounded-full bg-surface-sunken', className)}>
       <div
         className="h-full rounded-full bg-accent transition-[width] duration-500"
         style={{ width: `${pct}%` }}

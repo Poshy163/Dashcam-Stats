@@ -97,7 +97,12 @@ export default function Recordings() {
         }
       />
 
-      <div className="card flex flex-wrap items-end gap-3 p-3">
+      <section className="card p-4 sm:p-5">
+        <div className="mb-4">
+          <h2 className="section-title">Filter recordings</h2>
+          <p className="mt-1 text-sm text-content-muted">Narrow the library by file, processing state, or captured data.</p>
+        </div>
+        <div className="flex flex-wrap items-end gap-3">
         <label className="min-w-[12rem] flex-1">
           <span className="label mb-1 block text-xs">Filename</span>
           <input
@@ -148,7 +153,8 @@ export default function Recordings() {
         <button className="btn" onClick={() => setParams(new URLSearchParams())}>
           Clear
         </button>
-      </div>
+        </div>
+      </section>
 
       {query.isLoading && <Spinner label="Loading recordings…" className="py-20" />}
       {query.isError && <ErrorState error={query.error} retry={() => query.refetch()} />}
@@ -227,13 +233,13 @@ function Meta({ recording }: { recording: Recording }) {
 
 function Grid({ items }: { items: Recording[] }) {
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
       {items.map((recording) => (
-        <Link key={recording.id} to={`/recordings/${recording.id}`} className="card overflow-hidden p-2 transition-colors hover:border-accent/50">
+        <Link key={recording.id} to={`/recordings/${recording.id}`} className="card group overflow-hidden p-3 transition-all hover:-translate-y-0.5 hover:border-accent/40 hover:shadow-md">
           <Thumb recording={recording} />
-          <div className="mt-2 flex items-start justify-between gap-2">
+          <div className="mt-3 flex items-start justify-between gap-2">
             <div className="min-w-0">
-              <div className="truncate text-sm font-medium">{recording.filename}</div>
+              <div className="truncate text-sm font-semibold group-hover:text-accent">{recording.filename}</div>
               <div className="text-xs text-content-muted">
                 {recording.camera?.name ?? 'Unknown camera'} · {formatDateTime(recording.startedAt)}
               </div>
@@ -255,15 +261,15 @@ function Table({ items }: { items: Recording[] }) {
       <table className="w-full min-w-[54rem] text-sm">
         <thead className="border-b border-border text-left text-xs text-content-muted">
           <tr>
-            <th className="p-2 font-medium">Recording</th>
-            <th className="p-2 font-medium">Camera</th>
-            <th className="p-2 font-medium">Date</th>
-            <th className="p-2 font-medium">Duration</th>
-            <th className="p-2 font-medium">Size</th>
-            <th className="p-2 font-medium">GPS</th>
-            <th className="p-2 font-medium">Vehicles</th>
-            <th className="p-2 font-medium">Plates</th>
-            <th className="p-2 font-medium">State</th>
+            <th className="p-3 font-semibold">Recording</th>
+            <th className="p-3 font-semibold">Camera</th>
+            <th className="p-3 font-semibold">Date</th>
+            <th className="p-3 font-semibold">Duration</th>
+            <th className="p-3 font-semibold">Size</th>
+            <th className="p-3 font-semibold">GPS</th>
+            <th className="p-3 font-semibold">Vehicles</th>
+            <th className="p-3 font-semibold">Plates</th>
+            <th className="p-3 font-semibold">State</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-border">

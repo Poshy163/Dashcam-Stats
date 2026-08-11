@@ -86,14 +86,14 @@ export default function Settings() {
         subtitle="Changes take effect immediately — the container does not need restarting."
       />
 
-      <div className="grid gap-4 md:grid-cols-[12rem_minmax(0,1fr)]">
-        <nav className="flex gap-1 overflow-x-auto md:flex-col">
+      <div className="grid gap-5 md:grid-cols-[13rem_minmax(0,1fr)]">
+        <nav className="card flex h-fit gap-1 overflow-x-auto p-2 md:sticky md:top-24 md:flex-col">
           {categories.map((c) => (
             <button
               key={c.key}
               onClick={() => setActive(c.key)}
               className={cn(
-                'whitespace-nowrap rounded-md px-2.5 py-1.5 text-left text-sm transition-colors',
+                'min-h-10 whitespace-nowrap rounded-lg px-3 py-2 text-left text-sm transition-colors',
                 c.key === category.key
                   ? 'bg-accent-muted font-medium text-accent'
                   : 'text-content-muted hover:bg-surface-sunken hover:text-content',
@@ -105,8 +105,8 @@ export default function Settings() {
         </nav>
 
         <div className="space-y-4">
-          <section className="card p-4">
-            <h2 className="text-sm font-semibold">{category.label}</h2>
+          <section className="card p-5 sm:p-6">
+            <h2 className="text-lg font-semibold tracking-tight">{category.label}</h2>
             {category.description && <p className="hint mt-0.5">{category.description}</p>}
 
             <div className="mt-4 space-y-4">

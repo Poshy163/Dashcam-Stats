@@ -73,9 +73,9 @@ export default function Journeys() {
         />
       )}
 
-      <div className="space-y-2">
+      <div className="space-y-3">
         {query.data?.items.map((journey) => (
-          <div key={journey.id} className="card flex items-start gap-3 p-3">
+          <div key={journey.id} className="card flex items-start gap-4 p-4 transition-all hover:border-accent/30 hover:shadow-md sm:p-5">
             <input
               type="checkbox"
               className="mt-1"
@@ -84,8 +84,8 @@ export default function Journeys() {
               aria-label={`Select journey ${journey.id}`}
             />
             <Link to={`/journeys/${journey.id}`} className="min-w-0 flex-1 hover:text-accent">
-              <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
-                <span className="font-medium">{formatDate(journey.startedAt)}</span>
+              <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                <span className="text-base font-semibold">{formatDate(journey.startedAt)}</span>
                 <span className="tabular text-sm text-content-muted">
                   {formatTime(journey.startedAt)} → {formatTime(journey.endedAt)}
                 </span>
@@ -96,7 +96,7 @@ export default function Journeys() {
                   <span className="badge bg-accent-muted text-accent">edited</span>
                 )}
               </div>
-              <div className="tabular mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-content-muted">
+              <div className="tabular mt-2 flex flex-wrap gap-x-5 gap-y-1 text-sm text-content-muted">
                 {journey.hasGps ? (
                   <>
                     <DerivedHint>{formatDistance(journey.distanceM)}</DerivedHint>
