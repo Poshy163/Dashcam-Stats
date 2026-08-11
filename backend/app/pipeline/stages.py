@@ -396,6 +396,7 @@ async def stage_inspect(
 
     if progress:
         progress("metadata", 0.6)
+    source_unusable = False
     if not recording.thumbnail_path:
         thumb = _media_path("thumbnails", f"{recording.id:08d}.jpg")
         chosen = await _choose_thumbnail(
@@ -414,12 +415,14 @@ async def stage_inspect(
             info.warnings.append(
                 "no usable frame could be decoded; the source file appears to be damaged"
             )
+            source_unusable = True
 
     recording.probe_json = {
         "warnings": info.warnings,
         "pts_wrapped": info.pts_wrapped,
         "truncated": info.truncated,
         "source_damaged": bool(info.warnings),
+        "source_unusable": source_unusable,
     }
 
     recording.metadata_state = StageState.DONE

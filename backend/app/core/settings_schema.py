@@ -146,9 +146,11 @@ SETTINGS: tuple[SettingDef, ...] = (
         "select",
         "hide",
         "scanner",
-        "What to do after a stable file is positively classified as damaged. Hide keeps "
-        "the source and analysis history but removes it from normal library views. Delete "
-        "removes only the source footage, retains derived history, and is blocked unless "
+        "What to do after a stable file is positively classified as permanently unusable "
+        "(empty, no video stream, or no decodable frame). Recoverable container warnings "
+        "do not trigger this policy. Hide keeps the source and analysis history but removes "
+        "it from normal library views. Delete removes only the source footage, retains "
+        "derived history, and is blocked unless "
         "the footage mount passes all deletion safety checks and is writable. Existing "
         "damaged files are reconciled on the next scan.",
         choices=(

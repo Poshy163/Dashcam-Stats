@@ -58,6 +58,32 @@ class TestHiding:
 
         assert summary.hidden == 1
 
+    async def test_recoverable_transport_warning_is_not_blacklisted(self, db_session):
+        row = await _recording(db_session, "playable.ts")
+        row.probe_json = {
+            "source_damaged": True,
+            "warnings": ["file ends 100 bytes into a 188-byte transport packet"],
+        }
+
+        outcome = await apply_damaged_policy(db_session, row, action="hide")
+
+        assert outcome == "kept"
+        assert row.ignored is False
+
+    async def test_scan_restores_rows_hidden_for_recoverable_warnings(self, db_session):
+        row = await _recording(db_session, "restore-playable.ts")
+        await apply_damaged_policy(db_session, row, action="hide")
+        probe = dict(row.probe_json)
+        probe["warnings"] = ["container reported an implausible frame rate"]
+        probe["source_unusable"] = False
+        row.probe_json = probe
+        await db_session.flush()
+
+        summary = await apply_known_damaged_policy(db_session)
+
+        assert summary.restored == 1
+        assert row.ignored is False
+
 
 class TestDeletion:
     async def test_explicit_delete_removes_only_the_source(self, db_session, temp_dirs):

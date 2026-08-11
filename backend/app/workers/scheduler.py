@@ -154,7 +154,13 @@ class Scheduler:
 
         # New footage almost always extends the most recent journey, so keep boundaries
         # fresh rather than waiting for the next full rebuild.
-        if summary.new or summary.changed or summary.damaged_hidden or summary.damaged_deleted:
+        if (
+            summary.new
+            or summary.changed
+            or summary.damaged_hidden
+            or summary.damaged_deleted
+            or summary.damaged_restored
+        ):
             async with session_scope() as session:
                 await JourneyBuilder().rebuild(session)
 

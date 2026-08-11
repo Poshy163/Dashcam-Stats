@@ -153,6 +153,11 @@ export default function Settings() {
                       hidden instead
                     </>
                   )}
+                  {scanNow.data.damagedRestored > 0 && (
+                    <>
+                      {' '}&mdash; {scanNow.data.damagedRestored} playable recordings restored
+                    </>
+                  )}
                   .
                 </p>
               )}

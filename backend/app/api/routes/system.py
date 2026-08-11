@@ -278,6 +278,7 @@ async def scan_now():
         "damaged_hidden": summary.damaged_hidden,
         "damaged_deleted": summary.damaged_deleted,
         "damaged_delete_blocked": summary.damaged_delete_blocked,
+        "damaged_restored": summary.damaged_restored,
         "missing": summary.missing,
         "queued": summary.queued,
         "errors": summary.errors,

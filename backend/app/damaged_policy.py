@@ -23,6 +23,7 @@ from app.retention.safety import SafetyReport, evaluate_safety
 log = get_logger(__name__)
 
 _POLICY_KEY = "damaged_policy"
+_UNUSABLE_WARNING = "no usable frame could be decoded"
 
 
 @dataclass(slots=True)
@@ -34,9 +35,19 @@ class DamagedPolicySummary:
 
 
 def is_damaged(recording: Recording) -> bool:
-    """Whether the source, rather than a transient processing attempt, is damaged."""
+    """Whether the source is permanently unusable, not merely imperfect.
+
+    Recoverable container warnings are still shown on a recording, but they are not a
+    reason to hide it. In particular, dashcam transport streams commonly end partway
+    through a 188-byte packet or report a nonsense nominal FPS while decoding normally.
+    """
     probe = recording.probe_json if isinstance(recording.probe_json, dict) else {}
-    return recording.state is RecordingState.INVALID or bool(probe.get("source_damaged"))
+    warnings = [str(item).lower() for item in probe.get("warnings") or []]
+    return (
+        recording.state is RecordingState.INVALID
+        or bool(probe.get("source_unusable"))
+        or any(_UNUSABLE_WARNING in warning for warning in warnings)
+    )
 
 
 def _probe(recording: Recording) -> dict:
@@ -111,7 +122,11 @@ async def apply_damaged_policy(
 
     if selected == "keep":
         return "restored" if _restore_policy_hidden(recording) else "kept"
-    if not is_damaged(recording) or recording.file_missing:
+    if not is_damaged(recording):
+        # Also repairs rows hidden by an older, over-broad policy. A warning may still be
+        # useful diagnostics without making a playable recording disappear.
+        return "restored" if _restore_policy_hidden(recording) else "kept"
+    if recording.file_missing:
         return "kept"
     if selected == "hide":
         _hide(recording, status="hidden")

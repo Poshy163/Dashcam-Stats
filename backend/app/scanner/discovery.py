@@ -67,6 +67,7 @@ class ScanSummary:
     damaged_hidden: int = 0
     damaged_deleted: int = 0
     damaged_delete_blocked: int = 0
+    damaged_restored: int = 0
     missing: int = 0
     errors: int = 0
     duration_s: float = 0.0
@@ -258,6 +259,7 @@ class Scanner:
             summary.damaged_hidden = damaged.hidden
             summary.damaged_deleted = damaged.deleted
             summary.damaged_delete_blocked = damaged.blocked
+            summary.damaged_restored = damaged.restored
 
         await self._finish_run(run_id, summary, started)
 
@@ -273,6 +275,7 @@ class Scanner:
             damaged_hidden=summary.damaged_hidden,
             damaged_deleted=summary.damaged_deleted,
             damaged_delete_blocked=summary.damaged_delete_blocked,
+            damaged_restored=summary.damaged_restored,
             missing=summary.missing,
             errors=summary.errors,
             duration_s=round(summary.duration_s, 2),

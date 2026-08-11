@@ -130,6 +130,7 @@ export interface ScanResult {
   damagedHidden: number
   damagedDeleted: number
   damagedDeleteBlocked: number
+  damagedRestored: number
   errorMessage: string | null
 }
 
