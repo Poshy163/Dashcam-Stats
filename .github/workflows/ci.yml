@@ -112,6 +112,23 @@ jobs:
             VERSION=ci-${{ github.sha }}
             VCS_REF=${{ github.sha }}
 
+      # Merely listing OpenVINOExecutionProvider is insufficient: an ABI-mismatched
+      # OpenVINO library still appears in get_available_providers(), but fails only when
+      # an actual session is created and ONNX Runtime silently falls back to CPU.
+      - name: Verify OpenVINO provider can create a session
+        run: |
+          docker run --rm --entrypoint python dashcam-analyser:ci -c '
+          import onnxruntime as ort
+          from onnxruntime.datasets import get_example
+
+          session = ort.InferenceSession(
+              get_example("mul_1.onnx"),
+              providers=[("OpenVINOExecutionProvider", {"device_type": "CPU"})],
+          )
+          assert session.get_providers()[0] == "OpenVINOExecutionProvider", session.get_providers()
+          print("OpenVINO execution provider loaded successfully")
+          '
+
       # A container that starts but cannot serve /health is a broken release, and that
       # is not something the unit tests can catch.
       - name: Smoke test the image
