@@ -447,6 +447,47 @@ class TestInferenceProviders:
         assert loaded is not None
         assert captured["providers"] == ["CPUExecutionProvider"]
 
+    async def test_gpu_detection_waits_for_the_intel_media_slot(self, monkeypatch):
+        import asyncio
+        import threading
+        import weakref
+
+        import numpy as np
+
+        from app.ai import detector as detector_module
+        from app.ai.detector import ObjectDetector
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        monkeypatch.setattr(ffmpeg_module, "_vaapi_decode_locks", weakref.WeakKeyDictionary())
+        monkeypatch.setattr(detector_module, "get_settings_service", object)
+        predicted = threading.Event()
+
+        class Model:
+            device = "GPU"
+
+        class Detector:
+            model = Model()
+
+            def predict(self, frame):
+                predicted.set()
+                return []
+
+        detector = ObjectDetector()
+        detector._detector = Detector()
+        guard = ffmpeg_module.intel_media_lock()
+        async with guard:
+            task = asyncio.create_task(
+                detector.detect(
+                    np.zeros((4, 4, 3), dtype=np.uint8),
+                    classes=frozenset({"car"}),
+                )
+            )
+            await asyncio.sleep(0)
+            assert not predicted.is_set(), "OpenVINO ran while the VAAPI slot was occupied"
+
+        assert await task == []
+        assert predicted.is_set()
+
     def test_a_missing_device_falls_back_rather_than_failing(self, monkeypatch):
         """Naming a device OpenVINO cannot see fails session creation outright.
 

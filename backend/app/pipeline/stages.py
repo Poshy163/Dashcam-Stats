@@ -60,6 +60,7 @@ from app.hardware.ffmpeg import (
     FFmpegError,
     ProbeError,
     extract_frame,
+    intel_media_lock,
     iter_frames,
     probe,
 )
@@ -89,6 +90,11 @@ _templates_cache: GlyphTemplates | None = None
 #: Generous enough to absorb a camera whose clock drifts by a few minutes, tight enough
 #: that a mangled hour or day digit is caught.
 _MAX_OSD_FILENAME_DRIFT_S = 15 * 60
+
+# Decode a short VAAPI window completely, close it, then run GPU inference on the buffered
+# frames. Alder Lake cannot reliably execute VAAPI and OpenVINO together; buffering the
+# entire two-minute clip would cost ~1.5 GB, while ten seconds is about 120 MB at 2 fps.
+_DETECTION_DECODE_CHUNK_S = 10.0
 
 
 #: Why no stage writes ``journey_id`` on the rows it inserts.
@@ -606,7 +612,12 @@ async def _shared_detector(name: str) -> ObjectDetector | None:
         if cached is not None:
             return cached if cached.available else None
         detector = ObjectDetector(name)
-        if not await detector.load():
+        # Compiling a GPU graph allocates the same Alder Lake resources as inference. On
+        # an unpaused restart workers may already be opening VAAPI, so compilation also
+        # participates in the common media slot rather than racing the first decode.
+        async with intel_media_lock():
+            loaded = await detector.load()
+        if not loaded:
             # Cached even when unavailable, so a missing model is not re-attempted -- and
             # re-downloaded -- once per recording for the length of the queue.
             _detector_cache[name] = detector
@@ -998,19 +1009,59 @@ async def stage_detect(
         if decoder_used != "software":
             decoder_used = decoder
 
+    async def analyse_frame(offset: float, frame: np.ndarray) -> None:
+        nonlocal frames
+        detections = await detector.detect(frame)
+        tracker.update(detections, offset, frame)
+        frames += 1
+        if progress and duration:
+            progress("detection", min(0.95, offset / duration))
+
     try:
-        async for offset, frame in iter_frames(
-            path,
-            fps=sample_fps,
-            hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
-            codec=recording.video_codec,
-            on_decoder=note_decoder,
-        ):
-            detections = await detector.detect(frame)
-            tracker.update(detections, offset, frame)
-            frames += 1
-            if progress and duration:
-                progress("detection", min(0.95, offset / duration))
+        hardware = await settings.hardware_acceleration()
+        decode_mode = "auto" if hardware else "cpu"
+        geometry = (
+            (recording.width, recording.height) if recording.width and recording.height else None
+        )
+        gpu_inference = "GPU" in (detector.device or "").upper()
+        if hardware and gpu_inference and duration <= 0:
+            # Without a duration there is no safe bounded point at which to close VAAPI
+            # before inference. Software decode does not use the Intel media slot, so the
+            # streaming fallback remains deadlock-free and preserves GPU detection.
+            decode_mode = "cpu"
+        if hardware and gpu_inference and duration > 0:
+            chunk_start = 0.0
+            while chunk_start < duration:
+                chunk_duration = min(_DETECTION_DECODE_CHUNK_S, duration - chunk_start)
+                batch = [
+                    item
+                    async for item in iter_frames(
+                        path,
+                        fps=sample_fps,
+                        frame_size=geometry,
+                        start=chunk_start,
+                        duration=chunk_duration,
+                        hwaccel=decode_mode,
+                        codec=recording.video_codec,
+                        on_decoder=note_decoder,
+                    )
+                ]
+                # `iter_frames` has now closed ffmpeg and released the Intel media slot.
+                # ObjectDetector takes the same slot for each GPU request, so another
+                # worker cannot open VAAPI underneath this inference pass.
+                for offset, frame in batch:
+                    await analyse_frame(offset, frame)
+                chunk_start += chunk_duration
+        else:
+            async for offset, frame in iter_frames(
+                path,
+                fps=sample_fps,
+                frame_size=geometry,
+                hwaccel=decode_mode,
+                codec=recording.video_codec,
+                on_decoder=note_decoder,
+            ):
+                await analyse_frame(offset, frame)
     except DecodeError as exc:
         # Partial results from a damaged file are still worth keeping.
         log.warning("detection ended early", file=recording.filename, error=str(exc))

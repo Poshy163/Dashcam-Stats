@@ -126,6 +126,25 @@ class TestTransientFailuresDoNotSpendAttempts:
         async with session_scope() as session:
             assert (await session.get(ProcessingJob, job_id)).attempts == 1
 
+    async def test_a_running_retry_does_not_display_the_previous_error(self, recording_id):
+        async with session_scope() as session:
+            await queue.enqueue(session, recording_id)
+        async with session_scope() as session:
+            job = await queue.claim_next(session, "w1")
+            await queue.fail(session, job, "ffprobe produced no output (return code -6)")
+            job.not_before = None
+            recording = await session.get(Recording, recording_id)
+            recording.error_message = job.error_message
+
+        async with session_scope() as session:
+            retry = await queue.claim_next(session, "w2")
+            assert retry.state is JobState.RUNNING
+            assert retry.error_message is None
+            assert retry.finished_at is None
+            recording = await session.get(Recording, recording_id)
+            await session.refresh(recording)
+            assert recording.error_message is None
+
 
 class TestLegacyContentionFailures:
     async def test_old_lock_failures_are_reconciled_without_duplicating_new_work(self, db_session):

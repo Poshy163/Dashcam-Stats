@@ -124,6 +124,11 @@ def _vaapi_decode_lock() -> asyncio.Lock:
     return lock
 
 
+def intel_media_lock() -> asyncio.Lock:
+    """One process slot shared by VAAPI, ffprobe and OpenVINO GPU inference."""
+    return _vaapi_decode_lock()
+
+
 def _ffprobe_process_lock() -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     lock = _ffprobe_process_locks.get(loop)

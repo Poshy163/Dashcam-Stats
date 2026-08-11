@@ -227,6 +227,8 @@ async def claim_next(session: AsyncSession, worker_id: str) -> ProcessingJob | N
                 heartbeat_at=now,
                 attempts=ProcessingJob.attempts + 1,
                 progress=0.0,
+                finished_at=None,
+                error_message=None,
             )
             .returning(ProcessingJob.id)
             .execution_options(synchronize_session=False)
@@ -237,7 +239,18 @@ async def claim_next(session: AsyncSession, worker_id: str) -> ProcessingJob | N
         return None
 
     await session.flush()
-    return await session.get(ProcessingJob, claimed)
+    job = await session.get(ProcessingJob, claimed)
+    if job is not None and job.recording_id is not None:
+        # A retry is active work, not a current failure. Keeping the previous attempt's
+        # text on both rows made the Queue and recording pages claim ffprobe was failing
+        # while the replacement attempt was already progressing successfully.
+        await session.execute(
+            update(Recording)
+            .where(Recording.id == job.recording_id)
+            .values(error_message=None)
+            .execution_options(synchronize_session=False)
+        )
+    return job
 
 
 async def heartbeat(

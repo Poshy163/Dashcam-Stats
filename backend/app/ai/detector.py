@@ -27,6 +27,7 @@ from app.ai.openvino_session import use_openvino_session
 from app.core.logging import get_logger
 from app.core.resources import configure_opencv_threads, onnx_session_options
 from app.core.settings_service import get_settings_service
+from app.hardware.ffmpeg import intel_media_lock
 
 log = get_logger(__name__)
 
@@ -226,7 +227,14 @@ class ObjectDetector:
             return []
 
         try:
-            predictions = await asyncio.to_thread(self._detector.predict, frame)
+            device = (self.device or "").upper()
+            guard = intel_media_lock() if "GPU" in device else contextlib.nullcontext()
+            # VAAPI and OpenVINO are both stable independently on this iGPU, but the
+            # driver's shared OpenCL/media resources fail when they execute together.
+            # Detection feeds frames in bounded decoded batches, so no decoder is held by
+            # this same task while inference takes the common slot.
+            async with guard:
+                predictions = await asyncio.to_thread(self._detector.predict, frame)
         except Exception as exc:
             log.warning("inference failed", error=f"{type(exc).__name__}: {exc}")
             return []
