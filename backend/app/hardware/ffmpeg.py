@@ -315,7 +315,11 @@ async def _run(
     """Run FFmpeg tooling, allowing only one short ffprobe process at a time."""
     executable = Path(cmd[0]).name.lower() if cmd else ""
     if executable.startswith("ffprobe"):
-        async with _ffprobe_process_lock():
+        # This FFmpeg build initialises Intel media support even for probing. Starting it
+        # beside a VAAPI reader produced SIGABRT (-6) on valid files, so probe and hardware
+        # decode share the same process slot. Metadata already needs that slot for its
+        # thumbnail immediately afterwards, making the wait effectively free.
+        async with _vaapi_decode_lock(), _ffprobe_process_lock():
             return await _run_process(cmd, timeout, stdin)
     return await _run_process(cmd, timeout, stdin)
 
@@ -869,6 +873,14 @@ async def iter_frames(
         "grayscale": grayscale,
         "timeout": timeout,
     }
+    # Resolve geometry before entering the VAAPI slot. `_decode_frames` can do this itself,
+    # but probe now intentionally shares that slot; asking for it from inside the locked
+    # decoder would deadlock on a cold probe cache after restart.
+    if scale is None and crop is None and frame_size is None:
+        info = await probe(path)
+        if not info.width or not info.height:
+            raise DecodeError(f"cannot determine frame size for {Path(path).name}")
+        kwargs["frame_size"] = (info.width, info.height)
     _, label = select_hwaccel(hwaccel, codec)
 
     # A file that already refused to decode on the GPU will refuse again. Without this,

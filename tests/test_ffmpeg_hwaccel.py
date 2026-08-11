@@ -119,7 +119,9 @@ class TestDecodeFallback:
 
         frames = [
             frame
-            async for frame in ffmpeg_module.iter_frames("busy.ts", on_decoder=reported.append)
+            async for frame in ffmpeg_module.iter_frames(
+                "busy.ts", frame_size=(4, 4), on_decoder=reported.append
+            )
         ]
 
         assert frames
@@ -166,7 +168,7 @@ class TestDecodeFallback:
         monkeypatch.setattr(ffmpeg_module, "_decode_frames", decode)
 
         async def consume(path):
-            return [frame async for frame in ffmpeg_module.iter_frames(path)]
+            return [frame async for frame in ffmpeg_module.iter_frames(path, frame_size=(4, 4))]
 
         front = asyncio.create_task(consume("front.ts"))
         await first_started.wait()
@@ -213,7 +215,7 @@ class TestDecodeFallback:
         monkeypatch.setattr(ffmpeg_module, "_decode_frames", decode)
         monkeypatch.setattr(ffmpeg_module.asyncio, "sleep", no_wait)
 
-        frames = [frame async for frame in ffmpeg_module.iter_frames("busy.ts")]
+        frames = [frame async for frame in ffmpeg_module.iter_frames("busy.ts", frame_size=(4, 4))]
 
         assert frames
         assert attempts == ["auto", "auto", "auto", "cpu"]
@@ -242,7 +244,9 @@ class TestDecodeFallback:
 
         frames = [
             frame
-            async for frame in ffmpeg_module.iter_frames("broken.ts", on_decoder=reported.append)
+            async for frame in ffmpeg_module.iter_frames(
+                "broken.ts", frame_size=(4, 4), on_decoder=reported.append
+            )
         ]
 
         assert frames
@@ -404,6 +408,45 @@ class TestInferenceProviders:
 
         assert maximum == 1, "separate GPU models submitted concurrently to the Intel driver"
 
+    async def test_plate_detector_stays_on_bounded_ort_cpu(self, tmp_path, monkeypatch):
+        import contextlib
+        import sys
+        from types import ModuleType
+
+        from app.ai import detector as detector_module
+
+        model = tmp_path / "plate.onnx"
+        model.write_bytes(b"model")
+        captured = {}
+
+        fake_package = ModuleType("open_image_models")
+
+        def create_detector(path, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+        fake_package.create_detector = create_detector
+
+        async def ensure_model(name):
+            assert name == "plate-detector"
+            return model
+
+        @contextlib.contextmanager
+        def forbidden_facade(owner):
+            raise AssertionError("the plate detector was compiled on the iGPU")
+            yield
+
+        monkeypatch.setitem(sys.modules, "open_image_models", fake_package)
+        monkeypatch.setattr(detector_module, "ensure_model", ensure_model)
+        monkeypatch.setattr(detector_module, "_class_labels", lambda spec: ["plate"])
+        monkeypatch.setattr(detector_module, "onnx_session_options", object)
+        monkeypatch.setattr(detector_module, "use_openvino_session", forbidden_facade)
+
+        loaded = await detector_module.load_detector("plate-detector")
+
+        assert loaded is not None
+        assert captured["providers"] == ["CPUExecutionProvider"]
+
     def test_a_missing_device_falls_back_rather_than_failing(self, monkeypatch):
         """Naming a device OpenVINO cannot see fails session creation outright.
 
@@ -534,7 +577,9 @@ class TestEmptyWindowIsNotAHardwareFailure:
         monkeypatch.setattr(ffmpeg_module, "_decode_frames", empty_decode)
 
         with pytest.raises(ffmpeg_module.DecodeError):
-            async for _ in ffmpeg_module.iter_frames("clip.ts", start=119.9, duration=0.5):
+            async for _ in ffmpeg_module.iter_frames(
+                "clip.ts", frame_size=(4, 4), start=119.9, duration=0.5
+            ):
                 pass
 
         assert "clip.ts" not in ffmpeg_module._hwaccel_refused, (
@@ -792,6 +837,61 @@ class TestProbeProcessSafety:
 
         assert maximum == 1, "concurrent ffprobe processes can trigger the Intel abort"
 
+    async def test_ffprobe_waits_for_an_active_vaapi_reader(self, monkeypatch):
+        import asyncio
+        import weakref
+
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        monkeypatch.setattr(ffmpeg_module, "_vaapi_decode_locks", weakref.WeakKeyDictionary())
+        monkeypatch.setattr(ffmpeg_module, "_ffprobe_process_locks", weakref.WeakKeyDictionary())
+        started = asyncio.Event()
+
+        async def run_process(cmd, timeout, stdin=None):
+            started.set()
+            return 0, b"{}", b""
+
+        monkeypatch.setattr(ffmpeg_module, "_run_process", run_process)
+        guard = ffmpeg_module._vaapi_decode_lock()
+        async with guard:
+            probe_task = asyncio.create_task(ffmpeg_module._run(["ffprobe", "clip.ts"], 1))
+            await asyncio.sleep(0)
+            assert not started.is_set(), "ffprobe started beside the active Intel decoder"
+
+        await probe_task
+        assert started.is_set()
+
+    async def test_geometry_probe_happens_before_the_vaapi_slot(self, monkeypatch):
+        import weakref
+        from types import SimpleNamespace
+
+        import numpy as np
+
+        from app.hardware import ffmpeg as ffmpeg_module
+
+        monkeypatch.setattr(ffmpeg_module, "_vaapi_decode_locks", weakref.WeakKeyDictionary())
+        monkeypatch.setattr(
+            ffmpeg_module,
+            "select_hwaccel",
+            lambda *args, **kwargs: (["-hwaccel", "vaapi"], "vaapi"),
+        )
+
+        async def probe(path):
+            assert not ffmpeg_module._vaapi_decode_lock().locked()
+            return SimpleNamespace(width=4, height=4)
+
+        async def decode(path, **kwargs):
+            assert ffmpeg_module._vaapi_decode_lock().locked()
+            assert kwargs["frame_size"] == (4, 4)
+            yield 0.0, np.zeros((4, 4, 3), dtype=np.uint8)
+
+        monkeypatch.setattr(ffmpeg_module, "probe", probe)
+        monkeypatch.setattr(ffmpeg_module, "_decode_frames", decode)
+
+        frames = [frame async for frame in ffmpeg_module.iter_frames("clip.ts")]
+
+        assert frames
+
     def test_only_source_verdicts_are_permanent(self):
         from app.hardware.ffmpeg import ProbeError
         from app.pipeline.stages import _probe_failure_is_permanent
@@ -851,13 +951,18 @@ class TestAProvenFileIsNotDemoted:
         monkeypatch.setattr(ffmpeg_module, "_decode_frames", decode)
 
         # The detection stage: a long successful hardware pass over the whole file.
-        async for _ in ffmpeg_module.iter_frames("clip.ts", fps=5.0):
+        async for _ in ffmpeg_module.iter_frames("clip.ts", fps=5.0, frame_size=(4, 4)):
             pass
         assert "clip.ts" in ffmpeg_module._hwaccel_proven
 
         # The plates stage: one short seek that comes back with nothing.
         state["fail"] = True
-        frames = [f async for f in ffmpeg_module.iter_frames("clip.ts", start=64.9, duration=0.5)]
+        frames = [
+            f
+            async for f in ffmpeg_module.iter_frames(
+                "clip.ts", frame_size=(4, 4), start=64.9, duration=0.5
+            )
+        ]
 
         assert frames, "the software fallback should still answer this particular call"
         assert "clip.ts" not in ffmpeg_module._hwaccel_refused, (
@@ -888,6 +993,8 @@ class TestAProvenFileIsNotDemoted:
 
         monkeypatch.setattr(ffmpeg_module, "_decode_frames", decode)
 
-        frames = [f async for f in ffmpeg_module.iter_frames("broken.ts", fps=1.0)]
+        frames = [
+            f async for f in ffmpeg_module.iter_frames("broken.ts", fps=1.0, frame_size=(4, 4))
+        ]
         assert frames, "software decode should have answered"
         assert "broken.ts" in ffmpeg_module._hwaccel_refused

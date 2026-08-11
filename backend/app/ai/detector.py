@@ -101,6 +101,20 @@ async def load_detector(name: str, *, conf_thresh: float | None = None) -> Any |
 
     def build() -> Any:
         configure_opencv_threads()
+        kwargs = {
+            "backend": spec.runtime,
+            "class_labels": labels,
+            "conf_thresh": conf_thresh,
+            "providers": ["CPUExecutionProvider"],
+            "sess_options": onnx_session_options(),
+        }
+        if spec.task == "plate_detection":
+            # Keep the tiny plate models off the shared iGPU. Holding RF-DETR, the plate
+            # detector and OCR graph on Alder Lake beside VAAPI exhausted OpenCL resources
+            # even when requests were serialised. ORT CPU is bounded by our native thread
+            # budget and this model now sees only a handful of stored vehicle crops.
+            return create_detector(path, **kwargs)
+
         if spec.runtime == "rf_detr":
             from open_image_models.detection.core.rf_detr.inference import RFDETRDetector
 
@@ -111,16 +125,8 @@ async def load_detector(name: str, *, conf_thresh: float | None = None) -> Any |
             owner = YoloV9Detector
         else:
             raise ValueError(f"unsupported detector runtime: {spec.runtime}")
-
         with use_openvino_session(owner):
-            return create_detector(
-                path,
-                backend=spec.runtime,
-                class_labels=labels,
-                conf_thresh=conf_thresh,
-                providers=["CPUExecutionProvider"],
-                sess_options=onnx_session_options(),
-            )
+            return create_detector(path, **kwargs)
 
     try:
         # Building a session compiles the graph and can take seconds on first use; off the

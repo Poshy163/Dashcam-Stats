@@ -21,7 +21,6 @@ import numpy as np
 
 from app.ai.detector import Detection2D, load_detector
 from app.ai.models import OCR_CONFIG_FILE, ensure_model, model_dir
-from app.ai.openvino_session import use_openvino_session
 from app.ai.tracker import sharpness
 from app.core.logging import get_logger
 from app.core.resources import configure_opencv_threads, onnx_session_options
@@ -166,13 +165,16 @@ class PlateOCR:
 
         def build() -> Any:
             configure_opencv_threads()
-            with use_openvino_session(LicensePlateRecognizer):
-                return LicensePlateRecognizer(
-                    onnx_model_path=path,
-                    plate_config_path=config_path,
-                    providers=["CPUExecutionProvider"],
-                    sess_options=onnx_session_options(),
-                )
+            # Deliberately real ONNX Runtime CPU, not the OpenVINO facade. The main road
+            # detector keeps the iGPU; retaining two more compiled plate graphs there
+            # exhausted its shared OpenCL resources alongside VAAPI and restarted the
+            # container. Crop reuse makes this CPU work short and infrequent.
+            return LicensePlateRecognizer(
+                onnx_model_path=path,
+                plate_config_path=config_path,
+                providers=["CPUExecutionProvider"],
+                sess_options=onnx_session_options(),
+            )
 
         try:
             self._recogniser = await asyncio.to_thread(build)
