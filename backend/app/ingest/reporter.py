@@ -67,9 +67,24 @@ async def publish(
             import httpx
 
             async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(url, json=body)
+                response = await client.post(url, json=body)
+            if response.status_code >= 400:
+                log.warning(
+                    "home assistant rejected the webhook",
+                    url=url,
+                    status=response.status_code,
+                )
         except Exception as exc:
-            log.debug("home assistant webhook failed", error=f"{type(exc).__name__}: {exc}")
+            # Warning, not debug. A mistyped URL is the most likely thing to be wrong here
+            # and it fails silently by nature -- there is no reply to notice the absence
+            # of. One live deployment pointed at https:// on a host serving plain HTTP on
+            # 8123, and simply never saw a notification again with nothing in the log to
+            # say why. Two of these per transfer at most, so saying so cannot be noisy.
+            log.warning(
+                "could not reach the Home Assistant webhook",
+                url=url,
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
     if bool(_get("ha_mqtt_enabled", False)):
         try:

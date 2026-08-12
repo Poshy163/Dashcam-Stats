@@ -292,7 +292,10 @@ async def run_pull(*, trigger: str = "auto") -> RunResult:
 
         await asyncio.to_thread(_clean, staging)
         port = int(_get("data_port", 9000))
-        await adb.launch_listener(
+        # Anything still listening is serving a *previous* run's file list, so clear it
+        # before starting ours rather than connecting to the wrong stream.
+        await adb.clear_listener(info.address)
+        listener = await adb.launch_listener(
             info.address,
             info.source,
             [item.name for item in plan.files],
@@ -301,17 +304,22 @@ async def run_pull(*, trigger: str = "auto") -> RunResult:
         )
 
         host = info.address.split(":", 1)[0]
-        transferred = await asyncio.to_thread(
-            transport.receive,
-            host,
-            port,
-            staging,
-            expected={item.name for item in plan.files},
-            on_file_started=status.file_started,
-            on_file_done=status.file_done,
-            on_bytes=status.add_bytes,
-            cancel=status.cancel_event,
-        )
+        try:
+            transferred = await asyncio.to_thread(
+                transport.receive,
+                host,
+                port,
+                staging,
+                expected={item.name for item in plan.files},
+                on_file_started=status.file_started,
+                on_file_done=status.file_done,
+                on_bytes=status.add_bytes,
+                cancel=status.cancel_event,
+            )
+        finally:
+            # The adb session *is* the listener's lifetime now, so it has to be ended
+            # explicitly; leaving it would hold the port against the next window.
+            await adb.stop_listener(listener)
 
         expected = {item.name: item.size for item in plan.files}
         committed = await asyncio.to_thread(commit, staging, footage, expected)

@@ -20,6 +20,7 @@ which is the difference between keeping up and never catching up.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import shutil
 from dataclasses import dataclass
@@ -201,6 +202,19 @@ async def inventory(address: str, source: str) -> list[RemoteFile]:
     return files
 
 
+async def clear_listener(address: str) -> None:
+    """Kill any listener left over from a window that closed mid-transfer.
+
+    A cut mid-transfer is the normal ending here rather than the exceptional one, so an
+    orphan still holding the port is an ordinary thing to find.
+    """
+    with contextlib.suppress(AdbError):
+        await shell(
+            address,
+            "for p in $(pidof nc 2>/dev/null); do kill $p 2>/dev/null; done; exit 0",
+        )
+
+
 async def launch_listener(
     address: str,
     source: str,
@@ -208,36 +222,56 @@ async def launch_listener(
     *,
     port: int,
     timeout_s: int,
-) -> None:
-    """Start ``tar c <files> | nc -l -p PORT`` on the unit, detached, and return at once.
+) -> asyncio.subprocess.Process | None:
+    """Start ``tar c <files> | nc -l -p PORT`` and return the adb child *without waiting*.
 
-    Detached via ``setsid`` with its streams redirected, because otherwise the ADB shell
-    call does not return until the listener exits -- and the listener is meant to outlive
-    it and serve the socket this side is about to connect to.
+    The obvious shape -- background it on the unit with ``setsid ... &`` and let the shell
+    call return -- does not work here, and the way it fails is worth recording because it
+    looks like the command failing when it is doing nothing of the sort. On this unit
+    ``adb shell`` simply does not return for a backgrounded command, redirections and
+    ``setsid`` notwithstanding. Measured against the live head unit: the call had not
+    returned after twenty seconds, while a connection to port 9000 was answered
+    immediately with a valid tar header. The listener was up and serving the whole time;
+    only the local wait was stuck.
 
-    Nothing is installed on the unit for this. It is not rooted and it does not need to be:
-    Android's toybox already provides ``tar``, ``nc``, ``setsid`` and ``timeout``.
+    So nothing is backgrounded remotely and nothing is awaited locally. The adb session
+    stays open for the life of the transfer -- which is exactly as long as it is wanted --
+    and the caller kills this process when the stream ends. The remote ``timeout`` is the
+    backstop for the case where this side disappears first.
+
+    Nothing is installed on the unit for any of it. It is not rooted and does not need to
+    be: Android's toybox already provides ``tar``, ``nc`` and ``timeout``.
 
     The file list goes as argv. A full card is around 140 names of 30 characters, roughly
-    4 KB, which is far inside ARG_MAX, and the camera's filenames are ``[0-9]*_camera_[01].ts``
-    with no spaces or shell metacharacters in them.
+    4 KB, far inside ARG_MAX, and the camera's filenames carry no shell metacharacters --
+    which :func:`_bare_list` insists on rather than assumes.
     """
     if not names:
-        return
-    listed = _bare_list(names)
-    seconds = int(timeout_s)
+        return None
     command = (
-        # A listener orphaned by a window that closed mid-transfer still owns the port, and
-        # a mid-transfer cut is the normal ending here rather than the exceptional one.
-        "for p in $(pidof nc 2>/dev/null); do kill $p 2>/dev/null; done; "
-        f"cd '{source}' && setsid timeout {seconds} "
-        # The inner timeout is on `nc` specifically. The outer one only ever kills the
-        # wrapper shell, and `nc` -- the process actually holding the port -- would survive
-        # it, which is exactly the orphan the line above then has to clean up next time.
-        f"sh -c 'tar c {listed} | timeout {seconds} nc -l -p {int(port)}' "
-        "</dev/null >/dev/null 2>&1 &"
+        f"cd '{source}' && tar c {_bare_list(names)} | timeout {int(timeout_s)} "
+        f"nc -l -p {int(port)}"
     )
-    await shell(address, command)
+    return await asyncio.create_subprocess_exec(
+        adb_path(),
+        "-s",
+        address,
+        "shell",
+        command,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+
+async def stop_listener(proc: asyncio.subprocess.Process | None) -> None:
+    """End the adb session carrying the listener, once the stream is done with."""
+    if proc is None or proc.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    with contextlib.suppress(TimeoutError, Exception):
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
 
 
 async def delete(address: str, source: str, names: list[str]) -> int:

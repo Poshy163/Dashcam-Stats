@@ -41,6 +41,26 @@ def _tar_bytes(files: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
+class FakeProcess:
+    """Stands in for the `adb shell` child that carries the listener."""
+
+    def __init__(self, *, dies_on_kill: bool = True) -> None:
+        self.pid = 4321
+        self.returncode: int | None = None
+        self.killed = False
+        self._dies_on_kill = dies_on_kill
+
+    def kill(self) -> None:
+        self.killed = True
+        if self._dies_on_kill:
+            self.returncode = -9
+
+    async def wait(self) -> int:
+        if self.returncode is None:
+            await asyncio.sleep(3600)
+        return self.returncode or 0
+
+
 def _serve(payload: bytes, *, truncate_at: int | None = None) -> int:
     """Serve *payload* once on a loopback port, like the unit's `nc -l`. Returns the port."""
     listener = socket.socket()
@@ -326,8 +346,57 @@ class TestTheAdbControlChannel:
         assert len(files) == 1
         assert files[0] == RemoteFile("20260812120000_camera_0.ts", 104857600, 1786000000)
 
-    async def test_the_listener_is_detached_and_time_limited(self, monkeypatch):
-        """It has to outlive the shell call that starts it, and never outlive the window."""
+    async def test_the_listener_is_launched_without_waiting_for_adb(self, monkeypatch):
+        """`adb shell` does not return for this, and waiting for it is what broke.
+
+        Measured against the live head unit: the call had not returned after twenty
+        seconds, while a connection to port 9000 was answered immediately with a valid tar
+        header naming the first file. The listener was up and serving the whole time; only
+        the local wait was stuck, and the run aborted around a transfer that was ready to
+        go. So nothing is backgrounded remotely and nothing is awaited locally -- the adb
+        session becomes the listener's lifetime.
+        """
+        from app.ingest import adb
+
+        captured: list[list[str]] = []
+
+        async def fake_spawn(*args, **kwargs):
+            captured.append(list(args))
+            return FakeProcess()
+
+        async def forbidden_shell(address, command, **kwargs):
+            raise AssertionError("the listener must not be launched through a waited call")
+
+        monkeypatch.setattr(adb.asyncio, "create_subprocess_exec", fake_spawn)
+        monkeypatch.setattr(adb, "shell", forbidden_shell)
+        monkeypatch.setattr(adb, "adb_path", lambda: "adb")
+
+        proc = await adb.launch_listener(
+            "unit:5555", "/src", ["a.ts", "b.ts"], port=9000, timeout_s=180
+        )
+
+        assert proc is not None, "the caller needs the handle to end the session afterwards"
+        argv = captured[0]
+        assert argv[:4] == ["adb", "-s", "unit:5555", "shell"]
+        command = argv[4]
+        assert "tar c a.ts b.ts" in command
+        assert "timeout 180 nc -l -p 9000" in command
+        # Nothing backgrounded remotely: that is exactly what adb would not return from.
+        assert not command.rstrip().endswith("&")
+        assert "setsid" not in command
+
+    async def test_the_listener_session_is_ended_after_the_stream(self):
+        """The adb session is the listener's lifetime, so it has to be closed explicitly."""
+        from app.ingest import adb
+
+        proc = FakeProcess(dies_on_kill=True)
+        await adb.stop_listener(proc)
+
+        assert proc.killed
+        assert proc.returncode is not None
+
+    async def test_a_stale_listener_is_cleared_first(self, monkeypatch):
+        """An orphan is serving a *previous* run's file list, not this one's."""
         from app.ingest import adb
 
         captured: list[str] = []
@@ -337,17 +406,10 @@ class TestTheAdbControlChannel:
             return ""
 
         monkeypatch.setattr(adb, "shell", fake_shell)
-        await adb.launch_listener("unit:5555", "/src", ["a.ts", "b.ts"], port=9000, timeout_s=180)
+        await adb.clear_listener("unit:5555")
 
-        command = captured[0]
-        assert "setsid" in command, "the listener must survive the shell call returning"
-        assert "tar c a.ts b.ts" in command
-        assert "nc -l -p 9000" in command
-        assert command.rstrip().endswith("&")
-        # Two timeouts, and the inner one matters most: the outer only kills the wrapper
-        # shell, so `nc` -- the process actually holding the port -- would outlive it.
-        assert command.count("timeout 180") == 2
-        assert "timeout 180 nc -l -p 9000" in command
+        assert "pidof nc" in captured[0]
+        assert captured[0].rstrip().endswith("exit 0"), "an empty pidof must not fail the call"
 
     @pytest.mark.parametrize(
         "hostile",
