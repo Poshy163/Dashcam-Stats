@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 from starlette.responses import Response
 
+from app.ai.openvino_session import restore_gpu_failure_state
 from app.ai.runtime import describe_media_policy
 from app.api.errors import install_error_handlers
 from app.api.routes import content, heatmap, ingest, media, osd_debug, system
@@ -81,6 +82,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # An explicit pause is an operator decision, not process-local state. Restore it before
     # either worker can claim one of the hundreds of queued bulk-reprocess jobs.
     queue.restore_pause_state()
+    # Before anything can compile a model on it. The disable is otherwise process-local,
+    # and the process is being killed *by* the fault, so every restart re-armed the iGPU
+    # and walked into the same native abort -- which is the crash loop itself.
+    restore_gpu_failure_state()
     await pool.start()
     await scheduler.start()
     # Its own ticker rather than a scheduler task: the shared scheduler floors every

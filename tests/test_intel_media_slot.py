@@ -543,53 +543,139 @@ class TestAPoisonedGpuContextIsFatalToTheGpu:
         assert not is_gpu_context_failure(ValueError("input shape mismatch"))
         assert not is_gpu_context_failure(KeyError("output"))
 
-    def test_a_driver_failure_moves_the_session_to_the_cpu_and_still_answers(self, monkeypatch):
-        """The frame must still be inferred. Returning nothing is what lost the detections."""
+    def test_a_driver_failure_records_the_verdict_and_does_not_touch_the_runtime_again(
+        self, monkeypatch, tmp_path
+    ):
+        """Do not try to recompile on a runtime that has just aborted.
+
+        The tempting recovery -- rebuild on the CPU and answer the request -- is what this
+        used to do, and on the live deployment the log reads: native abort, this handler,
+        second abort, process gone. `compile_model` calls back into the very runtime that
+        is dying. Recovery has to happen in a process that is still entitled to exist, so
+        this records the verdict durably and gets out of the way.
+        """
         import threading
 
         import numpy as np
 
         import app.ai.openvino_session as openvino
-        from app.ai.openvino_session import OpenVINOSession, TensorInfo, gpu_backend_disabled
+        from app.ai.openvino_session import (
+            OpenVINOSession,
+            TensorInfo,
+            gpu_backend_disabled,
+            reset_gpu_backend_for_tests,
+        )
 
-        gpu_port, cpu_port = object(), object()
+        gpu_port = object()
 
         class GpuRequest:
             def infer(self, feed):
                 raise RuntimeError("[GPU] clFlush, error code: -5 CL_OUT_OF_RESOURCES")
 
-        class CpuRequest:
-            def infer(self, feed):
-                return {cpu_port: np.asarray([7])}
+        def forbidden_core():
+            raise AssertionError("the dying OpenVINO runtime was called again")
 
-        compiled_gpu = SimpleNamespace(
-            outputs=[gpu_port], create_infer_request=lambda: GpuRequest()
-        )
-        compiled_cpu = SimpleNamespace(
-            outputs=[cpu_port], create_infer_request=lambda: CpuRequest()
-        )
-        monkeypatch.setattr(
-            openvino,
-            "_get_core",
-            lambda: SimpleNamespace(compile_model=lambda model, device, config: compiled_cpu),
-        )
+        monkeypatch.setattr(openvino, "_get_core", forbidden_core)
+        monkeypatch.setattr(openvino, "_gpu_failure_marker_path", lambda: tmp_path / "gpu.json")
+        monkeypatch.setattr(openvino, "_devices_cache", ["GPU", "CPU"])
 
         session = object.__new__(OpenVINOSession)
         session.device = "GPU"
         session._outputs = (TensorInfo("output", (1,)),)
         session._output_ports = {"output": gpu_port}
-        session._compiled = compiled_gpu
+        session._compiled = SimpleNamespace(create_infer_request=lambda: GpuRequest())
         session._local = threading.local()
         session._model = object()
         session._model_name = "rf-detr-small-512-coco.onnx"
-        session._config = {"PERFORMANCE_HINT": "LATENCY"}
+        session._config = {}
         session._rebuild_lock = threading.Lock()
 
-        result = session.run(["output"], {"input": np.asarray([1])})
+        reset_gpu_backend_for_tests()
+        try:
+            with pytest.raises(RuntimeError, match="CL_OUT_OF_RESOURCES"):
+                session.run(["output"], {"input": np.asarray([1])})
 
-        assert [int(item[0]) for item in result] == [7], "the frame was silently lost"
-        assert session.device == "CPU"
-        assert gpu_backend_disabled(), "the poisoned GPU was left armed for the next job"
+            assert gpu_backend_disabled(), "the poisoned GPU was left armed"
+            assert (tmp_path / "gpu.json").is_file(), (
+                "the verdict died with the process, so the next one re-arms the GPU and "
+                "aborts again -- which is the crash loop"
+            )
+        finally:
+            reset_gpu_backend_for_tests()
+
+    def test_a_restart_inherits_the_gpu_verdict(self, monkeypatch, tmp_path):
+        """The abort kills the process, so an in-memory disable cannot survive it."""
+        import json as _json
+
+        import app.ai.openvino_session as openvino
+        from app.ai.openvino_session import (
+            clear_gpu_failure_state,
+            gpu_backend_disabled,
+            reset_gpu_backend_for_tests,
+            restore_gpu_failure_state,
+        )
+
+        marker = tmp_path / "gpu.json"
+        marker.write_text(_json.dumps({"reason": "clFlush -5", "failures": 3}), "utf-8")
+        monkeypatch.setattr(openvino, "_gpu_failure_marker_path", lambda: marker)
+
+        reset_gpu_backend_for_tests()
+        try:
+            assert not gpu_backend_disabled()
+            assert restore_gpu_failure_state()
+            assert gpu_backend_disabled(), "a fresh process re-armed a chip that aborts"
+            assert openvino.gpu_inference_engaged() is False
+
+            # And an operator can put it back after a driver change.
+            assert clear_gpu_failure_state()
+            assert not marker.exists()
+            assert not gpu_backend_disabled()
+        finally:
+            reset_gpu_backend_for_tests()
+
+    def test_a_transient_stall_does_not_condemn_the_gpu_forever(self, monkeypatch, tmp_path):
+        """An ffmpeg child that will not die is a condition of this run, not of the chip."""
+        import app.ai.openvino_session as openvino
+        from app.ai.openvino_session import disable_gpu_backend, reset_gpu_backend_for_tests
+
+        marker = tmp_path / "gpu.json"
+        monkeypatch.setattr(openvino, "_gpu_failure_marker_path", lambda: marker)
+        monkeypatch.setattr(openvino, "_devices_cache", ["GPU", "CPU"])
+
+        reset_gpu_backend_for_tests()
+        try:
+            disable_gpu_backend("the Intel media slot is unhealthy")
+            assert not marker.exists(), "a stuck subprocess disabled the iGPU permanently"
+        finally:
+            reset_gpu_backend_for_tests()
+
+    def test_disabling_never_re_enumerates_the_dying_driver(self, monkeypatch, tmp_path):
+        """Enumerating devices is a native call, and after an abort it does not return.
+
+        This is what hung the live container: the disable cleared the device cache, the
+        next /health resolved the device, and the event loop stopped for good.
+        """
+        import app.ai.openvino_session as openvino
+        from app.ai.openvino_session import (
+            disable_gpu_backend,
+            reset_gpu_backend_for_tests,
+            selected_device,
+        )
+
+        monkeypatch.setattr(openvino, "_gpu_failure_marker_path", lambda: tmp_path / "gpu.json")
+        monkeypatch.setattr(openvino, "_devices_cache", ["GPU", "CPU"])
+
+        def forbidden():
+            raise AssertionError("re-entered the driver to enumerate devices after it failed")
+
+        monkeypatch.setattr(openvino, "_get_core", forbidden)
+        reset_gpu_backend_for_tests()
+        monkeypatch.setattr(openvino, "_devices_cache", ["GPU", "CPU"])
+        try:
+            disable_gpu_backend("clFlush -5", durable=True)
+            assert selected_device() == "CPU"
+        finally:
+            reset_gpu_backend_for_tests()
 
     def test_a_disabled_gpu_is_removed_from_device_selection(self, monkeypatch):
         import app.ai.openvino_session as openvino

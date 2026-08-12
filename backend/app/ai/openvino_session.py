@@ -70,8 +70,13 @@ def gpu_backend_disabled() -> str | None:
     return _gpu_disabled_reason
 
 
-def disable_gpu_backend(reason: str) -> bool:
+def disable_gpu_backend(reason: str, *, durable: bool = False) -> bool:
     """Take the iGPU out of service for inference. Returns True on the first caller.
+
+    ``durable`` records the verdict on disk so restarts inherit it, and is for one thing
+    only: the driver itself aborting. Everything else that takes the GPU out of service --
+    an ffmpeg child that will not die, a media slot gone unhealthy -- is a condition of
+    this run and must not condemn the chip for every future one.
 
     Deliberately one-way. The failure mode this exists for is not a bad request but a
     poisoned OpenCL context: the deployment logged one ``CL_OUT_OF_RESOURCES`` and then
@@ -79,20 +84,122 @@ def disable_gpu_backend(reason: str) -> bool:
     detections because the model helper catches its own inference errors. Re-arming the GPU
     on the next job would simply reproduce that.
     """
-    global _gpu_disabled_reason
+    global _gpu_disabled_reason, _devices_cache, _device_cache
     with _gpu_state_lock:
         first = _gpu_disabled_reason is None
         if first:
             _gpu_disabled_reason = reason
-    # The cached answer named a device that has just been taken out of service.
-    _clear_device_cache()
+
+    # Drop the GPU from the *cached* device list and re-resolve from that, in Python.
+    #
+    # Emphatically not by clearing the cache and asking OpenVINO again. The runtime has
+    # just aborted; enumerating its devices means re-entering native code in a driver that
+    # is in the middle of dying, and that call does not come back. It happened: the cache
+    # was invalidated here, the next /health resolved the device, and the event loop
+    # stopped for good -- the container stayed up, accepted connections and answered
+    # nothing. The list from the last successful enumeration is all that is needed, and
+    # the one thing that changed about it is known.
+    remaining = [item for item in (_devices_cache or []) if not item.upper().startswith("GPU")]
+    _devices_cache = remaining
+    _device_cache = None
+
     if first:
         log.error(
             "the Intel GPU inference context has failed; inference moves to the CPU for "
             "the life of this process",
             reason=reason,
+            remaining_devices=remaining,
+            durable=durable,
         )
+        if durable:
+            _persist_gpu_failure(reason)
     return first
+
+
+#: Marker recording that this machine's iGPU aborted, so a restart does not re-arm it.
+#:
+#: The disable above is process-local, and the abort kills the process -- so every restart
+#: brought the GPU straight back and walked into the same abort. That is the crash loop,
+#: and nothing in-process can break it, because the thing being recovered from is a native
+#: ``abort()`` in the driver: by the time Python sees an exception the runtime has already
+#: decided to take the process down. Surviving it has to be durable.
+GPU_FAILURE_MARKER = "gpu-inference-failed.json"
+
+
+def _gpu_failure_marker_path():
+    from app.config import get_config
+
+    return get_config().data_dir / GPU_FAILURE_MARKER
+
+
+def _persist_gpu_failure(reason: str) -> None:
+    import json as _json
+    from datetime import UTC, datetime
+
+    try:
+        path = _gpu_failure_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = {}
+        if path.is_file():
+            with contextlib.suppress(Exception):
+                existing = _json.loads(path.read_text("utf-8"))
+        path.write_text(
+            _json.dumps(
+                {
+                    "reason": reason[:500],
+                    "failures": int(existing.get("failures", 0)) + 1,
+                    "last_failed_at": datetime.now(UTC).isoformat(),
+                },
+                indent=1,
+            ),
+            "utf-8",
+        )
+    except Exception as exc:
+        log.warning("could not record the GPU failure", error=f"{type(exc).__name__}: {exc}")
+
+
+def restore_gpu_failure_state() -> str | None:
+    """Re-apply a previous run's GPU verdict before anything can use the chip.
+
+    Called during start-up. Without it the disable dies with the process it was made in --
+    and the process is being killed *by* the fault, so the next one re-arms the GPU and
+    aborts again. That is the loop the deployment was stuck in.
+    """
+    global _gpu_disabled_reason
+    import json as _json
+
+    try:
+        path = _gpu_failure_marker_path()
+        if not path.is_file():
+            return None
+        data = _json.loads(path.read_text("utf-8"))
+    except Exception:
+        return None
+
+    reason = str(data.get("reason") or "the iGPU aborted during a previous run")
+    with _gpu_state_lock:
+        _gpu_disabled_reason = reason
+    log.error(
+        "the iGPU is disabled for inference because it aborted before; delete the marker "
+        "in the data directory to try it again",
+        marker=GPU_FAILURE_MARKER,
+        failures=data.get("failures"),
+        reason=reason[:200],
+    )
+    return reason
+
+
+def clear_gpu_failure_state() -> bool:
+    """Forget the durable verdict, so the iGPU is tried again after a driver change."""
+    global _gpu_disabled_reason
+    with _gpu_state_lock:
+        _gpu_disabled_reason = None
+    _clear_device_cache()
+    try:
+        _gpu_failure_marker_path().unlink(missing_ok=True)
+    except Exception:
+        return False
+    return True
 
 
 def gpu_inference_engaged() -> bool:
@@ -135,13 +242,26 @@ def _get_core() -> Any:
     return _core
 
 
+#: The last successful enumeration, so nothing ever has to ask the driver twice.
+#:
+#: Enumerating is a native call, and after the iGPU aborts it is a native call into a dying
+#: driver that does not return. Remembering the answer is what lets every later decision --
+#: the decode policy, the status page, the fallback to CPU -- be made in Python.
+_devices_cache: list[str] | None = None
+
+
 def available_devices() -> list[str]:
-    """Devices reported by the installed OpenVINO runtime."""
+    """Devices reported by the installed OpenVINO runtime, enumerated at most once."""
+    global _devices_cache
+    if _devices_cache is not None:
+        return list(_devices_cache)
     try:
-        return list(_get_core().available_devices)
+        devices = list(_get_core().available_devices)
     except Exception as exc:
         log.debug("OpenVINO device discovery failed", error=f"{type(exc).__name__}: {exc}")
         return []
+    _devices_cache = devices
+    return list(devices)
 
 
 #: Last resolved device, as ``(requested_setting, resolved)``.
@@ -158,8 +278,9 @@ _device_cache: tuple[str, str | None] | None = None
 
 
 def _clear_device_cache() -> None:
-    global _device_cache
+    global _device_cache, _devices_cache
     _device_cache = None
+    _devices_cache = None
 
 
 def selected_device() -> str | None:
@@ -408,13 +529,18 @@ class OpenVINOSession:
             except Exception as exc:
                 if not is_gpu_context_failure(exc):
                     raise
-                # The context is gone, so this request and every one after it would fail.
-                # Rebuild on the CPU and answer the question that was actually asked --
-                # the caller above catches inference errors and returns no detections, so
-                # re-raising here is indistinguishable from an empty frame.
-                disable_gpu_backend(f"{type(exc).__name__}: {exc}".strip()[:500])
-                self._move_to_cpu(str(exc)[:200])
-                result = self._request().infer(input_feed)
+                # Record the verdict and get out. Do NOT recompile here.
+                #
+                # The tempting thing is to rebuild on the CPU and answer the request that
+                # was asked, and that is what this used to do. But compiling a model calls
+                # back into the very runtime that has just failed, and on the live
+                # deployment the driver had *already* called abort() by this point: the
+                # log shows the native abort, then this handler, then a second abort, then
+                # the process gone. Recovery has to happen in a process that is still
+                # entitled to exist, which means the next one -- see the durable marker
+                # written by `disable_gpu_backend`.
+                disable_gpu_backend(f"{type(exc).__name__}: {exc}".strip()[:500], durable=True)
+                raise
         else:
             result = self._request().infer(input_feed)
         wanted = list(output_names) if output_names else [item.name for item in self._outputs]
