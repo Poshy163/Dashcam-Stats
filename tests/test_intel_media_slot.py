@@ -286,6 +286,73 @@ class TestTheSlotIsNotFreeUntilTheChildIsGone:
             )
 
 
+class TestCpuInferenceIsBoundedPerWorker:
+    """Raising the worker count must divide the machine, not multiply thread pools.
+
+    FFmpeg, OpenCV and ONNX Runtime were all already bounded per job. OpenVINO CPU
+    inference was not, so each worker's session spread across every core it could see --
+    and with the iGPU out of service and every detection running on the CPU, that is the
+    setting that decides whether a second worker helps or just thrashes the cache.
+    """
+
+    def test_the_budget_shrinks_as_workers_are_added(self, monkeypatch):
+        import app.ai.openvino_session as openvino
+        import app.core.resources as resources
+        import app.core.settings_service as settings_module
+
+        class _Settings:
+            workers = 1
+
+            def get_nowait(self, key):
+                if key == "processing.max_workers":
+                    return self.workers
+                if key == "advanced.ffmpeg_threads":
+                    return 0
+                raise KeyError(key)
+
+        settings = _Settings()
+        monkeypatch.setattr(settings_module, "get_settings_service", lambda: settings)
+        monkeypatch.setattr(resources, "get_settings_service", lambda: settings)
+        monkeypatch.setattr("os.cpu_count", lambda: 20)
+
+        seen = {}
+        for workers in (1, 2, 4):
+            settings.workers = workers
+            seen[workers] = openvino.cpu_inference_threads()
+
+        assert seen[1] > seen[2] > seen[4], f"the budget did not divide by workers: {seen}"
+        # Media threads come out of each worker's share rather than on top of it, so the
+        # total stays inside the machine.
+        for workers, threads in seen.items():
+            assert threads >= 2
+            assert (threads + resources.native_thread_budget()) * workers <= 20 + workers
+
+    def test_a_cpu_session_is_told_its_budget(self, monkeypatch):
+        """The bound is worthless unless it reaches `compile_model`."""
+        import app.ai.openvino_session as openvino
+
+        monkeypatch.setattr(openvino, "cpu_inference_threads", lambda: 6)
+        captured = {}
+
+        def compile_model(model, device, config):
+            captured["device"] = device
+            captured["config"] = dict(config)
+            return SimpleNamespace(outputs=[], get_property=lambda name: 1)
+
+        monkeypatch.setattr(
+            openvino,
+            "_get_core",
+            lambda: SimpleNamespace(
+                read_model=lambda p: SimpleNamespace(inputs=[], outputs=[]),
+                compile_model=compile_model,
+            ),
+        )
+        openvino.OpenVINOSession("model.onnx", device="CPU")
+
+        assert captured["device"] == "CPU"
+        assert captured["config"]["INFERENCE_NUM_THREADS"] == "6"
+
+
 class TestOnlyOneMediaProcessStartsAtATime:
     """Two FFmpeg processes must not initialise the Intel media stack together.
 

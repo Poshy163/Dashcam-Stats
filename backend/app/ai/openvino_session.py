@@ -341,6 +341,42 @@ def _resolve_device(requested: str) -> str | None:
     return devices[0]
 
 
+def cpu_inference_threads() -> int:
+    """How many threads one CPU inference session may use.
+
+    Unbounded, an OpenVINO CPU session spreads across every core it can see -- which is
+    right for one session and wrong for several. FFmpeg, OpenCV and ONNX Runtime are all
+    already bounded per job by ``native_thread_budget``; inference was the one native
+    runtime that was not, so raising the worker count multiplied whole-machine thread pools
+    rather than dividing the machine between them. With the iGPU out of service and every
+    detection running here, that is the setting that decides whether more workers help.
+
+    Each worker gets an equal share of the logical CPUs, and its media threads come out of
+    that share rather than on top of it.
+    """
+    import os
+
+    from app.core.resources import native_thread_budget
+
+    cpus = max(1, os.cpu_count() or 1)
+    workers = 1
+    try:
+        from app.core.settings_service import get_settings_service
+
+        workers = max(1, int(get_settings_service().get_nowait("processing.max_workers")))
+    except Exception:
+        pass
+
+    share = max(1, cpus // workers)
+    try:
+        media = native_thread_budget()
+    except Exception:
+        media = 0
+    # Never below two: a single-threaded detector on a twenty-core host would be a
+    # stranger failure than the oversubscription this exists to prevent.
+    return max(2, share - media)
+
+
 def selected_performance_hint(device: str | None = None) -> str:
     """Optimise for the configured workload rather than one synthetic request."""
     # A global single-request lane is intentional on this iGPU. LATENCY asks OpenVINO not
@@ -418,6 +454,8 @@ class OpenVINOSession:
         target = requested
         performance_hint = selected_performance_hint(target)
         config: dict[str, str] = {"PERFORMANCE_HINT": performance_hint}
+        if target.upper().startswith("CPU"):
+            config["INFERENCE_NUM_THREADS"] = str(cpu_inference_threads())
         try:
             from app.config import get_config
 
@@ -512,7 +550,11 @@ class OpenVINOSession:
         with self._rebuild_lock:
             if not self.device.upper().startswith("GPU"):
                 return  # another thread rebuilt it while this one waited
-            config = {**self._config, "PERFORMANCE_HINT": selected_performance_hint("CPU")}
+            config = {
+                **self._config,
+                "PERFORMANCE_HINT": selected_performance_hint("CPU"),
+                "INFERENCE_NUM_THREADS": str(cpu_inference_threads()),
+            }
             compiled = _get_core().compile_model(self._model, "CPU", config)
             self._compiled = compiled
             self._local = threading.local()
