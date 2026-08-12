@@ -30,22 +30,33 @@ Pillow>=11.0,<12
 # cannot safely coexist with the newer runtime because both packages ship ABI-distinct
 # libraries under the same SONAMEs. Plain ONNX Runtime remains for the public types used by
 # the upstream preprocessing/postprocessing libraries and as a CPU-only emergency fallback.
-# Pinned back from 2026.3.0, deliberately.
+# Pinned back from 2026.3.0 -- and the reason it was pinned back turned out to be wrong.
 #
-# The deployment's iGPU aborts inside the *driver* -- the abort names
-# ``shared/source/os_interface/linux/drm_buffer_object.cpp``, which is intel/compute-runtime
-# (NEO), not OpenVINO. Debian Bookworm ships NEO from 2022, and 2026.3 drives a four-year-old
-# driver through command patterns it was never built for. 2025.4.1 is the runtime that was
-# bundled inside ``onnxruntime-openvino==1.24.1`` while this library processed two thousand
-# recordings without a single abort; the crash loop began under three hours after the
-# upgrade to 2026.3 and never stopped.
+# The theory was that 2026.3 caused the deployment's iGPU aborts: the crash loop began under
+# three hours after that upgrade, having never happened across the two thousand recordings
+# processed before it. 2025.4.1 is the runtime that was bundled inside
+# ``onnxruntime-openvino==1.24.1`` throughout that quiet period, so going back to it looked
+# like the answer.
+#
+# It is not. Measured on the deployment afterwards, 2025.4.1 fails identically:
+#
+#     [GPU] clFlush, error code: -5 CL_OUT_OF_RESOURCES
+#     ...intel_gpu/src/runtime/ocl/ocl_stream.cpp:369      (2026.3 reported :388)
+#
+# Different line, same abort, so it is genuinely the older runtime failing rather than a
+# stale image. The OpenVINO version is not what decides this. What remains untested is the
+# layer the abort actually names -- ``os_interface/linux/drm_buffer_object.cpp`` belongs to
+# intel/compute-runtime (NEO), and Bookworm ships NEO from 2022. If GPU inference is ever
+# wanted here, that driver is the thing to move.
+#
+# The pin stays anyway: 2025.4.1 is now the version this deployment has actually run, it
+# does the CPU work it is asked for, and there is nothing to gain from churning it. The app
+# disables GPU inference by itself when the chip aborts, durably, so the runtime version no
+# longer decides whether the container survives.
 #
 # This is not the ABI trap that commit 4f0bf2d fixed. That was the *standalone* wheel loaded
 # beside ``onnxruntime-openvino``, both shipping libraries with the same SONAMEs. Plain
 # ``onnxruntime`` carries no OpenVINO libraries at all, so the two below cannot collide.
-#
-# If a newer runtime is wanted, the driver has to move first: install a current
-# compute-runtime from Intel's own packages rather than Bookworm's.
 openvino==2025.4.1
 onnxruntime==1.27.0
 
