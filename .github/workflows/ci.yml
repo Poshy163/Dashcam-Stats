@@ -115,15 +115,24 @@ jobs:
       # Merely listing OpenVINOExecutionProvider is insufficient: an ABI-mismatched
       # OpenVINO library still appears in get_available_providers(), but fails only when
       # an actual session is created and ONNX Runtime silently falls back to CPU.
-      - name: Verify OpenVINO 2026.3 direct inference
+      - name: Verify OpenVINO direct inference
         run: |
-          docker run --rm --entrypoint python dashcam-analyser:ci -c '
+          # Read the expected version out of the pin rather than repeating it here. This
+          # step used to assert "2026.3." literally, so pinning the runtime back to
+          # 2025.4.1 -- which is a thing that happens, and did -- failed the build for a
+          # reason that had nothing to do with the image being wrong.
+          expected="$(sed -n 's/^openvino==\([0-9][0-9.]*\).*/\1/p' backend/requirements.txt)"
+          test -n "$expected" || { echo "no openvino== pin found in requirements"; exit 1; }
+          echo "expecting OpenVINO $expected"
+          docker run --rm --entrypoint python -e EXPECTED_OPENVINO="$expected" dashcam-analyser:ci -c '
+          import os
           import openvino as ov
           import numpy as np
           from onnxruntime.datasets import get_example
           from app.ai.openvino_session import OpenVINOSession
           from app.hardware.detect import detect_hardware
 
+          expected = os.environ["EXPECTED_OPENVINO"]
           hardware = detect_hardware()
           session = OpenVINOSession(get_example("mul_1.onnx"), device="CPU")
           model_input = session.get_inputs()[0]
@@ -131,11 +140,28 @@ jobs:
               None,
               {model_input.name: np.ones(model_input.shape, dtype=np.float32)},
           )
-          assert ov.__version__.startswith("2026.3."), ov.__version__
+          assert ov.__version__.startswith(expected), (ov.__version__, expected)
           assert session.get_providers() == ["OpenVINO:CPU"]
           assert output
-          print("OpenVINO 2026.3 direct inference loaded successfully", hardware.openvino_devices)
+          print("OpenVINO", ov.__version__, "direct inference OK", hardware.openvino_devices)
           '
+
+      # The Dockerfile deliberately lets the Intel driver install fail rather than break
+      # the build, which means it can also fail *silently* -- and the whole point of
+      # installing it is that Debian's 2022 driver is what the deployment's iGPU aborts
+      # in. Without this the image would ship the old driver and look fine.
+      - name: Verify the Intel compute-runtime that actually shipped
+        run: |
+          expected="$(sed -n 's/^ARG NEO_VERSION=\(.*\)/\1/p' Dockerfile)"
+          test -n "$expected" || { echo "no NEO_VERSION found in the Dockerfile"; exit 1; }
+          installed="$(docker run --rm --entrypoint dpkg-query dashcam-analyser:ci \
+            -W -f='${Version}' intel-opencl-icd)"
+          echo "intel-opencl-icd: want ${expected}, image has ${installed}"
+          case "$installed" in
+            "${expected}"*) echo "Intel compute-runtime installed" ;;
+            *) echo "::error::image shipped ${installed} instead of ${expected};" \
+                    "the Intel driver download or dpkg step failed"; exit 1 ;;
+          esac
 
       # A container that starts but cannot serve /health is a broken release, and that
       # is not something the unit tests can catch.
