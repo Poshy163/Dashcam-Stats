@@ -276,6 +276,7 @@ async def get_status(session: SessionDep):
         hardware=hardware_dict,
         features=_feature_status(settings, totals),
         version=get_config().version,
+        timezone=str(settings.get_nowait("general.timezone")),
     )
 
 

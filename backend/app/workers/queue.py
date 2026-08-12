@@ -197,8 +197,21 @@ async def claim_next(session: AsyncSession, worker_id: str) -> ProcessingJob | N
     )
     visible_recordings = select(Recording.id).where(Recording.ignored.is_(False))
 
+    # Oldest footage first, by the moment the camera recorded it.
+    #
+    # Not by `queued_at`, which is what this used to do and which says nothing useful: a
+    # bulk reprocess stamps nine hundred jobs within the same second, so they came out in
+    # whatever order the rows were inserted. Working through a library chronologically is
+    # what a person watching it expects, it makes progress legible -- the date reached is
+    # the progress -- and it means an interrupted run leaves a contiguous processed span
+    # rather than holes scattered through the archive.
+    #
+    # Recordings whose start time could not be established sort last rather than first:
+    # an unparsed filename is not evidence of age, and putting unknowns at the front would
+    # let a handful of oddities delay everything real behind them.
     next_queued = (
         select(ProcessingJob.id)
+        .outerjoin(Recording, Recording.id == ProcessingJob.recording_id)
         .where(
             ProcessingJob.state == JobState.QUEUED,
             (ProcessingJob.not_before.is_(None)) | (ProcessingJob.not_before <= now),
@@ -208,7 +221,12 @@ async def claim_next(session: AsyncSession, worker_id: str) -> ProcessingJob | N
                 ProcessingJob.recording_id.in_(visible_recordings),
             ),
         )
-        .order_by(ProcessingJob.priority.asc(), ProcessingJob.queued_at.asc())
+        .order_by(
+            ProcessingJob.priority.asc(),
+            Recording.started_at.is_(None),
+            Recording.started_at.asc(),
+            ProcessingJob.queued_at.asc(),
+        )
         .limit(1)
         .scalar_subquery()
     )

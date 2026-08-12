@@ -55,32 +55,61 @@ export function formatPercent(value: number | null | undefined, digits = 0): str
   return `${(value * 100).toFixed(digits)}%`
 }
 
+/** The camera's timezone, as configured in Settings. See {@link setDisplayTimeZone}. */
+let displayTimeZone: string | undefined
+
+/**
+ * Show every timestamp in the camera's own timezone rather than the viewer's.
+ *
+ * The backend sends UTC and the browser was rendering it in whatever zone the machine
+ * happens to be set to. For a dashcam library that is wrong even when it looks right: the
+ * footage, the burned-in overlay and the filenames are all in the camera's local time, so
+ * a clip driven at 4pm should read as 4pm from a laptop in another country — and the queue
+ * should agree with the recording it names.
+ *
+ * Set once from `/api/status`. Until it is, formatting falls back to the browser's zone,
+ * which is the old behaviour and is right often enough to be a sane default.
+ */
+export function setDisplayTimeZone(zone: string | undefined): void {
+  displayTimeZone = zone
+}
+
+function withZone<T extends Intl.DateTimeFormatOptions>(options: T): T {
+  return displayTimeZone ? { ...options, timeZone: displayTimeZone } : options
+}
+
 export function formatDateTime(iso: string | null | undefined): string {
   if (!iso) return '—'
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return '—'
-  return d.toLocaleString(undefined, {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  })
+  return d.toLocaleString(
+    undefined,
+    withZone({
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }),
+  )
 }
 
 export function formatDate(iso: string | null | undefined): string {
   if (!iso) return '—'
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return '—'
-  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+  return d.toLocaleDateString(
+    undefined,
+    withZone({ year: 'numeric', month: 'short', day: 'numeric' }),
+  )
 }
 
 export function formatTime(iso: string | null | undefined): string {
   if (!iso) return '—'
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return '—'
-  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+  return d.toLocaleTimeString(undefined, withZone({ hour: '2-digit', minute: '2-digit' }))
 }
 
 export function formatRelative(iso: string | null | undefined): string {

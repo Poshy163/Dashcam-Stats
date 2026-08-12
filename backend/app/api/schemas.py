@@ -497,6 +497,14 @@ class StatusOut(BaseModel):
     hardware: dict[str, Any]
     features: list[FeatureStatus] = Field(default_factory=list)
     version: str
+    #: The configured display timezone, so the UI shows the camera's own clock.
+    #:
+    #: Every timestamp leaves here as UTC, and the browser was formatting them in whatever
+    #: zone the machine looking at them happens to be in. For a dashcam library that is the
+    #: wrong answer even when it is the same answer: the footage, the burned-in overlay and
+    #: the filenames are all in the camera's local time, so a recording viewed from another
+    #: zone should still read as the hour it was actually driven.
+    timezone: str = "UTC"
 
 
 class SearchResults(BaseModel):

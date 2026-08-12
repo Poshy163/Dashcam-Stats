@@ -18,6 +18,8 @@ recording, and each looked like something else in the logs:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from sqlalchemy import func, select
 
@@ -449,3 +451,74 @@ class TestPermanentFailuresLeaveTheQueue:
             "be handed fresh attempts by the next bulk reprocess"
         )
         assert stored.error_message
+
+
+class TestOldestFootageIsProcessedFirst:
+    """A bulk reprocess should work through the library chronologically.
+
+    ``queued_at`` cannot express that. A bulk reprocess stamps every job inside the same
+    second, so ordering by it meant the queue ran in whatever order the rows happened to be
+    inserted -- and progress through a nine-hundred-recording backlog was unreadable,
+    because the date reached told you nothing about how far along it was.
+    """
+
+    async def test_the_queue_runs_in_recording_order(self, db_session):
+        base = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+        # Inserted newest-first on purpose: if the claim honoured insertion order, this is
+        # the arrangement that would show it.
+        wanted = []
+        async with session_scope() as session:
+            for offset in (5, 1, 3, 0, 4, 2):
+                recording = Recording(
+                    rel_path=f"clip{offset}.ts",
+                    filename=f"clip{offset}.ts",
+                    started_at=base + timedelta(hours=offset),
+                )
+                session.add(recording)
+                await session.flush()
+                await queue.enqueue(session, recording.id)
+                wanted.append((offset, recording.id))
+
+        expected = [rid for _, rid in sorted(wanted)]
+
+        claimed = []
+        for index in range(len(expected)):
+            async with session_scope() as session:
+                job = await queue.claim_next(session, f"worker-{index}")
+                assert job is not None
+                claimed.append(job.recording_id)
+                # Finish it, or the next claim refuses a recording already running.
+                await queue.complete(session, job)
+
+        assert claimed == expected, "the queue did not work through the footage oldest first"
+
+    async def test_a_recording_with_no_known_time_sorts_last(self, db_session):
+        """An unparsed filename is not evidence of age.
+
+        Sorting unknowns first would let a handful of oddities delay every real recording
+        behind them.
+        """
+        async with session_scope() as session:
+            undated = Recording(rel_path="mystery.ts", filename="mystery.ts", started_at=None)
+            dated = Recording(
+                rel_path="known.ts",
+                filename="known.ts",
+                started_at=datetime(2026, 8, 9, 12, 0, tzinfo=UTC),
+            )
+            session.add(undated)
+            await session.flush()
+            await queue.enqueue(session, undated.id)
+            session.add(dated)
+            await session.flush()
+            await queue.enqueue(session, dated.id)
+            dated_id, undated_id = dated.id, undated.id
+
+        order = []
+        for index in range(2):
+            async with session_scope() as session:
+                job = await queue.claim_next(session, f"worker-{index}")
+                assert job is not None
+                order.append(job.recording_id)
+                await queue.complete(session, job)
+
+        assert order == [dated_id, undated_id]

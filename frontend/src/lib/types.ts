@@ -368,6 +368,8 @@ export interface Status {
   latestJourney: Journey | null
   hardware: HardwareInfo
   version: string
+  /** The camera's timezone, used to render every timestamp in the UI. */
+  timezone?: string
 }
 
 export interface LogEntry {
