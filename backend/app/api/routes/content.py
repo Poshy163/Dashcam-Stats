@@ -1119,7 +1119,19 @@ async def list_jobs(session: SessionDep, page: PaginationDep, state: str | None 
         state_rank,
         # Pending work reads in the order it will be claimed, so the top of that section
         # is what runs next; everything else reads newest first.
+        #
+        # These are `claim_next`'s keys, in its order, and they have to be: `queued_at`
+        # alone agrees with the claim only while nothing is added after the queue is built.
+        # The thumbnail-first pass adds constantly -- each thumbnail job creates its
+        # recording's analysis job as it finishes -- so on the live library ten recordings
+        # were being listed at the bottom of a nine-hundred-row queue while the claim was
+        # about to run them from the middle of it. The page said one thing and the queue
+        # did another, which is the whole complaint the ordering was meant to answer.
         case((ProcessingJob.state == JobState.QUEUED, ProcessingJob.priority), else_=None).asc(),
+        case(
+            (ProcessingJob.state == JobState.QUEUED, Recording.started_at.is_(None)), else_=None
+        ).asc(),
+        case((ProcessingJob.state == JobState.QUEUED, Recording.started_at), else_=None).asc(),
         case((ProcessingJob.state == JobState.QUEUED, ProcessingJob.queued_at), else_=None).asc(),
         recency.desc(),
         ProcessingJob.id.desc(),

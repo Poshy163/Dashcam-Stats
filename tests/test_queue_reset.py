@@ -344,6 +344,36 @@ class TestThumbnailsAreMadeFirst:
         assert stats["phase"] == "thumbnails"
 
 
+class TestTheQueuePageShowsTheOrderItWillRunIn:
+    async def test_a_thumbnail_follow_up_is_listed_where_it_will_run(self, client, db_session):
+        """Found on the live library: ten recordings listed at the bottom of a nine-hundred
+        row queue while the claim was about to run them from the middle of it.
+
+        Ordering the waiting list by ``queued_at`` agrees with the claim only while nothing
+        is added after the queue is built, and the thumbnail pass adds constantly -- every
+        thumbnail job creates its recording's analysis job as it finishes, minutes after the
+        rebuild stamped the rest.
+        """
+        async with session_scope() as session:
+            await make_recording(session, "old.ts", hours=1, thumbnail=write_thumbnail("old.jpg"))
+            # No thumbnail, and old: its analysis job is created last and belongs first.
+            await make_recording(session, "oldest.ts", hours=0, thumbnail=None)
+            await make_recording(session, "new.ts", hours=9, thumbnail=write_thumbnail("new.jpg"))
+            await reset_and_rebuild(session, stages=["everything"])
+        await db_session.commit()
+
+        async with session_scope() as session:
+            job = await queue.claim_next(session, "w1")
+            assert job.kind is JobKind.THUMBNAIL
+            await queue.complete(session, job, {"ok": True})
+
+        listed = (await client.get("/api/jobs?state=queued&page_size=50")).json()["items"]
+        assert [j["recording_filename"] for j in listed] == ["oldest.ts", "old.ts", "new.ts"], (
+            "the queue page listed the waiting work in a different order from the one the "
+            "claim will take it in"
+        )
+
+
 class TestThenTheAnalysisRunsOldestFirst:
     async def test_the_whole_library_comes_out_in_order(self, db_session):
         """Thumbnails first, then every recording chronologically -- including the ones the
