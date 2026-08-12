@@ -387,6 +387,32 @@ class TestOnlyOneMediaProcessStartsAtATime:
 
         assert most == 1, "two media processes initialised at once; this is the -6 abort"
 
+    async def test_software_launches_order_but_do_not_wait(self, monkeypatch):
+        """The settle is a *global* wait, so it multiplies.
+
+        Metadata launches six processes per recording -- one probe and up to five thumbnail
+        attempts -- and with two workers queueing on the same lock that became seconds of
+        pure waiting per recording. Software decode does not touch the driver that aborts,
+        so it takes its turn in the queue and skips the wait.
+        """
+        import weakref as _weakref
+
+        monkeypatch.setattr(ffmpeg_module, "_media_launch_locks", _weakref.WeakKeyDictionary())
+        monkeypatch.setattr(ffmpeg_module, "MEDIA_LAUNCH_SETTLE_S", 5.0)
+
+        async def create(*args, **kwargs):
+            return FakeProcess()
+
+        monkeypatch.setattr(ffmpeg_module.asyncio, "create_subprocess_exec", create)
+
+        started = asyncio.get_running_loop().time()
+        await asyncio.gather(
+            *(ffmpeg_module._spawn_media(["ffmpeg"], settle=False) for _ in range(4))
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert elapsed < 1.0, f"software launches paid the settle anyway ({elapsed:.1f}s)"
+
     async def test_the_slot_is_released_after_the_settle(self, monkeypatch):
         """Startup only. Holding it for the whole decode would serialise both workers."""
         import weakref as _weakref

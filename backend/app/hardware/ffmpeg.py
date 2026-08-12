@@ -384,13 +384,26 @@ def _media_launch_lock() -> asyncio.Lock:
     return lock
 
 
-async def _spawn_media(cmd: list[str], **kwargs: Any) -> asyncio.subprocess.Process:
-    """Start an ffmpeg/ffprobe process without another one initialising beside it."""
+async def _spawn_media(
+    cmd: list[str], *, settle: bool = True, **kwargs: Any
+) -> asyncio.subprocess.Process:
+    """Start an ffmpeg/ffprobe process without another one initialising beside it.
+
+    ``settle`` is what makes this expensive, and it is not always worth paying. Holding the
+    launch slot past the spawn is what actually prevents two Intel media initialisations
+    overlapping -- but it is a *global* wait, so it multiplies. The metadata stage alone
+    launches six processes per recording (one probe and up to five thumbnail attempts), and
+    with two workers queueing on the same lock that turned into seconds of pure waiting per
+    recording, on top of the media gate those launches were already serialised behind.
+    Software decode does not touch the driver that aborts, so it pays the spawn ordering
+    and skips the wait.
+    """
     async with _media_launch_lock():
         proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
-        # Held past the spawn on purpose: `create_subprocess_exec` returns at exec, and
-        # every part that can abort happens after that.
-        await asyncio.sleep(MEDIA_LAUNCH_SETTLE_S)
+        if settle:
+            # Held past the spawn on purpose: `create_subprocess_exec` returns at exec, and
+            # every part that can abort happens after that.
+            await asyncio.sleep(MEDIA_LAUNCH_SETTLE_S)
     return proc
 
 
@@ -614,6 +627,7 @@ async def _run_process(
 ) -> tuple[int, bytes, bytes]:
     proc = await _spawn_media(
         cmd,
+        settle=gated,
         stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -1148,6 +1162,7 @@ async def _decode_frames(
     frame_bytes = width * height * channels
     proc = await _spawn_media(
         cmd,
+        settle=label != "software",
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
