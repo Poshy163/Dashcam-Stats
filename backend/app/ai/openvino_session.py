@@ -358,6 +358,20 @@ def selected_performance_hint(device: str | None = None) -> str:
     return "THROUGHPUT" if workers > 1 else "LATENCY"
 
 
+def _runtime_version() -> str:
+    """A filesystem-safe OpenVINO version, for keying the compiled-model cache."""
+    try:
+        import openvino as ov
+
+        raw = str(getattr(ov, "__version__", "") or "unknown")
+    except Exception:
+        raw = "unknown"
+    # Versions look like "2025.4.1-19140-..."; the leading release is the part that
+    # decides blob compatibility, and the build suffix only makes the path unwieldy.
+    head = raw.split("-", 1)[0].strip() or "unknown"
+    return "".join(ch if ch.isalnum() or ch == "." else "_" for ch in head)
+
+
 def _port_name(port: Any, fallback: str) -> str:
     try:
         return str(port.get_any_name())
@@ -407,7 +421,15 @@ class OpenVINOSession:
         try:
             from app.config import get_config
 
-            cache_dir = get_config().data_dir / "openvino_cache_2026"
+            # Keyed on the runtime version rather than hard-coded.
+            #
+            # These are compiled device blobs, and feeding one runtime a blob another
+            # produced is a good way to reach exactly the kind of native abort this
+            # deployment has been chasing. The directory survives in /data across image
+            # rebuilds, so an OpenVINO change would otherwise silently inherit the previous
+            # version's cache -- and pinning the runtime back, which is a thing that
+            # happens, is precisely when that would bite.
+            cache_dir = get_config().data_dir / f"openvino_cache_{_runtime_version()}"
             cache_dir.mkdir(parents=True, exist_ok=True)
             config["CACHE_DIR"] = str(cache_dir)
         except Exception as exc:

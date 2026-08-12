@@ -30,7 +30,23 @@ Pillow>=11.0,<12
 # cannot safely coexist with the newer runtime because both packages ship ABI-distinct
 # libraries under the same SONAMEs. Plain ONNX Runtime remains for the public types used by
 # the upstream preprocessing/postprocessing libraries and as a CPU-only emergency fallback.
-openvino==2026.3.0
+# Pinned back from 2026.3.0, deliberately.
+#
+# The deployment's iGPU aborts inside the *driver* -- the abort names
+# ``shared/source/os_interface/linux/drm_buffer_object.cpp``, which is intel/compute-runtime
+# (NEO), not OpenVINO. Debian Bookworm ships NEO from 2022, and 2026.3 drives a four-year-old
+# driver through command patterns it was never built for. 2025.4.1 is the runtime that was
+# bundled inside ``onnxruntime-openvino==1.24.1`` while this library processed two thousand
+# recordings without a single abort; the crash loop began under three hours after the
+# upgrade to 2026.3 and never stopped.
+#
+# This is not the ABI trap that commit 4f0bf2d fixed. That was the *standalone* wheel loaded
+# beside ``onnxruntime-openvino``, both shipping libraries with the same SONAMEs. Plain
+# ``onnxruntime`` carries no OpenVINO libraries at all, so the two below cannot collide.
+#
+# If a newer runtime is wanted, the driver has to move first: install a current
+# compute-runtime from Intel's own packages rather than Bookworm's.
+openvino==2025.4.1
 onnxruntime==1.27.0
 
 # Model weights and their inference code, both MIT. Fetching weights from the projects
