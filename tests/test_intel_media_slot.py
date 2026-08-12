@@ -361,6 +361,54 @@ class TestOneResourcePolicy:
         monkeypatch.setattr(openvino, "gpu_inference_engaged", lambda: False)
         assert ffmpeg_module.software_decode_reason() is None
 
+    def test_resolving_the_device_does_not_re_enumerate_every_time(self, monkeypatch):
+        """Device enumeration is a native, synchronous OpenVINO call.
+
+        `select_hwaccel` consults the device on every decode and the health endpoint
+        consults it on every poll. Making that a native call per request meant an iGPU that
+        stalled -- the exact condition this module exists to survive -- took Uvicorn's only
+        event loop with it: the container stayed up, accepted connections, and answered
+        nothing at all, /health included.
+        """
+        import app.ai.openvino_session as openvino
+        from app.ai.openvino_session import reset_gpu_backend_for_tests, selected_device
+
+        reset_gpu_backend_for_tests()
+        calls = {"n": 0}
+
+        def enumerate_devices():
+            calls["n"] += 1
+            return ["GPU", "CPU"]
+
+        monkeypatch.setattr(openvino, "available_devices", enumerate_devices)
+        try:
+            for _ in range(25):
+                assert selected_device() == "GPU"
+            assert calls["n"] == 1, (
+                f"enumerated the devices {calls['n']} times; this runs per decode and per "
+                "health check, and it blocks the event loop when the driver stalls"
+            )
+        finally:
+            reset_gpu_backend_for_tests()
+
+    def test_disabling_the_gpu_invalidates_the_cached_device(self, monkeypatch):
+        """The cache must not keep naming a chip that has been taken out of service."""
+        import app.ai.openvino_session as openvino
+        from app.ai.openvino_session import (
+            disable_gpu_backend,
+            reset_gpu_backend_for_tests,
+            selected_device,
+        )
+
+        reset_gpu_backend_for_tests()
+        monkeypatch.setattr(openvino, "available_devices", lambda: ["GPU", "CPU"])
+        try:
+            assert selected_device() == "GPU"
+            disable_gpu_backend("clFlush -5")
+            assert selected_device() == "CPU"
+        finally:
+            reset_gpu_backend_for_tests()
+
     def test_the_effective_policy_is_reported(self, monkeypatch):
         """ "Decoder: software" must be explicable, not look like a hardware fault."""
         import app.ai.openvino_session as openvino

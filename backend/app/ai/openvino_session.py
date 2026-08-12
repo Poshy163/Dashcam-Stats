@@ -84,6 +84,8 @@ def disable_gpu_backend(reason: str) -> bool:
         first = _gpu_disabled_reason is None
         if first:
             _gpu_disabled_reason = reason
+    # The cached answer named a device that has just been taken out of service.
+    _clear_device_cache()
     if first:
         log.error(
             "the Intel GPU inference context has failed; inference moves to the CPU for "
@@ -110,6 +112,7 @@ def reset_gpu_backend_for_tests() -> None:
     global _gpu_disabled_reason
     with _gpu_state_lock:
         _gpu_disabled_reason = None
+    _clear_device_cache()
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,8 +144,51 @@ def available_devices() -> list[str]:
         return []
 
 
+#: Last resolved device, as ``(requested_setting, resolved)``.
+#:
+#: Resolving asks OpenVINO to enumerate its devices, which is a *native, synchronous* call.
+#: That is fine once and disastrous per request: `select_hwaccel` consults the device on
+#: every decode and the health endpoint consults it on every poll, so an iGPU that stalls
+#: -- the exact condition this whole area exists to survive -- took the event loop with it.
+#: The container stayed up, accepted connections and answered nothing, /health included.
+#:
+#: The answer cannot change underneath this cache: the setting is part of the key, and the
+#: only other thing that moves it is `disable_gpu_backend`, which clears it.
+_device_cache: tuple[str, str | None] | None = None
+
+
+def _clear_device_cache() -> None:
+    global _device_cache
+    _device_cache = None
+
+
 def selected_device() -> str | None:
-    """Resolve the configured device against what OpenVINO can actually open."""
+    """Resolve the configured device against what OpenVINO can actually open.
+
+    Memoised. See :data:`_device_cache` for why that is not an optimisation.
+    """
+    global _device_cache
+
+    requested_setting = "auto"
+    try:
+        from app.core.settings_service import get_settings_service
+
+        # An in-memory dictionary read, so this stays cheap enough to do every time and
+        # keeps a settings change from being served a stale device.
+        requested_setting = str(get_settings_service().get_nowait("processing.inference_device"))
+    except Exception:
+        pass
+
+    cached = _device_cache
+    if cached is not None and cached[0] == requested_setting:
+        return cached[1]
+
+    resolved = _resolve_device(requested_setting)
+    _device_cache = (requested_setting, resolved)
+    return resolved
+
+
+def _resolve_device(requested: str) -> str | None:
     devices = available_devices()
     if _gpu_disabled_reason is not None:
         # The chip is still enumerated and still broken. Removing it here is what makes
@@ -151,14 +197,6 @@ def selected_device() -> str | None:
         devices = [item for item in devices if not item.upper().startswith("GPU")]
     if not devices:
         return None
-
-    requested = "auto"
-    try:
-        from app.core.settings_service import get_settings_service
-
-        requested = str(get_settings_service().get_nowait("processing.inference_device"))
-    except Exception as exc:
-        log.debug("could not read inference device setting", error=str(exc))
 
     if requested != "auto":
         if requested in devices:
