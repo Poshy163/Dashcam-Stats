@@ -26,6 +26,7 @@ const LIBRARY_NAV: NavItem[] = [
 
 const SYSTEM_NAV: NavItem[] = [
   { to: '/queue', label: 'Queue', icon: QueueIcon },
+  { to: '/backup', label: 'Backup', icon: DownloadIcon },
   { to: '/logs', label: 'Activity logs', icon: LogIcon },
   { to: '/settings', label: 'Settings', icon: GearIcon },
 ]
@@ -270,6 +271,9 @@ function CarIcon({ className }: IconProps) {
 }
 function QueueIcon({ className }: IconProps) {
   return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M3 5h14M3 10h14M3 15h9" strokeLinecap="round" /></svg>
+}
+function DownloadIcon({ className }: IconProps) {
+  return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M10 2.5v9m0 0 3.5-3.5M10 11.5 6.5 8" strokeLinecap="round" strokeLinejoin="round" /><path d="M3 13v3.5h14V13" strokeLinecap="round" /></svg>
 }
 function LogIcon({ className }: IconProps) {
   return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><rect x="3.5" y="2.5" width="13" height="15" rx="1.5" /><path d="M6.5 6.5h7M6.5 10h7M6.5 13.5h4" strokeLinecap="round" /></svg>

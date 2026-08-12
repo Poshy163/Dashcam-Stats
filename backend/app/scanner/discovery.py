@@ -170,6 +170,13 @@ class Scanner:
                     for entry in it:
                         try:
                             if entry.is_dir(follow_symlinks=follow_symlinks):
+                                # Dot-directories are working space, not footage. The
+                                # ingest stages arrivals in `.ingest_staging` inside this
+                                # very tree -- same filesystem, so committing a finished
+                                # file is a rename rather than a copy -- and a half-written
+                                # file must never be indexed as a recording.
+                                if entry.name.startswith("."):
+                                    continue
                                 stack.append(Path(entry.path))
                                 continue
                             if not entry.is_file(follow_symlinks=follow_symlinks):

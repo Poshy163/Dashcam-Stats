@@ -135,6 +135,43 @@ export interface ScanResult {
   errorMessage: string | null
 }
 
+/** Live progress of a pull off the head unit. Also the Home Assistant REST sensor shape. */
+export interface IngestStatus {
+  state:
+    | 'disabled'
+    | 'idle'
+    | 'running'
+    | 'ok'
+    | 'partial'
+    | 'error'
+    | 'offline'
+    | 'unauthorized'
+    | 'cancelled'
+  unitOnline: boolean
+  filesTotal: number
+  filesDone: number
+  bytesTotal: number
+  bytesDone: number
+  throughputMbs: number
+  currentFile: string | null
+  backlogFiles: number
+  backlogBytes: number
+  lastSuccessTs: string | null
+  lastError: string | null
+}
+
+export interface IngestRun {
+  id: number
+  startedAt: string | null
+  finishedAt: string | null
+  trigger: string
+  state: string
+  filesTransferred: number
+  bytesTransferred: number
+  throughputMbsAvg: number
+  error: string | null
+}
+
 export interface RecordingFilters extends Query {
   page?: number
   pageSize?: number
@@ -226,6 +263,13 @@ export const api = {
     retryFailed: () => post<{ retried: number }>('/jobs/retry-failed'),
     retry: (id: number) => post<Job>(`/jobs/${id}/retry`),
     cancel: (id: number) => request<void>(`/jobs/${id}`, { method: 'DELETE' }),
+  },
+
+  ingest: {
+    status: () => request<IngestStatus>('/ingest/status'),
+    run: () => post<{ started: boolean; state: string }>('/ingest/run'),
+    cancel: () => post<{ cancelled: boolean }>('/ingest/cancel'),
+    history: (query?: Query) => request<Paginated<IngestRun>>('/ingest/history', { query }),
   },
 
   settings: {

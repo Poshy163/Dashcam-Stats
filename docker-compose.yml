@@ -17,9 +17,15 @@ services:
       # retention under any circumstance.
       - dashcam-data:/data
 
-      # Your raw footage. Mounted read-only: retention reports what it would remove
-      # instead of deleting. Drop the `:ro` and enable deletion in Settings > Storage
-      # if you later want automatic cleanup.
+      # Your raw footage. Mounted read-only, which is the recommended default: retention
+      # reports what it would remove instead of deleting, and nothing in the container can
+      # touch the originals whatever it decides.
+      #
+      # Drop the `:ro` only if you want one of the two features that write here:
+      #   * Settings > Backup / Ingest, which copies recordings off the dashcam's head unit
+      #     while the car is on the driveway (it refuses to run against a share it cannot
+      #     verify is mounted and writable, rather than writing into the mount point);
+      #   * automatic deletion in Settings > Storage.
       - /mnt/Vault/dashcam:/dashcam:ro
 
     # Everything else is configured in the web UI. These are the only variables that

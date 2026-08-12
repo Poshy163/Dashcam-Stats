@@ -1,0 +1,270 @@
+"""The ADB control channel — and only the control channel.
+
+ADB is used here for four tiny things: connect, ask the unit's state, resolve where the TF
+card is mounted, and list what is on it. The recordings themselves never travel through it.
+
+That division is the entire reason this feature is viable. Measured against the live unit:
+
+    adb pull, 4 parallel streams      ~4.0 MB/s
+    adb exec-out, single              ~8.3 MB/s
+    adb exec-out -P8                 ~10.0 MB/s     <- adbd's ceiling, whatever you do
+    tar | nc over a plain socket     ~34.3 MB/s     <- what transport.py uses
+
+The card reads at 60 MB/s and the WiFi link is good for ~50 MB/s, so ``adbd`` was the only
+thing in the way: everything routed through that one daemon funnels into it. The unit has
+no battery, so it is only powered while the car is running in the driveway -- a window of
+roughly one to two minutes. At 10 MB/s that window moves 1.2 GB; at 34 MB/s it moves 4 GB,
+which is the difference between keeping up and never catching up.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import shutil
+from dataclasses import dataclass
+
+from app.core.logging import get_logger
+from app.ingest.models import RemoteFile, UnitInfo, UnitState
+
+log = get_logger(__name__)
+
+#: Control calls are all sub-second against a healthy unit; this only bounds a hung link.
+CONTROL_TIMEOUT_S = 20.0
+
+#: Resolution order for the footage directory.
+#:
+#: The TF card's volume id changes whenever the card is reformatted -- the manual asks for
+#: that monthly, and it has already rolled EBDF-E4DD -> 0726-1708 once. ``/storage/Tfcard``
+#: is a symlink the platform recreates at every mount, so it survives the reformat; the
+#: glob is the fallback for a unit that does not create it.
+SOURCE_PROBE = (
+    "for d in /storage/Tfcard/DCIM/Video /storage/sdcard0/DCIM/Video /storage/*/DCIM/Video; "
+    'do [ -d "$d" ] && { echo "$d"; break; }; done'
+)
+
+
+class AdbError(RuntimeError):
+    """An ADB control call failed. Never raised for "the unit is simply not here"."""
+
+
+class CardNotFound(AdbError):
+    """The unit answered, but no DCIM/Video directory could be located on it.
+
+    Its own class because the operator needs to be told something quite different from
+    "the car is not here": the unit is present and authorised, and the card is missing,
+    unmounted or freshly reformatted.
+    """
+
+
+#: Filenames the camera actually produces, and the only ones ever put into a shell command.
+#:
+#: Names from the card are attacker-adjacent input as far as this code is concerned -- they
+#: are whatever happens to be on a removable card -- and they end up as argv inside
+#: ``sh -c``. Anything with a space, a quote or a glob character in it would word-split or
+#: expand: ``rm -f a b.ts`` deletes two files, and a single ``*`` deletes the card. So they
+#: are validated against the camera's own format and quoted, rather than either alone.
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def is_safe_name(name: str) -> bool:
+    return bool(_SAFE_NAME.match(name)) and ".." not in name
+
+
+def _checked(name: str) -> str:
+    if not is_safe_name(name):
+        raise AdbError(f"refusing to put an unexpected filename into a shell command: {name!r}")
+    return name
+
+
+def _bare_list(names: list[str]) -> str:
+    """Validated names for use *inside* an already single-quoted ``sh -c`` string.
+
+    Quoting here would be worse than useless: the surrounding string is already
+    single-quoted, so an inner ``'`` would close it rather than protect anything. The
+    allowlist is what makes this safe, which is why it raises rather than escaping.
+    """
+    return " ".join(_checked(name) for name in names)
+
+
+def _quoted_list(names: list[str]) -> str:
+    """Validated *and* quoted names, for a top-level command."""
+    return " ".join(f"'{_checked(name)}'" for name in names)
+
+
+@dataclass(slots=True)
+class AdbResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def adb_path() -> str:
+    found = shutil.which("adb")
+    if not found:
+        raise AdbError("adb is not installed in this image")
+    return found
+
+
+async def _adb(*args: str, timeout: float = CONTROL_TIMEOUT_S) -> AdbResult:
+    cmd = [adb_path(), *args]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        proc.kill()
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+        raise AdbError(f"adb {' '.join(args[:2])} timed out after {timeout:.0f}s") from None
+    return AdbResult(
+        proc.returncode or 0,
+        out.decode("utf-8", "replace").strip(),
+        err.decode("utf-8", "replace").strip(),
+    )
+
+
+async def shell(address: str, command: str, *, timeout: float = CONTROL_TIMEOUT_S) -> str:
+    result = await _adb("-s", address, "shell", command, timeout=timeout)
+    if result.returncode != 0:
+        raise AdbError(result.stderr or f"adb shell failed ({result.returncode})")
+    # The unit's shell is Android's: every line arrives with a carriage return attached.
+    return result.stdout.replace("\r", "")
+
+
+async def reconnect(address: str) -> None:
+    """Re-establish the control channel before every cycle.
+
+    Not optional and not paranoia. The unit reboots with the car, and the transport on this
+    side goes stale while still *looking* connected -- ``get-state`` answers ``device`` for
+    a socket that no longer reaches anything. Disconnecting first costs one round trip and
+    removes a whole class of "it worked yesterday" failure.
+    """
+    await _adb("disconnect", address)
+    await _adb("connect", address)
+
+
+async def state(address: str) -> UnitState:
+    result = await _adb("-s", address, "get-state")
+    text = f"{result.stdout} {result.stderr}".lower()
+    if result.returncode == 0 and "device" in result.stdout:
+        return UnitState.DEVICE
+    if "unauthorized" in text:
+        return UnitState.UNAUTHORIZED
+    if "offline" in text or "not found" in text or "cannot connect" in text:
+        return UnitState.OFFLINE
+    return UnitState.UNKNOWN
+
+
+async def resolve_source(address: str, override: str = "") -> str:
+    if override.strip():
+        return override.strip()
+    found = (await shell(address, SOURCE_PROBE)).strip().splitlines()
+    for line in found:
+        if line.strip():
+            return line.strip()
+    raise CardNotFound("could not find DCIM/Video on any mounted volume")
+
+
+async def inventory(address: str, source: str) -> list[RemoteFile]:
+    """List the card's recordings as ``size|name|mtime``.
+
+    ``stat`` per file rather than ``ls -l`` because the output is unambiguous to parse and
+    the field order is ours to choose. This is the only listing of the card we take, and it
+    is a few kilobytes for a full card.
+    """
+    # The trailing `exit 0` is not decoration. On an empty card the loop's last statement
+    # is a failed `[ -e '*.ts' ]`, so the shell exits non-zero and `shell()` would raise --
+    # turning "there is nothing to copy" into a control-channel failure. An empty card is
+    # the *expected* steady state once delete-after-verify is on, so every run after the
+    # first would have failed.
+    command = (
+        f"cd '{source}' && for f in *.ts; do [ -e \"$f\" ] && stat -c '%s|%n|%Y' \"$f\"; "
+        "done; exit 0"
+    )
+    files: list[RemoteFile] = []
+    for line in (await shell(address, command)).splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 3:
+            continue
+        name = parts[1].strip()
+        if not is_safe_name(name):
+            log.warning("ignoring a card file with an unexpected name", name=name[:80])
+            continue
+        try:
+            files.append(RemoteFile(name=name, size=int(parts[0]), mtime=int(parts[2])))
+        except ValueError:
+            continue
+    return files
+
+
+async def launch_listener(
+    address: str,
+    source: str,
+    names: list[str],
+    *,
+    port: int,
+    timeout_s: int,
+) -> None:
+    """Start ``tar c <files> | nc -l -p PORT`` on the unit, detached, and return at once.
+
+    Detached via ``setsid`` with its streams redirected, because otherwise the ADB shell
+    call does not return until the listener exits -- and the listener is meant to outlive
+    it and serve the socket this side is about to connect to.
+
+    Nothing is installed on the unit for this. It is not rooted and it does not need to be:
+    Android's toybox already provides ``tar``, ``nc``, ``setsid`` and ``timeout``.
+
+    The file list goes as argv. A full card is around 140 names of 30 characters, roughly
+    4 KB, which is far inside ARG_MAX, and the camera's filenames are ``[0-9]*_camera_[01].ts``
+    with no spaces or shell metacharacters in them.
+    """
+    if not names:
+        return
+    listed = _bare_list(names)
+    seconds = int(timeout_s)
+    command = (
+        # A listener orphaned by a window that closed mid-transfer still owns the port, and
+        # a mid-transfer cut is the normal ending here rather than the exceptional one.
+        "for p in $(pidof nc 2>/dev/null); do kill $p 2>/dev/null; done; "
+        f"cd '{source}' && setsid timeout {seconds} "
+        # The inner timeout is on `nc` specifically. The outer one only ever kills the
+        # wrapper shell, and `nc` -- the process actually holding the port -- would survive
+        # it, which is exactly the orphan the line above then has to clean up next time.
+        f"sh -c 'tar c {listed} | timeout {seconds} nc -l -p {int(port)}' "
+        "</dev/null >/dev/null 2>&1 &"
+    )
+    await shell(address, command)
+
+
+async def delete(address: str, source: str, names: list[str]) -> int:
+    """Remove files from the unit. Only ever called for verified, committed copies.
+
+    Every name is quoted and format-checked first. Unquoted, one unexpected filename on
+    the card turns a targeted delete into a broad one -- ``a b.ts`` removes two files, and
+    a name containing ``*`` removes everything matching it.
+    """
+    if not names:
+        return 0
+    await shell(address, f"cd '{source}' && rm -f {_quoted_list(names)}")
+    return len(names)
+
+
+async def describe(address: str, override: str = "") -> UnitInfo:
+    """One control round trip that answers "is it here, and where is the footage"."""
+    info = UnitInfo(address=address)
+    await reconnect(address)
+    info.state = await state(address)
+    if info.online:
+        try:
+            info.source = await resolve_source(address, override)
+        except AdbError as exc:
+            # Recorded rather than swallowed. Reporting a present, authorised unit with an
+            # unmounted or reformatted card as "not on the network" points the operator at
+            # the wiring when the problem is the card.
+            info.card_error = str(exc)
+            log.warning("unit is online but its card could not be located", error=str(exc))
+    return info

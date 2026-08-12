@@ -45,6 +45,7 @@ CATEGORIES: tuple[tuple[str, str, str], ...] = (
     ("journeys", "Journeys", "How recordings are grouped into drives"),
     ("events", "Events", "Protection and automatic driving-event rules"),
     ("storage", "Storage", "Retention limits and cleanup behaviour"),
+    ("ingest", "Backup / Ingest", "Pulling footage off the dashcam head unit"),
     ("maps", "Maps", "Map tiles and rendering"),
     ("advanced", "Advanced", "Logging, database and diagnostics"),
 )
@@ -842,6 +843,180 @@ SETTINGS: tuple[SettingDef, ...] = (
         minimum=30,
         maximum=7200,
         unit="seconds",
+    ),
+    # ---------------------------------------------------------------- ingest
+    SettingDef(
+        "ingest.enabled",
+        "Pull footage from the head unit",
+        "bool",
+        False,
+        "ingest",
+        "Watch for the dashcam's head unit on the network and copy new recordings into the "
+        "footage directory automatically. The footage directory must be mounted "
+        "read-write for this.",
+    ),
+    SettingDef(
+        "ingest.unit_adb_address",
+        "Head unit address",
+        "string",
+        "192.168.1.122:5555",
+        "ingest",
+        "host:port of the head unit's ADB service. Used only as a control channel — to ask "
+        "what is on the card and to start the transfer. The recordings themselves travel "
+        "over their own socket, which is roughly three times faster.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.data_port",
+        "Transfer port",
+        "int",
+        9000,
+        "ingest",
+        "Port the head unit listens on for the bulk transfer. The app connects out to it; "
+        "nothing needs to be opened on this side.",
+        minimum=1024,
+        maximum=65535,
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.source_path_override",
+        "Card path override",
+        "string",
+        "",
+        "ingest",
+        "Leave blank to find the card automatically. The TF card's volume id changes every "
+        "time it is reformatted, so /storage/Tfcard/DCIM/Video is tried first because the "
+        "platform recreates that symlink at every mount.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.poll_interval_s",
+        "Presence check interval",
+        "int",
+        8,
+        "ingest",
+        "How often to look for the head unit. The unit has no battery, so it is only on the "
+        "network while the engine is running — often only a minute or two.",
+        minimum=3,
+        maximum=300,
+        unit="seconds",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.listen_timeout_s",
+        "Transfer timeout",
+        "int",
+        180,
+        "ingest",
+        "How long the head unit keeps serving before giving up, so a window that closes "
+        "mid-transfer cannot leave a listener holding the port.",
+        minimum=30,
+        maximum=3600,
+        unit="seconds",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.skip_active_seconds",
+        "Ignore recordings newer than",
+        "int",
+        15,
+        "ingest",
+        "Both cameras write continuously while the car runs. The newest segment of each is "
+        "open in the recorder, and copying it would produce a truncated file that looks "
+        "complete.",
+        minimum=5,
+        maximum=600,
+        unit="seconds",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.camera_filter",
+        "Cameras to copy",
+        "select",
+        "both",
+        "ingest",
+        "Copying only the road-facing lens halves the data if the interior camera is not wanted.",
+        choices=(("both", "Both cameras"), ("camera_0", "Front only"), ("camera_1", "Rear only")),
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.delete_after_verify",
+        "Delete from the card after copying",
+        "bool",
+        False,
+        "ingest",
+        "Off by default. A file is only ever removed from the card after a byte-complete "
+        "copy of it has been committed to the footage directory.",
+        dangerous=True,
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.ha_webhook_url",
+        "Home Assistant webhook",
+        "string",
+        "",
+        "ingest",
+        "Posted to when a transfer starts, finishes or fails — this is what reaches a "
+        "phone. Blank disables it. Example: "
+        "http://homeassistant:8123/api/webhook/dashcam_backup",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.ha_mqtt_enabled",
+        "Publish to MQTT",
+        "bool",
+        False,
+        "ingest",
+        "Publishes Home Assistant discovery topics so the entities appear on their own. "
+        "Optional: the status endpoint already works as a REST sensor with no broker.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.ha_mqtt_host",
+        "MQTT host",
+        "string",
+        "",
+        "ingest",
+        "Broker hostname or address.",
+        requires="ingest.ha_mqtt_enabled",
+    ),
+    SettingDef(
+        "ingest.ha_mqtt_port",
+        "MQTT port",
+        "int",
+        1883,
+        "ingest",
+        "Broker port.",
+        minimum=1,
+        maximum=65535,
+        requires="ingest.ha_mqtt_enabled",
+    ),
+    SettingDef(
+        "ingest.ha_mqtt_user",
+        "MQTT username",
+        "string",
+        "",
+        "ingest",
+        "Leave blank for an anonymous broker.",
+        requires="ingest.ha_mqtt_enabled",
+    ),
+    SettingDef(
+        "ingest.ha_mqtt_pass",
+        "MQTT password",
+        "string",
+        "",
+        "ingest",
+        "Leave blank for an anonymous broker.",
+        requires="ingest.ha_mqtt_enabled",
+    ),
+    SettingDef(
+        "ingest.ha_mqtt_base_topic",
+        "MQTT base topic",
+        "string",
+        "dashcam/backup",
+        "ingest",
+        "State topics are published beneath this prefix.",
+        requires="ingest.ha_mqtt_enabled",
     ),
 )
 

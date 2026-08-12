@@ -23,13 +23,14 @@ from starlette.responses import Response
 
 from app.ai.runtime import describe_media_policy
 from app.api.errors import install_error_handlers
-from app.api.routes import content, heatmap, media, osd_debug, system
+from app.api.routes import content, heatmap, ingest, media, osd_debug, system
 from app.api.schemas import HealthOut
 from app.config import get_config
 from app.core.logging import configure_logging, get_logger, install_db_sink, shutdown_db_sink
 from app.core.settings_service import get_settings_service, init_settings_service
 from app.db.session import dispose_engine, get_session_factory, init_db
 from app.hardware.ffmpeg import media_health
+from app.ingest.poller import get_poller
 from app.pipeline.stages import warm_models
 from app.workers import queue
 from app.workers.scheduler import get_scheduler
@@ -82,6 +83,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     queue.restore_pause_state()
     await pool.start()
     await scheduler.start()
+    # Its own ticker rather than a scheduler task: the shared scheduler floors every
+    # interval at thirty seconds, and the head unit is only on the network for a minute or
+    # two while the engine runs.
+    await get_poller().start()
 
     # Deliberately not awaited: compiling the models takes about a minute on the iGPU, and
     # blocking here would delay the health check and the UI for no benefit. The first job
@@ -95,6 +100,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         warm.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await warm
+        await get_poller().stop()
         await scheduler.stop()
         await pool.stop()
         await shutdown_db_sink()
@@ -156,6 +162,7 @@ def create_app() -> FastAPI:
     app.include_router(media.router)
     app.include_router(heatmap.router)
     app.include_router(osd_debug.router)
+    app.include_router(ingest.router)
 
     @app.get("/health", response_model=HealthOut, tags=["health"])
     async def health() -> Response:

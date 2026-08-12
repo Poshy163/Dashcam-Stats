@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useSearchParams } from 'react-router-dom'
 
 import Spinner from '@/components/Spinner'
 import { ErrorState, PageHeader } from '@/components/ui'
@@ -11,7 +12,11 @@ import type { RetentionPlan, SettingDef } from '@/lib/types'
 
 export default function Settings() {
   const client = useQueryClient()
-  const [active, setActive] = useState<string>('general')
+  // The category lives in the URL so other pages can link straight to their own settings
+  // — the Backup page does — and so a reload keeps you where you were.
+  const [params, setParams] = useSearchParams()
+  const active = params.get('category') ?? 'general'
+  const setActive = (key: string) => setParams({ category: key }, { replace: true })
   const [dirty, setDirty] = useState<Record<string, unknown>>({})
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [saved, setSaved] = useState(false)

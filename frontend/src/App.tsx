@@ -17,6 +17,7 @@ const Plates = lazy(() => import('@/pages/Plates'))
 const PlateDetail = lazy(() => import('@/pages/PlateDetail'))
 const Vehicles = lazy(() => import('@/pages/Vehicles'))
 const Queue = lazy(() => import('@/pages/Queue'))
+const Backup = lazy(() => import('@/pages/Backup'))
 const Logs = lazy(() => import('@/pages/Logs'))
 const Settings = lazy(() => import('@/pages/Settings'))
 const Search = lazy(() => import('@/pages/Search'))
@@ -38,6 +39,7 @@ export default function App() {
           <Route path="/plates/:id" element={<PlateDetail />} />
           <Route path="/vehicles" element={<Vehicles />} />
           <Route path="/queue" element={<Queue />} />
+          <Route path="/backup" element={<Backup />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/search" element={<Search />} />

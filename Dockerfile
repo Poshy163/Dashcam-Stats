@@ -62,6 +62,12 @@ LABEL org.opencontainers.image.title="Dashcam Analyser" \
 # Intel hardware, but on an AMD iGPU or a host with no GPU at all mesa-va-drivers already
 # covers decode, and failing the whole image build over a driver the machine may never use
 # would be the wrong trade.
+#
+# android-tools-adb is the control channel for the head-unit backup, and only that:
+# connect, list the card, start a listener. The recordings themselves never pass through
+# adbd, which caps at about 10 MB/s however many streams it is given -- they come over a
+# plain socket at roughly 34. Nothing else is needed for it: the tar stream is unpacked in
+# Python here, and the unit already ships toybox tar/nc/setsid/timeout.
 RUN set -eux; \
     if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         sed -i 's/^Components:.*/Components: main contrib non-free non-free-firmware/' \
@@ -86,7 +92,8 @@ RUN set -eux; \
         libgomp1 \
         tini \
         gosu \
-        curl; \
+        curl \
+        android-tools-adb; \
     apt-get install -y --no-install-recommends intel-media-va-driver-non-free \
         || apt-get install -y --no-install-recommends intel-media-va-driver \
         || echo 'WARNING: no Intel media driver available; VAAPI will fall back to Mesa'; \
@@ -103,6 +110,10 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     # iHD is the right driver for modern Intel; the entrypoint overrides this if the
     # detected hardware needs the older i965 or a Mesa driver instead.
     LIBVA_DRIVER_NAME=iHD
+
+# Keep the ADB key on the data volume: the head unit authorises the key, so losing it on an
+# image rebuild means the car has to be re-authorised by hand from its own screen.
+ENV ANDROID_USER_HOME=/data/.android
 
 WORKDIR /app
 COPY backend/ /app/backend/

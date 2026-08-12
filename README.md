@@ -47,7 +47,7 @@ interval, detection thresholds, retention limits, map tiles — is on the Settin
 
 | Path | Purpose |
 | --- | --- |
-| `/dashcam` | Your raw footage. Mounted `:ro` above, which is the recommended default. |
+| `/dashcam` | Your raw footage. Mounted `:ro` above, which is the recommended default. Drop the `:ro` only to enable [Backup](#backup-pulling-footage-off-the-dashcam) or automatic deletion. |
 | `/data` | Database, settings, thumbnails, plate crops and models. **Never** touched by retention. Back this up. |
 | `/dev/dri` | The iGPU, used for hardware video decode and AI inference. Optional — without it everything still works on CPU, just slower. |
 
@@ -125,8 +125,70 @@ OCR confidence: 94%
 | **Plates** | Searchable plate database — full or partial (`ABC` matches `ABC123`) |
 | **Vehicles** | Vehicle sightings independent of plates |
 | **Queue** | What is processing now, what is queued, what failed, with retry |
+| **Backup** | Copying recordings off the dashcam itself — progress, backlog and history |
 | **Logs** | Application and per-job logs |
 | **Settings** | Everything above, editable without a restart |
+
+---
+
+## Backup: pulling footage off the dashcam
+
+Optional, and off until you turn it on in **Settings → Backup / Ingest**.
+
+Dashcam head units are usually Android boxes with no battery, which means they are only
+powered — and only on WiFi — while the engine is running. That is a window of a minute or
+two on the driveway, and it has to be enough to move a day's recordings. The app watches
+for the unit and pulls; nothing is installed on the unit and nothing is scheduled there,
+so there is no state in the car to get lost when the engine stops.
+
+Getting the data out fast enough is the whole problem, and it is a transport problem.
+Measured against a live unit (Unisoc UIS7861, Android 15, not rooted):
+
+| Path | Rate |
+| --- | --- |
+| WiFi link (Wi-Fi 5, 80 MHz, −54 dBm) | ~50 MB/s capable |
+| TF card sequential read, both lenses recording | 60 MB/s |
+| `adb pull`, four parallel streams | 4 MB/s |
+| `adb exec-out`, single / `-P8` | 8.3 / 10.0 MB/s |
+| **`tar` over a plain TCP socket** | **34.3 MB/s** |
+
+Everything routed through `adbd` funnels into one daemon and caps around 10 MB/s no matter
+how many streams it is given. So ADB is used only as a control channel — connect, list the
+card, start a listener — and the recordings travel over their own socket. At 34 MB/s a
+two-minute window moves about 4 GB, against 1.2 GB through `adbd`.
+
+What that means in practice:
+
+- **Nothing is installed on the head unit.** It already has toybox `tar`, `nc`, `setsid`
+  and `timeout`; the tar stream is unpacked in Python on this side.
+- **Interrupted transfers are normal.** Files land in `<footage>/.ingest_staging` and only
+  a byte-complete file is moved into the footage directory, so the scanner never sees a
+  partial. Whatever did not arrive is fetched next time.
+- **The delta is size-based.** A file cut short when the car pulled away has the wrong
+  size and is simply re-fetched — nothing has to remember that it was partial.
+- **The recording being written right now is skipped**, because copying an open segment
+  produces a truncated file that looks complete.
+- **Nothing is deleted from the card** unless you explicitly enable it, and then only
+  after a verified copy has been committed.
+
+Transferred files land in the same directory the scanner already watches, so they are
+analysed like anything else with no further configuration.
+
+Home Assistant integration — a REST sensor, a webhook for phone notifications, and
+optional MQTT discovery — is documented with copy-paste config in
+[`examples/homeassistant/`](examples/homeassistant/README.md).
+
+**First run:** the head unit authorises an ADB *key*, so the first connection puts an
+"Allow USB debugging?" prompt on the dashcam's own screen. Accept it with "always allow"
+while the car is running. The key is kept on the `/data` volume, so rebuilding the image
+does not ask again. Until it is accepted the Backup page says "Not authorised".
+
+To check the connection from the host without moving anything:
+
+```bash
+docker exec dashcam-analyser python /app/backend/scripts/ingest_smoke.py \
+    --address 192.168.1.122:5555
+```
 
 ---
 
@@ -172,6 +234,10 @@ GET  /api/plates?q=ABC            full or partial plate search
 GET  /api/plates/{id}/observations every sighting, with location and confidence
 GET  /api/vehicles                vehicle sightings
 GET  /api/jobs                    queue state; pause, resume, retry, cancel
+GET  /api/ingest/status           live backup progress — also the Home Assistant sensor source
+POST /api/ingest/run              pull from the head unit now
+POST /api/ingest/cancel           stop the running transfer
+GET  /api/ingest/history          past transfers
 GET  /api/settings                the settings catalogue and current values
 POST /api/scan                    scan now
 POST /api/retention/plan          evaluate retention (report-only unless enabled)

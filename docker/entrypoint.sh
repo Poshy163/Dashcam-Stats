@@ -67,9 +67,28 @@ prepare_dirs() {
     fi
 }
 
+prepare_adb_key() {
+    # The head unit authorises a *key*, not a container. Keeping it on the data volume
+    # means rebuilding the image does not put an "Allow USB debugging?" dialog in front of
+    # a car that nobody is sitting in. ANDROID_USER_HOME is honoured by newer adb; the
+    # symlink covers builds that still only look at $HOME/.android.
+    local key_dir="${DATA_DIR}/.android"
+    mkdir -p "$key_dir"
+    chown -R "$APP_USER":"$APP_USER" "$key_dir" 2>/dev/null || true
+    chmod 700 "$key_dir" 2>/dev/null || true
+
+    local home
+    home="$(getent passwd "$APP_USER" | cut -d: -f6)"
+    if [ -n "$home" ] && [ ! -e "${home}/.android" ]; then
+        ln -sfn "$key_dir" "${home}/.android" 2>/dev/null || true
+        chown -h "$APP_USER":"$APP_USER" "${home}/.android" 2>/dev/null || true
+    fi
+}
+
 if [ "$(id -u)" = "0" ]; then
     grant_dri_access
     prepare_dirs
+    prepare_adb_key
     exec_prefix=(gosu "$APP_USER")
 else
     # Already unprivileged (user: was set in compose); device access is the operator's

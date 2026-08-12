@@ -640,6 +640,30 @@ class ScanRun(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class IngestRun(Base):
+    """One pull of footage off the head unit.
+
+    History and "when did this last work", nothing more. Live progress stays in memory in
+    ``app.ingest.status``: a run lasts a minute or two and reports bytes several times a
+    second, which is not worth a write each, and nobody asks the database what is happening
+    right now -- they ask the status endpoint.
+    """
+
+    __tablename__ = "ingest_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    trigger: Mapped[str] = mapped_column(String(32), default="auto")
+
+    #: One of RunState: ok, partial, error, offline, unauthorized, cancelled, idle.
+    state: Mapped[str] = mapped_column(String(32), default="ok", index=True)
+    files_transferred: Mapped[int] = mapped_column(Integer, default=0)
+    bytes_transferred: Mapped[int] = mapped_column(Integer, default=0)
+    throughput_mbs_avg: Mapped[float] = mapped_column(Float, default=0.0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class AppSetting(Base):
     """UI-editable configuration. Values are JSON so types survive round-tripping."""
 

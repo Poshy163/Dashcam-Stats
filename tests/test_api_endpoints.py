@@ -47,6 +47,8 @@ READ_ENDPOINTS = [
     "/api/jobs",
     "/api/jobs/stats",
     "/api/logs",
+    "/api/ingest/status",
+    "/api/ingest/history",
     "/api/system/hardware",
     "/api/system/info",
     "/api/system/database",
