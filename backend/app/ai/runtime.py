@@ -28,16 +28,31 @@ def describe_media_policy() -> dict[str, object]:
     fault. It is the opposite: it is the policy that keeps the hardware working, since this
     chip will not run VAAPI and OpenVINO at once.
     """
+    from app.core.settings_service import get_settings_service
     from app.hardware.ffmpeg import media_health, select_hwaccel, software_decode_reason
 
-    # Ask the thing that actually decides, rather than reporting the policy and hoping.
+    # Ask the thing that actually decides, with the preference the pipeline actually
+    # passes it.
     #
-    # This used to say "hardware" whenever the *policy* permitted it, which is a different
-    # question from what a decode will really do -- and the two came apart the moment VAAPI
-    # stopped being available at all: the page claimed hardware decoding while every clip
-    # went through software, with no reason given because the policy had no objection.
+    # Two goes at this were wrong in the same way. It first reported whatever the *policy*
+    # permitted, which said "hardware" while every clip went through software once VAAPI
+    # stopped existing. Then it asked `select_hwaccel` -- but hard-coded "auto", which is
+    # not what the stages pass: they send "cpu" when hardware acceleration is switched off.
+    # So turning that setting off halved the wall-clock time per recording, visibly, while
+    # this went on reporting "vaapi".
+    preference = "auto"
     reason = software_decode_reason()
-    _, effective = select_hwaccel("auto", None)
+    try:
+        settings = get_settings_service()
+        if not bool(settings.get_nowait("processing.hardware_acceleration")):
+            preference = "cpu"
+            reason = reason or "hardware acceleration is switched off in Settings"
+        else:
+            preference = str(settings.get_nowait("processing.decoder_preference"))
+    except Exception as exc:
+        log.debug("could not read the decode preference", error=str(exc))
+
+    _, effective = select_hwaccel(preference, None)
     if reason is None and effective == "software":
         reason = "no hardware decoder is available on this machine"
     return {
