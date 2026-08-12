@@ -49,28 +49,39 @@ rest:
 
 ## B. Webhook — for a notification
 
-Put `http://homeassistant:8123/api/webhook/dashcam_backup` into
-**Settings → Backup / Ingest → Home Assistant webhook**, then:
+A complete automation is in [`automation.yaml`](automation.yaml): separate messages for
+started / finished / interrupted / failed, sharing one notification tag so the finish
+replaces the start instead of stacking.
 
-```yaml
-automation:
-  - alias: Dashcam backup notify
-    trigger:
-      - platform: webhook
-        webhook_id: dashcam_backup
-        local_only: true
-    action:
-      - service: notify.mobile_app_phone
-        data:
-          title: "Dashcam backup {{ trigger.json.event }}"
-          message: >
-            {{ trigger.json.files }} files ·
-            {{ (trigger.json.bytes / 1073741824) | round(2) }} GB ·
-            {{ trigger.json.throughput | round(1) }} MB/s
+Put the webhook URL into **Settings → Backup / Ingest → Home Assistant webhook**. Use
+Home Assistant's **internal** address, not a public one:
+
+```
+http://<home-assistant-lan-ip>:8123/api/webhook/<your-webhook-id>
 ```
 
-`local_only: true` keeps the webhook on the LAN, which is where the app posts from.
-Events are `started`, `finished` and `error`.
+`local_only: true` only accepts requests whose client IP is on the local network. The app
+posts from inside the LAN, so an internal URL satisfies that directly. Going out through
+a public hostname and back means Home Assistant sees the reverse proxy's address instead,
+and the webhook is silently rejected unless `use_x_forwarded_for` and `trusted_proxies`
+are configured for that proxy — an internal URL avoids the question, and the round trip.
+
+Events are `started`, `finished` and `error`. A window where the car turns up with nothing
+new to copy sends nothing at all, so this does not fire every time the engine starts.
+
+Payload fields:
+
+| Field | Notes |
+| --- | --- |
+| `event` | `started` / `finished` / `error` |
+| `state` | `ok`, `partial`, `error`, `cancelled`, `unauthorized` |
+| `files`, `bytes` | what the run moved — on `started`, what it intends to move |
+| `throughput`, `duration_s`, `error` | `finished` / `error` only |
+| `backlog_files`, `backlog_bytes` | still on the camera |
+| `files_total`, `files_done`, `bytes_total`, `bytes_done`, `current_file`, `unit_online` | live progress |
+
+`started` carries no `throughput`, `duration_s` or `error`, so use
+`trigger.json.get('throughput', 0)` rather than `trigger.json.throughput`.
 
 ## C. MQTT — live entities, no YAML
 

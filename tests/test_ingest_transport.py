@@ -606,6 +606,36 @@ class TestARunEndToEnd:
         assert unit.deleted == [], "the card was cleared against an unmounted share"
         assert list(app_config.footage_dir.glob("*.ts")) == []
 
+    async def test_a_window_with_nothing_new_notifies_nobody(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """The car arriving with nothing new is not an event.
+
+        Everything that is not OK reports as an error, so without this an ordinary "up to
+        date" window would put an error notification on a phone every time the engine
+        started.
+        """
+        from app.ingest import puller
+        from app.ingest.models import RunState
+
+        events: list[str] = []
+
+        async def record(event, **kwargs):
+            events.append(event)
+
+        monkeypatch.setattr(puller, "report_event", record)
+        await self._enable()
+
+        first = await puller.run_pull(trigger="manual")
+        assert first.state is RunState.OK
+        assert events == ["started", "finished"]
+
+        events.clear()
+        second = await puller.run_pull(trigger="manual")
+
+        assert second.state is RunState.IDLE
+        assert events == [], f"an idle window announced {events}"
+
     async def test_disabled_does_nothing_at_all(self, db_session, unit):
         from app.ingest.models import RunState
         from app.ingest.puller import run_pull

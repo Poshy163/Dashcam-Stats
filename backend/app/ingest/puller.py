@@ -359,16 +359,18 @@ async def run_pull(*, trigger: str = "auto") -> RunResult:
         if result.seconds <= 0:
             result.seconds = time.monotonic() - started
         status.finish(result)
-        # A run that found nothing to do, or found no car, is not history. Recording those
-        # would put a row in the table every time the engine started, and bury the
-        # transfers anyone actually wants to look at.
-        if result.state not in (RunState.IDLE, RunState.OFFLINE) or result.error:
+        # A run that found nothing to do, or found no car, is not an event. Recording and
+        # announcing those would put a row in the table and a notification on somebody's
+        # phone every single time the engine started -- and, because anything that is not
+        # OK reports as an error, it would call "nothing new to copy" a failure. The live
+        # state is on /api/ingest/status for anyone who wants to look.
+        if result.state not in (RunState.IDLE, RunState.OFFLINE):
             with contextlib.suppress(Exception):
                 await _persist(result, trigger)
-        with contextlib.suppress(Exception):
-            await report_event(
-                "finished" if result.state is RunState.OK else "error", result=result
-            )
+            with contextlib.suppress(Exception):
+                await report_event(
+                    "finished" if result.state is RunState.OK else "error", result=result
+                )
 
     return result
 

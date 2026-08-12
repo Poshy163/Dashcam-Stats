@@ -1,0 +1,123 @@
+# Dashcam backup -> phone notification.
+#
+# Replace `notify.mobile_app_joshua_s_iphone` and the webhook id with your own. The
+# webhook id here is a placeholder shape, not a real one.
+#
+# The app POSTs on `started`, `finished` and `error` only. A window where the car arrives
+# with nothing new to copy sends nothing at all, so this does not fire every time the
+# engine starts.
+#
+# Fields available on `trigger.json`:
+#   event           started | finished | error
+#   state           ok | partial | error | cancelled | unauthorized | running
+#   files, bytes    what this run moved (on `started`, what it intends to move)
+#   throughput      MB/s          (finished/error only)
+#   duration_s      seconds       (finished/error only)
+#   error           text or null  (finished/error only)
+#   backlog_files, backlog_bytes  still sitting on the camera
+#   files_total, files_done, bytes_total, bytes_done, current_file, unit_online
+#
+# `.get(...)` throughout because `started` carries no throughput/duration/error.
+
+alias: Dashcam backup
+description: Notify when the car's footage is copied off the dashcam.
+
+triggers:
+  - trigger: webhook
+    webhook_id: REPLACE_WITH_YOUR_WEBHOOK_ID
+    # POST only. Leaving GET/HEAD enabled means anything that touches the URL — a browser,
+    # a link preview, a scanner — fires this with no JSON body and every template below
+    # blows up on a missing `trigger.json`.
+    allowed_methods:
+      - POST
+    local_only: true
+
+conditions: []
+
+# Queued, not single: `started` and `finished` can land within seconds of each other on a
+# small transfer, and `single` would silently drop the second one.
+mode: queued
+max: 10
+
+actions:
+  - choose:
+      # ---------------------------------------------------------------- started
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.json.event == 'started' }}"
+        sequence:
+          - action: notify.mobile_app_joshua_s_iphone
+            data:
+              title: Dashcam backup started
+              message: >-
+                {{ trigger.json.get('files', 0) }} file{{ '' if
+                trigger.json.get('files', 0) == 1 else 's' }} ·
+                {{ (trigger.json.get('bytes', 0) / 1073741824) | round(2) }} GB
+              data:
+                # Same tag on all three, so the finish notification *replaces* this one
+                # rather than leaving a stale "started" sitting on the lock screen.
+                tag: dashcam-backup
+                group: dashcam-backup
+                push:
+                  interruption-level: passive
+
+      # --------------------------------------------------------------- finished
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.json.event == 'finished' }}"
+        sequence:
+          - action: notify.mobile_app_joshua_s_iphone
+            data:
+              title: Dashcam backup complete
+              message: >-
+                {{ trigger.json.get('files', 0) }} file{{ '' if
+                trigger.json.get('files', 0) == 1 else 's' }} ·
+                {{ (trigger.json.get('bytes', 0) / 1073741824) | round(2) }} GB ·
+                {{ trigger.json.get('throughput', 0) | round(1) }} MB/s
+                in {{ trigger.json.get('duration_s', 0) | round(0) | int }}s
+                {%- if trigger.json.get('backlog_files', 0) > 0 %}
+                · {{ trigger.json.backlog_files }} still on the camera
+                {%- endif %}
+              data:
+                tag: dashcam-backup
+                group: dashcam-backup
+                push:
+                  interruption-level: active
+
+      # ------------------------------------------------------------------ error
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.json.event == 'error' }}"
+        sequence:
+          - action: notify.mobile_app_joshua_s_iphone
+            data:
+              # `partial` is the ordinary ending when the car pulls away mid-transfer, so
+              # it is worth distinguishing from something actually being wrong: whatever
+              # arrived whole was kept, and the rest resumes next time.
+              title: >-
+                {% if trigger.json.get('state') == 'partial' %}
+                Dashcam backup interrupted
+                {% elif trigger.json.get('state') == 'unauthorized' %}
+                Dashcam not authorised
+                {% elif trigger.json.get('state') == 'cancelled' %}
+                Dashcam backup cancelled
+                {% else %}
+                Dashcam backup failed
+                {% endif %}
+              message: >-
+                {%- if trigger.json.get('state') == 'partial' -%}
+                Kept {{ trigger.json.get('files', 0) }} file{{ '' if
+                trigger.json.get('files', 0) == 1 else 's' }} ·
+                {{ trigger.json.get('backlog_files', 0) }} still to copy
+                {%- elif trigger.json.get('state') == 'unauthorized' -%}
+                Accept the debugging prompt on the dashcam screen.
+                {%- else -%}
+                {{ trigger.json.get('error') or 'No detail reported.' }}
+                {%- endif -%}
+              data:
+                tag: dashcam-backup
+                group: dashcam-backup
+                push:
+                  interruption-level: >-
+                    {{ 'passive' if trigger.json.get('state') in ['partial', 'cancelled']
+                       else 'time-sensitive' }}
