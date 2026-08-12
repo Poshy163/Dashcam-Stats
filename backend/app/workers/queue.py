@@ -120,11 +120,19 @@ async def enqueue(
             # A job already RUNNING is left alone -- cancelling it would throw away work
             # in progress, and `claim_next` will not let the replacement start until it
             # has finished.
+            # FAILED as well as QUEUED.
+            #
+            # Superseding only the queued job left every previous failure sitting in the
+            # table for good, and `stats` counts by state -- so one recording showed up as
+            # both "failed" and "queued" at once, and the failure count on the queue page
+            # never came down no matter how many times the library was reprocessed. Those
+            # rows describe an attempt that has just been explicitly replaced; they are
+            # history, and history is what `result` and the logs are for.
             await session.execute(
                 update(ProcessingJob)
                 .where(
                     ProcessingJob.recording_id == recording_id,
-                    ProcessingJob.state == JobState.QUEUED,
+                    ProcessingJob.state.in_([JobState.QUEUED, JobState.FAILED]),
                 )
                 .values(
                     state=JobState.CANCELLED,
@@ -410,6 +418,15 @@ async def fail(
         delay = _BACKOFF_S[min(max(0, job.attempts - 1), len(_BACKOFF_S) - 1)]
         job.state = JobState.QUEUED
         job.not_before = datetime.now(UTC) + timedelta(seconds=delay)
+        # A job waiting for another go is not a job that is failing. Keeping the last
+        # attempt's text in `error_message` put a decoder abort from yesterday next to a
+        # `queued` badge on every row of the queue page -- reading as a live fault on work
+        # that has not been tried yet, and staying there for as long as the backlog took.
+        # `claim_next` clears the same field on the *recording* for exactly this reason.
+        # The text is kept where history belongs, and the attempt counter already says
+        # that something went wrong before.
+        job.result = {**(job.result or {}), "last_error": message[:2000]}
+        job.error_message = None
         log.info(
             "job will retry",
             job_id=job.id,

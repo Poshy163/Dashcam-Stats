@@ -522,3 +522,80 @@ class TestOldestFootageIsProcessedFirst:
                 await queue.complete(session, job)
 
         assert order == [dated_id, undated_id]
+
+
+class TestTheQueuePageDoesNotShowStaleFailures:
+    """Two ways the queue page kept reporting faults that were already dealt with."""
+
+    async def test_a_requeued_job_stops_advertising_the_previous_error(self, recording_id):
+        """`queued 2/4` with a decoder abort beside it reads as a live fault.
+
+        It is not: the job has not been tried again yet. The text stayed on the row for as
+        long as the backlog took to reach it, and `claim_next` already clears the same
+        field on the recording for exactly this reason.
+        """
+        async with session_scope() as session:
+            await queue.enqueue(session, recording_id)
+        async with session_scope() as session:
+            job = await queue.claim_next(session, "w1")
+            await queue.fail(session, job, "ffprobe produced no output (return code -6)")
+            job_id = job.id
+
+        async with session_scope() as session:
+            stored = await session.get(ProcessingJob, job_id)
+            assert stored.state is JobState.QUEUED
+            assert stored.error_message is None, (
+                "a job waiting for another attempt still displayed the last failure"
+            )
+            # Kept where history belongs, so nothing is actually lost.
+            assert "ffprobe produced no output" in (stored.result or {})["last_error"]
+
+    async def test_a_terminal_failure_still_says_why(self, recording_id):
+        """Clearing the retry text must not silence a job that has actually given up."""
+        async with session_scope() as session:
+            await queue.enqueue(session, recording_id)
+
+        job_id = None
+        for _ in range(6):
+            async with session_scope() as session:
+                job = await queue.claim_next(session, "w1")
+                if job is None:
+                    break
+                job_id = job.id
+                await queue.fail(session, job, "decode failed for good")
+                job.not_before = None
+
+        async with session_scope() as session:
+            stored = await session.get(ProcessingJob, job_id)
+        assert stored.state is JobState.FAILED
+        assert stored.error_message == "decode failed for good"
+
+    async def test_reprocessing_supersedes_the_old_failure_row(self, recording_id):
+        """One recording used to count as both 'failed' and 'queued' at the same time.
+
+        `enqueue(force=True)` -- what a bulk reprocess uses -- superseded only the queued
+        job, so every previous failure stayed in the table and the failure count on the
+        queue page never came down however many times the library was reprocessed.
+        """
+        async with session_scope() as session:
+            await queue.enqueue(session, recording_id)
+        async with session_scope() as session:
+            job = await queue.claim_next(session, "w1")
+            await queue.fail(session, job, "ffprobe produced no output", permanent=True)
+            failed_id = job.id
+
+        async with session_scope() as session:
+            stats = await queue.stats(session)
+        assert stats["failed"] == 1
+
+        # The user presses "reprocess".
+        async with session_scope() as session:
+            await queue.enqueue(session, recording_id, force=True)
+
+        async with session_scope() as session:
+            stats = await queue.stats(session)
+            superseded = await session.get(ProcessingJob, failed_id)
+
+        assert superseded.state is JobState.CANCELLED
+        assert stats["failed"] == 0, "the old failure survived an explicit reprocess"
+        assert stats["queued"] == 1
