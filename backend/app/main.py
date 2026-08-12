@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 from starlette.responses import Response
 
+from app.ai.runtime import describe_media_policy
 from app.api.errors import install_error_handlers
 from app.api.routes import content, heatmap, media, osd_debug, system
 from app.api.schemas import HealthOut
@@ -28,6 +29,7 @@ from app.config import get_config
 from app.core.logging import configure_logging, get_logger, install_db_sink, shutdown_db_sink
 from app.core.settings_service import get_settings_service, init_settings_service
 from app.db.session import dispose_engine, get_session_factory, init_db
+from app.hardware.ffmpeg import media_health
 from app.pipeline.stages import warm_models
 from app.workers import queue
 from app.workers.scheduler import get_scheduler
@@ -186,9 +188,19 @@ def create_app() -> FastAPI:
         # The scanner reports mount availability without making UI liveness depend on the
         # storage server answering this request.
 
+        # The Intel media slot, which is degraded rather than fatal on purpose. A stuck
+        # ffmpeg child stops hardware decode and GPU inference but not the queue, and
+        # returning 503 here would have Docker restart a container that is still working --
+        # which is the loop this whole area exists to get out of.
+        media = media_health()
+        detail["media"] = media
+        detail["policy"] = describe_media_policy()
+
         components = {"database": database, "scanner": scanner, "worker": worker}
         unhealthy = [k for k, v in components.items() if v != "healthy"]
         status_text = "healthy" if not unhealthy else "degraded"
+        if media.get("status") != "healthy" and status_text == "healthy":
+            status_text = "degraded"
         if database == "unhealthy":
             status_text = "unhealthy"
 

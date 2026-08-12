@@ -14,6 +14,7 @@ Cost discipline, which is what makes this viable over terabytes:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -61,6 +62,7 @@ from app.hardware.ffmpeg import (
     ProbeError,
     extract_frame,
     intel_media_lock,
+    is_infrastructure_failure,
     iter_frames,
     probe,
 )
@@ -90,12 +92,6 @@ _templates_cache: GlyphTemplates | None = None
 #: Generous enough to absorb a camera whose clock drifts by a few minutes, tight enough
 #: that a mangled hour or day digit is caught.
 _MAX_OSD_FILENAME_DRIFT_S = 15 * 60
-
-# Decode a short VAAPI window completely, close it, then run GPU inference on the buffered
-# frames. Alder Lake cannot reliably execute VAAPI and OpenVINO together; buffering the
-# entire two-minute clip would cost ~1.5 GB, while ten seconds is about 120 MB at 2 fps.
-_DETECTION_DECODE_CHUNK_S = 10.0
-
 
 #: Why no stage writes ``journey_id`` on the rows it inserts.
 #:
@@ -317,12 +313,19 @@ async def _choose_thumbnail(
     codec: str | None,
     width: int,
     quality: int,
-) -> bool:
+) -> tuple[bool, bool]:
     """Write the best thumbnail the file can offer, or none at all.
 
     Several offsets are tried rather than one. A single fixed seek lands on a broken
     frame often enough in damaged footage, and the first few seconds of any clip are the
     most likely to be mid-GOP after a truncated write.
+
+    Returns ``(written, conclusive)``. ``conclusive`` is False when the decodes were
+    defeated by the machine rather than by the file -- an aborted FFmpeg, a busy or
+    unhealthy media device -- and it is the difference between "this recording is damaged"
+    and "this host was". Recording 801 on the live library was a perfectly good sixty
+    seconds of footage that got the first answer during an iGPU crash loop, was hidden, and
+    then became invisible to the queue that would otherwise have retried it.
     """
     span = duration_s or 4.0
     # Spread across the clip, with the start second rather than last.
@@ -337,11 +340,18 @@ async def _choose_thumbnail(
 
     best_frame: np.ndarray | None = None
     best_score = 0.0
+    machine_failed = False
+
+    def note_failure(exc: FFmpegError) -> None:
+        nonlocal machine_failed
+        if is_infrastructure_failure(exc):
+            machine_failed = True
 
     for offset in candidates:
         try:
-            frame = await extract_frame(source, offset, codec=codec)
-        except FFmpegError:
+            frame = await extract_frame(source, offset, codec=codec, on_error=note_failure)
+        except FFmpegError as exc:
+            note_failure(exc)
             continue
         if frame is None:
             continue
@@ -353,7 +363,7 @@ async def _choose_thumbnail(
             break
 
     if best_frame is None or best_score <= 0.0:
-        return False
+        return False, not machine_failed
 
     scale = width / best_frame.shape[1]
     if 0 < scale < 1:
@@ -362,7 +372,7 @@ async def _choose_thumbnail(
         xs = (np.arange(width) / scale).astype(np.int32).clip(0, best_frame.shape[1] - 1)
         best_frame = best_frame[ys][:, xs]
 
-    return _save_jpeg(best_frame, target, quality) is not None
+    return _save_jpeg(best_frame, target, quality) is not None, True
 
 
 # --------------------------------------------------------------------------------------
@@ -475,7 +485,7 @@ async def stage_inspect(
     source_unusable = False
     if not recording.thumbnail_path:
         thumb = _media_path("thumbnails", f"{recording.id:08d}.jpg")
-        chosen = await _choose_thumbnail(
+        chosen, conclusive = await _choose_thumbnail(
             path,
             thumb,
             duration_s=info.duration_s,
@@ -485,13 +495,22 @@ async def stage_inspect(
         )
         if chosen:
             recording.thumbnail_path = relative_to_media(thumb)
-        else:
+        elif conclusive:
             # No frame in the file decoded to a usable picture. Saying so is more useful
             # than a green rectangle that looks like the application misbehaved.
             info.warnings.append(
                 "no usable frame could be decoded; the source file appears to be damaged"
             )
             source_unusable = True
+        else:
+            # The decodes were killed by the media stack, not refused by the file. This is
+            # retryable and must never reach `source_unusable`, which the damaged-footage
+            # policy turns into a permanent hide -- and a hidden recording is skipped by
+            # `claim_next`, so it would never be looked at again.
+            raise StageError(
+                f"could not decode a thumbnail for {recording.filename}: the media stack "
+                "is failing, so the recording has not been judged"
+            )
 
     recording.probe_json = {
         "warnings": info.warnings,
@@ -1018,49 +1037,34 @@ async def stage_detect(
             progress("detection", min(0.95, offset / duration))
 
     try:
-        hardware = await settings.hardware_acceleration()
-        decode_mode = "auto" if hardware else "cpu"
+        decode_mode = "auto" if await settings.hardware_acceleration() else "cpu"
         geometry = (
             (recording.width, recording.height) if recording.width and recording.height else None
         )
-        gpu_inference = "GPU" in (detector.device or "").upper()
-        if hardware and gpu_inference and duration <= 0:
-            # Without a duration there is no safe bounded point at which to close VAAPI
-            # before inference. Software decode does not use the Intel media slot, so the
-            # streaming fallback remains deadlock-free and preserves GPU detection.
-            decode_mode = "cpu"
-        if hardware and gpu_inference and duration > 0:
-            chunk_start = 0.0
-            while chunk_start < duration:
-                chunk_duration = min(_DETECTION_DECODE_CHUNK_S, duration - chunk_start)
-                batch = [
-                    item
-                    async for item in iter_frames(
-                        path,
-                        fps=sample_fps,
-                        frame_size=geometry,
-                        start=chunk_start,
-                        duration=chunk_duration,
-                        hwaccel=decode_mode,
-                        codec=recording.video_codec,
-                        on_decoder=note_decoder,
-                    )
-                ]
-                # `iter_frames` has now closed ffmpeg and released the Intel media slot.
-                # ObjectDetector takes the same slot for each GPU request, so another
-                # worker cannot open VAAPI underneath this inference pass.
-                for offset, frame in batch:
-                    await analyse_frame(offset, frame)
-                chunk_start += chunk_duration
-        else:
-            async for offset, frame in iter_frames(
+        # Streamed, not buffered in chunks.
+        #
+        # This stage used to decode ten seconds at a time, close ffmpeg, then infer on the
+        # buffered frames, because VAAPI and OpenVINO cannot both hold this iGPU. That
+        # time-slicing is gone because the premise is: `select_hwaccel` now resolves every
+        # decode in the process to software while inference owns the GPU, so there is no
+        # VAAPI reader to keep away from. Chunking only bought seeks -- six ffmpeg launches
+        # for a one-minute clip -- and it never covered the other stages that decode.
+        # `aclosing` because this task is cancellable: the Cancel button and the heartbeat
+        # both stop a running job by cancelling it, and an `async for` does not close its
+        # iterator when an exception unwinds through it any more than when the body breaks.
+        # Without this the decoder is abandoned with its ffmpeg child alive, and the Intel
+        # media slot stays shut until the garbage collector gets to it.
+        async with contextlib.aclosing(
+            iter_frames(
                 path,
                 fps=sample_fps,
                 frame_size=geometry,
                 hwaccel=decode_mode,
                 codec=recording.video_codec,
                 on_decoder=note_decoder,
-            ):
+            )
+        ) as frames:
+            async for offset, frame in frames:
                 await analyse_frame(offset, frame)
     except DecodeError as exc:
         # Partial results from a damaged file are still worth keeping.
@@ -1425,21 +1429,27 @@ async def stage_plates(
                 # fallback away from Uvicorn's event loop.
                 footage_path = await asyncio.to_thread(resolve_footage_path, recording.rel_path)
             try:
-                async for _, decoded in iter_frames(
-                    footage_path,
-                    start=track.best_frame_offset_s,
-                    duration=0.5,
-                    fps=None,
-                    frame_size=(recording.width, recording.height)
-                    if recording.width and recording.height
-                    else None,
-                    hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
-                    codec=recording.video_codec,
-                    timeout=_PLATE_FRAME_SEEK_TIMEOUT_S,
-                    on_decoder=decoders_used.add,
-                ):
-                    frame = decoded
-                    break
+                # Closed rather than abandoned: this breaks after one frame, and an
+                # abandoned decoder keeps its ffmpeg child -- and the Intel media slot it
+                # sits behind -- alive until the event loop finalises the generator.
+                async with contextlib.aclosing(
+                    iter_frames(
+                        footage_path,
+                        start=track.best_frame_offset_s,
+                        duration=0.5,
+                        fps=None,
+                        frame_size=(recording.width, recording.height)
+                        if recording.width and recording.height
+                        else None,
+                        hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
+                        codec=recording.video_codec,
+                        timeout=_PLATE_FRAME_SEEK_TIMEOUT_S,
+                        on_decoder=decoders_used.add,
+                    )
+                ) as seek:
+                    async for _, decoded in seek:
+                        frame = decoded
+                        break
             except FFmpegError:
                 pass
             if frame is not None:

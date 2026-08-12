@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 
 from app.ai.models import describe_models, is_present
-from app.ai.runtime import describe_runtime
+from app.ai.runtime import describe_media_policy, describe_runtime
 from app.api.deps import PaginationDep, RowIdFilter, SessionDep
 from app.api.schemas import (
     FeatureStatus,
@@ -263,6 +263,10 @@ async def get_status(session: SessionDep):
     hardware = await detect_hardware_async()
     hardware_dict = hardware.as_dict()
     hardware_dict["inference"]["backend_name"] = describe_runtime().get("using")
+    # What the two consumers of the iGPU are actually doing, as opposed to what the chip
+    # can do. "Decoder: software" beside a working VAAPI device is the intended state
+    # whenever inference holds the GPU, and this is what says so.
+    hardware_dict["policy"] = describe_media_policy()
 
     return StatusOut(
         totals=totals,
@@ -558,6 +562,7 @@ async def system_hardware():
     # the OpenVINO devices probed above: those describe the hardware, this describes where
     # inference is really scheduled.
     data["inference"]["onnx"] = describe_runtime()
+    data["policy"] = describe_media_policy()
     data["models"] = describe_models()
     return data
 

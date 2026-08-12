@@ -93,13 +93,199 @@ _HWACCEL_REFUSED_MAX = 512
 _hwaccel_proven: set[str] = set()
 _HWACCEL_PROVEN_MAX = 512
 
+#: How long a media child is given to exit before it is left to a background reaper.
+#:
+#: A process in uninterruptible network-filesystem I/O cannot honour SIGKILL until the
+#: kernel call returns, so cleanup of that child must never pin the application. What it
+#: must also never do -- and what the previous version did -- is report the Intel media
+#: slot free anyway.
+PROCESS_EXIT_GRACE_S = 2.0
+
+#: How long a new acquirer waits for a previous holder's straggling child before the slot
+#: is reported unhealthy.
+#:
+#: Deliberately far longer than the grace above. By this point the only thing left to wait
+#: for is a kernel call returning, and starting VAAPI or OpenVINO regardless is exactly
+#: what poisons the driver: the live deployment handed the slot to an OpenVINO request
+#: while a killed-but-alive VAAPI child still held iHD resources, and the next OpenCL call
+#: came back ``CL_OUT_OF_RESOURCES`` and then aborted the process from
+#: ``drm_buffer_object.cpp``.
+MEDIA_SETTLE_TIMEOUT_S = 30.0
+
+
+@dataclass(slots=True)
+class _MediaChild:
+    """One live ffmpeg/ffprobe process, tracked for as long as it can hold the iGPU."""
+
+    pid: int
+    what: str
+    #: Whether this child occupies the shared slot. Software decodes run outside it and
+    #: must not make a second worker wait, or two workers would behave as one again.
+    gated: bool
+    exited: asyncio.Event
+    gate: MediaGate
+
+
+class MediaGate:
+    """The one process-wide slot for work that touches the Intel media stack.
+
+    A plain :class:`asyncio.Lock` was not enough, and the way it failed is worth writing
+    down because it is not visible in the code that uses it. ``iter_frames`` holds the slot
+    around a *nested* async generator, and Python does not close an async generator when
+    its consumer stops iterating early -- ``extract_frame`` returning after one frame, or
+    the plates stage breaking out of its seek. The inner generator is abandoned rather than
+    closed, and finalised later by the event loop's asyncgen hook, so the ``finally`` that
+    kills ffmpeg runs *after* the ``async with`` that released the slot.
+
+    Measured against this module before the change: on the thumbnail path the slot was
+    handed to OpenVINO while the VAAPI child was still running and had not yet even been
+    signalled. That is one process away from the ``CL_OUT_OF_RESOURCES`` and native abort
+    the deployment crash-loops on, and it happens on every recording rather than in a race.
+
+    So the slot is not the lock. The slot is the lock *and* the set of media children still
+    alive, and it is free only when both are.
+    """
+
+    __slots__ = ("_children", "_lock", "_reapers", "_unhealthy")
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._children: dict[int, _MediaChild] = {}
+        self._reapers: set[asyncio.Task[None]] = set()
+        self._unhealthy: str | None = None
+
+    def locked(self) -> bool:
+        """Whether someone holds the slot. Used to report waiting to the queue page."""
+        return self._lock.locked()
+
+    @property
+    def unhealthy(self) -> str | None:
+        """Why the slot cannot be trusted, or None while it is sound."""
+        return self._unhealthy
+
+    def live_children(self) -> list[dict[str, object]]:
+        """Diagnostics: what is still holding the slot, for /health and /api/status."""
+        return [
+            {"pid": child.pid, "what": child.what, "gated": child.gated}
+            for child in self._children.values()
+        ]
+
+    def register(self, proc: object, what: str, *, gated: bool) -> _MediaChild:
+        """Track *proc* from launch until its exit is confirmed."""
+        child = _MediaChild(
+            pid=int(getattr(proc, "pid", -1) or -1),
+            what=what,
+            gated=gated,
+            exited=asyncio.Event(),
+            gate=self,
+        )
+        # Keyed by identity rather than pid: pids are recycled, and a test double may not
+        # trouble itself to invent a unique one.
+        self._children[id(child)] = child
+        return child
+
+    def retire(self, child: _MediaChild) -> None:
+        """Record that a child has genuinely exited."""
+        child.exited.set()
+        self._children.pop(id(child), None)
+        if self._unhealthy and not any(item.gated for item in self._children.values()):
+            log.info(
+                "the Intel media slot recovered; every straggling child has exited",
+                previously=self._unhealthy,
+            )
+            self._unhealthy = None
+
+    def reap_later(self, proc: object, child: _MediaChild) -> None:
+        """Keep waiting for a child that outlived its caller's cleanup budget.
+
+        The gate stays closed against it in the meantime. This is the whole point: an
+        unreaped VAAPI process is precisely the state in which starting OpenVINO aborts
+        the container, so the correct response is to wait, not to press on.
+        """
+
+        async def reap() -> None:
+            try:
+                await proc.wait()  # type: ignore[attr-defined]
+            except Exception:
+                # A test double or a process reaped elsewhere. Either way, stop waiting:
+                # holding the slot shut forever on an unanswerable question is worse.
+                pass
+            finally:
+                self.retire(child)
+                log.info("a straggling media subprocess finally exited", pid=child.pid)
+
+        task = asyncio.create_task(reap(), name=f"media-reaper-{child.pid}")
+        self._reapers.add(task)
+        task.add_done_callback(self._reapers.discard)
+
+    async def settle(self) -> bool:
+        """Wait for previous holders' children, reporting whether the slot came good."""
+        pending = [
+            item for item in self._children.values() if item.gated and not item.exited.is_set()
+        ]
+        if not pending:
+            return True
+
+        log.info(
+            "waiting for an earlier media subprocess to exit before using the iGPU",
+            pids=[item.pid for item in pending],
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(item.exited.wait() for item in pending)),
+                timeout=MEDIA_SETTLE_TIMEOUT_S,
+            )
+        except TimeoutError:
+            self._unhealthy = (
+                f"{len(pending)} media subprocess(es) did not exit within "
+                f"{MEDIA_SETTLE_TIMEOUT_S:.0f}s: {', '.join(str(item.pid) for item in pending)}"
+            )
+            log.error(
+                "the Intel media slot is unhealthy; hardware decode and GPU inference "
+                "are suspended until the stuck subprocess exits",
+                pids=[item.pid for item in pending],
+                files=[item.what for item in pending],
+            )
+            return False
+        return True
+
+    def gpu_safe(self) -> bool:
+        """Whether it is safe to put GPU work on this chip right now.
+
+        Entering the slot is not the same as the slot being sound. ``settle`` gives up
+        after :data:`MEDIA_SETTLE_TIMEOUT_S` so that CPU-only work -- ffprobe, software
+        decode, the rest of the queue -- keeps moving when one child is wedged in an
+        uninterruptible kernel call. What must *not* keep moving is anything that touches
+        the iGPU, because a live unreaped media child is the documented precondition for
+        the driver abort. Callers that need the GPU ask this question first.
+        """
+        return self._unhealthy is None
+
+    async def __aenter__(self) -> MediaGate:
+        await self._lock.acquire()
+        try:
+            # The result is deliberately not fatal here. A caller that only needs a CPU
+            # process must still be able to run while a straggler is stuck, or one wedged
+            # NFS read would stop the whole queue. Callers that need the iGPU consult
+            # `gpu_safe()` instead -- see ObjectDetector.detect and select_hwaccel.
+            await self.settle()
+        except BaseException:
+            self._lock.release()
+            raise
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        self._lock.release()
+        return False
+
+
 # The Intel media driver on the deployment accepts one long-running VAAPI reader beside
 # OpenVINO, but a second reader fails during initialisation with ``HW busy``. Two pipeline
 # workers used to race here: one kept the iGPU and the other permanently condemned its file
 # to software decoding, pinning the CPU for every remaining stage. Coordinate VAAPI at the
-# process boundary instead. Locks are per event loop so isolated asyncio test loops never
-# inherit a lock bound by an earlier test.
-_vaapi_decode_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+# process boundary instead. Gates are per event loop so isolated asyncio test loops never
+# inherit one bound by an earlier test.
+_vaapi_decode_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, MediaGate] = (
     weakref.WeakKeyDictionary()
 )
 
@@ -115,18 +301,44 @@ _ffprobe_process_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asy
 )
 
 
-def _vaapi_decode_lock() -> asyncio.Lock:
+def _vaapi_decode_lock() -> MediaGate:
     loop = asyncio.get_running_loop()
-    lock = _vaapi_decode_locks.get(loop)
-    if lock is None:
-        lock = asyncio.Lock()
-        _vaapi_decode_locks[loop] = lock
-    return lock
+    gate = _vaapi_decode_locks.get(loop)
+    if gate is None:
+        gate = MediaGate()
+        _vaapi_decode_locks[loop] = gate
+    return gate
 
 
-def intel_media_lock() -> asyncio.Lock:
+def intel_media_lock() -> MediaGate:
     """One process slot shared by VAAPI, ffprobe and OpenVINO GPU inference."""
     return _vaapi_decode_lock()
+
+
+def media_gate_unhealthy() -> str | None:
+    """Why the Intel media slot is not currently trustworthy, or None.
+
+    Safe to call from anywhere, including outside the event loop: with no running loop
+    there is no gate and therefore nothing wrong with it.
+    """
+    try:
+        return _vaapi_decode_lock().unhealthy
+    except RuntimeError:
+        return None
+
+
+def media_health() -> dict[str, object]:
+    """The media slot's state, for the health endpoint and the hardware page."""
+    try:
+        gate = _vaapi_decode_lock()
+    except RuntimeError:
+        return {"status": "healthy", "reason": None, "live_children": []}
+    reason = gate.unhealthy
+    return {
+        "status": "unhealthy" if reason else "healthy",
+        "reason": reason,
+        "live_children": gate.live_children(),
+    }
 
 
 def _ffprobe_process_lock() -> asyncio.Lock:
@@ -140,9 +352,6 @@ def _ffprobe_process_lock() -> asyncio.Lock:
 
 DEFAULT_PROBE_TIMEOUT = 60.0
 DEFAULT_DECODE_TIMEOUT = 900.0
-#: A process in uninterruptible network-filesystem I/O cannot honour SIGKILL until the
-#: kernel call returns. Never let cleanup of that child pin the application indefinitely.
-PROCESS_EXIT_GRACE_S = 2.0
 
 
 class FFmpegError(RuntimeError):
@@ -278,25 +487,86 @@ def clear_probe_cache() -> None:
     _probe_failures.clear()
 
 
-async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
-    """Kill *proc* without waiting forever for a blocked NFS syscall to return."""
-    if proc.returncode is None:
+def _register_child(proc: object, what: str, *, gated: bool) -> _MediaChild | None:
+    """Track a freshly launched media process against the shared slot.
+
+    Returns None outside an event loop, which only happens in unit tests that drive these
+    helpers directly; there is no slot to protect there.
+    """
+    try:
+        return _vaapi_decode_lock().register(proc, what, gated=gated)
+    except RuntimeError:
+        return None
+
+
+async def _wait_for_exit(proc: asyncio.subprocess.Process, timeout: float) -> bool:
+    """Wait up to *timeout* for *proc*, reporting whether it actually exited.
+
+    Cancellation is caught rather than propagated. This runs from cleanup paths which are
+    themselves often unwinding a cancelled task -- the Cancel button, or the heartbeat
+    stopping a job -- and the caller still has to learn whether the child is gone before it
+    can say anything about the media slot. The original ``CancelledError`` continues to
+    propagate out of the ``finally`` that called this, so nothing is swallowed.
+    """
+    if proc.returncode is not None:
+        return True
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except (TimeoutError, asyncio.CancelledError):
+        return proc.returncode is not None
+    except Exception:
+        # Cleanup must not replace the useful probe/decode error the caller is raising.
+        return proc.returncode is not None
+    return True
+
+
+async def _close_child(
+    proc: asyncio.subprocess.Process,
+    child: _MediaChild | None,
+    *,
+    graceful: bool,
+) -> bool:
+    """End one media subprocess and keep the slot shut until it has really gone.
+
+    ``graceful`` separates the two endings that used to be treated as one. FFmpeg closing
+    its own stdout means it is already on its way out and merely needs reaping; the caller
+    walking away mid-stream means it has to be killed first. The old code killed
+    unconditionally, waited two seconds, logged, and then released the slot regardless --
+    which is how a live VAAPI child came to sit beside an OpenVINO request on the same iGPU.
+    """
+    if not graceful and proc.returncode is None:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=PROCESS_EXIT_GRACE_S)
-    except TimeoutError:
-        log.warning(
-            "subprocess did not exit after SIGKILL; leaving it for the child watcher",
-            pid=proc.pid,
-        )
-    except Exception:
-        # Cleanup must not replace the useful probe/decode error being raised by caller.
-        pass
+
+    exited = await _wait_for_exit(proc, PROCESS_EXIT_GRACE_S)
+    if not exited and graceful:
+        # It closed its output but has not finished. Escalate rather than wait forever.
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        exited = await _wait_for_exit(proc, PROCESS_EXIT_GRACE_S)
+
+    if child is None:
+        return exited
+    if exited:
+        child.gate.retire(child)
+        return True
+
+    log.warning(
+        "a media subprocess has not exited; the Intel media slot stays shut until it does",
+        pid=proc.pid,
+        file=child.what,
+    )
+    child.gate.reap_later(proc, child)
+    return False
+
+
+async def _terminate_process(proc: asyncio.subprocess.Process) -> bool:
+    """Kill *proc* without waiting forever for a blocked NFS syscall to return."""
+    return await _close_child(proc, None, graceful=False)
 
 
 async def _run_process(
-    cmd: list[str], timeout: float, stdin: bytes | None = None
+    cmd: list[str], timeout: float, stdin: bytes | None = None, *, gated: bool = False
 ) -> tuple[int, bytes, bytes]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -304,13 +574,18 @@ async def _run_process(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    child = _register_child(proc, Path(cmd[0]).name if cmd else "ffmpeg", gated=gated)
     try:
         out, err = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout)
     except TimeoutError:
         # SIGKILL cannot immediately release a process sleeping in an NFS kernel call, so
         # cleanup is bounded as well as the actual ffprobe/ffmpeg work.
-        await _terminate_process(proc)
+        await _close_child(proc, child, graceful=False)
         raise FFmpegError(f"timed out after {timeout:.0f}s: {' '.join(cmd[:3])}") from None
+    except BaseException:
+        await _close_child(proc, child, graceful=False)
+        raise
+    await _close_child(proc, child, graceful=True)
     return proc.returncode or 0, out, err
 
 
@@ -325,7 +600,15 @@ async def _run(
         # decode share the same process slot. Metadata already needs that slot for its
         # thumbnail immediately afterwards, making the wait effectively free.
         async with _vaapi_decode_lock(), _ffprobe_process_lock():
-            return await _run_process(cmd, timeout, stdin)
+            return await _run_process(cmd, timeout, stdin, gated=True)
+    if "-hwaccel" in cmd:
+        # An ffmpeg asked for the iGPU explicitly -- ``write_thumbnail`` is the one in this
+        # module -- and the executable-name test above never covered it, so it opened VAAPI
+        # with no slot at all. Long *software* invocations such as ``_measure_duration``
+        # stay outside: they hold nothing the driver cares about, and serialising a
+        # fifteen-minute decode behind this slot would stall every other worker.
+        async with _vaapi_decode_lock():
+            return await _run_process(cmd, timeout, stdin, gated=True)
     return await _run_process(cmd, timeout, stdin)
 
 
@@ -652,13 +935,49 @@ def _float_or_zero(value: Any) -> float:
 # --------------------------------------------------------------------------------------
 
 
+def software_decode_reason() -> str | None:
+    """Why hardware decode is withheld right now, or None when it is allowed.
+
+    This is the single place the deployment's resource policy is decided, and it is
+    deliberately *not* in the detection stage. Time-slicing decode and inference inside
+    ``stage_detect`` only ever covered that one stage: metadata thumbnails, telemetry
+    strips, the plates stage's compatibility seek and the OSD debug route all decode too,
+    and with two workers any of them could open VAAPI while the other worker's OpenVINO
+    request was on the iGPU. Alder/Raptor Lake will not do both, so whenever inference
+    holds the GPU every decode in the process resolves to software -- which is the cheap
+    half of the pair: H.264 at a few sampled frames a second costs far less than moving
+    RF-DETR off the iGPU.
+
+    Reported rather than silent, so ``Decoder: software`` reads as the intended policy on
+    the queue page instead of looking like a hardware failure.
+    """
+    unhealthy = media_gate_unhealthy()
+    if unhealthy:
+        return f"the Intel media slot is unhealthy ({unhealthy})"
+
+    try:
+        # Local import: the AI package imports this module for the media slot, so keeping
+        # the dependency inside the call avoids a cycle at import time.
+        from app.ai.openvino_session import gpu_inference_engaged
+
+        if gpu_inference_engaged():
+            return "inference is running on the Intel iGPU, which cannot also decode"
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        log.debug("could not resolve the inference device", error=str(exc))
+    return None
+
+
 def select_hwaccel(preference: str, codec: str | None) -> tuple[list[str], str]:
     """Choose input-side hardware acceleration flags.
 
     Returns ``(args, label)`` where the label is what the UI displays as the decoder in
-    use. Falls back to software whenever the requested path is not actually available.
+    use. Falls back to software whenever the requested path is not actually available, or
+    when the iGPU is already committed to inference -- see :func:`software_decode_reason`.
     """
     if preference == "cpu":
+        return [], "software"
+
+    if software_decode_reason() is not None:
         return [], "software"
 
     hw = detect_hardware()
@@ -790,6 +1109,7 @@ async def _decode_frames(
         stderr=asyncio.subprocess.PIPE,
     )
     assert proc.stdout is not None
+    child = _register_child(proc, Path(path).name, gated=label != "software")
 
     stderr_chunks: list[bytes] = []
 
@@ -804,12 +1124,18 @@ async def _decode_frames(
     index = 0
     step = 1.0 / fps if fps else None
     base = start or 0.0
+    #: Whether ffmpeg ended the stream itself, as opposed to the consumer walking away.
+    #: The distinction is the whole reason this decode can be closed safely: on a clean end
+    #: the process is already exiting and only needs reaping, while an abandoned generator
+    #: leaves a live child that has to be killed *and waited for* before the slot is free.
+    finished = False
 
     try:
         while True:
             try:
                 buf = await asyncio.wait_for(proc.stdout.readexactly(frame_bytes), timeout=timeout)
             except asyncio.IncompleteReadError:
+                finished = True
                 break
             except TimeoutError:
                 raise DecodeError(
@@ -822,11 +1148,17 @@ async def _decode_frames(
             yield offset, frame
             index += 1
     finally:
-        await _terminate_process(proc)
+        # Drain first on a clean end: ffmpeg has closed stdout, so its stderr is complete
+        # and this is the only chance to read the diagnostics the caller reports. On an
+        # abandoned generator the child is still writing, so cancel instead of hanging.
+        if finished:
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError, Exception):
+                await asyncio.wait_for(drainer, timeout=PROCESS_EXIT_GRACE_S)
         if not drainer.done():
             drainer.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await drainer
+        await _close_child(proc, child, graceful=finished)
 
     stderr = b"".join(stderr_chunks).decode("utf-8", "replace")
     if index == 0:
@@ -918,12 +1250,24 @@ async def iter_frames(
             async with guard:
                 if waited_for_decoder and on_decoder:
                     on_decoder(label)
-                async for item in _decode_frames(path, hwaccel=hwaccel, **kwargs):
-                    yielded += 1
-                    if yielded == 1 and label != "software":
-                        # This file and this GPU demonstrably work together. Remember it.
-                        _remember_hwaccel_success(path)
-                    yield item
+                # `aclosing` is what makes the slot safe to release, and it is not
+                # decoration. A consumer that stops early -- ``extract_frame`` taking one
+                # frame, the plates stage breaking out of its seek -- *abandons* this inner
+                # generator rather than closing it, because `async for` does not close what
+                # it iterates. Its ``finally``, which is what kills ffmpeg, then runs
+                # whenever the event loop's asyncgen hook gets round to it: after the
+                # ``async with`` below has already handed the iGPU to OpenVINO. Closing it
+                # here puts the child's death back inside the critical section where the
+                # rest of this function assumes it always was.
+                async with contextlib.aclosing(
+                    _decode_frames(path, hwaccel=hwaccel, **kwargs)
+                ) as frames:
+                    async for item in frames:
+                        yielded += 1
+                        if yielded == 1 and label != "software":
+                            # This file and this GPU demonstrably work together. Remember it.
+                            _remember_hwaccel_success(path)
+                        yield item
             return
         except FFmpegError as exc:
             # Retrying is only safe before anything reached the caller; mid-stream the
@@ -985,8 +1329,9 @@ async def iter_frames(
 
     if on_decoder:
         on_decoder("software")
-    async for item in _decode_frames(path, hwaccel="cpu", **kwargs):
-        yield item
+    async with contextlib.aclosing(_decode_frames(path, hwaccel="cpu", **kwargs)) as frames:
+        async for item in frames:
+            yield item
 
 
 #: Words that mean the decoder or the device gave up, as opposed to an empty window.
@@ -1014,6 +1359,26 @@ _TRANSIENT_HWACCEL_MARKERS = (
 def _is_transient_hwaccel_failure(exc: FFmpegError) -> bool:
     stderr = (getattr(exc, "stderr", "") or "").lower()
     return any(marker in stderr for marker in _TRANSIENT_HWACCEL_MARKERS)
+
+
+def is_infrastructure_failure(exc: FFmpegError) -> bool:
+    """True when a media failure was the machine's fault rather than the file's.
+
+    The distinction is not academic. A negative return code means the tool was killed by a
+    signal, and ``-6`` is the SIGABRT this deployment's FFmpeg raises from inside the Intel
+    media stack -- on valid footage, while the driver is unwell. Treating that as evidence
+    about the bytes is how one recording in this library was classified unusable, hidden,
+    and thereby removed from the queue's own candidate set: ``claim_next`` skips ignored
+    recordings, so nothing would ever have looked at it again.
+    """
+    returncode = getattr(exc, "returncode", None)
+    if returncode is not None and returncode < 0:
+        return True
+    if _is_transient_hwaccel_failure(exc):
+        return True
+    if "timed out after" in str(exc):
+        return True
+    return media_gate_unhealthy() is not None
 
 
 def _is_empty_window(exc: FFmpegError) -> bool:
@@ -1055,16 +1420,33 @@ def _remember_hwaccel_failure(path: Path | str) -> None:
 
 
 async def extract_frame(
-    path: Path | str, t: float, *, hwaccel: str = "auto", codec: str | None = None
+    path: Path | str,
+    t: float,
+    *,
+    hwaccel: str = "auto",
+    codec: str | None = None,
+    on_error: Callable[[FFmpegError], None] | None = None,
 ) -> np.ndarray | None:
-    """Single BGR frame at *t*, or None when it cannot be decoded."""
+    """Single BGR frame at *t*, or None when it cannot be decoded.
+
+    ``on_error`` receives the failure rather than only the absence of a frame. The caller
+    that chooses a thumbnail needs the difference: a file whose every offset decodes to
+    nothing is damaged, whereas a file whose decodes were killed by an aborting media stack
+    is fine and the *machine* is not. Without that distinction one driver crash marked a
+    perfectly good recording unusable and hid it from the library.
+    """
     try:
-        async for _, frame in iter_frames(
-            path, start=t, duration=0.5, fps=None, hwaccel=hwaccel, codec=codec
-        ):
-            return frame
+        # Closed explicitly rather than abandoned: this returns from inside the loop, and
+        # the generator holds the Intel media slot until it is finalised.
+        async with contextlib.aclosing(
+            iter_frames(path, start=t, duration=0.5, fps=None, hwaccel=hwaccel, codec=codec)
+        ) as frames:
+            async for _, frame in frames:
+                return frame
     except (DecodeError, FFmpegError) as exc:
         log.debug("frame extraction failed", file=Path(path).name, t=t, error=str(exc))
+        if on_error is not None:
+            on_error(exc)
     return None
 
 

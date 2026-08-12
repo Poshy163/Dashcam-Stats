@@ -15,6 +15,7 @@ Two derivations happen here that the dashcam does not provide:
 
 from __future__ import annotations
 
+import contextlib
 import math
 import statistics
 from collections.abc import Callable
@@ -177,10 +178,11 @@ class TelemetryExtractor:
             if expected is None:
                 continue
             try:
-                async for _, frame in self._iter_strips(
-                    path, region, fps=sample_fps, limit=frames_per_recording
-                ):
-                    learner.observe_strip(binarise(frame), expected)
+                async with contextlib.aclosing(
+                    self._iter_strips(path, region, fps=sample_fps, limit=frames_per_recording)
+                ) as strips:
+                    async for _, frame in strips:
+                        learner.observe_strip(binarise(frame), expected)
                 used += 1
             except (FFmpegError, OSError) as exc:
                 log.debug("skipped during template learning", file=path.name, error=str(exc))
@@ -198,8 +200,11 @@ class TelemetryExtractor:
         structural = TemplateLearner()
         for path in recordings[:5]:
             try:
-                async for _, frame in self._iter_strips(path, region, fps=sample_fps, limit=6):
-                    learn_structural(structural, templates, binarise(frame))
+                async with contextlib.aclosing(
+                    self._iter_strips(path, region, fps=sample_fps, limit=6)
+                ) as strips:
+                    async for _, frame in strips:
+                        learn_structural(structural, templates, binarise(frame))
             except (FFmpegError, OSError):
                 continue
         templates = merge_templates(templates, structural.build(min_samples=1))
@@ -232,18 +237,25 @@ class TelemetryExtractor:
             width, height = info.width or 1920, info.height or 1080
         crop = region.to_crop(width, height)
         count = 0
-        async for offset, frame in iter_frames(
-            path,
-            fps=fps,
-            crop=crop,
-            grayscale=True,
-            hwaccel=hwaccel,
-            on_decoder=on_decoder,
-        ):
-            yield offset, frame
-            count += 1
-            if limit is not None and count >= limit:
-                return
+        # `aclosing`, because `limit` makes this return mid-stream and because every
+        # consumer of this generator may itself stop early. An abandoned decoder holds its
+        # ffmpeg child, and therefore the Intel media slot, until the event loop gets round
+        # to finalising it -- which on this hardware means beside an OpenVINO request.
+        async with contextlib.aclosing(
+            iter_frames(
+                path,
+                fps=fps,
+                crop=crop,
+                grayscale=True,
+                hwaccel=hwaccel,
+                on_decoder=on_decoder,
+            )
+        ) as frames:
+            async for offset, frame in frames:
+                yield offset, frame
+                count += 1
+                if limit is not None and count >= limit:
+                    return
 
     async def calibrate_region(
         self, path: Path, *, samples: int = 5, hwaccel: str = "auto"
@@ -251,12 +263,13 @@ class TelemetryExtractor:
         """Locate the overlay by sampling full frames from a recording."""
         frames: list[np.ndarray] = []
         try:
-            async for _, frame in iter_frames(
-                path, fps=0.5, grayscale=True, hwaccel=hwaccel, duration=samples * 2.0
-            ):
-                frames.append(frame)
-                if len(frames) >= samples:
-                    break
+            async with contextlib.aclosing(
+                iter_frames(path, fps=0.5, grayscale=True, hwaccel=hwaccel, duration=samples * 2.0)
+            ) as sampled:
+                async for _, frame in sampled:
+                    frames.append(frame)
+                    if len(frames) >= samples:
+                        break
         except (FFmpegError, OSError) as exc:
             log.warning("calibration decode failed", file=path.name, error=str(exc))
             return None
@@ -303,20 +316,28 @@ class TelemetryExtractor:
         buckets: dict[int, list[tuple[float, OsdReading]]] = {}
 
         try:
-            async for offset, frame in self._iter_strips(
-                path,
-                region,
-                fps=candidate_fps,
-                width=width,
-                height=height,
-                hwaccel=hwaccel,
-                on_decoder=note_decoder,
-            ):
-                result.frames_read += 1
-                text, confidence = decode_line(binarise(frame), self._templates)
-                reading = parse_osd_text(text, confidence=confidence, max_speed_kmh=max_speed_kmh)
-                bucket = math.floor((offset * sample_fps) + 1e-6)
-                buckets.setdefault(bucket, []).append((offset, reading))
+            # Closed explicitly: this is the telemetry stage of a cancellable job, and an
+            # abandoned strip reader keeps its ffmpeg child -- and the Intel media slot --
+            # until the event loop finalises it.
+            async with contextlib.aclosing(
+                self._iter_strips(
+                    path,
+                    region,
+                    fps=candidate_fps,
+                    width=width,
+                    height=height,
+                    hwaccel=hwaccel,
+                    on_decoder=note_decoder,
+                )
+            ) as strips:
+                async for offset, frame in strips:
+                    result.frames_read += 1
+                    text, confidence = decode_line(binarise(frame), self._templates)
+                    reading = parse_osd_text(
+                        text, confidence=confidence, max_speed_kmh=max_speed_kmh
+                    )
+                    bucket = math.floor((offset * sample_fps) + 1e-6)
+                    buckets.setdefault(bucket, []).append((offset, reading))
         except DecodeError as exc:
             # Partial telemetry from a damaged file is still worth keeping.
             result.warnings.append(f"decode ended early: {exc}")

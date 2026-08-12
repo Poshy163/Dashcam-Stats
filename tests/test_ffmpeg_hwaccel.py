@@ -888,8 +888,10 @@ class TestProbeProcessSafety:
         monkeypatch.setattr(ffmpeg_module, "_ffprobe_process_locks", weakref.WeakKeyDictionary())
         started = asyncio.Event()
 
-        async def run_process(cmd, timeout, stdin=None):
+        async def run_process(cmd, timeout, stdin=None, *, gated=False):
             started.set()
+            # ffprobe occupies the shared slot, so it must be registered against it.
+            assert gated, "ffprobe ran without claiming the Intel media slot"
             return 0, b"{}", b""
 
         monkeypatch.setattr(ffmpeg_module, "_run_process", run_process)

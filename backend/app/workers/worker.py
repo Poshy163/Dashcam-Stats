@@ -102,6 +102,7 @@ class WorkerPool:
             await queue.release_stranded_recordings(session)
             await queue.reconcile_legacy_contention_failures(session)
             await queue.reconcile_misclassified_probe_crashes(session)
+            await queue.reconcile_media_failure_hides(session)
 
         self._supervisor = asyncio.create_task(self._supervise(), name="worker-supervisor")
         settings = get_settings_service()

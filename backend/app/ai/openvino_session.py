@@ -37,6 +37,80 @@ _core: Any | None = None
 # CPU/NPU sessions remain concurrent.
 _gpu_inference_lock = threading.Lock()
 
+#: Substrings that mean the GPU *context* has failed, not that this one request was bad.
+#:
+#: Taken verbatim from the deployment's own logs. Once any of these appears every
+#: subsequent request on the same compiled model fails the same way until the process is
+#: replaced, so there is no such thing as retrying past one of them.
+_GPU_CONTEXT_FAILURE_MARKERS = (
+    "cl_out_of_resources",
+    "cl_exec_status_error_for_events_in_wait_list",
+    "cl_invalid_command_queue",
+    "cl_device_not_available",
+    "clflush",
+    "clwaitforevents",
+    "clfinish",
+    "drm_buffer_object.cpp",
+    "intel_gpu/src/runtime",
+)
+
+#: Set once the iGPU has failed in this process; never cleared without a restart.
+_gpu_disabled_reason: str | None = None
+_gpu_state_lock = threading.Lock()
+
+
+def is_gpu_context_failure(exc: BaseException) -> bool:
+    """Whether *exc* is the Intel driver saying its context is gone."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _GPU_CONTEXT_FAILURE_MARKERS)
+
+
+def gpu_backend_disabled() -> str | None:
+    """Why the iGPU is no longer used for inference in this process, or None."""
+    return _gpu_disabled_reason
+
+
+def disable_gpu_backend(reason: str) -> bool:
+    """Take the iGPU out of service for inference. Returns True on the first caller.
+
+    Deliberately one-way. The failure mode this exists for is not a bad request but a
+    poisoned OpenCL context: the deployment logged one ``CL_OUT_OF_RESOURCES`` and then
+    thirty-seven more for the same recording, every frame of which silently returned no
+    detections because the model helper catches its own inference errors. Re-arming the GPU
+    on the next job would simply reproduce that.
+    """
+    global _gpu_disabled_reason
+    with _gpu_state_lock:
+        first = _gpu_disabled_reason is None
+        if first:
+            _gpu_disabled_reason = reason
+    if first:
+        log.error(
+            "the Intel GPU inference context has failed; inference moves to the CPU for "
+            "the life of this process",
+            reason=reason,
+        )
+    return first
+
+
+def gpu_inference_engaged() -> bool:
+    """Whether inference currently owns the Intel iGPU.
+
+    Read by the media layer to decide whether any decode may use VAAPI. The two cannot
+    share this chip, so this is the question that settles the whole resource policy.
+    """
+    if _gpu_disabled_reason is not None:
+        return False
+    device = selected_device()
+    return bool(device and device.upper().startswith("GPU"))
+
+
+def reset_gpu_backend_for_tests() -> None:
+    """Clear the one-way disable. Intended for isolated tests."""
+    global _gpu_disabled_reason
+    with _gpu_state_lock:
+        _gpu_disabled_reason = None
+
 
 @dataclass(frozen=True, slots=True)
 class TensorInfo:
@@ -70,6 +144,11 @@ def available_devices() -> list[str]:
 def selected_device() -> str | None:
     """Resolve the configured device against what OpenVINO can actually open."""
     devices = available_devices()
+    if _gpu_disabled_reason is not None:
+        # The chip is still enumerated and still broken. Removing it here is what makes
+        # every later decision -- new sessions, the decode policy, the status page -- agree
+        # that inference is on the CPU now, instead of each rediscovering it separately.
+        devices = [item for item in devices if not item.upper().startswith("GPU")]
     if not devices:
         return None
 
@@ -195,6 +274,11 @@ class OpenVINOSession:
         self.device = target
         self._compiled = compiled
         self._local = threading.local()
+        # Kept so the session can rebuild itself on the CPU if the GPU context dies.
+        self._model = model
+        self._model_name = model_path.name
+        self._config = config
+        self._rebuild_lock = threading.Lock()
         self._inputs = tuple(
             TensorInfo(_port_name(port, f"input_{index}"), _port_shape(port))
             for index, port in enumerate(model.inputs)
@@ -236,13 +320,62 @@ class OpenVINOSession:
             self._local.request = request
         return request
 
+    def _move_to_cpu(self, reason: str) -> None:
+        """Recompile this session on the CPU after the GPU context has failed.
+
+        Done in place, because the caller is an upstream model helper that owns the object
+        and would otherwise never learn anything had changed. Recompiling costs seconds
+        once; the alternative is what the deployment actually did -- return no detections
+        for every remaining frame while reporting the job complete.
+        """
+        with self._rebuild_lock:
+            if not self.device.upper().startswith("GPU"):
+                return  # another thread rebuilt it while this one waited
+            config = {**self._config, "PERFORMANCE_HINT": selected_performance_hint("CPU")}
+            compiled = _get_core().compile_model(self._model, "CPU", config)
+            self._compiled = compiled
+            self._local = threading.local()
+            self._output_ports = {
+                info.name: port for info, port in zip(self._outputs, compiled.outputs, strict=True)
+            }
+            self.device = "CPU"
+        log.warning(
+            "inference session rebuilt on the CPU after a GPU driver failure",
+            model=self._model_name,
+            reason=reason,
+        )
+
+    def ensure_cpu(self, reason: str) -> bool:
+        """Move this session off the iGPU for good. Returns True if it moved.
+
+        Called both when the driver has already failed and when the media layer says the
+        chip is unsafe to touch -- an ffmpeg child that will not die holds exactly the
+        resources OpenVINO is about to ask for.
+        """
+        if not self.device.upper().startswith("GPU"):
+            return False
+        disable_gpu_backend(reason)
+        self._move_to_cpu(reason)
+        return True
+
     def run(
         self,
         output_names: Sequence[str] | None,
         input_feed: dict[str, np.ndarray],
     ) -> list[np.ndarray]:
         if self.device.upper().startswith("GPU"):
-            with _gpu_inference_lock:
+            try:
+                with _gpu_inference_lock:
+                    result = self._request().infer(input_feed)
+            except Exception as exc:
+                if not is_gpu_context_failure(exc):
+                    raise
+                # The context is gone, so this request and every one after it would fail.
+                # Rebuild on the CPU and answer the question that was actually asked --
+                # the caller above catches inference errors and returns no detections, so
+                # re-raising here is indistinguishable from an empty frame.
+                disable_gpu_backend(f"{type(exc).__name__}: {exc}".strip()[:500])
+                self._move_to_cpu(str(exc)[:200])
                 result = self._request().infer(input_feed)
         else:
             result = self._request().infer(input_feed)
@@ -311,3 +444,4 @@ def reset_runtime_for_tests() -> None:
     global _core
     with _core_lock:
         _core = None
+    reset_gpu_backend_for_tests()

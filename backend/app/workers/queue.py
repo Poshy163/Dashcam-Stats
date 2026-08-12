@@ -636,6 +636,71 @@ async def reconcile_misclassified_probe_crashes(session: AsyncSession) -> int:
     return restored
 
 
+#: Marks a recording whose hide has already been reconsidered, so this runs once.
+_MEDIA_REVIEW_KEY = "media_failure_reviewed"
+
+
+async def reconcile_media_failure_hides(session: AsyncSession) -> int:
+    """Give back recordings hidden because the media stack was failing, not the file.
+
+    ``stage_inspect`` classified a recording unusable whenever no offset produced a
+    thumbnail, and the damaged-footage policy turned that into ``ignored``. During the
+    Intel driver crash loop every decode was being killed by an aborting FFmpeg, so valid
+    footage collected that verdict -- and an ignored recording is filtered out by
+    ``claim_next``, ``retry_failed`` and every bulk requeue, which means nothing would ever
+    have looked at it again. One sixty-second recording on the live library was in exactly
+    this state.
+
+    Reviewing them is safe and self-correcting: a genuinely unusable file simply earns the
+    same verdict on the next run, this time from a machine that is working. The marker
+    stops that becoming a loop -- each row is reconsidered once, not after every restart.
+    """
+    rows = list(
+        (
+            await session.execute(
+                select(Recording).where(
+                    Recording.ignored.is_(True),
+                    Recording.file_missing.is_(False),
+                    func.json_extract(Recording.probe_json, "$.source_unusable") == 1,
+                    func.json_extract(Recording.probe_json, f"$.{_MEDIA_REVIEW_KEY}").is_(None),
+                )
+            )
+        ).scalars()
+    )
+    if not rows:
+        return 0
+
+    for recording in rows:
+        probe = dict(recording.probe_json) if isinstance(recording.probe_json, dict) else {}
+        probe.pop("damaged_policy", None)
+        probe.pop("source_damaged", None)
+        probe.pop("source_unusable", None)
+        # Kept so a second restart does not undo a hide that a healthy run re-applied.
+        probe[_MEDIA_REVIEW_KEY] = True
+        recording.probe_json = probe
+        recording.ignored = False
+        recording.error_message = None
+        recording.state = RecordingState.QUEUED
+        recording.metadata_state = StageState.PENDING
+        # The thumbnail is the thing that could not be produced, so let it be attempted
+        # again rather than inheriting "there isn't one" as a settled fact.
+        recording.thumbnail_path = None
+        await enqueue(
+            session,
+            recording.id,
+            kind=JobKind.REPROCESS if recording.processed_at is not None else JobKind.PROCESS,
+            stages=None,
+            priority=200 if recording.processed_at is not None else 100,
+        )
+
+    log.warning(
+        "restored recordings hidden while the media stack was failing",
+        recordings=len(rows),
+    )
+    await session.flush()
+    return len(rows)
+
+
 async def reclaim_stale(session: AsyncSession) -> int:
     """Return jobs whose worker stopped reporting back to the queue.
 

@@ -11,12 +11,32 @@ from functools import cache
 
 from app.ai.openvino_session import (
     available_devices,
+    gpu_backend_disabled,
     selected_device,
     selected_performance_hint,
 )
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
+
+
+def describe_media_policy() -> dict[str, object]:
+    """How decode and inference are currently sharing the iGPU, and why.
+
+    Surfaced rather than left implicit because the answer is usually "decoding in
+    software", and without a reason beside it that reads on the queue page as a hardware
+    fault. It is the opposite: it is the policy that keeps the hardware working, since this
+    chip will not run VAAPI and OpenVINO at once.
+    """
+    from app.hardware.ffmpeg import media_health, software_decode_reason
+
+    reason = software_decode_reason()
+    return {
+        "decode": "software" if reason else "hardware",
+        "decode_reason": reason,
+        "gpu_inference_disabled": gpu_backend_disabled(),
+        "media_slot": media_health(),
+    }
 
 
 def _openvino_device() -> str | None:

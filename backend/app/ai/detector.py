@@ -211,6 +211,19 @@ class ObjectDetector:
         self._detector = detector
         return True
 
+    def _demote_to_cpu(self, reason: str) -> None:
+        """Ask the underlying session to leave the iGPU, if it is one that can.
+
+        Reaches through the upstream detector because that object owns the session this
+        module installed into it; a plain ONNX Runtime CPU session has no such method and
+        needs none.
+        """
+        model = getattr(self._detector, "model", None)
+        ensure_cpu = getattr(model, "ensure_cpu", None)
+        if callable(ensure_cpu):
+            with contextlib.suppress(Exception):
+                ensure_cpu(reason)
+
     async def detect(
         self, frame: np.ndarray, *, classes: frozenset[str] | None = None
     ) -> list[Detection2D]:
@@ -226,8 +239,15 @@ class ObjectDetector:
         if not height or not width:
             return []
 
-        try:
+        device = (self.device or "").upper()
+        if "GPU" in device and not intel_media_lock().gpu_safe():
+            # A media child that would not die is still holding this chip. Adding an
+            # OpenVINO request to that is the exact state the deployment aborts from, so
+            # this session moves to the CPU rather than waiting for the driver to decide.
+            self._demote_to_cpu(intel_media_lock().unhealthy or "the Intel media slot is unhealthy")
             device = (self.device or "").upper()
+
+        try:
             guard = intel_media_lock() if "GPU" in device else contextlib.nullcontext()
             # VAAPI and OpenVINO are both stable independently on this iGPU, but the
             # driver's shared OpenCL/media resources fail when they execute together.
