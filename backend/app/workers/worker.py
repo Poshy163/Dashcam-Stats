@@ -18,10 +18,11 @@ from dataclasses import dataclass, field
 from app.core.logging import get_logger, log_context
 from app.core.settings_service import get_settings_service
 from app.damaged_policy import apply_damaged_policy
-from app.db.models import JobState, ProcessingJob, Recording
+from app.db.models import JobKind, JobState, ProcessingJob, Recording
 from app.db.session import session_scope
 from app.hardware.detect import detect_hardware
-from app.pipeline.orchestrator import pending_stages, run_stages
+from app.pipeline.orchestrator import RunReport, pending_stages, run_stages
+from app.pipeline.stages import StageError, StageResult, ensure_thumbnail
 from app.workers import queue
 
 log = get_logger(__name__)
@@ -44,6 +45,16 @@ _FINISH_RETRY_S = 3.0
 #: Consecutive heartbeat failures before saying so at a level anyone will see. One is a
 #: blip; a run of them means the job is on its way to being reclaimed.
 _HEARTBEAT_WARN_AFTER = 3
+
+#: How long an abort waits for the runs it interrupted to actually stop.
+#:
+#: Cancelling an asyncio task only takes effect at its next await, and a stage inside a
+#: model or an ffmpeg read reaches one within a frame or two -- not instantly, but quickly.
+#: The wait matters because the caller is about to queue replacement work: returning early
+#: would let a new job for a recording start while the old run was still writing that same
+#: recording's rows, which is the one thing the claim's ``NOT EXISTS`` guard exists to
+#: prevent and which it cannot see once the old job has been cancelled out from under it.
+_ABORT_GRACE_S = 20.0
 
 
 @dataclass(slots=True)
@@ -183,6 +194,7 @@ class WorkerPool:
                         )
                         job_id = job.id
                         recording_id = job.recording_id
+                        kind = job.kind
                         stages = list(job.stages) if job.stages else None
                         filename = recording.filename if recording else f"job {job.id}"
 
@@ -190,7 +202,7 @@ class WorkerPool:
                     await asyncio.sleep(_IDLE_SLEEP_S)
                     continue
 
-                await self._run_job(job_id, recording_id, stages, filename)
+                await self._run_job(job_id, recording_id, kind, stages, filename)
 
             except asyncio.CancelledError:
                 raise
@@ -227,17 +239,27 @@ class WorkerPool:
         return found
 
     async def _run_job(
-        self, job_id: int, recording_id: int | None, stages: list[str] | None, filename: str
+        self,
+        job_id: int,
+        recording_id: int | None,
+        kind: JobKind,
+        stages: list[str] | None,
+        filename: str,
     ) -> None:
         # Everything logged from here down carries the job and the recording, including
         # lines raised from inside a thread executor. This is what makes a sighting
         # traceable: the coordinate a stage chose, the job that chose it and the file it
         # came from end up on the same rows of `log_entries`.
         with log_context(recording_id=recording_id, job_id=job_id, file=filename):
-            await self._run_job_inner(job_id, recording_id, stages, filename)
+            await self._run_job_inner(job_id, recording_id, kind, stages, filename)
 
     async def _run_job_inner(
-        self, job_id: int, recording_id: int | None, stages: list[str] | None, filename: str
+        self,
+        job_id: int,
+        recording_id: int | None,
+        kind: JobKind,
+        stages: list[str] | None,
+        filename: str,
     ) -> None:
         hardware = detect_hardware()
         active = ActiveJob(
@@ -260,7 +282,11 @@ class WorkerPool:
             # the only way to interrupt work that is inside a model or an ffmpeg read;
             # without it the Cancel button changed a badge and nothing else, and the run
             # then wrote its own result over the top and un-cancelled itself.
-            work = asyncio.create_task(self._process(recording_id, stages, active))
+            work = asyncio.create_task(
+                self._make_thumbnail(recording_id, active)
+                if kind is JobKind.THUMBNAIL
+                else self._process(recording_id, stages, active)
+            )
             self._work[job_id] = work
             try:
                 report = await work
@@ -290,6 +316,45 @@ class WorkerPool:
                 await heartbeat_task
             self._active.pop(job_id, None)
             self._work.pop(job_id, None)
+
+    async def _make_thumbnail(self, recording_id: int, active: ActiveJob):
+        """Run the thumbnail-first pass over one recording. Returns a report, or None.
+
+        Shaped like ``_process`` so the outcome is recorded by the same code: a thumbnail
+        job succeeds, retries and fails exactly as an analysis job does, and needs no second
+        opinion about what any of those mean.
+
+        Nothing here touches ``recordings.state``. The recording is still queued -- for its
+        analysis, which this pass has deliberately not done -- and marking it ``processing``
+        for the few seconds a thumbnail takes would report a run that is not happening and
+        leave the row stranded if the process died mid-decode.
+        """
+        started = time.monotonic()
+        async with session_scope() as session:
+            recording = await session.get(Recording, recording_id)
+            if recording is None:
+                return None
+
+            active.stage = "thumbnail"
+            report = RunReport(recording_id=recording_id)
+            try:
+                outcome = await ensure_thumbnail(recording)
+            except StageError as exc:
+                report.ok = False
+                report.error = str(exc)
+                report.permanent = exc.permanent
+                report.transient = exc.transient
+            else:
+                detail = (
+                    "written"
+                    if outcome.written
+                    else ("already present" if outcome.present else "no usable frame")
+                )
+                report.stages.append(StageResult("thumbnail", True, detail=detail))
+            report.elapsed_s = time.monotonic() - started
+            active.progress = 1.0
+            await session.flush()
+            return report
 
     async def _process(self, recording_id: int, stages: list[str] | None, active: ActiveJob):
         """Run the stages. Returns the report, or None if the recording has gone."""
@@ -449,6 +514,48 @@ class WorkerPool:
                     consecutive=consecutive_failures,
                     error=str(exc),
                 )
+
+    # -- interruption ------------------------------------------------------------------
+
+    async def abort_active(self) -> int:
+        """Stop every run in flight, and wait until they have actually stopped.
+
+        For rebuilding the queue from scratch. Cancelling the job rows alone is not enough
+        and is in fact the more dangerous half on its own: the claim refuses to start a
+        second job for a recording that is ``RUNNING``, so cancelling the row removes the
+        very guard that keeps the replacement job from starting on top of a run still
+        decoding, deleting and rewriting that recording's tables.
+
+        The pool itself keeps running. Workers whose job disappears simply find the queue
+        empty and idle until the rebuild fills it, which is what should happen -- stopping
+        and restarting the pool would reclaim jobs, restart the supervisor and run every
+        reconciliation, none of which a queue reset wants.
+        """
+        interrupted = list(self._active.values())
+        if not interrupted:
+            return 0
+
+        tasks: list[asyncio.Task] = []
+        for job in interrupted:
+            # Set before cancelling: this is what tells the run its cancellation was asked
+            # for rather than propagating out as an unexplained failure, and what stops it
+            # writing an outcome over a queue that has moved on without it.
+            job.cancelled = True
+            task = self._work.get(job.job_id)
+            if task is not None and not task.done():
+                task.cancel()
+                tasks.append(task)
+
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=_ABORT_GRACE_S)
+            if pending:
+                log.warning(
+                    "some runs did not stop within the abort grace period",
+                    still_running=len(pending),
+                    grace_s=_ABORT_GRACE_S,
+                )
+        log.info("stopped in-flight processing", jobs=len(interrupted))
+        return len(interrupted)
 
     # -- introspection -----------------------------------------------------------------
 

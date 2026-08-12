@@ -167,14 +167,33 @@ class TestAnEmptyRecordingLeavesTheQueue:
         assert queued == 1, "the empty segment was handed a processing attempt"
 
     async def test_a_bulk_reprocess_leaves_it_alone(self, share, client):
-        """The exact loop from the logs: reprocess-all handed it four fresh attempts."""
+        """The exact loop from the logs: reprocess-all handed it four fresh attempts.
+
+        The valid segment beside it *is* queued, and has to be: "reprocess all footage" now
+        empties the queue before rebuilding it, so anything the rebuild skips loses its job
+        rather than keeping the one it had. It goes into the thumbnail-first pass, which is
+        where a never-analysed recording with no picture belongs.
+        """
+        from sqlalchemy import select
+
         await Scanner(footage_dir=share).scan(trigger="test")
 
         response = await client.post("/api/reprocess", json={"stages": ["everything"]})
         assert response.status_code == 200
-        assert response.json()["queued"] == 0, (
-            "bulk reprocessing queued a zero-byte file or stole a never-processed file "
-            "from the higher-priority new-footage queue"
+        assert response.json()["queued"] == 1, (
+            "the rebuild queued the zero-byte file, or dropped the valid one beside it"
+        )
+
+        async with session_scope() as session:
+            rows = (
+                await session.execute(
+                    select(Recording.filename, ProcessingJob.kind)
+                    .join(ProcessingJob, ProcessingJob.recording_id == Recording.id)
+                    .where(ProcessingJob.state == JobState.QUEUED)
+                )
+            ).all()
+        assert rows == [("20260804111550_camera_0.ts", JobKind.THUMBNAIL)], (
+            "a file with no bytes in it was handed another four processing attempts"
         )
 
     async def test_a_file_that_later_gains_content_is_picked_up(self, share):

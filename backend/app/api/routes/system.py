@@ -38,6 +38,7 @@ from app.core.settings_service import (
 )
 from app.db.backup import create_backup, stage_restore
 from app.db.models import (
+    BULK_PRIORITY,
     JobKind,
     Journey,
     LogEntry,
@@ -57,6 +58,7 @@ from app.retention import current_usage, evaluate_safety
 from app.retention import execute as run_retention
 from app.retention import plan as plan_retention
 from app.workers import queue
+from app.workers.reset import reset_and_rebuild
 from app.workers.scheduler import get_scheduler
 from app.workers.worker import get_worker_pool
 
@@ -340,15 +342,35 @@ async def process_new():
 
 @router.post("/reprocess")
 async def reprocess_all(body: ReprocessAllRequest, session: SessionDep):
-    """Requeue the whole library, or just the failures.
+    """Rebuild the queue from the footage, or requeue a targeted subset of it.
 
     Needed whenever a processing change invalidates earlier results -- a decoder fix, a
     new model, a corrected overlay region. Per-recording reprocessing does not scale to a
     library of hundreds of files, and re-running only the stages that changed is far
     cheaper than re-running everything.
 
-    Queued at a lower priority than new footage so a bulk rerun never starves the scanner.
+    **Three different requests share this endpoint, and only one of them resets anything.**
+    "Reprocess all footage" means start again: the queue is emptied, the runs in flight are
+    stopped, the counters begin from zero, missing thumbnails are made first and the
+    analysis then works through the library oldest first. See ``app.workers.reset``.
+
+    "Failed only" and "outdated only" are targeted repairs of a queue the user wants to
+    keep. Wiping it to service them would throw away the waiting work they were not asking
+    about, so they still add rather than replace, and are queued below new footage so a
+    bulk rerun never starves the scanner.
     """
+    if not body.only_failed and not body.only_outdated:
+        summary = await reset_and_rebuild(session, stages=body.stages)
+        return {
+            **summary.as_dict(),
+            "reset": True,
+            "stages": list(expand_stages(list(summary.stages))),
+            # An operator's pause outlives a reset -- it is a decision about the machine,
+            # not state belonging to a run -- so the rebuilt queue may be sitting still on
+            # purpose. Said here rather than left to be discovered.
+            "paused": queue.is_paused(),
+        }
+
     stmt = select(Recording).where(
         Recording.ignored.is_(False),
         Recording.file_missing.is_(False),
@@ -399,7 +421,7 @@ async def reprocess_all(body: ReprocessAllRequest, session: SessionDep):
             recording.id,
             kind=JobKind.REPROCESS,
             stages=stages,
-            priority=200,
+            priority=BULK_PRIORITY,
             force=True,
         )
 

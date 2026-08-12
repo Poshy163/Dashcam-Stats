@@ -124,7 +124,7 @@ OCR confidence: 94%
 | **Heatmap** | Every road ever driven, on OpenStreetMap: heat for how often, traced lines for which |
 | **Plates** | Searchable plate database — full or partial (`ABC` matches `ABC123`) |
 | **Vehicles** | Vehicle sightings independent of plates |
-| **Queue** | What is processing now, what is queued, what failed, with retry |
+| **Queue** | What is processing now, what is queued, what failed, with retry. **Settings → Scanner → Reprocess all footage** starts again from scratch: the queue is emptied, anything in flight is stopped, every missing thumbnail is generated first, and the full analysis then runs oldest footage to newest |
 | **Backup** | Copying recordings off the dashcam itself — progress, backlog and history |
 | **Logs** | Application and per-job logs |
 | **Settings** | Everything above, editable without a restart |

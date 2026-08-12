@@ -49,6 +49,9 @@ export default function Settings() {
   const refreshQueueAndAnalysis = () => {
     void client.invalidateQueries({ queryKey: ['jobs'] })
     void client.invalidateQueries({ queryKey: ['queue-stats'] })
+    // The Queue page keeps its own copy of the same counts, and a reset changes every one
+    // of them. Left cached, it shows the previous run's figures until its next poll.
+    void client.invalidateQueries({ queryKey: ['queue-stats-page'] })
     void invalidateAnalysisQueries(client)
   }
 
@@ -184,7 +187,14 @@ export default function Settings() {
                 <p className="hint mb-2">
                   Re-runs analysis on footage already indexed. Needed after a change that
                   invalidates earlier results — a decoder fix, a new model, or a corrected
-                  overlay region. Queued below new footage so scanning is not starved.
+                  overlay region.
+                </p>
+                <p className="hint mb-2">
+                  <strong>Reprocess all footage</strong> starts again: the queue is emptied,
+                  anything in flight is stopped, the counts reset, and it is rebuilt from
+                  the footage — every missing thumbnail first, then the full analysis oldest
+                  first. The other two add to the existing queue and leave the rest of it
+                  alone.
                 </p>
                 <div className="flex flex-wrap items-center gap-2">
                   <select
@@ -200,7 +210,20 @@ export default function Settings() {
                   </select>
                   <button
                     className="btn"
-                    onClick={() => reprocessAll.mutate({})}
+                    onClick={() => {
+                      // It discards the queue, including work in progress, so it asks.
+                      if (
+                        window.confirm(
+                          'Clear the processing queue and rebuild it from the footage?\n\n' +
+                            'Anything currently processing is stopped, waiting and failed ' +
+                            'jobs are discarded, and every recording is queued again — ' +
+                            'missing thumbnails first, then full analysis oldest first. ' +
+                            'No footage or history is deleted.',
+                        )
+                      ) {
+                        reprocessAll.mutate({})
+                      }
+                    }}
                     disabled={reprocessAll.isPending}
                   >
                     Reprocess all footage
@@ -222,8 +245,29 @@ export default function Settings() {
                 </div>
                 {reprocessAll.data && (
                   <p className="hint mt-2">
-                    Queued {reprocessAll.data.queued} recordings. Watch progress on the
-                    Queue page.
+                    {reprocessAll.data.reset ? (
+                      <>
+                        Queue rebuilt: {reprocessAll.data.queued} recordings,{' '}
+                        {reprocessAll.data.thumbnailsQueued ?? 0} of them queued for a
+                        thumbnail first. Cleared{' '}
+                        {Object.values(reprocessAll.data.cleared ?? {}).reduce(
+                          (total, n) => total + n,
+                          0,
+                        )}{' '}
+                        old jobs
+                        {(reprocessAll.data.aborted ?? 0) > 0 &&
+                          ` and stopped ${reprocessAll.data.aborted} in flight`}
+                        .{' '}
+                        {reprocessAll.data.paused
+                          ? 'The queue is paused — resume it to start.'
+                          : 'Watch progress on the Queue page.'}
+                      </>
+                    ) : (
+                      <>
+                        Queued {reprocessAll.data.queued} recordings. Watch progress on the
+                        Queue page.
+                      </>
+                    )}
                   </p>
                 )}
               </div>

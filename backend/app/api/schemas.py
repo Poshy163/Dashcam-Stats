@@ -270,6 +270,11 @@ class QueueStatsOut(BaseModel):
     failed: int = 0
     completed: int = 0
     completed_today: int = 0
+    #: Waiting or running jobs from the thumbnail-first pass, which is a phase of the run
+    #: rather than a queue of its own. Included in ``queued``/``running``.
+    thumbnails_pending: int = 0
+    #: "thumbnails", "analysis" or "idle" -- which pass the queue is working through.
+    phase: str = "idle"
     paused: bool = False
     throughput_per_hour: float | None = None
     estimated_minutes_remaining: float | None = None

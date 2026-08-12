@@ -243,11 +243,11 @@ processing attempts on every bulk requeue, forever.
 
 | Stage | Work | Cost control |
 | --- | --- | --- |
-| 1 · Inspect | ffprobe; codec, duration, resolution, real fps, audio, PTS-wrap clamp | Header read only |
+| 1 · Inspect | ffprobe; codec, duration, resolution, real fps, audio, PTS-wrap clamp; thumbnail | Header read, and the thumbnail only if there is not already one |
 | 2 · Telemetry | OSD OCR at 1 fps | 1 fps is the OSD's own rate — no gain above it |
 | 3 · Detection | Vehicle/person detection on sampled frames + ByteTrack association | Default 4 fps sampling; tracks, not per-frame rows |
 | 4 · Plates | Plate detection inside tracked vehicle boxes only, OCR on the best few crops per track | Never OCR every frame; per-track voting |
-| 5 · Summarise | Roll up counts, distance, speeds; attach journey; write thumbnails | Single pass |
+| 5 · Summarise | Roll up counts, distance, speeds; attach journey | Single pass |
 
 **Models come from upstream, and so does their inference code.** Weights are fetched on
 first use into `/data/models` and cached, so the image stays small and the container works
@@ -820,6 +820,69 @@ files** rather than "recordings" for a count where one minute of driving is two 
 | Rebuild/recluster log entries | 12,626 |
 | `database is locked` in the worker loop | 128 |
 | Jobs spent on three zero-byte files | 9, across three bulk requeues |
+
+---
+
+## 5.9 "Reprocess all footage" means start again
+
+The action used to **add**: every previously-analysed recording was enqueued on top of
+whatever was already in the queue. `enqueue(force=True)` had stopped it stacking duplicates,
+but everything else survived a press of it — yesterday's failures stayed failed, a job the
+pool was halfway through stayed running, the counters above the queue carried the old run's
+arithmetic into the new one, and the order the library came out in was inherited from
+whatever happened to be queued before.
+
+It now **replaces**. `app/workers/reset.py` empties the queue, stops the runs in flight,
+opens a new run, and derives the work from the recordings that exist rather than from the
+rows that were in the table:
+
+```
+press → clear queue → stop in-flight runs → new run epoch → discover footage
+                                                                  │
+                        ┌─────────────────────────────────────────┘
+                        ▼
+        THUMBNAIL PASS  every recording with no usable thumbnail, priority 0
+                        ▼
+        ANALYSIS PASS   the whole library, priority 200, oldest → newest
+```
+
+**Thumbnails are a phase, not a second queue.** A thumbnail is a couple of ffmpeg seeks
+against minutes for a full analysis, so making every missing one first gives the library
+pictures in the time it would take to analyse a handful of clips — which is the difference
+between a recording imported this morning being visible immediately and being visible after
+the eight hundred older ones in front of it have been re-analysed. A recording holds exactly
+one job throughout: its analysis job is created when its thumbnail job *finishes*
+(`queue._follow_up_after_thumbnail`), because queueing both up front would put every
+recording in the queue twice and double every count on the page. The successor is created in
+the same transaction as the outcome that triggers it, and on failure as well as success — a
+recording whose thumbnail could not be made still has to be analysed, and the analysis pass
+is what probes the file properly and reaches a real verdict about it.
+
+**Missing is asked of the disk.** Media lives on the data volume rather than in the
+database, so a restored backup or a pruned volume leaves rows pointing at files that are not
+there. The old check looked only at whether `thumbnail_path` was set, which meant those
+recordings could never get a picture again; `stage_inspect` now asks the same question the
+reset does.
+
+**Four things stop a stopped worker.** Cancelling the job rows is not enough on its own, and
+is in fact the more dangerous half: the claim refuses to start a second job for a recording
+that is `RUNNING`, so cancelling that row removes the very guard keeping the replacement job
+off a recording still being decoded and rewritten. So the reset cancels the rows, *then*
+`WorkerPool.abort_active` cancels the tasks and waits for them to stop, and only then is any
+replacement work queued. A run that finishes anyway re-reads its row before recording an
+outcome and declines when it finds it cancelled.
+
+**Nothing is deleted.** Jobs are retired, not removed: `log_entries` references
+`processing_jobs` with `ON DELETE CASCADE` and foreign keys are enforced, so a `DELETE` here
+would take the log trail of everything the previous run did with it. The counters read as a
+fresh run because they are scoped to the run instead — a durable epoch beside the pause
+marker, so a restart does not hand the current run the previous one's failures back. The
+pause flag itself is *not* cleared: it is a decision about the machine rather than state
+belonging to a run, so a reset says it is paused rather than overriding it.
+
+**Only the full action resets.** "Failed only" and "outdated only" are targeted repairs of a
+queue the user wants to keep, and wiping it to service them would discard the waiting work
+they were not asking about.
 
 ---
 

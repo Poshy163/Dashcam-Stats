@@ -139,6 +139,24 @@ class JobKind(str, enum.Enum):
     JOURNEY_REBUILD = "journey_rebuild"
 
 
+#: The values ``processing_jobs.priority`` is meant to take. Lower runs first, and these
+#: three tiers are the whole ordering policy -- within a tier the claim works through the
+#: footage chronologically, so the tier is the only thing that can put one recording in
+#: front of an older one.
+#:
+#: Kept beside the column rather than in :mod:`app.workers.queue` because the scanner sets
+#: this too, and it cannot import the queue: ``app.workers`` imports the scheduler, which
+#: imports the scanner. Two copies of a number that decides ordering would disagree
+#: eventually, and the symptom would be a queue that quietly ran in the wrong order.
+#:
+#: ``THUMBNAIL_PRIORITY`` is what makes the thumbnail-first pass first: a thumbnail costs a
+#: couple of ffmpeg seeks against minutes for a full analysis, so the whole library can be
+#: given pictures in the time it would take to analyse a handful of clips.
+THUMBNAIL_PRIORITY = 0
+NEW_FOOTAGE_PRIORITY = 100
+BULK_PRIORITY = 200
+
+
 class CameraRole(str, enum.Enum):
     FRONT = "front"
     REAR = "rear"

@@ -262,9 +262,26 @@ export interface QueueStats {
   running: number
   failed: number
   completedToday: number
+  /** Waiting or running thumbnail jobs. Already counted in `queued`/`running`. */
+  thumbnailsPending: number
+  /** Which pass the run is working through. */
+  phase: 'thumbnails' | 'analysis' | 'idle'
   paused: boolean
   throughputPerHour: number | null
   estimatedMinutesRemaining: number | null
+}
+
+/** What "reprocess all footage" did. A full run resets the queue; the targeted ones add to it. */
+export interface ReprocessResult {
+  queued: number
+  stages: string[]
+  reset?: boolean
+  recordings?: number
+  thumbnailsQueued?: number
+  analysisQueued?: number
+  cleared?: Partial<Record<JobState, number>>
+  aborted?: number
+  paused?: boolean
 }
 
 export interface TelemetryQualityRecording {

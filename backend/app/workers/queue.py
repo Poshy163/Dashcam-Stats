@@ -13,15 +13,32 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, true, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_config
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service, local_midnight_utc
-from app.db.models import JobKind, JobState, ProcessingJob, Recording, RecordingState, StageState
+from app.db.models import (
+    BULK_PRIORITY,
+    NEW_FOOTAGE_PRIORITY,
+    JobKind,
+    JobState,
+    ProcessingJob,
+    Recording,
+    RecordingState,
+    StageState,
+)
 
 log = get_logger(__name__)
+
+# The priority tiers are imported rather than defined here: the scanner sets the same
+# values and cannot import this module without a cycle, so they are declared beside the
+# column they describe. See the note in `app.db.models`.
+
+#: What a job says when a queue reset retired it. It is not a failure and never was one:
+#: the work it described has been superseded by the run that replaced it.
+RESET_REASON = "cleared by a full reprocess reset"
 
 #: Retry backoff, indexed by attempt. Transient faults are usually a busy share or a
 #: momentarily unavailable mount, which clear in seconds to minutes.
@@ -38,10 +55,73 @@ MAX_CONTENTION_RETRIES = 6
 
 _paused = False
 
+#: When the queue was last wiped and rebuilt. Every count the Queue page reports is scoped
+#: to it, which is what makes a reset read as a fresh run rather than as the old one with
+#: new rows appended: yesterday's failures, cancellations and completions belong to the run
+#: that was replaced, and a run that has just started has none of any of them.
+_reset_at: datetime | None = None
+
 
 def _pause_marker() -> Path:
     """A local-volume marker makes an operator's pause survive container replacement."""
     return get_config().data_dir / ".queue-paused"
+
+
+def _reset_marker() -> Path:
+    """The reset epoch, kept beside the pause flag and for the same reason.
+
+    A restart must not resurrect the counters of a run the user explicitly discarded.
+    """
+    return get_config().data_dir / ".queue-reset"
+
+
+def restore_reset_epoch() -> datetime | None:
+    """Restore the durable reset epoch before anything reports a queue count."""
+    global _reset_at
+    _reset_at = None
+    try:
+        raw = _reset_marker().read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        log.warning("could not restore the queue reset epoch", error=str(exc))
+        return None
+    try:
+        moment = datetime.fromisoformat(raw)
+    except ValueError:
+        log.warning("the queue reset marker does not hold a timestamp", value=raw[:64])
+        return None
+    _reset_at = moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+    log.info("processing queue counts are scoped to the last reset", since=_reset_at.isoformat())
+    return _reset_at
+
+
+def reset_epoch() -> datetime | None:
+    """When the current queue run began, or None if the queue has never been reset."""
+    return _reset_at
+
+
+def record_reset(moment: datetime) -> None:
+    """Open a new queue run. Jobs queued before *moment* no longer count towards it."""
+    global _reset_at
+    _reset_at = moment
+    try:
+        marker = _reset_marker()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(moment.isoformat(), encoding="utf-8")
+    except OSError as exc:
+        log.warning("could not persist the queue reset epoch", error=str(exc))
+
+
+def _current_run():
+    """Restrict a job query to the run in progress.
+
+    Expressed against ``queued_at`` rather than ``finished_at`` on purpose: the jobs the
+    reset itself cancelled finish *at* the epoch, so filtering on when they ended would
+    count every one of them as a cancellation belonging to the new run.
+    """
+    epoch = _reset_at
+    return true() if epoch is None else ProcessingJob.queued_at >= epoch
 
 
 def restore_pause_state() -> bool:
@@ -89,7 +169,7 @@ async def enqueue(
     *,
     kind: JobKind = JobKind.PROCESS,
     stages: list[str] | None = None,
-    priority: int = 100,
+    priority: int = NEW_FOOTAGE_PRIORITY,
     force: bool = False,
 ) -> ProcessingJob | None:
     """Queue work, refusing to stack duplicates for the same recording.
@@ -353,6 +433,43 @@ async def complete(
     if device is not None:
         job.inference_device = device
     await session.flush()
+    await _follow_up_after_thumbnail(session, job)
+
+
+async def _follow_up_after_thumbnail(session: AsyncSession, job: ProcessingJob) -> None:
+    """Hand a recording on to its analysis job once the thumbnail pass has released it.
+
+    The thumbnail-first pass is a *phase*, not a second queue. A recording holds exactly one
+    job at a time and this is the transition between them, which is the whole reason the
+    analysis job is created here rather than alongside the thumbnail job during the rebuild:
+    queueing both up front would put every recording in the queue twice, double the waiting
+    count, and give the claim two rows per recording to keep apart.
+
+    It runs on every terminal outcome, not only success. A recording whose thumbnail could
+    not be produced still has to be analysed -- and the analysis pass probes the file
+    properly, so it is also what reaches a real verdict about footage this pass could only
+    say "no usable frame" about.
+
+    Creating the successor is part of the same transaction as finishing the thumbnail job,
+    so there is no instant in which the recording has no job. ``enqueue`` refuses to stack,
+    so a retried outcome write cannot produce a second one either.
+    """
+    if job.kind is not JobKind.THUMBNAIL or job.recording_id is None:
+        return
+    recording = await session.get(Recording, job.recording_id)
+    if recording is None or recording.ignored:
+        return
+    await enqueue(
+        session,
+        job.recording_id,
+        # A recording that has never been analysed is not being *re*-processed, whatever
+        # queued it. The kind is what the Queue page and the scanner's repair both read.
+        kind=JobKind.REPROCESS if recording.processed_at is not None else JobKind.PROCESS,
+        # The thumbnail job carries the stage selection the run was started with; it has no
+        # use for it itself, and this is where it was being kept for.
+        stages=list(job.stages) if job.stages else None,
+        priority=BULK_PRIORITY,
+    )
 
 
 async def fail(
@@ -386,6 +503,7 @@ async def fail(
         # Spending three attempts on a zero-byte file helps nobody.
         log.info("job failed permanently", job_id=job.id, error=message[:200])
         await session.flush()
+        await _follow_up_after_thumbnail(session, job)
         return
 
     if transient:
@@ -438,6 +556,63 @@ async def fail(
         job.state = JobState.FAILED
 
     await session.flush()
+    if job.state is JobState.FAILED:
+        await _follow_up_after_thumbnail(session, job)
+
+
+async def clear(session: AsyncSession, *, reason: str = RESET_REASON) -> dict[str, int]:
+    """Empty the queue: nothing waiting, nothing running, nothing failed.
+
+    Retired rather than deleted, and the distinction is not squeamishness. ``log_entries``
+    references ``processing_jobs`` with ``ON DELETE CASCADE`` and foreign keys are enforced,
+    so a ``DELETE`` here would take every log line those jobs ever wrote with it -- which is
+    the record of what the previous run actually did, and the one thing a reset has no
+    business destroying. Cancelling empties the queue just as completely: a cancelled job is
+    not claimable, not retryable, and counts towards nothing.
+
+    ``FAILED`` goes with them for the same reason ``enqueue(force=True)`` retires it -- those
+    rows describe attempts that have just been explicitly replaced. Leaving them behind is
+    what made the failure count on the Queue page immovable no matter how many times the
+    library was reprocessed.
+
+    A ``RUNNING`` job is cancelled here too, which is what stops its worker writing an
+    outcome: the pool re-reads the row before recording one and declines when it finds the
+    job cancelled. Stopping the run *itself* is the caller's job -- see
+    ``WorkerPool.abort_active`` -- and must happen before any replacement work is queued.
+
+    Returns the number of jobs cleared, keyed by the state they were in.
+    """
+    retired = (JobState.QUEUED, JobState.RUNNING, JobState.FAILED)
+    counts = {
+        state.value: int(count)
+        for state, count in (
+            await session.execute(
+                select(ProcessingJob.state, func.count(ProcessingJob.id))
+                .where(ProcessingJob.state.in_(retired))
+                .group_by(ProcessingJob.state)
+            )
+        ).all()
+    }
+    await session.execute(
+        update(ProcessingJob)
+        .where(ProcessingJob.state.in_(retired))
+        .values(
+            state=JobState.CANCELLED,
+            finished_at=datetime.now(UTC),
+            worker_id=None,
+            progress=0.0,
+            stage_current=None,
+            resource_state=None,
+            not_before=None,
+            heartbeat_at=None,
+            error_message=reason,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.flush()
+    if counts:
+        log.info("cleared the processing queue", **counts)
+    return counts
 
 
 async def cancel(session: AsyncSession, job_id: int) -> bool:
@@ -655,7 +830,9 @@ async def reconcile_misclassified_probe_crashes(session: AsyncSession) -> int:
                 recording.id,
                 kind=JobKind.REPROCESS if recording.processed_at is not None else JobKind.PROCESS,
                 stages=None,
-                priority=200 if recording.processed_at is not None else 100,
+                priority=BULK_PRIORITY
+                if recording.processed_at is not None
+                else NEW_FOOTAGE_PRIORITY,
             )
 
     restored = sum(
@@ -725,7 +902,7 @@ async def reconcile_media_failure_hides(session: AsyncSession) -> int:
             recording.id,
             kind=JobKind.REPROCESS if recording.processed_at is not None else JobKind.PROCESS,
             stages=None,
-            priority=200 if recording.processed_at is not None else 100,
+            priority=BULK_PRIORITY if recording.processed_at is not None else NEW_FOOTAGE_PRIORITY,
         )
 
     log.warning(
@@ -857,15 +1034,43 @@ async def release_stranded_recordings(session: AsyncSession) -> int:
 
 
 async def stats(session: AsyncSession) -> dict[str, object]:
+    """Everything the Queue page counts, scoped to the run in progress.
+
+    The scope is what makes "reprocess all footage" produce a page that reads as a fresh
+    run. Without it the reset cleared the queue and the tiles above it went on reporting the
+    previous run's failures and completions -- true of the table, and the opposite of what
+    the user had just asked for. Jobs from before the last reset are still in the table and
+    still in the list below; they are simply no longer part of this run's arithmetic.
+    """
+    visible = or_(ProcessingJob.recording_id.is_(None), Recording.ignored.is_(False))
     rows = (
         await session.execute(
             select(ProcessingJob.state, func.count(ProcessingJob.id))
             .outerjoin(Recording, Recording.id == ProcessingJob.recording_id)
-            .where(or_(ProcessingJob.recording_id.is_(None), Recording.ignored.is_(False)))
+            .where(visible, _current_run())
             .group_by(ProcessingJob.state)
         )
     ).all()
     counts = {state.value: int(count) for state, count in rows}
+
+    # What is left of the thumbnail-first pass. Reported separately because it is a phase
+    # of the run rather than a queue of its own, and because "1,400 waiting" means something
+    # quite different when the next hour of it is thumbnails.
+    thumbnails = int(
+        (
+            await session.execute(
+                select(func.count(ProcessingJob.id))
+                .outerjoin(Recording, Recording.id == ProcessingJob.recording_id)
+                .where(
+                    visible,
+                    _current_run(),
+                    ProcessingJob.kind == JobKind.THUMBNAIL,
+                    ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),
+                )
+            )
+        ).scalar()
+        or 0
+    )
 
     # The user's day, not UTC's — see local_midnight_utc. Adelaide is nine and a half
     # hours ahead, so "Completed today" reset itself at half past nine in the morning.
@@ -876,6 +1081,7 @@ async def stats(session: AsyncSession) -> dict[str, object]:
                 select(func.count(ProcessingJob.id)).where(
                     ProcessingJob.state == JobState.COMPLETED,
                     ProcessingJob.finished_at >= midnight,
+                    _current_run(),
                     or_(
                         ProcessingJob.recording_id.is_(None),
                         ProcessingJob.recording_id.in_(
@@ -897,6 +1103,10 @@ async def stats(session: AsyncSession) -> dict[str, object]:
                 ProcessingJob.finished_at.is_not(None),
                 ProcessingJob.finished_at >= datetime.now(UTC) - timedelta(hours=24),
                 ProcessingJob.recording_id.is_not(None),
+                # Thumbnails are seconds and analyses are minutes, so averaging the two
+                # together would produce a throughput figure describing neither and an
+                # estimate for the analysis backlog built out of thumbnail timings.
+                ProcessingJob.kind != JobKind.THUMBNAIL,
             )
             .order_by(ProcessingJob.finished_at.desc())
             .limit(100)
@@ -907,6 +1117,8 @@ async def stats(session: AsyncSession) -> dict[str, object]:
         for started, finished in recent
         if started is not None and finished is not None and finished > started
     ]
+    queued = counts.get("queued", 0)
+    running = counts.get("running", 0)
     throughput = None
     eta_minutes = None
     if durations:
@@ -914,15 +1126,21 @@ async def stats(session: AsyncSession) -> dict[str, object]:
         workers = int(get_settings_service().get_nowait("processing.max_workers"))
         throughput = round(workers * 3600.0 / average_s, 1)
         if throughput > 0:
-            eta_minutes = round((counts.get("queued", 0) / throughput) * 60.0, 1)
+            # The analysis backlog, which is what the average above measures. Counting the
+            # thumbnail pass in it would report hours for work that takes minutes.
+            eta_minutes = round((max(0, queued - thumbnails) / throughput) * 60.0, 1)
 
     return {
-        "queued": counts.get("queued", 0),
-        "running": counts.get("running", 0),
+        "queued": queued,
+        "running": running,
         "failed": counts.get("failed", 0),
         "completed": counts.get("completed", 0),
         "cancelled": counts.get("cancelled", 0),
         "completed_today": completed_today,
+        "thumbnails_pending": thumbnails,
+        # Which pass the run is in, so the page can say so rather than leaving the user to
+        # infer it from a queue full of jobs that are not what they look like.
+        "phase": "thumbnails" if thumbnails else ("analysis" if queued or running else "idle"),
         "paused": _paused,
         "throughput_per_hour": throughput,
         "estimated_minutes_remaining": eta_minutes,

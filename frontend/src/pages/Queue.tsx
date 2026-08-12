@@ -28,6 +28,7 @@ export default function Queue() {
     refetchInterval: 3_000,
   })
   const running = (stats.data?.running ?? 0) > 0
+  const thumbnails = stats.data?.thumbnailsPending ?? 0
 
   const jobs = useQuery({
     queryKey: ['jobs', state, page],
@@ -97,7 +98,15 @@ export default function Queue() {
       />
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <StatTile label="Queued" value={stats.data?.queued ?? 0} />
+        <StatTile
+          label="Queued"
+          value={stats.data?.queued ?? 0}
+          hint={
+            thumbnails > 0
+              ? `${thumbnails} waiting on a thumbnail, not on analysis`
+              : undefined
+          }
+        />
         <StatTile label="Running" value={stats.data?.running ?? 0} tone={running ? 'busy' : 'default'} />
         <StatTile
           label="Failed"
@@ -106,6 +115,17 @@ export default function Queue() {
         />
         <StatTile label="Completed today" value={stats.data?.completedToday ?? 0} tone="ok" />
       </div>
+
+      {/* A queue full of thumbnail jobs is not a queue full of analyses, and the count on
+          its own reads as though it were: thumbnails are seconds each and the analysis
+          they come before is minutes each. */}
+      {stats.data?.phase === 'thumbnails' && (
+        <div className="card border-accent/40 p-3 text-sm">
+          <strong>Thumbnail pass</strong> — {thumbnails} recording{thumbnails === 1 ? '' : 's'}{' '}
+          still to be given a picture. Full analysis starts with the oldest footage once
+          they are done, so recent clips are visible without waiting for the backlog.
+        </div>
+      )}
 
       {(stats.data?.throughputPerHour != null || stats.data?.estimatedMinutesRemaining != null) && (
         <div className="card flex flex-wrap gap-x-6 gap-y-1 p-3 text-sm text-content-muted">

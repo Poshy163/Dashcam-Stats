@@ -28,6 +28,7 @@ from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
 from app.damaged_policy import apply_known_damaged_policy
 from app.db.models import (
+    NEW_FOOTAGE_PRIORITY,
     JobKind,
     JobState,
     ProcessingJob,
@@ -528,6 +529,14 @@ async def queue_unprocessed(session: AsyncSession, limit: int | None = None) -> 
     # analysis to redo. It must keep normal processing priority instead of waiting behind
     # hundreds of already-analysed clips. This also repairs queues created by releases
     # before the bulk endpoint stopped selecting these recordings.
+    #
+    # Only ``REPROCESS`` jobs, which is what makes this a repair rather than a second
+    # opinion about priority. A queue *rebuild* deliberately queues the whole library in
+    # one chronological tier -- never-analysed recordings included, at bulk priority, as
+    # ``PROCESS`` jobs that already run whatever the recording needs. There is nothing
+    # wrong with those, and pulling them to the front on the next scan would take the
+    # ordering the user asked for apart mid-run. What is actually broken is a job that
+    # claims to be *re*-processing a recording that has never been processed at all.
     never_processed = select(Recording.id).where(
         Recording.processed_at.is_(None),
         Recording.ignored.is_(False),
@@ -538,9 +547,10 @@ async def queue_unprocessed(session: AsyncSession, limit: int | None = None) -> 
         .where(
             ProcessingJob.recording_id.in_(never_processed),
             ProcessingJob.state == JobState.QUEUED,
-            ProcessingJob.priority > 100,
+            ProcessingJob.kind == JobKind.REPROCESS,
+            ProcessingJob.priority > NEW_FOOTAGE_PRIORITY,
         )
-        .values(kind=JobKind.PROCESS, stages=None, priority=100)
+        .values(kind=JobKind.PROCESS, stages=None, priority=NEW_FOOTAGE_PRIORITY)
         .execution_options(synchronize_session=False)
     )
     if promoted.rowcount:

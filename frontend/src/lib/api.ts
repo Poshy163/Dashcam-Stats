@@ -21,6 +21,7 @@ import type {
   PlateObservation,
   QueueStats,
   Recording,
+  ReprocessResult,
   RetentionPlan,
   SafetyReport,
   SearchResults,
@@ -288,9 +289,15 @@ export const api = {
   scan: {
     now: () => post<ScanResult>('/scan'),
     processNew: () => post<{ queued: number }>('/process'),
-    /** Requeue the library — or just the failures — after a processing change. */
+    /**
+     * Rebuild the queue from the footage, or requeue a targeted subset of it.
+     *
+     * With neither flag set this is a full reset: the queue is emptied, in-flight runs are
+     * stopped, and it is rebuilt thumbnails-first then oldest-to-newest. The two flags are
+     * targeted repairs and leave the rest of the queue alone.
+     */
     reprocessAll: (stages: string[], onlyFailed = false, onlyOutdated = false) =>
-      post<{ queued: number; stages: string[] }>('/reprocess', { stages, onlyFailed, onlyOutdated }),
+      post<ReprocessResult>('/reprocess', { stages, onlyFailed, onlyOutdated }),
   },
 
   telemetryQuality: () => request<TelemetryQuality>('/telemetry/quality'),

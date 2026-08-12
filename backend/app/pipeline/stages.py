@@ -40,7 +40,12 @@ from app.ai.runtime import describe_runtime
 from app.ai.tracker import ByteTracker
 from app.config import get_config
 from app.core.logging import get_logger
-from app.core.paths import relative_to_media, resolve_footage_path, resolve_media_path
+from app.core.paths import (
+    PathTraversalError,
+    relative_to_media,
+    resolve_footage_path,
+    resolve_media_path,
+)
 from app.core.settings_service import get_settings_service
 from app.db.models import (
     Camera,
@@ -375,6 +380,97 @@ async def _choose_thumbnail(
     return _save_jpeg(best_frame, target, quality) is not None, True
 
 
+def thumbnail_file(recording_id: int) -> Path:
+    """Where a recording's thumbnail lives. One definition, because two would diverge.
+
+    The metadata stage and the thumbnail-first pass both write here, and a disagreement
+    between them would be invisible: each would decode the file, write a picture, and leave
+    the other still convinced there was not one.
+    """
+    return _media_path("thumbnails", f"{recording_id:08d}.jpg")
+
+
+def thumbnail_is_usable(rel_path: str | None) -> bool:
+    """Whether the stored path actually leads to a thumbnail. Blocking; call off the loop.
+
+    A recorded path is not a picture. Media lives on the data volume rather than in the
+    database, so a restored backup, a pruned volume or a half-written file leaves rows
+    pointing at nothing -- and the only check there used to be was whether the column was
+    set, so those recordings could never get a thumbnail again.
+    """
+    if not rel_path:
+        return False
+    try:
+        path = resolve_media_path(rel_path)
+    except (PathTraversalError, OSError):
+        return False
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+@dataclass(slots=True)
+class ThumbnailOutcome:
+    """What one pass over a recording's thumbnail achieved."""
+
+    #: A thumbnail was decoded and written by this call.
+    written: bool = False
+    #: The recording already had a usable one, so nothing was decoded.
+    present: bool = False
+
+
+async def ensure_thumbnail(recording: Recording) -> ThumbnailOutcome:
+    """Give a recording a thumbnail, without running the rest of the pipeline.
+
+    This is the thumbnail-first pass: the fast half of ``stage_inspect`` on its own, so a
+    library-wide reprocess can put a picture against every recording in minutes instead of
+    the days the full analysis takes. It deliberately writes nothing else -- no probe
+    results, no stage states, no revisions, no ``processed_at`` -- because a recording that
+    has been given a thumbnail has not been analysed, and any of those would say it had.
+
+    An existing usable thumbnail is left exactly as it is. Regenerating one costs several
+    decodes and cannot improve on a picture that is already there.
+
+    Raises :class:`StageError` for the two situations that are about the machine rather than
+    the footage -- an absent file, which is very often an absent share, and decodes killed
+    by a failing media stack. Both are retryable, and neither is evidence about the
+    recording. A file that genuinely holds no decodable frame returns ``written=False``
+    instead: that is a verdict, and reaching it properly belongs to the analysis pass, which
+    probes the file first.
+    """
+    if await asyncio.to_thread(thumbnail_is_usable, recording.thumbnail_path):
+        return ThumbnailOutcome(present=True)
+
+    path = await asyncio.to_thread(resolve_footage_path, recording.rel_path)
+    if not await asyncio.to_thread(path.exists):
+        raise StageError(f"{recording.filename} is no longer on disk")
+
+    settings = get_settings_service()
+    target = thumbnail_file(recording.id)
+    written, conclusive = await _choose_thumbnail(
+        path,
+        target,
+        # Whatever the last probe established. An unprobed recording has neither, and
+        # `_choose_thumbnail` falls back to sampling the opening seconds -- which is the
+        # right trade here, because probing would be doing the metadata stage's work
+        # without its bookkeeping.
+        duration_s=recording.duration_s,
+        codec=recording.video_codec,
+        width=int(settings.get_nowait("general.thumbnail_width")),
+        quality=int(settings.get_nowait("general.thumbnail_quality")),
+    )
+    if written:
+        recording.thumbnail_path = relative_to_media(target)
+        return ThumbnailOutcome(written=True)
+    if not conclusive:
+        raise StageError(
+            f"could not decode a thumbnail for {recording.filename}: the media stack "
+            "is failing, so the recording has not been judged"
+        )
+    return ThumbnailOutcome()
+
+
 # --------------------------------------------------------------------------------------
 # Stage 1 - inspection
 # --------------------------------------------------------------------------------------
@@ -483,8 +579,12 @@ async def stage_inspect(
     if progress:
         progress("metadata", 0.6)
     source_unusable = False
-    if not recording.thumbnail_path:
-        thumb = _media_path("thumbnails", f"{recording.id:08d}.jpg")
+    # Asked of the filesystem, not of the column. A recording whose thumbnail file has gone
+    # -- a pruned media volume, a restored backup, a write that never landed -- kept a path
+    # that satisfied the old check, so this stage skipped it on every run and the recording
+    # could never get a picture back.
+    if not await asyncio.to_thread(thumbnail_is_usable, recording.thumbnail_path):
+        thumb = thumbnail_file(recording.id)
         chosen, conclusive = await _choose_thumbnail(
             path,
             thumb,

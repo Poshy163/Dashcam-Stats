@@ -82,6 +82,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # An explicit pause is an operator decision, not process-local state. Restore it before
     # either worker can claim one of the hundreds of queued bulk-reprocess jobs.
     queue.restore_pause_state()
+    # The same argument for the epoch a queue reset opens: the counters on the Queue page
+    # are scoped to it, and a restart that forgot it would hand the current run the
+    # previous one's failures and completions back.
+    queue.restore_reset_epoch()
     # Before anything can compile a model on it. The disable is otherwise process-local,
     # and the process is being killed *by* the fault, so every restart re-armed the iGPU
     # and walked into the same native abort -- which is the crash loop itself.
