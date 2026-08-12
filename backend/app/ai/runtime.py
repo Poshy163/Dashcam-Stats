@@ -28,11 +28,20 @@ def describe_media_policy() -> dict[str, object]:
     fault. It is the opposite: it is the policy that keeps the hardware working, since this
     chip will not run VAAPI and OpenVINO at once.
     """
-    from app.hardware.ffmpeg import media_health, software_decode_reason
+    from app.hardware.ffmpeg import media_health, select_hwaccel, software_decode_reason
 
+    # Ask the thing that actually decides, rather than reporting the policy and hoping.
+    #
+    # This used to say "hardware" whenever the *policy* permitted it, which is a different
+    # question from what a decode will really do -- and the two came apart the moment VAAPI
+    # stopped being available at all: the page claimed hardware decoding while every clip
+    # went through software, with no reason given because the policy had no objection.
     reason = software_decode_reason()
+    _, effective = select_hwaccel("auto", None)
+    if reason is None and effective == "software":
+        reason = "no hardware decoder is available on this machine"
     return {
-        "decode": "software" if reason else "hardware",
+        "decode": effective,
         "decode_reason": reason,
         "gpu_inference_disabled": gpu_backend_disabled(),
         "media_slot": media_health(),

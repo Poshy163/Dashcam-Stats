@@ -146,22 +146,25 @@ jobs:
           print("OpenVINO", ov.__version__, "direct inference OK", hardware.openvino_devices)
           '
 
-      # The Dockerfile deliberately lets the Intel driver install fail rather than break
-      # the build, which means it can also fail *silently* -- and the whole point of
-      # installing it is that Debian's 2022 driver is what the deployment's iGPU aborts
-      # in. Without this the image would ship the old driver and look fine.
-      - name: Verify the Intel compute-runtime that actually shipped
+      # Both Intel drivers, together. They are a matched set through gmmlib, and upgrading
+      # only the compute runtime on the deployment replaced the gmmlib that Bookworm's iHD
+      # media driver was built against -- which took VAAPI out entirely, vaapi_available
+      # going true to false, while not bringing the OpenCL device back either. So this
+      # reports both and fails only on the media driver going missing, which is the one
+      # that silently turns every decode into software.
+      - name: Report the Intel graphics stack in the image
         run: |
-          expected="$(sed -n 's/^ARG NEO_VERSION=\(.*\)/\1/p' Dockerfile)"
-          test -n "$expected" || { echo "no NEO_VERSION found in the Dockerfile"; exit 1; }
-          installed="$(docker run --rm --entrypoint dpkg-query dashcam-analyser:ci \
-            -W -f='${Version}' intel-opencl-icd)"
-          echo "intel-opencl-icd: want ${expected}, image has ${installed}"
-          case "$installed" in
-            "${expected}"*) echo "Intel compute-runtime installed" ;;
-            *) echo "::error::image shipped ${installed} instead of ${expected};" \
-                    "the Intel driver download or dpkg step failed"; exit 1 ;;
-          esac
+          docker run --rm --entrypoint sh dashcam-analyser:ci -c '
+            dpkg-query -W intel-opencl-icd libigdgmm12 intel-media-va-driver-non-free \
+              intel-media-va-driver 2>/dev/null || true
+            for d in /usr/lib/x86_64-linux-gnu/dri/*_drv_video.so; do
+              [ -e "$d" ] && echo "va driver: $d"
+            done
+            test -e /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so || {
+              echo "::error::the iHD media driver is missing; every decode falls back to software"
+              exit 1
+            }
+          '
 
       # A container that starts but cannot serve /health is a broken release, and that
       # is not something the unit tests can catch.

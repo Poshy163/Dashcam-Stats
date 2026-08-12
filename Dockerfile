@@ -99,48 +99,60 @@ RUN set -eux; \
         || echo 'WARNING: no Intel media driver available; VAAPI will fall back to Mesa'; \
     rm -rf /var/lib/apt/lists/*
 
-# Intel's own compute-runtime, replacing Debian's.
+# Intel's own compute-runtime, off by default -- because it was tried, and it lost VAAPI.
 #
-# This is the layer the deployment's iGPU actually aborts in. The abort names
+# The reasoning for trying it was sound. The deployment's iGPU aborts inside
 # ``shared/source/os_interface/linux/drm_buffer_object.cpp``, which belongs to
-# intel/compute-runtime -- and Bookworm ships that from 2022, against a Raptor Lake iGPU
-# and a 2025 OpenVINO. Every other variable has now been changed without effect: VAAPI and
-# OpenVINO were separated, concurrency was cut to one worker, and OpenVINO was pinned back
-# from 2026.3 to 2025.4.1. All three still produced the identical
-# ``clFlush -5 CL_OUT_OF_RESOURCES``. The driver is what is left.
+# intel/compute-runtime, and Bookworm ships that from 2022 against a Raptor Lake chip.
+# Every other variable had been changed without effect: VAAPI separated from OpenVINO,
+# concurrency cut to one worker, OpenVINO pinned back from 2026.3 to 2025.4.1. All three
+# still produced the identical ``clFlush -5 CL_OUT_OF_RESOURCES``.
 #
-# OpenCL specifically, because that is what fails: the traceback is ``ocl_stream.cpp`` and
-# the call is ``clFlush``. Level Zero is deliberately not installed -- it would pull the
-# loader in behind it and is not on the path that breaks.
+# Measured on the deployment with NEO 26.27.39122.11 and IGC 2.38.2 installed:
 #
-# Pinned to a version pair Intel publishes together, and allowed to fail. If the downloads
-# or the install do not work the Debian packages above stay exactly as they were, and the
-# app already falls back to CPU inference on its own. An image that will not build is a
-# worse outcome than an old driver.
+#     openvino_devices : ["CPU"]        (GPU gone entirely)
+#     vaapi_available  : false          (was true)
+#     hardware_decode  : false          (was true)
+#
+# The render node and i915 were untouched, so this is not the hardware disappearing. NEO
+# 26.27 requires gmmlib 22.10, and ``dpkg -i`` of Intel's ``libigdgmm12`` replaces the one
+# Bookworm's iHD media driver was built against -- so the media driver stops loading and
+# VAAPI goes with it. The OpenCL device did not come back either. Strictly worse than the
+# old driver, which at least decoded.
+#
+# Left here because the diagnosis still points at this layer, and because doing it properly
+# means bringing the *media* driver forward at the same time rather than half of a matched
+# set. Enable with --build-arg INTEL_COMPUTE_RUNTIME=1 once that is worked out; leave it
+# off and Bookworm's driver stays, which is the configuration that decodes.
+ARG INTEL_COMPUTE_RUNTIME=
 ARG NEO_VERSION=26.27.39122.11
 ARG IGC_VERSION=2.38.2
 # The IGC filenames carry a build number after a '+', which has to be %2B in the URL.
 ARG IGC_BUILD=22051
 ARG GMMLIB_VERSION=22.10.0
 RUN set -eu; \
-    neo="https://github.com/intel/compute-runtime/releases/download/${NEO_VERSION}"; \
-    igc="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION}"; \
-    ver="${IGC_VERSION}%2B${IGC_BUILD}"; \
-    tmp="$(mktemp -d)"; \
-    if cd "$tmp" \
-        && curl -fsSL -o igc-core.deb "${igc}/intel-igc-core-2_${ver}_amd64.deb" \
-        && curl -fsSL -o igc-opencl.deb "${igc}/intel-igc-opencl-2_${ver}_amd64.deb" \
-        && curl -fsSL -o gmmlib.deb "${neo}/libigdgmm12_${GMMLIB_VERSION}_amd64.deb" \
-        && curl -fsSL -o icd.deb "${neo}/intel-opencl-icd_${NEO_VERSION}-0_amd64.deb" \
-        && dpkg -i gmmlib.deb igc-core.deb igc-opencl.deb icd.deb; \
-    then \
-        echo "installed Intel compute-runtime ${NEO_VERSION} with IGC ${IGC_VERSION}"; \
+    if [ -z "${INTEL_COMPUTE_RUNTIME}" ]; then \
+        echo "keeping Debian's Intel driver (INTEL_COMPUTE_RUNTIME unset)"; \
     else \
-        echo "WARNING: could not install Intel compute-runtime ${NEO_VERSION};" \
-             "keeping Debian's driver. GPU inference may abort; the app falls back to CPU."; \
-        dpkg --configure -a || true; \
+        neo="https://github.com/intel/compute-runtime/releases/download/${NEO_VERSION}"; \
+        igc="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION}"; \
+        ver="${IGC_VERSION}%2B${IGC_BUILD}"; \
+        tmp="$(mktemp -d)"; \
+        if cd "$tmp" \
+            && curl -fsSL -o igc-core.deb "${igc}/intel-igc-core-2_${ver}_amd64.deb" \
+            && curl -fsSL -o igc-opencl.deb "${igc}/intel-igc-opencl-2_${ver}_amd64.deb" \
+            && curl -fsSL -o gmmlib.deb "${neo}/libigdgmm12_${GMMLIB_VERSION}_amd64.deb" \
+            && curl -fsSL -o icd.deb "${neo}/intel-opencl-icd_${NEO_VERSION}-0_amd64.deb" \
+            && dpkg -i gmmlib.deb igc-core.deb igc-opencl.deb icd.deb; \
+        then \
+            echo "installed Intel compute-runtime ${NEO_VERSION} with IGC ${IGC_VERSION}"; \
+        else \
+            echo "WARNING: could not install Intel compute-runtime ${NEO_VERSION}"; \
+            dpkg --configure -a || true; \
+        fi; \
+        rm -rf "$tmp"; \
     fi; \
-    rm -rf "$tmp" /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=pydeps /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}" \
