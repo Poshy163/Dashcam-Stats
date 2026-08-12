@@ -1054,6 +1054,9 @@ async def stage_detect(
         # iterator when an exception unwinds through it any more than when the body breaks.
         # Without this the decoder is abandoned with its ffmpeg child alive, and the Intel
         # media slot stays shut until the garbage collector gets to it.
+        # Bound as `decoded`, emphatically not as `frames`: `frames` is the counter that
+        # `analyse_frame` increments through `nonlocal`, and binding the generator to that
+        # name replaced the counter with the generator for the whole scope.
         async with contextlib.aclosing(
             iter_frames(
                 path,
@@ -1063,8 +1066,8 @@ async def stage_detect(
                 codec=recording.video_codec,
                 on_decoder=note_decoder,
             )
-        ) as frames:
-            async for offset, frame in frames:
+        ) as decoded:
+            async for offset, frame in decoded:
                 await analyse_frame(offset, frame)
     except DecodeError as exc:
         # Partial results from a damaged file are still worth keeping.

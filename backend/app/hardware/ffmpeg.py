@@ -350,6 +350,50 @@ def _ffprobe_process_lock() -> asyncio.Lock:
     return lock
 
 
+#: One media process may *start up* at a time, whatever it is going to do afterwards.
+#:
+#: This build of FFmpeg initialises the Intel media stack on every invocation, including
+#: plain software decoding and probing, and two of those initialising together abort with
+#: SIGABRT and no stderr -- which arrives as "ffprobe produced no output" on a perfectly
+#: good recording. Serialising ffprobe against ffprobe was only ever half the answer: with
+#: two workers, one worker's software decode starts up beside the other's probe just as
+#: easily, and the live library produced a steady stream of return-code -6 failures doing
+#: exactly that.
+#:
+#: Startup only. The abort lives in libva/iHD initialisation, not in decoding, so holding
+#: this for the life of a decode would serialise the two workers completely -- halving
+#: throughput to fix something that happens in the first fraction of a second.
+_media_launch_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+    weakref.WeakKeyDictionary()
+)
+
+#: How long a freshly launched media process keeps the launch slot.
+#:
+#: Empirical, and deliberately a constant rather than a setting: it is a property of the
+#: driver, not of the deployment. Long enough to cover libva initialisation, short enough
+#: that a recording's dozen or so launches cost a few seconds against a run of minutes.
+MEDIA_LAUNCH_SETTLE_S = 0.4
+
+
+def _media_launch_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _media_launch_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _media_launch_locks[loop] = lock
+    return lock
+
+
+async def _spawn_media(cmd: list[str], **kwargs: Any) -> asyncio.subprocess.Process:
+    """Start an ffmpeg/ffprobe process without another one initialising beside it."""
+    async with _media_launch_lock():
+        proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+        # Held past the spawn on purpose: `create_subprocess_exec` returns at exec, and
+        # every part that can abort happens after that.
+        await asyncio.sleep(MEDIA_LAUNCH_SETTLE_S)
+    return proc
+
+
 DEFAULT_PROBE_TIMEOUT = 60.0
 DEFAULT_DECODE_TIMEOUT = 900.0
 
@@ -568,8 +612,8 @@ async def _terminate_process(proc: asyncio.subprocess.Process) -> bool:
 async def _run_process(
     cmd: list[str], timeout: float, stdin: bytes | None = None, *, gated: bool = False
 ) -> tuple[int, bytes, bytes]:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
+    proc = await _spawn_media(
+        cmd,
         stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -1102,8 +1146,8 @@ async def _decode_frames(
     cmd += ["-map", "0:v:0", "-vf", chain, "-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"]
 
     frame_bytes = width * height * channels
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
+    proc = await _spawn_media(
+        cmd,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

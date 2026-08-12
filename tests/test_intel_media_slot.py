@@ -286,6 +286,57 @@ class TestTheSlotIsNotFreeUntilTheChildIsGone:
             )
 
 
+class TestOnlyOneMediaProcessStartsAtATime:
+    """Two FFmpeg processes must not initialise the Intel media stack together.
+
+    This build initialises it on every invocation -- probing and plain software decoding
+    included -- and two of those starting together abort with SIGABRT and no stderr, which
+    surfaces as "ffprobe produced no output" against a perfectly good recording. The live
+    library produced a steady stream of return-code -6 failures from exactly that: ffprobe
+    was serialised against other ffprobes, but a second worker's *software decode* started
+    up beside it quite freely.
+    """
+
+    async def test_startups_do_not_overlap(self, monkeypatch):
+        import weakref as _weakref
+
+        monkeypatch.setattr(ffmpeg_module, "_media_launch_locks", _weakref.WeakKeyDictionary())
+        monkeypatch.setattr(ffmpeg_module, "MEDIA_LAUNCH_SETTLE_S", 0.05)
+
+        starting = 0
+        most = 0
+
+        async def create(*args, **kwargs):
+            nonlocal starting, most
+            starting += 1
+            most = max(most, starting)
+            await asyncio.sleep(0)
+            starting -= 1
+            return FakeProcess()
+
+        monkeypatch.setattr(ffmpeg_module.asyncio, "create_subprocess_exec", create)
+
+        await asyncio.gather(*(ffmpeg_module._spawn_media(["ffmpeg"]) for _ in range(4)))
+
+        assert most == 1, "two media processes initialised at once; this is the -6 abort"
+
+    async def test_the_slot_is_released_after_the_settle(self, monkeypatch):
+        """Startup only. Holding it for the whole decode would serialise both workers."""
+        import weakref as _weakref
+
+        monkeypatch.setattr(ffmpeg_module, "_media_launch_locks", _weakref.WeakKeyDictionary())
+        monkeypatch.setattr(ffmpeg_module, "MEDIA_LAUNCH_SETTLE_S", 0.01)
+
+        async def create(*args, **kwargs):
+            return FakeProcess()
+
+        monkeypatch.setattr(ffmpeg_module.asyncio, "create_subprocess_exec", create)
+
+        await ffmpeg_module._spawn_media(["ffmpeg"])
+
+        assert not ffmpeg_module._media_launch_lock().locked()
+
+
 class TestOneResourcePolicy:
     """Whenever inference owns the iGPU, every decode in the process is software.
 
