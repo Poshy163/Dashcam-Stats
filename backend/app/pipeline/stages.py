@@ -84,7 +84,26 @@ from app.osd import (
     missing_characters,
     select_training_set,
 )
+from app.osd.reasons import GpsQuality, GpsReason
 from app.pipeline.telemetry_quality import quality_rollup, recover_from_paired_camera
+
+
+def _gps_quality_of(sample) -> str:
+    """Which of the four states this sample's position is in.
+
+    Derived from the statuses the extractor already sets rather than tracked separately,
+    so there is one source of truth and no way for the column and the JSON to disagree.
+    """
+    if sample.has_fix:
+        return str(
+            GpsQuality.INTERPOLATED
+            if sample.gps_source in {"interpolated", "paired_camera"}
+            else GpsQuality.VALID
+        )
+    if sample.gps_status == "no_fix":
+        return str(GpsQuality.NO_FIX)
+    return str(GpsQuality.REJECTED)
+
 
 log = get_logger(__name__)
 
@@ -888,6 +907,7 @@ async def stage_telemetry(
             "time_delta_s": round(clock_delta, 3) if clock_delta is not None else None,
             "gps_status": sample.gps_status,
             "gps_source": sample.gps_source,
+            "gps_reason": sample.gps_reason,
             "interpolated": sample.gps_source == "interpolated",
             "candidate_count": sample.candidate_count,
             "problems": list(dict.fromkeys(problems)),
@@ -907,6 +927,9 @@ async def stage_telemetry(
                 "ocr_confidence": sample.ocr_confidence,
                 "raw_text": sample.raw_text,
                 "quality_json": quality,
+                "gps_quality": _gps_quality_of(sample),
+                "gps_reason": sample.gps_reason,
+                "breaks_segment": sample.breaks_segment,
             }
         )
 
@@ -924,6 +947,8 @@ async def stage_telemetry(
             row["quality_json"]["gps_source"] = "none"
             row["quality_json"]["interpolated"] = False
             row["quality_json"]["problems"].append("coordinate failed final database validation")
+            row["gps_quality"] = str(GpsQuality.REJECTED)
+            row["gps_reason"] = str(GpsReason.INVALID_LAT_LON)
             dropped += 1
     if dropped:
         log.warning(

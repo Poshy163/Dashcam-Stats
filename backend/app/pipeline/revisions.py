@@ -6,7 +6,12 @@ work instead of making users guess whether an entire library needs decoding agai
 
 CURRENT_REVISIONS: dict[str, str] = {
     "metadata": "metadata-v2",
-    "telemetry": "telemetry-v4",
+    # v5: coordinates are only accepted at the overlay's own printed precision, positions
+    # are judged against the samples either side of them rather than only the one before,
+    # interpolation runs after validation instead of over the top of it, and every sample
+    # records how much it is trusted and why. Recordings processed by v4 hold positions
+    # that none of those rules had ever seen, so their telemetry is rebuilt.
+    "telemetry": "telemetry-v5",
     "detection": "detection-v3",
     "plates": "plates-v3",
 }

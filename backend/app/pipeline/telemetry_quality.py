@@ -7,7 +7,12 @@ from collections.abc import Iterable
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.logging import get_logger
 from app.db.models import Recording, StageState, TelemetryPoint
+from app.osd.reasons import GpsQuality
+from app.osd.track_quality import Fix, classify
+
+log = get_logger(__name__)
 
 
 def quality_rollup(rows: Iterable[object]) -> tuple[int, float, int, int, int, int]:
@@ -49,6 +54,63 @@ def quality_rollup(rows: Iterable[object]) -> tuple[int, float, int, int, int, i
     if start is not None:
         longest = max(longest, last - start + 1.0)
     return gaps, round(longest, 2), problems, no_fix, ocr_gap, rejected
+
+
+def _revert_implausible(target: list[TelemetryPoint], filled: list[TelemetryPoint]) -> int:
+    """Undo copied positions that the target recording's own fixes contradict.
+
+    Only the rows this pass filled are eligible to be undone. A position the target read
+    for itself is not this function's business — it has already been judged where it was
+    extracted, and second-guessing it here would apply the same rule twice with less
+    context than the first time.
+    """
+    ordered = sorted(
+        (p for p in target if p.has_fix and p.lat is not None and p.lon is not None),
+        key=lambda p: float(p.t_offset_s or 0.0),
+    )
+    if len(ordered) < 3:
+        return 0
+
+    verdicts = classify(
+        [
+            Fix(
+                t_s=float(point.t_offset_s or 0.0),
+                lat=float(point.lat),
+                lon=float(point.lon),
+                # Copied positions are corroboration, not independent evidence, so they
+                # are marked synthetic and never used to justify one another.
+                synthetic=(point.quality_json or {}).get("gps_source") == "paired_camera",
+            )
+            for point in ordered
+        ]
+    )
+
+    eligible = {id(point) for point in filled}
+    reverted = 0
+    for point, verdict in zip(ordered, verdicts, strict=True):
+        if verdict.quality is not GpsQuality.REJECTED or id(point) not in eligible:
+            continue
+        quality = dict(point.quality_json or {})
+        quality.update(
+            gps_status="rejected",
+            gps_source="none",
+            gps_reason=str(verdict.reasons[0]),
+            interpolated=False,
+        )
+        quality["problems"] = [*quality.get("problems", []), verdict.detail]
+        point.quality_json = quality
+        point.lat = point.lon = point.heading_deg = None
+        point.has_fix = False
+        point.gps_quality = str(GpsQuality.REJECTED)
+        point.gps_reason = str(verdict.reasons[0])
+        reverted += 1
+    if reverted:
+        log.info(
+            "refused positions copied from the paired camera",
+            reverted=reverted,
+            of=len(filled),
+        )
+    return reverted
 
 
 async def recover_from_paired_camera(session: AsyncSession, recording: Recording) -> int:
@@ -112,6 +174,7 @@ async def recover_from_paired_camera(session: AsyncSession, recording: Recording
             if point.captured_at is not None and point.lat is not None and point.lon is not None
         }
         changed = 0
+        filled: list[TelemetryPoint] = []
         for point in target:
             quality = dict(point.quality_json or {})
             if point.has_fix or quality.get("gps_status") == "no_fix" or point.captured_at is None:
@@ -132,7 +195,26 @@ async def recover_from_paired_camera(session: AsyncSession, recording: Recording
                 p for p in quality.get("problems", []) if "position" not in str(p).lower()
             ]
             point.quality_json = quality
+            # A copied position is corroboration from the other camera, not something this
+            # recording observed, so it carries the same weight as an interpolated one:
+            # drawable, never counted as evidence for distance or for placing a sighting.
+            point.gps_quality = str(GpsQuality.INTERPOLATED)
+            point.gps_reason = None
+            filled.append(point)
             changed += 1
+
+        # Every donor is matched on the second its overlay clock printed, and that clock is
+        # read by the same OCR as everything else. A single misread digit moves it by an
+        # hour or a day, so the second it lands on may belong to a completely different
+        # part of the drive -- and nothing here had ever checked that the coordinate it
+        # brought with it made sense where it was pasted. On the live library that put a
+        # copied position 3.1 km off the route in the middle of an otherwise clean clip.
+        #
+        # Judging the filled rows against the whole target timeline is what catches it:
+        # a donor from the wrong second disagrees with the target's own fixes either side.
+        if filled:
+            reverted = _revert_implausible(target, filled)
+            changed -= reverted
         if changed:
             gaps, longest, problems, no_fix, ocr_gap, rejected = quality_rollup(target)
             target_recording.gps_recovered_count += changed

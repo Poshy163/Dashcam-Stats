@@ -102,8 +102,20 @@ def split_indices(
     *,
     max_gap_s: float = DEFAULT_MAX_GAP_S,
     max_jump_m: float = DEFAULT_MAX_JUMP_M,
+    breaks: Sequence[bool] | None = None,
 ) -> list[list[int]]:
     """Runs of indices that should each be drawn as one unbroken line.
+
+    ``breaks`` is the decision the pipeline already made, one flag per sample, marking a
+    position that must start a new line rather than continue the previous one. It is
+    honoured in addition to the geometric tests here, never instead of them.
+
+    Both exist because they know different things. The stored flag was computed where the
+    *rejected* samples were still visible, so it knows that the reason two surviving fixes
+    sit forty seconds apart is that everything between them was refused — which is exactly
+    the case the geometry cannot see, since by the time a map loads the route those rows
+    carry no coordinates at all. The geometric tests in turn cover rows written before the
+    flag existed, and anything assembled from more than one recording.
 
     See :func:`split_at_gaps`, which is this with the indices resolved to points.
     """
@@ -121,7 +133,8 @@ def split_indices(
                 and (seconds - prev_seconds) > max_gap_s
             )
             jumped = haversine_m(prev_lat, prev_lon, lat, lon) > max_jump_m
-            if gapped or jumped:
+            marked = bool(breaks[index]) if breaks is not None and index < len(breaks) else False
+            if gapped or jumped or marked:
                 if len(current) > 1:
                     runs.append(current)
                 current = []
@@ -176,6 +189,7 @@ def build_polylines(
     tolerance_m: float,
     max_gap_s: float = DEFAULT_MAX_GAP_S,
     max_jump_m: float = DEFAULT_MAX_JUMP_M,
+    breaks: Sequence[bool] | None = None,
 ) -> list[list[tuple[float, float]]]:
     """Ordered fixes to drawable lines: split first, then simplify each piece.
 
@@ -185,7 +199,8 @@ def build_polylines(
     prevent.
     """
     lines = []
-    for segment in split_at_gaps(samples, max_gap_s=max_gap_s, max_jump_m=max_jump_m):
+    for run in split_indices(samples, max_gap_s=max_gap_s, max_jump_m=max_jump_m, breaks=breaks):
+        segment = [(samples[i][0], samples[i][1]) for i in run]
         simplified = simplify(segment, tolerance_m)
         if len(simplified) > 1:
             lines.append(simplified)

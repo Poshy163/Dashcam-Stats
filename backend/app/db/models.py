@@ -388,12 +388,33 @@ class TelemetryPoint(Base):
     # widening the highest-cardinality table for every diagnostic status we learn to keep.
     quality_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # How much weight this position carries: valid / interpolated / rejected / no_fix.
+    # A column rather than another key in `quality_json` because this is the one piece of
+    # provenance that every *query* needs. The heat map aggregates in SQL, and filtering on
+    # a JSON field there means either a scan or a functional index; more importantly, the
+    # distinction it encodes was previously unavailable to SQL at all, so the heat layer
+    # had to settle for `has_fix` and drew interpolated fills at full weight alongside
+    # positions that were actually read.
+    gps_quality: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Why there is no trusted position here, from `app.osd.reasons.GpsReason`. Null when
+    # the position was accepted. Stable identifiers, so "what are we losing fixes to" is a
+    # GROUP BY rather than an afternoon reading logs.
+    gps_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # True when the route must be cut before this sample instead of joined to the previous
+    # one. Decided once, where the timing and the gaps are known, so that every map draws
+    # the same breaks rather than each re-deriving them from whatever it happened to load.
+    breaks_segment: Mapped[bool] = mapped_column(Boolean, default=False)
+
     recording: Mapped[Recording] = relationship(back_populates="telemetry")
 
     __table_args__ = (
         UniqueConstraint("recording_id", "t_offset_s", name="uq_telemetry_recording_offset"),
         Index("ix_telemetry_journey_time", "journey_id", "captured_at"),
         Index("ix_telemetry_recording_offset", "recording_id", "t_offset_s"),
+        # The heat map's hot path: every drawable position, in journey order. Including
+        # the quality keeps that query index-only rather than visiting rows to discard
+        # the rejected ones.
+        Index("ix_telemetry_quality", "gps_quality", "journey_id"),
         CheckConstraint("lat IS NULL OR (lat >= -90 AND lat <= 90)", name="ck_telemetry_lat"),
         CheckConstraint("lon IS NULL OR (lon >= -180 AND lon <= 180)", name="ck_telemetry_lon"),
     )

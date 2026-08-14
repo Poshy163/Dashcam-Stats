@@ -41,6 +41,7 @@ from app.osd.outliers import (
     robust_centre,
     spatial_outliers,
 )
+from app.osd.track_quality import MAX_ROAD_SPEED_MS
 from app.osd.validate import is_plausible_step
 
 log = get_logger(__name__)
@@ -53,9 +54,14 @@ log = get_logger(__name__)
 #: eighteen-minute drive.
 _MAX_LEG_M = 50_000.0
 
-#: Metres a vehicle could cover in a second. Mirrors the per-point ceiling in
-#: :mod:`app.osd.engine` so the two cannot disagree about what counts as travel.
-_MAX_STEP_M_PER_S = 400.0 * 1000.0 / 3600.0
+#: Metres a vehicle could cover in a second, including the overlay's own quantisation.
+#:
+#: Taken from :mod:`app.osd.track_quality` rather than restated, so the journey's idea of
+#: an impossible leg cannot drift away from the extractor's idea of an impossible step —
+#: they were 400 km/h and 400 km/h by coincidence rather than by construction, and at 1 Hz
+#: that licensed a 111 m hop every second, which is how a route could accumulate kilometres
+#: of travel through places the vehicle never went.
+_MAX_STEP_M_PER_S = MAX_ROAD_SPEED_MS
 
 #: Average speed over a whole journey beyond which its distance is not believable. Well
 #: above any real drive -- the fastest genuine journey in this corpus averages about 60 --
@@ -881,6 +887,16 @@ class JourneyBuilder:
                 anchor = (lat, lon)
                 anchor_time = captured
                 continue
+
+            # A break means nothing trustworthy was recorded between the previous position
+            # and this one, so nothing is *known* to have been travelled. The route layer
+            # already refuses to draw that leg; measuring it would put a distance on the
+            # map's own admission that it does not know the way.
+            if getattr(row, "breaks_segment", False):
+                anchor = (lat, lon)
+                anchor_time = captured
+                continue
+
             step = haversine_m(anchor[0], anchor[1], lat, lon)
 
             # A ceiling on a single leg, independent of the outlier pass above. That pass

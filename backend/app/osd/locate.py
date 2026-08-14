@@ -30,7 +30,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from app.osd.geo import haversine_m
-from app.osd.validate import is_plausible_step, is_valid_coordinate
+from app.osd.track_quality import MAX_GAP_M, reachable_radius_m
+from app.osd.validate import is_valid_coordinate
 
 #: How far from the requested moment a single fix may sit and still be used as-is.
 #:
@@ -214,7 +215,21 @@ class FixTrack:
         # which is recoverable; splitting the difference between a real position and a
         # misread one is a coordinate halfway to nowhere that nothing downstream can
         # recognise as suspect.
-        if not is_plausible_step(haversine_m(before.lat, before.lon, after.lat, after.lon), span):
+        #
+        # Judged against road speed rather than the old 400 km/h ceiling. That ceiling was
+        # chosen to catch a coordinate in the wrong hemisphere, and at this sampling rate it
+        # licensed a 111 m step every second — so a 15 s bracket could be filled across
+        # 1.6 km, and the fill was drawn as a dead-straight line of 1 Hz points each just
+        # small enough to slip under the route layer's jump threshold. That is the artefact
+        # that put straight lines through suburbs on the heat map.
+        gap_m = haversine_m(before.lat, before.lon, after.lat, after.lon)
+        if gap_m > reachable_radius_m(span):
+            return None
+
+        # Short in time is not enough; it has to be short on the ground too. Beyond this
+        # the vehicle had room to turn, and a straight line is a guess about which way —
+        # so the honest answer is that the route here is unknown.
+        if gap_m > MAX_GAP_M:
             return None
 
         ratio = (offset_s - before.t_offset_s) / span

@@ -249,6 +249,15 @@ async def get_telemetry(recording_id: RowId, session: SessionDep):
             "candidate_count": 1,
             "problems": ["quality unavailable until telemetry is reprocessed"],
         }
+        # The columns win over the JSON where both exist. A row repaired by the 0009
+        # migration has its verdict in the columns only -- the blob still describes what
+        # the old pipeline believed at the time, which is precisely what was wrong.
+        quality = {
+            **quality,
+            "gps_quality": row.gps_quality,
+            "gps_reason": row.gps_reason or quality.get("gps_reason"),
+            "breaks_segment": bool(row.breaks_segment),
+        }
         points.append(
             TelemetryPointOut.model_validate(row).model_copy(
                 update={"raw_text": row.raw_text, "quality": quality}

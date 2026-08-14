@@ -32,6 +32,7 @@ from app.api.schemas import HeatmapOut, RoutesOut
 from app.api.visibility import visible_journey_ids, visible_revision
 from app.core.logging import get_logger
 from app.db.models import Camera, CameraRole, Journey, Recording, TelemetryPoint
+from app.osd.reasons import DRAWABLE
 
 log = get_logger(__name__)
 
@@ -62,6 +63,18 @@ DEFAULT_SIMPLIFY_M = 15.0
 #: drawing than the map is worth, so the response says it was cut rather than quietly
 #: handing back a partial road network that looks complete.
 MAX_ROUTE_POINTS = 250_000
+
+
+def _drawable_quality():
+    """Positions a map may draw: read directly, or conservatively reconstructed.
+
+    ``gps_quality`` is null on rows written before it existed. Those are treated as
+    drawable on the strength of ``has_fix``, which is what every consumer relied on before
+    this column, rather than vanishing from the map until the library is reprocessed.
+    """
+    return TelemetryPoint.gps_quality.is_(None) | TelemetryPoint.gps_quality.in_(
+        [str(quality) for quality in DRAWABLE]
+    )
 
 
 @router.get("/map/heatmap", response_model=HeatmapOut)
@@ -135,6 +148,7 @@ async def heatmap(
             visible_revision(Recording.telemetry_revision),
             TelemetryPoint.lat.is_not(None),
             TelemetryPoint.lon.is_not(None),
+            _drawable_quality(),
         )
         .group_by(lat_cell, lon_cell)
         # Densest first, so a truncated response still shows the places most driven rather
@@ -229,6 +243,7 @@ async def routes(
             TelemetryPoint.captured_at,
             TelemetryPoint.t_offset_s,
             TelemetryPoint.recording_id,
+            TelemetryPoint.breaks_segment,
         )
         .join(Recording, TelemetryPoint.recording_id == Recording.id)
         .outerjoin(Camera, Recording.camera_id == Camera.id)
@@ -237,6 +252,10 @@ async def routes(
             visible_revision(Recording.telemetry_revision),
             TelemetryPoint.lat.is_not(None),
             TelemetryPoint.lon.is_not(None),
+            # Rejected positions carry no coordinate, so the nulls above already exclude
+            # them. Naming the quality as well keeps the intent legible and covers a row
+            # that was cleared by one route and not the other.
+            _drawable_quality(),
             # A rear-camera-only stretch is rare and not worth a second copy of every road.
             (Camera.role == CameraRole.FRONT) | (Camera.id.is_(None)),
         )
@@ -258,15 +277,19 @@ async def routes(
     # fixes costs a single round trip, where a query per journey is 45 of them on this
     # library and grows with every drive taken.
     by_journey: dict[int | None, list[tuple[float, float, float | None]]] = defaultdict(list)
+    breaks_by_journey: dict[int | None, list[bool]] = defaultdict(list)
     for row in (await session.execute(stmt)).all():
         seconds = row.captured_at.timestamp() if row.captured_at is not None else None
         by_journey[row.journey_id].append((float(row.lat), float(row.lon), seconds))
+        breaks_by_journey[row.journey_id].append(bool(row.breaks_segment))
 
     lines: list[list[list[float]]] = []
     points_sent = 0
     truncated = False
-    for fixes in by_journey.values():
-        for segment in build_polylines(fixes, tolerance_m=simplify_m):
+    for journey, fixes in by_journey.items():
+        for segment in build_polylines(
+            fixes, tolerance_m=simplify_m, breaks=breaks_by_journey[journey]
+        ):
             if points_sent + len(segment) > max_points:
                 truncated = True
                 break

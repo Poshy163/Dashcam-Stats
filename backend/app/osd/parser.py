@@ -23,10 +23,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 
 #: Re-exported rather than redefined. These are the rules for what may be stored as a
 #: position anywhere in the application, and having the parser own its own copy is how a
 #: coordinate could pass one layer's idea of valid and fail another's.
+from app.osd.reasons import GpsReason
 from app.osd.validate import (
     coordinate_problem,
     is_no_fix_placeholder,
@@ -96,35 +98,52 @@ _TIMESTAMP_RE = re.compile(
     rf"(?P<hour>\d{{2}}){_SEP}(?P<minute>\d{{2}}){_SEP}(?P<second>\d{{2}})(?!\d)"
 )
 
+
 #: Longitude, then latitude, then speed. Applied to the compacted text.
 #:
 #: ``(?<!\d)`` stops a coordinate being read out of the middle of a longer number, which
-#: is the same truncation the timestamp guard prevents from the other side.
-_FIX_RE = re.compile(
-    r"(?<!\d)(?P<lonsep>[^\d+-]{0,8})"
-    rf"(?P<lon>[-+]?\d{{1,3}}\.\d{{{_COORD_DECIMALS}}})"
-    r"(?P<latsep>[^\d+-]{0,8})"
-    rf"(?P<lat>[-+]?\d{{1,3}}\.\d{{{_COORD_DECIMALS}}})"
-    r"(?:[^\d]{0,6}(?P<speed>\d{1,3}))?"
-    r"(?:km/?h)?",
-    re.IGNORECASE | re.DOTALL,
-)
+#: is the same truncation the timestamp guard prevents from the other side, and the
+#: trailing ``(?!\d)`` on each fraction stops the converse: a fraction running on into the
+#: digits of the field after it, which is how ``E:138.65124:-34.7981 0 km/h`` used to
+#: yield a longitude one digit too long and a latitude that had swallowed the speed.
+#:
+#: Tolerant fallback for an overlay whose separators decoded badly. Run against the same
+#: compacted text and from the same offset as the strict pattern, which is what keeps it
+#: honest: an earlier version matched the spaced text and allowed whitespace around the
+#: decimal point, so on ``22:52:13 .6848`` it spliced the timestamp's seconds onto the
+#: fraction and reported a longitude of ``13.6848`` — ten thousand kilometres from the
+#: drive it belonged to.
+#:
+#: It differs from the strict pattern only in how much punctuation it tolerates *between*
+#: the fields. It deliberately does **not** relax the fraction width. An earlier version
+#: accepted one to six digits there, on the reasoning that another camera might print a
+#: different precision, and that single allowance was the largest source of wrong positions
+#: in the live library — see :func:`_precision_is_expected`. A camera that really does print
+#: a different width is served by the ``telemetry.coordinate_decimals`` setting, which
+#: rebuilds both patterns, rather than by letting every damaged frame invent its own format.
+@lru_cache(maxsize=8)
+def _fix_patterns(decimals: int) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """The strict and tolerant coordinate patterns for an overlay of this precision."""
+    strict = re.compile(
+        r"(?<!\d)(?P<lonsep>[^\d+-]{0,8})"
+        rf"(?P<lon>[-+]?\d{{1,3}}\.\d{{{decimals}}})"
+        r"(?P<latsep>[^\d+-]{0,8})"
+        rf"(?P<lat>[-+]?\d{{1,3}}\.\d{{{decimals}}})"
+        r"(?:[^\d]{0,6}(?P<speed>\d{1,3}))?"
+        r"(?:km/?h)?",
+        re.IGNORECASE | re.DOTALL,
+    )
+    loose = re.compile(
+        r"(?<!\d)(?P<lonsep>[^\d+-]{0,8})"
+        rf"(?P<lon>[-+]?\d{{1,3}}\.\d{{{decimals}}})(?!\d)"
+        r"(?P<latsep>[^\d+-]{0,8})"
+        rf"(?P<lat>[-+]?\d{{1,3}}\.\d{{{decimals}}})(?!\d)"
+        r"(?:[^\d]{0,8}(?P<speed>\d{1,3}))?"
+        r"(?:km/?h)?",
+        re.IGNORECASE | re.DOTALL,
+    )
+    return strict, loose
 
-#: Tolerant fallback for a camera whose overlay prints a different precision. Run against
-#: the same compacted text and from the same offset as the strict pattern, which is what
-#: keeps it honest: an earlier version matched the spaced text and allowed whitespace
-#: around the decimal point, so on ``22:52:13 .6848`` it spliced the timestamp's seconds
-#: onto the fraction and reported a longitude of ``13.6848`` — ten thousand kilometres
-#: from the drive it belonged to.
-_FIX_LOOSE_RE = re.compile(
-    r"(?<!\d)(?P<lonsep>[^\d+-]{0,8})"
-    r"(?P<lon>[-+]?\d{1,3}\.\d{1,6})"
-    r"(?P<latsep>[^\d+-]{0,8})"
-    r"(?P<lat>[-+]?\d{1,3}\.\d{1,6})"
-    r"(?:[^\d]{0,8}(?P<speed>\d{1,3}))?"
-    r"(?:km/?h)?",
-    re.IGNORECASE | re.DOTALL,
-)
 
 #: A final, labelled fallback for the failure that dominates sunlit rear-camera footage.
 #:
@@ -138,13 +157,19 @@ _FIX_LOOSE_RE = re.compile(
 #: camera's fixed four fraction digits, and a non-digit in the decimal cell is much tighter
 #: than globally replacing punctuation. The ordinary patterns always run first; this only
 #: recovers an otherwise missing pair.
-_LABELLED_DAMAGED_FIX_RE = re.compile(
-    r"E(?P<lonprefix>[^\d]{1,5})(?P<lonwhole>\d{1,3})(?P<lonpoint>[^\d]{1,2})"
-    rf"(?P<lonfrac>\d{{{_COORD_DECIMALS}}}).{{0,6}}?N"
-    r"(?P<latprefix>[^\d]{1,6})(?P<latwhole>\d{1,3})(?P<latpoint>[^\d]{1,2})"
-    rf"(?P<latfrac>\d{{{_COORD_DECIMALS}}})",
-    re.IGNORECASE | re.DOTALL,
-)
+@lru_cache(maxsize=8)
+def _labelled_damaged_pattern(decimals: int) -> re.Pattern[str]:
+    return re.compile(
+        r"E(?P<lonprefix>[^\d]{1,5})(?P<lonwhole>\d{1,3})(?P<lonpoint>[^\d]{1,2})"
+        rf"(?P<lonfrac>\d{{{decimals}}})(?!\d).{{0,6}}?N"
+        r"(?P<latprefix>[^\d]{1,6})(?P<latwhole>\d{1,3})(?P<latpoint>[^\d]{1,2})"
+        # No ``(?!\d)`` after the latitude: in compacted text the speed's digits run
+        # straight on from it, so requiring a non-digit here can never hold. The fixed
+        # fraction width and the ``E``/``N`` labels are what keep this anchored.
+        rf"(?P<latfrac>\d{{{decimals}}})",
+        re.IGNORECASE | re.DOTALL,
+    )
+
 
 #: Speed on its own, anchored on the trailing ``km/h``. That literal is four glyphs at a
 #: fixed place on the line and decodes reliably, which makes it a dependable anchor when
@@ -175,6 +200,9 @@ class OsdReading:
     time_status: str = "parse_failed"
     #: ``valid``, ``no_fix``, ``parse_failed`` or ``rejected``.
     gps_status: str = "parse_failed"
+    #: Machine-readable counterpart to whichever ``problems`` entry explains the position.
+    #: ``None`` on a clean read. See :class:`app.osd.reasons.GpsReason`.
+    gps_reason: GpsReason | None = None
 
     @property
     def valid(self) -> bool:
@@ -216,6 +244,36 @@ def _sign_is_ambiguous(separator: str | None, value: str | None) -> bool:
     return separator[-1] in _DOTLIKE
 
 
+def _fraction_width(value: str | None) -> int | None:
+    """How many digits this coordinate printed after the decimal point."""
+    if not value or "." not in value:
+        return None
+    return len(value.rsplit(".", 1)[1])
+
+
+def _precision_is_expected(lon: str | None, lat: str | None, decimals: int) -> bool:
+    """Did both coordinates print the width this overlay is known to use?
+
+    The camera formats both fields with one formatter, so the fraction width is a property
+    of the *overlay*, not of any single frame. A read that disagrees with it did not
+    observe a different place — it observed the same place badly.
+
+    This is the check that the tolerant pattern used to lack, and its absence was the
+    single largest source of wrong positions in the live library. Glyph segmentation infers
+    spaces from pixel gaps, so a wide gap splits a number: ``E:138.6510`` decodes as
+    ``E:138.6 510`` and a pattern willing to accept one fraction digit reports ``138.6`` —
+    a legal longitude 4.7 km west, at 0.94 classifier confidence, indistinguishable
+    downstream from a place the vehicle really was.
+
+    Width alone also catches the greedy converse, which symmetry between the two fields
+    does not: on ``E:138.65124:-34.7981 0 km/h`` a 1-to-6-digit pattern reads the longitude
+    one digit too long *and* absorbs the speed's leading zero into the latitude, leaving
+    both fields five digits wide and in perfect agreement with each other while the
+    longitude is wrong.
+    """
+    return _fraction_width(lon) == decimals and _fraction_width(lat) == decimals
+
+
 def _parse_timestamp(groups: dict[str, str], problems: list[str]) -> datetime | None:
     try:
         year = int(groups["year"])
@@ -236,7 +294,9 @@ def _parse_timestamp(groups: dict[str, str], problems: list[str]) -> datetime | 
         return None
 
 
-def _recover_labelled_coordinates(compact: str, start: int) -> dict[str, str | None] | None:
+def _recover_labelled_coordinates(
+    compact: str, start: int, decimals: int = _COORD_DECIMALS
+) -> dict[str, str | None] | None:
     """Recover labelled coordinates whose punctuation cells were OCR'd as other glyphs.
 
     No digit is corrected, inserted or removed here. The only inference is that the one or
@@ -244,7 +304,7 @@ def _recover_labelled_coordinates(compact: str, start: int) -> dict[str, str | N
     That keeps this useful for ``138:7013`` without turning arbitrary numbers in the scene
     or timestamp into a location.
     """
-    match = _LABELLED_DAMAGED_FIX_RE.search(compact, start)
+    match = _labelled_damaged_pattern(decimals).search(compact, start)
     if match is None:
         return None
     found = match.groupdict()
@@ -267,6 +327,7 @@ def parse_osd_text(
     *,
     confidence: float = 0.0,
     max_speed_kmh: float = DEFAULT_MAX_SPEED_KMH,
+    coord_decimals: int = _COORD_DECIMALS,
 ) -> OsdReading:
     """Turn a decoded overlay string into a validated reading.
 
@@ -295,11 +356,18 @@ def parse_osd_text(
     # match: a ``-`` that decoded as ``.`` can turn ``2026-07-31`` into something with the
     # shape of a coordinate, and matching that would invent a position from the clock.
     search_from = stamp.end() if stamp else 0
-    match = _FIX_RE.search(compact, search_from) or _FIX_LOOSE_RE.search(compact, search_from)
-    recovered_groups = None if match else _recover_labelled_coordinates(compact, search_from)
+    strict_re, loose_re = _fix_patterns(coord_decimals)
+    match = strict_re.search(compact, search_from) or loose_re.search(compact, search_from)
+    recovered_groups = (
+        None if match else _recover_labelled_coordinates(compact, search_from, coord_decimals)
+    )
     groups = match.groupdict() if match else recovered_groups or {}
     if match is None and recovered_groups is None:
         problems.append("GPS fields unreadable")
+        # Covers the commonest damage of all: digits lost to a pixel gap, so the fields no
+        # longer have the overlay's shape. Naming it here rather than leaving the reason
+        # null is what makes "why did this recording lose its positions" answerable.
+        reading.gps_reason = GpsReason.COORDINATE_PARSE_FAILURE
     elif recovered_groups is not None:
         problems.append("coordinate punctuation recovered from labelled overlay fields")
 
@@ -313,10 +381,21 @@ def parse_osd_text(
             lon = lat = None
 
     if lat is not None and lon is not None:
-        if _sign_is_ambiguous(groups.get("latsep"), groups.get("lat")) or _sign_is_ambiguous(
+        if not _precision_is_expected(groups.get("lon"), groups.get("lat"), coord_decimals):
+            # A partial read is the one failure that produces a *legal* coordinate, so it
+            # has to be caught here on the shape of the text. By the time it is two floats
+            # nothing downstream can tell 138.6 from a place the vehicle really was.
+            reading.gps_status = "rejected"
+            reading.gps_reason = GpsReason.COORDINATE_PARSE_FAILURE
+            problems.append(
+                f"coordinate precision inconsistent (lon {groups.get('lon')!r}, "
+                f"lat {groups.get('lat')!r}); digits were lost or gained in the read"
+            )
+        elif _sign_is_ambiguous(groups.get("latsep"), groups.get("lat")) or _sign_is_ambiguous(
             groups.get("lonsep"), groups.get("lon")
         ):
             reading.gps_status = "rejected"
+            reading.gps_reason = GpsReason.COORDINATE_PARSE_FAILURE
             problems.append(
                 "coordinate sign ambiguous; refused rather than risk a wrong hemisphere"
             )
@@ -327,8 +406,10 @@ def parse_osd_text(
             if not is_no_fix_placeholder(lat, lon):
                 problems.append(problem)
                 reading.gps_status = "rejected"
+                reading.gps_reason = GpsReason.INVALID_LAT_LON
             else:
                 reading.gps_status = "no_fix"
+                reading.gps_reason = GpsReason.NO_FIX
             reading.has_fix = False
         else:
             reading.lat = lat
