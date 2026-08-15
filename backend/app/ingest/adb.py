@@ -68,8 +68,25 @@ class CardNotFound(AdbError):
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
+#: A plain web address, and the only thing ever put into ``am start -d``.
+#:
+#: This one is the operator's own setting rather than whatever is on a removable card, which
+#: makes it *less* hostile and not safe to leave unchecked: it still ends up inside a
+#: single-quoted string that the unit's shell parses, and one stray quote there would close
+#: the string and hand the remainder to ``sh``. Checking it against the shape a LAN address
+#: actually has is cheaper than escaping, and it fails loudly instead of quietly starting
+#: something else.
+_SAFE_URL = re.compile(
+    r"^https?://[A-Za-z0-9._~-]+(:\d{1,5})?(/[A-Za-z0-9._~/%-]*)?(\?[A-Za-z0-9._~/%=&-]*)?$"
+)
+
+
 def is_safe_name(name: str) -> bool:
     return bool(_SAFE_NAME.match(name)) and ".." not in name
+
+
+def is_safe_url(url: str) -> bool:
+    return len(url) <= 300 and bool(_SAFE_URL.match(url))
 
 
 def _checked(name: str) -> str:
@@ -136,6 +153,46 @@ async def shell(address: str, command: str, *, timeout: float = CONTROL_TIMEOUT_
     return result.stdout.replace("\r", "")
 
 
+#: How long to wait for the unit's ADB port to answer during the presence tick.
+#:
+#: Short on purpose. On the home LAN a unit that is there answers in single-digit
+#: milliseconds, and one that is not is an ARP miss -- so this is really "how long to wait
+#: before concluding the car is out".
+PRESENCE_TIMEOUT_S = 0.4
+
+
+async def is_listening(address: str) -> bool:
+    """Whether anything answers on the unit's ADB port, without involving adb at all.
+
+    The presence tick used to be three ``adb`` process spawns -- disconnect, connect,
+    get-state -- every few seconds, all day, whether or not the car was within a kilometre.
+    This is one socket, and making the tick cheap is what makes it affordable to look often
+    enough to matter: the whole window is sixty to a hundred and twenty seconds, and at
+    34 MB/s every second spent not noticing the car is ~34 MB of footage that stays on the
+    card until tomorrow.
+
+    Deliberately not a substitute for :func:`describe`. An open port says something is
+    listening, not that it is authorised or that its card is mounted, so this only decides
+    whether asking the expensive question is worth it.
+    """
+    host, _, port = address.partition(":")
+    # An empty host is not "localhost" here, whatever asyncio would make of it. An
+    # unconfigured address must read as "no unit", not as a connection to this container.
+    if not host.strip():
+        return False
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, int(port or "5555")),
+            timeout=PRESENCE_TIMEOUT_S,
+        )
+    except (TimeoutError, OSError, ValueError):
+        return False
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+    return True
+
+
 async def reconnect(address: str) -> None:
     """Re-establish the control channel before every cycle.
 
@@ -173,19 +230,24 @@ async def resolve_source(address: str, override: str = "") -> str:
 async def inventory(address: str, source: str) -> list[RemoteFile]:
     """List the card's recordings as ``size|name|mtime``.
 
-    ``stat`` per file rather than ``ls -l`` because the output is unambiguous to parse and
-    the field order is ours to choose. This is the only listing of the card we take, and it
-    is a few kilobytes for a full card.
+    ``stat`` rather than ``ls -l`` because the output is unambiguous to parse and the field
+    order is ours to choose. This is the only listing of the card we take, and it is a few
+    kilobytes for a full card.
+
+    One ``stat`` for the whole card, not one per file. The loop this replaced spawned a
+    process per recording -- around 140 on a full card -- on a SoC that is not fast at
+    spawning processes, and it ran inside the window rather than before it. ``stat`` takes
+    as many operands as you give it, and a full card's worth of names is roughly 4 KB of
+    argv, nowhere near ``ARG_MAX``. Word splitting is not a risk here even though the glob
+    is unquoted: the results of pathname expansion are not field-split, so a name with a
+    space in it still arrives as one operand -- and anything that does not look like one of
+    the camera's own filenames is dropped below regardless.
     """
-    # The trailing `exit 0` is not decoration. On an empty card the loop's last statement
-    # is a failed `[ -e '*.ts' ]`, so the shell exits non-zero and `shell()` would raise --
-    # turning "there is nothing to copy" into a control-channel failure. An empty card is
-    # the *expected* steady state once delete-after-verify is on, so every run after the
-    # first would have failed.
-    command = (
-        f"cd '{source}' && for f in *.ts; do [ -e \"$f\" ] && stat -c '%s|%n|%Y' \"$f\"; "
-        "done; exit 0"
-    )
+    # The trailing `exit 0` is not decoration. On an empty card `*.ts` matches nothing, so
+    # the guard fails and the shell would exit non-zero -- turning "there is nothing to
+    # copy" into a control-channel failure. An empty card is the *expected* steady state
+    # once delete-after-verify is on, so every run after the first would have failed.
+    command = f"cd '{source}' && set -- *.ts && [ -e \"$1\" ] && stat -c '%s|%n|%Y' *.ts; exit 0"
     files: list[RemoteFile] = []
     for line in (await shell(address, command)).splitlines():
         parts = line.strip().split("|")
@@ -264,14 +326,58 @@ async def launch_listener(
     )
 
 
-async def stop_listener(proc: asyncio.subprocess.Process | None) -> None:
-    """End the adb session carrying the listener, once the stream is done with."""
+async def stop_listener(proc: asyncio.subprocess.Process | None) -> bool:
+    """End the adb session carrying the listener. True if it was still running.
+
+    The return value is free diagnostics, and it answers a question the logs could not
+    previously answer at all. The adb session *is* the listener's lifetime, so finding it
+    still alive means the unit was still serving when this side stopped reading -- the car
+    pulled away, the ordinary ending this whole design expects. Finding it already exited
+    means the **unit** stopped first: ``tar`` failed, ``nc`` died, or the remote ``timeout``
+    fired. Both used to surface as the identical "the stream ended with N file(s) still to
+    come", which is the one message that gives an operator nowhere to look.
+    """
     if proc is None or proc.returncode is not None:
-        return
+        return False
     with contextlib.suppress(ProcessLookupError):
         proc.kill()
     with contextlib.suppress(TimeoutError, Exception):
         await asyncio.wait_for(proc.wait(), timeout=5.0)
+    return True
+
+
+async def show_url(address: str, url: str) -> None:
+    """Open a web page on the unit's own screen.
+
+    This is how the car shows what is being copied, and without installing anything it is
+    the only way to show a real progress bar. AOSP's ``cmd notification post`` cannot: its
+    shell command has no ``setProgress``, no ``setOngoing`` and no ``setOnlyAlertOnce``, so
+    a notification could only ever be plain text that re-alerts on every update. The app
+    already serves a live Backup page, so pointing the unit's browser at it costs nothing
+    and stays in step with the dashboard by construction.
+
+    Never raises, and never reports failure upward. A unit with no browser answers "Error:
+    Activity not started, unable to resolve Intent", and a courtesy on the car's screen has
+    no business turning a working transfer into a failed one.
+    """
+    if not is_safe_url(url):
+        log.warning("refusing to open a URL that is not a plain web address", url=url[:120])
+        return
+    try:
+        # `-d` rather than a component: an implicit VIEW intent lets whatever browser the
+        # vendor shipped answer, instead of this needing to know its package name.
+        reply = await shell(
+            address,
+            f"am start -a android.intent.action.VIEW -d '{url}'",
+            timeout=10.0,
+        )
+    except AdbError as exc:
+        log.warning("could not open the backup page on the head unit", error=str(exc))
+        return
+    # `am` reports "no browser" on stdout with a zero exit status, so the return code alone
+    # would call that a success and leave nobody any the wiser about a blank screen.
+    if "Error" in reply:
+        log.warning("the head unit would not open the backup page", reply=reply[:200])
 
 
 async def delete(address: str, source: str, names: list[str]) -> int:

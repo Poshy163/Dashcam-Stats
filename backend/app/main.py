@@ -30,6 +30,7 @@ from app.core.logging import configure_logging, get_logger, install_db_sink, shu
 from app.core.settings_service import get_settings_service, init_settings_service
 from app.db.session import dispose_engine, get_session_factory, init_db
 from app.hardware.ffmpeg import media_health
+from app.ingest import origin
 from app.ingest.poller import get_poller
 from app.pipeline.stages import warm_models
 from app.workers import queue
@@ -261,6 +262,14 @@ def _mount_frontend(app: FastAPI) -> None:
         # return the HTML shell with a 200 instead of a 404, which is maddening to debug.
         if full_path.startswith(("api/", "media/", "stream/", "health")):
             return JSONResponse({"detail": "Not found"}, status_code=404)
+
+        # A browser has this app open, so it has just proved which address reaches it --
+        # the one thing a bridged container cannot discover about itself, and the one the
+        # dashcam's own browser needs in order to show the Backup page while a transfer
+        # runs. Taken here rather than in middleware precisely because this route serves
+        # the dashboard and nothing else: an API caller's idea of this app's address is
+        # its own, and Home Assistant's is usually a container name no car could resolve.
+        origin.remember(request.url.scheme, request.headers.get("host", ""))
 
         candidate = FRONTEND_DIST / full_path
         if (

@@ -41,7 +41,11 @@ log = get_logger(__name__)
 #: few hundred milliseconds of "connection refused" while the unit gets ``nc`` up is
 #: normal rather than an error.
 CONNECT_RETRY_S = 10.0
-CONNECT_RETRY_INTERVAL_S = 0.25
+#: Tight, because this interval is pure dead window. The listener comes up in a few hundred
+#: milliseconds and the wait is whatever is left of the current gap when it does -- so the
+#: interval is the error bar on the start of every transfer. A refused connection on the LAN
+#: costs a round trip and an RST, which is nothing next to the footage the gap represents.
+CONNECT_RETRY_INTERVAL_S = 0.05
 
 #: Read timeout once connected. Generous: a stall this long means the car has gone.
 SOCKET_TIMEOUT_S = 30.0

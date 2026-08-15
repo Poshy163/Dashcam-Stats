@@ -922,11 +922,13 @@ SETTINGS: tuple[SettingDef, ...] = (
         "ingest.poll_interval_s",
         "Presence check interval",
         "int",
-        8,
+        2,
         "ingest",
         "How often to look for the head unit. The unit has no battery, so it is only on the "
-        "network while the engine is running — often only a minute or two.",
-        minimum=3,
+        "network while the engine is running — often only a minute or two, and seconds spent "
+        "not noticing it are footage left on the card. A check costs one connection attempt "
+        "that fails immediately when the car is out, so checking often is cheap.",
+        minimum=1,
         maximum=300,
         unit="seconds",
         requires="ingest.enabled",
@@ -967,6 +969,46 @@ SETTINGS: tuple[SettingDef, ...] = (
         "Copying only the road-facing lens halves the data if the interior camera is not wanted.",
         choices=(("both", "Both cameras"), ("camera_0", "Front only"), ("camera_1", "Rear only")),
         requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.transfer_order",
+        "Copy order",
+        "select",
+        "oldest_first",
+        "ingest",
+        "Oldest first keeps the library contiguous and is right while the camera is nearly "
+        "caught up. Switch to newest first if the backlog is permanently larger than one "
+        "driveway window — otherwise every window goes on the oldest recordings and today's "
+        "drive is never reached.",
+        choices=(("oldest_first", "Oldest first"), ("newest_first", "Newest first")),
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.show_on_unit",
+        "Show the backup page on the dashcam screen",
+        "bool",
+        False,
+        "ingest",
+        "Opens this app's Backup page on the head unit's own screen when a transfer starts, "
+        "so the car shows what is being copied. Nothing is installed for it. The address is "
+        "worked out on its own — whatever you open this dashboard on is what the car is sent "
+        "to — so there is normally nothing to configure. It only fires when there is "
+        "something to copy, and nothing puts the previous screen back afterwards. Worth "
+        "knowing that a transfer can begin while you are still manoeuvring, so this can take "
+        "the screen over mid-park.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.unit_display_url",
+        "Dashcam screen address",
+        "string",
+        "",
+        "ingest",
+        "Leave blank. The address is normally learned from however you open this dashboard, "
+        "which is by definition one that works on this network. Fill it in only if the car "
+        "needs a different one — behind a reverse proxy whose hostname the head unit cannot "
+        "resolve, for instance. Example: http://192.168.1.16:8199/backup.",
+        requires="ingest.show_on_unit",
     ),
     SettingDef(
         "ingest.delete_after_verify",

@@ -18,15 +18,20 @@ import contextlib
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
-from app.ingest import puller
+from app.ingest import adb, puller
 from app.ingest.models import RunState, UnitState
 from app.ingest.status import get_status
 
 log = get_logger(__name__)
 
-#: Floor on the poll interval. Each tick is two sub-second ADB control calls, so this is
-#: cheap, but it is still a subprocess pair and not worth spinning on.
-MIN_POLL_S = 3.0
+#: Floor on the poll interval.
+#:
+#: A tick against an absent car is now one TCP connect that fails in under half a second,
+#: not the three ``adb`` process spawns it used to be, so looking often is affordable in a
+#: way it was not. That matters more than it sounds: the window is sixty to a hundred and
+#: twenty seconds and the transfer runs at ~34 MB/s, so four seconds spent not noticing the
+#: car has arrived is about 140 MB of footage that waits until tomorrow.
+MIN_POLL_S = 1.0
 
 
 class IngestPoller:
@@ -72,6 +77,12 @@ class IngestPoller:
         except Exception:
             return False
 
+    def _address(self) -> str:
+        try:
+            return str(get_settings_service().get_nowait("ingest.unit_adb_address") or "").strip()
+        except Exception:
+            return ""
+
     async def _loop(self) -> None:
         status = get_status()
         while self._running:
@@ -90,6 +101,20 @@ class IngestPoller:
                     await asyncio.sleep(max(MIN_POLL_S, 15.0))
                     continue
 
+                # One socket before three subprocesses. The car is absent for all but a few
+                # minutes of the day, and on every one of those ticks the expensive question
+                # -- reconnect, get-state, resolve the card -- has the same answer as a
+                # refused connection to the ADB port, for a small fraction of the cost.
+                # Nothing is concluded from an *open* port beyond "worth asking properly":
+                # it says something is listening, not that it is authorised or that its card
+                # is mounted, and both of those still come from `describe`.
+                if not await adb.is_listening(self._address()):
+                    status.set_unit_online(False)
+                    status.set_state(RunState.OFFLINE)
+                    self._was_online = False
+                    await asyncio.sleep(self._interval())
+                    continue
+
                 info = await puller.probe_unit()
                 status.set_unit_online(info.online)
                 if info.state is UnitState.UNAUTHORIZED:
@@ -103,7 +128,13 @@ class IngestPoller:
                         # Not awaited: a pull runs for as long as the window lasts and the
                         # poll has to keep ticking underneath it. `start_run` keeps the
                         # reference so the task cannot be collected and shutdown can find it.
-                        puller.start_run(trigger="auto")
+                        #
+                        # `info` is handed over rather than left to be re-derived. This
+                        # describe has just reconnected and resolved the card one line
+                        # above; doing it again inside the run tore down the link it had
+                        # only just proven good, and paid for the round trip twice at the
+                        # most expensive moment of the day.
+                        puller.start_run(trigger="auto", info=info)
                     self._was_online = True
             except asyncio.CancelledError:
                 raise

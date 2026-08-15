@@ -61,6 +61,19 @@ class FakeProcess:
         return self.returncode or 0
 
 
+async def _settle() -> None:
+    """Let the run's fire-and-forget side effects finish.
+
+    Reporting and the head unit's screen are deliberately not awaited by the transfer, so a
+    test that wants to see them has to say so rather than race them.
+    """
+    from app.ingest import puller
+
+    pending = list(puller._side_tasks)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
 def _serve(payload: bytes, *, truncate_at: int | None = None) -> int:
     """Serve *payload* once on a loopback port, like the unit's `nc -l`. Returns the port."""
     listener = socket.socket()
@@ -118,6 +131,25 @@ class TestTheDelta:
 
         assert [item.name for item in plan.files] == ["20260812120000_camera_0.ts"]
         assert plan.active_skipped == 1
+
+    def test_the_copy_order_can_be_reversed_so_a_big_backlog_does_not_starve(self, tmp_path):
+        """Oldest-first is only right while the backlog fits in a window.
+
+        Once it does not, every window goes on the oldest recordings and today's drive is
+        never reached at all.
+        """
+        remote = [
+            RemoteFile("20260812120000_camera_0.ts", 100, 0),
+            RemoteFile("20260812130000_camera_0.ts", 100, 0),
+            RemoteFile("20260812140000_camera_0.ts", 100, 0),
+        ]
+        names = sorted(item.name for item in remote)
+
+        oldest = delta(remote, tmp_path, skip_active_s=15, camera="both")
+        newest = delta(remote, tmp_path, skip_active_s=15, camera="both", newest_first=True)
+
+        assert [item.name for item in oldest.files] == names
+        assert [item.name for item in newest.files] == list(reversed(names))
 
     def test_the_camera_filter_still_counts_the_backlog(self, tmp_path):
         """Filtering changes what is fetched, not what is known to be outstanding."""
@@ -346,6 +378,27 @@ class TestTheAdbControlChannel:
         assert len(files) == 1
         assert files[0] == RemoteFile("20260812120000_camera_0.ts", 104857600, 1786000000)
 
+    async def test_the_card_is_listed_with_one_process_not_one_per_file(self, monkeypatch):
+        """A full card is ~140 recordings, and this runs inside the driveway window.
+
+        The loop this replaced spawned a `stat` per recording on a SoC that is not quick
+        at spawning anything.
+        """
+        from app.ingest import adb
+
+        captured: list[str] = []
+
+        async def fake_shell(address, command, **kwargs):
+            captured.append(command)
+            return ""
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+        await adb.inventory("unit:5555", "/src")
+
+        assert "for f in" not in captured[0], "the per-file loop is back"
+        assert captured[0].count("stat -c") == 1
+        assert captured[0].rstrip().endswith("exit 0"), "an empty card must not fail the call"
+
     async def test_the_listener_is_launched_without_waiting_for_adb(self, monkeypatch):
         """`adb shell` does not return for this, and waiting for it is what broke.
 
@@ -390,10 +443,25 @@ class TestTheAdbControlChannel:
         from app.ingest import adb
 
         proc = FakeProcess(dies_on_kill=True)
-        await adb.stop_listener(proc)
+        was_serving = await adb.stop_listener(proc)
 
         assert proc.killed
         assert proc.returncode is not None
+        assert was_serving, "a session we had to kill means the unit was still serving"
+
+    async def test_a_listener_that_died_on_its_own_is_reported_as_such(self):
+        """Which side stopped first is the difference between a fault and a normal ending.
+
+        Still serving when we stopped reading = the car pulled away. Already gone = the
+        unit gave up, and that is somebody's problem.
+        """
+        from app.ingest import adb
+
+        proc = FakeProcess()
+        proc.returncode = 1  # `tar` failed, or the remote `timeout` fired
+
+        assert await adb.stop_listener(proc) is False
+        assert not proc.killed, "an exited session must not be killed again"
 
     async def test_a_stale_listener_is_cleared_first(self, monkeypatch):
         """An orphan is serving a *previous* run's file list, not this one's."""
@@ -482,6 +550,306 @@ class TestTheAdbControlChannel:
 
         monkeypatch.setattr(adb, "shell", fail)
         await adb.launch_listener("unit:5555", "/src", [], port=9000, timeout_s=180)
+
+
+class TestThePresenceProbe:
+    """The tick that runs all day. It has to be cheap, and it has to be right about absence."""
+
+    async def test_an_open_port_is_seen(self):
+        from app.ingest import adb
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        try:
+            assert await adb.is_listening(f"127.0.0.1:{listener.getsockname()[1]}")
+        finally:
+            listener.close()
+
+    async def test_a_closed_port_reads_as_the_car_being_out(self, monkeypatch):
+        from app.ingest import adb
+
+        monkeypatch.setattr(adb, "PRESENCE_TIMEOUT_S", 0.3)
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        listener.close()
+
+        assert not await adb.is_listening(f"127.0.0.1:{port}")
+
+    @pytest.mark.parametrize("address", ["", "   ", ":5555"])
+    async def test_an_unconfigured_address_never_connects_to_ourselves(self, address):
+        """An empty host is not localhost, whatever asyncio would otherwise make of it."""
+        from app.ingest import adb
+
+        assert not await adb.is_listening(address)
+
+    async def test_it_spawns_nothing(self, monkeypatch):
+        """The entire point: the car is absent for all but a few minutes of the day.
+
+        This used to be three `adb` process spawns per tick, which is what kept the
+        interval long enough to lose a meaningful slice of the window to it.
+        """
+        from app.ingest import adb
+
+        async def forbidden(*args, **kwargs):
+            raise AssertionError("the cheap presence check spawned a subprocess")
+
+        monkeypatch.setattr(adb.asyncio, "create_subprocess_exec", forbidden)
+        monkeypatch.setattr(adb, "PRESENCE_TIMEOUT_S", 0.3)
+
+        await adb.is_listening("127.0.0.1:1")
+
+
+class TestTheUnitDisplay:
+    """Putting the Backup page on the head unit's own screen while a transfer runs.
+
+    The only way to show a real progress bar on the car without installing anything: AOSP's
+    `cmd notification post` has no setProgress, no setOngoing and no setOnlyAlertOnce, so a
+    notification could only ever be text that re-alerts on every update.
+    """
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            "http://h:8098/b'; rm -rf /storage/Tfcard; echo '",
+            "http://h:8098/$(reboot)",
+            "http://h:8098/`id`",
+            "http://h:8098/a b",
+            "http://h:8098/x\nam force-stop com.example",
+            "http://h:8098/x; reboot",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "",
+            "http://" + "a" * 400,
+        ],
+    )
+    def test_only_a_plain_web_address_is_accepted(self, hostile):
+        from app.ingest.adb import is_safe_url
+
+        assert not is_safe_url(hostile)
+
+    @pytest.mark.parametrize(
+        "good",
+        [
+            "http://192.168.1.10:8098/backup",
+            "https://dashcam.example.com/backup",
+            "http://nas:8098/backup?tab=history",
+            "http://nas:8098",
+        ],
+    )
+    def test_an_ordinary_lan_address_is_allowed(self, good):
+        from app.ingest.adb import is_safe_url
+
+        assert is_safe_url(good)
+
+    async def test_a_refused_url_never_reaches_a_shell(self, monkeypatch):
+        from app.ingest import adb
+
+        async def fail(*args, **kwargs):
+            raise AssertionError("a URL that is not a plain web address reached a shell")
+
+        monkeypatch.setattr(adb, "shell", fail)
+        await adb.show_url("u:5555", "http://h/'; reboot; echo '")
+
+    async def test_a_unit_with_no_browser_is_not_a_transfer_failure(self, monkeypatch):
+        """`am` reports this on stdout with a zero exit status, so it is easy to miss."""
+        from app.ingest import adb
+
+        async def fake_shell(address, command, **kwargs):
+            assert "am start -a android.intent.action.VIEW" in command
+            return "Error: Activity not started, unable to resolve Intent"
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+        await adb.show_url("u:5555", "http://nas:8098/backup")
+
+    async def test_a_control_channel_failure_is_swallowed(self, monkeypatch):
+        from app.ingest import adb
+
+        async def fake_shell(address, command, **kwargs):
+            raise adb.AdbError("device offline")
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+        await adb.show_url("u:5555", "http://nas:8098/backup")
+
+
+class TestTheAppsOwnAddress:
+    """Learned from the browser, because a bridged container cannot know it.
+
+    The addresses on this app's own interfaces are the container's; the one that reaches it
+    is the host's LAN address and the *published* port, and neither exists inside the
+    container. Whatever address the dashboard was opened on is, by definition, one that
+    works on this network.
+    """
+
+    def setup_method(self):
+        from app.ingest import origin
+
+        origin.reset_for_tests()
+
+    def test_the_dashboard_address_becomes_the_cars_address(self):
+        from app.ingest import origin
+
+        origin.remember("http", "192.168.1.16:8199")
+
+        assert origin.backup_url() == "http://192.168.1.16:8199/backup"
+
+    def test_it_is_a_url_the_control_channel_will_accept(self):
+        """Whatever is learned still has to survive the allowlist before it is used."""
+        from app.ingest import origin
+        from app.ingest.adb import is_safe_url
+
+        origin.remember("http", "192.168.1.16:8199")
+
+        assert is_safe_url(origin.backup_url())
+
+    @pytest.mark.parametrize(
+        "host",
+        ["localhost:8199", "127.0.0.1:8199", "[::1]:8199", "0.0.0.0:8199", "", "   "],
+    )
+    def test_an_address_only_this_machine_can_use_is_refused(self, host):
+        """The head unit resolving "localhost" would reach itself, not this app."""
+        from app.ingest import origin
+
+        origin.remember("http", host)
+
+        assert origin.backup_url() == ""
+
+    def test_moving_the_app_is_picked_up_on_the_next_page_load(self):
+        from app.ingest import origin
+
+        origin.remember("http", "192.168.1.16:8199")
+        origin.remember("http", "192.168.1.20:9000")
+
+        assert origin.backup_url() == "http://192.168.1.20:9000/backup"
+
+    def test_nothing_is_known_before_anybody_opens_the_dashboard(self):
+        from app.ingest import origin
+
+        assert origin.backup_url() == ""
+
+
+class TestLearningTheAddressFromTheDashboard:
+    """The hook sits on the route that serves the dashboard, and deliberately nowhere else."""
+
+    @pytest.fixture(autouse=True)
+    def _forget(self):
+        from app.ingest import origin
+
+        origin.reset_for_tests()
+        yield
+        origin.reset_for_tests()
+
+    async def test_an_api_call_never_teaches_it_an_address(self, client):
+        """Home Assistant polls this app under whatever name *it* was configured with.
+
+        Usually a container name or a Docker-internal host that nothing in a car could
+        resolve, and inheriting it would send the head unit somewhere unreachable while
+        looking entirely correct.
+        """
+        from app.ingest import origin
+
+        await client.get("/api/ingest/status")
+
+        assert origin.backup_url() == ""
+
+    async def test_opening_the_dashboard_teaches_it(self, client):
+        from app.ingest import origin
+        from app.main import FRONTEND_DIST
+
+        if not FRONTEND_DIST.is_dir():
+            pytest.skip("the SPA is not built in this tree")
+
+        await client.get("/backup")
+
+        assert origin.backup_url() == "http://test/backup"
+
+
+class TestTheLiveNumbers:
+    """What the Backup page reads while a window is open."""
+
+    def test_the_speed_shown_is_recent_rather_than_the_run_average(self, monkeypatch):
+        """The average is dragged down for the whole run by the seconds before any bytes.
+
+        That is exactly when somebody is deciding whether this is working.
+        """
+        from app.ingest.status import IngestStatus
+
+        clock = {"now": 1000.0}
+        monkeypatch.setattr("app.ingest.status.time.monotonic", lambda: clock["now"])
+
+        status = IngestStatus()
+        status.try_begin()
+        clock["now"] += 10.0  # ten seconds of connecting and listing, no bytes
+        for _ in range(4):
+            clock["now"] += 1.0
+            status.add_bytes(30_000_000)
+
+        assert status.throughput_mbs() < 10.0, "the run average is the misleading one"
+        assert 29.0 <= status.speed_recent_mbs() <= 31.0
+
+    def test_an_eta_is_only_offered_while_bytes_are_actually_moving(self, monkeypatch):
+        from app.ingest.models import DeltaPlan, Phase
+        from app.ingest.status import IngestStatus
+
+        clock = {"now": 0.0}
+        monkeypatch.setattr("app.ingest.status.time.monotonic", lambda: clock["now"])
+
+        status = IngestStatus()
+        status.try_begin()
+        status.plan(DeltaPlan(files=[RemoteFile("a.ts", 400_000_000, 0)]))
+
+        assert status.eta_seconds() is None, "an estimate during the connect is fiction"
+
+        status.set_phase(Phase.TRANSFERRING)
+        for _ in range(4):
+            clock["now"] += 1.0
+            status.add_bytes(20_000_000)
+
+        eta = status.eta_seconds()
+        assert eta is not None
+        assert 15.0 <= eta <= 17.0, "320 MB left at ~20 MB/s"
+
+    def test_the_current_file_is_cleared_when_it_finishes(self):
+        """It used to hold the file that had just *finished*.
+
+        So between files the page named the previous recording, which reads to anyone
+        watching as though the transfer had gone backwards.
+        """
+        from app.ingest.status import IngestStatus
+
+        status = IngestStatus()
+        status.try_begin()
+        status.file_started("a.ts")
+        assert status.snapshot()["current_file"] == "a.ts"
+
+        status.file_done("a.ts")
+        assert status.snapshot()["current_file"] is None
+        assert status.snapshot()["files_done"] == 1
+
+    def test_the_phase_leaves_the_state_the_sensor_reads_alone(self):
+        """`state` is the Home Assistant contract and keeps exactly its old meaning."""
+        from app.ingest.models import Phase
+        from app.ingest.status import IngestStatus
+
+        status = IngestStatus()
+        status.try_begin()
+        status.set_phase(Phase.SCANNING)
+
+        snapshot = status.snapshot()
+        assert snapshot["state"] == "running", "an established consumer would have broken"
+        assert snapshot["phase"] == "scanning"
+
+    def test_recordings_left_alone_are_visible(self):
+        """Otherwise "2 of 5 files" looks like three went missing."""
+        from app.ingest.models import DeltaPlan
+        from app.ingest.status import IngestStatus
+
+        status = IngestStatus()
+        status.try_begin()
+        status.plan(DeltaPlan(files=[RemoteFile("a.ts", 10, 0)], active_skipped=2))
+
+        assert status.snapshot()["active_skipped"] == 2
 
 
 class TestTheScannerIgnoresStaging:
@@ -689,14 +1057,225 @@ class TestARunEndToEnd:
         await self._enable()
 
         first = await puller.run_pull(trigger="manual")
+        await _settle()
         assert first.state is RunState.OK
-        assert events == ["started", "finished"]
+        assert sorted(events) == ["finished", "started"]
 
         events.clear()
         second = await puller.run_pull(trigger="manual")
+        await _settle()
 
         assert second.state is RunState.IDLE
         assert events == [], f"an idle window announced {events}"
+
+    async def test_a_slow_webhook_does_not_delay_the_first_byte(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """A ten-second httpx timeout used to sit between a decided transfer and its start.
+
+        The one failure this has in practice -- an unreachable webhook host -- is precisely
+        the one that takes the full ten seconds, and at 34 MB/s that is 340 MB of footage
+        left on the card so a notification could go out marginally sooner.
+        """
+        from app.ingest import adb, puller
+        from app.ingest.models import RunState
+
+        order: list[str] = []
+        launched = adb.launch_listener
+
+        async def slow_report(event, **kwargs):
+            if event != "started":
+                return
+            await asyncio.sleep(0.3)
+            order.append("webhook")
+
+        async def launch(address, source, names, *, port, timeout_s):
+            order.append("listener")
+            return await launched(address, source, names, port=port, timeout_s=timeout_s)
+
+        monkeypatch.setattr(puller, "report_event", slow_report)
+        monkeypatch.setattr(adb, "launch_listener", launch)
+        await self._enable()
+
+        result = await puller.run_pull(trigger="manual")
+        await _settle()
+
+        assert result.state is RunState.OK
+        assert order == ["listener", "webhook"], "the transfer waited for the notification"
+
+    async def test_the_local_checks_overlap_the_card_listing(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """Not one of them needs the card, and they used to wait for it anyway.
+
+        Two database reads and a walk of the staging directory on what is a hard NFS mount
+        in the deployment, run in series between the listing and the first byte purely
+        because of the order they were written in.
+        """
+        from app.ingest import adb, puller
+        from app.ingest.models import RunState
+
+        order: list[str] = []
+        listed = adb.inventory
+        looked_up = puller._deliberately_removed
+
+        async def inventory(address, source):
+            order.append("card:start")
+            await asyncio.sleep(0.05)
+            order.append("card:end")
+            return await listed(address, source)
+
+        async def removed():
+            order.append("database")
+            return await looked_up()
+
+        monkeypatch.setattr(adb, "inventory", inventory)
+        monkeypatch.setattr(puller, "_deliberately_removed", removed)
+        await self._enable()
+
+        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+        assert order.index("database") < order.index("card:end"), (
+            "the local checks waited for the head unit to answer"
+        )
+
+    async def test_an_idle_window_collects_the_checks_it_never_needed(
+        self, db_session, unit, app_config
+    ):
+        """Nothing to copy, so the safety check and the staging clean are never awaited.
+
+        They still have to be collected, or a short run leaves tasks complaining about
+        results nobody retrieved.
+        """
+        from app.ingest import puller
+        from app.ingest.models import RunState
+
+        await self._enable()
+        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+
+        second = await puller.run_pull(trigger="manual")
+
+        assert second.state is RunState.IDLE
+        assert not [task for task in puller._side_tasks if not task.done()]
+
+    async def test_the_unit_is_not_described_twice_when_the_poll_already_did(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """The poll describes the unit one line before it starts the run.
+
+        Re-deriving it inside the run meant a second `disconnect`/`connect` against a link
+        that had only just been proven good, at the most expensive moment of the day.
+        """
+        from app.ingest import adb, puller
+        from app.ingest.models import RunState, UnitInfo, UnitState
+
+        calls = 0
+
+        async def counting(address, override=""):
+            nonlocal calls
+            calls += 1
+            return UnitInfo(address=address, state=UnitState.DEVICE, source="/src")
+
+        monkeypatch.setattr(adb, "describe", counting)
+        await self._enable()
+
+        known = UnitInfo(
+            address="127.0.0.1:5555",
+            state=UnitState.DEVICE,
+            source="/storage/Tfcard/DCIM/Video",
+        )
+        result = await puller.run_pull(trigger="manual", info=known)
+
+        assert result.state is RunState.OK
+        assert calls == 0, "the run re-described a unit the caller had already described"
+
+    async def test_the_car_is_sent_to_the_address_the_dashboard_was_opened_on(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """The one address a bridged container cannot discover about itself.
+
+        Also: coming home with nothing new must not hijack the head unit's display.
+        """
+        from app.ingest import adb, origin, puller
+        from app.ingest.models import RunState
+
+        shown: list[str] = []
+
+        async def record(address, url):
+            shown.append(url)
+
+        monkeypatch.setattr(adb, "show_url", record)
+        origin.reset_for_tests()
+        origin.remember("http", "192.168.1.16:8199")
+        await self._enable(**{"ingest.show_on_unit": True})
+
+        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+        await _settle()
+        assert shown == ["http://192.168.1.16:8199/backup"]
+
+        shown.clear()
+        assert (await puller.run_pull(trigger="manual")).state is RunState.IDLE
+        await _settle()
+        assert shown == [], "an idle window took the car's screen over for nothing"
+
+    async def test_an_explicit_address_wins_over_the_learned_one(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """For a reverse proxy whose hostname the head unit cannot resolve."""
+        from app.ingest import adb, origin, puller
+        from app.ingest.models import RunState
+
+        shown: list[str] = []
+
+        async def record(address, url):
+            shown.append(url)
+
+        monkeypatch.setattr(adb, "show_url", record)
+        origin.reset_for_tests()
+        origin.remember("https", "dashcam.example.com")
+        await self._enable(
+            **{
+                "ingest.show_on_unit": True,
+                "ingest.unit_display_url": "http://192.168.1.16:8199/backup",
+            }
+        )
+
+        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+        await _settle()
+        assert shown == ["http://192.168.1.16:8199/backup"]
+
+    async def test_a_transfer_still_runs_when_the_address_is_not_known_yet(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """Nobody has opened the dashboard since this process started. Copy anyway."""
+        from app.ingest import adb, origin, puller
+        from app.ingest.models import RunState
+
+        async def fail(address, url):
+            raise AssertionError("the car was sent to an address nobody knows")
+
+        monkeypatch.setattr(adb, "show_url", fail)
+        origin.reset_for_tests()
+        await self._enable(**{"ingest.show_on_unit": True})
+
+        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+        await _settle()
+
+    async def test_the_car_screen_is_left_alone_unless_asked_for(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        from app.ingest import adb, origin, puller
+        from app.ingest.models import RunState
+
+        async def fail(address, url):
+            raise AssertionError("the head unit's screen was taken over without being asked")
+
+        monkeypatch.setattr(adb, "show_url", fail)
+        origin.reset_for_tests()
+        origin.remember("http", "192.168.1.16:8199")
+        await self._enable()
+
+        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+        await _settle()
 
     async def test_disabled_does_nothing_at_all(self, db_session, unit):
         from app.ingest.models import RunState

@@ -4,7 +4,7 @@ import { Link } from 'react-router-dom'
 import { EmptyState, ErrorState, PageHeader, ProgressBar, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
 import type { IngestStatus } from '@/lib/api'
-import { formatBytes, formatDateTime, formatRelative } from '@/lib/format'
+import { formatBytes, formatDateTime, formatDuration, formatRelative } from '@/lib/format'
 
 /** How the state reads to a person, and how alarming it should look. */
 const STATES: Record<IngestStatus['state'], { label: string; tone: 'default' | 'ok' | 'warn' | 'error' | 'busy' }> = {
@@ -17,6 +17,23 @@ const STATES: Record<IngestStatus['state'], { label: string; tone: 'default' | '
   offline: { label: 'Car not here', tone: 'default' },
   unauthorized: { label: 'Not authorised', tone: 'error' },
   cancelled: { label: 'Cancelled', tone: 'warn' },
+}
+
+/**
+ * What a running transfer is doing right now.
+ *
+ * Worth showing separately from the state because the first few seconds of a window are
+ * not idle time and used to look like it: "Copying" appeared the moment the car did, while
+ * the app was still listing the card, and a progress bar sitting at zero with no
+ * explanation reads as a transfer that is not working.
+ */
+const PHASES: Record<IngestStatus['phase'], string> = {
+  idle: 'Waiting',
+  connecting: 'Connecting to the dashcam',
+  scanning: 'Reading the memory card',
+  preparing: 'Working out what to copy',
+  transferring: 'Copying',
+  verifying: 'Checking what arrived',
 }
 
 export default function Backup() {
@@ -48,7 +65,11 @@ export default function Backup() {
   const data = status.data
   const running = data?.state === 'running'
   const descriptor = data ? STATES[data.state] ?? STATES.idle : STATES.idle
-  const fraction = data && data.bytesTotal > 0 ? data.bytesDone / data.bytesTotal : 0
+  // Clamped: the byte counter meters the socket, so it also carries the tar headers and
+  // padding that the file sizes it is measured against do not. That is a few kilobytes on
+  // a full card — invisible, until it renders as 100.01% and a bar overshooting its track.
+  const fraction =
+    data && data.bytesTotal > 0 ? Math.min(1, data.bytesDone / data.bytesTotal) : 0
 
   return (
     <div>
@@ -99,11 +120,22 @@ export default function Backup() {
       )}
 
       <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <StatTile label="Status" value={descriptor.label} tone={descriptor.tone} />
+        <StatTile
+          label="Status"
+          value={descriptor.label}
+          hint={running && data ? PHASES[data.phase] : undefined}
+          tone={descriptor.tone}
+        />
         <StatTile
           label="Speed"
-          value={running ? `${(data?.throughputMbs ?? 0).toFixed(1)} MB/s` : '—'}
-          hint={running ? 'off the head unit' : undefined}
+          value={running ? `${(data?.speedMbsRecent ?? 0).toFixed(1)} MB/s` : '—'}
+          hint={
+            running
+              ? data?.etaSeconds
+                ? `${formatDuration(data.etaSeconds)} left`
+                : 'off the head unit'
+              : undefined
+          }
           tone={running ? 'busy' : 'default'}
         />
         <StatTile
@@ -124,16 +156,26 @@ export default function Backup() {
         <div className="card mb-6 px-5 py-4">
           <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
             <div className="text-sm font-medium">
-              {data.filesDone} of {data.filesTotal} files
+              {PHASES[data.phase]}
+              {data.filesTotal > 0 && (
+                <span className="ml-2 font-normal text-content-muted">
+                  {data.filesDone} of {data.filesTotal} files
+                </span>
+              )}
             </div>
             <div className="tabular text-sm text-content-muted">
               {formatBytes(data.bytesDone)} of {formatBytes(data.bytesTotal)}
             </div>
           </div>
           <ProgressBar value={fraction} />
-          {data.currentFile && (
-            <div className="mt-2 truncate text-xs text-content-faint">{data.currentFile}</div>
-          )}
+          <div className="mt-2 flex flex-wrap items-baseline justify-between gap-2 text-xs text-content-faint">
+            <span className="truncate">{data.currentFile ?? ' '}</span>
+            {data.activeSkipped > 0 && (
+              <span>
+                {data.activeSkipped} still recording, left alone
+              </span>
+            )}
+          </div>
         </div>
       )}
 

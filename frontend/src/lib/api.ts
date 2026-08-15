@@ -169,15 +169,28 @@ export interface IngestStatus {
     | 'offline'
     | 'unauthorized'
     | 'cancelled'
+  /**
+   * Where a running transfer currently is. Separate from `state`, which says how a run
+   * *ended* and is also what the Home Assistant sensor publishes.
+   */
+  phase: 'idle' | 'connecting' | 'scanning' | 'preparing' | 'transferring' | 'verifying'
   unitOnline: boolean
   filesTotal: number
   filesDone: number
   bytesTotal: number
   bytesDone: number
+  /** Average across the whole run, including the seconds before any bytes moved. */
   throughputMbs: number
+  /** Rate over the last few seconds — the one to show while somebody is watching. */
+  speedMbsRecent: number
+  /** Null unless bytes are actually moving; an estimate is not offered otherwise. */
+  etaSeconds: number | null
   currentFile: string | null
   backlogFiles: number
   backlogBytes: number
+  /** Recordings left alone because the camera is still writing them. */
+  activeSkipped: number
+  startedAt: string | null
   lastSuccessTs: string | null
   lastError: string | null
 }

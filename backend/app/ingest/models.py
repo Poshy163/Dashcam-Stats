@@ -34,6 +34,28 @@ class RunState(str, Enum):
     CANCELLED = "cancelled"
 
 
+class Phase(str, Enum):
+    """*Where* a running pull currently is, as opposed to how it ended.
+
+    Separate from :class:`RunState` rather than folded into it, because the two answer
+    different questions and one of them is already load-bearing: ``RunState`` is what the
+    Home Assistant sensor, the webhook and MQTT publish, so adding "scanning" to it would
+    change an established contract to say something those consumers never asked about.
+    ``RunState.RUNNING`` stays exactly as broad as it was; this says which part of it.
+
+    Only phases the code can actually report are listed. There is deliberately no
+    "pausing recording" here -- nothing pauses recording, and a state the app can never
+    enter is a promise in the UI that it does something it does not.
+    """
+
+    IDLE = "idle"
+    CONNECTING = "connecting"
+    SCANNING = "scanning"
+    PREPARING = "preparing"
+    TRANSFERRING = "transferring"
+    VERIFYING = "verifying"
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteFile:
     """One recording on the unit's TF card."""

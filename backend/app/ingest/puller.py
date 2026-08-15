@@ -17,8 +17,16 @@ from pathlib import Path
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
-from app.ingest import adb, transport
-from app.ingest.models import DeltaPlan, RemoteFile, RunResult, RunState, UnitInfo, UnitState
+from app.ingest import adb, origin, transport
+from app.ingest.models import (
+    DeltaPlan,
+    Phase,
+    RemoteFile,
+    RunResult,
+    RunState,
+    UnitInfo,
+    UnitState,
+)
 from app.ingest.status import get_status
 
 log = get_logger(__name__)
@@ -46,6 +54,7 @@ def delta(
     skip_active_s: int,
     camera: str,
     already_seen: set[str] | None = None,
+    newest_first: bool = False,
 ) -> DeltaPlan:
     """Decide what to fetch.
 
@@ -59,6 +68,13 @@ def delta(
     file is absent from disk, so the delta asks for it again, retention deletes it again,
     and every driveway window is spent re-fetching the oldest footage while today's never
     gets a turn.
+
+    ``newest_first`` exists because the ordering is a policy question, not an implementation
+    detail, and the default answer is only right while the backlog fits in a window. Oldest
+    first keeps the library contiguous and is what you want when the card is nearly caught
+    up. Once the backlog is permanently larger than one window it starves: every window is
+    spent on the oldest files and today's drive is never reached at all. The camera's names
+    sort chronologically, so the choice is one sort key.
     """
     now = time.time()
     plan = DeltaPlan()
@@ -88,7 +104,7 @@ def delta(
             continue
         plan.files.append(item)
 
-    plan.files.sort(key=lambda item: item.name)
+    plan.files.sort(key=lambda item: item.name, reverse=newest_first)
     return plan
 
 
@@ -182,13 +198,47 @@ async def probe_unit() -> UnitInfo:
 #: mid-flight; and shutdown has to be able to find the transfer to stop it.
 _current: asyncio.Task[RunResult] | None = None
 
+#: Side effects that must never be able to delay or fail a transfer.
+#:
+#: Held for the same reason ``_current`` is: the event loop keeps only a weak reference to a
+#: running task, so one that is not stored somewhere can be collected mid-flight.
+_side_tasks: set[asyncio.Task] = set()
 
-def start_run(*, trigger: str) -> asyncio.Task[RunResult]:
-    """Begin a pull in the background and keep hold of it."""
+
+def _fire_and_forget(coro) -> None:
+    task = asyncio.create_task(coro)
+    _side_tasks.add(task)
+    task.add_done_callback(_side_tasks.discard)
+
+
+def _preflight(tracked: list[asyncio.Task], coro) -> asyncio.Task:
+    """Start work that does not depend on the head unit, and remember it for cleanup.
+
+    Tracked rather than fired, because unlike the reporting side effects these have results
+    the run needs, and a window that ends before it needs them -- nothing new to copy, a
+    share that failed its checks -- must still collect them rather than leave a task to warn
+    about a result nobody retrieved.
+    """
+    task = asyncio.create_task(coro)
+    tracked.append(task)
+    return task
+
+
+def start_run(*, trigger: str, info: UnitInfo | None = None) -> asyncio.Task[RunResult]:
+    """Begin a pull in the background and keep hold of it.
+
+    ``info`` is the caller's *own* fresh look at the unit, handed over rather than thrown
+    away. The poller has just described the unit -- reconnected, asked its state, resolved
+    the card -- one line before it gets here, and re-asking all of that inside the run meant
+    disconnecting the transport that had only just been established and paying for the whole
+    round trip twice, at the one moment in the day when it is most expensive.
+    """
     global _current
     if _current is not None and not _current.done():
         return _current
-    _current = asyncio.create_task(run_pull(trigger=trigger), name=f"ingest-pull-{trigger}")
+    _current = asyncio.create_task(
+        run_pull(trigger=trigger, info=info), name=f"ingest-pull-{trigger}"
+    )
     return _current
 
 
@@ -200,6 +250,11 @@ async def shutdown() -> None:
     staging directory and calling back into status while the database is being disposed.
     Setting the flag is what actually stops it; the reader checks it once per megabyte.
     """
+    # Fired side effects are best-effort by definition, but they still have to be tidied
+    # away. A task left pending when the loop closes prints "Task was destroyed but it is
+    # pending", which reads like a bug in a shutdown path that has to look clean.
+    for side in list(_side_tasks):
+        side.cancel()
     task = _current
     if task is None or task.done():
         return
@@ -216,7 +271,7 @@ async def shutdown() -> None:
     log.info("stopped an in-flight transfer for shutdown")
 
 
-async def run_pull(*, trigger: str = "auto") -> RunResult:
+async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> RunResult:
     """Fetch everything the unit has that we do not. Safe to call from anywhere."""
     status = get_status()
     if not bool(_get("enabled", False)):
@@ -231,9 +286,14 @@ async def run_pull(*, trigger: str = "auto") -> RunResult:
     result = RunResult(state=RunState.ERROR)
     footage = Path(str(await get_settings_service().footage_dir()))
     staging = footage / STAGING_DIRNAME
+    preflight: list[asyncio.Task] = []
 
     try:
-        info = await probe_unit()
+        # Only if nobody has already looked. The presence poll describes the unit
+        # immediately before starting a run, and probing again from in here re-ran a
+        # `disconnect`/`connect` against a link that had just been proven good.
+        if info is None:
+            info = await probe_unit()
         status.set_unit_online(info.online)
         if info.state is UnitState.UNAUTHORIZED:
             result = RunResult(
@@ -254,7 +314,19 @@ async def run_pull(*, trigger: str = "auto") -> RunResult:
             )
             return result
 
+        # Started before the unit is asked anything, and awaited only where each result is
+        # actually needed. Not one of the three depends on the card: two are database reads
+        # and the third walks the staging directory on the (NFS) share. They ran in series
+        # between the card listing and the first byte for no reason beyond the order they
+        # happened to be written in, and on a share that is a hard mount over the network
+        # that series is worth hundreds of milliseconds -- which is footage, at 34 MB/s.
+        removed = _preflight(preflight, _deliberately_removed())
+        safety = _preflight(preflight, _footage_is_safe_to_write(footage))
+        cleaned = _preflight(preflight, asyncio.to_thread(_clean, staging))
+
+        status.set_phase(Phase.SCANNING)
         remote = await adb.inventory(info.address, info.source)
+        status.set_phase(Phase.PREPARING)
         # Off the event loop: this stats every candidate against the footage share, which
         # is a hard NFS mount in the deployment, and a full card is ~140 files. Doing it
         # inline would freeze /health and the whole UI behind a slow server every time the
@@ -265,7 +337,8 @@ async def run_pull(*, trigger: str = "auto") -> RunResult:
             footage,
             skip_active_s=int(_get("skip_active_seconds", 15)),
             camera=str(_get("camera_filter", "both")),
-            already_seen=await _deliberately_removed(),
+            already_seen=await removed,
+            newest_first=str(_get("transfer_order", "oldest_first")) == "newest_first",
         )
         status.plan(plan)
         if not plan.files:
@@ -279,18 +352,37 @@ async def run_pull(*, trigger: str = "auto") -> RunResult:
             megabytes=round(plan.bytes / 1e6),
             backlog_files=plan.backlog_files,
         )
-        # Checked here, after the delta and before a single byte moves, because this is the
+        # Awaited here, after the delta and before a single byte moves, because this is the
         # last moment at which refusing costs nothing. Past this point the card may be
-        # deleted from.
-        safe, why = await _footage_is_safe_to_write(footage)
+        # deleted from. Computing it earlier changes nothing about that: it was always a
+        # point-in-time snapshot, and it still gates the transfer rather than merely
+        # preceding it.
+        safe, why = await safety
         if not safe:
             result = RunResult(state=RunState.ERROR, error=why)
             log.error("refusing to transfer into an unsafe footage directory", reason=why)
             return result
 
-        await report_event("started", plan=plan)
+        # Fired, not awaited. This is an httpx POST with a ten-second timeout standing
+        # between a decided transfer and its first byte, and the one failure it has in
+        # practice -- an unreachable webhook host -- is precisely the one that takes the
+        # full ten seconds. At 34 MB/s that is 340 MB of footage left on the card so a
+        # notification could go out marginally sooner. Nothing downstream reads its result.
+        _fire_and_forget(report_event("started", plan=plan))
 
-        await asyncio.to_thread(_clean, staging)
+        # The car's own screen, if the operator asked for it. Also fired rather than
+        # awaited: `am start` against a cold browser is not fast, and a courtesy display
+        # must not be able to spend the window it is reporting on.
+        if bool(_get("show_on_unit", False)):
+            display = str(_get("unit_display_url", "") or "").strip() or origin.backup_url()
+            if display:
+                _fire_and_forget(adb.show_url(info.address, display))
+            else:
+                # Only reachable when nobody has opened the dashboard since this process
+                # started -- see `app.ingest.origin` for why that is not worth persisting.
+                log.debug("not showing the backup page: this app's own address is not known yet")
+
+        await cleaned
         port = int(_get("data_port", 9000))
         # Anything still listening is serving a *previous* run's file list, so clear it
         # before starting ours rather than connecting to the wrong stream.
@@ -304,6 +396,8 @@ async def run_pull(*, trigger: str = "auto") -> RunResult:
         )
 
         host = info.address.split(":", 1)[0]
+        status.set_phase(Phase.TRANSFERRING)
+        was_serving = False
         try:
             transferred = await asyncio.to_thread(
                 transport.receive,
@@ -319,8 +413,17 @@ async def run_pull(*, trigger: str = "auto") -> RunResult:
         finally:
             # The adb session *is* the listener's lifetime now, so it has to be ended
             # explicitly; leaving it would hold the port against the next window.
-            await adb.stop_listener(listener)
+            was_serving = await adb.stop_listener(listener)
 
+        # Which side stopped first. An incomplete transfer whose listener was still serving
+        # is the car leaving, which is the expected ending and not a fault; one whose
+        # listener had already exited is the unit giving up -- `tar` failing, the remote
+        # `timeout` firing -- and that is worth saying out loud, because the two used to
+        # produce the same sentence and only one of them is anybody's problem.
+        if transferred.error and not transferred.complete and not was_serving:
+            transferred.error = f"{transferred.error} (the head unit stopped serving first)"
+
+        status.set_phase(Phase.VERIFYING)
         expected = {item.name: item.size for item in plan.files}
         committed = await asyncio.to_thread(commit, staging, footage, expected)
 
@@ -364,6 +467,14 @@ async def run_pull(*, trigger: str = "auto") -> RunResult:
         result = RunResult(state=RunState.ERROR, error=f"{type(exc).__name__}: {exc}")
         log.exception("the ingest run failed", error=str(exc))
     finally:
+        # Any preflight nobody got as far as needing -- an idle window, a share that failed
+        # its checks. Collected rather than abandoned, so a short run cannot leave a task
+        # complaining that its result was never retrieved.
+        for task in preflight:
+            task.cancel()
+        if preflight:
+            await asyncio.gather(*preflight, return_exceptions=True)
+
         if result.seconds <= 0:
             result.seconds = time.monotonic() - started
         status.finish(result)

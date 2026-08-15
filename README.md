@@ -170,6 +170,18 @@ What that means in practice:
   produces a truncated file that looks complete.
 - **Nothing is deleted from the card** unless you explicitly enable it, and then only
   after a verified copy has been committed.
+- **The car can show its own progress.** Turn on **Show the backup page on the dashcam
+  screen** and the head unit opens this app's Backup page when a transfer starts. There is
+  no address to configure: whatever you open the dashboard on is what the car is sent to,
+  which is by definition an address that works on this network — a bridged container cannot
+  discover its own published address any other way. Nothing is installed on the unit for
+  this either; Android's own `am start` does it. Off by default, and worth knowing that a
+  transfer can begin while you are still manoeuvring, so it can take the screen over
+  mid-park.
+- **Copy order is a setting.** Oldest first by default, which keeps the library
+  contiguous. If the backlog is permanently larger than one window, switch to newest
+  first — otherwise every window goes on the oldest recordings and today's drive is never
+  reached.
 
 Transferred files land in the same directory the scanner already watches, so they are
 analysed like anything else with no further configuration.
