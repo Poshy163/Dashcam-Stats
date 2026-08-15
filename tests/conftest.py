@@ -158,6 +158,8 @@ async def db_session(app_config) -> AsyncIterator:
     service fails in a confusing way (`RuntimeError: settings service is not initialised`)
     far from the code that actually needed it.
     """
+    from app.auth import ratelimit
+    from app.auth.service import reset_auth_state
     from app.core.settings_service import (
         init_settings_service,
         set_settings_service,
@@ -167,11 +169,19 @@ async def db_session(app_config) -> AsyncIterator:
 
     await init_db()
     await init_settings_service(get_session_factory())
+    # Whether an account exists and who has failed to sign in are both process-wide, for
+    # the same reason the settings cache is: the gate answers them without a query. Left
+    # standing, one test's account would decide whether the next one's requests are
+    # challenged.
+    reset_auth_state()
+    ratelimit.reset()
 
     try:
         async with session_scope() as session:
             yield session
     finally:
+        reset_auth_state()
+        ratelimit.reset()
         await shutdown_settings_service()
         # Reset the process-wide singleton so the next test does not inherit this
         # database's settings cache.

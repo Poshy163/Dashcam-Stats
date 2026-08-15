@@ -323,6 +323,80 @@ class SettingsReset(BaseModel):
     keys: list[str]
 
 
+# --------------------------------------------------------------------------------------
+# Authentication
+# --------------------------------------------------------------------------------------
+
+
+class AuthStateOut(BaseModel):
+    """What the browser is told before it has signed in.
+
+    ``required`` and ``authenticated`` are the whole answer for a visitor who has not. The
+    remaining fields describe the configured account, and are filled in only once the
+    caller is entitled to know -- either because they are signed in, or because sign-in is
+    off and the deployment is open to them anyway. An unauthenticated stranger learns that
+    a password is wanted and nothing else.
+    """
+
+    required: bool
+    authenticated: bool
+    username: str | None = None
+    #: Whether an account exists at all, which is what the Settings page keys off.
+    configured: bool = False
+    #: Sign-in is switched on with no account behind it, so the app is serving unguarded.
+    #: Only reachable by hand-editing the database or restoring a backup from a deployment
+    #: that had one. Reported so the Security panel can say so rather than let a page that
+    #: reads "protected" sit in front of one that is not.
+    misconfigured: bool = False
+    #: Whether this caller may claim the first account. Restricted to the local network so
+    #: that the window before a password is set is not an open invitation on a public
+    #: hostname; the UI uses it to explain itself rather than to enforce anything.
+    can_claim_account: bool = False
+    remember_days: int | None = None
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(max_length=128)
+    #: Deliberately unbounded here. Pydantic v2 puts the offending value in `input` on
+    #: every validation error, and FastAPI serialises that straight into the 422 body — so
+    #: a `max_length` on this field would echo the submitted password back to the caller
+    #: and into anything that logs response bodies. The bound is applied in the handler.
+    password: str
+    #: "Stay signed in" — a persistent cookie lasting ``security.remember_days``.
+    remember: bool = False
+
+
+class LoginResponse(BaseModel):
+    authenticated: bool
+    username: str
+    expires_at: datetime
+
+
+class CredentialRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=8, max_length=1024)
+    #: Required when an account already exists and sign-in is on, so that a session someone
+    #: else is holding cannot be used to change the password and lock the owner out.
+    current_password: str | None = Field(default=None, max_length=1024)
+
+
+class CredentialClearRequest(BaseModel):
+    current_password: str | None = Field(default=None, max_length=1024)
+
+
+class AuthSessionOut(BaseModel):
+    id: int
+    created_at: datetime
+    expires_at: datetime
+    last_used_at: datetime
+    remembered: bool
+    user_agent: str | None = None
+    created_ip: str | None = None
+    #: True for the browser making this request, so the UI can label it and refuse to
+    #: present signing itself out as if it were signing out something else.
+    current: bool = False
+
+
 class ReprocessRequest(BaseModel):
     #: "metadata" | "telemetry" | "detection" | "plates" | "everything"
     stages: list[str] = Field(default_factory=lambda: ["everything"])

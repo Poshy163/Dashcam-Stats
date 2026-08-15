@@ -713,6 +713,56 @@ class AppSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
 
 
+class AuthCredential(Base):
+    """The single sign-in account, when the operator has configured one.
+
+    Deliberately not in ``app_settings``. Every value in that table is echoed back by
+    ``GET /api/settings`` to render the Settings page, so a password living there would be
+    handed to any browser that asked for it -- and the settings cache is snapshotted into
+    worker threads besides. A password hash belongs in neither place.
+
+    One row, id 1. Multiple accounts would need a permission model to be worth anything,
+    and this application has exactly one kind of user: the person who owns the footage.
+    """
+
+    __tablename__ = "auth_credentials"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(128))
+    #: ``scrypt$<n>$<r>$<p>$<salt-b64>$<hash-b64>``. See ``app.auth.passwords``.
+    password_hash: Mapped[str] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
+
+
+class AuthSession(Base):
+    """One signed-in browser.
+
+    The cookie carries a random token; only its SHA-256 lives here. A database that leaks
+    -- through the backup download on the Settings page, most plausibly -- therefore hands
+    over no usable session. Unsalted SHA-256 is the right choice for exactly this input and
+    no other: the token is 256 bits of ``secrets`` output, so there is no dictionary to
+    build and nothing for a salt to defend against, and the lookup has to be a single
+    indexed equality match on the hot path.
+    """
+
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(UtcDateTime, index=True)
+    last_used_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    #: True when the visitor ticked "stay signed in"; drives the cookie lifetime and is
+    #: shown on the sessions list so a long-lived login is visible as one.
+    remembered: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: Truncated User-Agent, so a stale session can be recognised before it is revoked.
+    user_agent: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    #: The address the session was created from. Never used for authorisation -- it is
+    #: proxy-supplied and trivially spoofed -- only to help the operator recognise a row.
+    created_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
 class LogEntry(Base):
     """Application log surfaced in the UI. Deliberately not one row per analysed frame."""
 

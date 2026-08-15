@@ -1,10 +1,10 @@
 import { Suspense, lazy, useEffect } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Navigate, Route, Routes } from 'react-router-dom'
 
 import Layout from '@/components/Layout'
 import Spinner from '@/components/Spinner'
-import { api } from '@/lib/api'
+import { api, setUnauthorizedHandler } from '@/lib/api'
 import { setDisplayTimeZone } from '@/lib/format'
 
 // Route-level code splitting. The map and chart bundles are large and most sessions never
@@ -25,20 +25,62 @@ const Logs = lazy(() => import('@/pages/Logs'))
 const Settings = lazy(() => import('@/pages/Settings'))
 const Search = lazy(() => import('@/pages/Search'))
 const NotFound = lazy(() => import('@/pages/NotFound'))
+// Not lazy. It is what a signed-out visitor sees first, and a chunk fetch in front of it
+// would show a spinner before the password box on every cold load.
+import Login from '@/pages/Login'
 
 export default function App() {
+  const client = useQueryClient()
+
+  // Asked for before anything else renders. Every page in the app opens by fetching
+  // something, so mounting the shell before this resolves would fire a screenful of
+  // requests that can only 401.
+  const auth = useQuery({ queryKey: ['auth-state'], queryFn: api.auth.state, staleTime: 60_000 })
+  const locked = auth.data?.required === true && auth.data.authenticated === false
+
+  // A thirty-day session expires while a tab is open, and the first request to notice is
+  // whichever one happened to fire. Rather than have that page render an error, any 401
+  // re-asks who we are, which flips `locked` and puts the login page up.
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      void client.invalidateQueries({ queryKey: ['auth-state'] })
+    })
+    return () => setUnauthorizedHandler(null)
+  }, [client])
+
   // Timestamps are rendered in the camera's timezone, not the viewer's — the footage, the
   // burned-in overlay and the filenames are all in the camera's local time, so a clip
   // driven at 4pm should read as 4pm wherever it is being looked at. Set here rather than
   // in a page, because every page formats dates and the first one rendered would otherwise
   // use the browser's zone until something else happened to fetch the status.
-  const status = useQuery({ queryKey: ['status'], queryFn: api.status, staleTime: 300_000 })
+  const status = useQuery({
+    queryKey: ['status'],
+    queryFn: api.status,
+    staleTime: 300_000,
+    enabled: !locked,
+  })
   useEffect(() => {
     setDisplayTimeZone(status.data?.timezone)
   }, [status.data?.timezone])
 
+  if (auth.isLoading) return <Spinner label="Loading…" className="py-24" />
+
+  if (locked) {
+    return (
+      <Login
+        rememberDays={auth.data?.rememberDays ?? null}
+        onSignedIn={() => {
+          // Everything cached was fetched as somebody else, or as nobody. The simplest
+          // correct thing is to keep none of it.
+          client.clear()
+          void client.invalidateQueries({ queryKey: ['auth-state'] })
+        }}
+      />
+    )
+  }
+
   return (
-    <Layout>
+    <Layout auth={auth.data}>
       <Suspense fallback={<Spinner label="Loading…" className="py-24" />}>
         <Routes>
           <Route path="/" element={<Dashboard />} />
@@ -56,6 +98,9 @@ export default function App() {
           <Route path="/logs" element={<Logs />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/search" element={<Search />} />
+          {/* Reached only by someone who signed in and then typed the URL, since the login
+              page replaces the app rather than living at a path of its own. */}
+          <Route path="/login" element={<Navigate to="/" replace />} />
           <Route path="/index.html" element={<Navigate to="/" replace />} />
           <Route path="*" element={<NotFound />} />
         </Routes>

@@ -433,6 +433,37 @@ export interface SettingCategory {
   settings: SettingDef[]
 }
 
+/**
+ * Whether this deployment asks for a password, and whether this browser has given it.
+ *
+ * `required` and `authenticated` are all a signed-out visitor is told. The rest describes
+ * the configured account and arrives only once the caller is entitled to know it — either
+ * signed in, or sign-in is off and the deployment is open to them anyway.
+ */
+export interface AuthState {
+  required: boolean
+  authenticated: boolean
+  username: string | null
+  configured: boolean
+  /** Sign-in is switched on with no account behind it, so the app is serving unguarded. */
+  misconfigured: boolean
+  /** Whether this browser is on the local network, and so may claim the first account. */
+  canClaimAccount: boolean
+  rememberDays: number | null
+}
+
+export interface AuthSession {
+  id: number
+  createdAt: string
+  expiresAt: string
+  lastUsedAt: string
+  remembered: boolean
+  userAgent: string | null
+  createdIp: string | null
+  /** The browser making the request. Shown as "This browser" and never offered a revoke. */
+  current: boolean
+}
+
 export interface RetentionCandidate {
   recordingId: number
   filename: string

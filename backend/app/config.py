@@ -33,10 +33,13 @@ class AppConfig(BaseSettings):
     #: Escape hatch for tests and unusual deployments; normally left alone.
     database_url: str | None = None
 
-    #: Optional HTTP Basic authentication. Disabled unless both are set. Intended for a
-    #: reverse-proxy/TLS deployment; the trusted-LAN default stays zero-configuration.
-    auth_username: str | None = None
-    auth_password: str | None = None
+    # Authentication is deliberately absent from this file. It used to live here as
+    # ``DASHCAM_AUTH_USERNAME``/``DASHCAM_AUTH_PASSWORD``, which meant the only way to put
+    # a password on the app was to edit the compose file, put the password in it in clear
+    # text, and restart the container -- and what you got for that was the browser's native
+    # Basic prompt, with no way to sign out and no way to stay signed in. It is a UI
+    # setting now, in ``app.core.settings_schema``, with the account in its own table. See
+    # ``app.auth``.
 
     @field_validator("data_dir", "footage_dir", mode="before")
     @classmethod

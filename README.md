@@ -52,8 +52,8 @@ interval, detection thresholds, retention limits, map tiles — is on the Settin
 | `/dev/dri` | The iGPU, used for hardware video decode and AI inference. Optional — without it everything still works on CPU, just slower. |
 
 Deployment variables are `DASHCAM_DATA_DIR`, `DASHCAM_FOOTAGE_DIR`, `DASHCAM_PORT`,
-`DASHCAM_LOG_LEVEL`, `TZ`, plus the optional `DASHCAM_AUTH_USERNAME` and
-`DASHCAM_AUTH_PASSWORD`. Authentication stays disabled unless both credentials are set.
+`DASHCAM_LOG_LEVEL` and `TZ`. That is the whole list — including sign-in, which is a
+setting rather than a variable. See [Sign-in](#sign-in).
 
 ---
 
@@ -241,17 +241,70 @@ GET  /api/ingest/history          past transfers
 GET  /api/settings                the settings catalogue and current values
 POST /api/scan                    scan now
 POST /api/retention/plan          evaluate retention (report-only unless enabled)
+GET  /api/auth/state              whether sign-in is on, and whether you have done it
+POST /api/auth/login              exchange a username and password for a session
 ```
-
-The default deployment assumes a trusted LAN. Optional HTTP Basic authentication can be
-enabled by setting both `DASHCAM_AUTH_USERNAME` and `DASHCAM_AUTH_PASSWORD`; use it behind
-TLS because Basic credentials are encoded, not encrypted. Do not expose the app directly
-to the internet without a TLS reverse proxy. The `/health` endpoint remains unauthenticated
-so Docker can monitor the container.
 
 Settings > Advanced can download a consistent SQLite backup while analysis is running.
 A restore upload is integrity-checked and staged, then applied on the next container
 restart; the replaced database is retained in `/data/backups` as a pre-restore copy.
+That file now carries the sign-in account's password hash, so treat it accordingly.
+
+---
+
+## Sign-in
+
+Off by default, because the deployment this was built for is a trusted LAN and asking for
+a password there earns nothing. Turn it on when the app can be reached from anywhere else.
+
+**Settings → Access** → set a username and password → tick **Require sign-in** → Save.
+Nothing restarts and no file is edited. From then on the app shows a login page, with a
+**Stay signed in** option that lasts thirty days by default; without it a session ends
+after twelve hours or when the browser closes, whichever comes first.
+
+A few things that are deliberate rather than incidental:
+
+* **The switch cannot be turned on without an account.** A deployment that demands a
+  password nobody holds is one nobody can open, so that combination is refused where the
+  setting is written rather than merely discouraged in the UI. Deleting the account
+  switches sign-in off in the same operation, for the same reason.
+* **The first account can only be claimed from your own network.** Between a public
+  hostname going live and a password existing, the app is open — including to whoever
+  would like to set the password themselves. Changing an existing account works from
+  anywhere, with the current password.
+* **API clients keep working.** Home Assistant's REST sensor and `curl` cannot hold a
+  cookie, so the same username and password are accepted as HTTP Basic on `/api/*`.
+* **`/health` stays open.** The Docker healthcheck calls it with no credentials, and a 401
+  there would restart the container forever. While sign-in is on it returns a bare status
+  with the version, worker counts and diagnostics stripped out.
+* **Everything else is closed**, including `/media` (thumbnails and plate crops),
+  `/stream` (the footage) and the API documentation.
+
+Passwords are hashed with scrypt from the standard library — memory-hard, no new
+dependency — and only the SHA-256 of a session token is stored, so neither the database nor
+a backup of it hands over anything reusable.
+
+### Forgotten it
+
+```bash
+docker compose exec dashcam entrypoint.sh recover-login status
+docker compose exec dashcam entrypoint.sh recover-login set-password
+docker compose exec dashcam entrypoint.sh recover-login disable
+```
+
+`set-password` works against the running container immediately. `disable` deletes the
+account and switches sign-in off together, and reopens a running container within about
+thirty seconds — no restart, no editing the database by hand.
+
+### Putting it on the internet
+
+Turn sign-in on **before** the hostname is live, not after.
+[examples/cloudflare-tunnel/](examples/cloudflare-tunnel/) has the full setup —
+no ports forwarded, plus the two Cloudflare rules that matter: bypass the cache for the
+hostname, and rate-limit `POST /api/auth/login`. The cache one is not optional. A CDN keys
+on the URL and not on your cookie, and thumbnails live at sequential paths, so a cached
+response is a footage still that anyone can enumerate without the request ever reaching
+the container.
 
 ---
 

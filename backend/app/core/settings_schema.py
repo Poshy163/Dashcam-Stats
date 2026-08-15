@@ -47,6 +47,7 @@ CATEGORIES: tuple[tuple[str, str, str], ...] = (
     ("storage", "Storage", "Retention limits and cleanup behaviour"),
     ("ingest", "Backup / Ingest", "Pulling footage off the dashcam head unit"),
     ("maps", "Maps", "Map tiles and rendering"),
+    ("security", "Access", "Whether this deployment asks for a password"),
     ("advanced", "Advanced", "Logging, database and diagnostics"),
 )
 
@@ -780,6 +781,34 @@ SETTINGS: tuple[SettingDef, ...] = (
         minimum=0.0,
         maximum=100.0,
         unit="m",
+    ),
+    # --------------------------------------------------------------- security
+    SettingDef(
+        "security.require_login",
+        "Require sign-in",
+        "bool",
+        False,
+        "security",
+        "Ask for a username and password before anything is shown. Off by default, which "
+        "is right for the trusted LAN this was built for and wrong the moment the app has "
+        "a public hostname. Set the account below first — this cannot be switched on "
+        "without one, because a deployment that demands a password nobody holds is one "
+        "nobody can open.",
+    ),
+    SettingDef(
+        "security.remember_days",
+        "Stay signed in for",
+        "int",
+        30,
+        "security",
+        "How long a browser that ticked “Stay signed in” keeps its session. Sessions "
+        "without it last twelve hours and end when the browser closes. Changing this "
+        "affects sessions created afterwards; sign the existing ones out below to apply "
+        "it now.",
+        minimum=1,
+        maximum=365,
+        unit="days",
+        requires="security.require_login",
     ),
     # --------------------------------------------------------------- advanced
     SettingDef(

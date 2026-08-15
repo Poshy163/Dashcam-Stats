@@ -45,8 +45,19 @@ async def get_media(path: str) -> FileResponse:
         resolved,
         media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
         # Media is content-addressed by recording and track id and never rewritten in
-        # place, so it can be cached hard.
-        headers={"Cache-Control": "public, max-age=604800, immutable"},
+        # place, so it can be cached hard -- but only by the browser that asked for it.
+        #
+        # `public` was actively dangerous behind a CDN. These paths are `.jpg` at
+        # sequential zero-padded ids (`thumbnails/00000123.jpg`,
+        # `plates/00000012/...`), which is on Cloudflare's default cacheable list, and a
+        # CDN cache key does not include the session cookie. One signed-in look at the
+        # recordings grid would have populated the edge with seven days of thumbnails and
+        # licence-plate crops that anyone could then enumerate without the request ever
+        # reaching this process -- the gate cannot refuse a request it never sees.
+        #
+        # `private` unconditionally, not only while sign-in is on: objects cached during
+        # an unauthenticated period outlive the moment it is switched on.
+        headers={"Cache-Control": "private, max-age=604800, immutable"},
     )
 
 
@@ -167,4 +178,11 @@ async def export_recording(
     except (PathTraversalError, FileNotFoundError):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording file not found") from None
     name = f"{recording.filename.rsplit('.', 1)[0]}-{start:.0f}s.mp4"
-    return FileResponse(clip, media_type="video/mp4", filename=name)
+    # An exported clip carries no cache headers of its own, and `.mp4` is another
+    # extension a CDN caches by default. Said explicitly for the same reason as above.
+    return FileResponse(
+        clip,
+        media_type="video/mp4",
+        filename=name,
+        headers={"Cache-Control": "private, no-store"},
+    )

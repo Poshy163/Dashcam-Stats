@@ -104,6 +104,12 @@ case "${1:-serve}" in
     migrate)
         exec "${exec_prefix[@]}" python -m alembic -c /app/backend/alembic.ini upgrade head
         ;;
+    recover-login)
+        # The way back in after locking yourself out. Runs as the app account rather than
+        # as root, so it cannot leave root-owned WAL files beside the database.
+        shift
+        exec "${exec_prefix[@]}" python -m app.auth.recover "$@"
+        ;;
     shell)
         exec "${exec_prefix[@]}" /bin/bash
         ;;

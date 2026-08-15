@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { invalidateAnalysisQueries } from '@/lib/queryInvalidation'
+import type { AuthState } from '@/lib/types'
 
 type IconProps = { className?: string }
 type NavItem = {
@@ -46,12 +47,28 @@ function useTheme() {
   return { theme, toggle: () => setTheme((current) => (current === 'dark' ? 'light' : 'dark')) }
 }
 
-export default function Layout({ children }: { children: ReactNode }) {
+export default function Layout({
+  children,
+  auth,
+}: {
+  children: ReactNode
+  auth?: AuthState
+}) {
   const client = useQueryClient()
   const { theme, toggle } = useTheme()
   const [query, setQuery] = useState('')
   const [navOpen, setNavOpen] = useState(false)
   const navigate = useNavigate()
+
+  const signOut = useMutation({
+    mutationFn: api.auth.logout,
+    onSuccess: () => {
+      // Drop the cache before asking who we are: the answer will be "nobody", and every
+      // page's data belongs to the session that just ended.
+      client.clear()
+      void client.invalidateQueries({ queryKey: ['auth-state'] })
+    },
+  })
 
   const { data: stats, dataUpdatedAt: statsUpdatedAt } = useQuery({
     queryKey: ['queue-stats'],
@@ -235,8 +252,31 @@ export default function Layout({ children }: { children: ReactNode }) {
             >
               {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
             </button>
+
+            {auth?.authenticated && (
+              <button
+                className="grid h-10 w-10 shrink-0 place-items-center rounded-lg text-content-muted hover:bg-surface-sunken hover:text-content"
+                onClick={() => signOut.mutate()}
+                disabled={signOut.isPending}
+                aria-label={`Sign out${auth.username ? ` (${auth.username})` : ''}`}
+                title={auth.username ? `Signed in as ${auth.username} — sign out` : 'Sign out'}
+              >
+                <SignOutIcon />
+              </button>
+            )}
           </div>
         </header>
+
+        {auth?.misconfigured && (
+          <div className="border-b border-state-warn/40 bg-state-warn/10 px-4 py-2.5 text-sm text-state-warn sm:px-6 lg:px-8">
+            Sign-in is switched on but no account is set, so this deployment is serving
+            without a password. Set one in{' '}
+            <NavLink to="/settings?category=security" className="font-semibold underline">
+              Settings → Access
+            </NavLink>
+            .
+          </div>
+        )}
 
         <main className="mx-auto w-full max-w-[1600px] px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
           {children}
@@ -292,6 +332,9 @@ function CloseIcon({ className }: IconProps) {
 }
 function SunIcon({ className }: IconProps) {
   return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><circle cx="10" cy="10" r="3.5" /><path d="M10 2v1.8M10 16.2V18M2 10h1.8M16.2 10H18M4.3 4.3l1.3 1.3M14.4 14.4l1.3 1.3M15.7 4.3l-1.3 1.3M5.6 14.4l-1.3 1.3" strokeLinecap="round" /></svg>
+}
+function SignOutIcon({ className }: IconProps) {
+  return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M12.5 3.5H16a1.5 1.5 0 0 1 1.5 1.5v10a1.5 1.5 0 0 1-1.5 1.5h-3.5" strokeLinecap="round" /><path d="M9 13.5 12.5 10 9 6.5M12.5 10h-10" strokeLinecap="round" strokeLinejoin="round" /></svg>
 }
 function MoonIcon({ className }: IconProps) {
   return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M16 11.5A6.5 6.5 0 0 1 8.5 4a6.5 6.5 0 1 0 7.5 7.5z" strokeLinejoin="round" /></svg>

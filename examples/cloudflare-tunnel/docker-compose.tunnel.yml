@@ -1,0 +1,34 @@
+# Cloudflare Tunnel overlay.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tunnel.yml up -d
+#
+# Nothing is port-forwarded and no port is opened on the router: cloudflared dials out to
+# Cloudflare and traffic returns down that connection. Set the tunnel's public hostname to
+# point at `dashcam:8080` — the compose service name and the port *inside* the container.
+#
+# Turn sign-in on in Settings > Access before the hostname goes live. See the README here.
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: dashcam-cloudflared
+    restart: unless-stopped
+
+    # `--no-autoupdate` because the container is the update mechanism: pull a new image
+    # rather than have a long-running process replace its own binary underneath itself.
+    command: tunnel --no-autoupdate run
+
+    environment:
+      # Put this in a .env file beside the compose file, not in the compose file. It is a
+      # bearer credential for the tunnel — anyone holding it can publish traffic as you.
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:?set TUNNEL_TOKEN in a .env file beside this one}
+
+    # Ordering only. cloudflared retries a refused origin, so this stops the first few
+    # seconds after a reboot returning 502 rather than fixing anything deeper.
+    depends_on:
+      - dashcam
+
+    # It talks to Cloudflare and to one container on this network. It needs nothing else.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

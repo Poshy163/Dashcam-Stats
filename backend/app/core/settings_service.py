@@ -322,6 +322,37 @@ _COERCERS: dict[str, Callable[[SettingDef, Any], Any]] = {
 }
 
 
+def _require_account_before_sign_in(defn: SettingDef, value: Any) -> None:
+    """Refuse to switch sign-in on when there is no account to sign in against.
+
+    The setting's own description promises this, and a promise a schema cannot keep is the
+    failure ``_require_containment`` above was written for. The catalogue validates each
+    value against its own definition and knows nothing else, so cross-field rules land
+    here, in the one place every write goes through -- the API route is not that place,
+    because the route is not the only caller and a guard there is a guard on one door of
+    several.
+
+    Getting this wrong does not produce a bad setting. It produces a deployment that
+    demands a password nobody holds, on a hostname the owner cannot get past.
+    """
+    if not value:
+        return
+    from app.auth.service import credential_configured
+
+    if not credential_configured():
+        raise SettingValidationError(
+            defn.key, "set a username and password before requiring sign-in"
+        )
+
+
+#: Rules that depend on something outside the catalogue. Consulted after coercion, so the
+#: value they see is the one that would be stored. Deliberately tiny -- a setting that
+#: needs one of these is a setting whose validity is not a property of the setting.
+_CROSS_FIELD_VALIDATORS: dict[str, Callable[[SettingDef, Any], None]] = {
+    "security.require_login": _require_account_before_sign_in,
+}
+
+
 def coerce_setting(defn: SettingDef, raw: Any) -> Any:
     """Validate ``raw`` against ``defn`` and return the value that should be stored.
 
@@ -487,6 +518,9 @@ class SettingsService:
             if defn.read_only:
                 raise SettingValidationError(key, "this setting is read-only")
             coerced[key] = coerce_setting(defn, raw)
+            validator = _CROSS_FIELD_VALIDATORS.get(key)
+            if validator is not None:
+                validator(defn, coerced[key])
 
         if not coerced:
             return {}

@@ -8,14 +8,11 @@ external services.
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
-import hmac
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
@@ -24,8 +21,10 @@ from starlette.responses import Response
 from app.ai.openvino_session import restore_gpu_failure_state
 from app.ai.runtime import describe_media_policy
 from app.api.errors import install_error_handlers
-from app.api.routes import content, heatmap, ingest, media, osd_debug, system
+from app.api.routes import auth, content, heatmap, ingest, media, osd_debug, system
 from app.api.schemas import HealthOut
+from app.auth.gate import AuthGate
+from app.auth.service import ensure_credential_loaded, require_login_setting, reset_auth_state
 from app.config import get_config
 from app.core.logging import configure_logging, get_logger, install_db_sink, shutdown_db_sink
 from app.core.settings_service import get_settings_service, init_settings_service
@@ -71,6 +70,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     await init_db()
     await init_settings_service(get_session_factory())
+
+    # Whether an account exists is answered from process state on every gated request, so
+    # it is read once here rather than faulted in by whoever happens to knock first. The
+    # reset in front of it matters for the restore path: a staged database is swapped in
+    # by init_db above, and it may carry a different account from the one this process
+    # started with.
+    reset_auth_state()
+    await ensure_credential_loaded()
 
     settings = get_settings_service()
     # The database log sink starts after settings so it honours the configured level from
@@ -126,46 +133,29 @@ def create_app() -> FastAPI:
         openapi_url="/api/openapi.json",
         docs_url="/api/docs",
         redoc_url="/api/redoc",
+        # FastAPI registers this at the *root* by default, which would have been the one
+        # route outside the gate's `/api` prefix rule. Nothing here uses OAuth, so rather
+        # than carve out an exception the route simply does not exist.
+        swagger_ui_oauth2_redirect_url=None,
     )
 
-    if config.auth_username and config.auth_password:
+    app.add_middleware(AuthGate)
 
-        @app.middleware("http")
-        async def optional_basic_auth(request: Request, call_next):
-            if request.url.path == "/health":
-                return await call_next(request)
-            supplied = request.headers.get("Authorization", "")
-            valid = False
-            if supplied.startswith("Basic "):
-                try:
-                    decoded = base64.b64decode(supplied[6:], validate=True).decode("utf-8")
-                    username, password = decoded.split(":", 1)
-                    valid = hmac.compare_digest(
-                        username, config.auth_username or ""
-                    ) and hmac.compare_digest(password, config.auth_password or "")
-                except (ValueError, UnicodeDecodeError):
-                    valid = False
-            if not valid:
-                return Response(
-                    "Authentication required",
-                    status_code=401,
-                    headers={"WWW-Authenticate": 'Basic realm="Dashcam Analyser"'},
-                )
-            return await call_next(request)
-
-    # Permissive because the intended deployment is a trusted LAN with no auth and users
-    # may hit the API from Home Assistant or a script on another host. Tighten this before
-    # exposing the app beyond a private network.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # There is no CORS middleware here any more, and its absence is the tightening its own
+    # comment asked for -- "tighten this before exposing the app beyond a private network"
+    # is exactly the change being made.
+    #
+    # `allow_origins=["*"]` bought this application nothing. The SPA is served from this
+    # same origin, so its requests were never subject to CORS at all, and the clients the
+    # permissiveness was written for -- Home Assistant's REST sensor, curl, a script on
+    # another host -- are not browsers and have never been bound by it either. What it did
+    # buy was a real hole in the default configuration: with sign-in off, any page the
+    # owner happened to visit could read `/api/map/routes` and `/api/plates` straight out
+    # of their browser, which is to say the home address and the plate list.
 
     install_error_handlers(app)
 
+    app.include_router(auth.router)
     app.include_router(system.router)
     app.include_router(content.router)
     app.include_router(media.router)
@@ -220,13 +210,18 @@ def create_app() -> FastAPI:
         if database == "unhealthy":
             status_text = "unhealthy"
 
+        # `/health` cannot be gated -- the Docker HEALTHCHECK runs `curl -fsS` with no
+        # credentials, and a 401 there restarts the container forever. So when the app is
+        # guarded, the *detail* goes instead: worker counts, the ffmpeg policy, the version
+        # and raw database exception strings are free reconnaissance for anyone who finds
+        # the hostname, and the healthcheck reads only the status code.
         payload = HealthOut(
             status=status_text,
             database=database,
             scanner=scanner,
             worker=worker,
             version=get_config().version,
-            detail=detail,
+            detail={} if require_login_setting() else detail,
         )
         return JSONResponse(
             status_code=200 if status_text != "unhealthy" else 503,

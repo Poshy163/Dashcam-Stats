@@ -7,6 +7,8 @@
  * the components actually see.
  */
 import type {
+  AuthSession,
+  AuthState,
   Heatmap,
   OsdDebug,
   HeatmapFilters,
@@ -82,6 +84,19 @@ function buildQuery(params?: Query): string {
   return qs ? `?${qs}` : ''
 }
 
+/**
+ * Called whenever the API answers 401, so the app can put the login page back up.
+ *
+ * A hook here rather than in the query client because not every call is a query — a
+ * mutation firing after a thirty-day session finally expired has to reach it too, and this
+ * is the one place every request already passes through.
+ */
+let onUnauthorized: (() => void) | null = null
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  onUnauthorized = handler
+}
+
 async function request<T>(
   path: string,
   options: RequestInit & { query?: Query; rawKeys?: boolean } = {},
@@ -89,8 +104,14 @@ async function request<T>(
   const { query, rawKeys, ...init } = options
   const response = await fetch(`/api${path}${buildQuery(query)}`, {
     headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) },
+    // Explicit rather than relying on the default. The session cookie is what
+    // authenticates every one of these, and a silent change of default here would log
+    // everyone out with no obvious cause.
+    credentials: 'same-origin',
     ...init,
   })
+
+  if (response.status === 401) onUnauthorized?.()
 
   if (!response.ok) {
     let detail: unknown
@@ -190,6 +211,32 @@ export interface RecordingFilters extends Query {
 export const api = {
   status: () => request<Status>('/status'),
   health: () => fetch('/health').then((r) => r.json()),
+
+  auth: {
+    /** Reachable signed out — it is how the app finds out that it is signed out. */
+    state: () => request<AuthState>('/auth/state'),
+    login: (username: string, password: string, remember: boolean) =>
+      post<{ authenticated: boolean; username: string; expiresAt: string }>('/auth/login', {
+        username,
+        password,
+        remember,
+      }),
+    logout: () => post<void>('/auth/logout'),
+    /** Creates the account, or changes it. Signs every other browser out either way. */
+    setCredential: (username: string, password: string, currentPassword?: string) =>
+      request<void>('/auth/credential', {
+        method: 'PUT',
+        body: JSON.stringify(
+          convertKeys({ username, password, currentPassword }, camelToSnake),
+        ),
+      }),
+    /** Deletes the account and switches sign-in off with it. */
+    clearCredential: (currentPassword?: string) =>
+      post<void>('/auth/credential/clear', { currentPassword }),
+    sessions: () => request<AuthSession[]>('/auth/sessions'),
+    revokeSession: (id: number) => request<void>(`/auth/sessions/${id}`, { method: 'DELETE' }),
+    revokeOtherSessions: () => post<{ revoked: number }>('/auth/sessions/revoke-all'),
+  },
 
   recordings: {
     list: (filters?: RecordingFilters) =>

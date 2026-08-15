@@ -29,6 +29,7 @@ from app.api.schemas import (
     StatusTotals,
 )
 from app.api.visibility import visible_journey_ids, visible_revision
+from app.auth.service import ensure_credential_loaded
 from app.config import get_config
 from app.core.logging import get_logger
 from app.core.settings_service import (
@@ -294,6 +295,10 @@ async def get_settings():
 
 @router.put("/settings", response_model=list[SettingCategoryOut])
 async def update_settings(body: SettingsUpdate):
+    # `security.require_login` is refused without an account, by a cross-field rule inside
+    # the settings service rather than by a check here. All this has to do is make sure the
+    # process knows whether an account exists before that rule is consulted.
+    await ensure_credential_loaded()
     try:
         await get_settings_service().set_many(body.values)
     except SettingValidationError as exc:

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
 
@@ -6,7 +6,7 @@ import Spinner from '@/components/Spinner'
 import { ErrorState, PageHeader } from '@/components/ui'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
-import { formatBytes } from '@/lib/format'
+import { formatBytes, formatDate, formatRelative } from '@/lib/format'
 import { invalidateAnalysisQueries } from '@/lib/queryInvalidation'
 import type { RetentionPlan, SettingDef } from '@/lib/types'
 
@@ -282,6 +282,8 @@ export default function Settings() {
             />
           )}
 
+          {category.key === 'security' && <SecurityPanel />}
+
           {category.key === 'advanced' && (
             <section className="card space-y-4 p-4">
               <h3 className="text-sm font-semibold">Diagnostics</h3>
@@ -486,6 +488,286 @@ function Field({
       {error && <p className="text-xs text-state-error">{error}</p>}
     </div>
   )
+}
+
+/** Shortest password the backend will accept. Kept in step with `MIN_PASSWORD_LENGTH`. */
+const MIN_PASSWORD_LENGTH = 12
+
+/**
+ * The account behind the “Require sign-in” switch, and the browsers currently holding a
+ * session against it.
+ *
+ * The password cannot go through the generic settings grid above: every value there is
+ * echoed back by `GET /api/settings` to render this page, so a password field would hand
+ * itself to anyone who asked. It has its own endpoint and its own panel for that reason.
+ */
+function SecurityPanel() {
+  const client = useQueryClient()
+  const auth = useQuery({ queryKey: ['auth-state'], queryFn: api.auth.state })
+  const sessions = useQuery({
+    queryKey: ['auth-sessions'],
+    queryFn: api.auth.sessions,
+    enabled: auth.data?.configured === true,
+  })
+
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [current, setCurrent] = useState('')
+  const [done, setDone] = useState<string | null>(null)
+
+  const configured = auth.data?.configured === true
+  const refresh = () => {
+    void client.invalidateQueries({ queryKey: ['auth-state'] })
+    void client.invalidateQueries({ queryKey: ['auth-sessions'] })
+    void client.invalidateQueries({ queryKey: ['settings'] })
+  }
+
+  const save = useMutation({
+    mutationFn: () => api.auth.setCredential(username.trim(), password, current || undefined),
+    onSuccess: () => {
+      setPassword('')
+      setConfirm('')
+      setCurrent('')
+      setDone(configured ? 'Password changed. Every other browser was signed out.' : 'Account created.')
+      refresh()
+    },
+  })
+
+  const clear = useMutation({
+    mutationFn: () => api.auth.clearCredential(current || undefined),
+    onSuccess: () => {
+      setCurrent('')
+      setDone('Account deleted and sign-in switched off.')
+      refresh()
+    },
+  })
+
+  const revokeOthers = useMutation({
+    mutationFn: api.auth.revokeOtherSessions,
+    onSuccess: (result) => {
+      setDone(`Signed out ${result.revoked} other browser${result.revoked === 1 ? '' : 's'}.`)
+      refresh()
+    },
+  })
+
+  const revokeOne = useMutation({
+    mutationFn: api.auth.revokeSession,
+    onSuccess: refresh,
+  })
+
+  useEffect(() => {
+    if (auth.data?.username && !username) setUsername(auth.data.username)
+  }, [auth.data?.username, username])
+
+  const mismatch = confirm.length > 0 && password !== confirm
+  const tooShort = password.length > 0 && password.length < MIN_PASSWORD_LENGTH
+  const canSave =
+    username.trim().length > 0 &&
+    password.length >= MIN_PASSWORD_LENGTH &&
+    password === confirm &&
+    (!configured || current.length > 0)
+
+  const error = save.error ?? clear.error ?? revokeOthers.error ?? revokeOne.error
+
+  return (
+    <section className="card space-y-4 p-4">
+      <div>
+        <h3 className="text-sm font-semibold">Sign-in account</h3>
+        <p className="hint mt-1">
+          {configured ? (
+            <>
+              One account, <strong className="text-content">{auth.data?.username}</strong>. There
+              is no user list and no roles — this is the person who owns the footage.
+            </>
+          ) : (
+            <>
+              No account yet. Set one here, then turn on “Require sign-in” above. The first
+              account can only be claimed from your own network; after that it can be changed
+              from anywhere with the current password.
+            </>
+          )}
+        </p>
+      </div>
+
+      {auth.data?.misconfigured && (
+        <p className="rounded border border-state-warn/40 bg-state-warn/10 p-2 text-xs text-state-warn">
+          Sign-in is switched on with no account behind it, so nothing is actually being
+          asked for. Setting a password below closes this.
+        </p>
+      )}
+
+      {!configured && auth.data?.canClaimAccount === false && (
+        <p className="rounded border border-state-warn/40 bg-state-warn/10 p-2 text-xs text-state-warn">
+          You are reaching this from outside the local network, so the first account cannot
+          be claimed here. Open the app from home, or run{' '}
+          <code>entrypoint.sh recover-login set-password</code> on the host.
+        </p>
+      )}
+
+      <div className="grid max-w-md gap-3">
+        <div className="space-y-1">
+          <label className="label" htmlFor="auth-username">Username</label>
+          <input
+            id="auth-username"
+            className="input"
+            value={username}
+            autoComplete="username"
+            onChange={(event) => setUsername(event.target.value)}
+          />
+        </div>
+
+        {configured && (
+          <div className="space-y-1">
+            <label className="label" htmlFor="auth-current">Current password</label>
+            <input
+              id="auth-current"
+              className="input"
+              type="password"
+              value={current}
+              autoComplete="current-password"
+              onChange={(event) => setCurrent(event.target.value)}
+            />
+            <p className="hint">
+              Asked for so that a session someone else is holding cannot be used to change
+              the password and lock you out.
+            </p>
+          </div>
+        )}
+
+        <div className="space-y-1">
+          <label className="label" htmlFor="auth-password">
+            {configured ? 'New password' : 'Password'}
+          </label>
+          <input
+            id="auth-password"
+            className="input"
+            type="password"
+            value={password}
+            autoComplete="new-password"
+            onChange={(event) => setPassword(event.target.value)}
+          />
+          <p className={cn('hint', tooShort && 'text-state-error')}>
+            At least {MIN_PASSWORD_LENGTH} characters. The database this is stored in can be
+            downloaded from Settings → Advanced, so length is what protects it if that file
+            ever leaves the machine.
+          </p>
+        </div>
+
+        <div className="space-y-1">
+          <label className="label" htmlFor="auth-confirm">Repeat password</label>
+          <input
+            id="auth-confirm"
+            className="input"
+            type="password"
+            value={confirm}
+            autoComplete="new-password"
+            onChange={(event) => setConfirm(event.target.value)}
+          />
+          {mismatch && <p className="text-xs text-state-error">Those do not match.</p>}
+        </div>
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        <button
+          className="btn btn-primary"
+          disabled={!canSave || save.isPending}
+          onClick={() => {
+            setDone(null)
+            save.mutate()
+          }}
+        >
+          {save.isPending ? 'Saving…' : configured ? 'Change password' : 'Create account'}
+        </button>
+        {configured && (
+          <button
+            className="btn btn-danger"
+            disabled={clear.isPending || current.length === 0}
+            onClick={() => {
+              if (
+                window.confirm(
+                  'Delete the sign-in account?\n\nSign-in is switched off at the same time, ' +
+                    'every browser is signed out, and anyone who can reach this address will ' +
+                    'have full access again.',
+                )
+              ) {
+                setDone(null)
+                clear.mutate()
+              }
+            }}
+          >
+            Delete account and turn sign-in off
+          </button>
+        )}
+      </div>
+
+      {done && <p className="text-sm text-state-ok">{done}</p>}
+      {error && <p className="text-sm text-state-error">{error.message}</p>}
+
+      {configured && (
+        <div className="border-t border-border pt-3">
+          <div className="flex items-center gap-2">
+            <h3 className="text-sm font-semibold">Signed-in browsers</h3>
+            <button
+              className="btn ml-auto"
+              disabled={revokeOthers.isPending}
+              onClick={() => revokeOthers.mutate()}
+            >
+              Sign out everywhere else
+            </button>
+          </div>
+          <p className="hint mt-1">
+            A “stay signed in” session lasts as long as the setting above. Changing the
+            password ends all of them.
+          </p>
+          <ul className="mt-2 space-y-1.5">
+            {(sessions.data ?? []).map((session) => (
+              <li
+                key={session.id}
+                className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded border border-border px-2.5 py-2 text-xs"
+              >
+                <span className="font-medium text-content">
+                  {session.current ? 'This browser' : describeAgent(session.userAgent)}
+                </span>
+                <span className="tabular text-content-muted">
+                  last used {formatRelative(session.lastUsedAt)}
+                </span>
+                <span className="tabular text-content-faint">
+                  {session.remembered ? 'stays signed in' : 'until the browser closes'} · expires{' '}
+                  {formatDate(session.expiresAt)}
+                </span>
+                {session.createdIp && (
+                  <span className="tabular text-content-faint">from {session.createdIp}</span>
+                )}
+                {!session.current && (
+                  <button
+                    className="ml-auto text-2xs text-content-faint hover:text-state-error"
+                    onClick={() => revokeOne.mutate(session.id)}
+                  >
+                    sign out
+                  </button>
+                )}
+              </li>
+            ))}
+            {sessions.data?.length === 0 && (
+              <li className="hint">No sessions — sign-in is set up but nobody is signed in.</li>
+            )}
+          </ul>
+        </div>
+      )}
+    </section>
+  )
+}
+
+/** Enough of a User-Agent to recognise a row by, without pretending to parse one. */
+function describeAgent(agent: string | null): string {
+  if (!agent) return 'Unknown browser'
+  const browser = ['Firefox', 'Edg', 'Chrome', 'Safari'].find((name) => agent.includes(name))
+  const platform = ['Windows', 'Android', 'iPhone', 'iPad', 'Mac', 'Linux'].find((name) =>
+    agent.includes(name),
+  )
+  const label = [browser === 'Edg' ? 'Edge' : browser, platform].filter(Boolean).join(' on ')
+  return label || 'Unknown browser'
 }
 
 // Takes the pieces it needs rather than the whole mutation object: TanStack's

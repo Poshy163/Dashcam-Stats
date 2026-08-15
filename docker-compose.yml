@@ -30,12 +30,14 @@ services:
 
     # Everything else is configured in the web UI. These are the only variables that
     # exist, and all of them already have sensible defaults.
+    #
+    # There is no password here any more. Sign-in is a UI setting — Settings > Access —
+    # with the account in the database, so turning it on no longer means writing a
+    # password into this file in clear text and restarting the container. Turn it on
+    # before putting the app on a public hostname; see examples/cloudflare-tunnel/.
     environment:
       - TZ=Australia/Adelaide
       # - DASHCAM_LOG_LEVEL=INFO
-      # Optional browser/API password. Enable both and place the app behind TLS.
-      # - DASHCAM_AUTH_USERNAME=dashcam
-      # - DASHCAM_AUTH_PASSWORD=change-me
 
 volumes:
   dashcam-data:

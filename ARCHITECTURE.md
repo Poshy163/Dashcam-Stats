@@ -137,8 +137,11 @@ volumes:
 ```
 
 Environment variables are deliberately minimal — `DASHCAM_DATA_DIR`, `DASHCAM_FOOTAGE_DIR`,
-`DASHCAM_PORT`, `DASHCAM_LOG_LEVEL`, and optional authentication credentials. Everything else is a row in `app_settings`, edited
+`DASHCAM_PORT`, `DASHCAM_LOG_LEVEL`. Everything else is a row in `app_settings`, edited
 through the UI and applied without a restart.
+
+Authentication used to be the exception, as `DASHCAM_AUTH_USERNAME` and
+`DASHCAM_AUTH_PASSWORD`. It is not any more, and section 9 explains why that mattered.
 
 ---
 
@@ -937,6 +940,7 @@ cameras ──< recordings >── journeys
                 └──< plate_observations >── plates
 
 processing_jobs, scan_runs, app_settings, log_entries, osd_profiles
+auth_credentials, auth_sessions
 ```
 
 Media files are never stored in the database — only paths under `/data/media`.
@@ -952,3 +956,95 @@ available devices. The resolved capability set drives decoder and inference sele
 surfaced in the UI (GPU name, decoder in use, inference device, realtime factor, current job).
 Every acceleration path degrades to CPU independently — a failed VAAPI probe does not disable
 GPU inference, and vice versa. No CUDA anywhere.
+
+---
+
+## 9. Optional sign-in
+
+Off by default. The deployment this was built for is a trusted LAN, and a password there
+buys nothing at the cost of a login page in front of everything. It exists so that putting
+the app on a public hostname is a decision rather than a mistake.
+
+### Why it is not two environment variables any more
+
+It was: `DASHCAM_AUTH_USERNAME` and `DASHCAM_AUTH_PASSWORD`, a middleware, and the browser's
+native Basic prompt. Three things were wrong with that, and only the first is obvious.
+
+* **The password was in the compose file, in clear text, and turning it on meant a
+  restart.** Everything else a user would reasonably want to change is a UI setting; this
+  was the one thing that was not, and it was the one thing people would want to change
+  after the fact.
+* **There is no way to sign out of a Basic prompt**, and no way to stay signed in either.
+  A "remember me" is not expressible in it at all.
+* **It was all-or-nothing at the edge of the process**, which meant the login page could
+  not exist — there is nothing to render when the challenge is the browser's own dialog.
+
+So: an account in its own table, sessions in another, a cookie, and a page.
+
+### The shape
+
+`app/auth/` is four small modules and a rescue tool. `passwords` hashes with
+`hashlib.scrypt` — memory-hard, standard library, no new wheel in an image that already
+carries OpenVINO and two model runtimes. `service` owns the account, the sessions and the
+caching. `ratelimit` throttles. `gate` is the ASGI middleware.
+
+Pure ASGI, not `BaseHTTPMiddleware`. Starlette's wrapper puts an anyio task and a memory
+stream around every response, and the two hot paths here are a recordings grid firing fifty
+thumbnail requests and a scrubber firing range requests as fast as it is dragged. Nothing in
+the gate needs to see a response, so nothing in the gate should be in its way.
+
+### Three decisions that carry the design
+
+**Lockout is the worst outcome, so the dangerous state is made unreachable rather than
+handled.** `security.require_login` cannot be switched on without an account — enforced in
+`SettingsService.set_many` beside `_require_containment`, not in the route, because a guard
+on one door of several is not a guard. Deleting the account switches the setting off in the
+same operation. If the pair somehow comes apart anyway — a hand-edited database, a restored
+backup — `sign_in_required()` fails *open* and says so in the log once a minute, and while
+in that state it re-reads the account row every thirty seconds, which is what lets
+`recover-login` reopen a running container without a restart.
+
+**The check has to be free, and revocation still has to be instant.** A verified token is
+cached in-process for a minute, misses are single-flighted so fifty simultaneous thumbnail
+requests behind one cold cookie cost one query rather than fifty, unknown tokens are
+remembered as unknown, and `last_used_at` is written in its own transaction after the read
+scope closes — never as an upgrade of it, because SQLite has one writer and section 5.1 is
+about what happens when the API queues behind it. Correctness does not depend on any of
+those TTLs: every entry carries an epoch, and anything that invalidates a session bumps it,
+retiring the whole cache in a single assignment.
+
+**Being expensive on purpose makes it a weapon.** A scrypt derivation is 32 MiB and an
+eighth of a second, `asyncio.to_thread` uses the loop's default executor, and that executor
+is shared with the detection stage, the ffmpeg probes and the ingest transfers. The
+`Authorization: Basic` path is reachable by anyone who knows the hostname, so unthrottled it
+is both a password oracle and a way to take the thread pool away from the pipeline. Every
+derivation goes through a two-permit semaphore; the Basic path is rate-limited and caches
+its rejections as well as its successes.
+
+The rate limiter's own shape follows from the same worry. Only the per-address bucket ever
+returns 429, because it is the only one an attacker fills for themselves. A per-username or
+global bucket that refused would hand any stranger a way to lock the *owner* out: four bad
+guesses a minute against a global ceiling keeps it permanently full, and the owner typing
+the correct password is refused along with everyone else. Those two buckets add bounded
+delay instead.
+
+### What the tunnel changed
+
+Three things only became wrong once the app had a public hostname, and all three were
+already in the code before any of this was added:
+
+* `/media` was served `Cache-Control: public`. A CDN keys on the URL and not on a cookie,
+  thumbnails and plate crops sit at sequential zero-padded `.jpg` paths, and Cloudflare
+  caches that extension by default — so one signed-in look at the recordings grid would
+  have published a week of footage stills to an edge cache that the gate never sees. Now
+  `private`, unconditionally, because objects cached while sign-in was off outlive the
+  moment it is switched on.
+* CORS was `allow_origins=["*"]`, whose own comment asked for it to be tightened before the
+  app left a private network. It is gone rather than narrowed: the SPA is same-origin so it
+  was never subject to CORS, and Home Assistant and `curl` are not browsers and never were.
+  What the wildcard did buy was any page the owner visited being able to read
+  `/api/map/routes` out of their browser.
+* `SameSite=Lax` is scoped to the registrable domain, so every other host under the same
+  apex is same-site to this one and can post here with the cookie attached. The gate checks
+  `Origin` on cookie-authenticated writes, and over HTTPS the cookie is named
+  `__Host-dashcam_session`, which no sibling host can write.

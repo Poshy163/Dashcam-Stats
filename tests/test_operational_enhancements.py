@@ -213,31 +213,3 @@ async def test_smart_reprocess_queues_only_the_requested_outdated_stage(client, 
     await db_session.refresh(outdated)
     assert current.telemetry_revision == CURRENT_REVISIONS["telemetry"]
     assert outdated.telemetry_revision == INVALIDATED_REVISION
-
-
-async def test_optional_auth_challenges_everything_except_health(monkeypatch, temp_dirs):
-    import httpx
-    from httpx import ASGITransport
-
-    from app.config import get_config
-    from app.db.session import dispose_engine
-    from app.main import create_app
-
-    data, footage = temp_dirs
-    monkeypatch.setenv("DASHCAM_DATA_DIR", str(data))
-    monkeypatch.setenv("DASHCAM_FOOTAGE_DIR", str(footage))
-    monkeypatch.setenv("DASHCAM_AUTH_USERNAME", "viewer")
-    monkeypatch.setenv("DASHCAM_AUTH_PASSWORD", "secret")
-    get_config.cache_clear()
-    secured = create_app()
-    transport = ASGITransport(app=secured)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
-        denied = await http.get("/")
-        allowed = await http.get("/", auth=("viewer", "secret"))
-        health = await http.get("/health")
-    assert denied.status_code == 401
-    assert denied.headers["www-authenticate"].startswith("Basic")
-    assert allowed.status_code == 200
-    assert health.status_code in {200, 503}
-    await dispose_engine()
-    get_config.cache_clear()
