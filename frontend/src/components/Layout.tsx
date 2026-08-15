@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
-import { invalidateAnalysisQueries } from '@/lib/queryInvalidation'
+import { invalidateAnalysisQueries, resetForIdentityChange } from '@/lib/queryInvalidation'
 import type { AuthState } from '@/lib/types'
 
 type IconProps = { className?: string }
@@ -62,12 +62,11 @@ export default function Layout({
 
   const signOut = useMutation({
     mutationFn: api.auth.logout,
-    onSuccess: () => {
-      // Drop the cache before asking who we are: the answer will be "nobody", and every
-      // page's data belongs to the session that just ended.
-      client.clear()
-      void client.invalidateQueries({ queryKey: ['auth-state'] })
-    },
+    // Drop the cache before asking who we are: the answer will be "nobody", and every
+    // page's data belongs to the session that just ended. The auth-state query is the one
+    // thing kept, because dropping it too leaves nothing for the refetch to find and the
+    // shell carries on rendering the signed-in app over a session that has ended.
+    onSuccess: () => resetForIdentityChange(client),
   })
 
   const { data: stats, dataUpdatedAt: statsUpdatedAt } = useQuery({

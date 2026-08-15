@@ -6,6 +6,7 @@ import Layout from '@/components/Layout'
 import Spinner from '@/components/Spinner'
 import { api, setUnauthorizedHandler } from '@/lib/api'
 import { setDisplayTimeZone } from '@/lib/format'
+import { AUTH_STATE_KEY, resetForIdentityChange } from '@/lib/queryInvalidation'
 
 // Route-level code splitting. The map and chart bundles are large and most sessions never
 // open a journey, so they should not sit in the initial payload.
@@ -35,7 +36,7 @@ export default function App() {
   // Asked for before anything else renders. Every page in the app opens by fetching
   // something, so mounting the shell before this resolves would fire a screenful of
   // requests that can only 401.
-  const auth = useQuery({ queryKey: ['auth-state'], queryFn: api.auth.state, staleTime: 60_000 })
+  const auth = useQuery({ queryKey: AUTH_STATE_KEY, queryFn: api.auth.state, staleTime: 60_000 })
   const locked = auth.data?.required === true && auth.data.authenticated === false
 
   // A thirty-day session expires while a tab is open, and the first request to notice is
@@ -43,7 +44,7 @@ export default function App() {
   // re-asks who we are, which flips `locked` and puts the login page up.
   useEffect(() => {
     setUnauthorizedHandler(() => {
-      void client.invalidateQueries({ queryKey: ['auth-state'] })
+      void client.invalidateQueries({ queryKey: AUTH_STATE_KEY })
     })
     return () => setUnauthorizedHandler(null)
   }, [client])
@@ -69,12 +70,10 @@ export default function App() {
     return (
       <Login
         rememberDays={auth.data?.rememberDays ?? null}
-        onSignedIn={() => {
-          // Everything cached was fetched as somebody else, or as nobody. The simplest
-          // correct thing is to keep none of it.
-          client.clear()
-          void client.invalidateQueries({ queryKey: ['auth-state'] })
-        }}
+        // Everything cached was fetched as somebody else, or as nobody, so none of it is
+        // kept — but the auth-state query itself has to survive that, or nothing is left
+        // to refetch and the login page stays up over a session that already exists.
+        onSignedIn={() => resetForIdentityChange(client)}
       />
     )
   }
