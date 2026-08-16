@@ -346,8 +346,11 @@ async def stop_listener(proc: asyncio.subprocess.Process | None) -> bool:
     return True
 
 
-async def show_url(address: str, url: str) -> None:
-    """Open a web page on the unit's own screen.
+async def show_url(address: str, url: str) -> str:
+    """Open a web page on the unit's own screen. Returns "" on success, or why not.
+
+    The return value is for the Test button on the Backup page and nothing else. The
+    transfer path ignores it, and must: see below.
 
     This is how the car shows what is being copied, and without installing anything it is
     the only way to show a real progress bar. AOSP's ``cmd notification post`` cannot: its
@@ -356,13 +359,14 @@ async def show_url(address: str, url: str) -> None:
     already serves a live Backup page, so pointing the unit's browser at it costs nothing
     and stays in step with the dashboard by construction.
 
-    Never raises, and never reports failure upward. A unit with no browser answers "Error:
-    Activity not started, unable to resolve Intent", and a courtesy on the car's screen has
-    no business turning a working transfer into a failed one.
+    Never raises. A unit with no browser answers "Error: Activity not started, unable to
+    resolve Intent", and a courtesy on the car's screen has no business turning a working
+    transfer into a failed one -- which is why the transfer path discards what comes back
+    rather than checking it.
     """
     if not is_safe_url(url):
         log.warning("refusing to open a URL that is not a plain web address", url=url[:120])
-        return
+        return "That is not a plain web address."
     try:
         # `-d` rather than a component: an implicit VIEW intent lets whatever browser the
         # vendor shipped answer, instead of this needing to know its package name.
@@ -373,11 +377,13 @@ async def show_url(address: str, url: str) -> None:
         )
     except AdbError as exc:
         log.warning("could not open the backup page on the head unit", error=str(exc))
-        return
+        return f"Could not reach the head unit: {exc}"
     # `am` reports "no browser" on stdout with a zero exit status, so the return code alone
     # would call that a success and leave nobody any the wiser about a blank screen.
     if "Error" in reply:
         log.warning("the head unit would not open the backup page", reply=reply[:200])
+        return f"The head unit refused to open it: {reply[:200]}"
+    return ""
 
 
 async def delete(address: str, source: str, names: list[str]) -> int:

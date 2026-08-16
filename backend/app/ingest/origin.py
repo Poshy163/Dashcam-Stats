@@ -40,7 +40,7 @@ answer for anyone who wants certainty rather than inference.
 
 from __future__ import annotations
 
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.auth.service import API_KEY_PARAM, api_key_enabled, configured_api_key
 from app.core.logging import get_logger
@@ -99,6 +99,25 @@ def _stored() -> str:
         return ""
 
 
+def with_api_key(url: str) -> str:
+    """Attach the API key to a URL bound for the head unit, if there is one to attach.
+
+    Applied to the operator's own ``ingest.unit_display_url`` as well as to the learned
+    address, because the alternative is a trap: that setting's example is a bare
+    ``http://host:port/backup``, anyone filling it in copies the example, and with sign-in
+    on the car then gets a login form it has no keyboard to answer. The override exists to
+    change *where* the car is sent, not to opt out of being able to get in.
+    """
+    if not url or not api_key_enabled():
+        return url
+    query = urlsplit(url).query
+    # An operator who pasted a full URL complete with `?k=` keeps theirs rather than
+    # collecting a second one.
+    if any(key == API_KEY_PARAM for key, _ in parse_qsl(query, keep_blank_values=True)):
+        return url
+    return f"{url}{'&' if query else '?'}{urlencode({API_KEY_PARAM: configured_api_key()})}"
+
+
 def backup_url() -> str:
     """Where to send the head unit's browser, or "" if this app has never been opened.
 
@@ -108,13 +127,24 @@ def backup_url() -> str:
     -- see ``_redeem_api_key`` in :mod:`app.main`.
     """
     base = _origin or _stored()
-    if not base:
-        return ""
-    # Only a key the gate would actually accept. Appending a too-short one would send the
-    # car to a login form by way of a URL that looks like it should have worked.
-    if not api_key_enabled():
-        return f"{base}/backup"
-    return f"{base}/backup?{urlencode({API_KEY_PARAM: configured_api_key()})}"
+    return with_api_key(f"{base}/backup") if base else ""
+
+
+def redacted(url: str) -> str:
+    """The same URL with the API key masked, for anything a human will look at.
+
+    The key is the account's equal, and the places this URL gets shown -- a log line on the
+    Logs page, the Test button's own result, the screenshot of either that ends up in a
+    bug report -- are all places it should not be legible.
+    """
+    if not url:
+        return url
+    parts = urlsplit(url)
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    if not any(key == API_KEY_PARAM for key, _ in pairs):
+        return url
+    masked = [(k, "<key>" if k == API_KEY_PARAM else v) for k, v in pairs]
+    return urlunsplit(parts._replace(query=urlencode(masked, safe="<>")))
 
 
 def reset_for_tests() -> None:

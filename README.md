@@ -179,6 +179,10 @@ What that means in practice:
   installed on the unit for this either; Android's own `am start` does it. Off by default,
   and worth knowing that a transfer can begin while you are still manoeuvring, so it can
   take the screen over mid-park.
+  - **Test car screen** on the Backup page fires it by hand, while the engine is running,
+    and tells you what happened — no address learned, no unit on the network, no browser on
+    the unit. Worth having because the real thing only fires when there is something to
+    copy, so otherwise confirming it works means catching a sixty-second window by luck.
   - If you have **Require sign-in** on, set an **API key** in Settings → Access as well.
     The car has nobody to fill in a login form, so the key rides along in the address it is
     opened on and is swapped for a cookie the moment it arrives — it does not stay in the

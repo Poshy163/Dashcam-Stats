@@ -235,6 +235,43 @@ def create_app() -> FastAPI:
     return app
 
 
+#: What the SPA shell is allowed to be cached as, and it is the whole of the blank-screen
+#: fix.
+#:
+#: Neither this file nor the assets carried a ``Cache-Control`` header at all, and "no
+#: header" does not mean "do not cache" -- it means the browser guesses, and the guess in
+#: every major browser is a fraction of the document's age since ``Last-Modified``. So an
+#: ``index.html`` that had been deployed a while was cached for hours *without revalidating*.
+#:
+#: That is fatal for this particular file, because it is the only unhashed thing in the
+#: build. Every page is a lazy chunk called ``Backup-CEsM9GNL.js`` and the hash changes with
+#: the contents, so a stale shell asks the server for chunk filenames that no longer exist,
+#: gets a 404, and React unmounts to a white screen. A manual refresh fixed it because a
+#: refresh is precisely what forces the revalidation that should have been happening anyway.
+#:
+#: ``no-cache`` is not ``no-store``: the file may still be stored, it just may not be reused
+#: without asking. The cost of asking is one request for about a kilobyte, and only on a
+#: full page load -- moving between pages is client-side routing and does not fetch the
+#: shell at all. (``FileResponse`` answers that request with a 200 rather than a 304;
+#: Starlette only does conditional requests in ``StaticFiles``. Not worth machinery for a
+#: file this size.)
+SHELL_CACHE_CONTROL = "no-cache"
+
+#: And the other half. The asset filenames contain a content hash, so a given URL's bytes
+#: can never change -- which makes them safe to cache for a year and never revalidate. This
+#: is what stops "revalidate the shell every navigation" from meaning "refetch everything".
+ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+
+class _ImmutableAssets(StaticFiles):
+    """Vite's hashed build output, served as permanently cacheable."""
+
+    def file_response(self, *args, **kwargs) -> Response:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = ASSET_CACHE_CONTROL
+        return response
+
+
 def _mount_frontend(app: FastAPI) -> None:
     """Serve the built SPA at / without shadowing the API."""
     if not FRONTEND_DIST.is_dir():
@@ -253,7 +290,7 @@ def _mount_frontend(app: FastAPI) -> None:
 
     assets = FRONTEND_DIST / "assets"
     if assets.is_dir():
-        app.mount("/assets", StaticFiles(directory=assets), name="assets")
+        app.mount("/assets", _ImmutableAssets(directory=assets), name="assets")
 
     index = FRONTEND_DIST / "index.html"
 
@@ -283,8 +320,10 @@ def _mount_frontend(app: FastAPI) -> None:
             and candidate.is_file()
             and candidate.resolve().is_relative_to(FRONTEND_DIST.resolve())
         ):
-            return FileResponse(candidate)
-        return FileResponse(index)
+            # Unhashed root files -- the favicon, manifest, robots.txt -- so they get the
+            # shell's treatment rather than the assets': revalidate, do not assume.
+            return FileResponse(candidate, headers={"Cache-Control": SHELL_CACHE_CONTROL})
+        return FileResponse(index, headers={"Cache-Control": SHELL_CACHE_CONTROL})
 
 
 async def _redeem_api_key(request: Request, full_path: str) -> Response | None:
@@ -317,6 +356,8 @@ async def _redeem_api_key(request: Request, full_path: str) -> Response | None:
     query = urlencode(remaining)
     secure = request_is_https(request)
     response = RedirectResponse(f"/{full_path}{'?' + query if query else ''}", status_code=303)
+    # This response carries the key as a Set-Cookie. Nothing may hold on to it.
+    response.headers["Cache-Control"] = "no-store"
     response.set_cookie(
         service.SECURE_API_KEY_COOKIE_NAME if secure else service.API_KEY_COOKIE_NAME,
         presented,

@@ -330,6 +330,8 @@ export const api = {
     status: () => request<IngestStatus>('/ingest/status'),
     run: () => post<{ started: boolean; state: string }>('/ingest/run'),
     cancel: () => post<{ cancelled: boolean }>('/ingest/cancel'),
+    // The URL comes back with the API key masked — it is rendered straight into the page.
+    showTest: () => post<{ shown: boolean; url: string }>('/ingest/show-test'),
     history: (query?: Query) => request<Paginated<IngestRun>>('/ingest/history', { query }),
   },
 

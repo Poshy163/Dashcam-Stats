@@ -47,6 +47,17 @@ def _get(key: str, default=None):
         return default
 
 
+def display_url() -> str:
+    """Where the head unit's browser gets sent, or "" if there is nowhere to send it.
+
+    Shared with the Backup page's Test button rather than duplicated there, so that what
+    the test proves is what a real transfer would actually do -- a test that resolves its
+    own address separately is a test of the test.
+    """
+    override = str(_get("unit_display_url", "") or "").strip()
+    return origin.with_api_key(override) if override else origin.backup_url()
+
+
 def delta(
     remote: list[RemoteFile],
     footage: Path,
@@ -374,7 +385,7 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
         # awaited: `am start` against a cold browser is not fast, and a courtesy display
         # must not be able to spend the window it is reporting on.
         if bool(_get("show_on_unit", False)):
-            display = str(_get("unit_display_url", "") or "").strip() or origin.backup_url()
+            display = display_url()
             if display:
                 _fire_and_forget(adb.show_url(info.address, display))
             else:

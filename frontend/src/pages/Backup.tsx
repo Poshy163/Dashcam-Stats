@@ -59,6 +59,9 @@ export default function Backup() {
   }
   const pullNow = useMutation({ mutationFn: api.ingest.run, onSuccess: invalidate })
   const cancel = useMutation({ mutationFn: api.ingest.cancel, onSuccess: invalidate })
+  // Deliberately not invalidating anything: this changes what is on the car's screen, not
+  // anything this page displays.
+  const showTest = useMutation({ mutationFn: api.ingest.showTest })
 
   if (status.isError) return <ErrorState error={status.error} retry={() => status.refetch()} />
 
@@ -81,6 +84,14 @@ export default function Backup() {
             <Link className="btn" to="/settings?category=ingest">
               Settings
             </Link>
+            <button
+              className="btn"
+              disabled={showTest.isPending}
+              onClick={() => showTest.mutate()}
+              title="Open this page on the dashcam's own screen right now"
+            >
+              {showTest.isPending ? 'Opening…' : 'Test car screen'}
+            </button>
             {running ? (
               <button className="btn" disabled={cancel.isPending} onClick={() => cancel.mutate()}>
                 Cancel
@@ -97,6 +108,25 @@ export default function Backup() {
           </>
         }
       />
+
+      {showTest.isSuccess && (
+        <div className="card mb-6 border-state-ok/40 px-5 py-4 text-sm">
+          <span className="font-medium text-state-ok">Opened on the dashcam.</span>{' '}
+          <span className="text-content-muted">
+            The car&rsquo;s screen should now be showing{' '}
+            <code className="text-xs">{showTest.data.url}</code>. Nothing puts the previous
+            screen back afterwards.
+          </span>
+        </div>
+      )}
+      {showTest.isError && (
+        <div className="card mb-6 border-state-error/40 px-5 py-4 text-sm">
+          <span className="font-medium text-state-error">Could not open it on the dashcam.</span>{' '}
+          <span className="text-content-muted">
+            {showTest.error instanceof Error ? showTest.error.message : 'Something went wrong'}
+          </span>
+        </div>
+      )}
 
       {data?.state === 'disabled' && (
         <div className="card mb-6 px-5 py-4 text-sm text-content-muted">

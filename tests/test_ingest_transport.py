@@ -1368,3 +1368,148 @@ class TestARunEndToEnd:
 
         assert result.state is RunState.OK
         assert sorted(unit.deleted) == sorted(unit.payload)
+
+
+class TestTheShellIsNotCachedIntoABlankScreen:
+    """`index.html` is the only unhashed file in the build, and that makes it dangerous.
+
+    Nothing here used to send `Cache-Control` at all, and "no header" does not mean "do not
+    cache" — browsers fall back to a heuristic fraction of the file's age. So a shell that
+    had been deployed a while was served from cache without revalidating, and since every
+    page is a content-hashed lazy chunk, it asked for filenames the new build no longer
+    had. The 404 unmounted React to a white screen, and a manual refresh "fixed" it only
+    because refreshing forces the revalidation that should never have been skipped.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _needs_spa(self):
+        from app.main import FRONTEND_DIST
+
+        if not FRONTEND_DIST.is_dir():
+            pytest.skip("the SPA is not built in this tree")
+
+    async def test_the_shell_must_be_revalidated(self, client):
+        response = await client.get("/backup")
+
+        assert response.headers["cache-control"] == "no-cache"
+
+    async def test_the_root_is_the_same(self, client):
+        assert (await client.get("/")).headers["cache-control"] == "no-cache"
+
+    async def test_hashed_assets_are_cached_hard(self, client):
+        """Otherwise revalidating the shell every navigation refetches the whole app."""
+        import re
+
+        shell = (await client.get("/")).text
+        match = re.search(r"/assets/(index-[A-Za-z0-9_-]+\.js)", shell)
+        assert match, "no hashed entry chunk in the shell"
+
+        response = await client.get(f"/assets/{match.group(1)}")
+
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+    async def test_revalidating_costs_about_a_kilobyte(self, client):
+        """`no-cache` is not `no-store`, and what it costs has to stay negligible.
+
+        Only a full page load fetches the shell at all — moving between pages is
+        client-side routing — so this is the whole price of never seeing a white screen.
+        """
+        response = await client.get("/")
+
+        assert response.status_code == 200
+        assert len(response.content) < 8_000, "the shell has grown enough to be worth caching"
+
+
+class TestTheCarScreenTestButton:
+    """Firing the head unit's screen by hand, because the real thing is unobservable.
+
+    It only fires when a transfer has files to copy, and a card with nothing new on it is
+    the steady state — so confirming it works otherwise means waiting for the car to arrive
+    carrying footage and catching a sixty-second window.
+    """
+
+    async def _enable(self, **values):
+        from app.core.settings_service import get_settings_service
+
+        await get_settings_service().set_many({"ingest.enabled": True, **values})
+
+    async def test_it_reports_success_and_hides_the_key(self, db_session, monkeypatch, client):
+        from app.ingest import adb, origin
+
+        shown: list[str] = []
+
+        async def record(address, url):
+            shown.append(url)
+            return ""
+
+        monkeypatch.setattr(adb, "show_url", record)
+        monkeypatch.setattr(adb, "is_listening", lambda address: _true())
+        origin.reset_for_tests()
+        await self._enable(**{"ingest.unit_adb_address": "10.0.0.5:5555"})
+        await client.put(
+            "/api/settings",
+            json={"values": {"security.api_key": "iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"}},
+        )
+        await origin.remember("http", "192.168.1.16:8199")
+
+        response = await client.post("/api/ingest/show-test")
+
+        assert response.status_code == 200
+        # The unit gets the real key...
+        assert shown == ["http://192.168.1.16:8199/backup?k=iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"]
+        # ...and the screen the operator is looking at does not.
+        assert response.json()["url"] == "http://192.168.1.16:8199/backup?k=<key>"
+
+    async def test_it_says_so_when_the_address_is_not_known(self, db_session, monkeypatch, client):
+        from app.ingest import origin
+
+        origin.reset_for_tests()
+        await self._enable()
+        await client.put("/api/settings", json={"values": {"ingest.learned_origin": ""}})
+
+        response = await client.post("/api/ingest/show-test")
+
+        assert response.status_code == 409
+        assert "does not know its own address" in response.json()["detail"]
+
+    async def test_it_says_so_when_the_car_is_not_here(self, db_session, monkeypatch, client):
+        from app.ingest import adb, origin
+
+        monkeypatch.setattr(adb, "is_listening", lambda address: _false())
+        origin.reset_for_tests()
+        await self._enable(**{"ingest.unit_adb_address": "10.0.0.5:5555"})
+        await origin.remember("http", "192.168.1.16:8199")
+
+        response = await client.post("/api/ingest/show-test")
+
+        assert response.status_code == 409
+        assert "Nothing is answering" in response.json()["detail"]
+
+    async def test_a_unit_with_no_browser_is_reported_rather_than_swallowed(
+        self, db_session, monkeypatch, client
+    ):
+        """The transfer path deliberately ignores this. The test button must not."""
+        from app.ingest import adb, origin
+
+        async def refuse(address, url):
+            return "The head unit refused to open it: Error: Activity not started"
+
+        monkeypatch.setattr(adb, "show_url", refuse)
+        monkeypatch.setattr(adb, "is_listening", lambda address: _true())
+        origin.reset_for_tests()
+        await self._enable(**{"ingest.unit_adb_address": "10.0.0.5:5555"})
+        await origin.remember("http", "192.168.1.16:8199")
+
+        response = await client.post("/api/ingest/show-test")
+
+        assert response.status_code == 502
+        assert "Activity not started" in response.json()["detail"]
+
+
+async def _true() -> bool:
+    return True
+
+
+async def _false() -> bool:
+    return False

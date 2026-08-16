@@ -47,6 +47,53 @@ async def ingest_run() -> dict[str, object]:
     return {"started": True, "state": get_status().snapshot()["state"]}
 
 
+@router.post("/ingest/show-test", summary="Open the backup page on the dashcam now")
+async def ingest_show_test() -> dict[str, object]:
+    """Fire the head unit's screen by hand, and say what actually happened.
+
+    This exists because the real thing is almost impossible to observe on purpose. It only
+    fires when a transfer has files to copy, and a card with nothing new on it is the
+    steady state -- so "did it work?" normally means waiting for the car to arrive carrying
+    footage, catching a sixty-second window, and watching the dashboard at the same time.
+    Every failure below was found that way once and should not have to be again.
+
+    Unlike the transfer path this reports failure, and reports it in the terms the operator
+    can act on: no address learned yet, no unit on the network, no browser on the unit.
+    """
+    from app.ingest import adb, puller
+    from app.ingest.origin import redacted
+
+    url = puller.display_url()
+    if not url:
+        raise HTTPException(
+            http_status.HTTP_409_CONFLICT,
+            "This app does not know its own address yet. Open the dashboard once, or set "
+            "the address in Settings → Backup / Ingest.",
+        )
+
+    address = str(puller._get("unit_adb_address", "") or "").strip()
+    if not address:
+        raise HTTPException(
+            http_status.HTTP_409_CONFLICT,
+            "No head unit address is configured in Settings → Backup / Ingest.",
+        )
+    if not await adb.is_listening(address):
+        raise HTTPException(
+            http_status.HTTP_409_CONFLICT,
+            f"Nothing is answering at {address}. The unit is only on the network while the "
+            "engine is running.",
+        )
+
+    # Awaited, unlike the transfer path — there is no window being spent here, and the
+    # whole point is to find out how it went.
+    reason = await adb.show_url(address, url)
+    if reason:
+        raise HTTPException(http_status.HTTP_502_BAD_GATEWAY, reason)
+    log.info("opened the backup page on the head unit by hand", url=redacted(url))
+    # Redacted: this is echoed into the UI and straight into any screenshot of it.
+    return {"shown": True, "url": redacted(url)}
+
+
 @router.post("/ingest/cancel", summary="Stop the running transfer")
 async def ingest_cancel() -> dict[str, object]:
     if not get_status().cancel():
