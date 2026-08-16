@@ -1906,3 +1906,120 @@ class TestProtectedRecordings:
         assert total.files == ["a.ts"]
         assert total.bytes_received == 10
         assert total.error == "the car left"
+
+
+class TestReclaimingSpaceAlreadyBackedUp:
+    """ "Delete from the card" only ever deleted what a run copied *itself*.
+
+    Everything copied before the setting was switched on stayed on the card for good: the
+    delta correctly skips a recording the library already has, so it never entered a plan,
+    never got committed, and was never a candidate for deletion. Observed on the live card
+    — 132 recordings still there, every sampled one already in the library, on a volume
+    that had been at 96% and recycling.
+    """
+
+    def test_files_the_library_already_has_are_recorded_not_just_skipped(self, tmp_path):
+        from app.ingest.models import RemoteFile
+        from app.ingest.puller import delta
+
+        (tmp_path / "20260812120000_camera_0.ts").write_bytes(b"x" * 100)
+        remote = [
+            RemoteFile("20260812120000_camera_0.ts", 100, 0),  # already local, same size
+            RemoteFile("20260812120100_camera_0.ts", 100, 0),  # genuinely new
+        ]
+
+        plan = delta(remote, tmp_path, skip_active_s=15, camera="both")
+
+        assert [i.name for i in plan.files] == ["20260812120100_camera_0.ts"]
+        assert [i.name for i in plan.already_local] == ["20260812120000_camera_0.ts"]
+
+    def test_a_short_local_copy_is_refetched_not_reclaimed(self, tmp_path):
+        """The size check is the whole guarantee. A truncated local copy is not a copy."""
+        from app.ingest.models import RemoteFile
+        from app.ingest.puller import delta
+
+        (tmp_path / "20260812120000_camera_0.ts").write_bytes(b"x" * 40)
+
+        plan = delta(
+            [RemoteFile("20260812120000_camera_0.ts", 100, 0)],
+            tmp_path,
+            skip_active_s=15,
+            camera="both",
+        )
+
+        assert [i.name for i in plan.files] == ["20260812120000_camera_0.ts"]
+        assert plan.already_local == []
+
+    def test_an_unmounted_share_reclaims_nothing(self, tmp_path):
+        """An absent mount looks like an empty directory, so nothing matches — the card
+        must not be emptied against a share that is not there."""
+        from app.ingest.models import RemoteFile
+        from app.ingest.puller import delta
+
+        plan = delta(
+            [RemoteFile("20260812120000_camera_0.ts", 100, 0)],
+            tmp_path / "not-mounted",
+            skip_active_s=15,
+            camera="both",
+        )
+
+        assert plan.already_local == []
+
+    def test_the_camera_filter_does_not_strand_the_other_lens(self, tmp_path):
+        """Front-only copying must still let the card give back rear footage the library
+        already holds, or the filter quietly becomes a leak."""
+        from app.ingest.models import RemoteFile
+        from app.ingest.puller import delta
+
+        (tmp_path / "20260812120000_camera_1.ts").write_bytes(b"x" * 100)
+
+        plan = delta(
+            [RemoteFile("20260812120000_camera_1.ts", 100, 0)],
+            tmp_path,
+            skip_active_s=15,
+            camera="camera_0",
+        )
+
+        assert [i.name for i in plan.already_local] == ["20260812120000_camera_1.ts"]
+
+    async def test_reclaim_groups_by_directory_and_reports_what_went(self, monkeypatch):
+        from app.ingest import adb, puller
+        from app.ingest.models import RemoteFile, UnitInfo
+
+        calls: list[tuple[str, list[str]]] = []
+
+        async def fake_delete(address, source, names):
+            calls.append((source, list(names)))
+            return len(names)
+
+        monkeypatch.setattr(adb, "delete", fake_delete)
+        info = UnitInfo(address="u:5555", source="/card/Video")
+
+        removed = await puller._reclaim(
+            info,
+            [
+                RemoteFile("a.ts", 10, 0, "/card/Video"),
+                RemoteFile("locked.ts", 5, 0, "/card/LockVideo"),
+            ],
+        )
+
+        assert removed == 2
+        assert sorted(calls) == [("/card/LockVideo", ["locked.ts"]), ("/card/Video", ["a.ts"])]
+
+    async def test_a_failed_reclaim_is_reported_rather_than_swallowed(self, monkeypatch):
+        """It was a bare `suppress(AdbError)`, which is why "is it deleting?" could not be
+        answered from the Logs page at all."""
+        from app.ingest import adb, puller
+        from app.ingest.models import RemoteFile, UnitInfo
+
+        async def fake_delete(address, source, names):
+            raise adb.AdbError("read-only file system")
+
+        monkeypatch.setattr(adb, "delete", fake_delete)
+
+        removed = await puller._reclaim(
+            UnitInfo(address="u:5555", source="/card/Video"),
+            [RemoteFile("a.ts", 10, 0, "/card/Video")],
+        )
+
+        assert removed == 0, "a failed reclaim must not be reported as space freed"

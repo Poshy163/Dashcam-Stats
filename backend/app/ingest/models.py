@@ -99,6 +99,14 @@ class DeltaPlan:
     backlog_bytes: int = 0
     #: Files excluded because the camera is still writing them.
     active_skipped: int = 0
+    #: Recordings the card still holds that the library already has, byte-for-byte.
+    #:
+    #: Not fetched -- that is the point of the delta -- but with delete-after-verify on they
+    #: are still the card's to give back. Without this the only files ever reclaimed were
+    #: the ones a run happened to copy itself, so everything copied before the setting was
+    #: switched on stayed on the card for good, and the card stayed full of footage that was
+    #: already safely in the library.
+    already_local: list[RemoteFile] = field(default_factory=list)
 
     @property
     def bytes(self) -> int:

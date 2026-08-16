@@ -216,6 +216,15 @@ def _bump_sessions() -> None:
     _session_cache.clear()
     _session_missing.clear()
     _last_used_written.clear()
+    # Single-flight entries are retired with everything else. They hold futures created on
+    # whichever event loop was running when the lookup started, so an entry that outlives
+    # its loop -- between tests, or after a restart-in-place -- is one that can never be
+    # awaited again. Cancel rather than drop, so anything already waiting is released
+    # instead of hanging on a future nobody will complete.
+    for pending in _inflight.values():
+        if not pending.done():
+            pending.cancel()
+    _inflight.clear()
 
 
 def _bump_credential() -> None:
@@ -554,15 +563,30 @@ async def resolve_session(token: str) -> Principal | None:
     try:
         principal = await _load_session(token_hash, username, now_wall, now)
     except Exception as exc:
-        _inflight.pop(token_hash, None)
         future.set_exception(exc)
         # Retrieved here so a future nobody happened to await does not have the loop
         # complain about an exception that was in fact handled.
         future.exception()
         raise
-    _inflight.pop(token_hash, None)
-    future.set_result(principal)
-    return principal
+    else:
+        future.set_result(principal)
+        return principal
+    finally:
+        # In a `finally`, and this is the whole point of it: `except Exception` does not
+        # catch `CancelledError`, so the two lines above used to leave the entry behind
+        # whenever the waiter was cancelled -- and a cancelled session lookup is not
+        # exotic here. The docstring above describes fifty thumbnail requests arriving
+        # together behind one cold cookie; navigating away part-way through cancels them.
+        #
+        # What was left behind is worse than a leak. Every later request presenting that
+        # cookie finds the orphan and awaits it, and it is a future nobody will ever
+        # complete -- so the session stops resolving until the process restarts. In the
+        # test suite, where each test gets its own event loop, the orphan is a future
+        # belonging to a *closed* loop, and awaiting it is exactly the "Event loop is
+        # closed" that has been failing CI since this cache was introduced.
+        _inflight.pop(token_hash, None)
+        if not future.done():
+            future.cancel()
 
 
 async def _load_session(

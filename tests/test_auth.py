@@ -641,3 +641,62 @@ class TestRedeemingTheKeyInTheUrl:
 
         assert response.status_code == 200
         assert (await secured.get("/api/ingest/status")).status_code == 401
+
+
+class TestTheSingleFlightCacheIsNotATrap:
+    """Fifty thumbnail requests behind one cold cookie collapse into one query.
+
+    The bookkeeping for that is a module-level dict of in-flight futures, and it has to be
+    emptied on every exit path. `except Exception` does not catch `CancelledError`, so a
+    cancelled lookup — a browser navigating away mid-burst, which is the ordinary case this
+    cache exists for — used to leave its future behind forever. Every later request with
+    that cookie then awaited a future nobody would ever complete.
+
+    The same orphan is what had been failing CI: each test gets its own event loop, so an
+    entry outliving its loop is a future on a *closed* loop, and awaiting it raises
+    "Event loop is closed".
+    """
+
+    async def test_a_cancelled_lookup_leaves_nothing_behind(self, client):
+        import asyncio
+
+        from app.auth import service
+
+        await _configure_account(client)
+        await _require_sign_in(client)
+
+        started = asyncio.Event()
+
+        async def never_finishes(*args, **kwargs):
+            started.set()
+            await asyncio.sleep(3600)
+
+        original = service._load_session
+        service._load_session = never_finishes
+        try:
+            task = asyncio.create_task(service.resolve_session("some-token"))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert service._inflight, "the lookup should be registered while it runs"
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            service._load_session = original
+
+        assert service._inflight == {}, "a cancelled lookup orphaned its future"
+
+    async def test_retiring_sessions_releases_anything_still_waiting(self, client):
+        """Nothing may be left holding a future that will never be completed."""
+        import asyncio
+
+        from app.auth import service
+
+        loop = asyncio.get_running_loop()
+        orphan = loop.create_future()
+        service._inflight["stale"] = orphan
+
+        service.reset_auth_state()
+
+        assert service._inflight == {}
+        assert orphan.cancelled(), "a waiter would have hung on this forever"

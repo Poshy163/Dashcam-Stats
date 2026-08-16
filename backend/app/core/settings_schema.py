@@ -1060,8 +1060,10 @@ SETTINGS: tuple[SettingDef, ...] = (
         "bool",
         False,
         "ingest",
-        "Off by default. A file is only ever removed from the card after a byte-complete "
-        "copy of it has been committed to the footage directory.",
+        "Off by default. A file is only ever removed from the card once a byte-complete "
+        "copy of it is in the footage directory — including recordings copied by an "
+        "earlier run, so switching this on reclaims the space taken by everything already "
+        "backed up rather than only by what is copied from now on.",
         dangerous=True,
         requires="ingest.enabled",
     ),

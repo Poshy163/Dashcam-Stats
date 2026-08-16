@@ -61,6 +61,37 @@ def _by_directory(files: list[RemoteFile], default: str) -> list[tuple[str, list
     return list(batches.items())
 
 
+async def _reclaim(info: UnitInfo, items: list[RemoteFile]) -> int:
+    """Remove recordings the library already holds from the card. Returns how many went.
+
+    Logged rather than silent, at info level, which is the other half of this fix. The
+    delete was wrapped in a bare ``suppress(AdbError)`` and said nothing on the way past,
+    so "is it deleting?" could not be answered from the Logs page at all -- the same shape
+    of mistake as the backup-page warning that sat below the default log level.
+    """
+    where = {item.name: item.directory or (info.source or "") for item in items}
+    removed = 0
+    for directory, names in _group_names([item.name for item in items], where).items():
+        try:
+            removed += await adb.delete(info.address, directory, names)
+        except adb.AdbError as exc:
+            # Still not fatal -- the copies are safe in the library and the card can be
+            # reclaimed next window -- but no longer invisible.
+            log.warning(
+                "could not reclaim space on the card",
+                directory=directory,
+                files=len(names),
+                error=str(exc),
+            )
+    if removed:
+        log.info(
+            "reclaimed card space for recordings already in the library",
+            files=removed,
+            megabytes=round(sum(i.size for i in items) / 1e6),
+        )
+    return removed
+
+
 def _group_names(names: list[str], where: dict[str, str]) -> dict[str, list[str]]:
     """Bucket committed filenames by the directory they came from.
 
@@ -152,6 +183,10 @@ def delta(
         except OSError:
             same = False
         if same:
+            # Recorded rather than merely skipped. The library has this one already, so it
+            # is not fetched -- but it is still occupying the card, and the same size check
+            # that justifies not copying it justifies giving that space back.
+            plan.already_local.append(item)
             continue
 
         plan.backlog_files += 1
@@ -405,6 +440,26 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
             newest_first=str(_get("transfer_order", "oldest_first")) == "newest_first",
         )
         status.plan(plan)
+
+        # Before the idle return, not after it. A card whose whole contents the library
+        # already holds produces exactly that idle run, every window, forever -- so leaving
+        # the reclaim until after this point is what made "delete from the card" look like
+        # it did nothing at all: only files a run happened to copy itself were ever given
+        # back, and everything copied before the setting was turned on stayed put.
+        if plan.already_local and bool(_get("delete_after_verify", False)):
+            # Gated on the same evaluator as every other destructive path here. The delta's
+            # own size check has already proved each of these exists locally, so an
+            # unmounted share yields an empty list rather than a wrong one -- but the check
+            # is cheap on a run that has something to reclaim, and this is the one place
+            # that erases footage from the card without having just written it.
+            safe, why = await safety
+            if safe:
+                await _reclaim(info, plan.already_local)
+            else:
+                log.warning(
+                    "not reclaiming card space: the footage directory is not safe", reason=why
+                )
+
         if not plan.files:
             result = RunResult(state=RunState.IDLE)
             return result
@@ -515,13 +570,13 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
         committed = await asyncio.to_thread(commit, staging, footage, expected)
 
         if bool(_get("delete_after_verify", False)) and committed:
-            # Grouped the same way the transfer was: `rm` is run from the directory, so a
-            # locked recording deleted against the ordinary Video path would either miss or
-            # -- far worse -- match a different file that happened to share its name.
-            where = {item.name: item.directory or info.source for item in plan.files}
-            for directory, names in _group_names(committed, where).items():
-                with contextlib.suppress(adb.AdbError):
-                    await adb.delete(info.address, directory, names)
+            # Grouped by directory the same way the transfer was: `rm` runs from the
+            # directory, so a locked recording deleted against the ordinary Video path
+            # would either miss or -- far worse -- match a different file that happened to
+            # share its name. `_reclaim` does that grouping and, unlike the bare
+            # `suppress(AdbError)` this replaced, says so in the log either way.
+            by_name = {item.name: item for item in plan.files}
+            await _reclaim(info, [by_name[name] for name in committed if name in by_name])
 
         state = (
             RunState.OK
