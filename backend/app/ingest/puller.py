@@ -378,9 +378,15 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
             if display:
                 _fire_and_forget(adb.show_url(info.address, display))
             else:
-                # Only reachable when nobody has opened the dashboard since this process
-                # started -- see `app.ingest.origin` for why that is not worth persisting.
-                log.debug("not showing the backup page: this app's own address is not known yet")
+                # Reachable only before this app has ever been opened in a browser, since
+                # the learned address is now kept across restarts. A warning rather than
+                # the debug line this used to be: while it was below the default log level
+                # the feature could fail on every single run and leave no trace at all,
+                # which is exactly what it did.
+                log.warning(
+                    "not showing the backup page: this app's own address is not known yet. "
+                    "Open the dashboard once, or set the address in Settings > Backup / Ingest."
+                )
 
         await cleaned
         port = int(_get("data_port", 9000))

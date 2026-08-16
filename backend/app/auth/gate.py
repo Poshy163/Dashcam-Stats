@@ -27,7 +27,12 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.auth.service import (
+    API_KEY_COOKIE_NAME,
+    API_KEY_HEADER,
+    API_KEY_PARAM,
+    SECURE_API_KEY_COOKIE_NAME,
     Principal,
+    resolve_api_key,
     resolve_basic,
     resolve_session,
     sign_in_required,
@@ -49,6 +54,14 @@ PUBLIC_PATHS = frozenset(
 
 #: Methods that change something, and therefore the ones an ``Origin`` is checked on.
 UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+#: Ways of authenticating that a *browser* attaches by itself, and which therefore ride
+#: along on a request some other site caused. The API key is here because it is handed out
+#: as a cookie once accepted -- without that it would be the one credential in this
+#: application that a sibling subdomain could spend. Nothing is lost by including it: a
+#: script presenting the key in a header sends no ``Origin`` at all, and the check passes
+#: any request that has none.
+_COOKIE_BORNE = frozenset({"session", "apikey"})
 
 
 class AuthGate:
@@ -76,7 +89,7 @@ class AuthGate:
             await _challenge(request)(scope, receive, send)
             return
 
-        if principal.method == "session" and not _origin_is_ours(request):
+        if principal.method in _COOKIE_BORNE and not _origin_is_ours(request):
             await _refuse_cross_origin()(scope, receive, send)
             return
 
@@ -85,16 +98,40 @@ class AuthGate:
 
 
 async def authenticate(request: Request) -> Principal | None:
-    """Resolve the request's principal from its cookie, or from Basic credentials."""
+    """Resolve the request's principal from its cookie, its API key, or Basic credentials."""
     token = token_from_cookies(request.cookies)
     if token:
         principal = await resolve_session(token)
+        if principal is not None:
+            return principal
+    presented = api_key_from_request(request)
+    if presented:
+        principal = await resolve_api_key(presented)
         if principal is not None:
             return principal
     header = request.headers.get("Authorization", "")
     if header:
         return await resolve_basic(header, address=client_ip(request) or "unknown")
     return None
+
+
+def api_key_from_request(request: Request) -> str:
+    """An API key presented as a cookie, a header, or a query parameter.
+
+    All three, because one caller needs each. The head unit arrives with the key in the
+    query string, since a browser navigation carries nothing else; it is given the cookie
+    on that first request and uses it for every fetch the page makes afterwards; and a
+    script or a Home Assistant sensor is better served by a header than by a key in a URL
+    that ends up in access logs.
+    """
+    from_cookie = request.cookies.get(SECURE_API_KEY_COOKIE_NAME) or request.cookies.get(
+        API_KEY_COOKIE_NAME
+    )
+    return (
+        from_cookie
+        or request.headers.get(API_KEY_HEADER, "")
+        or request.query_params.get(API_KEY_PARAM, "")
+    )
 
 
 def _is_gated(path: str) -> bool:

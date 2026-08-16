@@ -66,6 +66,31 @@ COOKIE_NAME = "dashcam_session"
 #: precisely the cookie no sibling host is able to write.
 SECURE_COOKIE_NAME = "__Host-dashcam_session"
 
+#: Name of the cookie a caller is given once its API key has been accepted.
+#:
+#: Exists so the head unit's browser can be handed the key exactly once, in the URL it is
+#: opened on, and then keep it out of the address bar. The alternative -- leaving ``?k=``
+#: on every page of the SPA -- puts the key in the browser history of a screen that sits
+#: unlocked in a car, and in the ``Referer`` of anything the page loads.
+API_KEY_COOKIE_NAME = "dashcam_key"
+
+#: And over HTTPS, for the reason given on :data:`SECURE_COOKIE_NAME`.
+SECURE_API_KEY_COOKIE_NAME = "__Host-dashcam_key"
+
+#: Where an API key may be presented, in the order the gate looks.
+#:
+#: The query parameter is what makes this feature possible at all: the head unit is handed
+#: a URL and nothing else -- no header can be attached to a browser's first navigation --
+#: so the key has to survive being written into a link. It is short because it is typed
+#: into ``am start`` and read off a car's screen.
+API_KEY_PARAM = "k"
+API_KEY_HEADER = "X-API-Key"
+
+#: Shortest key accepted. A key is a bearer credential with no username, no throttle worth
+#: the name and no second factor, so it is not allowed to be short enough to guess. Keys
+#: from :func:`generate_api_key` are far longer; this only refuses a hand-typed one.
+MIN_API_KEY_LENGTH = 24
+
 #: How long a verified token is trusted without going back to the database. Bounded by the
 #: epoch below rather than by this number, which only decides how stale ``last_used_at``
 #: and an expiry that passed mid-window are allowed to get.
@@ -114,7 +139,8 @@ class Principal:
     """Who is making the request, and how they proved it."""
 
     username: str
-    #: ``"session"`` for a cookie, ``"basic"`` for an API client's Authorization header.
+    #: ``"session"`` for a cookie, ``"basic"`` for an API client's Authorization header,
+    #: ``"apikey"`` for the standing key the head unit is handed in its URL.
     method: str
     session_id: int | None = None
 
@@ -653,6 +679,63 @@ async def list_sessions(*, current_session_id: int | None) -> list[SessionInfo]:
 
 
 # --------------------------------------------------------------------------------------
+# The API key, for callers that cannot be asked to type anything
+# --------------------------------------------------------------------------------------
+#
+# There is exactly one caller this exists for: the dashcam's own head unit. When a transfer
+# starts the app opens its Backup page on the car's screen, and there is nobody in the
+# driver's seat to fill in a login form -- the unit is handed a URL by ``am start`` and that
+# is the whole of its opportunity to authenticate.
+#
+# It is a bearer credential and it is *full access*: presenting it is presenting the
+# account. That is a deliberate choice by the operator rather than an oversight, and it is
+# why it is off until a key is set, why it is one setting to blank out, and why the key is
+# taken out of the URL on arrival rather than left in the history of a screen that lives in
+# a car. Anything that can read the key can read the footage.
+
+
+def generate_api_key() -> str:
+    """A fresh key. 32 bytes of urandom, URL-safe so it survives being put in a link."""
+    return secrets.token_urlsafe(32)
+
+
+def configured_api_key() -> str:
+    """The operator's key, or "" when the feature is switched off."""
+    try:
+        return str(get_settings_service().get_nowait("security.api_key") or "").strip()
+    except Exception:
+        # Only before the settings service is up, which means no request has been served.
+        return ""
+
+
+def api_key_enabled() -> bool:
+    return len(configured_api_key()) >= MIN_API_KEY_LENGTH
+
+
+async def resolve_api_key(presented: str) -> Principal | None:
+    """Turn a presented key into the account's principal, or None.
+
+    No cache and no rate limit, unlike the Basic path, because there is nothing expensive
+    here to protect: this is a comparison of two strings, not a scrypt derivation. The
+    comparison is constant-time all the same -- a bearer credential checked with ``==``
+    leaks its prefix to anyone patient enough to measure, and unlike a password there is no
+    KDF in front of it to hide behind.
+    """
+    if not presented:
+        return None
+    expected = configured_api_key()
+    if len(expected) < MIN_API_KEY_LENGTH:
+        return None
+    if not hmac.compare_digest(presented, expected):
+        return None
+    await ensure_credential_loaded()
+    username = _credential_username
+    if username is None:
+        return None
+    return Principal(username=username, method="apikey")
+
+
+# --------------------------------------------------------------------------------------
 # HTTP Basic, for API clients
 # --------------------------------------------------------------------------------------
 
@@ -720,24 +803,33 @@ async def resolve_basic(header: str, *, address: str) -> Principal | None:
 
 
 __all__ = [
+    "API_KEY_COOKIE_NAME",
+    "API_KEY_HEADER",
+    "API_KEY_PARAM",
     "CACHE_TTL_S",
     "COOKIE_NAME",
     "CREDENTIAL_ID",
     "DEFAULT_SESSION_HOURS",
+    "MIN_API_KEY_LENGTH",
     "MIN_PASSWORD_LENGTH",
+    "SECURE_API_KEY_COOKIE_NAME",
     "SECURE_COOKIE_NAME",
     "Principal",
     "SessionInfo",
+    "api_key_enabled",
     "clear_credential",
+    "configured_api_key",
     "configured_username",
     "create_session",
     "credential_configured",
     "ensure_credential_loaded",
+    "generate_api_key",
     "list_sessions",
     "misconfigured",
     "normalise_username",
     "require_login_setting",
     "reset_auth_state",
+    "resolve_api_key",
     "resolve_basic",
     "resolve_session",
     "revoke_all_sessions",

@@ -810,6 +810,24 @@ SETTINGS: tuple[SettingDef, ...] = (
         unit="days",
         requires="security.require_login",
     ),
+    SettingDef(
+        "security.api_key",
+        "API key",
+        "string",
+        "",
+        "security",
+        "A standing key that stands in for the username and password, for callers that "
+        "cannot be asked to type them. The dashcam's own screen is the reason it exists: "
+        "when a transfer starts the car is sent to this app's Backup page, and there is "
+        "nobody in the driver's seat to sign in — the key rides along in that address and "
+        "is swapped for a cookie the moment it arrives, so it does not stay in the car's "
+        "browser history. Scripts can send it as an X-API-Key header instead. "
+        "Blank switches it off, and blanking it is how you revoke one. "
+        "Treat it as the password: it reaches everything the account reaches, so anyone "
+        "holding it can read your footage and change these settings. At least 24 "
+        "characters; use the Generate button rather than inventing one.",
+        requires="security.require_login",
+    ),
     # --------------------------------------------------------------- advanced
     SettingDef(
         "advanced.log_level",
@@ -1008,6 +1026,20 @@ SETTINGS: tuple[SettingDef, ...] = (
         "which is by definition one that works on this network. Fill it in only if the car "
         "needs a different one — behind a reverse proxy whose hostname the head unit cannot "
         "resolve, for instance. Example: http://192.168.1.16:8199/backup.",
+        requires="ingest.show_on_unit",
+    ),
+    SettingDef(
+        "ingest.learned_origin",
+        "Address the car will be sent to",
+        "string",
+        "",
+        "ingest",
+        "Worked out on its own from however this dashboard was last opened, and kept so it "
+        "survives a restart — the car usually arrives long before anybody next opens the "
+        "app, and before this was stored those transfers ran with nothing on the screen. "
+        "Shown here so you can see where the car is actually being pointed. Overridden by "
+        "the address above if you set one.",
+        read_only=True,
         requires="ingest.show_on_unit",
     ),
     SettingDef(

@@ -135,7 +135,12 @@ export default function Settings() {
                   key={setting.key}
                   setting={setting}
                   value={valueOf(setting.key)}
-                  disabled={setting.requires ? !valueOf(setting.requires) : false}
+                  // Read-only settings are ones the app derives and writes for itself, so
+                  // the box is shown but not typed into — the API refuses the write anyway,
+                  // and an editable field that always fails to save is worse than none.
+                  disabled={
+                    setting.read_only || (setting.requires ? !valueOf(setting.requires) : false)
+                  }
                   error={errors[setting.key]}
                   onChange={(v) => setDirty((d) => ({ ...d, [setting.key]: v }))}
                   onReset={() => reset.mutate(setting.key)}
@@ -441,13 +446,27 @@ function Field({
         )
       default:
         return (
-          <input
-            type="text"
-            className="input"
-            value={String(value ?? '')}
-            disabled={disabled}
-            onChange={(e) => onChange(e.target.value)}
-          />
+          <div className="flex gap-2">
+            <input
+              type="text"
+              className="input"
+              value={String(value ?? '')}
+              disabled={disabled}
+              onChange={(e) => onChange(e.target.value)}
+            />
+            {setting.key === API_KEY_SETTING && !disabled && (
+              // A key nobody types is a key nobody makes weak. Left to invent one, the
+              // realistic outcome is a short memorable string standing in for the password
+              // on a deployment with a public hostname.
+              <button
+                type="button"
+                className="btn shrink-0"
+                onClick={() => onChange(generateApiKey())}
+              >
+                Generate
+              </button>
+            )}
+          </div>
         )
     }
   }
@@ -488,6 +507,23 @@ function Field({
       {error && <p className="text-xs text-state-error">{error}</p>}
     </div>
   )
+}
+
+/** The one setting that gets a generator beside it. */
+const API_KEY_SETTING = 'security.api_key'
+
+/**
+ * A key of the same shape the backend's `generate_api_key` produces.
+ *
+ * 32 bytes of `crypto.getRandomValues`, base64url so it survives being written into the
+ * URL the dashcam's head unit is opened on — which is the entire reason the key exists.
+ */
+function generateApiKey(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32))
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '')
 }
 
 /** Shortest password the backend will accept. Kept in step with `MIN_PASSWORD_LENGTH`. */

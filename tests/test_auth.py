@@ -494,3 +494,150 @@ class TestTheMisconfiguredState:
 
         client.cookies.clear()
         assert (await client.get("/api/status")).status_code == 200
+
+
+class TestTheApiKey:
+    """The standing key, which exists for one caller: the dashcam's own screen.
+
+    When a transfer starts the app opens its Backup page on the head unit, and there is
+    nobody in the driver's seat to fill in a login form. The unit is handed a URL by
+    ``am start`` and that URL is the whole of its opportunity to authenticate — so the key
+    has to survive being written into a link, and then has to stop living in the browser
+    history of a screen that sits unlocked in a parked car.
+    """
+
+    KEY = "iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"
+
+    @pytest.fixture
+    async def secured(self, client):
+        await _secure_and_sign_out(client)
+        return client
+
+    async def _set_key(self, client, key: str) -> None:
+        # Set as the signed-in owner, then step back out: changing the key is an
+        # authenticated action, and the tests below are about callers who are not.
+        await _sign_in(client, remember=False)
+        response = await client.put("/api/settings", json={"values": {"security.api_key": key}})
+        assert response.status_code == 200, response.text
+        assert (await client.post("/api/auth/logout")).status_code == 204
+        client.cookies.clear()
+
+    async def test_it_is_off_until_a_key_is_set(self, secured):
+        """No key configured means no key accepted, whatever is presented."""
+        assert (await secured.get("/api/status", params={"k": self.KEY})).status_code == 401
+        assert (
+            await secured.get("/api/status", headers={"X-API-Key": self.KEY})
+        ).status_code == 401
+
+    async def test_a_configured_key_is_accepted_as_a_query_parameter(self, secured):
+        """The form the head unit has to use — a navigation carries nothing else."""
+        await self._set_key(secured, self.KEY)
+
+        response = await secured.get("/api/status", params={"k": self.KEY})
+
+        assert response.status_code == 200
+
+    async def test_a_configured_key_is_accepted_as_a_header(self, secured):
+        """The form a script or a Home Assistant sensor should use instead."""
+        await self._set_key(secured, self.KEY)
+
+        response = await secured.get("/api/status", headers={"X-API-Key": self.KEY})
+
+        assert response.status_code == 200
+
+    async def test_it_speaks_for_the_account(self, secured):
+        """Chosen deliberately: it is the password's equal, not a reduced one."""
+        await self._set_key(secured, self.KEY)
+
+        body = (await secured.get("/api/auth/state", params={"k": self.KEY})).json()
+
+        assert body["authenticated"] is True
+        assert body["username"] == "joshua"
+
+    async def test_a_wrong_key_is_refused(self, secured):
+        await self._set_key(secured, self.KEY)
+
+        assert (await secured.get("/api/status", params={"k": "x" * 32})).status_code == 401
+
+    async def test_a_key_too_short_to_be_worth_guessing_is_refused(self, secured):
+        """Set by hand rather than generated. Accepting it would be the weakest link."""
+        await self._set_key(secured, "short")
+
+        assert (await secured.get("/api/status", params={"k": "short"})).status_code == 401
+
+    async def test_blanking_the_key_revokes_it(self, secured):
+        await self._set_key(secured, self.KEY)
+        assert (await secured.get("/api/status", params={"k": self.KEY})).status_code == 200
+
+        await self._set_key(secured, "")
+
+        assert (await secured.get("/api/status", params={"k": self.KEY})).status_code == 401
+
+    async def test_a_sibling_subdomain_cannot_spend_the_cookie(self, secured):
+        """The key is handed out as a cookie, so it inherits the session cookie's problem.
+
+        Every host under `joshualeaper.dev` is same-site to this one; without the Origin
+        check, a page on any of them could POST here and have the browser attach this.
+        """
+        await self._set_key(secured, self.KEY)
+
+        response = await secured.post(
+            "/api/scan",
+            params={"k": self.KEY},
+            headers={"Origin": "https://evil.joshualeaper.dev"},
+        )
+
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "cross_origin_refused"
+
+
+class TestRedeemingTheKeyInTheUrl:
+    """`?k=` is traded for a cookie on arrival and taken back out of the address bar.
+
+    Left there it would be in the history of a car's screen, in the `Referer` of every map
+    tile the page loads, and in any screenshot of the thing going wrong.
+    """
+
+    KEY = "iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"
+
+    @pytest.fixture
+    async def secured(self, client):
+        from app.main import FRONTEND_DIST
+
+        if not FRONTEND_DIST.is_dir():
+            pytest.skip("the SPA is not built in this tree")
+        await _configure_account(client)
+        await _require_sign_in(client)
+        response = await client.put(
+            "/api/settings", json={"values": {"security.api_key": self.KEY}}
+        )
+        assert response.status_code == 200, response.text
+        assert (await client.post("/api/auth/logout")).status_code == 204
+        client.cookies.clear()
+        return client
+
+    async def test_it_redirects_to_the_same_page_without_the_key(self, secured):
+        response = await secured.get("/backup", params={"k": self.KEY}, follow_redirects=False)
+
+        assert response.status_code == 303
+        assert response.headers["location"] == "/backup"
+
+    async def test_the_cookie_it_sets_authenticates_the_pages_own_fetches(self, secured):
+        """What actually makes the Backup page work on the car: no further key anywhere."""
+        await secured.get("/backup", params={"k": self.KEY}, follow_redirects=False)
+
+        assert (await secured.get("/api/ingest/status")).status_code == 200
+
+    async def test_other_query_parameters_survive_the_redirect(self, secured):
+        response = await secured.get(
+            "/backup", params={"k": self.KEY, "tab": "history"}, follow_redirects=False
+        )
+
+        assert response.headers["location"] == "/backup?tab=history"
+
+    async def test_a_wrong_key_lands_on_the_login_page_rather_than_an_error(self, secured):
+        """Saying which of "wrong key" and "no key" it was tells a guesser the same thing."""
+        response = await secured.get("/backup", params={"k": "x" * 32}, follow_redirects=False)
+
+        assert response.status_code == 200
+        assert (await secured.get("/api/ingest/status")).status_code == 401

@@ -503,19 +503,29 @@ class SettingsService:
 
     # -- writes -----------------------------------------------------------------------
 
-    async def set(self, key: str, value: Any) -> Any:
+    async def set(self, key: str, value: Any, *, internal: bool = False) -> Any:
         """Validate, persist and publish one setting. Returns the stored value."""
-        stored = await self.set_many({key: value})
+        stored = await self.set_many({key: value}, internal=internal)
         return stored[key]
 
-    async def set_many(self, values: Mapping[str, Any]) -> dict[str, Any]:
-        """Apply a batch atomically: nothing is written unless every value validates."""
+    async def set_many(
+        self, values: Mapping[str, Any], *, internal: bool = False
+    ) -> dict[str, Any]:
+        """Apply a batch atomically: nothing is written unless every value validates.
+
+        ``internal`` is for values the application derives and stores for itself rather
+        than ones the operator types -- the address the dashboard was last reached on being
+        the only one so far. Those are ``read_only`` so the settings page reports them
+        without offering a box to edit, and read-only has to mean "not yours to type", not
+        "nothing may ever write it". The flag is never set from the settings route, which
+        is the boundary the guard exists to protect.
+        """
         coerced: dict[str, Any] = {}
         for key, raw in values.items():
             defn = SETTINGS_BY_KEY.get(key)
             if defn is None:
                 raise SettingValidationError(key, "unknown setting")
-            if defn.read_only:
+            if defn.read_only and not internal:
                 raise SettingValidationError(key, "this setting is read-only")
             coerced[key] = coerce_setting(defn, raw)
             validator = _CROSS_FIELD_VALIDATORS.get(key)

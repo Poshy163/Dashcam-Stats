@@ -174,10 +174,16 @@ What that means in practice:
   screen** and the head unit opens this app's Backup page when a transfer starts. There is
   no address to configure: whatever you open the dashboard on is what the car is sent to,
   which is by definition an address that works on this network — a bridged container cannot
-  discover its own published address any other way. Nothing is installed on the unit for
-  this either; Android's own `am start` does it. Off by default, and worth knowing that a
-  transfer can begin while you are still manoeuvring, so it can take the screen over
-  mid-park.
+  discover its own published address any other way. It is kept across restarts, because the
+  car arrives on the driveway far more often than anybody opens the dashboard. Nothing is
+  installed on the unit for this either; Android's own `am start` does it. Off by default,
+  and worth knowing that a transfer can begin while you are still manoeuvring, so it can
+  take the screen over mid-park.
+  - If you have **Require sign-in** on, set an **API key** in Settings → Access as well.
+    The car has nobody to fill in a login form, so the key rides along in the address it is
+    opened on and is swapped for a cookie the moment it arrives — it does not stay in the
+    head unit's browser history. Without a key the car just gets the login page. The key is
+    the password's equal, so anyone holding it can read your footage; blank it to revoke.
 - **Copy order is a setting.** Oldest first by default, which keeps the library
   contiguous. If the backlog is permanently larger than one window, switch to newest
   first — otherwise every window goes on the oldest recordings and today's drive is never

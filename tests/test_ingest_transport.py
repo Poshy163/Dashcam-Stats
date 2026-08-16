@@ -687,19 +687,19 @@ class TestTheAppsOwnAddress:
 
         origin.reset_for_tests()
 
-    def test_the_dashboard_address_becomes_the_cars_address(self):
+    async def test_the_dashboard_address_becomes_the_cars_address(self):
         from app.ingest import origin
 
-        origin.remember("http", "192.168.1.16:8199")
+        await origin.remember("http", "192.168.1.16:8199")
 
         assert origin.backup_url() == "http://192.168.1.16:8199/backup"
 
-    def test_it_is_a_url_the_control_channel_will_accept(self):
+    async def test_it_is_a_url_the_control_channel_will_accept(self):
         """Whatever is learned still has to survive the allowlist before it is used."""
         from app.ingest import origin
         from app.ingest.adb import is_safe_url
 
-        origin.remember("http", "192.168.1.16:8199")
+        await origin.remember("http", "192.168.1.16:8199")
 
         assert is_safe_url(origin.backup_url())
 
@@ -707,23 +707,23 @@ class TestTheAppsOwnAddress:
         "host",
         ["localhost:8199", "127.0.0.1:8199", "[::1]:8199", "0.0.0.0:8199", "", "   "],
     )
-    def test_an_address_only_this_machine_can_use_is_refused(self, host):
+    async def test_an_address_only_this_machine_can_use_is_refused(self, host):
         """The head unit resolving "localhost" would reach itself, not this app."""
         from app.ingest import origin
 
-        origin.remember("http", host)
+        await origin.remember("http", host)
 
         assert origin.backup_url() == ""
 
-    def test_moving_the_app_is_picked_up_on_the_next_page_load(self):
+    async def test_moving_the_app_is_picked_up_on_the_next_page_load(self):
         from app.ingest import origin
 
-        origin.remember("http", "192.168.1.16:8199")
-        origin.remember("http", "192.168.1.20:9000")
+        await origin.remember("http", "192.168.1.16:8199")
+        await origin.remember("http", "192.168.1.20:9000")
 
         assert origin.backup_url() == "http://192.168.1.20:9000/backup"
 
-    def test_nothing_is_known_before_anybody_opens_the_dashboard(self):
+    async def test_nothing_is_known_before_anybody_opens_the_dashboard(self):
         from app.ingest import origin
 
         assert origin.backup_url() == ""
@@ -763,6 +763,77 @@ class TestLearningTheAddressFromTheDashboard:
         await client.get("/backup")
 
         assert origin.backup_url() == "http://test/backup"
+
+    async def test_it_survives_a_restart(self, client):
+        """The reason this feature never once fired on the deployment it was written for.
+
+        The dashboard is opened when somebody wants to look at footage; the car arrives
+        when somebody comes home. There is no reason the first has happened since the last
+        restart, and on the real unit it had not — two windows of sixty-two files each ran
+        with an empty address and nothing on the screen, and the app only learned where it
+        lived ninety-three seconds after the second one had started moving.
+        """
+        from app.ingest import origin
+        from app.main import FRONTEND_DIST
+
+        if not FRONTEND_DIST.is_dir():
+            pytest.skip("the SPA is not built in this tree")
+
+        await client.get("/backup")
+        # What a restart actually does: process memory goes, the database stays.
+        origin.reset_for_tests()
+
+        assert origin.backup_url() == "http://test/backup"
+
+    async def test_a_later_page_load_overwrites_a_stored_address(self, client):
+        """Staleness is what memory-only was protecting against, and it still is."""
+        from app.ingest import origin
+        from app.main import FRONTEND_DIST
+
+        if not FRONTEND_DIST.is_dir():
+            pytest.skip("the SPA is not built in this tree")
+
+        await origin.remember("http", "192.168.1.16:8199")
+        await origin.remember("http", "192.168.1.20:9000")
+        origin.reset_for_tests()
+
+        assert origin.backup_url() == "http://192.168.1.20:9000/backup"
+
+    async def test_the_car_is_sent_the_api_key_when_one_is_set(self, client):
+        """The head unit has no other way to present it — no keyboard, and no header on a
+        browser's first navigation."""
+        from app.auth.service import MIN_API_KEY_LENGTH
+        from app.ingest import origin
+
+        key = "iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"
+        assert len(key) >= MIN_API_KEY_LENGTH
+        await client.put("/api/settings", json={"values": {"security.api_key": key}})
+        await origin.remember("http", "192.168.1.16:8199")
+
+        assert origin.backup_url() == f"http://192.168.1.16:8199/backup?k={key}"
+
+    async def test_the_url_with_a_key_still_survives_the_control_channel_allowlist(self, client):
+        """`show_url` refuses anything that is not a plain web address, key or no key."""
+        from app.ingest import origin
+        from app.ingest.adb import is_safe_url
+
+        await client.put(
+            "/api/settings",
+            json={"values": {"security.api_key": "iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"}},
+        )
+        await origin.remember("http", "192.168.1.16:8199")
+
+        assert is_safe_url(origin.backup_url())
+
+    async def test_a_key_too_short_to_be_accepted_is_not_appended(self, client):
+        """Appending it would send the car to a login form by way of a URL that looks
+        like it should have worked."""
+        from app.ingest import origin
+
+        await client.put("/api/settings", json={"values": {"security.api_key": "short"}})
+        await origin.remember("http", "192.168.1.16:8199")
+
+        assert origin.backup_url() == "http://192.168.1.16:8199/backup"
 
 
 class TestTheLiveNumbers:
@@ -1205,7 +1276,7 @@ class TestARunEndToEnd:
 
         monkeypatch.setattr(adb, "show_url", record)
         origin.reset_for_tests()
-        origin.remember("http", "192.168.1.16:8199")
+        await origin.remember("http", "192.168.1.16:8199")
         await self._enable(**{"ingest.show_on_unit": True})
 
         assert (await puller.run_pull(trigger="manual")).state is RunState.OK
@@ -1231,7 +1302,7 @@ class TestARunEndToEnd:
 
         monkeypatch.setattr(adb, "show_url", record)
         origin.reset_for_tests()
-        origin.remember("https", "dashcam.example.com")
+        await origin.remember("https", "dashcam.example.com")
         await self._enable(
             **{
                 "ingest.show_on_unit": True,
@@ -1271,7 +1342,7 @@ class TestARunEndToEnd:
 
         monkeypatch.setattr(adb, "show_url", fail)
         origin.reset_for_tests()
-        origin.remember("http", "192.168.1.16:8199")
+        await origin.remember("http", "192.168.1.16:8199")
         await self._enable()
 
         assert (await puller.run_pull(trigger="manual")).state is RunState.OK

@@ -11,19 +11,21 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
+from urllib.parse import urlencode
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import RedirectResponse, Response
 
 from app.ai.openvino_session import restore_gpu_failure_state
 from app.ai.runtime import describe_media_policy
 from app.api.errors import install_error_handlers
 from app.api.routes import auth, content, heatmap, ingest, media, osd_debug, system
 from app.api.schemas import HealthOut
-from app.auth.gate import AuthGate
+from app.auth import service
+from app.auth.gate import AuthGate, request_is_https
 from app.auth.service import ensure_credential_loaded, require_login_setting, reset_auth_state
 from app.config import get_config
 from app.core.logging import configure_logging, get_logger, install_db_sink, shutdown_db_sink
@@ -269,7 +271,11 @@ def _mount_frontend(app: FastAPI) -> None:
         # runs. Taken here rather than in middleware precisely because this route serves
         # the dashboard and nothing else: an API caller's idea of this app's address is
         # its own, and Home Assistant's is usually a container name no car could resolve.
-        origin.remember(request.url.scheme, request.headers.get("host", ""))
+        await origin.remember(request.url.scheme, request.headers.get("host", ""))
+
+        redeemed = await _redeem_api_key(request, full_path)
+        if redeemed is not None:
+            return redeemed
 
         candidate = FRONTEND_DIST / full_path
         if (
@@ -279,6 +285,53 @@ def _mount_frontend(app: FastAPI) -> None:
         ):
             return FileResponse(candidate)
         return FileResponse(index)
+
+
+async def _redeem_api_key(request: Request, full_path: str) -> Response | None:
+    """Trade a ``?k=`` in the URL for a cookie, and send the browser back without it.
+
+    This is the whole of how the dashcam's head unit signs in. It is opened with
+    ``am start -a android.intent.action.VIEW -d <url>`` and that URL is its only chance to
+    present anything -- there is no keyboard in front of it, and no way to attach a header
+    to a browser's first navigation.
+
+    The redirect is the point, not politeness. Left in the address bar the key would be in
+    the history of a screen that sits unlocked in a parked car, in the ``Referer`` of every
+    tile the map loads, and in the URL the operator screenshots when something goes wrong.
+    Redeeming it once and moving to the clean path keeps it to a single request.
+
+    Returns None when there is no key to redeem, so the ordinary path is untouched.
+    """
+    presented = request.query_params.get(service.API_KEY_PARAM, "")
+    if not presented:
+        return None
+    if await service.resolve_api_key(presented) is None:
+        # Deliberately not an error page. A wrong key should land on the same login form as
+        # no key at all -- telling the car's screen which of the two it was tells anyone
+        # holding a guess the same thing.
+        return None
+
+    remaining = [
+        (k, v) for k, v in request.query_params.multi_items() if k != service.API_KEY_PARAM
+    ]
+    query = urlencode(remaining)
+    secure = request_is_https(request)
+    response = RedirectResponse(f"/{full_path}{'?' + query if query else ''}", status_code=303)
+    response.set_cookie(
+        service.SECURE_API_KEY_COOKIE_NAME if secure else service.API_KEY_COOKIE_NAME,
+        presented,
+        # No Max-Age. The key is a standing credential the operator revokes by blanking the
+        # setting, not one that expires; the cookie lasting the browser session is enough,
+        # and the unit is handed the URL again on the next transfer regardless.
+        path="/",
+        httponly=True,
+        # Strict, unlike the session cookie. Nothing ever links into this app holding an
+        # API key, so there is no inbound-link case to preserve -- and this cookie speaks
+        # for the whole account with no password behind it.
+        samesite="strict",
+        secure=secure,
+    )
+    return response
 
 
 app = create_app()

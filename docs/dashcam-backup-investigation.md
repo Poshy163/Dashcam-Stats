@@ -499,7 +499,7 @@ All app-side, no device access, every reliability property in §1 preserved.
 | 9 | `ingest.transfer_order` — oldest-first (default) or newest-first | `settings_schema.py`, `puller.py` | §2e — a permanently oversized backlog no longer starves new footage |
 | 11 | The two DB reads and the staging clean now run *concurrently with* the card listing instead of after it | `puller.py` | None of the three needs the card, and on a hard NFS mount that series was worth hundreds of milliseconds. Still awaited — and still gating — exactly where each result is needed |
 | 12 | Connect retry interval 250 ms → 50 ms | `transport.py` | The interval is the error bar on the start of every transfer: whatever is left of the current gap when the listener comes up is dead window |
-| — | `ingest.show_on_unit` — open this app's Backup page on the head unit's own screen when a transfer starts | `adb.show_url`, `origin.py`, `main.py`, `settings_schema.py` | §5. Off by default, URL allowlisted, fired not awaited, only when there is something to copy. The address is **learned from the browser**: a bridged container sees only its own 172.x interfaces, never the host LAN address and published port that actually reach it, so the address the dashboard was opened on is used. Learned from the SPA route only — never from an API call, because Home Assistant polls under a container name no car could resolve. `ingest.unit_display_url` overrides it for reverse-proxy setups |
+| — | `ingest.show_on_unit` — open this app's Backup page on the head unit's own screen when a transfer starts | `adb.show_url`, `origin.py`, `main.py`, `settings_schema.py` | §5. Off by default, URL allowlisted, fired not awaited, only when there is something to copy. The address is **learned from the browser**: a bridged container sees only its own 172.x interfaces, never the host LAN address and published port that actually reach it, so the address the dashboard was opened on is used. Learned from the SPA route only — never from an API call, because Home Assistant polls under a container name no car could resolve. `ingest.unit_display_url` overrides it for reverse-proxy setups. **Superseded in part — see §14: the address is now persisted, and an API key is needed when sign-in is on** |
 
 ### Deliberately not done
 
@@ -824,6 +824,79 @@ immediately**. Recording must be restored before the vehicle is driven. Do not l
 in a stopped state overnight under any circumstances.
 
 ---
+
+## 14. Why the backup page never actually appeared (field diagnosis, 2026-08-16)
+
+The feature shipped in `f744398` and had **never once fired** on the live deployment. Three
+separate things were wrong, and only the third was visible from the car.
+
+Everything the design assumed about the *device* held up. Probed against the live unit
+(`192.168.1.122:5555`) during a real driveway window:
+
+| Check | Result |
+| --- | --- |
+| Browser present | `com.android.chrome` + `com.google.android.webview` |
+| `http` VIEW intent resolves | `com.android.chrome/…IntentDispatcher`, `isDefault=true` |
+| `am start … -d 'http://192.168.1.16:8199/backup'` | `Starting: Intent { … }`, no `Error:` |
+| Unit → app reachability | `ping` 0 % loss, ~21 ms avg; TCP 8199 `REACHABLE` |
+
+So steps 6, 7 and 8 of the original checklist were fine, and the notification fallback in
+§12 G was never needed.
+
+### a. The learned address was empty at every single pull
+
+`origin` kept the address in process memory only, on the reasoning that the cost of a cold
+start was "one window's transfer". The logs say otherwise:
+
+```
+2026-08-15T13:55:27Z  ingest poller started          <- process restart, _origin = None
+2026-08-16T05:01:38Z  pulling from the head unit     62 files, 13 495 MB   <- no page
+2026-08-16T05:42:42Z  pulling from the head unit     62 files, 13 514 MB   <- no page
+2026-08-16T05:44:15Z  learned the address …          origin=http://192.168.1.16:8199
+```
+
+The dashboard is opened when somebody wants to look at footage; the car arrives when
+somebody comes home. There is no reason the first has happened since the last restart — and
+here it had not, for sixteen hours and two full windows. "One window" was every window.
+
+**Fixed** by persisting the learned address to `ingest.learned_origin` (read-only, shown on
+the settings page so the operator can see where the car is being pointed). Memory still
+wins, and any dashboard load still overwrites both, so the staleness argument that motivated
+memory-only is intact.
+
+### b. The failure was below the log level
+
+The one line that would have explained it, `not showing the backup page: this app's own
+address is not known yet`, was `log.debug`. The deployment runs at INFO, so a feature that
+failed on every run left **no trace whatsoever** — the table in §12 lists that message as a
+diagnostic, but it was unreachable in practice. Now a warning.
+
+### c. With sign-in on, the car got the login page
+
+Confirmed on the unit: Chrome loaded the URL and rendered the login form. The head unit has
+no keyboard and nobody in the driver's seat, and a browser's first navigation cannot carry
+an `Authorization` header — so there was no way for it to authenticate at all.
+
+**Fixed** with `security.api_key`. `backup_url()` appends it as `?k=…`; `_redeem_api_key` in
+`main.py` trades it for a `HttpOnly`/`SameSite=Strict` cookie and 303s to the clean path, so
+the key does not stay in the browser history of a screen that lives in a parked car. Also
+accepted as an `X-API-Key` header for scripts.
+
+It is a **full-access** bearer credential — the owner's explicit choice over a scoped
+read-only variant. Consequences, recorded deliberately: anyone holding it can read the
+footage and change the settings, and revocation is blanking the field. The cookie is
+included in the gate's `Origin` check (`_COOKIE_BORNE`) so a sibling subdomain cannot spend
+it on an unsafe method, which is the one thing handing it out as a cookie would otherwise
+have cost.
+
+### Not the cause
+
+The deployment hypothesis in the original brief — `release.yml` only tags `latest` on `v*`
+while `docker-compose.yml` pulls `:latest` — did **not** apply here: the live container was
+already running a `main` build (`/health` reports `"version":"main"`) and had
+`ingest.show_on_unit` in its settings schema. The mismatch is still a live trap for anyone
+following the committed compose file, but it was not this bug.
+
 
 ## Sources
 
