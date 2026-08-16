@@ -680,6 +680,35 @@ class TestTheUnitDisplay:
         monkeypatch.setattr(adb, "shell", fake_shell)
         await adb.show_url("u:5555", "http://nas:8098/backup")
 
+    async def test_it_reuses_one_tab_instead_of_opening_a_new_one_each_window(self, monkeypatch):
+        """Without this the car ends up with a tab per transfer, on a screen nobody tidies.
+
+        Measured against the live unit: three intents produced three tabs without the
+        application id and exactly one with it, and re-firing the same URL reloaded that
+        tab rather than only focusing it — so this is the refresh as well as the fix.
+        """
+        from app.ingest import adb
+
+        captured: list[str] = []
+
+        async def fake_shell(address, command, **kwargs):
+            captured.append(command)
+            return "Starting: Intent { ... }"
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+        await adb.show_url("u:5555", "http://nas:8098/backup")
+
+        assert f"--es {adb.BROWSER_APPLICATION_ID_EXTRA} '{adb.APPLICATION_ID}'" in captured[0]
+
+    def test_the_application_id_carries_nothing_into_the_shell(self):
+        """It is interpolated into a command, so it may not contain anything a shell reads."""
+        import re
+
+        from app.ingest import adb
+
+        assert re.fullmatch(r"[A-Za-z0-9._-]+", adb.APPLICATION_ID)
+        assert re.fullmatch(r"[A-Za-z0-9._-]+", adb.BROWSER_APPLICATION_ID_EXTRA)
+
 
 class TestTheAppsOwnAddress:
     """Learned from the browser, because a bridged container cannot know it.

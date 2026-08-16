@@ -409,6 +409,25 @@ async def stop_listener(proc: asyncio.subprocess.Process | None) -> bool:
     return True
 
 
+#: Tells the browser which application asked, so it reuses that application's tab.
+#:
+#: Without it every transfer opened another tab, and they accumulate for as long as the
+#: unit is up -- three pulls left three tabs of the same page on a screen nobody is going
+#: to tidy up. Passing a stable id makes the browser keep one tab per application and
+#: navigate it instead, which is both the fix and the refresh: measured on the unit, three
+#: intents produced three tabs without it and one with it, and re-firing the *same* URL
+#: reloaded that tab rather than merely focusing it.
+#:
+#: The extra is ``android.provider.Browser.EXTRA_APPLICATION_ID``, spelled out because this
+#: is a shell command rather than a linked constant. Chrome honours it; a vendor browser
+#: that does not will ignore an unknown extra rather than fail.
+BROWSER_APPLICATION_ID_EXTRA = "com.android.browser.application_id"
+
+#: The id itself. Any stable string works -- it is a grouping key, not a real package -- and
+#: this one is a plain identifier so it carries no shell metacharacters into the command.
+APPLICATION_ID = "com.dashcam.analyser"
+
+
 async def show_url(address: str, url: str) -> str:
     """Open a web page on the unit's own screen. Returns "" on success, or why not.
 
@@ -435,7 +454,8 @@ async def show_url(address: str, url: str) -> str:
         # vendor shipped answer, instead of this needing to know its package name.
         reply = await shell(
             address,
-            f"am start -a android.intent.action.VIEW -d '{url}'",
+            f"am start -a android.intent.action.VIEW -d '{url}' "
+            f"--es {BROWSER_APPLICATION_ID_EXTRA} '{APPLICATION_ID}'",
             timeout=10.0,
         )
     except AdbError as exc:
