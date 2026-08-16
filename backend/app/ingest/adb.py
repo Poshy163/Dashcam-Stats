@@ -39,8 +39,15 @@ CONTROL_TIMEOUT_S = 20.0
 #: that monthly, and it has already rolled EBDF-E4DD -> 0726-1708 once. ``/storage/Tfcard``
 #: is a symlink the platform recreates at every mount, so it survives the reformat; the
 #: glob is the fallback for a unit that does not create it.
+#: Internal shared storage is last on purpose. The removable card is where this camera
+#: records by default and is what the probe should find on an unmodified unit; the internal
+#: path is the fallback for one that has been pointed at its own flash instead. It needs
+#: naming explicitly because the glob above it cannot reach it -- the user directory is
+#: ``/storage/emulated/0/DCIM/Video``, and ``/storage/*/DCIM/Video`` only descends one
+#: level, matching ``/storage/emulated/DCIM/Video``, which does not exist.
 SOURCE_PROBE = (
-    "for d in /storage/Tfcard/DCIM/Video /storage/sdcard0/DCIM/Video /storage/*/DCIM/Video; "
+    "for d in /storage/Tfcard/DCIM/Video /storage/sdcard0/DCIM/Video /storage/*/DCIM/Video "
+    "/storage/emulated/0/DCIM/Video /sdcard/DCIM/Video; "
     'do [ -d "$d" ] && { echo "$d"; break; }; done'
 )
 

@@ -1608,3 +1608,117 @@ async def _configure_account_for_key(client, key: str) -> None:
     ).status_code == 200
     assert (await client.post("/api/auth/logout")).status_code == 204
     client.cookies.clear()
+
+
+class TestDrainingWhileTheCarIsStillHere:
+    """A window is not over when the first pull finishes.
+
+    The poller used to fire once on arrival and then sit idle for as long as the unit
+    stayed on the network. Everything that made that expensive is ordinary: the segment
+    being recorded when the plan is drawn is skipped on purpose, the camera closes another
+    every five minutes and writes ~2 MB/s throughout, and a run the link cut short has
+    files it never reached. All of it waited for the next window — the next time somebody
+    drove. One measured run moved 13.5 GB over seven minutes, leaving ~840 MB behind with
+    the car still sitting on the driveway.
+    """
+
+    def _poller(self):
+        from app.ingest.poller import IngestPoller
+
+        poller = IngestPoller()
+        poller._was_online = True
+        return poller
+
+    def _status(self, state):
+        from app.ingest.status import IngestStatus
+
+        status = IngestStatus()
+        status.state = state
+        return status
+
+    def test_a_run_that_moved_files_goes_again_immediately(self):
+        """It stopped for a reason that more copying is the answer to."""
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+
+        assert poller._should_drain_again(self._status(RunState.OK)) is True
+
+    def test_a_run_the_car_cut_short_goes_again(self):
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+
+        assert poller._should_drain_again(self._status(RunState.PARTIAL)) is True
+
+    def test_an_empty_card_is_not_listed_every_two_seconds(self):
+        """A run that found nothing proved the card is drained. Asking again straight away
+        would `stat` the whole card for as long as the car sits there."""
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+        status = self._status(RunState.IDLE)
+
+        assert poller._should_drain_again(status) is True, "the first look is allowed"
+        assert poller._should_drain_again(status) is False
+        assert poller._should_drain_again(status) is False
+
+    def test_the_empty_card_is_re_checked_once_the_backoff_passes(self):
+        """The camera closes a segment every five minutes; the backoff is well inside it."""
+        import time as _time
+
+        from app.ingest import poller as poller_mod
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+        status = self._status(RunState.IDLE)
+        assert poller._should_drain_again(status) is True
+        poller._idle_since = _time.monotonic() - poller_mod.IDLE_RECHECK_S - 1
+
+        assert poller._should_drain_again(status) is True
+
+    def test_pressing_stop_is_not_undone_two_seconds_later(self):
+        """Restarting a cancelled transfer is not a re-drain, it is ignoring the operator."""
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+
+        assert poller._should_drain_again(self._status(RunState.CANCELLED)) is False
+
+    def test_a_failing_unit_is_not_retried_on_a_timer(self):
+        """A unit answering its port but failing every pull should not be driven at."""
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+
+        for state in (RunState.ERROR, RunState.OFFLINE, RunState.UNAUTHORIZED):
+            assert poller._should_drain_again(self._status(state)) is False, state
+
+    def test_moving_files_clears_an_earlier_idle_backoff(self):
+        """Otherwise one empty look would hold off the drain that follows a real transfer."""
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+        assert poller._should_drain_again(self._status(RunState.IDLE)) is True
+        assert poller._should_drain_again(self._status(RunState.OK)) is True
+
+        assert poller._should_drain_again(self._status(RunState.IDLE)) is True
+
+
+class TestFindingTheFootageDirectory:
+    """Where the probe looks, and why internal storage needs naming explicitly."""
+
+    def test_internal_shared_storage_is_reachable_by_the_probe(self):
+        """`/storage/*/DCIM/Video` cannot find it: the user directory is one level deeper,
+        at `/storage/emulated/0/DCIM/Video`, and the glob only descends one level."""
+        from app.ingest.adb import SOURCE_PROBE
+
+        assert "/storage/emulated/0/DCIM/Video" in SOURCE_PROBE
+
+    def test_the_removable_card_is_still_preferred(self):
+        """It is where this camera records unmodified; internal is the fallback."""
+        from app.ingest.adb import SOURCE_PROBE
+
+        assert SOURCE_PROBE.index("/storage/Tfcard/DCIM/Video") < SOURCE_PROBE.index(
+            "/storage/emulated/0/DCIM/Video"
+        )

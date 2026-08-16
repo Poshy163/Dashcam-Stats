@@ -6,15 +6,24 @@ no battery, so the whole opportunity is the one to two minutes the engine runs, 
 seconds of that can be half the window. Rather than loosen a floor that protects everything
 else, ingest owns its own tick.
 
-Only the *transition* to online starts a run. A unit that simply stays on the network -- the
-car idling on the driveway -- must not have a new pull started on top of the last one, and
-`IngestStatus.try_begin` refuses that anyway; this just avoids asking.
+The transition to online starts the first run, and the unit staying on the network starts
+the next one. That second half was missing, and it was costing whole windows: a pull fired
+once on arrival and then nothing happened for as long as the car sat there. The segment
+being recorded when the plan was drawn is skipped on purpose, everything the camera closes
+during the transfer arrives too late to be in it, and a run cut short by the link dropping
+has files it never reached -- all of which waited for the *next* window, which here means
+the next time somebody drives. One measured 13.5 GB run took seven minutes, and the camera
+wrote about 2 MB/s throughout.
+
+Never two at once: a run in flight returns this loop early, and `IngestStatus.try_begin`
+refuses a second claim regardless.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
@@ -33,12 +42,23 @@ log = get_logger(__name__)
 #: car has arrived is about 140 MB of footage that waits until tomorrow.
 MIN_POLL_S = 1.0
 
+#: How long to leave a present-but-nothing-to-copy unit alone before asking again.
+#:
+#: The re-check below exists because a window is not over when the first pull finishes, but
+#: it must not turn into a card listing every couple of seconds for as long as the car sits
+#: on the driveway. A run that found nothing has just proved the card is drained; the only
+#: thing that changes that is the recorder closing another segment, which on this camera is
+#: every five minutes. Thirty seconds is well inside that and costs one `stat` of the card.
+IDLE_RECHECK_S = 30.0
+
 
 class IngestPoller:
     def __init__(self) -> None:
         self._task: asyncio.Task[None] | None = None
         self._running = False
         self._was_online = False
+        #: When the last run that found nothing finished, so the re-check can back off.
+        self._idle_since: float = 0.0
 
     async def start(self) -> None:
         if self._running:
@@ -76,6 +96,38 @@ class IngestPoller:
             return bool(get_settings_service().get_nowait("ingest.enabled"))
         except Exception:
             return False
+
+    def _should_drain_again(self, status) -> bool:
+        """Whether to start another pull at a unit that is already here.
+
+        Only reached with no run in flight -- the loop returns early while one is running --
+        so this is purely "has anything changed since the last one finished".
+
+        Two cases, and they want opposite answers. A run that *moved files* says the card
+        had a backlog, and the reasons it stopped are all reasons to go again immediately:
+        the segment being recorded when the plan was drawn is now closed, more have been
+        written during the transfer, and a run cut short by the car leaving has files left
+        that it never reached. A run that found *nothing* has proved the card is drained,
+        and asking again straight away would list it every couple of seconds for as long as
+        the car sits there -- so that one waits out :data:`IDLE_RECHECK_S`, which is well
+        inside the five minutes it takes the camera to close another segment.
+
+        Errors and offline runs are left to the arrival transition rather than retried in a
+        loop; a unit that is answering its ADB port but failing every pull should not have
+        that failure driven at it on a timer.
+        """
+        if status.state is RunState.IDLE:
+            now = time.monotonic()
+            if self._idle_since and now - self._idle_since < IDLE_RECHECK_S:
+                return False
+            self._idle_since = now
+            return True
+        if status.state in (RunState.OK, RunState.PARTIAL):
+            self._idle_since = 0.0
+            return True
+        # CANCELLED is deliberately not in that list. Somebody pressed Stop; starting the
+        # same transfer again two seconds later is not a re-drain, it is ignoring them.
+        return False
 
     def _address(self) -> str:
         try:
@@ -125,6 +177,7 @@ class IngestPoller:
                 else:
                     if not self._was_online:
                         log.info("the head unit appeared; starting a pull", address=info.address)
+                        self._idle_since = 0.0
                         # Not awaited: a pull runs for as long as the window lasts and the
                         # poll has to keep ticking underneath it. `start_run` keeps the
                         # reference so the task cannot be collected and shutdown can find it.
@@ -134,6 +187,19 @@ class IngestPoller:
                         # above; doing it again inside the run tore down the link it had
                         # only just proven good, and paid for the round trip twice at the
                         # most expensive moment of the day.
+                        puller.start_run(trigger="auto", info=info)
+                    elif self._should_drain_again(status):
+                        # The window is not over when the first pull ends, and it used to be
+                        # treated as though it were: this fired once on arrival and then sat
+                        # idle for as long as the car stayed. Everything the recorder closed
+                        # during the transfer, and the segment that was still being written
+                        # when the plan was drawn up, waited for the *next* window -- which
+                        # on this deployment is the next time somebody drives.
+                        #
+                        # A 13.5 GB run takes seven minutes, and the camera writes about
+                        # 2 MB/s while it does, so that one window alone left ~840 MB behind
+                        # with the car still sitting on the driveway.
+                        log.info("the head unit is still here; looking for more to copy")
                         puller.start_run(trigger="auto", info=info)
                     self._was_online = True
             except asyncio.CancelledError:

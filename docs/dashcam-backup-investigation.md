@@ -898,6 +898,189 @@ already running a `main` build (`/health` reports `"version":"main"`) and had
 following the committed compose file, but it was not this bug.
 
 
+## 15. The benchmark matrix, run against the live unit (2026-08-16)
+
+§13-H executed on the real device. The unit was on a bench on mains power rather than in the
+car, so window length was not a constraint and every cell could be run to completion three
+times. Receiver was a separate host on **10 GbE**, so nothing here is limited by the far end.
+
+### The numbers
+
+| Cell | What it isolates | min | median | max |
+| --- | --- | ---: | ---: | ---: |
+| **H0** | link only, exec mode, `/dev/zero` (2 GB) | 34.57 | **34.88** | 35.70 |
+| **H1** | link + toybox `nc` relay, `/dev/zero` (2 GB) | 31.65 | **32.43** | 32.58 |
+| **H2** | card + exec mode, no relay, real `.ts` (1.7 GB) | 28.12 | **30.99** | 32.64 |
+| **H3** | card + relay — **the current transport** | 31.84 | **32.07** | 32.20 |
+| **H4** | 4 parallel streams, aggregate | — | **33.51** | — |
+| — | cold card read through FUSE (`dd`, recording live) | 54 | **55** | 56 |
+| — | production, unit → NAS, staged and committed | 27.8 | **30.7** | 32.5 |
+
+All MB/s. H2/H3 alternated run-by-run so cache state matched.
+
+### What it says
+
+**The radio is the ceiling, and the transport is already at 93% of it.**
+
+```
+Wi-Fi standard        : 5 (802.11ac)          Frequency : 5220 MHz (ch 44, 80 MHz)
+RSSI                  : -48 dBm               Link speed: 433 Mbps
+Max Supported Tx/Rx   : 433 Mbps  <-- the device cap, 1x1 VHT80
+```
+
+433 Mbps PHY is 54.1 MB/s raw; H0's 34.9 MB/s is 65% goodput, which is ordinary for 11ac.
+`Max Supported` being equal to the negotiated rate means the radio is **single-stream** —
+there is no better rate to negotiate. RSSI is already -48 with zero TX errors, drops or
+collisions, so nothing about placement, channel or antenna is being left on the table.
+
+Everything else has slack:
+
+- **The card is not the constraint.** 55 MB/s cold through FUSE against 32 used.
+- **The CPU is not the constraint.** During a full-rate transfer: `414% idle of 800%`,
+  `tar` at 10.3%, `nc` at 0.0%.
+- **The link is clean.** `ip -s link`: 0 errors, 0 dropped, 0 collisions.
+
+### Optimisations that are now dead, with the measurement that killed them
+
+| Idea | Verdict |
+| --- | --- |
+| **Exec mode** (`nc -l -p P COMMAND`, no relay) — §2b | **No gain.** H2 ≈ H3, and H3 was *more consistent*. The relay costs 7% on `/dev/zero` (H0→H1) because `dd` outruns the link, but with real files the FUSE read paces the pipeline and the relay has slack. `nc` does support the COMMAND form; it is simply not worth using. Note `tar -C DIR c F` fails on toybox (`Needs -txc`) — only `cd DIR && tar c F` or `tar cC DIR F` work. |
+| **Raw mount** (`/mnt/media_rw/<VOL>`, bypassing FUSE) | **Impossible unrooted.** `ls: Permission denied`. The vfat mount is `gid=1023 (media_rw)`, `dmask=0007`; `shell` is in `sdcard_rw`/`sdcard_r` but not `media_rw`. And FUSE is not costing anything anyway — see the 55 MB/s read. |
+| **Parallel streams** — H4 | **No gain.** 4 streams aggregate 33.51 MB/s against 34.88 for one. It is the same radio. |
+| **Compression** (`-z zstd`, gzip) | **No gain.** 40 MB of `.ts` gzips to 97.6% of its original size. It is already H.264. |
+| **A faster `adb`** — H6 | **Moot.** The bulk path has not touched `adbd` since the `tar`/`nc` transport landed. |
+| **Pausing the recorder** — H7/§K | **No gain, and no clean mechanism.** See below. |
+
+### Pausing recording is not worth it
+
+The question was asked directly, so it was measured rather than assumed.
+
+Recording costs, during a live transfer: about 10% of *one* core (`media.unisoc.codec2` 6.8%,
+`media.swcodec` 3.4%) against 414% idle, and roughly 2 MB/s of card writes against a card
+that reads at 55 and a link that caps at 35. **There is no contention to recover.**
+
+There is also no clean way to do it. `com.zqc.camera` exports exactly one component —
+`.ui.CameraActivity`, on `android.intent.action.MAIN` and `zqc.intent.action.camera`. Every
+other receiver in its manifest is AndroidX WorkManager `ConstraintProxy` boilerplate
+(`BATTERY_OKAY`, `ACTION_POWER_DISCONNECTED`, `DEVICE_STORAGE_LOW`, `CONNECTIVITY_CHANGE`).
+There is no pause or stop action to send. The only routes are `am force-stop` or
+`pm disable`, both of which stop the dashcam recording with no guarantee about what restarts
+it — to buy nothing.
+
+**Recommendation: do not implement §7. Close it.**
+
+## 16. What is actually limiting the backup, and what to do
+
+The transport is finished work. The constraint moved somewhere else entirely.
+
+### The arithmetic
+
+Measured from the library's own totals — 134.6 GB over 34.7 hours of recording across 1128
+files, a mean of **8.62 Mbps**. With both lenses running that is **~2.16 MB/s of wall-clock
+driving**. Transfers run at **~32.5 MB/s**.
+
+```
+window needed  =  driving time x (2.16 / 32.5)  =  driving time / 15
+```
+
+**One second of window pays for fifteen seconds of driving.** So:
+
+| Window | Moves | Covers |
+| ---: | ---: | ---: |
+| 60 s | 1.95 GB | ~15 min of driving |
+| 120 s | 3.90 GB | ~30 min of driving |
+| 600 s | 19.5 GB | ~2.5 h of driving |
+
+The median successful window in the run history moved **1.23 GB** — about 38 seconds of
+transfer, covering **~9.5 minutes of driving**. Drive longer than that between windows and
+the backlog grows permanently, which is exactly what the card shows.
+
+### Ranked, by how much they actually change the outcome
+
+1. **Extend the window. This is the only lever that changes anything.** `dumpsys battery`
+   reports `present: false` — there is no backup power of any kind, so the unit dies with
+   the ignition. A hardwire kit with an ACC delay, or any small 12 V holdover, converts a
+   ~40-second window into whatever it is set to. Ten minutes of holdover moves 19.5 GB,
+   which is more than the entire card. Nothing in software competes with this.
+   (`wifi_sleep_policy=2` is already "never sleep" and `screen_off_timeout` is already
+   effectively infinite, so there is nothing to win in settings.)
+
+2. **Halve the data.** `ingest.camera_filter` = `camera_0` doubles effective throughput at
+   the cost of the second lens. Lowering the recorder's bitrate in the vendor app does the
+   same to both. 8.62 Mbps is generous for what this footage is used for.
+
+3. **Use the whole window, not just its first forty seconds.** *(implemented)* The
+   poller fired one pull on arrival and then nothing, however long the unit stayed. Fixed
+   in `poller.py`: after a run that moved files it goes again immediately, and after one
+   that found nothing it re-checks every `IDLE_RECHECK_S` (30 s, well inside the five
+   minutes the camera takes to close a segment). This is worth the most on exactly the
+   windows that matter most — the 13.5 GB run took seven minutes and left ~840 MB behind.
+
+4. **Transport tuning: nothing left.** 32.5 of a 34.9 ceiling.
+
+### Separately, and more urgent than any of it: the card is eating footage
+
+Not a throughput finding, but found while benchmarking and it matters more.
+
+The card is **96% full with 1.4 GB free**, and the recorder is recycling the oldest files to
+make room. This was observed directly rather than inferred: a benchmark file set shrank from
+1729 MB to 1478 MB *between two runs minutes apart*, and both
+`20260813230432_camera_1.ts` (the oldest file on the card at the start of the session) and
+`20260813233520_camera_1.ts` (in the benchmark set) were gone by the end.
+
+`ingest.delete_after_verify` is **off**, so the app never reclaims space on the card. The
+recorder therefore decides what to delete, it deletes oldest-first, and it has no idea which
+files have been copied. Any footage the recorder recycles before a window reaches it is gone
+permanently.
+
+Turning `delete_after_verify` on is the fix, and it is safe by construction: a file is only
+removed after a byte-complete copy has been committed to the footage directory. With the
+backlog permanently larger than one window, `ingest.transfer_order` = `newest_first` is also
+worth considering, so today's drive is never the thing that gets recycled.
+
+## 17. Recording to internal storage instead of the card
+
+Asked because the card is the visibly weak part. It is — but not for throughput.
+
+| | Removable card | Internal |
+| --- | --- | --- |
+| Filesystem | vfat (no journal) | **f2fs** |
+| Size / free | 30 GB / **1.4 GB (96% full)** | 108 GB / **101 GB (7% used)** |
+| Sequential read | ~55 MB/s | ~859 MB/s (cached) |
+| Sequential write | — | **170 MB/s** (`conv=fsync`) |
+| Mount | FUSE over `/dev/block/vold/public:179,1` | FUSE over `/dev/block/dm-47` |
+
+**It cannot make the transfer faster.** The link caps at ~35 MB/s and the card already
+reads at 55, so the storage has never been on the critical path. Moving to something three
+times faster still leaves the radio as the ceiling.
+
+**What it would fix is the thing that is actually losing footage.** 101 GB against 1.4 GB
+free is the difference between a card that recycles the oldest recordings every few hours
+and one that could hold roughly thirteen hours of two-lens footage — which is the data-loss
+risk in §16, removed rather than mitigated. f2fs over vfat is worth having on its own for a
+device that loses power without warning several times a day.
+
+### Can it be done?
+
+Two halves, and only one of them is ours.
+
+**Reading from there: already supported.** `shell` can read `/storage/emulated/0` (it lists
+fine; the FUSE daemon grants it via `sdcard_rw`/`sdcard_r`). `SOURCE_PROBE` now names
+`/storage/emulated/0/DCIM/Video` explicitly — the existing `/storage/*/DCIM/Video` glob
+could never have found it, because the user directory is one level deeper than the glob
+descends. `ingest.source_path_override` remains available for anywhere else.
+
+**Recording to there: unknown, and not answerable from the shell.** `com.zqc.camera` is a
+system app at `/system/app/ZqcCamera/ZqcCamera.apk` and its data directory is
+`Permission denied`, so its configuration is only reachable through its own UI on the unit.
+There is no `DCIM/Video` in internal storage today, and the app exports no component that
+would let a storage target be set remotely — its only exported activity is `.ui.CameraActivity`.
+
+So this comes down to: **does the camera app's own settings screen offer a storage or path
+option?** If it does, switching it and leaving `ingest.source_path_override` blank should now
+work unchanged. If it does not, there is no unrooted way to redirect it — and the fallback is
+the one in §16, which is to stop the card overfilling rather than to replace it.
+
 ## Sources
 
 - [ADB man page — `push`/`pull` `-z` compression, `shell -T/-t`](https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/master/docs/user/adb.1.md)
