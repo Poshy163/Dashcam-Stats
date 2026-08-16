@@ -1513,3 +1513,98 @@ async def _true() -> bool:
 
 async def _false() -> bool:
     return False
+
+
+class TestTheCarsUrlChangesWithTheBuild:
+    """`Cache-Control` on the shell cannot reach a copy a browser already holds.
+
+    Which is exactly the client that matters here. Observed on the live unit: Chrome kept
+    an `index.html` from before the header existed, requested `Backup-E4HX69ll.js` and
+    `ui-RYhSyzFl.js`, got two 404s and rendered a white screen — in a vehicle, where there
+    is nobody to press refresh. A new build has to mean a new URL.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _forget(self):
+        from app.ingest import origin
+
+        origin.reset_for_tests()
+        origin.set_build_tag("")
+        yield
+        origin.set_build_tag("")
+
+    async def test_a_new_build_is_a_new_url(self, client):
+        from app.ingest import origin
+
+        await origin.remember("http", "192.168.1.16:8199")
+
+        origin.set_build_tag("aaaaaaaa")
+        before = origin.backup_url()
+        origin.set_build_tag("bbbbbbbb")
+        after = origin.backup_url()
+
+        assert before == "http://192.168.1.16:8199/backup?v=aaaaaaaa"
+        assert after != before, "the head unit would have been sent to its cached shell"
+
+    async def test_the_key_still_rides_alongside_it(self, client):
+        from app.ingest import origin
+
+        await client.put(
+            "/api/settings",
+            json={"values": {"security.api_key": "iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"}},
+        )
+        await origin.remember("http", "192.168.1.16:8199")
+        origin.set_build_tag("aaaaaaaa")
+
+        url = origin.backup_url()
+
+        assert url == (
+            "http://192.168.1.16:8199/backup?v=aaaaaaaa&k=iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"
+        )
+        from app.ingest.adb import is_safe_url
+
+        assert is_safe_url(url), "the control channel would refuse to open it"
+
+    async def test_the_fingerprint_survives_the_key_being_stripped(self, client):
+        """The redirect drops `k` and must keep everything else, or the cache-bust is lost."""
+        from app.main import FRONTEND_DIST
+
+        if not FRONTEND_DIST.is_dir():
+            pytest.skip("the SPA is not built in this tree")
+
+        key = "iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"
+        await _configure_account_for_key(client, key)
+
+        response = await client.get(
+            "/backup", params={"k": key, "v": "aaaaaaaa"}, follow_redirects=False
+        )
+
+        assert response.status_code == 303
+        assert response.headers["location"] == "/backup?v=aaaaaaaa"
+
+    async def test_the_real_build_tag_is_a_stable_fingerprint(self):
+        """Same shell, same tag — or every restart would push a fresh load at the car."""
+        from app.main import FRONTEND_DIST, _build_tag
+
+        if not FRONTEND_DIST.is_dir():
+            pytest.skip("the SPA is not built in this tree")
+
+        index = FRONTEND_DIST / "index.html"
+
+        assert _build_tag(index) == _build_tag(index)
+        assert len(_build_tag(index)) == 8
+
+
+async def _configure_account_for_key(client, key: str) -> None:
+    response = await client.put(
+        "/api/auth/credential", json={"username": "joshua", "password": "correct-horse-battery"}
+    )
+    assert response.status_code == 204, response.text
+    assert (
+        await client.put("/api/settings", json={"values": {"security.require_login": True}})
+    ).status_code == 200
+    assert (
+        await client.put("/api/settings", json={"values": {"security.api_key": key}})
+    ).status_code == 200
+    assert (await client.post("/api/auth/logout")).status_code == 204
+    client.cookies.clear()

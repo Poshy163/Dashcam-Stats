@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 from urllib.parse import urlencode
@@ -263,6 +264,22 @@ SHELL_CACHE_CONTROL = "no-cache"
 ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 
+def _build_tag(index: Path) -> str:
+    """A short fingerprint of the built SPA, from the shell's own bytes.
+
+    The shell is the right thing to hash rather than the app's version string: it names
+    every content-hashed chunk in the build, so it changes exactly when what a browser
+    needs to fetch changes -- and it does so for ``main`` builds too, which all carry the
+    version "main" and would otherwise be indistinguishable from each other.
+    """
+    try:
+        return hashlib.sha256(index.read_bytes()).hexdigest()[:8]
+    except OSError:
+        # A missing shell is already handled by the caller; an unreadable one just means
+        # the head unit's URL goes back to being stable, which is what it was before.
+        return ""
+
+
 class _ImmutableAssets(StaticFiles):
     """Vite's hashed build output, served as permanently cacheable."""
 
@@ -293,6 +310,8 @@ def _mount_frontend(app: FastAPI) -> None:
         app.mount("/assets", _ImmutableAssets(directory=assets), name="assets")
 
     index = FRONTEND_DIST / "index.html"
+    # Whatever the head unit is sent has to change when the build does. See `backup_url`.
+    origin.set_build_tag(_build_tag(index))
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa(request: Request, full_path: str) -> Response:

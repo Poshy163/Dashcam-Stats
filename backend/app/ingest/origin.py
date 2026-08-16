@@ -61,6 +61,20 @@ _UNREACHABLE = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
 
 _origin: str | None = None
 
+#: A fingerprint of the built SPA, set once at startup by :mod:`app.main`.
+#:
+#: Injected rather than read from here, because the build lives behind ``FRONTEND_DIST`` in
+#: ``app.main`` and this module is imported by it.
+_build_tag: str = ""
+
+#: Query parameter carrying that fingerprint on the head unit's URL.
+BUILD_PARAM = "v"
+
+
+def set_build_tag(tag: str) -> None:
+    global _build_tag
+    _build_tag = (tag or "").strip()
+
 
 def _hostname(host: str) -> str:
     """The host part of a ``Host`` header, with any port and IPv6 brackets removed."""
@@ -125,9 +139,26 @@ def backup_url() -> str:
     present it: it is handed this URL by ``am start`` and has nobody to fill in a login
     form. The key is redeemed for a cookie on arrival and taken back out of the address bar
     -- see ``_redeem_api_key`` in :mod:`app.main`.
+
+    Carries the build fingerprint for a blunter reason. ``Cache-Control: no-cache`` on the
+    shell governs copies fetched *after* it started being sent, and does nothing about one
+    a browser already holds -- so an upgrade leaves every existing client entitled to serve
+    its stale ``index.html`` until that entry expires on its own. That was observed on the
+    live unit: Chrome kept an old shell, asked for ``Backup-E4HX69ll.js`` and ``ui-*.js``,
+    got two 404s, and rendered a white screen with no way to press refresh in a parked car.
+
+    A new build means a new URL, which is a different cache entry, which cannot be stale.
+    The head unit is the one client that is *sent* its address rather than choosing it, so
+    this is available here and nowhere else -- and it is the difference between the screen
+    recovering by itself after a deploy and needing somebody to go and touch it.
     """
     base = _origin or _stored()
-    return with_api_key(f"{base}/backup") if base else ""
+    if not base:
+        return ""
+    url = f"{base}/backup"
+    if _build_tag:
+        url = f"{url}?{urlencode({BUILD_PARAM: _build_tag})}"
+    return with_api_key(url)
 
 
 def redacted(url: str) -> str:
@@ -148,5 +179,12 @@ def redacted(url: str) -> str:
 
 
 def reset_for_tests() -> None:
-    global _origin
+    """Forget both pieces of process-global state this module holds.
+
+    The build tag is included because importing ``app.main`` sets it as a side effect --
+    ``create_app()`` runs at module scope -- so without this every test in the suite would
+    inherit the fingerprint of whatever happened to be built in the tree.
+    """
+    global _origin, _build_tag
     _origin = None
+    _build_tag = ""
