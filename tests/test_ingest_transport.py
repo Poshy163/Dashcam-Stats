@@ -376,7 +376,15 @@ class TestTheAdbControlChannel:
         files = await adb.inventory("unit:5555", "/storage/Tfcard/DCIM/Video")
 
         assert len(files) == 1
-        assert files[0] == RemoteFile("20260812120000_camera_0.ts", 104857600, 1786000000)
+        # Tagged with where it came from: the card keeps ordinary segments and locked ones
+        # in different directories, and every later step -- the tar, the rm -- is rooted at
+        # a directory rather than given a path.
+        assert files[0] == RemoteFile(
+            "20260812120000_camera_0.ts",
+            104857600,
+            1786000000,
+            "/storage/Tfcard/DCIM/Video",
+        )
 
     async def test_the_card_is_listed_with_one_process_not_one_per_file(self, monkeypatch):
         """A full card is ~140 recordings, and this runs inside the driveway window.
@@ -1722,3 +1730,150 @@ class TestFindingTheFootageDirectory:
         assert SOURCE_PROBE.index("/storage/Tfcard/DCIM/Video") < SOURCE_PROBE.index(
             "/storage/emulated/0/DCIM/Video"
         )
+
+
+class TestProtectedRecordings:
+    """The camera *moves* a clip you protect into `DCIM/LockVideo`.
+
+    So it leaves the ordinary listing entirely, and the one recording anybody deliberately
+    marked as worth keeping was the one recording that never got backed up. Found on the
+    live card: two locked clips sitting there from five days earlier, on a card that was
+    96% full and recycling.
+    """
+
+    async def test_the_locked_directory_is_found_beside_the_video_one(self, monkeypatch):
+        from app.ingest import adb
+
+        asked: list[str] = []
+
+        async def fake_shell(address, command, **kwargs):
+            asked.append(command)
+            return "yes"
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+
+        found = await adb.resolve_locked("unit:5555", "/storage/Tfcard/DCIM/Video")
+
+        assert found == "/storage/Tfcard/DCIM/LockVideo"
+        assert "/storage/Tfcard/DCIM/LockVideo" in asked[0]
+
+    async def test_a_card_with_no_locked_clips_is_not_an_error(self, monkeypatch):
+        """The directory only exists once something has been protected."""
+        from app.ingest import adb
+
+        async def fake_shell(address, command, **kwargs):
+            return ""
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+
+        assert await adb.resolve_locked("unit:5555", "/storage/Tfcard/DCIM/Video") == ""
+
+    async def test_a_failing_control_channel_does_not_fail_the_window(self, monkeypatch):
+        """A card with no protected clips is the ordinary case; it must not be able to
+        stop a window that would otherwise have copied footage."""
+        from app.ingest import adb
+
+        async def fake_shell(address, command, **kwargs):
+            raise adb.AdbError("link went away")
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+
+        assert await adb.resolve_locked("unit:5555", "/storage/Tfcard/DCIM/Video") == ""
+
+    async def test_both_directories_are_listed_and_tagged(self, monkeypatch):
+        from app.ingest import adb
+
+        async def fake_shell(address, command, **kwargs):
+            if "LockVideo" in command:
+                return "50|20260811154630_camera_0.ts|1786000001"
+            return "100|20260812120000_camera_0.ts|1786000000"
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+
+        files = await adb.inventory_all(
+            "unit:5555", ["/storage/Tfcard/DCIM/Video", "/storage/Tfcard/DCIM/LockVideo"]
+        )
+
+        assert [(f.name, f.directory.split("/")[-1]) for f in files] == [
+            ("20260812120000_camera_0.ts", "Video"),
+            ("20260811154630_camera_0.ts", "LockVideo"),
+        ]
+
+    async def test_a_name_in_both_places_is_refused_rather_than_trusted(self, monkeypatch):
+        """Everything downstream keys on the bare filename — the delta, the size check at
+        commit, the rm sent back to the unit. Two files sharing one name would silently
+        become one, and the second would be committed under the first's expected size."""
+        from app.ingest import adb
+
+        async def fake_shell(address, command, **kwargs):
+            return "100|20260812120000_camera_0.ts|1786000000"
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+
+        files = await adb.inventory_all(
+            "unit:5555", ["/storage/Tfcard/DCIM/Video", "/storage/Tfcard/DCIM/LockVideo"]
+        )
+
+        assert len(files) == 1
+        assert files[0].directory.endswith("Video"), "the first listing wins"
+
+    def test_the_transfer_is_batched_per_directory(self):
+        """`tar` is rooted where it runs. The alternative — rooting it at the parent so
+        members arrive as `LockVideo/x.ts` — is refused by the receiver, because a member
+        carrying a path is how a tar stream escapes its staging directory."""
+        from app.ingest.models import RemoteFile
+        from app.ingest.puller import _by_directory
+
+        video, locked = "/storage/Tfcard/DCIM/Video", "/storage/Tfcard/DCIM/LockVideo"
+        plan = [
+            RemoteFile("a.ts", 1, 0, video),
+            RemoteFile("locked.ts", 1, 0, locked),
+            RemoteFile("b.ts", 1, 0, video),
+        ]
+
+        batches = _by_directory(plan, video)
+
+        assert [(d, [f.name for f in b]) for d, b in batches] == [
+            (video, ["a.ts", "b.ts"]),
+            (locked, ["locked.ts"]),
+        ]
+
+    def test_the_chosen_copy_order_survives_batching(self):
+        """`ingest.transfer_order` picked it, and a window that only gets through half the
+        plan must get through the half that setting asked for."""
+        from app.ingest.models import RemoteFile
+        from app.ingest.puller import _by_directory
+
+        video, locked = "/v", "/l"
+        newest_first = [RemoteFile("z.ts", 1, 0, locked), RemoteFile("a.ts", 1, 0, video)]
+
+        assert _by_directory(newest_first, video)[0][0] == locked
+
+    def test_deletes_are_sent_to_the_directory_the_file_came_from(self):
+        """`rm` runs from the directory. A locked clip deleted against the ordinary Video
+        path would either miss, or match a different file that shared its name."""
+        from app.ingest.puller import _group_names
+
+        where = {"a.ts": "/v", "locked.ts": "/l"}
+
+        assert _group_names(["a.ts", "locked.ts"], where) == {"/v": ["a.ts"], "/l": ["locked.ts"]}
+
+    def test_a_file_the_run_cannot_account_for_is_never_deleted(self):
+        from app.ingest.puller import _group_names
+
+        assert _group_names(["mystery.ts"], {"a.ts": "/v"}) == {}
+
+    def test_a_run_is_complete_only_if_every_batch_was(self):
+        from app.ingest.puller import _absorb
+        from app.ingest.transport import TransferResult
+
+        total = TransferResult(complete=True)
+        _absorb(
+            total, TransferResult(files=["a.ts"], bytes_received=10, seconds=1.0, complete=True)
+        )
+        _absorb(total, TransferResult(files=[], complete=False, error="the car left"))
+
+        assert total.complete is False
+        assert total.files == ["a.ts"]
+        assert total.bytes_received == 10
+        assert total.error == "the car left"

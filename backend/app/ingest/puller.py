@@ -47,6 +47,51 @@ def _get(key: str, default=None):
         return default
 
 
+def _by_directory(files: list[RemoteFile], default: str) -> list[tuple[str, list[RemoteFile]]]:
+    """Group a plan into one batch per directory, preserving the plan's order.
+
+    Order is preserved rather than sorted because it is a decision, not an accident:
+    ``ingest.transfer_order`` chose it, and a window that only gets through half the plan
+    must get through the half that setting asked for. The first directory to appear is
+    therefore transferred first.
+    """
+    batches: dict[str, list[RemoteFile]] = {}
+    for item in files:
+        batches.setdefault(item.directory or default, []).append(item)
+    return list(batches.items())
+
+
+def _group_names(names: list[str], where: dict[str, str]) -> dict[str, list[str]]:
+    """Bucket committed filenames by the directory they came from.
+
+    A name with no known directory is dropped rather than guessed at. This feeds ``rm`` on
+    the unit, and the one thing that must never happen there is deleting a file the run
+    cannot account for.
+    """
+    grouped: dict[str, list[str]] = {}
+    for name in names:
+        directory = where.get(name)
+        if directory:
+            grouped.setdefault(directory, []).append(name)
+    return grouped
+
+
+def _absorb(total: transport.TransferResult, part: transport.TransferResult) -> None:
+    """Fold one batch's outcome into the run's.
+
+    ``complete`` is an AND, so the caller seeds it ``True`` -- a fresh ``TransferResult``
+    is ``False`` and ANDing onto that would report every run as incomplete. The first error
+    is kept rather than the last, because it is the one that explains why the batches after
+    it never happened.
+    """
+    total.files.extend(part.files)
+    total.bytes_received += part.bytes_received
+    total.seconds += part.seconds
+    total.complete = total.complete and part.complete
+    if total.error is None:
+        total.error = part.error
+
+
 def display_url() -> str:
     """Where the head unit's browser gets sent, or "" if there is nowhere to send it.
 
@@ -336,7 +381,15 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
         cleaned = _preflight(preflight, asyncio.to_thread(_clean, staging))
 
         status.set_phase(Phase.SCANNING)
-        remote = await adb.inventory(info.address, info.source)
+        sources = [info.source]
+        if bool(_get("include_locked", True)):
+            # Resolved per run rather than cached on the unit info: the directory only
+            # exists once something has been locked, so a card that had none yesterday can
+            # have one today. Costs one `[ -d ]` on the control channel.
+            locked = await adb.resolve_locked(info.address, info.source)
+            if locked:
+                sources.append(locked)
+        remote = await adb.inventory_all(info.address, sources)
         status.set_phase(Phase.PREPARING)
         # Off the event loop: this stats every candidate against the footage share, which
         # is a hard NFS mount in the deployment, and a full card is ~140 files. Doing it
@@ -401,52 +454,74 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
 
         await cleaned
         port = int(_get("data_port", 9000))
-        # Anything still listening is serving a *previous* run's file list, so clear it
-        # before starting ours rather than connecting to the wrong stream.
-        await adb.clear_listener(info.address)
-        listener = await adb.launch_listener(
-            info.address,
-            info.source,
-            [item.name for item in plan.files],
-            port=port,
-            timeout_s=int(_get("listen_timeout_s", 180)),
-        )
-
         host = info.address.split(":", 1)[0]
+        timeout_s = int(_get("listen_timeout_s", 180))
         status.set_phase(Phase.TRANSFERRING)
-        was_serving = False
-        try:
-            transferred = await asyncio.to_thread(
-                transport.receive,
-                host,
-                port,
-                staging,
-                expected={item.name for item in plan.files},
-                on_file_started=status.file_started,
-                on_file_done=status.file_done,
-                on_bytes=status.add_bytes,
-                cancel=status.cancel_event,
-            )
-        finally:
-            # The adb session *is* the listener's lifetime now, so it has to be ended
-            # explicitly; leaving it would hold the port against the next window.
-            was_serving = await adb.stop_listener(listener)
 
-        # Which side stopped first. An incomplete transfer whose listener was still serving
-        # is the car leaving, which is the expected ending and not a fault; one whose
-        # listener had already exited is the unit giving up -- `tar` failing, the remote
-        # `timeout` firing -- and that is worth saying out loud, because the two used to
-        # produce the same sentence and only one of them is anybody's problem.
-        if transferred.error and not transferred.complete and not was_serving:
-            transferred.error = f"{transferred.error} (the head unit stopped serving first)"
+        # One listener per directory rather than one for the run. The card keeps ordinary
+        # segments and incident-locked ones in separate directories, and `tar` is rooted at
+        # the directory it is run from -- so the alternative was rooting it at the parent
+        # and letting members arrive as `Video/x.ts`, which the receiver refuses outright
+        # because a member carrying a path is how a tar stream escapes its staging
+        # directory. Batching keeps that guard untouched and costs one extra connection
+        # setup, only on cards that actually have locked recordings.
+        # Seeded complete; `_absorb` ANDs each batch onto it.
+        transferred = transport.TransferResult(complete=True)
+        for directory, batch in _by_directory(plan.files, info.source):
+            # Anything still listening is serving a *previous* batch's file list, so clear
+            # it before starting ours rather than connecting to the wrong stream.
+            await adb.clear_listener(info.address)
+            listener = await adb.launch_listener(
+                info.address,
+                directory,
+                [item.name for item in batch],
+                port=port,
+                timeout_s=timeout_s,
+            )
+            was_serving = False
+            try:
+                part = await asyncio.to_thread(
+                    transport.receive,
+                    host,
+                    port,
+                    staging,
+                    expected={item.name for item in batch},
+                    on_file_started=status.file_started,
+                    on_file_done=status.file_done,
+                    on_bytes=status.add_bytes,
+                    cancel=status.cancel_event,
+                )
+            finally:
+                # The adb session *is* the listener's lifetime now, so it has to be ended
+                # explicitly; leaving it would hold the port against the next batch.
+                was_serving = await adb.stop_listener(listener)
+
+            # Which side stopped first. An incomplete transfer whose listener was still
+            # serving is the car leaving, which is the expected ending and not a fault; one
+            # whose listener had already exited is the unit giving up -- `tar` failing, the
+            # remote `timeout` firing -- and that is worth saying out loud, because the two
+            # used to produce the same sentence and only one of them is anybody's problem.
+            if part.error and not part.complete and not was_serving:
+                part.error = f"{part.error} (the head unit stopped serving first)"
+            _absorb(transferred, part)
+            if not part.complete:
+                # The window shut, or the operator cancelled. Standing up another listener
+                # into a link that has already gone would spend what is left of the window
+                # on a connection that cannot be answered.
+                break
 
         status.set_phase(Phase.VERIFYING)
         expected = {item.name: item.size for item in plan.files}
         committed = await asyncio.to_thread(commit, staging, footage, expected)
 
         if bool(_get("delete_after_verify", False)) and committed:
-            with contextlib.suppress(adb.AdbError):
-                await adb.delete(info.address, info.source, committed)
+            # Grouped the same way the transfer was: `rm` is run from the directory, so a
+            # locked recording deleted against the ordinary Video path would either miss or
+            # -- far worse -- match a different file that happened to share its name.
+            where = {item.name: item.directory or info.source for item in plan.files}
+            for directory, names in _group_names(committed, where).items():
+                with contextlib.suppress(adb.AdbError):
+                    await adb.delete(info.address, directory, names)
 
         state = (
             RunState.OK

@@ -265,9 +265,65 @@ async def inventory(address: str, source: str) -> list[RemoteFile]:
             log.warning("ignoring a card file with an unexpected name", name=name[:80])
             continue
         try:
-            files.append(RemoteFile(name=name, size=int(parts[0]), mtime=int(parts[2])))
+            files.append(
+                RemoteFile(name=name, size=int(parts[0]), mtime=int(parts[2]), directory=source)
+            )
         except ValueError:
             continue
+    return files
+
+
+#: Where the camera puts a recording somebody protected, relative to ``DCIM/Video``.
+#:
+#: A locked clip is *moved* here rather than copied, so it disappears from the ordinary
+#: listing entirely -- which meant the one recording anybody deliberately marked as worth
+#: keeping was the one recording that never got backed up. It sits beside ``Video`` under
+#: ``DCIM``, so it is derived from the resolved source rather than probed for separately.
+LOCKED_DIRNAME = "LockVideo"
+
+
+async def resolve_locked(address: str, source: str) -> str:
+    """The unit's locked-recording directory, or "" if it has none.
+
+    Never raises for absence. A card with no protected clips on it is the ordinary case,
+    and it must not be able to fail a window that would otherwise have copied footage.
+    """
+    parent, _, leaf = source.rstrip("/").rpartition("/")
+    if not parent or not leaf:
+        return ""
+    candidate = f"{parent}/{LOCKED_DIRNAME}"
+    try:
+        found = (await shell(address, f"[ -d '{candidate}' ] && echo yes; exit 0")).strip()
+    except AdbError as exc:
+        log.debug("could not check for locked recordings", error=str(exc))
+        return ""
+    return candidate if found == "yes" else ""
+
+
+async def inventory_all(address: str, sources: list[str]) -> list[RemoteFile]:
+    """List several directories, first listing winning any name that appears twice.
+
+    The duplicate rule is not hypothetical housekeeping. Every downstream step keys on the
+    bare filename -- the delta compares it against the footage directory, the commit maps
+    it to an expected size, the delete names it back to the unit -- so two files sharing a
+    name in different directories would silently become one, and whichever arrived second
+    would be committed under the other's size check. This camera moves a locked clip rather
+    than copying it, so it should never happen; that is exactly why it is worth refusing
+    rather than trusting.
+    """
+    seen: set[str] = set()
+    files: list[RemoteFile] = []
+    for source in sources:
+        for item in await inventory(address, source):
+            if item.name in seen:
+                log.warning(
+                    "ignoring a duplicate recording name on the card",
+                    name=item.name,
+                    directory=source,
+                )
+                continue
+            seen.add(item.name)
+            files.append(item)
     return files
 
 

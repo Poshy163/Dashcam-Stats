@@ -1043,6 +1043,18 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.show_on_unit",
     ),
     SettingDef(
+        "ingest.include_locked",
+        "Also copy protected recordings",
+        "bool",
+        True,
+        "ingest",
+        "The camera moves a clip you protect into its own folder on the card, out of the "
+        "ordinary listing — so without this, the one recording you deliberately marked as "
+        "worth keeping is the one recording that never gets backed up. On by default. "
+        "Turn it off only if you want protected clips left on the card.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
         "ingest.delete_after_verify",
         "Delete from the card after copying",
         "bool",

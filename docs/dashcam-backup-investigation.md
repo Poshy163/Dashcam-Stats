@@ -1018,6 +1018,22 @@ the backlog grows permanently, which is exactly what the card shows.
 
 4. **Transport tuning: nothing left.** 32.5 of a 34.9 ceiling.
 
+### Protected recordings were never backed up at all *(fixed)*
+
+The camera **moves** a clip you protect into `DCIM/LockVideo` rather than copying it, so it
+leaves `DCIM/Video` entirely — and `SOURCE_PROBE` only ever resolved to `DCIM/Video`. The one
+recording anybody deliberately marked as worth keeping was the one recording the backup never
+saw. On the live card that was two clips from five days earlier, sitting on a volume that was
+96% full and recycling.
+
+`ingest.include_locked` (on by default) now lists both directories. The transfer batches by
+directory and runs one `tar` per batch, because `tar` is rooted where it runs — the
+alternative, rooting it at `DCIM` so members arrive as `LockVideo/x.ts`, is refused by the
+receiver, which rejects any member carrying a path because that is how a tar stream escapes
+its staging directory. Deletes are grouped the same way, since `rm` also runs from the
+directory. A filename appearing in both places is refused rather than merged: every step
+downstream keys on the bare name.
+
 ### Separately, and more urgent than any of it: the card is eating footage
 
 Not a throughput finding, but found while benchmarking and it matters more.

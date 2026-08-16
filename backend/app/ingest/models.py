@@ -64,6 +64,15 @@ class RemoteFile:
     size: int
     #: Unix seconds. Used only to leave the segment the camera is still writing alone.
     mtime: int
+    #: The absolute directory on the unit this file is in.
+    #:
+    #: Carried per-file because a card holds recordings in more than one place: ordinary
+    #: segments in ``DCIM/Video`` and incident-locked ones in ``DCIM/LockVideo``. The
+    #: transfer groups by this and runs one ``tar`` per directory, rather than one ``tar``
+    #: rooted at the parent -- a member arriving as ``LockVideo/x.ts`` would carry a path,
+    #: and the receiver rejects those outright to prevent traversal. Grouping keeps that
+    #: guard exactly as strict as it was.
+    directory: str = ""
 
 
 @dataclass(slots=True)
