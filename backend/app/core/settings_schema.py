@@ -1055,6 +1055,35 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.quiet_radios",
+        "Turn off Bluetooth and the hotspot while copying",
+        "bool",
+        False,
+        "ingest",
+        "The head unit's WiFi is a single-stream chip shared with its Bluetooth and its "
+        "own hotspot, and the transfer already runs at that radio's measured ceiling — "
+        "anything else using it is paid for in footage left on the card. This turns both "
+        "off while recordings are moving and back on when the run ends. It waits until "
+        "the unit has been on the network for ten seconds, so a car that is only turning "
+        "around keeps its phone connection. If the engine stops mid-transfer, a watchdog "
+        "left on the unit turns Bluetooth back on by itself, and anything still off is "
+        "restored the moment the unit is next seen.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.radios_pending_restore",
+        "Radios awaiting restore",
+        "string",
+        "",
+        "ingest",
+        "Set while something the transfer turned off has not yet been confirmed back on, "
+        "so a silent phone is never a mystery. Cleared the moment a restore succeeds — "
+        "normally at the end of the same transfer, otherwise the next time the unit "
+        "appears on the network.",
+        read_only=True,
+        requires="ingest.quiet_radios",
+    ),
+    SettingDef(
         "ingest.delete_after_verify",
         "Delete from the card after copying",
         "bool",

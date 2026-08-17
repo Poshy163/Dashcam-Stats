@@ -1176,6 +1176,73 @@ class TestARunEndToEnd:
         assert second.state is RunState.IDLE
         assert events == [], f"an idle window announced {events}"
 
+    async def test_the_radios_go_quiet_for_the_transfer_and_come_back(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """Bluetooth off while bytes move, back on when the run ends.
+
+        The guard is collapsed to zero because a loopback transfer is over in
+        milliseconds; what is under test here is the wiring — the quiet begins once a
+        transfer is decided, and the run's own `finally` undoes it.
+        """
+        from app.ingest import adb, puller, radios
+        from app.ingest.models import RunState
+
+        monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        commands: list[str] = []
+
+        async def shell(address, command, **kwargs):
+            commands.append(command)
+            return "1" if "bluetooth_on" in command else ""
+
+        monkeypatch.setattr(adb, "shell", shell)
+
+        async def no_watchdog(address, deadline_s):
+            return None
+
+        monkeypatch.setattr(radios, "_arm_watchdog", no_watchdog)
+        await self._enable(**{"ingest.quiet_radios": True})
+
+        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+
+        disables = [i for i, c in enumerate(commands) if "bluetooth_manager disable" in c]
+        enables = [i for i, c in enumerate(commands) if "bluetooth_manager enable" in c]
+        assert disables, "Bluetooth was never turned off for the transfer"
+        assert enables, "Bluetooth was never turned back on afterwards"
+        assert disables[0] < enables[0]
+
+    async def test_an_idle_window_never_touches_the_radios(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """A card the library already holds is drained every thirty seconds for as long
+        as the car sits there; flapping Bluetooth on each of those checks would make the
+        feature worse than the contention it removes."""
+        from app.ingest import adb, puller, radios
+        from app.ingest.models import RunState
+
+        monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        commands: list[str] = []
+
+        async def shell(address, command, **kwargs):
+            commands.append(command)
+            return "1" if "bluetooth_on" in command else ""
+
+        monkeypatch.setattr(adb, "shell", shell)
+
+        async def no_watchdog(address, deadline_s):
+            return None
+
+        monkeypatch.setattr(radios, "_arm_watchdog", no_watchdog)
+        await self._enable(**{"ingest.quiet_radios": True})
+
+        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+        commands.clear()
+
+        assert (await puller.run_pull(trigger="manual")).state is RunState.IDLE
+
+        touched = [c for c in commands if "bluetooth" in c or "softap" in c]
+        assert touched == [], f"an idle window touched the radios: {touched}"
+
     async def test_a_slow_webhook_does_not_delay_the_first_byte(
         self, db_session, unit, app_config, monkeypatch
     ):

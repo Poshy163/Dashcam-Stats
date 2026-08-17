@@ -27,7 +27,7 @@ import time
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
-from app.ingest import adb, puller
+from app.ingest import adb, puller, radios
 from app.ingest.models import RunState, UnitState
 from app.ingest.status import get_status
 
@@ -178,6 +178,12 @@ class IngestPoller:
                     if not self._was_online:
                         log.info("the head unit appeared; starting a pull", address=info.address)
                         self._idle_since = 0.0
+                        # If a previous window ended with the unit's radios still off --
+                        # the engine stopping mid-transfer is the ordinary ending -- put
+                        # them right the moment the car is back, before it is asked for
+                        # anything. Fired, not awaited: it rides the control channel,
+                        # which the transfer below does not use for its bytes.
+                        radios.restore_if_pending(info.address)
                         # Not awaited: a pull runs for as long as the window lasts and the
                         # poll has to keep ticking underneath it. `start_run` keeps the
                         # reference so the task cannot be collected and shutdown can find it.

@@ -45,6 +45,9 @@ class IngestStatus:
         self.state: RunState = RunState.IDLE
         self.phase: Phase = Phase.IDLE
         self.unit_online: bool = False
+        #: When the unit was last seen arriving, so `online_for` can answer "is the car
+        #: actually parked, or just passing through". Cleared the moment it drops off.
+        self._online_since: float | None = None
         self.files_total = 0
         self.files_done = 0
         self.bytes_total = 0
@@ -138,7 +141,24 @@ class IngestStatus:
 
     def set_unit_online(self, online: bool) -> None:
         with self._lock:
+            if online and self._online_since is None:
+                self._online_since = time.monotonic()
+            elif not online:
+                self._online_since = None
             self.unit_online = online
+
+    def online_for(self) -> float:
+        """Seconds the unit has been continuously on the network; 0.0 while it is not.
+
+        This is what gates the radio quieting: a connection younger than its guard is a
+        car that may be about to reverse out of range, and its Bluetooth is left alone.
+        Undercounting is the safe direction, which is why a fresh process that finds the
+        unit already present starts the clock at first sight rather than guessing.
+        """
+        with self._lock:
+            if self._online_since is None:
+                return 0.0
+            return time.monotonic() - self._online_since
 
     def set_state(self, state: RunState) -> None:
         with self._lock:

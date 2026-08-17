@@ -17,7 +17,7 @@ from pathlib import Path
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
-from app.ingest import adb, origin, transport
+from app.ingest import adb, origin, radios, transport
 from app.ingest.models import (
     DeltaPlan,
     Phase,
@@ -346,6 +346,7 @@ async def shutdown() -> None:
     # pending", which reads like a bug in a shutdown path that has to look clean.
     for side in list(_side_tasks):
         side.cancel()
+    radios.cancel_pending()
     task = _current
     if task is None or task.done():
         return
@@ -378,6 +379,7 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
     footage = Path(str(await get_settings_service().footage_dir()))
     staging = footage / STAGING_DIRNAME
     preflight: list[asyncio.Task] = []
+    quiet: radios.RadioQuiet | None = None
 
     try:
         # Only if nobody has already looked. The presence poll describes the unit
@@ -513,6 +515,20 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
         timeout_s = int(_get("listen_timeout_s", 180))
         status.set_phase(Phase.TRANSFERRING)
 
+        # The unit's Bluetooth and hotspot share the transfer's single-stream radio, and
+        # the transfer runs at that radio's measured ceiling — so both go quiet while
+        # bytes move, once the unit has been here long enough to be parked rather than
+        # passing. Started here, after the idle return, so a window with nothing to copy
+        # never touches them; the run's `finally` puts back whatever was taken. The
+        # deadline covers one listener timeout per directory the plan can have, plus
+        # slack, so the on-unit watchdog cannot fire mid-run.
+        if bool(_get("quiet_radios", False)):
+            quiet = radios.begin_quiet(
+                info.address,
+                online_for=status.online_for(),
+                watchdog_deadline_s=timeout_s * 2 + 120,
+            )
+
         # One listener per directory rather than one for the run. The card keeps ordinary
         # segments and incident-locked ones in separate directories, and `tar` is rooted at
         # the directory it is run from -- so the alternative was rooting it at the parent
@@ -614,6 +630,14 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
         result = RunResult(state=RunState.ERROR, error=f"{type(exc).__name__}: {exc}")
         log.exception("the ingest run failed", error=str(exc))
     finally:
+        # Radios first, before any other tidying: this is the one piece of cleanup whose
+        # failure follows somebody into the car. Bounded, because the usual reason a
+        # restore struggles is that the unit has driven away and every call is a timeout
+        # — the marker and the on-unit watchdog carry the cases this cannot reach.
+        if quiet is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(quiet.finish(), timeout=30.0)
+
         # Any preflight nobody got as far as needing -- an idle window, a share that failed
         # its checks. Collected rather than abandoned, so a short run cannot leave a task
         # complaining that its result was never retrieved.
