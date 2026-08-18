@@ -171,7 +171,7 @@ What that means in practice:
 - **Nothing is deleted from the card** unless you explicitly enable it, and then only
   after a verified copy has been committed.
 - **The unit's other radios can get out of the way.** Turn on **Turn off Bluetooth and
-  the hotspot while copying** and both are switched off while recordings are moving —
+  the hotspot while copying** and they are switched off while recordings are moving —
   they share the unit's single-stream WiFi chip, and the transfer already runs at that
   radio's measured ceiling. It waits until the unit has been on the network for ten
   seconds, so a car that is only turning around on the driveway keeps its phone
@@ -179,6 +179,12 @@ What that means in practice:
   mid-transfer — the ordinary way a window ends — a watchdog left running on the unit
   turns Bluetooth back on by itself, and anything still off is restored the moment the
   car is next seen. Off by default.
+  - **Bluetooth works on any unit. The hotspot needs one whose ADB runs as root**, which
+    most do not: Android only lets uid 0 stop a soft AP, so an ordinary unit answers
+    `SecurityException` and keeps beaconing. The app checks whether the hotspot is
+    genuinely still serving rather than trusting the exit status, and says so in the log
+    once per transfer instead of quietly claiming success. If it matters, turn the
+    hotspot off on the unit itself.
 - **The car can show its own progress.** Turn on **Show the backup page on the dashcam
   screen** and the head unit opens this app's Backup page when a transfer starts. There is
   no address to configure: whatever you open the dashboard on is what the car is sent to,

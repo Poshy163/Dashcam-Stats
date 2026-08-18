@@ -22,14 +22,22 @@ whose run already restored does nothing.
 
 **Only turn off what can be turned back on.** Bluetooth's state is readable
 (``settings get global bluetooth_on``), so it is toggled freely and only when it was
-actually on. The hotspot can always be *stopped* — ``cmd wifi stop-softap`` is a no-op
-on a hotspot that is not running — but starting it back needs its SSID and passphrase,
-which a shell can only recover by parsing ``dumpsys wifi``. So it is restarted only when
-it was positively seen running *and* its configuration was recovered, and the log says
-which. A hotspot that cannot be restored is still stopped, because "make sure it is off"
-is the entire point and the unit — which has no battery and reboots with every engine
-start — re-arms its own boot-time defaults next drive; but that choice is recorded
-loudly rather than silently.
+actually on. The hotspot is restarted only when it was positively seen serving *and* its
+SSID and passphrase were recovered from ``dumpsys wifi``, because a shell has nowhere
+else to get them and restarting the wrong network — or an open one — is worse than
+leaving it for the next engine start to re-arm.
+
+**Believe the effect, never the exit status.** This is the rule the first version of this
+module did not have, and the field found it inside a day: Bluetooth went off and the
+hotspot did not. AOSP's ``WifiShellCommand`` gates every verb outside its
+``NON_PRIVILEGED_COMMANDS`` allowlist on ``uid != Process.ROOT_UID``, and neither
+``stop-softap`` nor ``start-softap`` is on that list — so on an unrooted unit the command
+throws ``SecurityException: Uid 2000 does not have access to stop-softap`` and the
+hotspot carries on beaconing through every transfer. ``svc bluetooth`` has no equivalent
+gate, which is why exactly half the feature appeared to work. So a stop is believed only
+when :func:`_serving_ap` can no longer find the AP — and when it cannot be done, that is
+a warning naming the unit's own words, not silence. There is no unrooted way round it;
+the honest outcome is to say so and leave the hotspot alone.
 
 **Never delay the transfer.** Every call here rides the control channel, which is idle
 while the bulk socket moves bytes. The quieting itself waits until the unit has been on
@@ -74,15 +82,59 @@ FLAG_PATH = "/data/local/tmp/.dashcam_analyser_radios"
 #: next seen. Read-only in the UI, shown so a silent phone is never a mystery.
 MARKER_KEY = "ingest.radios_pending_restore"
 
+#: Serialises everything that changes a radio's state.
+#:
+#: Two things can be doing that at once, started seconds apart by different code paths:
+#: the run's own quieting, and the arrival-time restore the poller fires when a previous
+#: window left something off. Each is a multi-step sequence — read the state, write the
+#: marker, touch the flag, issue the toggle — and interleaving them lets the slower one
+#: undo the faster one's bookkeeping. The case that matters: a lagging restore deleting
+#: the flag and the marker that the *current* window has just written, which takes out the
+#: on-unit watchdog and the next-arrival repair together and leaves nothing at all holding
+#: the promise that Bluetooth comes back.
+_lock = asyncio.Lock()
+
+#: How many quietings currently own the radios. An arrival restore that reaches the front
+#: of the queue and finds one in progress stands down, rather than turning back on what
+#: the transfer has just deliberately turned off.
+_active = 0
+
 #: Ceiling on every radio control call. These are sub-second against a healthy unit, and
 #: against a unit that has just driven away the only wrong answer is a long one.
 RADIO_TIMEOUT_S = 6.0
 
-#: Interface names vendors give a running soft AP. Existence is the detector: Android
-#: creates the AP interface when the hotspot starts and removes it when it stops, which
-#: makes this a far more literal answer than grepping state machines out of ``dumpsys``
-#: — whose log buffers mention the hotspot long after it last ran.
-_AP_IFACES = ("ap0", "softap0", "swlan0", "wlan1", "wlan2")
+#: Interface names that can carry a soft AP. Matched rather than listed, because the
+#: name is a vendor choice — ``ap0``, ``softap0``, ``swlan0`` and ``wlan1`` are all in the
+#: wild — and which one matters is decided by what it is *doing*, in :func:`_serving_ap`.
+_AP_NAME = re.compile(r"^(?:ap|softap|swlan|wlan|wl)\d*(?:\.\d+)?$")
+
+#: One ``ip -o addr`` line: the interface and the IPv4 it holds. ``inet6`` lines cannot
+#: match, which is deliberate — a link-local address says nothing about serving.
+_IP_LINE = re.compile(r"^\d+:\s+(\S+)\s+inet\s+(\d{1,3}(?:\.\d{1,3}){3})")
+
+#: Replies that mean the unit declined, whatever its exit status said.
+#:
+#: Both have to be checked. ``cmd`` prints a ``SecurityException`` and exits non-zero, but
+#: an unknown *service* is reported on stdout with a zero exit status — so a return code
+#: alone calls a refusal a success, which is precisely how the first version of this
+#: reported a hotspot as stopped every window while it carried on beaconing.
+_REFUSALS = (
+    "error",
+    "exception",
+    "unknown",
+    "not found",
+    "does not have access",
+    "usage:",
+    # What a unit without the service at all answers: `cmd: Can't find service: tethering`.
+    "can't find",
+    "no such",
+)
+
+
+def _accepted(reply: str) -> bool:
+    lowered = reply.lower()
+    return not any(refusal in lowered for refusal in _REFUSALS)
+
 
 #: What may be carried back into ``cmd wifi start-softap`` inside single quotes.
 #:
@@ -162,25 +214,94 @@ async def _set_bluetooth(address: str, *, enable: bool) -> bool:
             reply = await adb.shell(address, command, timeout=RADIO_TIMEOUT_S)
         except adb.AdbError:
             continue
-        lowered = reply.lower()
-        if "error" in lowered or "unknown" in lowered or "not found" in lowered:
+        if not _accepted(reply):
             continue
         return True
     return False
 
 
-async def _hotspot_iface(address: str) -> str:
-    """The running soft AP's interface name, or "" when none exists."""
-    probes = " ".join(_AP_IFACES)
-    command = f'for i in {probes}; do [ -e "/sys/class/net/$i" ] && echo "$i"; done; exit 0'
+async def _serving_ap(address: str) -> str:
+    """The interface of a soft AP that is actually serving, or "" when none is.
+
+    Three questions get conflated here and only one of them is the right one.
+
+    *Does an AP interface exist* is not it — plenty of units keep a dormant ``wlan1``
+    around whether or not the hotspot has ever been switched on, so existence answers
+    "yes" forever. *What does dumpsys say* is worse: its log buffers mention the hotspot
+    long after it last ran, which is the kind of evidence that is never false.
+
+    A soft AP that is **serving** holds its own IPv4 on its own interface — it is the
+    DHCP server for whatever joins it, so it is ``192.168.43.1`` or a vendor variant from
+    the moment it comes up, client or no client. That is what is looked for, and asking
+    the same question a second time is what proves a stop actually took effect rather
+    than merely being accepted.
+
+    The interface carrying the address this app reached the unit on is excluded by
+    address, never by name. If somebody's server is itself a client of the dashcam's
+    hotspot then that hotspot *is* the transfer's link, and stopping it would cut the one
+    thing this feature exists to speed up — so the interface that must not be touched is
+    identified literally rather than assumed to be called ``wlan0``.
+    """
+    host = address.partition(":")[0].strip()
     try:
-        reply = await adb.shell(address, command, timeout=RADIO_TIMEOUT_S)
+        reply = await adb.shell(address, "ip -o addr show; exit 0", timeout=RADIO_TIMEOUT_S)
     except adb.AdbError:
         return ""
     for line in reply.splitlines():
-        if line.strip():
-            return line.strip()
+        match = _IP_LINE.match(line.strip())
+        if not match:
+            continue
+        iface, addr = match.group(1), match.group(2)
+        if addr == host or not _AP_NAME.match(iface):
+            continue
+        return iface
     return ""
+
+
+#: How a soft AP is asked to stop, in the order the unit is asked.
+#:
+#: The first is the platform's own API, and on an unrooted unit it is also the one that
+#: cannot work. AOSP's ``WifiShellCommand`` gates everything outside a
+#: ``NON_PRIVILEGED_COMMANDS`` allowlist on ``uid != Process.ROOT_UID``, and neither
+#: ``stop-softap`` nor ``start-softap`` is on that list — so a shell caller gets
+#: ``SecurityException: Uid 2000 does not have access to stop-softap wifi command``.
+#: That is exactly what this head unit returns, and it is why the hotspot half of this
+#: feature did nothing on the first attempt while the Bluetooth half worked: ``svc
+#: bluetooth`` has no equivalent gate.
+#:
+#: The second is the Tethering module's own shell command — a different service with a
+#: different permission model, worth asking on a unit whose adbd does run as root or a
+#: vendor build that relaxed the check. It is **unverified against this unit** and is
+#: tried opportunistically rather than relied upon: an unknown service costs one round
+#: trip and says so on stdout, and nothing here believes any of them without
+#: :func:`_serving_ap` confirming it afterwards.
+_STOP_COMMANDS = ("cmd wifi stop-softap", "cmd tethering stop-all-tethering")
+
+
+async def _stop_hotspot(address: str) -> tuple[bool, str]:
+    """Stop a serving soft AP. Returns (stopped, what the unit said when it would not).
+
+    Success is not a zero exit status; it is :func:`_serving_ap` no longer finding the
+    interface. The unit's own words are carried back rather than discarded, because this
+    is a failure the operator can do nothing about from the app and everything about from
+    the log — and a feature that fails silently on every window is the mistake this
+    project has already made once.
+    """
+    replies: list[str] = []
+    for command in _STOP_COMMANDS:
+        try:
+            reply = await adb.shell(address, command, timeout=RADIO_TIMEOUT_S)
+        except adb.AdbError as exc:
+            replies.append(f"{command}: {exc}")
+            continue
+        if not _accepted(reply):
+            first = reply.splitlines()[0][:120] if reply.strip() else "refused"
+            replies.append(f"{command}: {first}")
+            continue
+        if not await _serving_ap(address):
+            return True, ""
+        replies.append(f"{command}: accepted, but the hotspot is still up")
+    return False, "; ".join(replies)[:400]
 
 
 async def _persist_marker(value: str) -> None:
@@ -241,6 +362,9 @@ class RadioQuiet:
     hotspot_restore: tuple[str, str] | None = None
     _task: asyncio.Task | None = None
     _watchdog: asyncio.subprocess.Process | None = None
+    #: Whether this run has claimed the radios, so `finish` releases exactly once however
+    #: it is reached -- including for a task cancelled before it ever claimed them.
+    _owns: bool = False
 
     @property
     def delay(self) -> float:
@@ -251,10 +375,17 @@ class RadioQuiet:
         self._task = asyncio.create_task(self._run(), name="ingest-radio-quiet")
 
     async def _run(self) -> None:
+        global _active
         if self.delay > 0:
             await asyncio.sleep(self.delay)
+        # Claimed before the lock is taken, not after. The claim is what tells a waiting
+        # arrival-restore to stand down, and it has to hold for as long as this run owns
+        # the radios -- which ends in `finish`, not when `_quiet` returns.
+        _active += 1
+        self._owns = True
         try:
-            await self._quiet()
+            async with _lock:
+                await self._quiet()
         except Exception as exc:
             # Best-effort by contract: a radio that cannot be quieted costs throughput,
             # not the transfer.
@@ -287,27 +418,39 @@ class RadioQuiet:
             log.warning("the unit did not accept a Bluetooth disable; leaving it on")
 
     async def _quiet_hotspot(self) -> None:
-        iface = await _hotspot_iface(self.address)
-        config: tuple[str, str] | None = None
-        if iface:
-            # Read the configuration *before* stopping — and regardless of the outcome,
-            # stop it: the whole point is the radio going quiet, and the unit re-arms its
-            # own defaults at the next engine start.
-            try:
-                dump = await adb.shell(self.address, "dumpsys wifi", timeout=15.0)
-                config = _parse_softap_config(dump)
-            except adb.AdbError as exc:
-                log.debug("could not read the hotspot configuration", error=str(exc))
-        try:
-            await adb.shell(self.address, "cmd wifi stop-softap", timeout=RADIO_TIMEOUT_S)
-        except adb.AdbError as exc:
-            if iface:
-                log.warning("could not stop the unit's hotspot", error=str(exc))
+        iface = await _serving_ap(self.address)
+        if not iface:
+            # Nothing is serving, which is already the state that was asked for. The
+            # previous version fired a `stop-softap` here every window regardless, which
+            # on a unit that cannot run it produced no effect and no log line either --
+            # and those two together are why it looked like it was working.
             return
-        if iface and config:
+
+        # Read the configuration before stopping. Afterwards there is nothing left to
+        # read it from.
+        config: tuple[str, str] | None = None
+        try:
+            dump = await adb.shell(self.address, "dumpsys wifi", timeout=15.0)
+            config = _parse_softap_config(dump)
+        except adb.AdbError as exc:
+            log.debug("could not read the hotspot configuration", error=str(exc))
+
+        stopped, why = await _stop_hotspot(self.address)
+        if not stopped:
+            log.warning(
+                "the head unit will not stop its hotspot, so it is still sharing the "
+                "radio with the transfer. Android only lets uid 0 stop a soft AP and "
+                "this unit's ADB is not root, so there is nothing the app can do from "
+                "here -- switch the hotspot off on the unit itself if the throughput "
+                "matters",
+                iface=iface,
+                reply=why,
+            )
+            return
+        if config:
             self.hotspot_restore = config
             log.info("stopped the unit's hotspot for the transfer", iface=iface)
-        elif iface:
+        else:
             log.warning(
                 "stopped the unit's hotspot, but its configuration could not be "
                 "recovered, so it will not be started again from here; the unit "
@@ -325,13 +468,30 @@ class RadioQuiet:
         if task is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-        if self.bluetooth_off:
-            await self._restore_bluetooth()
-        if self.hotspot_restore:
-            await self._restore_hotspot()
+        global _active
+        try:
+            async with _lock:
+                if self.bluetooth_off:
+                    await self._restore_bluetooth()
+                if self.hotspot_restore:
+                    await self._restore_hotspot()
+        finally:
+            if self._owns:
+                _active -= 1
+                self._owns = False
 
     async def _restore_bluetooth(self) -> None:
+        restored = False
         if await _set_bluetooth(self.address, enable=True):
+            # Confirmed, not assumed. A clean `enable` is not proof the radio came back,
+            # and clearing the marker and the flag on an unverified success is the one
+            # mistake that strands the driver's hands-free with nothing left holding the
+            # promise: watchdog stood down, marker gone, next arrival with nothing to
+            # repair. Anything short of a positive "it is on" keeps all three layers in
+            # place, and being wrong in that direction costs an `enable` issued at a
+            # radio that is already on, which is a no-op.
+            restored = await _bluetooth_is_on(self.address) is True
+        if restored:
             log.info("turned the unit's Bluetooth back on")
             await _remove_flag(self.address)
             await _persist_marker("")
@@ -341,11 +501,11 @@ class RadioQuiet:
             # and the marker stays so the next arrival is put right before it is asked
             # for anything.
             log.warning(
-                "could not turn the unit's Bluetooth back on; the watchdog on the "
-                "unit will, or the next arrival"
+                "could not confirm the unit's Bluetooth is back on; the watchdog on the "
+                "unit will see to it, or the next arrival"
             )
         watchdog = self._watchdog
-        if not self.bluetooth_off and watchdog is not None and watchdog.returncode is None:
+        if restored and watchdog is not None and watchdog.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 watchdog.kill()
             with contextlib.suppress(TimeoutError, Exception):
@@ -400,20 +560,37 @@ def restore_if_pending(address: str) -> None:
 
 
 async def _restore_pending(address: str, pending: str) -> None:
-    log.info(
-        "a previous window left the unit's radios off; turning them back on",
-        radios=pending,
-    )
-    if "bluetooth" in pending:
-        if await _set_bluetooth(address, enable=True):
-            await _remove_flag(address)
-            await _persist_marker("")
-            log.info("the unit's Bluetooth is back on")
-        else:
-            log.warning(
-                "could not turn the unit's Bluetooth back on; it will be tried again "
-                "the next time the unit appears"
-            )
+    async with _lock:
+        if _active:
+            # A transfer owns the radios right now, and the marker read here is very
+            # likely the one *it* just wrote. Turning Bluetooth back on would undo the
+            # window in progress, and clearing the marker afterwards would throw away
+            # that window's own promise to restore.
+            log.debug("a transfer owns the radios; leaving the pending restore to it")
+            return
+        # Re-read under the lock rather than trusting the value this task started with:
+        # it may have been cleared by the run that wrote it, or rewritten by a newer one,
+        # while this task was waiting its turn.
+        try:
+            pending = str(get_settings_service().get_nowait(MARKER_KEY) or "").strip()
+        except Exception:
+            pending = ""
+        if not pending:
+            return
+        log.info(
+            "a previous window left the unit's radios off; turning them back on",
+            radios=pending,
+        )
+        if "bluetooth" in pending:
+            if await _set_bluetooth(address, enable=True):
+                await _remove_flag(address)
+                await _persist_marker("")
+                log.info("the unit's Bluetooth is back on")
+            else:
+                log.warning(
+                    "could not turn the unit's Bluetooth back on; it will be tried "
+                    "again the next time the unit appears"
+                )
 
 
 def cancel_pending() -> None:

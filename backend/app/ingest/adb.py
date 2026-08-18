@@ -145,6 +145,16 @@ async def _adb(*args: str, timeout: float = CONTROL_TIMEOUT_S) -> AdbResult:
         proc.kill()
         await asyncio.wait_for(proc.wait(), timeout=5.0)
         raise AdbError(f"adb {' '.join(args[:2])} timed out after {timeout:.0f}s") from None
+    except asyncio.CancelledError:
+        # Cancelling only stops this side *waiting*. The adb client keeps running and the
+        # command it carries still lands on the unit, which for anything that has to be
+        # undone is the worst possible outcome: a cancelled `disable` can arrive after the
+        # `enable` meant to reverse it, leaving the radio off while this side believes it
+        # restored. Killing the client hangs up the remote shell with it, so a command
+        # that has not run yet never does -- and one that already ran necessarily ran
+        # before whatever is issued next.
+        proc.kill()
+        raise
     return AdbResult(
         proc.returncode or 0,
         out.decode("utf-8", "replace").strip(),

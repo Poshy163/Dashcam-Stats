@@ -73,6 +73,11 @@ def unit_shell(monkeypatch):
         commands.append(command)
         for key, value in replies.items():
             if key in command:
+                if isinstance(value, list):
+                    # Sequenced answers, for the probes that get asked twice -- "is the
+                    # hotspot serving" before a stop, and again to prove the stop worked.
+                    # The final entry sticks once the sequence runs out.
+                    value = value.pop(0) if len(value) > 1 else value[0]
                 if isinstance(value, Exception):
                     raise value
                 return value
@@ -99,6 +104,42 @@ def unit_shell(monkeypatch):
 
 def _issued(commands: list[str], fragment: str) -> list[int]:
     return [index for index, command in enumerate(commands) if fragment in command]
+
+
+@pytest.fixture(autouse=True)
+def clean_module_state():
+    """The claim counter and the restore tasks are module globals; no test may inherit
+    another's. A leaked claim would silently disable the arrival restore for the rest of
+    the session, which is exactly the failure these tests exist to catch."""
+    radios._active = 0
+    radios._tasks.clear()
+    yield
+    radios._active = 0
+    radios._tasks.clear()
+
+
+#: An address on the AP's own subnet, as a soft AP always holds while it is serving.
+_IP_WITH_AP = (
+    "1: lo    inet 127.0.0.1/8 scope host lo\n"
+    "23: wlan0    inet 192.168.1.122/24 brd 192.168.1.255 scope global wlan0\n"
+    "25: ap0    inet 192.168.43.1/24 brd 192.168.43.255 scope global ap0\n"
+)
+
+_IP_NO_AP = (
+    "1: lo    inet 127.0.0.1/8 scope host lo\n"
+    "23: wlan0    inet 192.168.1.122/24 brd 192.168.1.255 scope global wlan0\n"
+)
+
+#: What an unrooted unit actually answers. AOSP's WifiShellCommand gates every verb
+#: outside its NON_PRIVILEGED_COMMANDS allowlist on uid 0, and stop-softap is not on it.
+_SECURITY_EXCEPTION = (
+    "java.lang.SecurityException: Uid 2000 does not have access to stop-softap wifi "
+    "command (or such command doesn't exist)"
+)
+
+#: The tests that care about the hotspot must use an address the fake `ip` output agrees
+#: with, because the interface carrying it is excluded by address rather than by name.
+UNIT = "192.168.1.122:5555"
 
 
 class TestTheGuard:
@@ -193,6 +234,33 @@ class TestBluetooth:
 
         assert watchdog.killed
 
+    async def test_an_enable_that_does_not_stick_keeps_every_layer_in_place(
+        self, unit_shell, monkeypatch
+    ):
+        """A clean `enable` is not proof the radio came back.
+
+        If it is still off, the marker, the flag and the watchdog are the only things
+        left holding the promise -- so all three have to survive. Clearing them on an
+        unverified success is what would strand the driver's hands-free with nothing at
+        all left to repair it.
+        """
+        watchdog = FakeProcess()
+
+        async def armed(address, deadline_s):
+            return watchdog
+
+        monkeypatch.setattr(radios, "_arm_watchdog", armed)
+        # On when asked at the start of the window, still off when asked after the enable.
+        unit_shell.replies["bluetooth_on"] = ["1", "0"]
+
+        quiet = radios.begin_quiet("u:5555", online_for=60.0, watchdog_deadline_s=300)
+        await quiet._task
+        await quiet.finish()
+
+        assert unit_shell.settings.values[radios.MARKER_KEY] == "bluetooth"
+        assert not _issued(unit_shell.commands, f"rm -f '{radios.FLAG_PATH}'")
+        assert not watchdog.killed, "the watchdog stood down over an unconfirmed restore"
+
 
 class TestTheWatchdog:
     async def test_it_is_left_on_the_unit_gated_on_the_flag(self, monkeypatch):
@@ -217,11 +285,15 @@ class TestTheWatchdog:
 
 
 class TestTheHotspot:
-    async def test_seen_running_it_is_stopped_and_started_again(self, unit_shell):
-        unit_shell.replies["/sys/class/net"] = "ap0"
-        unit_shell.replies["dumpsys wifi"] = _DUMP_MODERN
+    """Stopping a soft AP is root-gated on Android, which is the whole story here."""
+
+    async def test_a_serving_hotspot_is_stopped_and_started_again(self, unit_shell):
         unit_shell.replies["bluetooth_on"] = "0"
-        quiet = radios.begin_quiet("u:5555", online_for=60.0, watchdog_deadline_s=300)
+        # Serving before the stop, gone after it -- the only evidence that counts.
+        unit_shell.replies["ip -o addr"] = [_IP_WITH_AP, _IP_NO_AP]
+        unit_shell.replies["dumpsys wifi"] = _DUMP_MODERN
+
+        quiet = radios.begin_quiet(UNIT, online_for=60.0, watchdog_deadline_s=300)
         await quiet._task
 
         stops = _issued(unit_shell.commands, "cmd wifi stop-softap")
@@ -232,26 +304,96 @@ class TestTheHotspot:
         starts = _issued(unit_shell.commands, "cmd wifi start-softap 'CarSpot' wpa2 'roadtrip99'")
         assert starts and stops[0] < starts[0]
 
+    async def test_a_unit_that_refuses_the_stop_is_reported_rather_than_believed(self, unit_shell):
+        """The field bug. Android only lets uid 0 stop a soft AP, and this unit's ADB is
+        not root -- so the command throws, the hotspot keeps beaconing through every
+        transfer, and the first version of this said nothing at all about it."""
+        unit_shell.replies["bluetooth_on"] = "0"
+        unit_shell.replies["ip -o addr"] = _IP_WITH_AP  # it never goes away
+        unit_shell.replies["dumpsys wifi"] = _DUMP_MODERN
+        unit_shell.replies["stop-softap"] = _SECURITY_EXCEPTION
+
+        quiet = radios.begin_quiet(UNIT, online_for=60.0, watchdog_deadline_s=300)
+        await quiet._task
+        await quiet.finish()
+
+        assert quiet.hotspot_restore is None, "a hotspot that never stopped was restarted"
+        assert not _issued(unit_shell.commands, "start-softap")
+
+    async def test_a_stop_that_is_accepted_but_changes_nothing_is_a_failure(self, unit_shell):
+        """A zero exit status is not the question. Whether it is still serving is."""
+        unit_shell.replies["bluetooth_on"] = "0"
+        unit_shell.replies["ip -o addr"] = _IP_WITH_AP
+        unit_shell.replies["dumpsys wifi"] = _DUMP_MODERN
+
+        quiet = radios.begin_quiet(UNIT, online_for=60.0, watchdog_deadline_s=300)
+        await quiet._task
+        await quiet.finish()
+
+        assert quiet.hotspot_restore is None
+        assert not _issued(unit_shell.commands, "start-softap")
+
+    async def test_nothing_serving_means_nothing_is_issued(self, unit_shell):
+        """A dormant `wlan1` is not a hotspot, and a stop nobody needs is a round trip
+        that can only produce a misleading log line."""
+        unit_shell.replies["bluetooth_on"] = "0"
+        unit_shell.replies["ip -o addr"] = _IP_NO_AP
+
+        quiet = radios.begin_quiet(UNIT, online_for=60.0, watchdog_deadline_s=300)
+        await quiet._task
+        await quiet.finish()
+
+        assert not _issued(unit_shell.commands, "softap")
+        assert not _issued(unit_shell.commands, "dumpsys wifi")
+
+    async def test_the_link_the_transfer_runs_over_is_never_stopped(self, unit_shell):
+        """If somebody's server is itself a client of the dashcam's hotspot, that hotspot
+        *is* the transfer's link -- stopping it would cut the one thing this feature
+        exists to speed up."""
+        unit_shell.replies["bluetooth_on"] = "0"
+        unit_shell.replies["ip -o addr"] = (
+            "1: lo    inet 127.0.0.1/8 scope host lo\n"
+            "25: ap0    inet 192.168.43.1/24 brd 192.168.43.255 scope global ap0\n"
+        )
+
+        quiet = radios.begin_quiet("192.168.43.1:5555", online_for=60.0, watchdog_deadline_s=300)
+        await quiet._task
+        await quiet.finish()
+
+        assert not _issued(unit_shell.commands, "softap")
+
     async def test_with_no_recoverable_config_it_is_stopped_but_never_guessed_at(self, unit_shell):
-        unit_shell.replies["/sys/class/net"] = "ap0"
+        unit_shell.replies["bluetooth_on"] = "0"
+        unit_shell.replies["ip -o addr"] = [_IP_WITH_AP, _IP_NO_AP]
         unit_shell.replies["dumpsys wifi"] = "nothing useful in here"
-        unit_shell.replies["bluetooth_on"] = "0"
-        quiet = radios.begin_quiet("u:5555", online_for=60.0, watchdog_deadline_s=300)
+
+        quiet = radios.begin_quiet(UNIT, online_for=60.0, watchdog_deadline_s=300)
         await quiet._task
         await quiet.finish()
 
         assert _issued(unit_shell.commands, "cmd wifi stop-softap")
         assert not _issued(unit_shell.commands, "start-softap")
 
-    async def test_not_running_it_is_still_asked_to_stop_but_never_started(self, unit_shell):
-        """ "Make sure it is off" is the point; a stop on a stopped AP is a no-op."""
-        unit_shell.replies["bluetooth_on"] = "0"
-        quiet = radios.begin_quiet("u:5555", online_for=60.0, watchdog_deadline_s=300)
-        await quiet._task
-        await quiet.finish()
 
-        assert _issued(unit_shell.commands, "cmd wifi stop-softap")
-        assert not _issued(unit_shell.commands, "start-softap")
+class TestTheRefusalCheck:
+    """Neither the exit status nor the text alone is enough, so both are consulted."""
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            _SECURITY_EXCEPTION,
+            "Unknown command: stop-all-tethering",
+            "Error: no such service",
+            "cmd: Can't find service: tethering",
+            "Usage: cmd wifi ...",
+        ],
+    )
+    def test_a_refusal_is_not_success(self, reply):
+        assert not radios._accepted(reply)
+
+    @pytest.mark.parametrize("reply", ["", "\n", "Soft AP stopped"])
+    def test_a_quiet_or_positive_reply_is(self, reply):
+        assert radios._accepted(reply)
 
 
 class TestTheConfigParse:
@@ -302,6 +444,29 @@ class TestTheArrivalRestore:
         await asyncio.gather(*list(radios._tasks))
 
         assert unit_shell.settings.values[radios.MARKER_KEY] == "bluetooth"
+
+    async def test_it_stands_down_while_a_transfer_owns_the_radios(self, unit_shell, monkeypatch):
+        """Otherwise a lagging restore turns Bluetooth back on mid-transfer and then
+        clears the marker the running window wrote, taking the on-unit watchdog and the
+        next-arrival repair with it."""
+        unit_shell.settings.values[radios.MARKER_KEY] = "bluetooth"
+        monkeypatch.setattr(radios, "_active", 1)
+
+        radios.restore_if_pending("u:5555")
+        await asyncio.gather(*list(radios._tasks))
+
+        assert not _issued(unit_shell.commands, "bluetooth_manager enable")
+        assert unit_shell.settings.values[radios.MARKER_KEY] == "bluetooth"
+
+    async def test_a_marker_cleared_while_it_queued_is_not_acted_on(self, unit_shell):
+        """It re-reads under the lock rather than trusting what it was started with."""
+        unit_shell.settings.values[radios.MARKER_KEY] = "bluetooth"
+
+        radios.restore_if_pending("u:5555")
+        unit_shell.settings.values[radios.MARKER_KEY] = ""
+        await asyncio.gather(*list(radios._tasks))
+
+        assert not _issued(unit_shell.commands, "bluetooth_manager enable")
 
     async def test_nothing_pending_spawns_nothing(self, unit_shell):
         radios.restore_if_pending("u:5555")
