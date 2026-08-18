@@ -244,6 +244,34 @@ async def resolve_source(address: str, override: str = "") -> str:
     raise CardNotFound("could not find DCIM/Video on any mounted volume")
 
 
+async def unit_clock(address: str) -> int | None:
+    """The unit's own idea of the time, in Unix seconds, or None if it will not say.
+
+    Needed because the only evidence that a recording is still being written is its
+    mtime, and that timestamp is stamped by *this* clock while the code comparing it was
+    using the container's. They are not the same clock and nothing holds them together:
+    the unit has no battery, no cellular radio and a hand-set clock -- the whole reason
+    ``general.timezone`` exists is that its overlay prints local time with no zone -- so
+    drift of minutes is ordinary. Fifteen seconds of it is enough that "skip the segment
+    the camera is writing right now" never fires once.
+
+    None rather than a guess when it cannot be read. The caller falls back to its own
+    clock, which is what the comparison did unconditionally before, so an unreadable
+    clock is no worse than not asking.
+    """
+    try:
+        reply = (await shell(address, "date +%s", timeout=CONTROL_TIMEOUT_S)).strip()
+    except AdbError as exc:
+        log.debug("could not read the head unit's clock", error=str(exc))
+        return None
+    for line in reply.splitlines():
+        try:
+            return int(line.strip())
+        except ValueError:
+            continue
+    return None
+
+
 async def inventory(address: str, source: str) -> list[RemoteFile]:
     """List the card's recordings as ``size|name|mtime``.
 

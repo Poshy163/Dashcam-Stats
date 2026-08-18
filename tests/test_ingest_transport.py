@@ -116,6 +116,33 @@ class TestTheDelta:
         assert plan.bytes == 200
         assert plan.backlog_files == 2
 
+    def test_the_guard_is_judged_on_the_units_own_clock(self, tmp_path):
+        """The mtimes come from the head unit; comparing them to this machine's clock
+        measures the drift between two computers rather than the age of a file.
+
+        The unit has no battery and a hand-set clock, so drift is ordinary -- and at
+        fifteen seconds of it the active-segment guard stops firing entirely, which means
+        the one file that must never be copied, the segment open in the recorder, is
+        copied every single window.
+        """
+        unit_now = 1_000_000.0
+        remote = [
+            # Written one second ago *by the unit's clock*: still open in the recorder.
+            RemoteFile("20260812120000_camera_0.ts", 100, int(unit_now) - 1),
+        ]
+
+        # This machine's clock happens to be two minutes ahead of the unit's.
+        with_container_clock = delta(
+            remote, tmp_path, skip_active_s=15, camera="both", now=unit_now + 120
+        )
+        with_unit_clock = delta(remote, tmp_path, skip_active_s=15, camera="both", now=unit_now)
+
+        assert [i.name for i in with_container_clock.files] == ["20260812120000_camera_0.ts"], (
+            "this is the bug: a two-minute clock difference defeats the guard"
+        )
+        assert with_unit_clock.files == [], "the unit's own clock sees the file is open"
+        assert with_unit_clock.active_skipped == 1
+
     def test_the_segment_still_being_recorded_is_left_alone(self, tmp_path):
         """Both lenses write continuously; the newest file of each is open in the recorder.
 
@@ -1242,6 +1269,114 @@ class TestARunEndToEnd:
 
         touched = [c for c in commands if "bluetooth" in c or "softap" in c]
         assert touched == [], f"an idle window touched the radios: {touched}"
+
+    async def test_a_recording_that_grew_since_the_listing_is_left_for_next_time(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """The camera is still writing it, whatever its mtime says.
+
+        mtime is stamped by a hand-set clock onto a vfat card behind FUSE, where it has
+        two-second granularity and need not advance on every write. Two sizes a moment
+        apart are evidence instead: a file that grew between them is open right now, and
+        copying it produces the one thing this design exists to prevent -- a recording
+        that arrives looking complete and is not.
+        """
+        from app.ingest import adb, puller
+        from app.ingest.models import RunState
+
+        listings = {"n": 0}
+        first = adb.inventory_all
+
+        async def inventory_all(address, sources):
+            listings["n"] += 1
+            items = await first(address, sources)
+            if listings["n"] == 1:
+                return items
+            # The second look finds one of them larger: still being recorded.
+            return [
+                RemoteFile(i.name, i.size + 4096, i.mtime, i.directory)
+                if i.name == "20260812120000_camera_0.ts"
+                else i
+                for i in items
+            ]
+
+        monkeypatch.setattr(adb, "inventory_all", inventory_all)
+        await self._enable()
+
+        result = await puller.run_pull(trigger="manual")
+
+        assert listings["n"] == 2, "the card was never looked at a second time"
+        footage = app_config.footage_dir
+        landed = sorted(path.name for path in footage.glob("*.ts"))
+        assert landed == ["20260812120100_camera_0.ts"], (
+            "the recording that was still growing was copied anyway"
+        )
+        assert result.state is RunState.OK
+
+    async def test_a_recording_recycled_off_the_card_mid_run_is_dropped(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """A full card recycles the oldest file out from under a run, and that is how
+        footage is permanently lost -- so it is dropped from the plan and said out loud
+        rather than transferred into a failure."""
+        from app.ingest import adb, puller
+        from app.ingest.models import RunState
+
+        listings = {"n": 0}
+        first = adb.inventory_all
+
+        async def inventory_all(address, sources):
+            listings["n"] += 1
+            items = await first(address, sources)
+            if listings["n"] == 1:
+                return items
+            return [i for i in items if i.name != "20260812120000_camera_0.ts"]
+
+        monkeypatch.setattr(adb, "inventory_all", inventory_all)
+        await self._enable()
+
+        result = await puller.run_pull(trigger="manual")
+
+        assert result.state is RunState.OK
+        landed = sorted(path.name for path in app_config.footage_dir.glob("*.ts"))
+        assert landed == ["20260812120100_camera_0.ts"]
+
+    async def test_a_staged_file_of_the_wrong_size_says_so_before_discarding_it(
+        self, tmp_path, monkeypatch
+    ):
+        """The one place a recording that never lands would vanish without trace.
+
+        The window ends, the operator sees a hole in the footage, and nothing anywhere
+        explains it -- the same shape of silent failure this project has already been
+        bitten by twice.
+        """
+        from app.ingest import puller
+
+        staging = tmp_path / "staging"
+        footage = tmp_path / "footage"
+        staging.mkdir()
+        footage.mkdir()
+        (staging / "20260812120000_camera_0.ts").write_bytes(b"x" * 50)
+
+        logged: list[tuple[str, dict]] = []
+
+        class Recorder:
+            def __getattr__(self, level):
+                def emit(message, **kwargs):
+                    logged.append((message, kwargs))
+
+                return emit
+
+        monkeypatch.setattr(puller, "log", Recorder())
+
+        committed = puller.commit(staging, footage, {"20260812120000_camera_0.ts": 100})
+
+        assert committed == []
+        assert list(staging.iterdir()) == [], "the short file was left in staging"
+        said = [kwargs for message, kwargs in logged if "discarding" in message]
+        assert said, f"the discard was silent: {logged}"
+        assert said[0]["listed_bytes"] == 100
+        assert said[0]["staged_bytes"] == 50
 
     async def test_a_slow_webhook_does_not_delay_the_first_byte(
         self, db_session, unit, app_config, monkeypatch

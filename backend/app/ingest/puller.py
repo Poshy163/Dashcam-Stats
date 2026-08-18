@@ -142,6 +142,7 @@ def delta(
     camera: str,
     already_seen: set[str] | None = None,
     newest_first: bool = False,
+    now: float | None = None,
 ) -> DeltaPlan:
     """Decide what to fetch.
 
@@ -162,8 +163,17 @@ def delta(
     up. Once the backlog is permanently larger than one window it starves: every window is
     spent on the oldest files and today's drive is never reached at all. The camera's names
     sort chronologically, so the choice is one sort key.
+
+    ``now`` is **the unit's clock**, not this machine's, and passing the wrong one is not a
+    rounding error. Every ``mtime`` here was stamped by the head unit, which has no battery
+    and a hand-set clock; comparing those timestamps against the container's NTP-synced
+    time measures the drift between two machines rather than the age of a file. Fifteen
+    seconds of drift -- ordinary on a device like this -- makes the active-segment guard
+    below never fire at all, and the segment the camera is writing right now is exactly the
+    file that must not be copied. Defaults to this machine's clock only so the function
+    stays callable without a unit.
     """
-    now = time.time()
+    now = time.time() if now is None else now
     plan = DeltaPlan()
     seen = already_seen or set()
 
@@ -237,7 +247,26 @@ def commit(staging: Path, footage: Path, expected: dict[str, int]) -> list[str]:
             continue
         wanted = expected.get(path.name)
         try:
-            if wanted is None or path.stat().st_size != wanted:
+            staged = path.stat().st_size
+            if wanted is None or staged != wanted:
+                # Never silently. This check is what keeps a half-arrived file out of the
+                # library, and it is also the exact place a recording that never lands
+                # disappears without trace: the window ends, the operator sees a hole in
+                # the footage, and nothing anywhere says why. For the last file of an
+                # interrupted window this is the expected ending; for any other file it
+                # means something upstream is wrong, and saying so is the only way to
+                # tell the two apart.
+                log.warning(
+                    "discarding a staged recording that is not the size it was listed at",
+                    file=path.name,
+                    listed_bytes=wanted,
+                    staged_bytes=staged,
+                    reason=(
+                        "it was not in this run's plan"
+                        if wanted is None
+                        else "incomplete; it will be fetched again next window"
+                    ),
+                )
                 path.unlink()
                 continue
 
@@ -274,6 +303,71 @@ def _clean(staging: Path) -> None:
         with contextlib.suppress(OSError):
             if path.is_file():
                 path.unlink()
+
+
+async def _drop_still_growing(info: UnitInfo, plan: DeltaPlan, sources: list[str]) -> None:
+    """Take a second look at the card and drop anything whose size has moved since the first.
+
+    The mtime guard in :func:`delta` is inference -- "this was written recently, so it is
+    probably still open" -- and it rests on two things that are not guaranteed. The
+    timestamp is stamped by the unit's own hand-set clock, and the card is vfat behind
+    FUSE, where mtime has two-second granularity and is under no obligation to advance on
+    every write. Either one failing silently defeats it.
+
+    Two sizes taken a moment apart are evidence rather than inference. A file that grew
+    between them is open in the recorder right now whatever its mtime claims, and copying
+    it is the one failure this whole design is arranged around: a recording that arrives
+    looking complete and is not. It costs one listing of a card that was just listed, and
+    it buys back the transfer time that file would have spent -- because a copy taken
+    mid-write fails its size check at commit and is thrown away regardless, so the window
+    was spent either way.
+
+    A file that has *vanished* between the two listings is dropped for a different reason
+    and gets its own line. That is the recorder recycling the card out from under the run,
+    which on a card as full as this one is how footage is actually, permanently lost.
+    """
+    try:
+        fresh = {item.name: item.size for item in await adb.inventory_all(info.address, sources)}
+    except adb.AdbError as exc:
+        # Best effort. The commit's size check is still behind this, so the worst case of
+        # not knowing is the transfer this was meant to save.
+        log.debug("could not take a second look at the card", error=str(exc))
+        return
+
+    keep: list[RemoteFile] = []
+    growing: list[str] = []
+    gone: list[str] = []
+    for item in plan.files:
+        current = fresh.get(item.name)
+        if current is None:
+            gone.append(item.name)
+        elif current != item.size:
+            growing.append(item.name)
+        else:
+            keep.append(item)
+
+    if not growing and not gone:
+        return
+
+    plan.files[:] = keep
+    # Counted as skipped rather than lost: they are still on the card and still in the
+    # backlog, and the next window gets them once the camera has closed them.
+    plan.active_skipped += len(growing)
+    if growing:
+        log.info(
+            "leaving recordings the camera is still writing",
+            files=len(growing),
+            names=growing[:3],
+        )
+    if gone:
+        log.warning(
+            "recordings vanished from the card while this run was planning; the recorder "
+            "is recycling the card to make room, and anything it reaches first is lost "
+            "for good -- turn on 'Delete from the card after copying' so the space comes "
+            "back from footage that is already safely in the library",
+            files=len(gone),
+            names=gone[:3],
+        )
 
 
 async def probe_unit() -> UnitInfo:
@@ -416,6 +510,10 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
         removed = _preflight(preflight, _deliberately_removed())
         safety = _preflight(preflight, _footage_is_safe_to_write(footage))
         cleaned = _preflight(preflight, asyncio.to_thread(_clean, staging))
+        # Asked here so it overlaps the card listing rather than adding a round trip to
+        # the critical path. What it answers -- how far the unit's clock is from this
+        # one -- is what makes the active-segment guard mean anything at all.
+        clock = _preflight(preflight, adb.unit_clock(info.address))
 
         status.set_phase(Phase.SCANNING)
         sources = [info.source]
@@ -432,6 +530,16 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
         # is a hard NFS mount in the deployment, and a full card is ~140 files. Doing it
         # inline would freeze /health and the whole UI behind a slow server every time the
         # car appears -- the regression commit da2850a exists to prevent.
+        # Carried as an offset rather than an absolute, so the listing's own duration
+        # cannot age the reading: the guard is judged at the moment the delta runs.
+        unit_now = await clock
+        skew = (unit_now - time.time()) if unit_now is not None else 0.0
+        if abs(skew) >= 5.0:
+            log.info(
+                "the head unit's clock differs from this one; using the unit's own time "
+                "to judge which recordings are still being written",
+                seconds=round(skew),
+            )
         plan = await asyncio.to_thread(
             delta,
             remote,
@@ -440,7 +548,13 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
             camera=str(_get("camera_filter", "both")),
             already_seen=await removed,
             newest_first=str(_get("transfer_order", "oldest_first")) == "newest_first",
+            now=time.time() + skew,
         )
+        # A second opinion on which files are still open, from two sizes rather than one
+        # timestamp. Only when there is something to fetch, so an idle window still costs
+        # exactly one listing.
+        if plan.files:
+            await _drop_still_growing(info, plan, sources)
         status.plan(plan)
 
         # Before the idle return, not after it. A card whose whole contents the library
