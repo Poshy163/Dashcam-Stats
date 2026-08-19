@@ -258,24 +258,56 @@ async def _serving_ap(address: str) -> str:
     return ""
 
 
-#: How a soft AP is asked to stop, in the order the unit is asked.
+#: How a soft AP is asked to stop.
 #:
-#: The first is the platform's own API, and on an unrooted unit it is also the one that
-#: cannot work. AOSP's ``WifiShellCommand`` gates everything outside a
+#: One command, because the AOSP source (checked against ``android15-release``) says there
+#: is exactly one worth issuing. ``WifiShellCommand`` gates everything outside its
 #: ``NON_PRIVILEGED_COMMANDS`` allowlist on ``uid != Process.ROOT_UID``, and neither
 #: ``stop-softap`` nor ``start-softap`` is on that list — so a shell caller gets
-#: ``SecurityException: Uid 2000 does not have access to stop-softap wifi command``.
-#: That is exactly what this head unit returns, and it is why the hotspot half of this
-#: feature did nothing on the first attempt while the Bluetooth half worked: ``svc
-#: bluetooth`` has no equivalent gate.
+#: ``SecurityException: Uid 2000 does not have access to stop-softap wifi command``. That
+#: is exactly what this head unit returns, and it is why the hotspot half of this feature
+#: did nothing on the first attempt while the Bluetooth half worked: ``svc bluetooth`` has
+#: no equivalent gate. On a unit whose adbd *does* run as root (a debuggable build) this
+#: same command simply succeeds.
 #:
-#: The second is the Tethering module's own shell command — a different service with a
-#: different permission model, worth asking on a unit whose adbd does run as root or a
-#: vendor build that relaxed the check. It is **unverified against this unit** and is
-#: tried opportunistically rather than relied upon: an unknown service costs one round
-#: trip and says so on stdout, and nothing here believes any of them without
-#: :func:`_serving_ap` confirming it afterwards.
-_STOP_COMMANDS = ("cmd wifi stop-softap", "cmd tethering stop-all-tethering")
+#: There is deliberately no ``cmd tethering`` fallback. It was tried once on the theory
+#: that the Tethering module exposed its own shell command with a softer permission model;
+#: it does not. ``TetheringService`` overrides only ``dump()``, so ``cmd tethering
+#: <anything>`` falls through to Binder's default handler and answers ``No shell command
+#: implementation.`` — a round trip that can never stop anything. The stop lives only
+#: behind the ``ITetheringConnector`` binder (``stopAllTethering``), reachable from shell
+#: in principle because ``com.android.shell`` holds ``TETHER_PRIVILEGED``, but only via a
+#: raw ``service call`` with a transaction code that is not stable API — and the code for
+#: *start* sits directly beside the code for *stop*, so an off-by-one against a vendor-
+#: forked module would switch the hotspot **on**. That is not a thing to fire blind at
+#: somebody's car; it needs the transaction code verified against this exact unit first.
+#: Until then the honest outcome for an unrooted unit is the one this already reports:
+#: say the unit refused, in its own words, and leave the hotspot alone.
+_STOP_COMMANDS = ("cmd wifi stop-softap",)
+
+
+#: How long a stop is given to actually take effect, and how often to look.
+#:
+#: ``WifiServiceImpl.stopSoftAp`` posts to the WiFi handler thread and returns straight
+#: away; ``SoftApManager`` then tears hostapd down and drops the interface's address some
+#: unspecified time later. Asking once, immediately, therefore reads a *successful* stop
+#: as "accepted, but the hotspot is still up" — and on a rooted unit, where the command
+#: finally works, that is every single window. The consequence is not cosmetic: a stop
+#: wrongly judged failed means ``hotspot_restore`` is never set, so the hotspot is taken
+#: down and then never put back.
+STOP_SETTLE_BUDGET_S = 3.0
+STOP_SETTLE_POLL_S = 0.4
+
+
+async def _stop_took_effect(address: str) -> bool:
+    """Whether the AP is really gone, allowing for the teardown not being instant."""
+    deadline = asyncio.get_running_loop().time() + STOP_SETTLE_BUDGET_S
+    while True:
+        if not await _serving_ap(address):
+            return True
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(STOP_SETTLE_POLL_S)
 
 
 async def _stop_hotspot(address: str) -> tuple[bool, str]:
@@ -298,7 +330,7 @@ async def _stop_hotspot(address: str) -> tuple[bool, str]:
             first = reply.splitlines()[0][:120] if reply.strip() else "refused"
             replies.append(f"{command}: {first}")
             continue
-        if not await _serving_ap(address):
+        if await _stop_took_effect(address):
             return True, ""
         replies.append(f"{command}: accepted, but the hotspot is still up")
     return False, "; ".join(replies)[:400]
@@ -311,6 +343,24 @@ async def _persist_marker(value: str) -> None:
         # The marker is the third line of defence, behind the run's own restore and the
         # on-unit watchdog; failing to write it is worth a line, not a failed transfer.
         log.debug("could not persist the radio-restore marker", error=str(exc))
+
+
+#: Where the unit's last hotspot refusal is kept, in the unit's own words.
+#:
+#: A read-only setting rather than a log line, because this is the half of the feature
+#: that fails permanently on an unrooted unit and the log line saying so scrolls away
+#: with the window that produced it. The first version of this feature failed silently
+#: on every transfer; the second logged it once per run; this makes the standing state —
+#: "your unit will not allow it, and here is what it said" — visible on the Settings
+#: page for as long as it remains true. Cleared the moment a stop actually works.
+REFUSAL_KEY = "ingest.hotspot_refusal"
+
+
+async def _persist_refusal(value: str) -> None:
+    try:
+        await get_settings_service().set(REFUSAL_KEY, value, internal=True)
+    except Exception as exc:
+        log.debug("could not persist the hotspot refusal", error=str(exc))
 
 
 async def _remove_flag(address: str) -> None:
@@ -446,7 +496,9 @@ class RadioQuiet:
                 iface=iface,
                 reply=why,
             )
+            await _persist_refusal(why or "the unit refused without saying why")
             return
+        await _persist_refusal("")
         if config:
             self.hotspot_restore = config
             log.info("stopped the unit's hotspot for the transfer", iface=iface)

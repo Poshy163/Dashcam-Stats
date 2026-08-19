@@ -190,6 +190,12 @@ export interface IngestStatus {
   backlogBytes: number
   /** Recordings left alone because the camera is still writing them. */
   activeSkipped: number
+  /** The unit's WiFi frequency in MHz as last read by the band gate; null when unknown. */
+  wifiFrequencyMhz: number | null
+  /** True while a transfer is being held waiting for a 5 GHz link. */
+  wifiBandHold: boolean
+  /** Why it is being held, including whether 5 GHz is in range. Null unless held. */
+  wifiBandHoldReason: string | null
   startedAt: string | null
   lastSuccessTs: string | null
   lastError: string | null

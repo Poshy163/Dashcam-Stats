@@ -1087,6 +1087,75 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.quiet_radios",
     ),
     SettingDef(
+        "ingest.adb_root",
+        "Let the app restart the dashcam's ADB as root",
+        "bool",
+        False,
+        "ingest",
+        "Android only lets root stop a hotspot, so without this the hotspot keeps "
+        "sharing the transfer's radio however the setting above is set. This runs "
+        "'adb root' once per transfer, before any copying starts, which works only if "
+        "the unit runs a debuggable build — most do not, and on those it is asked once, "
+        "answered no, and never asked again. Two things worth knowing before turning it "
+        "on: the unit's ADB stays root until the engine stops (it reverts on its own at "
+        "the next start, and nothing here puts it back sooner), and restarting ADB "
+        "briefly drops the control channel — if it does not come back, that window is "
+        "lost and the next engine start fixes it. Whether your unit allows it at all is "
+        "reported below.",
+        dangerous=True,
+        requires="ingest.quiet_radios",
+    ),
+    SettingDef(
+        "ingest.adb_root_state",
+        "Whether this unit allows ADB root",
+        "string",
+        "",
+        "ingest",
+        "What the head unit answered the last time it was asked to restart its ADB as "
+        "root. A production build refuses permanently, and the app stops asking; that "
+        "is a property of the unit's firmware and nothing here can change it.",
+        read_only=True,
+        requires="ingest.adb_root",
+    ),
+    SettingDef(
+        "ingest.hotspot_refusal",
+        "Why the hotspot could not be stopped",
+        "string",
+        "",
+        "ingest",
+        "The head unit's own words from the last time it refused to stop its hotspot "
+        "for a transfer. Android only lets root stop a soft AP, so on most units this "
+        "reads as a SecurityException for uid 2000 — permanent until the unit's ADB "
+        "runs as root, and nothing this app can work around. Turn the hotspot off on "
+        "the unit itself if the throughput matters. Cleared automatically if a stop "
+        "ever succeeds.",
+        read_only=True,
+        requires="ingest.quiet_radios",
+    ),
+    SettingDef(
+        "ingest.wifi_band",
+        "WiFi band for transfers",
+        "select",
+        "any",
+        "ingest",
+        "The head unit's single-stream WiFi moves ~32 MB/s on 5 GHz and ~5 MB/s on "
+        "2.4 GHz — and once it joins 2.4 it stays there, because Android does not roam "
+        "off a link that still works. 'Prefer' notes the slow band in the log and copies "
+        "anyway; 'Require' holds the transfer while the unit is on 2.4 GHz and re-checks "
+        "every half minute for as long as the car is here, telling you on the Backup page "
+        "whether 5 GHz is even in range from where you park. Nothing here can move the "
+        "unit between bands: the only way to do that without root is to switch its WiFi "
+        "off and on, and on a unit with no battery an engine stopping at the wrong "
+        "instant would leave it with WiFi disabled and unreachable for good. Give the "
+        "router a 5 GHz-only SSID and point the car at it — that fixes it properly.",
+        choices=(
+            ("any", "Copy on any band"),
+            ("prefer_5ghz", "Prefer 5 GHz (warn, but copy)"),
+            ("require_5ghz", "Require 5 GHz (hold until it connects on 5 GHz)"),
+        ),
+        requires="ingest.enabled",
+    ),
+    SettingDef(
         "ingest.delete_after_verify",
         "Delete from the card after copying",
         "bool",

@@ -182,9 +182,38 @@ What that means in practice:
   - **Bluetooth works on any unit. The hotspot needs one whose ADB runs as root**, which
     most do not: Android only lets uid 0 stop a soft AP, so an ordinary unit answers
     `SecurityException` and keeps beaconing. The app checks whether the hotspot is
-    genuinely still serving rather than trusting the exit status, and says so in the log
-    once per transfer instead of quietly claiming success. If it matters, turn the
+    genuinely still serving rather than trusting the exit status, and records the unit's
+    own refusal in Settings instead of quietly claiming success. If it matters, turn the
     hotspot off on the unit itself.
+  - **Let the app restart the dashcam's ADB as root** closes that gap on a unit that
+    allows it. `adb root` is run once per transfer, before any copying starts, and only
+    works on a debuggable build (`ro.debuggable=1`) — most units are production builds,
+    and those are asked once, answered no, and never asked again. Check yours with
+    `adb -s <unit> shell getprop ro.debuggable`: `1` means this will work. Two things to
+    know before switching it on: the unit's ADB stays root until the engine stops (it
+    reverts by itself at the next start), and the restart briefly drops the control
+    channel — if it does not come back, that one window is lost and the next engine start
+    fixes it. Off by default, and it does nothing unless the radio quieting above is on.
+- **The transfer can insist on the fast band.** The unit's single-stream WiFi moves
+  ~32 MB/s on 5 GHz and ~5 MB/s on 2.4 GHz, and once it has joined 2.4 it stays there —
+  Android does not roam off a link that still works. **WiFi band for transfers** set to
+  *Require 5 GHz* holds the transfer while the unit is on 2.4 GHz and re-checks every
+  half minute for as long as the car is on the driveway; *Prefer 5 GHz* just says so in
+  the log and copies anyway. The Backup page shows when a transfer is being held and
+  why. Reading the band is one `cmd wifi status` on the control channel — unlike
+  stopping the hotspot, Android answers that one without root.
+  - **Nothing here moves the unit between bands, on purpose.** The only way to do that
+    without root is to switch the unit's WiFi off and on so Android re-picks — but
+    `set-wifi-enabled disabled` persists `WIFI_ON=0` immediately and cuts the very link
+    its own command is travelling over, and this unit has no battery. An engine stopping
+    in that window leaves it powered down with WiFi disabled, booting deaf at every
+    subsequent start, recoverable only by hand in the car. It was built, measured against
+    that risk, and removed.
+  - **The fix is on the router: give it a 5 GHz-only SSID and point the head unit at
+    it.** There is then no 2.4 GHz band to lock onto, the gate never fires, and it costs
+    nothing. When holding, the Backup page also tells you whether 5 GHz is even in range
+    from where you park — which is the difference between "move the access point" and
+    "split the SSID".
 - **The car can show its own progress.** Turn on **Show the backup page on the dashcam
   screen** and the head unit opens this app's Backup page when a transfer starts. There is
   no address to configure: whatever you open the dashboard on is what the car is sent to,

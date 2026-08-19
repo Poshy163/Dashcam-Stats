@@ -299,6 +299,9 @@ class TestTheHotspot:
         stops = _issued(unit_shell.commands, "cmd wifi stop-softap")
         assert stops
         assert quiet.hotspot_restore == ("CarSpot", "roadtrip99")
+        assert unit_shell.settings.values[radios.REFUSAL_KEY] == "", (
+            "a stop that worked must clear any standing refusal"
+        )
 
         await quiet.finish()
         starts = _issued(unit_shell.commands, "cmd wifi start-softap 'CarSpot' wpa2 'roadtrip99'")
@@ -319,6 +322,9 @@ class TestTheHotspot:
 
         assert quiet.hotspot_restore is None, "a hotspot that never stopped was restarted"
         assert not _issued(unit_shell.commands, "start-softap")
+        assert "does not have access" in unit_shell.settings.values[radios.REFUSAL_KEY], (
+            "the unit's own words must outlive the log line, on the Settings page"
+        )
 
     async def test_a_stop_that_is_accepted_but_changes_nothing_is_a_failure(self, unit_shell):
         """A zero exit status is not the question. Whether it is still serving is."""

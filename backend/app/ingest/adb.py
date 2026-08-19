@@ -210,16 +210,43 @@ async def is_listening(address: str) -> bool:
     return True
 
 
-async def reconnect(address: str) -> None:
+async def reconnect(address: str, *, timeout: float = CONTROL_TIMEOUT_S) -> None:
     """Re-establish the control channel before every cycle.
 
     Not optional and not paranoia. The unit reboots with the car, and the transport on this
     side goes stale while still *looking* connected -- ``get-state`` answers ``device`` for
     a socket that no longer reaches anything. Disconnecting first costs one round trip and
     removes a whole class of "it worked yesterday" failure.
+
+    ``timeout`` is exposed for callers that are retrying against a budget of their own. The
+    default is the full control timeout, which is right for the once-per-cycle use; a caller
+    polling for a restarted daemon needs each attempt to fail *fast* enough that it gets more
+    than one, and inheriting a twenty-second ceiling would spend an entire driveway window
+    inside a single attempt.
     """
-    await _adb("disconnect", address)
-    await _adb("connect", address)
+    await _adb("disconnect", address, timeout=timeout)
+    await _adb("connect", address, timeout=timeout)
+
+
+#: How long adbd is given to answer a root request.
+#:
+#: A production build refuses in milliseconds; a debuggable one restarts, and the restart
+#: is what takes the time. Generous, because this is issued once per run and the answer
+#: decides whether the hotspot can be quieted for the whole window.
+ROOT_TIMEOUT_S = 10.0
+
+
+async def root(address: str) -> str:
+    """Ask adbd to restart as root. Returns what it said, and never raises for a refusal.
+
+    A refusal is the *expected* answer on most units and is emphatically not an error:
+    ``adb root`` exits non-zero on a production build, and letting that surface as a
+    failed control call would turn "this unit does not allow it" -- the ordinary case --
+    into a failed transfer. Both streams are returned because the client writes the
+    interesting sentence to whichever it feels like depending on version.
+    """
+    result = await _adb("-s", address, "root", timeout=ROOT_TIMEOUT_S)
+    return f"{result.stdout} {result.stderr}".strip()
 
 
 async def state(address: str) -> UnitState:

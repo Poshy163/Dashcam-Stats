@@ -138,6 +138,19 @@ export default function Backup() {
         </div>
       )}
 
+      {data?.wifiBandHold && data.state !== 'disabled' && (
+        <div className="card mb-6 border-state-warn/40 px-5 py-4 text-sm">
+          <div className="font-medium text-state-warn">
+            Waiting for 5&nbsp;GHz WiFi
+            {data.wifiFrequencyMhz ? ` — the dashcam joined on ${data.wifiFrequencyMhz} MHz` : ''}
+          </div>
+          <div className="mt-1 text-content-muted">
+            {data.wifiBandHoldReason ??
+              '2.4 GHz moves about 5 MB/s against 32 on 5 GHz, so the transfer is held rather than spent on the slow band. It is re-checked every half minute while the car is here.'}
+          </div>
+        </div>
+      )}
+
       {data?.state === 'unauthorized' && (
         <div className="card mb-6 border-state-error/40 px-5 py-4 text-sm">
           <div className="font-medium text-state-error">The head unit has not authorised this app.</div>
@@ -209,7 +222,7 @@ export default function Backup() {
         </div>
       )}
 
-      {data?.lastError && !running && (
+      {data?.lastError && !running && !data.wifiBandHold && (
         <div className="card mb-6 px-5 py-4 text-sm">
           <div className="font-medium text-state-warn">Last attempt reported a problem</div>
           <div className="mt-1 break-words text-content-muted">{data.lastError}</div>

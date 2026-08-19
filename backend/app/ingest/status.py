@@ -56,6 +56,18 @@ class IngestStatus:
         self.backlog_files = 0
         self.backlog_bytes = 0
         self.active_skipped = 0
+        #: The unit's WiFi frequency in MHz as last read by the band gate, whether a
+        #: transfer is currently being held for it, and why. Cleared when the unit leaves:
+        #: the reading describes a link that no longer exists, and the next arrival may
+        #: well associate on the other band.
+        #:
+        #: The reason lives here rather than in ``last_error`` because a hold is not a
+        #: fault. Routed through the error field it would leave the Backup page saying
+        #: "last attempt reported a problem" from the moment the car left until the next
+        #: time somebody drives, about a transfer that was deliberately postponed.
+        self.wifi_frequency_mhz: int | None = None
+        self.wifi_band_hold: bool = False
+        self.wifi_band_hold_reason: str | None = None
         self.last_success: datetime | None = None
         self.last_error: str | None = None
         self._started_at: float | None = None
@@ -145,7 +157,16 @@ class IngestStatus:
                 self._online_since = time.monotonic()
             elif not online:
                 self._online_since = None
+                self.wifi_frequency_mhz = None
+                self.wifi_band_hold = False
+                self.wifi_band_hold_reason = None
             self.unit_online = online
+
+    def set_wifi(self, frequency_mhz: int | None, *, held: bool, reason: str | None) -> None:
+        with self._lock:
+            self.wifi_frequency_mhz = frequency_mhz
+            self.wifi_band_hold = held
+            self.wifi_band_hold_reason = reason if held else None
 
     def online_for(self) -> float:
         """Seconds the unit has been continuously on the network; 0.0 while it is not.
@@ -251,6 +272,9 @@ class IngestStatus:
                 "backlog_files": self.backlog_files,
                 "backlog_bytes": self.backlog_bytes,
                 "active_skipped": self.active_skipped,
+                "wifi_frequency_mhz": self.wifi_frequency_mhz,
+                "wifi_band_hold": self.wifi_band_hold,
+                "wifi_band_hold_reason": self.wifi_band_hold_reason,
                 "started_at": self._started_wall.isoformat() if self._started_wall else None,
                 "last_success_ts": self.last_success.isoformat() if self.last_success else None,
                 "last_error": self.last_error,

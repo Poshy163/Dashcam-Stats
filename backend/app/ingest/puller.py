@@ -17,7 +17,7 @@ from pathlib import Path
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
-from app.ingest import adb, origin, radios, transport
+from app.ingest import adb, band, elevate, origin, radios, transport
 from app.ingest.models import (
     DeltaPlan,
     Phase,
@@ -577,6 +577,41 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
                 )
 
         if not plan.files:
+            result = RunResult(state=RunState.IDLE)
+            return result
+
+        # The band gate sits here, after the plan proves there is footage waiting and
+        # before anything irreversible: no webhook has fired, no screen has been taken
+        # over, no radio touched. A hold comes back as IDLE on purpose — IDLE is the one
+        # state the poller re-asks every thirty seconds while the car is still on the
+        # driveway, it is not recorded as a failed run, and it does not page anybody.
+        # Deliberately with no `error`: a hold is a postponement, not a fault, and one
+        # routed through the error field would have the Backup page reporting a problem
+        # from the moment the car left until the next time somebody drives. The reason
+        # for the page to show lives in the status instead.
+        if not await band.gate(info.address):
+            result = RunResult(state=RunState.IDLE)
+            return result
+
+        # The one safe moment to restart the unit's ADB as root, if the operator asked
+        # for it and the unit allows it. `adb root` restarts adbd, and the listener that
+        # serves the bulk socket lives inside an adb session -- so this has to happen
+        # before any listener exists and can never move later. It is also why the
+        # presence poll must not do this: that reconnects every couple of seconds.
+        if not await elevate.ensure_root(info.address) and elevate.channel_lost():
+            # Refusing root is the ordinary case and costs nothing -- the run carries on
+            # and the hotspot stays up. Losing the *channel* is different: the daemon was
+            # restarted and has not come back, so every call after this would be issued at
+            # a unit that cannot hear it. Carrying on would fire a "transfer started"
+            # webhook for a transfer that can never move a byte, spend ten seconds inside
+            # a refused connect, and then blame the head unit for stopping first.
+            #
+            # IDLE, not ERROR, and the difference is the whole point: ERROR is terminal
+            # for the poller -- `_should_drain_again` refuses to re-run it -- so a daemon
+            # that comes back a second after the budget expired would still cost the
+            # entire window. IDLE is re-drained as soon as the unit answers, and the
+            # cooldown inside `elevate` stops that retry restarting the daemon again, so
+            # the second run simply transfers without root.
             result = RunResult(state=RunState.IDLE)
             return result
 
