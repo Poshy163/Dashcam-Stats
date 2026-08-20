@@ -104,10 +104,19 @@ class TestTheGate:
         """Everything the browser fetches before it can offer a password.
 
         If any of these were gated the app would answer 401 to a visitor who has no way to
-        stop being one, which is the failure mode this whole feature has to avoid.
+        stop being one, which is the failure mode this whole feature has to avoid. That the
+        gate lets them through is the invariant, and it is checked in every environment; the
+        SPA actually answering ``/login`` with the shell needs the frontend to be built,
+        which the backend CI job does not do, so that half is asserted only where it exists
+        — the same guard :mod:`tests.test_ingest_transport` uses for build-dependent tests.
         """
+        from app.main import FRONTEND_DIST
+
         assert (await secured.get("/")).status_code == 200
-        assert (await secured.get("/login")).status_code == 200
+        login = await secured.get("/login")
+        assert login.status_code != 401, "the login page must never be gated behind auth"
+        if FRONTEND_DIST.is_dir():
+            assert login.status_code == 200
         assert (await secured.get("/api/auth/state")).status_code == 200
 
     async def test_the_healthcheck_still_answers(self, secured):
