@@ -1,36 +1,36 @@
-"""Removing footage from drives where the car never moved.
+"""Removing clips that recorded nothing: the car never moved and nothing was seen.
 
-The "sitting on my desk" case: a session the camera recorded while stationary, with nothing
-in view — no ground covered, no vehicles or plates seen. It is pure noise in a library meant
-to be about journeys, so this finds it and, when deletion is permitted, removes it.
+The "sitting on my desk" footage, and its cousin the long idle park: a clip where, for its
+whole duration, the position did not change, the speed stayed at nothing, and neither the
+object detector nor the plate reader found a thing. It holds no information, so it goes.
 
-Speed is the signal, and it is read off the burned-in overlay rather than derived from GPS
-(:mod:`app.osd.parser` pulls the ``NN km/h`` field independently of position). That matters:
-a unit on a desk has no GPS fix, so anything GPS-derived is null there — but the overlay
-still says ``0 km/h``, so ``Recording.max_speed_kmh`` is ``0``, not unknown, and the footage
-is identifiable.
+Speed is read off the burned-in overlay, not derived from GPS (:mod:`app.osd.parser` pulls
+the ``NN km/h`` field independently of position), so a unit on a desk with no fix still
+reports ``0 km/h`` and the clip is identifiable. Confirmed on the live library: the desk
+clips read ``max_speed_kmh = 0``, ``distance_m = null`` (no GPS), ``vehicle_count = 0``,
+``plate_count = 0`` once analysed.
 
-Cautious by construction, four ways, because this deletes and deletion does not come back:
+**Per clip, not per drive.** An earlier version spared a whole journey if any one clip in
+it held a detection — which meant a two-hour desk session was kept in full because six
+frames tripped a false vehicle. Judging each clip on its own removes the ~139 empty ones
+and keeps only the handful that actually caught something. A red light inside a real drive
+is still safe: at a light there are almost always other cars in view (detected → kept), and
+a moving approach to it covers ground (``distance_m`` > 0 → kept).
 
-* **Whole idle drives only.** A recording is removed only when *every* live recording in the
-  journey it belongs to is idle — so a red light or a pause inside a real drive, whose
-  journey moved overall, is always kept. One segment that read a real speed spares the whole
-  journey, which also means a single OCR misread of ``0`` cannot cause a deletion. A
-  recording with no journey — what a desk session looks like, with no adjacency to group it —
-  is judged on its own.
-* **Never on absent evidence.** A recording whose telemetry has not been read, or that has no
-  speed at all, cannot be called stationary and is left alone. Silence is not a speed of zero.
-* **Never anything with something in it.** A detected vehicle or plate, or a protected/event
-  flag, keeps a recording however still the car was — parking-mode activity is exactly what
-  you would want to keep.
-* **Same safety as size-based retention.** The footage root must be genuinely writable, the
-  master "actually delete" switch on, and the single-run fraction cap honoured — all reused
-  from :mod:`app.retention.planner`, not reimplemented.
+**It deletes on its own, and that is deliberate.** Unlike the size-based cleanup this does
+not wait on the master "actually delete" switch: the operator asked for empty static footage
+to be removed without a per-run step, and the rule only ever touches a clip it has *proven*
+worthless — analysed, still, and empty. The load-bearing guards remain: the footage root
+must be genuinely writable (the guard against deleting into a share that failed to mount),
+the single-run fraction cap still applies (a telemetry regression that suddenly called half
+the library static blocks rather than deletes), and anything protected, flagged as an event,
+or not yet fully analysed is never eligible. ``storage.delete_idle`` turns the whole rule
+off for anyone who does not want it.
 """
 
 from __future__ import annotations
 
-from sqlalchemy import and_, case, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -41,22 +41,34 @@ from app.retention.safety import SafetyReport, evaluate_safety
 
 log = get_logger(__name__)
 
-#: Reason stamped on every idle candidate, shown in the retention report.
-IDLE_REASON = "stationary — the car never moved"
+#: Reason stamped on every candidate, shown in the retention report.
+IDLE_REASON = "static — the car never moved and nothing was seen"
+
+#: A clip that covered less than this went nowhere. Mostly redundant with the speed test
+#: (below ~3 km/h a clip cannot cover much in a minute), which is the point: it is the
+#: second, independent witness the operator asked for — "the GPS coordinates did not
+#: change" as well as "the speed did not change" — so a single misread does not delete a
+#: clip on its own. A clip with no GPS at all (``distance_m`` null) satisfies it by having
+#: no position to have changed.
+IDLE_DISTANCE_M = 50.0
 
 
-def _idle_condition(threshold_kmh: float):
-    """The per-recording test for 'the car was not moving and nothing was in view'.
+def _static_condition(threshold_kmh: float):
+    """The per-clip test: analysed, and proven to hold nothing.
 
-    A SQL expression rather than a Python predicate so it can serve double duty: as a
-    ``WHERE`` for the unassigned recordings and, wrapped in ``CASE``, as the count that
-    decides whether a whole journey is idle. ``file_missing``/``DELETED`` are left out here
-    because every caller already restricts to live rows.
+    A SQL expression so it can be a ``WHERE`` directly. ``file_missing``/``DELETED`` are
+    left out because callers restrict to live rows.
+
+    Both stages must be ``DONE`` — silence is not evidence. A clip whose telemetry has not
+    been read has an unknown speed, and one whose detection has not run has an unknown
+    object count; either way it cannot be called empty, so it is left alone.
     """
     return and_(
         Recording.telemetry_state == StageState.DONE,
+        Recording.detection_state == StageState.DONE,
         Recording.max_speed_kmh.isnot(None),
         Recording.max_speed_kmh < threshold_kmh,
+        or_(Recording.distance_m.is_(None), Recording.distance_m < IDLE_DISTANCE_M),
         Recording.vehicle_count == 0,
         Recording.plate_count == 0,
         Recording.protected.is_(False),
@@ -71,65 +83,28 @@ def _live():
     )
 
 
-async def _candidates(session: AsyncSession, threshold_kmh: float) -> list[Recording]:
-    idle = _idle_condition(threshold_kmh)
-
-    # Journeys where every live recording is idle. Counting idle vs total in one grouped
-    # pass is what enforces "whole drive only" without loading the library into memory.
-    grouped = await session.execute(
-        select(
-            Recording.journey_id,
-            func.count().label("live"),
-            func.sum(case((idle, 1), else_=0)).label("idle"),
-        )
-        .where(_live(), Recording.journey_id.isnot(None))
-        .group_by(Recording.journey_id)
-    )
-    fully_idle = [row.journey_id for row in grouped if row.live > 0 and row.live == row.idle]
-
-    recordings: list[Recording] = []
-    if fully_idle:
-        recordings.extend(
-            (
-                await session.execute(
-                    select(Recording).where(_live(), Recording.journey_id.in_(fully_idle))
-                )
-            )
-            .scalars()
-            .all()
-        )
-    # Recordings with no journey are judged individually — a desk session has no drive to
-    # belong to, so "the whole drive is idle" collapses to "this recording is idle".
-    recordings.extend(
-        (
-            await session.execute(
-                select(Recording).where(_live(), Recording.journey_id.is_(None), idle)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return recordings
-
-
 async def plan_idle(session: AsyncSession, safety: SafetyReport | None = None) -> RetentionPlan:
-    """Which recordings would be removed for being stationary footage.
+    """Which clips would be removed for being static and empty.
 
-    Returns a :class:`RetentionPlan` so it can be handed straight to
-    :func:`app.retention.planner.execute`, which carries the real deletion safety. Empty
-    (and harmless) when the rule is switched off or the mount is not safe to write.
-
-    ``safety`` may be passed in when the caller has already evaluated it — the scheduler
-    runs the size-based plan first and hands its result straight here, so the footage tree
-    is walked once a cycle rather than twice.
+    Returns a :class:`RetentionPlan` handed straight to :func:`app.retention.planner.execute`.
+    ``deletion_enabled`` is set true by the rule itself — it authorises its own removals (see
+    the module docstring) — so the scheduler runs it with ``dry_run=False`` and it acts
+    without the master switch. ``safety`` may be passed in when the caller already evaluated
+    it, so the footage tree is walked once a cycle.
     """
     settings = get_settings_service()
     result = RetentionPlan()
     result.safety = safety if safety is not None else await evaluate_safety(session)
-    result.deletion_enabled = bool(settings.get_nowait("storage.enable_deletion"))
 
     if not bool(settings.get_nowait("storage.delete_idle")):
+        # Rule off: nothing planned, and nothing authorised.
+        result.deletion_enabled = False
         return result
+
+    # The rule authorises its own deletion. The mount-writable guard and the fraction cap
+    # below are what keep that safe; the master 'actually delete' switch is not consulted.
+    result.deletion_enabled = True
+
     if not result.safety.ok:
         result.blocked = True
         result.blocked_reason = result.safety.blocked_reason
@@ -137,7 +112,12 @@ async def plan_idle(session: AsyncSession, safety: SafetyReport | None = None) -
         return result
 
     threshold = float(settings.get_nowait("storage.idle_speed_kmh"))
-    for recording in await _candidates(session, threshold):
+    recordings = (
+        (await session.execute(select(Recording).where(_live(), _static_condition(threshold))))
+        .scalars()
+        .all()
+    )
+    for recording in recordings:
         result.candidates.append(
             RetentionCandidate(
                 recording_id=recording.id,
@@ -149,9 +129,9 @@ async def plan_idle(session: AsyncSession, safety: SafetyReport | None = None) -
             )
         )
 
-    # The same runaway guard the size-based plan has: a rule that suddenly wants to remove a
-    # large fraction of the library is far likelier to be a telemetry regression than a real
-    # intent, so it blocks rather than deletes.
+    # The runaway guard, kept even though this deletes automatically: a rule that suddenly
+    # wants to remove a large fraction of the library is far likelier to be a telemetry or
+    # detection regression that called everything empty than a real intent, so it blocks.
     max_fraction = float(settings.get_nowait("storage.max_delete_fraction"))
     indexed = int(
         (
@@ -167,7 +147,8 @@ async def plan_idle(session: AsyncSession, safety: SafetyReport | None = None) -
     if indexed and result.would_free_bytes > indexed * max_fraction:
         result.blocked = True
         result.blocked_reason = (
-            f"idle cleanup would remove {result.would_free_bytes / _GB:.1f} GB, more than "
-            f"the {max_fraction:.0%} single-run limit — check the telemetry before enabling"
+            f"static cleanup would remove {result.would_free_bytes / _GB:.1f} GB, more than "
+            f"the {max_fraction:.0%} single-run limit — check the telemetry and detection "
+            f"stages before letting it run"
         )
     return result

@@ -166,6 +166,7 @@ class TestWriteEndpoints:
                     started_at=datetime.now(UTC) - timedelta(days=3),
                     state=RecordingState.COMPLETED,
                     telemetry_state=StageState.DONE,
+                    detection_state=StageState.DONE,
                     telemetry_point_count=60,
                     max_speed_kmh=0.0,
                 )
@@ -180,13 +181,15 @@ class TestWriteEndpoints:
                     started_at=datetime.now(UTC) - timedelta(days=3),
                     state=RecordingState.COMPLETED,
                     telemetry_state=StageState.DONE,
+                    detection_state=StageState.DONE,
                     telemetry_point_count=60,
                     max_speed_kmh=55.0,
+                    distance_m=900.0,
                 )
             )
 
         plan = (await client.post("/api/retention/plan")).json()
-        idle = [c for c in plan["candidates"] if "stationary" in c["reason"]]
+        idle = [c for c in plan["candidates"] if "static" in c["reason"]]
         assert [c["filename"] for c in idle] == ["desk.ts"], plan["candidates"]
 
 

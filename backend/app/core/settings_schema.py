@@ -693,29 +693,32 @@ SETTINGS: tuple[SettingDef, ...] = (
     ),
     SettingDef(
         "storage.delete_idle",
-        "Remove footage from drives where the car never moved",
+        "Automatically delete static, empty clips",
         "bool",
         True,
         "storage",
-        "The 'sitting on the desk' footage: a whole recorded session where the car never "
-        "moved and nothing was seen. Judged from the speed read off the overlay, so it "
-        "works even with no GPS fix. Deliberately cautious — it removes a recording only "
-        "when the entire drive it belongs to stayed still (so a red light inside a real "
-        "journey is always kept), never when the telemetry has not been read, and never "
-        "when a vehicle or plate was detected or the clip is protected. Like all cleanup "
-        "here it only reports until 'Actually delete files' is on; then it removes idle "
-        "drives on each cleanup pass.",
+        "The 'sitting on the desk' footage: a clip where, the whole way through, the car "
+        "did not move, went nowhere, and nothing was detected. It holds no information, so "
+        "it is removed. Speed is read off the overlay, so this works even with no GPS. "
+        "Unlike the size-based cleanup this does not wait on 'Actually delete files' — it "
+        "acts on its own, because it only ever touches a clip it has proven worthless: "
+        "analysed (both telemetry and detection done), top speed below the threshold below, "
+        "no distance covered, no vehicle or plate seen, and not protected or an event. The "
+        "footage folder must still be writable, and a run that would suddenly remove more "
+        "than the single-run safety fraction blocks instead. Turn this off to keep every "
+        "clip regardless.",
         requires="storage.cleanup_enabled",
+        dangerous=True,
     ),
     SettingDef(
         "storage.idle_speed_kmh",
-        "Speed below which a drive counts as not moving",
+        "Speed below which a clip counts as not moving",
         "float",
         3.0,
         "storage",
-        "A drive is treated as stationary only if its top speed, read from the overlay, "
-        "never reached this. A few km/h of slack absorbs the odd misread digit and GPS "
-        "creep, so only genuinely-still footage qualifies.",
+        "A clip counts as static only if its top speed, read from the overlay, never "
+        "reached this. A few km/h of slack absorbs the odd misread digit and GPS creep, so "
+        "only genuinely-still footage qualifies.",
         minimum=0.0,
         maximum=30.0,
         unit="km/h",

@@ -503,10 +503,11 @@ async def retention_run(session: SessionDep):
     plan = await plan_retention(session)
     enabled = await get_settings_service().deletion_enabled()
     await run_retention(session, plan, dry_run=not enabled, trigger="manual")
-    # Same idle-drive cleanup the scheduler runs, so "run now" behaves like the scheduled
-    # pass rather than quietly skipping it. Reuses the safety just evaluated.
+    # Same static-clip cleanup the scheduler runs, so "run now" behaves like the scheduled
+    # pass. It authorises its own deletion, so it runs for real regardless of the master
+    # switch; reuses the safety just evaluated.
     idle = await plan_idle(session, plan.safety)
-    await run_retention(session, idle, dry_run=not enabled, trigger="idle-cleanup")
+    await run_retention(session, idle, dry_run=False, trigger="idle-cleanup")
     return _plan_out(plan)
 
 
