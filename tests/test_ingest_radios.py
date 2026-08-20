@@ -89,6 +89,11 @@ def unit_shell(monkeypatch):
         return None
 
     monkeypatch.setattr(radios, "_arm_watchdog", no_watchdog)
+    # The stop's settle budget is a real few seconds against a car; here it only needs to
+    # be long enough to poll the fake `ip` output a couple of times, so it is squeezed to
+    # keep the "the stop never took" tests off the wall clock.
+    monkeypatch.setattr(radios, "STOP_SETTLE_BUDGET_S", 0.05)
+    monkeypatch.setattr(radios, "STOP_SETTLE_POLL_S", 0.01)
     stub = StubSettings()
     monkeypatch.setattr(radios, "get_settings_service", lambda: stub)
 
@@ -130,11 +135,13 @@ _IP_NO_AP = (
     "23: wlan0    inet 192.168.1.122/24 brd 192.168.1.255 scope global wlan0\n"
 )
 
-#: What an unrooted unit actually answers. AOSP's WifiShellCommand gates every verb
-#: outside its NON_PRIVILEGED_COMMANDS allowlist on uid 0, and stop-softap is not on it.
+#: What an unrooted unit actually answers to `cmd wifi stop-softap`. WifiManager.stopSoftAp
+#: gates on NETWORK_STACK/MAINLINE_NETWORK_STACK, which the shell (uid 2000) does not hold,
+#: so the wifi command throws — which is why the real stop rides the tethering binder, and
+#: this command is only the fallback for a rooted/debuggable unit.
 _SECURITY_EXCEPTION = (
-    "java.lang.SecurityException: Uid 2000 does not have access to stop-softap wifi "
-    "command (or such command doesn't exist)"
+    "java.lang.SecurityException: Neither user 2000 nor current process has "
+    "android.permission.MAINLINE_NETWORK_STACK."
 )
 
 #: The tests that care about the hotspot must use an address the fake `ip` output agrees
@@ -285,7 +292,9 @@ class TestTheWatchdog:
 
 
 class TestTheHotspot:
-    """Stopping a soft AP is root-gated on Android, which is the whole story here."""
+    """Stopping a soft AP from an unrooted shell rides the tethering binder, not the wifi
+    service -- ``stopTethering`` gates on TETHER_PRIVILEGED, which the shell holds, while
+    ``stopSoftAp`` gates on a network-stack permission it does not."""
 
     async def test_a_serving_hotspot_is_stopped_and_started_again(self, unit_shell):
         unit_shell.replies["bluetooth_on"] = "0"
@@ -296,8 +305,11 @@ class TestTheHotspot:
         quiet = radios.begin_quiet(UNIT, online_for=60.0, watchdog_deadline_s=300)
         await quiet._task
 
-        stops = _issued(unit_shell.commands, "cmd wifi stop-softap")
-        assert stops
+        stops = _issued(unit_shell.commands, "service call tethering")
+        assert stops, "the hotspot stop must go through the tethering binder"
+        assert not _issued(unit_shell.commands, "cmd wifi stop-softap"), (
+            "the wifi fallback must not be reached once the binder has taken the AP down"
+        )
         assert quiet.hotspot_restore == ("CarSpot", "roadtrip99")
         assert unit_shell.settings.values[radios.REFUSAL_KEY] == "", (
             "a stop that worked must clear any standing refusal"
@@ -307,10 +319,28 @@ class TestTheHotspot:
         starts = _issued(unit_shell.commands, "cmd wifi start-softap 'CarSpot' wpa2 'roadtrip99'")
         assert starts and stops[0] < starts[0]
 
+    async def test_bluetooth_is_taken_down_before_the_hotspot_is_stopped(self, unit_shell):
+        """Load-bearing order: while Bluetooth is on, this unit re-arms the soft AP within
+        seconds of any stop, so the AP must not be stopped until Bluetooth is already down.
+        Getting this backwards is a stop that never sticks."""
+        unit_shell.replies["bluetooth_on"] = "1"
+        unit_shell.replies["ip -o addr"] = [_IP_WITH_AP, _IP_NO_AP]
+        unit_shell.replies["dumpsys wifi"] = _DUMP_MODERN
+
+        quiet = radios.begin_quiet(UNIT, online_for=60.0, watchdog_deadline_s=300)
+        await quiet._task
+
+        disables = _issued(unit_shell.commands, "cmd bluetooth_manager disable")
+        stops = _issued(unit_shell.commands, "service call tethering")
+        assert disables and stops
+        assert disables[0] < stops[0], "the hotspot was stopped before Bluetooth came down"
+
     async def test_a_unit_that_refuses_the_stop_is_reported_rather_than_believed(self, unit_shell):
-        """The field bug. Android only lets uid 0 stop a soft AP, and this unit's ADB is
-        not root -- so the command throws, the hotspot keeps beaconing through every
-        transfer, and the first version of this said nothing at all about it."""
+        """A unit where neither lever takes the AP down -- the binder does nothing (no
+        TETHER_PRIVILEGED, or a code the vendor moved) and the wifi fallback throws. The
+        AP keeps beaconing through every transfer, and the first version of this said
+        nothing at all about it; now the unit's own words are carried to the Settings
+        page."""
         unit_shell.replies["bluetooth_on"] = "0"
         unit_shell.replies["ip -o addr"] = _IP_WITH_AP  # it never goes away
         unit_shell.replies["dumpsys wifi"] = _DUMP_MODERN
@@ -322,7 +352,7 @@ class TestTheHotspot:
 
         assert quiet.hotspot_restore is None, "a hotspot that never stopped was restarted"
         assert not _issued(unit_shell.commands, "start-softap")
-        assert "does not have access" in unit_shell.settings.values[radios.REFUSAL_KEY], (
+        assert "MAINLINE_NETWORK_STACK" in unit_shell.settings.values[radios.REFUSAL_KEY], (
             "the unit's own words must outlive the log line, on the Settings page"
         )
 
@@ -377,7 +407,7 @@ class TestTheHotspot:
         await quiet._task
         await quiet.finish()
 
-        assert _issued(unit_shell.commands, "cmd wifi stop-softap")
+        assert _issued(unit_shell.commands, "service call tethering")
         assert not _issued(unit_shell.commands, "start-softap")
 
 

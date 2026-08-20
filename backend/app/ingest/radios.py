@@ -29,15 +29,25 @@ leaving it for the next engine start to re-arm.
 
 **Believe the effect, never the exit status.** This is the rule the first version of this
 module did not have, and the field found it inside a day: Bluetooth went off and the
-hotspot did not. AOSP's ``WifiShellCommand`` gates every verb outside its
-``NON_PRIVILEGED_COMMANDS`` allowlist on ``uid != Process.ROOT_UID``, and neither
-``stop-softap`` nor ``start-softap`` is on that list — so on an unrooted unit the command
-throws ``SecurityException: Uid 2000 does not have access to stop-softap`` and the
-hotspot carries on beaconing through every transfer. ``svc bluetooth`` has no equivalent
-gate, which is why exactly half the feature appeared to work. So a stop is believed only
-when :func:`_serving_ap` can no longer find the AP — and when it cannot be done, that is
-a warning naming the unit's own words, not silence. There is no unrooted way round it;
-the honest outcome is to say so and leave the hotspot alone.
+hotspot did not. ``WifiManager.stopSoftAp`` — what ``cmd wifi stop-softap`` calls — gates
+on ``NETWORK_STACK``/``MAINLINE_NETWORK_STACK``, which an unrooted shell does not hold, so
+the command throws and the hotspot carries on beaconing through every transfer; ``svc
+bluetooth`` has no equivalent gate, which is why exactly half the feature appeared to
+work. The unrooted way round it is not the WiFi service at all but the tethering binder:
+``stopTethering(TETHERING_WIFI)`` gates on ``TETHER_PRIVILEGED``, which ``com.android
+.shell`` *does* hold (see :data:`_STOP_VIA_TETHERING`). It works — but its reply is a red
+herring, because passed a null result listener it answers with a ``NullPointerException``
+raised *after* the teardown has already happened. So a stop is believed only when
+:func:`_serving_ap` can no longer find the AP, never because a command returned — and when
+it genuinely cannot be done, that is a warning naming the unit's own words, not silence.
+
+**Bluetooth comes down before the hotspot, and the order is load-bearing.** This unit
+couples the two: while its Bluetooth is on, it re-arms the soft AP within seconds of any
+stop (``cmd bluetooth_manager enable`` is observed to drive the hotspot back up — a vendor
+car-kit behaviour). A hotspot stopped while Bluetooth is still on therefore never sticks;
+taking Bluetooth down first removes the thing that turns it back on, which is why
+:func:`_quiet` disables Bluetooth and only then stops the AP. It also means the restore is
+half-automatic: re-enabling Bluetooth brings the operator's hotspot back on its own.
 
 **Never delay the transfer.** Every call here rides the control channel, which is idle
 while the bulk socket moves bytes. The quieting itself waits until the unit has been on
@@ -258,31 +268,40 @@ async def _serving_ap(address: str) -> str:
     return ""
 
 
-#: How a soft AP is asked to stop.
+#: How a soft AP is asked to stop from an unrooted shell — the lever that actually works.
 #:
-#: One command, because the AOSP source (checked against ``android15-release``) says there
-#: is exactly one worth issuing. ``WifiShellCommand`` gates everything outside its
-#: ``NON_PRIVILEGED_COMMANDS`` allowlist on ``uid != Process.ROOT_UID``, and neither
-#: ``stop-softap`` nor ``start-softap`` is on that list — so a shell caller gets
-#: ``SecurityException: Uid 2000 does not have access to stop-softap wifi command``. That
-#: is exactly what this head unit returns, and it is why the hotspot half of this feature
-#: did nothing on the first attempt while the Bluetooth half worked: ``svc bluetooth`` has
-#: no equivalent gate. On a unit whose adbd *does* run as root (a debuggable build) this
-#: same command simply succeeds.
+#: ``stopTethering(TETHERING_WIFI)`` on the tethering binder. ``WifiManager.stopSoftAp`` —
+#: what ``cmd wifi stop-softap`` calls — gates on ``NETWORK_STACK``/``MAINLINE_NETWORK_STACK``,
+#: which the shell does not hold, so on this unit it throws ``SecurityException: Neither
+#: user 2000 nor current process has android.permission.MAINLINE_NETWORK_STACK`` and does
+#: nothing. The tethering path gates on ``TETHER_PRIVILEGED`` instead, and ``com.android
+#: .shell`` (uid 2000) *does* hold it — ``granted=true`` in ``dumpsys package
+#: com.android.shell`` on the live unit. There is no ``cmd tethering`` verb
+#: (``TetheringService`` overrides only ``dump()``, so ``cmd tethering <anything>`` answers
+#: Binder's ``No shell command implementation.``), so the call rides a raw ``service
+#: call``: transaction **5** is ``stopTethering(int type, String pkg, String tag,
+#: IIntResultListener receiver)`` in the ``android.net.ITetheringConnector`` AIDL, and
+#: ``i32 0`` is ``TETHERING_WIFI``. The result listener is passed ``null``, so the
+#: *callback* raises ``NullPointerException`` — but only after the teardown has run, which
+#: is why success is judged solely by :func:`_stop_took_effect` and ``; exit 0`` keeps that
+#: captured exception from surfacing as a failed control call. Verified against the live
+#: unit (Unisoc UIS7861, Android 15, uid 2000): with Bluetooth already down, the AP
+#: interface dropped inside the settle budget and stayed down.
 #:
-#: There is deliberately no ``cmd tethering`` fallback. It was tried once on the theory
-#: that the Tethering module exposed its own shell command with a softer permission model;
-#: it does not. ``TetheringService`` overrides only ``dump()``, so ``cmd tethering
-#: <anything>`` falls through to Binder's default handler and answers ``No shell command
-#: implementation.`` — a round trip that can never stop anything. The stop lives only
-#: behind the ``ITetheringConnector`` binder (``stopAllTethering``), reachable from shell
-#: in principle because ``com.android.shell`` holds ``TETHER_PRIVILEGED``, but only via a
-#: raw ``service call`` with a transaction code that is not stable API — and the code for
-#: *start* sits directly beside the code for *stop*, so an off-by-one against a vendor-
-#: forked module would switch the hotspot **on**. That is not a thing to fire blind at
-#: somebody's car; it needs the transaction code verified against this exact unit first.
-#: Until then the honest outcome for an unrooted unit is the one this already reports:
-#: say the unit refused, in its own words, and leave the hotspot alone.
+#: The old warning here feared that a wrong ``service call`` code, with *start* sitting
+#: beside *stop*, could switch the hotspot **on**. Two guards make that impossible now.
+#: This is reached only when :func:`_serving_ap` has already found an AP *serving*, so any
+#: "start" a mis-numbered code triggered would be a no-op on an AP that is already up; and
+#: the effect is verified afterwards regardless of what any code did. The hazard was firing
+#: at an AP that was *off* — a path that does not exist here, because nothing calls this
+#: unless an AP is already serving.
+_STOP_VIA_TETHERING = (
+    "service call tethering 5 i32 0 s16 com.android.shell s16 com.android.shell null; exit 0"
+)
+
+#: The fallback, for a unit whose adbd runs as root (a debuggable build) where
+#: ``WifiManager.stopSoftAp`` is reachable directly. Never reached on an unrooted unit: the
+#: binder above has by then taken the AP down and :func:`_stop_hotspot` has returned.
 _STOP_COMMANDS = ("cmd wifi stop-softap",)
 
 
@@ -320,6 +339,17 @@ async def _stop_hotspot(address: str) -> tuple[bool, str]:
     project has already made once.
     """
     replies: list[str] = []
+
+    # The tethering binder first: the one lever an unrooted shell has. Fired for effect,
+    # never for its reply — the null result listener makes the callback NPE after the
+    # teardown, so only _stop_took_effect can tell whether it actually worked.
+    with contextlib.suppress(adb.AdbError):
+        await adb.shell(address, _STOP_VIA_TETHERING, timeout=RADIO_TIMEOUT_S)
+    if await _stop_took_effect(address):
+        return True, ""
+    replies.append("stopTethering: accepted, but the hotspot is still up")
+
+    # Then the wifi command, for a rooted/debuggable unit where stopSoftAp is reachable.
     for command in _STOP_COMMANDS:
         try:
             reply = await adb.shell(address, command, timeout=RADIO_TIMEOUT_S)
@@ -442,6 +472,11 @@ class RadioQuiet:
             log.warning("could not quiet the unit's radios", error=str(exc))
 
     async def _quiet(self) -> None:
+        # Bluetooth first, and not for tidiness: while this unit's Bluetooth is on it
+        # re-arms the soft AP within seconds of any stop (a vendor car-kit coupling —
+        # `cmd bluetooth_manager enable` is observed to drive the hotspot up). Stopping
+        # the AP while Bluetooth is still on therefore never sticks; taking Bluetooth down
+        # first removes the thing that turns it back on. Confirmed on the live unit.
         await self._quiet_bluetooth()
         await self._quiet_hotspot()
 
