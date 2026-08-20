@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.retention.idle import plan_idle
 from app.retention.planner import (
     RetentionCandidate,
     RetentionPlan,
@@ -21,4 +22,5 @@ __all__ = [
     "evaluate_safety",
     "execute",
     "plan",
+    "plan_idle",
 ]

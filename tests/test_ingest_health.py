@@ -82,7 +82,9 @@ class TestTheStallRule:
         rows = _trip(1_755_640_000, 10)
         # The recorder stops: age climbs past the threshold and keeps climbing.
         last = rows[-1][0]
-        rows += [(last + TICK * (i + 1), "rw", 200 + TICK * i, 20_000_000, 500_000) for i in range(9)]
+        rows += [
+            (last + TICK * (i + 1), "rw", 200 + TICK * i, 20_000_000, 500_000) for i in range(9)
+        ]
         report = health.analyze(health.parse(_log(rows)))
         assert len(report.incidents) == 1
         assert "STOPPED WRITING" in report.incidents[0]
@@ -256,9 +258,7 @@ class TestArming:
             health, "get_settings_service", lambda: StubSettings({health.ENABLED_KEY: False})
         )
         started: list = []
-        monkeypatch.setattr(
-            health, "_collect_then_arm", lambda *a: started.append(a)
-        )
+        monkeypatch.setattr(health, "_collect_then_arm", lambda *a: started.append(a))
         health.on_unit_seen("u:5555", "/storage/Tfcard/DCIM/Video")
         assert not started
 

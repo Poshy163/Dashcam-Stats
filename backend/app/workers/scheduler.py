@@ -22,6 +22,7 @@ from app.journeys.builder import JourneyBuilder
 from app.pipeline.repair import repair_durations
 from app.retention import execute as run_retention
 from app.retention import plan as plan_retention
+from app.retention import plan_idle
 from app.scanner.discovery import Scanner, queue_unprocessed
 from app.workers import queue
 
@@ -201,11 +202,17 @@ class Scheduler:
 
     async def _run_retention(self) -> None:
         async with session_scope() as session:
-            plan = await plan_retention(session)
             # dry_run mirrors the user's own setting: with deletion disabled (the default,
-            # and the only option on a read-only mount) this just refreshes the report.
+            # and the only option on a read-only mount) both passes just refresh the report.
             enabled = await get_settings_service().deletion_enabled()
+            plan = await plan_retention(session)
             await run_retention(session, plan, dry_run=not enabled, trigger="scheduled")
+            # Stationary "desk" footage is removed independently of the size limit — it is
+            # junk whether or not the disk is full. Same executor, so the same safety gates
+            # apply; a separate run so its report reads on its own terms. The size-based plan
+            # has just evaluated safety, so hand it over rather than walk the tree again.
+            idle = await plan_idle(session, plan.safety)
+            await run_retention(session, idle, dry_run=not enabled, trigger="idle-cleanup")
 
     async def _run_reclaim(self) -> None:
         async with session_scope() as session:

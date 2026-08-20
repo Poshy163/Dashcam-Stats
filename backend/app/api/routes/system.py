@@ -55,7 +55,7 @@ from app.db.session import current_revision
 from app.hardware.detect import detect_hardware_async
 from app.pipeline.orchestrator import expand_stages, invalidate_recordings
 from app.pipeline.revisions import outdated_stages
-from app.retention import current_usage, evaluate_safety
+from app.retention import current_usage, evaluate_safety, plan_idle
 from app.retention import execute as run_retention
 from app.retention import plan as plan_retention
 from app.workers import queue
@@ -486,6 +486,10 @@ async def retention_run(session: SessionDep):
     plan = await plan_retention(session)
     enabled = await get_settings_service().deletion_enabled()
     await run_retention(session, plan, dry_run=not enabled, trigger="manual")
+    # Same idle-drive cleanup the scheduler runs, so "run now" behaves like the scheduled
+    # pass rather than quietly skipping it. Reuses the safety just evaluated.
+    idle = await plan_idle(session, plan.safety)
+    await run_retention(session, idle, dry_run=not enabled, trigger="idle-cleanup")
     return _plan_out(plan)
 
 

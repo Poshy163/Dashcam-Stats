@@ -692,6 +692,36 @@ SETTINGS: tuple[SettingDef, ...] = (
         "this applies only to recordings flagged by the harsh-braking heuristic or by hand.",
     ),
     SettingDef(
+        "storage.delete_idle",
+        "Remove footage from drives where the car never moved",
+        "bool",
+        True,
+        "storage",
+        "The 'sitting on the desk' footage: a whole recorded session where the car never "
+        "moved and nothing was seen. Judged from the speed read off the overlay, so it "
+        "works even with no GPS fix. Deliberately cautious — it removes a recording only "
+        "when the entire drive it belongs to stayed still (so a red light inside a real "
+        "journey is always kept), never when the telemetry has not been read, and never "
+        "when a vehicle or plate was detected or the clip is protected. Like all cleanup "
+        "here it only reports until 'Actually delete files' is on; then it removes idle "
+        "drives on each cleanup pass.",
+        requires="storage.cleanup_enabled",
+    ),
+    SettingDef(
+        "storage.idle_speed_kmh",
+        "Speed below which a drive counts as not moving",
+        "float",
+        3.0,
+        "storage",
+        "A drive is treated as stationary only if its top speed, read from the overlay, "
+        "never reached this. A few km/h of slack absorbs the odd misread digit and GPS "
+        "creep, so only genuinely-still footage qualifies.",
+        minimum=0.0,
+        maximum=30.0,
+        unit="km/h",
+        requires="storage.delete_idle",
+    ),
+    SettingDef(
         "storage.cleanup_enabled",
         "Run cleanup automatically",
         "bool",
