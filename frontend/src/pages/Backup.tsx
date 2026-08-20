@@ -151,6 +151,38 @@ export default function Backup() {
         </div>
       )}
 
+      {data?.arrivalHold && data.state !== 'disabled' && (
+        <div className="card mb-6 border-state-warn/40 px-5 py-4 text-sm">
+          <div className="font-medium text-state-warn">Waiting until you&rsquo;re home</div>
+          <div className="mt-1 text-content-muted">
+            {data.arrivalHoldReason ??
+              'The dashcam has only just powered on, which usually means the car is setting off. The backup waits until it has been running a while — so footage is pulled when you arrive rather than as you leave — and re-checks every few seconds while the car is here.'}
+          </div>
+        </div>
+      )}
+
+      {data?.recorderHealth && data.state !== 'disabled' && (
+        <div
+          className={`card mb-6 px-5 py-4 text-sm ${
+            data.recorderHealthOk ? 'border-state-ok/40' : 'border-state-error/50'
+          }`}
+        >
+          <div
+            className={`font-medium ${
+              data.recorderHealthOk ? 'text-state-ok' : 'text-state-error'
+            }`}
+          >
+            {data.recorderHealthOk ? 'Recorder healthy' : 'Recording problem detected'}
+          </div>
+          <div className="mt-1 break-words text-content-muted">{data.recorderHealth}</div>
+          {data.recorderHealthAt && (
+            <div className="mt-1 text-xs text-content-muted">
+              Checked {formatRelative(data.recorderHealthAt)}
+            </div>
+          )}
+        </div>
+      )}
+
       {data?.state === 'unauthorized' && (
         <div className="card mb-6 border-state-error/40 px-5 py-4 text-sm">
           <div className="font-medium text-state-error">The head unit has not authorised this app.</div>

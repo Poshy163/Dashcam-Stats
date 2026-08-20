@@ -333,6 +333,11 @@ async def collect(address: str) -> Report | None:
     report = analyze(parse(raw))
     if not report.samples:
         return report
+    # Onto the live status first, so the Backup page shows the last drive's verdict whether
+    # or not the webhook and the setting write below succeed. Import-local to avoid a cycle.
+    from app.ingest.status import get_status
+
+    get_status().set_recorder_health(report.summary(), ok=report.healthy)
     if report.healthy:
         log.info("the recording watcher saw no problems", **_fields(report))
     else:

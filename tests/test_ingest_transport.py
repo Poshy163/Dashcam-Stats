@@ -375,6 +375,8 @@ class TestTheStatusSnapshot:
             "current_file",
             "backlog_files",
             "backlog_bytes",
+            "recorder_health",
+            "recorder_health_ok",
             "last_success_ts",
             "last_error",
         ):

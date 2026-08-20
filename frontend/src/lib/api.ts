@@ -196,6 +196,18 @@ export interface IngestStatus {
   wifiBandHold: boolean
   /** Why it is being held, including whether 5 GHz is in range. Null unless held. */
   wifiBandHoldReason: string | null
+  /** The unit's running time in seconds as last read by the arrival gate; null if unknown. */
+  unitUptimeS: number | null
+  /** True while the first pull is being held until the unit has been running long enough. */
+  arrivalHold: boolean
+  /** Why the pull is being held for arrival. Null unless held. */
+  arrivalHoldReason: string | null
+  /** The recording watcher's last verdict in one line; null until it has collected once. */
+  recorderHealth: string | null
+  /** Whether that verdict was clean. Null when no verdict yet. */
+  recorderHealthOk: boolean | null
+  /** When the verdict was collected. Null when no verdict yet. */
+  recorderHealthAt: string | null
   startedAt: string | null
   lastSuccessTs: string | null
   lastError: string | null

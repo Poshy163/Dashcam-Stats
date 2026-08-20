@@ -236,3 +236,26 @@ class TestCollection:
         assert "READ-ONLY" in str(settings.values.get(health.REPORT_KEY))
         assert published.get("event") == "health"
         assert published["extra"]["health_incidents"] == report.incidents
+
+    async def test_the_verdict_reaches_the_live_status_for_the_backup_page(self, monkeypatch):
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        settings = StubSettings({health.ENABLED_KEY: True})
+        monkeypatch.setattr(health, "get_settings_service", lambda: settings)
+
+        async def fake_shell(address, command, **kwargs):
+            return _log(_trip(1_755_640_000, 5))
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+
+        await health.collect("u:5555")
+        status = get_status()
+        assert status.recorder_health_ok is True
+        assert "healthy" in (status.recorder_health or "")
+        assert status.recorder_health_at is not None
+        # And it survives the unit leaving -- the last drive's story is what you look at
+        # while the car is away.
+        status.set_unit_online(False)
+        assert status.snapshot()["recorder_health_ok"] is True
+        reset_status_for_tests()

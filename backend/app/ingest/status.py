@@ -77,6 +77,13 @@ class IngestStatus:
         self.unit_uptime_s: float | None = None
         self.arrival_hold: bool = False
         self.arrival_hold_reason: str | None = None
+        #: The recording watcher's most recent verdict — a human summary, whether it was
+        #: clean, and when it was collected. Unlike the holds above this is NOT cleared when
+        #: the unit leaves: the last drive's story is exactly what someone wants to see while
+        #: the car is away, and it stands until the next collection replaces it.
+        self.recorder_health: str | None = None
+        self.recorder_health_ok: bool | None = None
+        self.recorder_health_at: datetime | None = None
         self.last_success: datetime | None = None
         self.last_error: str | None = None
         self._started_at: float | None = None
@@ -185,6 +192,12 @@ class IngestStatus:
             self.unit_uptime_s = uptime_s
             self.arrival_hold = held
             self.arrival_hold_reason = reason if held else None
+
+    def set_recorder_health(self, summary: str, *, ok: bool) -> None:
+        with self._lock:
+            self.recorder_health = summary
+            self.recorder_health_ok = ok
+            self.recorder_health_at = datetime.now(UTC)
 
     def online_for(self) -> float:
         """Seconds the unit has been continuously on the network; 0.0 while it is not.
@@ -296,6 +309,11 @@ class IngestStatus:
                 "unit_uptime_s": self.unit_uptime_s,
                 "arrival_hold": self.arrival_hold,
                 "arrival_hold_reason": self.arrival_hold_reason,
+                "recorder_health": self.recorder_health,
+                "recorder_health_ok": self.recorder_health_ok,
+                "recorder_health_at": (
+                    self.recorder_health_at.isoformat() if self.recorder_health_at else None
+                ),
                 "started_at": self._started_wall.isoformat() if self._started_wall else None,
                 "last_success_ts": self.last_success.isoformat() if self.last_success else None,
                 "last_error": self.last_error,
