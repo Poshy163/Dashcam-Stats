@@ -299,6 +299,33 @@ async def unit_clock(address: str) -> int | None:
     return None
 
 
+async def uptime(address: str) -> float | None:
+    """Seconds since the unit last booted, or None when it will not say.
+
+    The unit has no battery, so it powers up when the engine starts and its uptime *is*
+    the length of the current drive. That is the one thing that tells an arrival from a
+    departure without any location sense: a car pulling back onto the driveway has been
+    running for the whole trip (uptime of minutes to hours), while one pulling off it has
+    just booted (uptime of seconds). ``/proc/uptime``'s first field is exactly that, in
+    seconds; the second is idle time and is ignored.
+
+    None rather than a guess when it cannot be read, so a caller gating on it can choose
+    to proceed rather than strand a backup on an unreadable answer.
+    """
+    try:
+        reply = (await shell(address, "cat /proc/uptime", timeout=CONTROL_TIMEOUT_S)).strip()
+    except AdbError as exc:
+        log.debug("could not read the head unit's uptime", error=str(exc))
+        return None
+    for line in reply.splitlines():
+        field = line.strip().split(" ", 1)[0]
+        try:
+            return float(field)
+        except ValueError:
+            continue
+    return None
+
+
 async def inventory(address: str, source: str) -> list[RemoteFile]:
     """List the card's recordings as ``size|name|mtime``.
 

@@ -1055,6 +1055,26 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.min_uptime_s",
+        "Only start a backup after the unit has been running for",
+        "int",
+        120,
+        "ingest",
+        "Waits until the head unit has been powered on for this long before an automatic "
+        "backup begins, so footage is pulled when you arrive home rather than as you leave. "
+        "The unit has no battery — it boots when the engine starts — so its running time is "
+        "the length of the current drive: a car pulling back onto the driveway has been "
+        "going for the whole trip, while one pulling off it has only just booted. A backup "
+        "held for this reason shows on the Backup page and is re-checked every few seconds "
+        "while the car is here, so a genuine arrival starts the moment the threshold is "
+        "crossed. Set it above the longest your car idles on the driveway before setting "
+        "off, and below your shortest trip; 0 turns the wait off. Manual backups ignore it.",
+        minimum=0,
+        maximum=3600,
+        unit="s",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
         "ingest.quiet_radios",
         "Turn off Bluetooth and the hotspot while copying",
         "bool",

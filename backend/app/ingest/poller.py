@@ -135,6 +135,57 @@ class IngestPoller:
         except Exception:
             return ""
 
+    def _min_uptime_s(self) -> float:
+        try:
+            return max(0.0, float(get_settings_service().get_nowait("ingest.min_uptime_s") or 0))
+        except Exception:
+            return 0.0
+
+    async def _arrival_ready(self, address: str) -> bool:
+        """Whether an automatic pull may start, or the unit has only just booted.
+
+        The arrival gate. The unit has no battery, so its uptime is the length of the
+        current drive — a car pulling back onto the driveway has been running for the whole
+        trip, one pulling off it has just booted. Holding the first pull until the uptime
+        clears the threshold is what makes a backup happen on the way *in* rather than as a
+        doomed few seconds on the way *out*, when the car is about to drive out of range.
+
+        Only the first pull of a visit is gated; once a window is under way its follow-on
+        drains are not, because by then the unit is plainly parked. A hold is published to
+        the status so the Backup page can say why nothing is moving, and cleared the moment
+        it passes. An unreadable uptime is treated as ready: a backup that quietly stops
+        happening is a worse failure than one that starts a little early.
+        """
+        threshold = self._min_uptime_s()
+        if threshold <= 0:
+            get_status().set_arrival(None, held=False, reason=None)
+            return True
+        uptime = await adb.uptime(address)
+        if uptime is None:
+            get_status().set_arrival(None, held=False, reason=None)
+            log.debug("could not read the unit's uptime; not holding the pull for it")
+            return True
+        if uptime >= threshold:
+            get_status().set_arrival(uptime, held=False, reason=None)
+            return True
+        reason = (
+            f"waiting until the unit has been running for {int(threshold)}s before backing "
+            f"up, so footage is pulled when you arrive rather than as you leave — it has "
+            f"been up {int(uptime)}s. Re-checked every few seconds while the car is here"
+        )
+        was_held = get_status().arrival_hold
+        get_status().set_arrival(uptime, held=True, reason=reason)
+        if not was_held:
+            # Once per hold episode, not once per tick: this is re-evaluated every poll
+            # while the car sits there, and a line each time would bury the log.
+            log.info(
+                "holding the automatic backup until the unit has been running longer; it "
+                "has only just booted, the signature of leaving rather than arriving",
+                uptime_s=int(uptime),
+                threshold_s=int(threshold),
+            )
+        return False
+
     async def _loop(self) -> None:
         status = get_status()
         while self._running:
@@ -176,24 +227,41 @@ class IngestPoller:
                     self._was_online = False
                 else:
                     if not self._was_online:
-                        log.info("the head unit appeared; starting a pull", address=info.address)
-                        self._idle_since = 0.0
                         # If a previous window ended with the unit's radios still off --
                         # the engine stopping mid-transfer is the ordinary ending -- put
                         # them right the moment the car is back, before it is asked for
                         # anything. Fired, not awaited: it rides the control channel,
-                        # which the transfer below does not use for its bytes.
+                        # which the transfer below does not use for its bytes. Safe to
+                        # re-fire while the arrival gate holds below, because it does
+                        # nothing once the marker it reads is clear.
                         radios.restore_if_pending(info.address)
-                        # Not awaited: a pull runs for as long as the window lasts and the
-                        # poll has to keep ticking underneath it. `start_run` keeps the
-                        # reference so the task cannot be collected and shutdown can find it.
-                        #
-                        # `info` is handed over rather than left to be re-derived. This
-                        # describe has just reconnected and resolved the card one line
-                        # above; doing it again inside the run tore down the link it had
-                        # only just proven good, and paid for the round trip twice at the
-                        # most expensive moment of the day.
-                        puller.start_run(trigger="auto", info=info)
+                        # The arrival gate: hold the first pull until the unit has been
+                        # running long enough to be arriving rather than leaving. A hold
+                        # leaves `_was_online` False so the next tick re-checks, and a real
+                        # arrival -- which already has a high uptime -- clears it at once.
+                        if await self._arrival_ready(info.address):
+                            log.info(
+                                "the head unit appeared; starting a pull", address=info.address
+                            )
+                            self._idle_since = 0.0
+                            # Not awaited: a pull runs for as long as the window lasts and
+                            # the poll has to keep ticking underneath it. `start_run` keeps
+                            # the reference so the task cannot be collected and shutdown can
+                            # find it.
+                            #
+                            # `info` is handed over rather than left to be re-derived. This
+                            # describe has just reconnected and resolved the card one line
+                            # above; doing it again inside the run tore down the link it had
+                            # only just proven good, and paid for the round trip twice at
+                            # the most expensive moment of the day.
+                            puller.start_run(trigger="auto", info=info)
+                            self._was_online = True
+                        else:
+                            # Held for the arrival gate. IDLE like the band hold: not a
+                            # failure, and the one state the poll re-checks while the car
+                            # is here. `_was_online` stays False so this stays the arrival
+                            # transition until the uptime clears.
+                            status.set_state(RunState.IDLE)
                     elif self._should_drain_again(status):
                         # The window is not over when the first pull ends, and it used to be
                         # treated as though it were: this fired once on arrival and then sat
@@ -207,7 +275,11 @@ class IngestPoller:
                         # with the car still sitting on the driveway.
                         log.info("the head unit is still here; looking for more to copy")
                         puller.start_run(trigger="auto", info=info)
-                    self._was_online = True
+                    # `_was_online` is set the moment a pull actually starts (above), not
+                    # merely because the unit is present -- otherwise the arrival gate's
+                    # hold would be mistaken for a window already under way, and the next
+                    # tick would fall through to the drain-again branch instead of
+                    # re-checking the uptime.
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

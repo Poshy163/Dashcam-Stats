@@ -68,6 +68,15 @@ class IngestStatus:
         self.wifi_frequency_mhz: int | None = None
         self.wifi_band_hold: bool = False
         self.wifi_band_hold_reason: str | None = None
+        #: The unit's running time in seconds as last read, whether an automatic backup is
+        #: currently being held until it has been up long enough (the arrival gate), and
+        #: why. Same reasoning as the band hold: a hold is a postponement, not a fault, so
+        #: it lives here rather than in ``last_error`` — otherwise the Backup page would
+        #: report a problem from the moment the car left until the next time somebody drove.
+        #: Cleared when the unit leaves, because the reading describes a boot that is over.
+        self.unit_uptime_s: float | None = None
+        self.arrival_hold: bool = False
+        self.arrival_hold_reason: str | None = None
         self.last_success: datetime | None = None
         self.last_error: str | None = None
         self._started_at: float | None = None
@@ -160,6 +169,9 @@ class IngestStatus:
                 self.wifi_frequency_mhz = None
                 self.wifi_band_hold = False
                 self.wifi_band_hold_reason = None
+                self.unit_uptime_s = None
+                self.arrival_hold = False
+                self.arrival_hold_reason = None
             self.unit_online = online
 
     def set_wifi(self, frequency_mhz: int | None, *, held: bool, reason: str | None) -> None:
@@ -167,6 +179,12 @@ class IngestStatus:
             self.wifi_frequency_mhz = frequency_mhz
             self.wifi_band_hold = held
             self.wifi_band_hold_reason = reason if held else None
+
+    def set_arrival(self, uptime_s: float | None, *, held: bool, reason: str | None) -> None:
+        with self._lock:
+            self.unit_uptime_s = uptime_s
+            self.arrival_hold = held
+            self.arrival_hold_reason = reason if held else None
 
     def online_for(self) -> float:
         """Seconds the unit has been continuously on the network; 0.0 while it is not.
@@ -275,6 +293,9 @@ class IngestStatus:
                 "wifi_frequency_mhz": self.wifi_frequency_mhz,
                 "wifi_band_hold": self.wifi_band_hold,
                 "wifi_band_hold_reason": self.wifi_band_hold_reason,
+                "unit_uptime_s": self.unit_uptime_s,
+                "arrival_hold": self.arrival_hold,
+                "arrival_hold_reason": self.arrival_hold_reason,
                 "started_at": self._started_wall.isoformat() if self._started_wall else None,
                 "last_success_ts": self.last_success.isoformat() if self.last_success else None,
                 "last_error": self.last_error,
