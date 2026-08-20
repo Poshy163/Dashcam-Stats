@@ -259,3 +259,72 @@ class TestCollection:
         status.set_unit_online(False)
         assert status.snapshot()["recorder_health_ok"] is True
         reset_status_for_tests()
+
+
+class TestLiveRefresh:
+    """The glance while parked: keep the card current on a unit that never leaves, without
+    consuming the log the next arrival will report on or paging a phone for it."""
+
+    async def test_refresh_updates_the_card_without_truncating(self, monkeypatch):
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        settings = StubSettings({health.ENABLED_KEY: True})
+        monkeypatch.setattr(health, "get_settings_service", lambda: settings)
+        commands: list[str] = []
+
+        async def fake_shell(address, command, **kwargs):
+            commands.append(command)
+            return _log(_trip(1_755_640_000, 5))
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+
+        await health.refresh("u:5555")
+        assert get_status().recorder_health_ok is True
+        assert all(f": > {health.REMOTE_LOG}" not in c for c in commands), (
+            "refresh must not truncate the log the next arrival reports on"
+        )
+        reset_status_for_tests()
+
+    async def test_refresh_never_pages_a_phone_even_on_a_problem(self, monkeypatch):
+        from app.ingest.status import reset_status_for_tests
+
+        reset_status_for_tests()
+        settings = StubSettings({health.ENABLED_KEY: True})
+        monkeypatch.setattr(health, "get_settings_service", lambda: settings)
+        rows = [*_trip(1_755_640_000, 5), (1_755_640_000 + 5 * TICK, "ro", 30, 1, 1)]
+
+        async def fake_shell(address, command, **kwargs):
+            return _log(rows)
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+        published: list[str] = []
+
+        import app.ingest.reporter as reporter
+
+        async def fake_publish(event, **kwargs):
+            published.append(event)
+
+        monkeypatch.setattr(reporter, "publish", fake_publish)
+
+        await health.refresh("u:5555")
+        assert not published, "a parked-at-home glance must not fire the alert webhook"
+        reset_status_for_tests()
+
+    async def test_on_unit_present_is_throttled(self, monkeypatch):
+        monkeypatch.setattr(
+            health, "get_settings_service", lambda: StubSettings({health.ENABLED_KEY: True})
+        )
+        calls: list[str] = []
+
+        async def fake_refresh(address):
+            calls.append(address)
+
+        monkeypatch.setattr(health, "refresh", fake_refresh)
+
+        import asyncio
+
+        health.on_unit_present("u:5555")
+        health.on_unit_present("u:5555")
+        await asyncio.sleep(0)
+        assert calls == ["u:5555"], "the poll fires this every tick; the refresh must throttle"

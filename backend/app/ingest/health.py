@@ -314,43 +314,81 @@ async def arm(address: str, source_dir: str) -> bool:
     return True
 
 
+async def _read_log(address: str, *, truncate: bool) -> str | None:
+    """The unit's log, optionally emptying it in the same call. None if it cannot be read.
+
+    Truncation is what makes a line reported at most once, so it belongs to :func:`collect`
+    (the authoritative per-drive read) and never to :func:`refresh` (the live glance while
+    parked, which must not consume what the next arrival will report on). The append/read
+    race can drop at most one 35-byte sample, nothing against re-reporting whole drives.
+    """
+    command = f"cat {REMOTE_LOG} 2>/dev/null"
+    if truncate:
+        command += f"; : > {REMOTE_LOG} 2>/dev/null"
+    command += "; exit 0"
+    try:
+        return await adb.shell(address, command, timeout=HEALTH_TIMEOUT_S)
+    except adb.AdbError as exc:
+        log.debug("could not read the health log", error=str(exc))
+        return None
+
+
+async def _publish_report(report: Report) -> None:
+    """Put a verdict where a person can see it: the live status and the Settings page.
+
+    The live status first, so the Backup page shows the verdict whether or not the setting
+    write succeeds. Import-local to avoid a cycle. This is the part shared by the live
+    refresh and the per-drive collect; the webhook is not here because only the arrival
+    collect should be able to page a phone.
+    """
+    from app.ingest.status import get_status
+
+    get_status().set_recorder_health(report.summary(), ok=report.healthy)
+    try:
+        await get_settings_service().set(
+            REPORT_KEY,
+            f"as of {time.strftime('%Y-%m-%d %H:%M')}: {report.summary()}",
+            internal=True,
+        )
+    except Exception as exc:
+        log.debug("could not persist the health report", error=str(exc))
+
+
+async def refresh(address: str) -> None:
+    """Update the live card from the log so far, without consuming it or paging anyone.
+
+    The glance while parked: on a unit that stays online the arrival collect never fires a
+    second time, so this is what keeps the Backup page's recorder-health card current. It
+    reads non-destructively and stops at the status/Settings surface — no truncation, no
+    webhook — so the next real arrival still gets the whole drive to report on.
+    """
+    raw = await _read_log(address, truncate=False)
+    if not raw:
+        return
+    report = analyze(parse(raw))
+    if report.samples:
+        await _publish_report(report)
+
+
 async def collect(address: str) -> Report | None:
     """Read and truncate the unit's log, and say what the drives looked like.
 
-    Truncated in the same call that reads it, so a line is only ever reported once. The
-    race with the writer appending between the ``cat`` and the truncate can drop at most
-    one 35-byte sample, which is nothing against re-reporting whole drives every arrival.
+    The authoritative per-drive read, fired on arrival: it consumes the log so a line is
+    reported once, updates the card and Settings page, and — only when something went
+    wrong — fires the webhook that reaches a phone.
     """
-    try:
-        raw = await adb.shell(
-            address,
-            f"cat {REMOTE_LOG} 2>/dev/null; : > {REMOTE_LOG} 2>/dev/null; exit 0",
-            timeout=HEALTH_TIMEOUT_S,
-        )
-    except adb.AdbError as exc:
-        log.debug("could not collect the health log", error=str(exc))
+    raw = await _read_log(address, truncate=True)
+    if raw is None:
         return None
     report = analyze(parse(raw))
     if not report.samples:
         return report
-    # Onto the live status first, so the Backup page shows the last drive's verdict whether
-    # or not the webhook and the setting write below succeed. Import-local to avoid a cycle.
-    from app.ingest.status import get_status
-
-    get_status().set_recorder_health(report.summary(), ok=report.healthy)
+    await _publish_report(report)
     if report.healthy:
         log.info("the recording watcher saw no problems", **_fields(report))
     else:
         for incident in report.incidents:
             log.warning("the recording watcher caught a problem", incident=incident)
-    try:
-        await get_settings_service().set(
-            REPORT_KEY, f"as of {time.strftime('%Y-%m-%d %H:%M')}: {report.summary()}",
-            internal=True,
-        )
-    except Exception as exc:
-        log.debug("could not persist the health report", error=str(exc))
-    if not report.healthy:
         # The one channel that reaches a phone. Fired with the incidents attached; the
         # reporter never raises, so this cannot cost the window that is starting.
         try:
@@ -370,8 +408,16 @@ def _fields(report: Report) -> dict[str, object]:
     }
 
 
-#: The last time each unit was armed, for the debounce, and the collect/arm tasks in flight.
+#: How often the live card is refreshed from the log while a unit stays present. Frequent
+#: enough that a card is current within a glance of opening the page, rare enough to be one
+#: small read on the idle control channel; the arm debounce is longer because arming is the
+#: heavier act.
+REFRESH_S = 30.0
+
+#: The last time each unit was armed / refreshed, for the two throttles, and the tasks in
+#: flight.
 _last_armed: dict[str, float] = {}
+_last_refresh: dict[str, float] = {}
 _tasks: set[asyncio.Task] = set()
 
 
@@ -395,6 +441,25 @@ def on_unit_seen(address: str, source_dir: str) -> None:
     task.add_done_callback(_tasks.discard)
 
 
+def on_unit_present(address: str) -> None:
+    """Keep the live card current while the unit stays online. Never blocks the caller.
+
+    Fired by the poller on every tick a unit is present, and throttled to :data:`REFRESH_S`
+    so it is one small non-destructive read now and then rather than a read per tick. This
+    is what makes the recorder-health card mean something on a unit that never leaves — a
+    car parked at home, or a bench unit — where the arrival collect fires only once.
+    """
+    if not _wanted():
+        return
+    now = time.monotonic()
+    if now - _last_refresh.get(address, 0.0) < REFRESH_S:
+        return
+    _last_refresh[address] = now
+    task = asyncio.create_task(refresh(address), name="ingest-health-refresh")
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
 async def _collect_then_arm(address: str, source_dir: str) -> None:
     # Collect first: arming restarts the script, and the story of the last drives should
     # be read before anything touches the file it is written in.
@@ -412,4 +477,5 @@ async def shutdown() -> None:
 
 def reset_for_tests() -> None:
     _last_armed.clear()
+    _last_refresh.clear()
     _tasks.clear()

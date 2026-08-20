@@ -289,6 +289,12 @@ class IngestPoller:
                     # hold would be mistaken for a window already under way, and the next
                     # tick would fall through to the drain-again branch instead of
                     # re-checking the uptime.
+                    #
+                    # Keep the recorder-health card current while the unit stays present.
+                    # Throttled inside, and non-destructive, so it costs one small read now
+                    # and then -- what makes the card mean something on a unit parked at
+                    # home, where the arrival collect above fires only once.
+                    health.on_unit_present(info.address)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
