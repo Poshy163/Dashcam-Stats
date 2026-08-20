@@ -45,6 +45,21 @@ class TestTheScript:
     def test_the_sample_interval_is_the_configured_one(self):
         assert f"sleep {TICK}" in health.script()
 
+    def test_it_self_heals_a_read_only_card_throttled(self):
+        text = health.script()
+        assert "sm unmount" in text and "sm mount" in text, "no remount path"
+        assert 'FIX="$2"' in text, "the self-heal must be gated on the passed flag"
+        assert f"-lt {health.FIX_MAX_ATTEMPTS}" in text, "remounts must be capped per drive"
+        assert f"-gt {health.FIX_COOLDOWN_S}" in text, "remounts must have a cooldown"
+
+
+def _rows_ro(start, count, *, fix_first, avail=20_000_000):
+    """`count` read-only samples; the first `fix_first` carry a remount attempt."""
+    return [
+        (start + i * TICK, "ro", 30, avail, 500_000, "fixtry" if i < fix_first else "-")
+        for i in range(count)
+    ]
+
 
 class TestParsing:
     def test_ordinary_lines_parse(self):
@@ -119,6 +134,33 @@ class TestTheOtherIncidents:
         assert report.healthy
 
 
+class TestSelfHeal:
+    def test_the_fix_field_is_parsed_and_old_five_field_lines_still_work(self):
+        new = health.parse("1755640000|ro|30|20000000|500000|fixtry")
+        assert new and new[0].fix == "fixtry"
+        old = health.parse("1755640000|rw|30|20000000|500000")  # no sixth field
+        assert old and old[0].fix == "-"
+
+    def test_a_read_only_card_that_was_remounted_reads_as_recovered(self):
+        start = 1_755_640_000
+        rows = [
+            *_trip(start, 5),  # healthy rw
+            *_rows_ro(start + 5 * TICK, 2, fix_first=1),  # flips ro, one remount
+            (start + 7 * TICK, "rw", 5, 20_000_000, 500_000, "-"),  # back read-write
+        ]
+        report = health.analyze(health.parse(_log(rows)))
+        joined = " ".join(report.incidents)
+        assert "READ-ONLY" in joined and "automatically remounted" in joined
+        assert "does not exist" not in joined, "recording continued, so nothing was lost"
+
+    def test_a_card_that_would_not_remount_says_replace_it(self):
+        start = 1_755_640_000
+        rows = [*_trip(start, 3), *_rows_ro(start + 3 * TICK, 6, fix_first=3)]  # ends ro
+        report = health.analyze(health.parse(_log(rows)))
+        joined = " ".join(report.incidents)
+        assert "did not come back" in joined and "replacing" in joined
+
+
 class StubSettings:
     def __init__(self, values):
         self.values = dict(values)
@@ -154,6 +196,34 @@ class TestArming:
         # launch returns rather than hanging like the tar|nc listener does.
         assert f"sh {health.REMOTE_SCRIPT} '/storage/Tfcard/DCIM/Video'" in launch
         assert "</dev/null >/dev/null 2>&1 &" in launch
+
+    async def test_arm_passes_the_self_heal_flag_from_the_setting(self, monkeypatch):
+        shells: list[str] = []
+
+        async def fake_shell(address, command, **kwargs):
+            shells.append(command)
+            return ""
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+
+        # On when both switches are on.
+        monkeypatch.setattr(
+            health,
+            "get_settings_service",
+            lambda: StubSettings({health.ENABLED_KEY: True, health.FIX_KEY: True}),
+        )
+        await health.arm("u:5555", "/storage/Tfcard/DCIM/Video")
+        assert " 1 </dev/null" in next(c for c in shells if "setsid" in c)
+
+        # Off when the self-heal switch is off, even with the watcher on.
+        shells.clear()
+        monkeypatch.setattr(
+            health,
+            "get_settings_service",
+            lambda: StubSettings({health.ENABLED_KEY: True, health.FIX_KEY: False}),
+        )
+        await health.arm("u:5555", "/storage/Tfcard/DCIM/Video")
+        assert " 0 </dev/null" in next(c for c in shells if "setsid" in c)
 
     async def test_an_odd_directory_is_refused_outright(self, monkeypatch):
         async def fake_shell(address, command, **kwargs):

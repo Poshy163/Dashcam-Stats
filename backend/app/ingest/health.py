@@ -79,8 +79,9 @@ LOW_SPACE_KB = 1_048_576  # 1 GiB
 #: missed samples — so scheduler jitter on a busy SoC never splits a real trip in two.
 TRIP_GAP_S = SAMPLE_INTERVAL_S * 3 + 5
 
-#: Settings keys: the switch, and where the last collected verdict is shown.
+#: Settings keys: the switch, the self-heal switch, and where the last verdict is shown.
 ENABLED_KEY = "ingest.unit_health_watch"
+FIX_KEY = "ingest.unit_health_fix"
 REPORT_KEY = "ingest.unit_health"
 
 #: Ceiling on each control call here, same reasoning as the radio quieting's.
@@ -97,8 +98,18 @@ ARM_DEBOUNCE_S = 120.0
 #: refused otherwise, never escaped.
 _SAFE_DIR = re.compile(r"^/[A-Za-z0-9/_.-]{1,200}$")
 
-#: One log line: ``epoch|card|age|avail_kb|memavail_kb``, any field may be ``na``/``nodir``.
-_LINE = re.compile(r"^(\d{9,11})\|(\w+)\|(\w+)\|(\w+)\|(\w+)$")
+#: One log line: ``epoch|card|age|avail_kb|memavail_kb|fix``. The sixth field is optional so
+#: logs written by an older watcher (five fields, no self-heal) still parse. Any field may be
+#: ``na``/``nodir``; ``fix`` is ``-`` normally and ``fixtry`` on a cycle that remounted.
+_LINE = re.compile(r"^(\d{9,11})\|(\w+)\|(\w+)\|(\w+)\|(\w+)(?:\|([\w-]+))?$")
+
+#: How many self-heal remounts the watcher will attempt in one drive, and how far apart.
+#: A card that does not come back after a few tries is failing, not stuck, and wants
+#: replacing rather than remounting in a loop — so the watcher gives up and keeps flagging
+#: it instead. Both are baked into the on-unit script; the constants exist so the analysis
+#: and the tests can speak of the same numbers.
+FIX_MAX_ATTEMPTS = 3
+FIX_COOLDOWN_S = 90
 
 
 def script(sample_interval_s: int = SAMPLE_INTERVAL_S) -> str:
@@ -112,17 +123,30 @@ def script(sample_interval_s: int = SAMPLE_INTERVAL_S) -> str:
     because a unit recording to internal storage has no vfat card and nothing is wrong.
     The log is rotated by line count so it can never grow past a few hundred KB even if
     the car does not come home for weeks.
+
+    **Self-heal.** When ``$2`` is ``1`` and the card has flipped read-only or dropped its
+    mount, the watcher remounts it in place — ``sm unmount`` then ``sm mount``, which routes
+    through vold, runs ``fsck_msdos`` on the way back up, and returns the card read-write.
+    Verified on the unit: the camera resumes recording on its own afterwards. It fires only
+    on an already-broken card, so a working recording is never disturbed; it is throttled to
+    :data:`FIX_MAX_ATTEMPTS` a drive, :data:`FIX_COOLDOWN_S` apart, because a card that will
+    not come back is failing and wants replacing, not looping. ``com.android.shell`` holds
+    ``MOUNT_UNMOUNT_FILESYSTEMS`` on this unit, which is what lets an unrooted watcher do it
+    at all. Every remount is marked ``fixtry`` in the log so the app can report it.
     """
     return f"""#!/system/bin/sh
 # dashcam-stats recording watcher. Deleting this file and its .log removes every trace.
 DIR="$1"
+FIX="$2"
 LOG={REMOTE_LOG}
 PIDF={REMOTE_PID}
 [ -f "$PIDF" ] && kill "$(cat "$PIDF")" 2>/dev/null
 echo $$ > "$PIDF"
+fixes=0
+lastfix=0
 while :; do
   now=$(date +%s)
-  card=na; age=na; avail=na; mem=na
+  card=na; age=na; avail=na; mem=na; fixed=-
   line=$(grep " vfat " /proc/mounts | grep /mnt/media_rw | head -n 1)
   if [ -n "$line" ]; then
     set -- $line
@@ -141,7 +165,18 @@ while :; do
   fi
   set -- $(grep MemAvailable /proc/meminfo)
   [ -n "$2" ] && mem=$2
-  echo "$now|$card|$age|$avail|$mem" >> "$LOG"
+  if [ "$FIX" = "1" ] && {{ [ "$card" = "ro" ] || [ "$age" = "nodir" ]; }}; then
+    if [ "$fixes" -lt {int(FIX_MAX_ATTEMPTS)} ] && [ $((now-lastfix)) -gt {int(FIX_COOLDOWN_S)} ]; then
+      vol=$(sm list-volumes 2>/dev/null | grep "^public" | head -n 1 | cut -d" " -f1)
+      if [ -n "$vol" ]; then
+        sm unmount "$vol" >/dev/null 2>&1
+        sleep 3
+        sm mount "$vol" >/dev/null 2>&1
+        fixes=$((fixes+1)); lastfix=$now; fixed=fixtry
+      fi
+    fi
+  fi
+  echo "$now|$card|$age|$avail|$mem|$fixed" >> "$LOG"
   n=$(wc -l < "$LOG")
   [ "$n" -gt 4000 ] && {{ tail -n 2000 "$LOG" > "$LOG.t" && mv "$LOG.t" "$LOG"; }}
   sleep {int(sample_interval_s)}
@@ -157,6 +192,7 @@ class Sample:
     nodir: bool  # the footage directory itself was missing
     avail_kb: int | None
     mem_kb: int | None
+    fix: str = "-"  # "fixtry" on a cycle where the watcher remounted the card
 
 
 @dataclass
@@ -190,7 +226,7 @@ def parse(raw: str) -> list[Sample]:
         match = _LINE.match(line.strip())
         if not match:
             continue
-        ts, card, age, avail, mem = match.groups()
+        ts, card, age, avail, mem, fix = match.groups()
         samples.append(
             Sample(
                 ts=int(ts),
@@ -199,6 +235,7 @@ def parse(raw: str) -> list[Sample]:
                 nodir=age == "nodir",
                 avail_kb=int(avail) if avail.isdigit() else None,
                 mem_kb=int(mem) if mem.isdigit() else None,
+                fix=fix or "-",
             )
         )
     samples.sort(key=lambda s: s.ts)
@@ -235,12 +272,28 @@ def analyze(samples: list[Sample]) -> Report:
         start, end = trip[0].ts, trip[-1].ts
         report.watched_s += max(int(SAMPLE_INTERVAL_S), end - start)
 
+        fixes = [s for s in trip if s.fix == "fixtry"]
+        # Whether the card was writable again by the end tells "auto-recovered" from "gave
+        # up": both are worth surfacing, but only the second is footage lost.
+        ended_ro = trip[-1].card == "ro"
+
         ro = [s for s in trip if s.card == "ro"]
-        if ro:
+        if ro and fixes and not ended_ro:
+            report.incidents.append(
+                f"the card went READ-ONLY at {_when(ro[0].ts)} and was automatically "
+                f"remounted ({len(fixes)}×), so recording continued — but a card that does "
+                f"this is failing and should be replaced soon"
+            )
+        elif ro:
+            tail = (
+                f" the watcher tried to remount it {len(fixes)}× and it did not come back;"
+                if fixes
+                else ""
+            )
             report.incidents.append(
                 f"the card went READ-ONLY at {_when(ro[0].ts)} — a filesystem error made "
-                f"the kernel stop all writes, and recording with it; the card needs "
-                f"checking (and likely replacing)"
+                f"the kernel stop all writes, and recording with it;{tail} the card needs "
+                f"replacing"
             )
 
         # The grace period: at power-on the newest recording is the previous drive's last,
@@ -259,9 +312,10 @@ def analyze(samples: list[Sample]) -> Report:
 
         gone = [s for s in trip if s.nodir and s.ts - start > 60]
         if gone:
+            recovered = " it was automatically remounted," if fixes else ""
             report.incidents.append(
-                f"the recording folder was MISSING at {_when(gone[0].ts)} — the card "
-                f"unmounted or was reformatted mid-drive"
+                f"the recording folder went MISSING at {_when(gone[0].ts)} — the card "
+                f"unmounted or was reformatted mid-drive;{recovered} check the card"
             )
 
     last = samples[-1]
@@ -276,6 +330,16 @@ def analyze(samples: list[Sample]) -> Report:
 def _wanted() -> bool:
     try:
         return bool(get_settings_service().get_nowait(ENABLED_KEY))
+    except Exception:
+        return False
+
+
+def _fix_wanted() -> bool:
+    """Whether the watcher should remount a broken card, not only report it. Both switches
+    must be on: the self-heal is meaningless without the watcher that detects the fault."""
+    try:
+        settings = get_settings_service()
+        return bool(settings.get_nowait(ENABLED_KEY)) and bool(settings.get_nowait(FIX_KEY))
     except Exception:
         return False
 
@@ -295,6 +359,7 @@ async def arm(address: str, source_dir: str) -> bool:
     if not _SAFE_DIR.match(source_dir):
         log.warning("refusing to arm the health watcher on an odd directory", dir=source_dir[:80])
         return False
+    fix = "1" if _fix_wanted() else "0"
     encoded = base64.b64encode(script().encode()).decode()
     try:
         await adb.shell(
@@ -304,7 +369,7 @@ async def arm(address: str, source_dir: str) -> bool:
         )
         await adb.shell(
             address,
-            f"setsid sh {REMOTE_SCRIPT} '{source_dir}' </dev/null >/dev/null 2>&1 &",
+            f"setsid sh {REMOTE_SCRIPT} '{source_dir}' {fix} </dev/null >/dev/null 2>&1 &",
             timeout=HEALTH_TIMEOUT_S,
         )
     except adb.AdbError as exc:

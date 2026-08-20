@@ -1110,6 +1110,22 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.unit_health_fix",
+        "Let the watcher remount a broken card by itself",
+        "bool",
+        True,
+        "ingest",
+        "When the watcher finds the card has flipped read-only or dropped its mount — the "
+        "failures that silently stop recording — it remounts it in place (unmount, then "
+        "mount, which makes Android run a filesystem check on the way back up) and the "
+        "camera resumes on its own. It only ever acts on a card that is already broken, so "
+        "a working recording is never disturbed, and it gives up after a few tries a drive "
+        "because a card that will not come back is failing and wants replacing, not "
+        "remounting in a loop. Every repair it makes is reported with the rest of the "
+        "recorder health. Turn this off to have it only report the fault, not fix it.",
+        requires="ingest.unit_health_watch",
+    ),
+    SettingDef(
         "ingest.unit_health",
         "What the recorder watcher last saw",
         "string",
