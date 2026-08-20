@@ -472,8 +472,25 @@ def _plan_out(plan) -> RetentionPlanOut:
 
 @router.post("/retention/plan", response_model=RetentionPlanOut)
 async def retention_plan(session: SessionDep):
-    """Evaluate retention without touching anything."""
-    return _plan_out(await plan_retention(session))
+    """Evaluate retention without touching anything.
+
+    Both passes together — the size-based oldest-first *and* the idle-drive cleanup — so the
+    preview shows everything a real run would remove, each candidate carrying the reason it
+    was picked. This is the report a person uses to check the idle rule is catching the right
+    footage before turning deletion on.
+    """
+    plan = await plan_retention(session)
+    idle = await plan_idle(session, plan.safety)
+    seen = {c.recording_id for c in plan.candidates}
+    for candidate in idle.candidates:
+        if candidate.recording_id not in seen:
+            plan.candidates.append(candidate)
+            seen.add(candidate.recording_id)
+    # A blocked idle pass (e.g. its runaway guard tripped) must not be hidden behind a clean
+    # size-based one, or the preview would look safe while a real run would refuse.
+    if idle.blocked and not plan.blocked:
+        plan.blocked, plan.blocked_reason = True, idle.blocked_reason
+    return _plan_out(plan)
 
 
 @router.post("/retention/run", response_model=RetentionPlanOut)

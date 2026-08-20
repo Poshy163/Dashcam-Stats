@@ -139,6 +139,56 @@ class TestWriteEndpoints:
         assert plan["deletion_enabled"] is False, "deletion must default to off"
         assert "safety" in plan
 
+    async def test_the_plan_preview_lists_idle_drives_with_their_reason(self, client):
+        """What makes the idle rule checkable before deletion is turned on: the same report
+        the 'Run Now' button shows must name the stationary footage it would remove."""
+        from datetime import UTC, datetime, timedelta
+
+        from app.core.settings_service import get_settings_service
+        from app.db.models import Recording, RecordingState, StageState
+        from app.db.session import session_scope
+
+        footage = await get_settings_service().footage_dir()
+        for i in range(12):
+            (footage / f"seg_{i}.ts").write_bytes(b"\x47" * 4096)
+        assert (
+            await client.put(
+                "/api/settings", json={"values": {"storage.require_mountpoint": False}}
+            )
+        ).status_code == 200
+
+        async with session_scope() as session:
+            session.add(
+                Recording(
+                    rel_path="desk.ts",
+                    filename="desk.ts",
+                    size_bytes=2048,
+                    started_at=datetime.now(UTC) - timedelta(days=3),
+                    state=RecordingState.COMPLETED,
+                    telemetry_state=StageState.DONE,
+                    telemetry_point_count=60,
+                    max_speed_kmh=0.0,
+                )
+            )
+            # A real drive too, so the desk clip is a small fraction and the runaway guard
+            # stays out of the way.
+            session.add(
+                Recording(
+                    rel_path="drive.ts",
+                    filename="drive.ts",
+                    size_bytes=2_000_000,
+                    started_at=datetime.now(UTC) - timedelta(days=3),
+                    state=RecordingState.COMPLETED,
+                    telemetry_state=StageState.DONE,
+                    telemetry_point_count=60,
+                    max_speed_kmh=55.0,
+                )
+            )
+
+        plan = (await client.post("/api/retention/plan")).json()
+        idle = [c for c in plan["candidates"] if "stationary" in c["reason"]]
+        assert [c["filename"] for c in idle] == ["desk.ts"], plan["candidates"]
+
 
 class TestFeatureStatus:
     """A zero has to say which kind of zero it is.

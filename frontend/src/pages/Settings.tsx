@@ -869,6 +869,9 @@ function RetentionPanel({
                 {result.candidates.slice(0, 50).map((c) => (
                   <li key={c.recordingId} className="text-content-faint">
                     {c.filename} — {formatBytes(c.sizeBytes)}
+                    {c.reason ? (
+                      <span className="text-content-muted"> · {c.reason}</span>
+                    ) : null}
                   </li>
                 ))}
               </ul>
