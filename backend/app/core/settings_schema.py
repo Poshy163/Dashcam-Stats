@@ -1087,11 +1087,40 @@ SETTINGS: tuple[SettingDef, ...] = (
         "the unit has been on the network for ten seconds, so a car that is only turning "
         "around keeps its phone connection. If the engine stops mid-transfer, a watchdog "
         "left on the unit turns Bluetooth back on by itself, and anything still off is "
-        "restored the moment the unit is next seen. Bluetooth works on any unit; the "
-        "hotspot only on one whose ADB runs as root, because Android refuses to stop a "
-        "hotspot for anyone else — if yours refuses, the log says so once per transfer "
-        "and nothing else changes.",
+        "restored the moment the unit is next seen. Bluetooth is turned off first on "
+        "purpose: some units re-arm their hotspot within seconds while Bluetooth is on. "
+        "If your unit still refuses to stop its hotspot, the refusal is shown below in "
+        "the unit's own words and nothing else changes.",
         requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.unit_health_watch",
+        "Watch the recorder while the car is away",
+        "bool",
+        True,
+        "ingest",
+        "Leaves a tiny watcher (a one-kilobyte shell script, not an app) running on the "
+        "head unit that checks every twenty seconds that recordings are still being "
+        "written, the card is still writable and not nearly full — the silent failures "
+        "that otherwise show up as missing or glitchy footage days later. It keeps "
+        "watching after the car drives off, and whatever it saw is collected the next "
+        "time the car appears: problems go to the log, the summary below, and the "
+        "webhook if one is set. Nothing is installed — deleting two files from the "
+        "unit's temp directory removes every trace.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.unit_health",
+        "What the recorder watcher last saw",
+        "string",
+        "",
+        "ingest",
+        "The verdict from the most recent collection: how much running time was watched, "
+        "across how many trips, and anything that went wrong — the recorder stalling, the "
+        "card flipping read-only, the recording folder disappearing, space running out. "
+        "'The recorder looked healthy throughout' is the answer this should always give.",
+        read_only=True,
+        requires="ingest.unit_health_watch",
     ),
     SettingDef(
         "ingest.radios_pending_restore",

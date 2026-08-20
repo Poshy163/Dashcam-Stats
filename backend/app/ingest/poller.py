@@ -27,7 +27,7 @@ import time
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
-from app.ingest import adb, puller, radios
+from app.ingest import adb, health, puller, radios
 from app.ingest.models import RunState, UnitState
 from app.ingest.status import get_status
 
@@ -77,6 +77,9 @@ class IngestPoller:
         # Stop the ticker first, then the transfer: otherwise the next tick could start a
         # new pull while this one is being wound down.
         await puller.shutdown()
+        # Local watcher sessions only; the script on the unit keeps running, by design --
+        # the app going down is exactly the kind of absence it exists to cover.
+        await health.shutdown()
         log.info("ingest poller stopped")
 
     @property
@@ -235,6 +238,12 @@ class IngestPoller:
                         # re-fire while the arrival gate holds below, because it does
                         # nothing once the marker it reads is clear.
                         radios.restore_if_pending(info.address)
+                        # Collect what the recording watcher saw while the car was away,
+                        # and re-arm it for the drive that is starting. Before the arrival
+                        # gate on purpose: a departure window whose pull is held is exactly
+                        # the drive the watcher exists to cover. Debounced inside, because
+                        # this branch re-runs every tick while the gate holds.
+                        health.on_unit_seen(info.address, info.source)
                         # The arrival gate: hold the first pull until the unit has been
                         # running long enough to be arriving rather than leaving. A hold
                         # leaves `_was_online` False so the next tick re-checks, and a real

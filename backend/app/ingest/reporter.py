@@ -57,10 +57,21 @@ def _payload(event: str, plan: DeltaPlan | None, result: RunResult | None) -> di
 
 
 async def publish(
-    event: str, *, plan: DeltaPlan | None = None, result: RunResult | None = None
+    event: str,
+    *,
+    plan: DeltaPlan | None = None,
+    result: RunResult | None = None,
+    extra: dict[str, object] | None = None,
 ) -> None:
-    """Fan out one event. Never raises: reporting must not be able to fail a transfer."""
+    """Fan out one event. Never raises: reporting must not be able to fail a transfer.
+
+    ``extra`` is merged into the webhook body for events that carry something the snapshot
+    does not — the health watcher's incidents ride here. Additive only, so nothing an
+    automation already matches on can change shape.
+    """
     body = _payload(event, plan, result)
+    if extra:
+        body.update(extra)
     url = str(_get("ha_webhook_url", "") or "").strip()
     if url:
         try:
