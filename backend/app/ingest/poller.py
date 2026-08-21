@@ -118,6 +118,14 @@ class IngestPoller:
         Errors and offline runs are left to the arrival transition rather than retried in a
         loop; a unit that is answering its ADB port but failing every pull should not have
         that failure driven at it on a timer.
+
+        The run that moved files waits out a cooldown first. Each run quiets the unit's
+        Bluetooth and hotspot and restores them on the way out, so going again the instant
+        it finished meant the radios came back and were cut again within a second, over and
+        over, for as long as the card kept yielding something -- which is what the driver
+        saw as the unit's screen and phone connection "glitching" after a backup. The
+        cooldown leaves the radios on, and the screen alone, for a minute between passes;
+        the sweeps inside the run itself catch most of what used to need a re-drain anyway.
         """
         if status.state is RunState.IDLE:
             now = time.monotonic()
@@ -127,7 +135,7 @@ class IngestPoller:
             return True
         if status.state in (RunState.OK, RunState.PARTIAL):
             self._idle_since = 0.0
-            return True
+            return status.since_finished() >= self._redrain_cooldown_s()
         # CANCELLED is deliberately not in that list. Somebody pressed Stop; starting the
         # same transfer again two seconds later is not a re-drain, it is ignoring them.
         return False
@@ -137,6 +145,14 @@ class IngestPoller:
             return str(get_settings_service().get_nowait("ingest.unit_adb_address") or "").strip()
         except Exception:
             return ""
+
+    def _redrain_cooldown_s(self) -> float:
+        try:
+            return max(
+                0.0, float(get_settings_service().get_nowait("ingest.redrain_cooldown_s") or 0)
+            )
+        except Exception:
+            return 60.0
 
     def _min_uptime_s(self) -> float:
         try:

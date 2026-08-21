@@ -1088,6 +1088,39 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.sweep_passes",
+        "Re-check the card before finishing a backup",
+        "int",
+        2,
+        "ingest",
+        "The list of what to copy is drawn up the moment the car arrives, and the clip the "
+        "camera is still writing at that moment — the last minute of the drive, the bit "
+        "where you actually park — is skipped because it is not finished. By the time the "
+        "transfer ends it has been closed for a while. This re-lists the card before the "
+        "backup is called done and copies anything newly finished in the same run, while "
+        "the radios are still quiet and the link is still good, up to this many times. It "
+        "stops the first time it finds nothing new. 0 turns it off.",
+        minimum=0,
+        maximum=10,
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.redrain_cooldown_s",
+        "Pause between backups while the car stays parked",
+        "int",
+        60,
+        "ingest",
+        "After a backup that copied something, how long to wait before looking for more "
+        "with the car still here. Each backup turns the unit's Bluetooth and hotspot off "
+        "and back on, and going again the instant one finished had them flicking on and "
+        "off, and the screen reloading, for as long as the card kept yielding footage. This "
+        "leaves the radios on and the screen alone in between. 0 goes again immediately.",
+        minimum=0,
+        maximum=600,
+        unit="s",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
         "ingest.min_uptime_s",
         "Only start a backup after the unit has been running for",
         "int",

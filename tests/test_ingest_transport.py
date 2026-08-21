@@ -1126,6 +1126,58 @@ class TestARunEndToEnd:
         assert again.files == 0
         assert unit.served["names"] is not None
 
+    async def test_a_recording_closed_during_the_transfer_is_swept_up_in_the_same_run(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """The clip of actually parking. It was still being written when the plan was
+        drawn, so it was skipped; by the time the transfer ends it has been closed. Without
+        the sweep it waited for a re-drain (now a minute away) or the next drive."""
+        from app.ingest import adb
+        from app.ingest.models import RunState
+        from app.ingest.puller import run_pull
+
+        await self._enable(**{"ingest.sweep_passes": 2})
+        listings = {"count": 0}
+        real_inventory = adb.inventory
+
+        async def inventory(address, source):
+            listings["count"] += 1
+            if listings["count"] == 2:
+                # Between the first listing and the sweep, the camera closed the segment it
+                # was writing when the car arrived.
+                unit.payload["20260812120200_camera_0.ts"] = b"c" * 4096
+            return await real_inventory(address, source)
+
+        monkeypatch.setattr(adb, "inventory", inventory)
+
+        result = await run_pull(trigger="manual")
+
+        assert result.state is RunState.OK, result.error
+        assert result.files == 3, "the swept-up recording must count in the same run"
+        assert (app_config.footage_dir / "20260812120200_camera_0.ts").read_bytes() == b"c" * 4096
+        # Each plan is listed and then listed again by the still-growing check: arrival
+        # (1, 2), the sweep that found the new clip (3, 4), the sweep that found nothing (5).
+        assert listings["count"] == 5
+
+    async def test_sweeps_can_be_switched_off(self, db_session, unit, app_config, monkeypatch):
+        from app.ingest import adb
+        from app.ingest.models import RunState
+        from app.ingest.puller import run_pull
+
+        await self._enable(**{"ingest.sweep_passes": 0})
+        listings = {"count": 0}
+        real_inventory = adb.inventory
+
+        async def inventory(address, source):
+            listings["count"] += 1
+            return await real_inventory(address, source)
+
+        monkeypatch.setattr(adb, "inventory", inventory)
+
+        assert (await run_pull(trigger="manual")).state is RunState.OK
+        # The arrival listing plus the still-growing check's second look, and nothing more.
+        assert listings["count"] == 2, "no sweep listing when sweeps are off"
+
     async def test_a_window_that_closes_early_commits_only_whole_files(
         self, db_session, unit, app_config
     ):
@@ -1303,7 +1355,9 @@ class TestARunEndToEnd:
             ]
 
         monkeypatch.setattr(adb, "inventory_all", inventory_all)
-        await self._enable()
+        # Sweeps off: this test is about the growing check alone, and the fake above only
+        # grows the file once, which a later sweep would (correctly) read as stable.
+        await self._enable(**{"ingest.sweep_passes": 0})
 
         result = await puller.run_pull(trigger="manual")
 
@@ -1877,8 +1931,9 @@ class TestDrainingWhileTheCarIsStillHere:
         status.state = state
         return status
 
-    def test_a_run_that_moved_files_goes_again_immediately(self):
-        """It stopped for a reason that more copying is the answer to."""
+    def test_a_run_that_moved_files_goes_again(self):
+        """It stopped for a reason that more copying is the answer to. (No run has actually
+        finished on this status, so there is no cooldown to wait out.)"""
         from app.ingest.models import RunState
 
         poller = self._poller()
@@ -1891,6 +1946,45 @@ class TestDrainingWhileTheCarIsStillHere:
         poller = self._poller()
 
         assert poller._should_drain_again(self._status(RunState.PARTIAL)) is True
+
+    def test_a_just_finished_run_waits_out_the_cooldown(self, monkeypatch):
+        """Each run cuts the radios and restores them on the way out; going again the
+        instant it finished had Bluetooth and the hotspot flicking on and off, and the
+        screen reloading, for as long as the card kept yielding. So the next pass waits."""
+        from app.ingest.models import RunResult, RunState
+
+        poller = self._poller()
+        monkeypatch.setattr(poller, "_redrain_cooldown_s", lambda: 60.0)
+        status = self._status(RunState.OK)
+        status.try_begin()
+        status.finish(RunResult(state=RunState.OK, files=3))  # ended just now
+
+        assert poller._should_drain_again(status) is False, "the radios were only just restored"
+
+    def test_the_cooldown_passes_and_the_drain_resumes(self, monkeypatch):
+        import time as _time
+
+        from app.ingest.models import RunResult, RunState
+
+        poller = self._poller()
+        monkeypatch.setattr(poller, "_redrain_cooldown_s", lambda: 60.0)
+        status = self._status(RunState.OK)
+        status.try_begin()
+        status.finish(RunResult(state=RunState.OK, files=3))
+        status._finished_at = _time.monotonic() - 61.0
+
+        assert poller._should_drain_again(status) is True
+
+    def test_a_zero_cooldown_is_the_old_immediate_behaviour(self, monkeypatch):
+        from app.ingest.models import RunResult, RunState
+
+        poller = self._poller()
+        monkeypatch.setattr(poller, "_redrain_cooldown_s", lambda: 0.0)
+        status = self._status(RunState.OK)
+        status.try_begin()
+        status.finish(RunResult(state=RunState.OK, files=3))
+
+        assert poller._should_drain_again(status) is True
 
     def test_an_empty_card_is_not_listed_every_two_seconds(self):
         """A run that found nothing proved the card is drained. Asking again straight away

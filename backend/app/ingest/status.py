@@ -88,6 +88,10 @@ class IngestStatus:
         self.last_error: str | None = None
         self._started_at: float | None = None
         self._started_wall: datetime | None = None
+        #: When the last run ended (monotonic), so the poller can hold a re-drain off for
+        #: a cooldown rather than starting the next pull -- and quieting the radios again --
+        #: the instant the previous one restored them.
+        self._finished_at: float | None = None
         #: (monotonic, cumulative bytes) pairs inside the speed window.
         self._samples: deque[tuple[float, int]] = deque(maxlen=64)
         self._run_id: int | None = None
@@ -134,7 +138,19 @@ class IngestStatus:
                 self.last_success = datetime.now(UTC)
             self._started_at = None
             self._started_wall = None
+            self._finished_at = time.monotonic()
             self._samples.clear()
+
+    def since_finished(self) -> float:
+        """Seconds since the last run ended; infinite when no run has ended yet.
+
+        Infinite rather than zero for the never-finished case on purpose: a fresh process
+        that finds the car already here must not invent a cooldown it never earned.
+        """
+        with self._lock:
+            if self._finished_at is None:
+                return float("inf")
+            return time.monotonic() - self._finished_at
 
     def cancel(self) -> bool:
         """Ask an in-flight pull to stop at the next read. False if nothing is running."""
@@ -156,6 +172,15 @@ class IngestStatus:
             self.bytes_total = plan.bytes
             self.backlog_files = plan.backlog_files
             self.backlog_bytes = plan.backlog_bytes
+            self.active_skipped = plan.active_skipped
+
+    def extend_plan(self, plan: DeltaPlan) -> None:
+        """Grow the run's totals for a sweep: recordings found by re-checking the card
+        partway through, copied in the same run. Totals only -- the progress bar keeps
+        counting up rather than resetting -- and the backlog is left to the final reckoning."""
+        with self._lock:
+            self.files_total += len(plan.files)
+            self.bytes_total += plan.bytes
             self.active_skipped = plan.active_skipped
 
     def set_phase(self, phase: Phase) -> None:
