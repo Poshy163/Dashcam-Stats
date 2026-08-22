@@ -368,6 +368,77 @@ class TestAParkedSessionWithNoLockInventsNoPlace:
 
         assert await self._surviving_fixes(journey_id) == 0
 
+    async def test_the_cleared_rows_stop_calling_themselves_valid(self, db_session):
+        """The quality columns have to move with the coordinate.
+
+        Clearing a position used to leave ``gps_quality`` reading ``valid`` on a row with
+        no coordinate at all. Nothing drew it, because every map query tests the coordinate
+        too — but :mod:`app.osd.reasons` exists so that "which check rejected this" is a
+        query, and a rejected row reporting ``valid`` is the one answer it must never give.
+        """
+        journey_id = await self._parked_journey(lat=0.1, lon=0.0, no_fix_per_recording=250)
+
+        await self._refresh(journey_id)
+
+        async with session_scope() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(TelemetryPoint.gps_quality, TelemetryPoint.gps_reason).where(
+                            TelemetryPoint.journey_id == journey_id
+                        )
+                    )
+                )
+                .tuples()
+                .all()
+            )
+        assert rows
+        # No lock is what the camera actually reported, so that is what the rows say -- not
+        # "rejected", which would imply a reading we disbelieved.
+        assert {quality for quality, _ in rows} == {"no_fix"}
+        assert {reason for _, reason in rows} == {"no_fix"}
+
+    async def test_an_ordinary_outlier_is_marked_rejected_instead(self, db_session):
+        # The other verdict: these positions were read and disbelieved, which is a
+        # different thing from the camera never having had a lock.
+        journey_id = await self._parked_journey(lat=LAT, lon=LON, no_fix_per_recording=0)
+        async with session_scope() as session:
+            rec_id = (
+                await session.execute(
+                    select(Recording.id).where(Recording.journey_id == journey_id).limit(1)
+                )
+            ).scalar_one()
+            base = datetime(2026, 8, 20, 4, 34, tzinfo=UTC)
+            # One fix on the far side of the planet, in a journey that otherwise agrees.
+            session.add(
+                TelemetryPoint(
+                    recording_id=rec_id,
+                    journey_id=journey_id,
+                    t_offset_s=99.0,
+                    captured_at=base + timedelta(seconds=99),
+                    lat=-LAT,
+                    lon=LON,
+                    has_fix=True,
+                    speed_kmh=0.0,
+                    gps_quality="valid",
+                )
+            )
+            await session.commit()
+
+        await self._refresh(journey_id)
+
+        async with session_scope() as session:
+            row = (
+                await session.execute(
+                    select(TelemetryPoint.gps_quality, TelemetryPoint.gps_reason).where(
+                        TelemetryPoint.journey_id == journey_id,
+                        TelemetryPoint.t_offset_s == 99.0,
+                    )
+                )
+            ).one()
+        assert row.gps_quality == "rejected"
+        assert row.gps_reason == "isolated_position_outlier"
+
     async def test_a_genuinely_stationary_drive_with_a_lock_is_left_alone(self, db_session):
         """The guard that keeps this from eating real data.
 

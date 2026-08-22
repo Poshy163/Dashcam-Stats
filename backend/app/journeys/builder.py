@@ -41,6 +41,7 @@ from app.osd.outliers import (
     robust_centre,
     spatial_outliers,
 )
+from app.osd.reasons import GpsQuality, GpsReason
 from app.osd.track_quality import MAX_ROAD_SPEED_MS
 from app.osd.validate import is_plausible_step
 
@@ -660,9 +661,16 @@ class JourneyBuilder:
         # The one shape the outlier pass above is structurally unable to judge: a journey
         # with no satellite lock anywhere in it, whose only "positions" are the placeholder
         # decoding badly. They agree with each other perfectly, so nothing disagrees.
+        # Rejected for disagreeing with the drive around them, unless the whole session
+        # turns out to be a garage below -- in which case the honest reading is the one the
+        # camera gave: there was no satellite lock, and nothing was ever misread *into* a
+        # place. The two sets are disjoint by construction, so one verdict covers the batch.
+        reject_quality, reject_reason = GpsQuality.REJECTED, GpsReason.ISOLATED_POSITION_OUTLIER
+
         no_lock = self._is_no_lock_session(points, recordings)
         if no_lock:
             rejected_ids = {p.id for p in points if p.lat is not None and p.lon is not None}
+            reject_quality, reject_reason = GpsQuality.NO_FIX, GpsReason.NO_FIX
             # No centre survives: there is no established position to judge anything
             # against, and inventing one out of the readings being rejected is how the
             # placeholder got believed in the first place.
@@ -751,7 +759,9 @@ class JourneyBuilder:
 
         # -- writes ----------------------------------------------------------------------
         if rejected_ids:
-            await self._clear_positions(session, rejected_ids)
+            await self._clear_positions(
+                session, rejected_ids, quality=reject_quality, reason=reject_reason
+            )
         if stale_tracks:
             await session.execute(
                 update(TrackedObject)
@@ -863,18 +873,38 @@ class JourneyBuilder:
         return len({(float(row.lat), float(row.lon)) for row in located}) == 1
 
     @staticmethod
-    async def _clear_positions(session: AsyncSession, ids: set[int]) -> None:
+    async def _clear_positions(
+        session: AsyncSession,
+        ids: set[int],
+        *,
+        quality: GpsQuality,
+        reason: GpsReason,
+    ) -> None:
         """Strip the coordinates off telemetry rows, keeping everything else.
 
         Rejected rows keep their timestamp, speed and raw text and lose only the position,
         because the rest of the reading was never in doubt — the speed on a sign-flipped
         line is perfectly good, and discarding it would trade one wrong number for a
         missing one.
+
+        The quality columns move with the coordinate, and they were the one thing this used
+        to leave behind: a row cleared here kept saying ``valid`` while carrying no
+        position. Nothing drew it — the map tests ``lat IS NOT NULL`` as well — but
+        :mod:`app.osd.reasons` exists so that "which check rejected this, and why" is a
+        query rather than an afternoon, and a rejected row reporting ``valid`` is precisely
+        the answer that module was built to stop being wrong.
         """
         await session.execute(
             update(TelemetryPoint)
             .where(TelemetryPoint.id.in_(ids))
-            .values(has_fix=False, lat=None, lon=None, heading_deg=None)
+            .values(
+                has_fix=False,
+                lat=None,
+                lon=None,
+                heading_deg=None,
+                gps_quality=str(quality),
+                gps_reason=str(reason),
+            )
             .execution_options(synchronize_session=False)
         )
 
