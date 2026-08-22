@@ -31,6 +31,12 @@ from datetime import UTC, datetime
 #: A tenth of a degree is about 11 km, which is a wide net for a placeholder and no net at
 #: all for a real coordinate: the nearest land to (0, 0) is 600 km away. Nothing legitimate
 #: is being discarded, because nothing legitimate is there.
+#:
+#: The bound is inclusive, and that is not a detail. ``00.0000`` misread one digit at a
+#: time lands on ``00.1000`` more often than on anything else, and a strict ``<`` missed
+#: that by exactly zero: ``abs(0.1) < 0.1`` is False. One parked afternoon put 24 fixes in
+#: the Gulf of Guinea that way while ``00.0900`` from the same clip was caught, which is
+#: the tell that the comparison, not the constant, was wrong.
 NO_FIX_EPSILON = 0.1
 
 MAX_LATITUDE = 90.0
@@ -125,8 +131,11 @@ def is_no_fix_placeholder(lat: float, lon: float, epsilon: float = NO_FIX_EPSILO
     close to zero exists — the equator and the Greenwich meridian are real places — but
     both at once is 600 km off the African coast in the Gulf of Guinea, which no dashcam
     is driving through.
+
+    Inclusive on both sides, because the placeholder's commonest corruption lands exactly
+    on the bound rather than inside it — see :data:`NO_FIX_EPSILON`.
     """
-    return abs(lat) < epsilon and abs(lon) < epsilon
+    return abs(lat) <= epsilon and abs(lon) <= epsilon
 
 
 def implied_speed_ms(distance_m: float, seconds: float) -> float:

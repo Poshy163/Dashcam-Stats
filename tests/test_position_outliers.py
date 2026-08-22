@@ -118,6 +118,13 @@ class TestNoFixPlaceholder:
             "2026-08-07 12:30:29 E:00.0010 N:00.0000 0 km/h",
             "2026-08-06 10:15:15 E:00.0000 N:00.0010 0 km/h",
             "2026-08-04 11:29:38 E:00.0000 N:00.0100 77 km/h",
+            # The boundary itself. A strict ``<`` against a 0.1 epsilon missed these by
+            # exactly nothing, and they are the *commonest* corruption of the placeholder:
+            # one wrong digit in the first decimal place. Two parked clips put 24 fixes in
+            # the Gulf of Guinea this way while ``00.0900`` from the same footage was
+            # caught, which is what gave the comparison away.
+            "2026-08-20 16:08:36 E:00.0000 N:00.1000 0 km/h",
+            "2026-08-20 16:12:41 E:00.1000 N:00.0000 0 km/h",
         ],
     )
     def test_a_near_zero_placeholder_is_not_a_coordinate(self, line):
@@ -247,6 +254,180 @@ class TestJourneyMetrics:
         assert journey.min_lat is not None and journey.max_lat is not None
         assert journey.max_lat - journey.min_lat < 1.0
         assert journey.max_lat < 0, "bounds still reach into the northern hemisphere"
+
+
+class TestAParkedSessionWithNoLockInventsNoPlace:
+    """The one shape the relative checks are structurally unable to judge.
+
+    Every pass above asks whether a fix disagrees with its neighbours. A car parked in a
+    garage for two hours has no neighbours to disagree with: the camera reported no lock
+    for all but a handful of samples, and that handful is the same corrupted placeholder
+    repeated to the last printed digit. The median centre lands on the corruption, the
+    check reports a clean drive, and the map draws a journey in the Gulf of Guinea.
+
+    Two live journeys looked exactly like this — 24 fixes at ``0.1, 0.0`` and one at
+    ``0.0, 161.0`` — and each was reported as a journey whose entire bounds were the stray
+    point.
+    """
+
+    async def _parked_journey(
+        self, *, lat: float, lon: float, no_fix_per_recording: int, fixes_per_recording: int = 12
+    ) -> int:
+        async with session_scope() as session:
+            journey = Journey(
+                started_at=datetime(2026, 8, 20, 4, 34, tzinfo=UTC),
+                ended_at=datetime(2026, 8, 20, 6, 59, tzinfo=UTC),
+                duration_s=8734.0,
+            )
+            session.add(journey)
+            await session.flush()
+
+            base = datetime(2026, 8, 20, 4, 34, tzinfo=UTC)
+            for index in range(2):
+                rec = Recording(
+                    rel_path=f"parked-{index}.ts",
+                    filename=f"parked-{index}.ts",
+                    size_bytes=1,
+                    state=RecordingState.COMPLETED,
+                    journey_id=journey.id,
+                    started_at=base + timedelta(seconds=index * 60),
+                    ended_at=base + timedelta(seconds=(index + 1) * 60),
+                    telemetry_point_count=no_fix_per_recording + fixes_per_recording,
+                    gps_point_count=fixes_per_recording,
+                    gps_no_fix_count=no_fix_per_recording,
+                )
+                session.add(rec)
+                await session.flush()
+                for step in range(fixes_per_recording):
+                    session.add(
+                        TelemetryPoint(
+                            recording_id=rec.id,
+                            journey_id=journey.id,
+                            t_offset_s=float(step),
+                            captured_at=base + timedelta(seconds=index * 60 + step),
+                            # Identical every time, which no real receiver manages.
+                            lat=lat,
+                            lon=lon,
+                            has_fix=True,
+                            speed_kmh=0.0,
+                        )
+                    )
+            await session.flush()
+            return journey.id
+
+    async def _refresh(self, journey_id: int) -> Journey:
+        async with session_scope() as session:
+            journey = (
+                await session.execute(select(Journey).where(Journey.id == journey_id))
+            ).scalar_one()
+            await JourneyBuilder().refresh(session, journey)
+            await session.commit()
+        async with session_scope() as session:
+            return (
+                await session.execute(select(Journey).where(Journey.id == journey_id))
+            ).scalar_one()
+
+    async def _surviving_fixes(self, journey_id: int) -> int:
+        async with session_scope() as session:
+            return (
+                await session.execute(
+                    select(func.count(TelemetryPoint.id)).where(
+                        TelemetryPoint.journey_id == journey_id,
+                        TelemetryPoint.has_fix.is_(True),
+                    )
+                )
+            ).scalar_one()
+
+    async def test_the_placeholder_positions_are_discarded(self, db_session):
+        journey_id = await self._parked_journey(lat=0.1, lon=0.0, no_fix_per_recording=250)
+
+        journey = await self._refresh(journey_id)
+
+        assert await self._surviving_fixes(journey_id) == 0
+        assert journey.has_gps is False
+
+    async def test_the_journey_stops_claiming_bounds_it_never_had(self, db_session):
+        journey_id = await self._parked_journey(lat=0.1, lon=0.0, no_fix_per_recording=250)
+
+        journey = await self._refresh(journey_id)
+
+        # Bounds are what the heat map and the coverage list read. While these were set the
+        # map fitted itself to half the planet and every real drive collapsed into a dot.
+        assert (journey.min_lat, journey.max_lat) == (None, None)
+        assert (journey.min_lon, journey.max_lon) == (None, None)
+        assert (journey.start_lat, journey.end_lat) == (None, None)
+
+    async def test_a_corruption_that_is_not_near_null_island_goes_too(self, db_session):
+        # The rule is about the *session*, not about proximity to (0, 0). This one is a
+        # longitude in the Pacific, produced by the date being read as a coordinate.
+        journey_id = await self._parked_journey(
+            lat=0.0, lon=161.0, no_fix_per_recording=300, fixes_per_recording=1
+        )
+
+        await self._refresh(journey_id)
+
+        assert await self._surviving_fixes(journey_id) == 0
+
+    async def test_a_genuinely_stationary_drive_with_a_lock_is_left_alone(self, db_session):
+        """The guard that keeps this from eating real data.
+
+        Idling at a level crossing also produces identical coordinates. What it does not
+        produce is a camera reporting no satellite lock, so the ratio is what tells the two
+        apart — and it has to, because discarding a real position is the worse error.
+        """
+        journey_id = await self._parked_journey(lat=LAT, lon=LON, no_fix_per_recording=0)
+
+        journey = await self._refresh(journey_id)
+
+        assert await self._surviving_fixes(journey_id) == 24
+        assert journey.has_gps is True
+        assert journey.min_lat == pytest.approx(LAT)
+
+    async def test_a_lock_that_is_merely_patchy_is_left_alone(self, db_session):
+        # No lock for most of the session, but the positions it did report are distinct --
+        # the car was moving. Only the combination is damning.
+        async with session_scope() as session:
+            journey = Journey(
+                started_at=datetime(2026, 8, 20, 4, 34, tzinfo=UTC),
+                ended_at=datetime(2026, 8, 20, 4, 44, tzinfo=UTC),
+                duration_s=600.0,
+            )
+            session.add(journey)
+            await session.flush()
+            base = datetime(2026, 8, 20, 4, 34, tzinfo=UTC)
+            rec = Recording(
+                rel_path="patchy.ts",
+                filename="patchy.ts",
+                size_bytes=1,
+                state=RecordingState.COMPLETED,
+                journey_id=journey.id,
+                started_at=base,
+                ended_at=base + timedelta(seconds=600),
+                telemetry_point_count=600,
+                gps_point_count=10,
+                gps_no_fix_count=590,
+            )
+            session.add(rec)
+            await session.flush()
+            for step in range(10):
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec.id,
+                        journey_id=journey.id,
+                        t_offset_s=float(step),
+                        captured_at=base + timedelta(seconds=step),
+                        lat=LAT + step * 1e-4,
+                        lon=LON + step * 1e-4,
+                        has_fix=True,
+                        speed_kmh=40.0,
+                    )
+                )
+            await session.flush()
+            journey_id = journey.id
+
+        await self._refresh(journey_id)
+
+        assert await self._surviving_fixes(journey_id) == 10
 
 
 class TestRebuildPreservesTheIndex:

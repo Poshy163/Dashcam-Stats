@@ -252,6 +252,79 @@ class TestCandidateSelection:
         assert combined.ocr_status == "valid"
         assert combined.candidate_count == 3
 
+    def _no_fix_frame(self, confidence: float) -> OsdReading:
+        return OsdReading(
+            captured_at=BASE,
+            has_fix=False,
+            speed_kmh=0.0,
+            raw_text="2026-08-20 16:08:43 E:00.0000 N:00.0000 0 km/h",
+            confidence=confidence,
+            time_status="valid",
+            gps_status="no_fix",
+        )
+
+    def _corrupt_frame(self, confidence: float) -> OsdReading:
+        # The same printed characters, one digit misread: '00.0000' -> '00.1000'.
+        return OsdReading(
+            captured_at=BASE,
+            lat=0.1,
+            lon=0.0,
+            has_fix=True,
+            speed_kmh=0.0,
+            raw_text="2026-08-20 16:08:43 E:00.0000 N:00.1000 0 km/h",
+            confidence=confidence,
+            time_status="valid",
+            gps_status="valid",
+        )
+
+    def test_a_no_fix_sibling_beats_an_equally_confident_position(self):
+        """The camera reporting no lock is evidence, not the absence of it.
+
+        Both frames in an overlay-second are looking at the same printed characters, so
+        they cannot both be right. Preferring the positioned one unconditionally let a
+        single corrupted read beat a clean no-fix read every time, whatever the classifier
+        made of either — which is how a garage produced 24 fixes in the Gulf of Guinea.
+        """
+        combined = TelemetryExtractor._combine_candidates(
+            0.0,
+            [(0.0, self._no_fix_frame(0.94)), (0.5, self._corrupt_frame(0.94))],
+            min_confidence=0.6,
+        )
+
+        assert combined.has_fix is False
+        assert (combined.lat, combined.lon) == (None, None)
+        assert combined.gps_status == "no_fix"
+        # The clock on the same line was never in doubt and must survive.
+        assert combined.captured_at == BASE
+
+    def test_a_clearly_better_position_still_overrules_the_no_fix_frame(self):
+        # Ties go to no-fix, but this is not a veto: a confident read of a real coordinate
+        # beside a poor no-fix read is exactly the case field-by-field merging exists for.
+        combined = TelemetryExtractor._combine_candidates(
+            0.0,
+            [
+                (0.0, self._no_fix_frame(0.70)),
+                (
+                    0.5,
+                    OsdReading(
+                        captured_at=BASE,
+                        lat=LAT,
+                        lon=LON,
+                        has_fix=True,
+                        speed_kmh=61.0,
+                        raw_text="gps",
+                        confidence=0.96,
+                        time_status="valid",
+                        gps_status="valid",
+                    ),
+                ),
+            ],
+            min_confidence=0.6,
+        )
+
+        assert combined.has_fix is True
+        assert (combined.lat, combined.lon) == (LAT, LON)
+
     def test_all_low_confidence_candidates_are_retained_but_not_trusted(self):
         reading = OsdReading(
             captured_at=BASE,

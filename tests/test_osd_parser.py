@@ -142,6 +142,36 @@ class TestCoordinatesAreNeverInvented:
         r = parse_osd_text("2026.0731 15:15:03")
         assert r.has_position is False
 
+    def test_a_surviving_date_cannot_become_a_longitude_when_the_clock_dies(self):
+        """The same guard, in the one case it used to be missing.
+
+        Coordinates are searched for from the *end* of the timestamp precisely so the date
+        cannot be read as one — but that only happened when the whole timestamp matched.
+        On this frame, from a car parked in a garage, the time is destroyed and the ``E:``
+        field is wreckage, so the search restarted at zero and spliced the day digits onto
+        what was left: ``161.0000``, a longitude in the Pacific, at 0.96 confidence.
+        """
+        r = parse_osd_text("2026-08-16 1 .0000 N:00.0000 0 km/h")
+        assert r.has_position is False
+        assert r.lon is None
+
+    @pytest.mark.parametrize(
+        ("line", "expected_lon"),
+        [
+            # The clock does not parse in any of these, so the date is stepped over on its
+            # own -- and that must not cost the coordinates beside it. A hole in the map is
+            # cheap only when it is a hole that had to be there.
+            ("202670 13:49:22 E:138.7075 N:-34.7955 61 km/h", 138.7075),
+            ("-07-28 13:49:25 E:138.7078 N:-34.7955 57 km/h", 138.7078),
+            ("E:138.7078 N:-34.7955 57 km/h", 138.7078),
+        ],
+    )
+    def test_stepping_over_the_date_does_not_cost_a_clean_fix(self, line, expected_lon):
+        r = parse_osd_text(line)
+        assert r.has_position is True
+        assert r.lon == pytest.approx(expected_lon)
+        assert r.lat == pytest.approx(-34.7955)
+
 
 class TestNoFix:
     def test_zero_coordinates_mean_no_fix_not_null_island(self):

@@ -98,6 +98,23 @@ _TIMESTAMP_RE = re.compile(
     rf"(?P<hour>\d{{2}}){_SEP}(?P<minute>\d{{2}}){_SEP}(?P<second>\d{{2}})(?!\d)"
 )
 
+#: The date half of the overlay clock, on its own.
+#:
+#: The coordinate patterns are deliberately run from the *end* of the timestamp, so that a
+#: date whose separators decoded badly cannot be read as a position. That guard only ever
+#: existed when the whole timestamp matched — and the frame that needs it most is the one
+#: where the time is destroyed and the date survives. On ``2026-08-16 1 .0000 N:00.0000``
+#: the clock did not match, the search restarted at zero, and the strict pattern spliced
+#: the day digits onto the wreckage of the ``E:`` field to report ``161.0000``: a longitude
+#: in the Pacific, at 0.96 confidence, from a car parked in a garage.
+#:
+#: Anchored on the first digit of the line rather than searched for anywhere in it. The
+#: overlay prints the date leftmost, so a date-shaped run that starts where the digits
+#: start is the date; one further in is just as likely to *be* the coordinates — a northern
+#: hemisphere ``E:138.7078N:34.7955`` has the same shape — and skipping past those would
+#: lose the fix this is meant to protect.
+_DATE_SHAPE_RE = re.compile(rf"\d{{4}}{_SEP}\d{{2}}{_SEP}\d{{2}}")
+
 
 #: Longitude, then latitude, then speed. Applied to the compacted text.
 #:
@@ -274,6 +291,20 @@ def _precision_is_expected(lon: str | None, lat: str | None, decimals: int) -> b
     return _fraction_width(lon) == decimals and _fraction_width(lat) == decimals
 
 
+def _date_shape_end(compact: str) -> int:
+    """Where to start looking for coordinates when the clock could not be read.
+
+    Returns the offset just past a date-shaped run beginning at the line's first digit, or
+    zero when there is no such run — in which case nothing is skipped and the behaviour is
+    what it always was.
+    """
+    first_digit = next((i for i, ch in enumerate(compact) if ch.isdigit()), None)
+    if first_digit is None:
+        return 0
+    date = _DATE_SHAPE_RE.match(compact, first_digit)
+    return date.end() if date else 0
+
+
 def _parse_timestamp(groups: dict[str, str], problems: list[str]) -> datetime | None:
     try:
         year = int(groups["year"])
@@ -355,7 +386,10 @@ def parse_osd_text(
     # Searching from the end of the timestamp keeps a mangled date out of the coordinate
     # match: a ``-`` that decoded as ``.`` can turn ``2026-07-31`` into something with the
     # shape of a coordinate, and matching that would invent a position from the clock.
-    search_from = stamp.end() if stamp else 0
+    # When the clock did not parse at all the date is stepped over on its own, because
+    # otherwise the one frame with no timestamp to hide behind is the one frame where the
+    # date is fair game -- see :data:`_DATE_SHAPE_RE`.
+    search_from = stamp.end() if stamp else _date_shape_end(compact)
     strict_re, loose_re = _fix_patterns(coord_decimals)
     match = strict_re.search(compact, search_from) or loose_re.search(compact, search_from)
     recovered_groups = (

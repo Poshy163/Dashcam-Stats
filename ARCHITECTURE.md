@@ -573,6 +573,40 @@ disagreeing with it. A median cannot be dragged by the outlier it is looking for
 whole recording now gets a say before the walk starts, and a walk that condemns a majority
 is treated as evidence of a bad anchor rather than a field of outliers.
 
+### A parked session has nothing to disagree with
+
+Every check above is *relative*: does this fix disagree with its recording, or with the rest
+of its drive? That question has no answer for a car parked in a garage. The camera reports
+no lock for almost every sample, the handful it misreads are the same corrupted placeholder
+to the last printed digit, and the median centre lands on the corruption — so the journey is
+reported as a clean drive to wherever the corruption points.
+
+Two live journeys were exactly this: 24 fixes at `0.1, 0.0` and one at `0.0, 161.0`, each
+reported as a journey whose *entire bounds* were the stray point. Four independent things
+had to be wrong at once:
+
+* **The no-fix epsilon was exclusive.** `00.0000` misread one digit at a time lands on
+  `00.1000` more often than anything else, and `abs(0.1) < 0.1` is False. The bound is now
+  inclusive; `00.0900` from the same footage was always caught, which is what gave it away.
+* **A destroyed clock let the date be read as a coordinate.** Coordinates are searched for
+  from the end of the timestamp precisely so a mangled date cannot become a position, but
+  that guard only existed when the timestamp matched. `2026-08-16 1 .0000 N:00.0000` has no
+  readable time, so the search restarted at zero and spliced the day digits onto the wreck
+  of the `E:` field: `161.0000`. The date is now stepped over on its own.
+* **The candidate merge preferred a position over "no fix".** Two frames per overlay-second
+  read the same printed characters, so they cannot both be right; taking the positioned one
+  unconditionally let one corrupt read beat a clean no-fix read every time. Ties now go to
+  no-fix — overruling the camera's own report is the claim that needs the evidence.
+* **Nothing judged the session as a whole.** A journey whose camera reported no lock at
+  least ten times as often as it reported a position, and whose every position is the same
+  coordinate to the last digit, is now read as a parked session rather than a place. A real
+  receiver wanders further than the overlay's 11 m quantisation within a minute; a constant
+  repeated exactly is one misread rendered the same way every time.
+
+The ratio is what keeps this off real data. Idling at a level crossing also produces
+identical coordinates — but it does not produce a camera reporting no lock, and discarding
+a real position is the worse error.
+
 ### Tracing `-34.8040, -8.6845` on the live library
 
 Worth writing down in full, because the obvious explanation was wrong and the measurement

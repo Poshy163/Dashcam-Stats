@@ -54,6 +54,21 @@ log = get_logger(__name__)
 #: eighteen-minute drive.
 _MAX_LEG_M = 50_000.0
 
+#: How lopsided a journey has to be before its few "positions" are read as a misread
+#: placeholder rather than as a place.
+#:
+#: The outlier pass either side of this is *relative* — it asks whether a fix disagrees
+#: with its recording or with the rest of its drive. That question has no answer for a
+#: session the camera spent parked with no satellite lock, because there is nothing to
+#: disagree with: every located fix is the same corrupted ``00.0000`` marker, so the median
+#: centre lands on it and the check reports a clean drive to the Gulf of Guinea.
+#:
+#: Ten no-fix samples for every position is deliberately lopsided. A parked car that really
+#: does hold a lock reports thousands of positions and no no-fix samples at all, so it is
+#: nowhere near this; a garage reports hundreds of no-fix samples and a handful of
+#: corruptions, and lands well past it.
+_NO_LOCK_FIX_RATIO = 10.0
+
 #: Metres a vehicle could cover in a second, including the overlay's own quantisation.
 #:
 #: Taken from :mod:`app.osd.track_quality` rather than restated, so the journey's idea of
@@ -641,6 +656,24 @@ class JourneyBuilder:
         # *every* point, so the write phase below clears every copy of a bad one; the
         # single track assembled next is only for measuring.
         rejected_ids, centre, radius_m = self._find_outliers(points, journey.duration_s)
+
+        # The one shape the outlier pass above is structurally unable to judge: a journey
+        # with no satellite lock anywhere in it, whose only "positions" are the placeholder
+        # decoding badly. They agree with each other perfectly, so nothing disagrees.
+        no_lock = self._is_no_lock_session(points, recordings)
+        if no_lock:
+            rejected_ids = {p.id for p in points if p.lat is not None and p.lon is not None}
+            # No centre survives: there is no established position to judge anything
+            # against, and inventing one out of the readings being rejected is how the
+            # placeholder got believed in the first place.
+            centre = None
+            log.info(
+                "journey has no satellite lock; its positions are a misread placeholder",
+                journey_id=journey.id,
+                telemetry=len(rejected_ids),
+                no_fix_samples=sum(r.gps_no_fix_count or 0 for r in recordings),
+            )
+
         good = [p for p in points if p.id not in rejected_ids]
         track = self._one_track(good, recordings, front_ids)
 
@@ -649,7 +682,7 @@ class JourneyBuilder:
         # which is why a coordinate cleared out of `telemetry_points` went on being drawn
         # on the map as a detection long afterwards.
         stale_tracks, stale_observations = await self._find_stale_sighting_positions(
-            session, recording_ids, centre, radius_m
+            session, recording_ids, centre, radius_m, reject_all=no_lock
         )
 
         counts = (
@@ -802,6 +835,34 @@ class JourneyBuilder:
         return {located[i].id for i in outliers}, centre, radius
 
     @staticmethod
+    def _is_no_lock_session(rows: list, recordings: list[Recording]) -> bool:
+        """Is this a parked session whose "positions" are the no-fix marker misread?
+
+        Two conditions, and both are needed. The camera has to have reported no lock
+        overwhelmingly more often than it reported a position — see
+        :data:`_NO_LOCK_FIX_RATIO` — and every position it did report has to be the *same*
+        coordinate, to the last printed digit.
+
+        The second is what separates this from a genuinely stationary drive. A real lock
+        wanders: the overlay prints four decimals, about 11 m, and a stationary receiver
+        drifts further than that within a minute, so a parked hour is dozens of distinct
+        cells. A constant repeated to the fourth decimal across every fix in a journey is
+        not a receiver, it is one misread rendered the same way every time.
+
+        A journey holding a single position is caught by the same rule, vacuously — and
+        that is the intent rather than an oversight. One unrepeatable fix in a session the
+        camera otherwise spent reporting no lock has nothing to corroborate it, and the
+        live library's example was a longitude of 161.0 in the Pacific.
+        """
+        located = [row for row in rows if row.lat is not None and row.lon is not None]
+        if not located:
+            return False
+        no_fix_samples = sum(recording.gps_no_fix_count or 0 for recording in recordings)
+        if no_fix_samples < len(located) * _NO_LOCK_FIX_RATIO:
+            return False
+        return len({(float(row.lat), float(row.lon)) for row in located}) == 1
+
+    @staticmethod
     async def _clear_positions(session: AsyncSession, ids: set[int]) -> None:
         """Strip the coordinates off telemetry rows, keeping everything else.
 
@@ -823,6 +884,8 @@ class JourneyBuilder:
         recording_ids: list[int],
         centre: tuple[float, float] | None,
         radius_m: float,
+        *,
+        reject_all: bool = False,
     ) -> tuple[list[int], list[int]]:
         """Sightings holding a coordinate this journey says the vehicle was never at.
 
@@ -834,8 +897,11 @@ class JourneyBuilder:
         the drive it belonged to, long after the telemetry point behind it was gone.
 
         Judged by the same centre and radius as the telemetry, so the two cannot disagree.
+        ``reject_all`` is the case where there is no centre to judge against because every
+        telemetry position was thrown out: a sighting stamped from those is no better than
+        the fix it was copied from.
         """
-        if centre is None:
+        if centre is None and not reject_all:
             return [], []
 
         stale: dict[str, list[int]] = {"tracks": [], "observations": []}
@@ -852,7 +918,8 @@ class JourneyBuilder:
             stale[key] = [
                 row.id
                 for row in rows
-                if haversine_m(centre[0], centre[1], float(row.lat), float(row.lon)) > radius_m
+                if centre is None
+                or haversine_m(centre[0], centre[1], float(row.lat), float(row.lon)) > radius_m
             ]
         return stale["tracks"], stale["observations"]
 

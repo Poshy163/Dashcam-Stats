@@ -450,9 +450,31 @@ class TelemetryExtractor:
         speed_reading = best(lambda r: r.speed_kmh is not None)
         no_fix = best(lambda r: r.gps_status == "no_fix")
 
+        # A sibling frame that read ``00.0000/00.0000`` is not the *absence* of a position,
+        # it is the camera stating it has no lock -- and the two frames sampled in one
+        # overlay-second are looking at the same printed characters, so they cannot both be
+        # right. Preferring the positioned frame unconditionally meant one corrupted read
+        # beat a clean no-fix read every time, whatever the classifier thought of either.
+        # That is how a garage full of ``N:00.0000`` became 24 fixes in the Gulf of Guinea.
+        #
+        # Ties go to no-fix on purpose. Overruling the camera's own report is the claim that
+        # needs the evidence, so the frame carrying coordinates has to be *more* confident,
+        # not merely as confident.
+        overruled = (
+            gps_reading is not None
+            and no_fix is not None
+            and no_fix.confidence >= gps_reading.confidence
+        )
+        if overruled:
+            gps_reading = None
+
         fields = sum(value is not None for value in (time_reading, gps_reading, speed_reading))
         status = "valid" if fields == 3 else "partial" if fields else "failed"
         problems = list(dict.fromkeys(problem for r in trusted for problem in (r.problems or [])))
+        if overruled:
+            problems.append(
+                "a sibling frame read the no-fix marker at least as confidently; position discarded"
+            )
         if len(candidates) > 1 and fields:
             problems.append(f"selected best fields from {len(candidates)} candidate frames")
 
