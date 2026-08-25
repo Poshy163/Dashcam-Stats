@@ -17,9 +17,18 @@ its own, and it was verified to outlive both the launching client exiting and a 
 starting powers the unit up; the app arms the watcher the moment the unit is seen; the car
 drives off; the session drops; the script keeps sampling. Every 20 seconds
 it appends one line — unit clock, card writable or read-only, age of the newest recording,
-free space, free memory — and when the car is next seen, the app collects the log, reads
-the drive's story out of it, and reports anything that went wrong where a person will see
-it: the log, the Settings page, and the Home Assistant webhook that reaches a phone.
+free space, free memory, and the age of each camera's newest recording — and when the car
+is next seen, the app collects the log, reads the drive's story out of it, and reports
+anything that went wrong where a person will see it: the log, the Settings page, and the
+Home Assistant webhook that reaches a phone.
+
+**Why per camera as well as overall.** A car with a rear camera records from both at once,
+so the newest file on the card stays fresh while *either* of them works. A rear camera that
+dies — and its cable is the most failure-prone part of any install, run the length of the
+car behind the trim — therefore takes half the footage with it while every whole-card check
+stays green. Each camera's own liveness is the only thing that can see it, and a camera is
+only ever judged against a sibling that is demonstrably recording in the same sample, so a
+parked car with everything idle is never mistaken for a failure.
 
 **The stall rule needs its grace period explained.** The age of the newest ``.ts`` is the
 liveness signal — this camera closes a segment roughly every minute, so an age beyond
@@ -98,10 +107,11 @@ ARM_DEBOUNCE_S = 120.0
 #: refused otherwise, never escaped.
 _SAFE_DIR = re.compile(r"^/[A-Za-z0-9/_.-]{1,200}$")
 
-#: One log line: ``epoch|card|age|avail_kb|memavail_kb|fix``. The sixth field is optional so
-#: logs written by an older watcher (five fields, no self-heal) still parse. Any field may be
-#: ``na``/``nodir``; ``fix`` is ``-`` normally and ``fixtry`` on a cycle that remounted.
-_LINE = re.compile(r"^(\d{9,11})\|(\w+)\|(\w+)\|(\w+)\|(\w+)(?:\|([\w-]+))?$")
+#: One log line: ``epoch|card|age|avail_kb|memavail_kb|fix|cams``. The last two fields are
+#: optional so logs written by an older watcher still parse. Any field may be ``na``/
+#: ``nodir``; ``fix`` is ``-`` normally and ``fixtry`` on a cycle that remounted; ``cams``
+#: is ``0:12;1:45;`` — the age of each camera's newest recording.
+_LINE = re.compile(r"^(\d{9,11})\|(\w+)\|(\w+)\|(\w+)\|(\w+)(?:\|([\w-]+))?(?:\|([\d:;]*))?$")
 
 #: How many self-heal remounts the watcher will attempt in one drive, and how far apart.
 #: A card that does not come back after a few tries is failing, not stuck, and wants
@@ -146,7 +156,7 @@ fixes=0
 lastfix=0
 while :; do
   now=$(date +%s)
-  card=na; age=na; avail=na; mem=na; fixed=-
+  card=na; age=na; avail=na; mem=na; fixed=-; cams=
   line=$(grep " vfat " /proc/mounts | grep /mnt/media_rw | head -n 1)
   if [ -n "$line" ]; then
     set -- $line
@@ -158,6 +168,17 @@ while :; do
       m=$(stat -c %Y "$f" 2>/dev/null)
       [ -n "$m" ] && age=$((now-m))
     fi
+    # Per camera, not just the newest overall. A car with a rear camera records from both
+    # at once, so the newest file is fresh as long as *either* works -- which is how a dead
+    # rear camera stays invisible while half the footage silently stops existing. Bounded
+    # 0..3: front, rear, interior, spare is every configuration this hardware has.
+    for c in 0 1 2 3; do
+      g=$(ls -t "$DIR"/*_camera_$c.ts 2>/dev/null | head -n 1)
+      if [ -n "$g" ]; then
+        m=$(stat -c %Y "$g" 2>/dev/null)
+        [ -n "$m" ] && cams="$cams$c:$((now-m));"
+      fi
+    done
     set -- $(df -k "$DIR" 2>/dev/null | tail -n 1)
     [ -n "$4" ] && avail=$4
   else
@@ -176,7 +197,7 @@ while :; do
       fi
     fi
   fi
-  echo "$now|$card|$age|$avail|$mem|$fixed" >> "$LOG"
+  echo "$now|$card|$age|$avail|$mem|$fixed|$cams" >> "$LOG"
   n=$(wc -l < "$LOG")
   [ "$n" -gt 4000 ] && {{ tail -n 2000 "$LOG" > "$LOG.t" && mv "$LOG.t" "$LOG"; }}
   sleep {int(sample_interval_s)}
@@ -193,6 +214,9 @@ class Sample:
     avail_kb: int | None
     mem_kb: int | None
     fix: str = "-"  # "fixtry" on a cycle where the watcher remounted the card
+    #: ``{camera index: seconds since that camera's newest recording}``. Empty for a log
+    #: written by a watcher that did not report per-camera ages.
+    cameras: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -226,7 +250,12 @@ def parse(raw: str) -> list[Sample]:
         match = _LINE.match(line.strip())
         if not match:
             continue
-        ts, card, age, avail, mem, fix = match.groups()
+        ts, card, age, avail, mem, fix, cams = match.groups()
+        cameras: dict[int, int] = {}
+        for entry in (cams or "").split(";"):
+            index, _, seconds = entry.partition(":")
+            if index.isdigit() and seconds.isdigit():
+                cameras[int(index)] = int(seconds)
         samples.append(
             Sample(
                 ts=int(ts),
@@ -236,6 +265,7 @@ def parse(raw: str) -> list[Sample]:
                 avail_kb=int(avail) if avail.isdigit() else None,
                 mem_kb=int(mem) if mem.isdigit() else None,
                 fix=fix or "-",
+                cameras=cameras,
             )
         )
     samples.sort(key=lambda s: s.ts)
@@ -309,6 +339,28 @@ def analyze(samples: list[Sample]) -> Report:
                 f"the recorder STOPPED WRITING around {_when(stalls[0].ts)} for ~{span} "
                 f"min while the unit was running — that footage does not exist"
             )
+
+        # One camera stopped while another kept going. The single-newest-file check above
+        # cannot see this at all: a car records front and rear at once, so the newest file
+        # stays fresh while one camera works, and a rear camera that dies -- a cable rubbed
+        # through behind the trim, a connector corroded, the camera itself -- silently
+        # takes half the footage with it and every other check stays green. A camera is
+        # only judged against a sibling that is *demonstrably* recording in the same
+        # sample, so this cannot fire while the car is simply parked.
+        for index in sorted({i for s in trip for i in s.cameras}):
+            dead = [
+                s
+                for s in trip
+                if s.ts - start > STALL_AGE_S
+                and s.cameras.get(index, 0) > STALL_AGE_S
+                and any(other != index and seen <= STALL_AGE_S for other, seen in s.cameras.items())
+            ]
+            if dead:
+                report.incidents.append(
+                    f"camera {index} STOPPED RECORDING around {_when(dead[0].ts)} while the "
+                    f"other camera kept going — check its cable and connector; footage from "
+                    f"that camera does not exist for that period"
+                )
 
         gone = [s for s in trip if s.nodir and s.ts - start > 60]
         if gone:

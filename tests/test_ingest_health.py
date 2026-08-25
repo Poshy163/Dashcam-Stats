@@ -136,6 +136,49 @@ class TestTheOtherIncidents:
         assert report.healthy
 
 
+class TestPerCameraLiveness:
+    """A dead rear camera is invisible to the newest-file check: the front keeps writing,
+    so the newest file stays fresh while half the footage stops existing."""
+
+    def _row(self, ts, cams, *, card="rw", age=30):
+        return (ts, card, age, 20_000_000, 500_000, "-", cams)
+
+    def test_the_script_reports_an_age_per_camera(self):
+        text = health.script()
+        assert "for c in 0 1 2 3" in text, "no per-camera loop"
+        assert "_camera_$c.ts" in text
+        assert "$fixed|$cams" in text, "per-camera ages must reach the log"
+
+    def test_a_camera_that_stops_while_the_other_records_is_caught(self):
+        start = 1_755_640_000
+        rows = [self._row(start + i * TICK, "0:20;1:25;") for i in range(6)]
+        # The rear camera stops: its age climbs while the front stays fresh.
+        rows += [self._row(start + (6 + i) * TICK, f"0:20;1:{200 + i * TICK};") for i in range(8)]
+        report = health.analyze(health.parse(_log(rows)))
+        joined = " ".join(report.incidents)
+        assert "camera 1 STOPPED RECORDING" in joined, report.incidents
+        assert "camera 0" not in joined, "the working camera must not be blamed"
+
+    def test_a_parked_car_with_both_cameras_idle_is_not_an_incident(self):
+        """Both stale together is the car being off, not a camera failing."""
+        start = 1_755_640_000
+        rows = [
+            self._row(start + i * TICK, f"0:{300 + i};1:{300 + i};", age=300 + i) for i in range(10)
+        ]
+        report = health.analyze(health.parse(_log(rows)))
+        assert not any("STOPPED RECORDING" in i for i in report.incidents), report.incidents
+
+    def test_both_cameras_healthy_is_silent(self):
+        start = 1_755_640_000
+        rows = [self._row(start + i * TICK, "0:15;1:18;") for i in range(10)]
+        report = health.analyze(health.parse(_log(rows)))
+        assert report.healthy, report.incidents
+
+    def test_a_log_without_camera_ages_still_parses(self):
+        (sample,) = health.parse("1755640000|rw|30|20000000|500000|-")
+        assert sample.cameras == {}
+
+
 class TestSelfHeal:
     def test_the_fix_field_is_parsed_and_old_five_field_lines_still_work(self):
         new = health.parse("1755640000|ro|30|20000000|500000|fixtry")
