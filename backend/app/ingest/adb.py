@@ -392,6 +392,66 @@ async def resolve_locked(address: str, source: str) -> str:
     return candidate if found == "yes" else ""
 
 
+#: How the camera names the segment it is still writing, and where it leaves it.
+#:
+#: The recorder writes the in-progress segment as ``pre_<start>_camera_N.ts`` in ``DCIM``
+#: itself — one level above ``Video`` — pre-creates the next one as a zero-byte
+#: placeholder, and finalises into ``DCIM/Video`` on close. When the power dies mid-
+#: segment the finalise loses a race with the unit's three-second shutdown countdown
+#: (``persist.sys.shutdown.countdown.time=3`` on this unit): the front camera usually
+#: makes it, the rear often does not, and its partial stays stranded at the DCIM root —
+#: valid, playable MPEG-TS (verified on the card: 0x47 sync packets and a clean PAT), of
+#: exactly the footage most worth having, the last minute before the car shut off.
+PARTIAL_PREFIX = "pre_"
+
+
+async def list_orphan_partials(
+    address: str, source: str, *, unit_now: int, min_age_s: int = 180
+) -> list[RemoteFile]:
+    """Cut-short recordings stranded beside ``source``'s parent, oldest first.
+
+    Only files that are demonstrably orphans: non-zero (a zero-byte partial is a
+    placeholder or a loss with nothing in it), older than *min_age_s* by the unit's own
+    clock (the one that stamped them — the live segment is written continuously, so age is
+    what separates the stranded from the in-flight), and named exactly the way the camera
+    names its in-progress files. Absence and errors return an empty list: a card with no
+    orphans is the healthy case, and rescue must never be able to fail a window.
+    """
+    parent, _, leaf = source.rstrip("/").rpartition("/")
+    if not parent or not leaf:
+        return []
+    command = (
+        f"cd '{parent}' && set -- {PARTIAL_PREFIX}*.ts && [ -e \"$1\" ] && "
+        f"stat -c '%s|%n|%Y' {PARTIAL_PREFIX}*.ts; exit 0"
+    )
+    try:
+        reply = await shell(address, command)
+    except AdbError as exc:
+        log.debug("could not look for cut-short recordings", error=str(exc))
+        return []
+    orphans: list[RemoteFile] = []
+    for line in reply.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 3:
+            continue
+        name = parts[1].strip()
+        if not name.startswith(PARTIAL_PREFIX) or not is_safe_name(name):
+            continue
+        # The rescued file is committed under the name the camera *would* have given it,
+        # so that name has to be safe too — and non-empty, which a bare "pre_.ts" is not.
+        if not is_safe_name(name[len(PARTIAL_PREFIX) :]):
+            continue
+        try:
+            size, mtime = int(parts[0]), int(parts[2])
+        except ValueError:
+            continue
+        if size <= 0 or unit_now - mtime < min_age_s:
+            continue
+        orphans.append(RemoteFile(name=name, size=size, mtime=mtime, directory=parent))
+    orphans.sort(key=lambda f: f.mtime)
+    return orphans
+
+
 async def inventory_all(address: str, sources: list[str]) -> list[RemoteFile]:
     """List several directories, first listing winning any name that appears twice.
 

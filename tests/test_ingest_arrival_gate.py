@@ -96,6 +96,21 @@ class TestTheArrivalGate:
         assert await p._arrival_ready("u:5555") is True
         assert get_status().arrival_hold is False
 
+    async def test_a_run_that_starts_clears_the_hold(self, gate):
+        """The field bug: a manual pull bypasses this gate entirely, so a hold published
+        earlier stood while the transfer visibly ran -- state=running, phase=transferring,
+        and the Backup page still saying "Waiting until you're home"."""
+        p, settings, set_uptime = gate
+        settings.values["ingest.min_uptime_s"] = 120
+        set_uptime(15.0)
+        assert await p._arrival_ready("u:5555") is False
+        assert get_status().arrival_hold is True
+
+        assert get_status().try_begin() is True
+
+        assert get_status().arrival_hold is False, "a run under way is not a run being held"
+        assert get_status().snapshot()["arrival_hold_reason"] is None
+
     async def test_crossing_the_threshold_clears_a_standing_hold(self, gate):
         """A genuine arrival with a short trip: held at first, released the tick its uptime
         crosses the line, and the hold reason cleared so the page stops explaining it."""

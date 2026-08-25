@@ -1159,6 +1159,87 @@ class TestARunEndToEnd:
         # (1, 2), the sweep that found the new clip (3, 4), the sweep that found nothing (5).
         assert listings["count"] == 5
 
+    async def test_a_cut_short_recording_is_rescued_under_its_proper_name(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """The stranded partial: the camera lost the shutdown race and left it beside
+        Video, valid TS up to the cut. It must land in the library under the name the
+        camera would have given it -- never as a `pre_` file the scanner cannot parse."""
+        from app.ingest import adb
+        from app.ingest.models import RemoteFile, RunState
+        from app.ingest.puller import run_pull
+
+        await self._enable()
+        unit.payload["pre_20260812115900_camera_1.ts"] = b"p" * 2048
+        # The listener can serve the partial, but the Video listing must not show it --
+        # in reality the stranded file lives one level up, outside what inventory sees.
+        listed = adb.inventory
+
+        async def inventory(address, source):
+            return [i for i in await listed(address, source) if not i.name.startswith("pre_")]
+
+        monkeypatch.setattr(adb, "inventory", inventory)
+
+        async def orphans(address, source, *, unit_now, min_age_s=180):
+            return [RemoteFile("pre_20260812115900_camera_1.ts", 2048, 0, "/storage/Tfcard/DCIM")]
+
+        monkeypatch.setattr(adb, "list_orphan_partials", orphans)
+
+        result = await run_pull(trigger="manual")
+
+        assert result.state is RunState.OK, result.error
+        assert result.files == 3, "the rescued partial must count with the run"
+        rescued = app_config.footage_dir / "20260812115900_camera_1.ts"
+        assert rescued.read_bytes() == b"p" * 2048
+        assert not (app_config.footage_dir / "pre_20260812115900_camera_1.ts").exists()
+        assert unit.deleted == [], "rescue must not delete from the card by default"
+
+    async def test_a_rescue_already_in_the_library_is_not_repeated(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """Idempotence with delete-after-verify off: the orphan stays on the card, so the
+        next window sees it again and must recognise its target already landed."""
+        from app.ingest import adb
+        from app.ingest.models import RemoteFile, RunState
+        from app.ingest.puller import run_pull
+
+        await self._enable()
+        unit.payload["pre_20260812115900_camera_1.ts"] = b"p" * 2048
+        listed = adb.inventory
+
+        async def inventory(address, source):
+            return [i for i in await listed(address, source) if not i.name.startswith("pre_")]
+
+        monkeypatch.setattr(adb, "inventory", inventory)
+
+        async def orphans(address, source, *, unit_now, min_age_s=180):
+            return [RemoteFile("pre_20260812115900_camera_1.ts", 2048, 0, "/storage/Tfcard/DCIM")]
+
+        monkeypatch.setattr(adb, "list_orphan_partials", orphans)
+        assert (await run_pull(trigger="manual")).state is RunState.OK
+
+        second = await run_pull(trigger="manual")
+
+        assert second.state is RunState.IDLE, "nothing new: the rescue must not repeat"
+        assert second.files == 0
+
+    async def test_rescue_can_be_switched_off(self, db_session, unit, app_config, monkeypatch):
+        from app.ingest import adb
+        from app.ingest.models import RunState
+        from app.ingest.puller import run_pull
+
+        await self._enable(**{"ingest.rescue_partials": False})
+        called = {"n": 0}
+
+        async def orphans(address, source, *, unit_now, min_age_s=180):
+            called["n"] += 1
+            return []
+
+        monkeypatch.setattr(adb, "list_orphan_partials", orphans)
+
+        assert (await run_pull(trigger="manual")).state is RunState.OK
+        assert called["n"] == 0, "switched off means the card is never even asked"
+
     async def test_sweeps_can_be_switched_off(self, db_session, unit, app_config, monkeypatch):
         from app.ingest import adb
         from app.ingest.models import RunState
@@ -2038,6 +2119,67 @@ class TestDrainingWhileTheCarIsStillHere:
         assert poller._should_drain_again(self._status(RunState.OK)) is True
 
         assert poller._should_drain_again(self._status(RunState.IDLE)) is True
+
+
+class TestListingOrphanPartials:
+    """Which stranded `pre_` files count as rescuable, straight off the stat output."""
+
+    def _reply(self, monkeypatch, text):
+        from app.ingest import adb
+
+        async def shell(address, command, **kwargs):
+            assert "pre_*.ts" in command and "/storage/Tfcard/DCIM" in command
+            return text
+
+        monkeypatch.setattr(adb, "shell", shell)
+
+    async def test_an_abandoned_partial_is_found_and_its_target_name_derived(self, monkeypatch):
+        from app.ingest import adb
+
+        self._reply(monkeypatch, "22544384|pre_20260825113830_camera_1.ts|1000\n")
+        found = await adb.list_orphan_partials(
+            "u:5555", "/storage/Tfcard/DCIM/Video", unit_now=2000
+        )
+        assert [f.name for f in found] == ["pre_20260825113830_camera_1.ts"]
+        assert found[0].directory == "/storage/Tfcard/DCIM"
+
+    async def test_zero_byte_placeholders_and_the_live_segment_are_left_alone(self, monkeypatch):
+        from app.ingest import adb
+
+        self._reply(
+            monkeypatch,
+            "0|pre_20260825113930_camera_1.ts|1000\n"  # placeholder: nothing in it
+            "39813120|pre_20260825133512_camera_0.ts|1990\n",  # 10s old: being written NOW
+        )
+        found = await adb.list_orphan_partials(
+            "u:5555", "/storage/Tfcard/DCIM/Video", unit_now=2000
+        )
+        assert found == []
+
+    async def test_a_hostile_or_unmappable_name_is_dropped(self, monkeypatch):
+        from app.ingest import adb
+
+        self._reply(
+            monkeypatch,
+            "4096|pre_a b.ts|1000\n"  # space: would word-split in a shell
+            "4096|pre_.ts|1000\n"  # strips to an empty target name
+            "4096|notpre_20260825113830.ts|1000\n",
+        )
+        found = await adb.list_orphan_partials(
+            "u:5555", "/storage/Tfcard/DCIM/Video", unit_now=2000
+        )
+        assert found == []
+
+    async def test_a_dead_control_channel_is_an_empty_list_not_an_error(self, monkeypatch):
+        from app.ingest import adb
+
+        async def shell(address, command, **kwargs):
+            raise adb.AdbError("car has left")
+
+        monkeypatch.setattr(adb, "shell", shell)
+        assert (
+            await adb.list_orphan_partials("u:5555", "/storage/Tfcard/DCIM/Video", unit_now=2000)
+        ) == []
 
 
 class TestFindingTheFootageDirectory:

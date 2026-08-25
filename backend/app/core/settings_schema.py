@@ -1105,6 +1105,22 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.rescue_partials",
+        "Rescue recordings cut short by the engine stopping",
+        "bool",
+        True,
+        "ingest",
+        "When the engine stops mid-recording, the camera races the unit's three-second "
+        "shutdown to finish the segment it is writing — and when it loses, the partial "
+        "recording is stranded in a folder the camera never shows again, holding the most "
+        "valuable footage there is: the last moments before the car shut off. It is still "
+        "perfectly playable up to the cut. This finds those stranded partials, copies them "
+        "over with the rest of the backup, and files them under the name the camera would "
+        "have used. Only files provably abandoned are touched — non-empty, and minutes "
+        "old — never the one being written right now.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
         "ingest.redrain_cooldown_s",
         "Pause between backups while the car stays parked",
         "int",

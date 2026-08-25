@@ -122,6 +122,18 @@ class IngestStatus:
             self.active_skipped = 0
             self.current_file = None
             self.last_error = None
+            # A run that has actually begun is not being held for anything. Both holds are
+            # published by things that decide *whether* to start -- the band gate, the
+            # poller's arrival gate -- and neither had anywhere to say "never mind". So a
+            # manual pull, which bypasses the arrival gate entirely, left the Backup page
+            # showing "Waiting until you're home" while it was visibly transferring;
+            # observed in the field, state=running and phase=transferring beside
+            # arrival_hold=true. Cleared here because this is the one place every path into
+            # a run goes through.
+            self.arrival_hold = False
+            self.arrival_hold_reason = None
+            self.wifi_band_hold = False
+            self.wifi_band_hold_reason = None
             self._samples.clear()
             self._started_at = time.monotonic()
             self._started_wall = datetime.now(UTC)

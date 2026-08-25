@@ -194,6 +194,83 @@ async def _move(
     return transferred
 
 
+async def _rescue_partials(
+    info: UnitInfo,
+    *,
+    staging: Path,
+    footage: Path,
+    host: str,
+    port: int,
+    timeout_s: int,
+    unit_now: int,
+) -> tuple[list[RemoteFile], list[str], dict[str, int]]:
+    """Recover cut-short recordings the camera never finished. Best-effort by contract.
+
+    When the engine stops mid-segment, the camera's finalise races the unit's three-second
+    shutdown countdown; the segment that loses stays stranded in the DCIM root as
+    ``pre_<start>_camera_N.ts`` — never moved into ``Video``, so the ordinary listing never
+    sees it, and it holds the most valuable footage there is: the last minute before the
+    car shut off. Verified against the live card, the stranded files are plain playable
+    MPEG-TS up to the cut.
+
+    Each orphan is pulled over the same transport as everything else, renamed **in
+    staging** to the name the camera would have given it — the scanner must never see a
+    ``pre_`` name in the footage directory — and committed like any other recording. A
+    target that already exists in the library means this orphan was rescued on an earlier
+    window and is skipped, which is what makes the rescue idempotent when
+    delete-after-verify is off.
+
+    Returns ``(rescued, committed_names, expected_sizes)`` containing only what actually
+    landed, so the caller's OK/PARTIAL arithmetic never counts a rescue that did not
+    happen — a failed rescue costs nothing and is simply tried again next window.
+    """
+    if not info.source:
+        return [], [], {}
+    orphans = await adb.list_orphan_partials(info.address, info.source, unit_now=unit_now)
+    candidates = [
+        item
+        for item in orphans
+        if not (footage / item.name[len(adb.PARTIAL_PREFIX) :]).exists()
+        and not (footage / item.name).exists()
+    ]
+    if not candidates:
+        return [], [], {}
+    log.info(
+        "the card holds cut-short recordings the camera never finished; rescuing them",
+        files=len(candidates),
+        megabytes=round(sum(item.size for item in candidates) / 1e6),
+    )
+    get_status().extend_plan(DeltaPlan(files=candidates))
+    await _move(info, candidates, staging=staging, host=host, port=port, timeout_s=timeout_s)
+
+    expected: dict[str, int] = {}
+    by_target: dict[str, RemoteFile] = {}
+    for item in candidates:
+        staged = staging / item.name
+        if not staged.is_file():
+            continue
+        target = item.name[len(adb.PARTIAL_PREFIX) :]
+        try:
+            staged.rename(staging / target)
+        except OSError as exc:
+            log.debug("could not stage a rescued recording", name=item.name, error=str(exc))
+            continue
+        expected[target] = item.size
+        by_target[target] = item
+
+    committed = await asyncio.to_thread(commit, staging, footage, expected)
+    if committed:
+        log.info(
+            "rescued cut-short recordings into the library",
+            files=len(committed),
+            names=committed[:5],
+        )
+        if bool(_get("delete_after_verify", False)):
+            await _reclaim(info, [by_target[name] for name in committed if name in by_target])
+    rescued = [by_target[name] for name in committed if name in by_target]
+    return rescued, committed, {name: expected[name] for name in committed if name in expected}
+
+
 def display_url() -> str:
     """Where the head unit's browser gets sent, or "" if there is nowhere to send it.
 
@@ -824,6 +901,32 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
             if bool(_get("delete_after_verify", False)) and more_committed:
                 by_name = {item.name: item for item in more.files}
                 await _reclaim(info, [by_name[name] for name in more_committed if name in by_name])
+
+        # The rescue: cut-short recordings stranded outside Video by a power cut. After
+        # the sweeps, while the link is still proven good, and only on a run that has not
+        # already lost the car -- a rescue is a bonus, never a reason a window fails, so
+        # it is fenced in its own try and only what actually landed is counted.
+        if (
+            bool(_get("rescue_partials", True))
+            and transferred.complete
+            and not status.cancel_event.is_set()
+        ):
+            try:
+                rescued, rescued_names, rescued_sizes = await _rescue_partials(
+                    info,
+                    staging=staging,
+                    footage=footage,
+                    host=host,
+                    port=port,
+                    timeout_s=timeout_s,
+                    unit_now=int(time.time() + skew),
+                )
+            except Exception as exc:
+                log.warning("could not rescue cut-short recordings", error=str(exc))
+            else:
+                wanted.extend(rescued)
+                committed = [*committed, *rescued_names]
+                expected.update(rescued_sizes)
 
         state = (
             RunState.OK
