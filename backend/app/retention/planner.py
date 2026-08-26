@@ -12,15 +12,21 @@ plate observations stay; only the video file goes.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
-from app.core.paths import PathTraversalError, directory_size, safe_join
+from app.core.paths import (
+    PathTraversalError,
+    forget_tree_measurements,
+    measure_tree,
+    safe_join,
+)
 from app.core.settings_service import get_settings_service
 from app.db.models import (
     JobState,
@@ -32,6 +38,15 @@ from app.db.models import (
 from app.retention.safety import SafetyReport, can_delete, evaluate_safety
 
 log = get_logger(__name__)
+
+#: Rows fetched per round trip while choosing deletion candidates. The plan normally stops
+#: after a handful, so the batch only has to be large enough that the round trips do not
+#: dominate.
+_PLAN_FETCH_BATCH = 500
+
+#: Ids per ``IN`` clause when marking deleted rows. SQLite bounds the bound parameters in
+#: one statement, and a large cleanup can name thousands of recordings.
+_ROW_UPDATE_BATCH = 500
 
 _GB = 1024**3
 
@@ -139,8 +154,27 @@ async def plan(session: AsyncSession) -> RetentionPlan:
         ProcessingJob.recording_id.isnot(None),
     )
 
+    # Columns, not entities, and streamed rather than buffered.
+    #
+    # This selected whole `Recording` objects with no eligibility predicate and no limit,
+    # and `AsyncSession.execute` buffers its result -- so picking the handful of oldest
+    # files that would free a few gigabytes first hydrated *every* live recording in the
+    # library into the identity map, and the `break` below stopped a loop over rows that
+    # had already been fetched. `stream` with a `yield_per` makes the break real, and the
+    # eight columns the candidate needs are a fraction of the sixty-odd on the entity.
     stmt = (
-        select(Recording)
+        select(
+            Recording.id,
+            Recording.rel_path,
+            Recording.filename,
+            Recording.size_bytes,
+            Recording.started_at,
+            Recording.state,
+            Recording.vehicle_count,
+            Recording.plate_count,
+            Recording.protected,
+            Recording.event_type,
+        )
         .where(
             Recording.file_missing.is_(False),
             Recording.state != RecordingState.DELETED,
@@ -150,38 +184,43 @@ async def plan(session: AsyncSession) -> RetentionPlan:
         # treated as infinitely old — an unparsed filename must not make a file a
         # deletion candidate ahead of everything else.
         .order_by(Recording.started_at.asc().nullslast(), Recording.id.asc())
+        .execution_options(yield_per=_PLAN_FETCH_BATCH)
     )
 
     skipped: dict[str, int] = {}
     freed = 0
 
-    for recording in (await session.execute(stmt)).scalars():
-        if freed >= result.bytes_to_free:
-            break
+    stream = await session.stream(stmt)
+    try:
+        async for recording in stream:
+            if freed >= result.bytes_to_free:
+                break
 
-        if min_age_days > 0 and recording.started_at and recording.started_at > cutoff:
-            skipped["too recent"] = skipped.get("too recent", 0) + 1
-            continue
-        if keep_with_detections and (recording.vehicle_count or recording.plate_count):
-            skipped["contains detections"] = skipped.get("contains detections", 0) + 1
-            continue
-        if keep_events and _is_event(recording):
-            skipped["event recording"] = skipped.get("event recording", 0) + 1
-            continue
-        if recording.state is RecordingState.PROCESSING:
-            skipped["currently processing"] = skipped.get("currently processing", 0) + 1
-            continue
+            if min_age_days > 0 and recording.started_at and recording.started_at > cutoff:
+                skipped["too recent"] = skipped.get("too recent", 0) + 1
+                continue
+            if keep_with_detections and (recording.vehicle_count or recording.plate_count):
+                skipped["contains detections"] = skipped.get("contains detections", 0) + 1
+                continue
+            if keep_events and _is_event(recording):
+                skipped["event recording"] = skipped.get("event recording", 0) + 1
+                continue
+            if recording.state is RecordingState.PROCESSING:
+                skipped["currently processing"] = skipped.get("currently processing", 0) + 1
+                continue
 
-        result.candidates.append(
-            RetentionCandidate(
-                recording_id=recording.id,
-                rel_path=recording.rel_path,
-                filename=recording.filename,
-                size_bytes=recording.size_bytes,
-                started_at=recording.started_at,
+            result.candidates.append(
+                RetentionCandidate(
+                    recording_id=recording.id,
+                    rel_path=recording.rel_path,
+                    filename=recording.filename,
+                    size_bytes=recording.size_bytes,
+                    started_at=recording.started_at,
+                )
             )
-        )
-        freed += recording.size_bytes
+            freed += recording.size_bytes
+    finally:
+        await stream.close()
 
     result.skipped_reasons = skipped
 
@@ -208,8 +247,12 @@ async def plan(session: AsyncSession) -> RetentionPlan:
     return result
 
 
-def _is_event(recording: Recording) -> bool:
-    """Whether manual protection or an analysis rule marked this as an event."""
+def _is_event(recording: object) -> bool:
+    """Whether manual protection or an analysis rule marked this as an event.
+
+    Takes anything carrying the two columns -- a `Recording` or a row from the column
+    query the planner streams -- because the planner no longer hydrates entities.
+    """
     return bool(recording.protected or recording.event_type)
 
 
@@ -258,47 +301,77 @@ async def execute(
         return run
 
     root = await settings.footage_dir()
-    deleted_count = 0
-    deleted_bytes = 0
 
-    for candidate in retention_plan.candidates:
-        # Re-validate immediately before unlinking rather than trusting the path recorded
-        # when the plan was built: the settings could have changed, and a symlink could
-        # have appeared, between planning and execution.
-        try:
-            target = safe_join(root, candidate.rel_path)
-        except PathTraversalError as exc:
-            log.error(
-                "refusing to delete a path outside the footage root",
-                rel_path=candidate.rel_path,
-                error=str(exc),
-            )
-            continue
+    def unlink_all() -> tuple[list[int], int]:
+        """Validate and remove every candidate. **Blocking**, so it runs in a thread.
 
-        if not target.is_file():
-            continue
+        Six syscalls per candidate against what is usually a network mount -- two
+        ``resolve`` calls inside ``safe_join``, an ``is_file``, a ``stat`` and an
+        ``unlink`` -- and all of it used to happen on the event loop, inside the single
+        SQLite write transaction the scheduler wraps the whole retention pass in. Nothing
+        else in the process could be served for the duration, and one slow share turned a
+        cleanup into a stall.
 
-        try:
-            size = target.stat().st_size
-            target.unlink()
-        except OSError as exc:
-            log.warning("could not delete recording", file=candidate.filename, error=str(exc))
-            continue
+        Returns the ids actually removed and the bytes they held.
+        """
+        removed: list[int] = []
+        freed = 0
+        for candidate in retention_plan.candidates:
+            # Re-validated immediately before unlinking rather than trusting the path
+            # recorded when the plan was built: the settings could have changed, and a
+            # symlink could have appeared, between planning and execution.
+            try:
+                target = safe_join(root, candidate.rel_path)
+            except PathTraversalError as exc:
+                log.error(
+                    "refusing to delete a path outside the footage root",
+                    rel_path=candidate.rel_path,
+                    error=str(exc),
+                )
+                continue
 
-        deleted_count += 1
-        deleted_bytes += size
+            if not target.is_file():
+                continue
 
-        recording = await session.get(Recording, candidate.recording_id)
-        if recording is not None:
-            # The file is gone but everything derived from it survives — the plates and
-            # journeys remain searchable after cleanup.
-            recording.file_missing = True
-            recording.deleted_at = datetime.now(UTC)
-            recording.state = RecordingState.DELETED
+            try:
+                size = target.stat().st_size
+                target.unlink()
+            except OSError as exc:
+                log.warning("could not delete recording", file=candidate.filename, error=str(exc))
+                continue
+
+            removed.append(candidate.recording_id)
+            freed += size
+        return removed, freed
+
+    removed_ids, deleted_bytes = await asyncio.to_thread(unlink_all)
+    deleted_count = len(removed_ids)
+
+    # One statement rather than a `session.get` per candidate. The file is gone but
+    # everything derived from it survives — the plates and journeys remain searchable
+    # after cleanup.
+    now = datetime.now(UTC)
+    for start in range(0, len(removed_ids), _ROW_UPDATE_BATCH):
+        batch = removed_ids[start : start + _ROW_UPDATE_BATCH]
+        await session.execute(
+            update(Recording)
+            .where(Recording.id.in_(batch))
+            .values(file_missing=True, deleted_at=now, state=RecordingState.DELETED)
+            # `fetch`, not False: a caller holding one of these `Recording` instances --
+            # the scheduler's session does, and so does every test -- must see the row it
+            # is looking at change. One extra SELECT per batch, against the N `session.get`
+            # round trips this replaced.
+            .execution_options(synchronize_session="fetch")
+        )
 
     run.deleted_count = deleted_count
     run.deleted_bytes = deleted_bytes
     run.finished_at = datetime.now(UTC)
+    if deleted_count:
+        # The share is not what it was measured to be a moment ago. Cheaper and more honest
+        # than waiting out the TTL, which would leave the storage bar reporting the bytes
+        # this run has just freed.
+        forget_tree_measurements()
 
     log.info(
         "retention deleted footage",
@@ -309,8 +382,13 @@ async def execute(
     return run
 
 
-async def current_usage(session: AsyncSession) -> tuple[int, int, int]:
-    """``(bytes_used, file_count, bytes_limit)`` for the dashboard's storage bar."""
+async def current_usage(session: AsyncSession, *, max_age_s: float = 0.0) -> tuple[int, int, int]:
+    """``(bytes_used, file_count, bytes_limit)`` for the dashboard's storage bar.
+
+    ``max_age_s`` is passed through to :func:`measure_tree`; the dashboard's ten-second poll
+    supplies a TTL so it cannot re-walk the share on every request, while the retention
+    planner keeps the default of always measuring.
+    """
     settings = get_settings_service()
     root = await settings.footage_dir()
     extensions = await settings.media_extensions()
@@ -318,5 +396,5 @@ async def current_usage(session: AsyncSession) -> tuple[int, int, int]:
 
     used, count = 0, 0
     with contextlib.suppress(OSError):
-        used, count = directory_size(root, extensions)
+        used, count = await measure_tree(root, extensions, max_age_s=max_age_s)
     return used, count, limit

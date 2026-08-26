@@ -6,6 +6,7 @@ import RouteMap from '@/components/RouteMap'
 import Spinner from '@/components/Spinner'
 import { DerivedHint, EmptyState, ErrorState, PageHeader, StatTile, StateBadge } from '@/components/ui'
 import { api } from '@/lib/api'
+import { useMapSettings } from '@/lib/useMapSettings'
 import {
   formatDate,
   formatDateTime,
@@ -36,25 +37,19 @@ export default function JourneyDetail() {
     enabled: Number.isFinite(journeyId),
   })
 
-  const settings = useQuery({ queryKey: ['settings'], queryFn: api.settings.get })
-
   const reprocess = useMutation({
     mutationFn: () => api.journeys.reprocess(journeyId, [stage]),
     onSuccess: () => {
       client.invalidateQueries({ queryKey: ['jobs'] })
+      // The counts as well as the list. Without this the Queue page we are about to
+      // navigate to shows the pre-request figures until its next poll.
+      client.invalidateQueries({ queryKey: ['queue-stats'] })
       navigate('/queue')
     },
   })
 
-  const mapSettings = useMemo(() => {
-    const maps = settings.data?.find((c) => c.key === 'maps')
-    const value = (key: string) => maps?.settings.find((s) => s.key === key)?.value
-    return {
-      tileUrl: (value('maps.tile_url') as string) || undefined,
-      attribution: (value('maps.attribution') as string) || undefined,
-      maxZoom: (value('maps.max_zoom') as number) || undefined,
-    }
-  }, [settings.data])
+  // Shared with the Heatmap and the plate map, which both used to hard-code their tiles.
+  const mapSettings = useMapSettings()
 
   // Coordinates only, for the map; the recording and offset on each point stay behind for
   // the click handler to resolve.

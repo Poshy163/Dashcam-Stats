@@ -39,7 +39,7 @@ leading ``S`` of the South Australian ``S000AAA`` series.
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 __all__ = [
     "AU_PATTERNS",
@@ -374,7 +374,20 @@ def patterns_for_region(region: str | None) -> tuple[PlatePattern, ...]:
         return AU_PATTERNS
     if token.startswith("AU-"):
         state = token[3:]
-        return tuple(p for p in AU_PATTERNS if p.generic or state in p.states)
+        # A named series from elsewhere keeps its *shape* and loses its attribution, rather
+        # than disappearing. Dropping it outright left nothing to match a common interstate
+        # plate: `AAA###` and `###AAA` are deliberately excluded from the generic fallbacks
+        # because they are named series, so scoping to one state removed the only pattern
+        # of that shape and a Victorian car photographed in Adelaide matched nothing at all
+        # -- while a *wrong* generic shape was still free to claim it. The docstring above
+        # has always promised the opposite.
+        scoped = []
+        for pattern in AU_PATTERNS:
+            if pattern.generic or state in pattern.states:
+                scoped.append(pattern)
+            else:
+                scoped.append(replace(pattern, states=(), priority=2))
+        return tuple(scoped)
     # An unrecognised region is treated as "no regional rules" rather than as Australia:
     # applying the wrong country's formats would produce confident nonsense.
     return ()
@@ -463,6 +476,26 @@ def normalise(raw: str, region: str = "AU") -> NormalisedPlate:
     candidates: list[tuple[int, int, int, int, str, PlatePattern]] = []
     for index, pattern in enumerate(patterns_for_region(region)):
         if pattern.length != len(cleaned):
+            continue
+        # A pattern with digit slots has to be shown at least one real digit.
+        #
+        # Whether a digit slot is satisfied by an actual digit depends only on the cleaned
+        # character, not on which projection wins, so it can be decided before projecting.
+        # Without it a mask made mostly of letters accepted any word of the right shape by
+        # converting its remaining characters: NISSAN off a badge matched ``AA00AA`` and was
+        # stored as "NI55AN"; SCHOOL and DANGER off road signs matched ``0AAAAA`` as
+        # "5CHOOL" and "0ANGER". Each became a plate identity with its own card, its own
+        # rollups and a positive confidence delta. This is the same class of defect the
+        # blanket ``AAAAAA``/``000000`` masks were removed for, one step further down.
+        #
+        # Genuine reads are untouched: they carry at least one character the recogniser saw
+        # as a digit -- ``ABC1O3`` still resolves to ``ABC103`` on the strength of its 1 and
+        # 3 -- because a plate whose *every* digit was misread as a letter is a different
+        # and far rarer thing than a word that never had one.
+        if DIGIT_SLOT in pattern.mask and not any(
+            slot == DIGIT_SLOT and char.isdigit()
+            for char, slot in zip(cleaned, pattern.mask, strict=True)
+        ):
             continue
         projected = _project(cleaned, pattern)
         if projected is None:

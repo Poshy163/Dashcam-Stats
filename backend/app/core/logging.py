@@ -361,7 +361,23 @@ class DatabaseLogSink:
             self._stats.seen += 1
             if not force and _level_number(record.level) < self._min_level:
                 return
-            key = (record.level, record.logger, record.message)
+            # The identity is part of the key, because the message is not.
+            #
+            # Every log call in this codebase uses a constant event name with the variable
+            # data in kwargs -- "job failed permanently", "stage failed", "processed
+            # recording" -- so keying on the text alone collapsed *different recordings*
+            # failing in the same way into one row with a repeat count. The Logs page's
+            # recording and job filters then found nothing for all but the first of them,
+            # which is precisely when somebody is looking. A message carrying no identity
+            # keys exactly as before, so the noisy lines this brake exists for are
+            # unaffected.
+            key = (
+                record.level,
+                record.logger,
+                record.message,
+                record.recording_id,
+                record.job_id,
+            )
             now = time.monotonic()
             state = self._dedupe.get(key)
             if state is not None and now - state.window_started < self._dedupe_window_s:

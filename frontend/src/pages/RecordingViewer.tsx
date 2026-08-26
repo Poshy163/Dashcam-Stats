@@ -179,7 +179,7 @@ function OsdDebugPanel({
             <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs sm:grid-cols-4">
               <div>
                 <dt className="text-content-faint">Frame number</dt>
-                <dd className="tabular">{debug.data.timeline.frameNumber ?? 'â€”'}</dd>
+                <dd className="tabular">{debug.data.timeline.frameNumber ?? '—'}</dd>
               </div>
               <div>
                 <dt className="text-content-faint">Video PTS</dt>
@@ -192,7 +192,7 @@ function OsdDebugPanel({
               <div>
                 <dt className="text-content-faint">Stored sample delta</dt>
                 <dd className="tabular">
-                  {debug.data.storedSample ? `${debug.data.storedSample.dtS.toFixed(3)}s` : 'â€”'}
+                  {debug.data.storedSample ? `${debug.data.storedSample.dtS.toFixed(3)}s` : '—'}
                 </dd>
               </div>
             </dl>
@@ -210,11 +210,11 @@ function OsdDebugPanel({
                 </div>
                 <div>
                   <dt className="text-content-faint">Time</dt>
-                  <dd>{debug.data.storedSample.quality.timeStatus ?? 'unknown'} Â· {debug.data.storedSample.quality.timeSource ?? 'unknown'}</dd>
+                  <dd>{debug.data.storedSample.quality.timeStatus ?? 'unknown'} · {debug.data.storedSample.quality.timeSource ?? 'unknown'}</dd>
                 </div>
                 <div>
                   <dt className="text-content-faint">GPS</dt>
-                  <dd>{debug.data.storedSample.quality.gpsStatus ?? 'unknown'} Â· {debug.data.storedSample.quality.gpsSource ?? 'none'}</dd>
+                  <dd>{debug.data.storedSample.quality.gpsStatus ?? 'unknown'} · {debug.data.storedSample.quality.gpsSource ?? 'none'}</dd>
                 </div>
                 <div>
                   <dt className="text-content-faint">Position</dt>
@@ -333,6 +333,9 @@ export default function RecordingViewer() {
     onSuccess: () => {
       client.invalidateQueries({ queryKey: ['recording', recordingId] })
       client.invalidateQueries({ queryKey: ['jobs'] })
+      // The counts as well as the list, or the Queue page this navigates to shows the
+      // pre-request figures until its next poll.
+      client.invalidateQueries({ queryKey: ['queue-stats'] })
       navigate('/queue')
     },
   })

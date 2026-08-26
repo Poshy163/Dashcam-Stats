@@ -1,10 +1,23 @@
 name: CI
 
+# Pushes are not listed here, deliberately: release.yml owns them and calls this workflow
+# as its first job, so publishing physically cannot happen before the tests have passed.
+#
+# It used to be the other way round. ci.yml ran on pushes to main while release.yml, with no
+# dependency on it at all, pushed `:main` and `:sha-...` to GHCR in parallel — so a red
+# build still shipped an image. Worse, a `v*` tag matched none of ci.yml's triggers, so a
+# release ran no tests, no lint and not even the Docker build, while moving `:latest` — the
+# tag the README tells every new user to pull.
+#
+# `workflow_call` rather than `workflow_run`: a called workflow runs in the caller's event
+# context, so `github.ref` is the branch or tag actually being released and the image tags
+# derive from it correctly. `workflow_run` would have run in the default branch's context
+# instead, and would additionally have fired for pull requests — including forks, with a
+# writable token.
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -168,29 +181,69 @@ jobs:
 
       # A container that starts but cannot serve /health is a broken release, and that
       # is not something the unit tests can catch.
+      #
+      # Three separate things are checked here, and each has broken independently before:
+      # that the app answers, that the image's own HEALTHCHECK agrees it answers, and that
+      # the entrypoint actually dropped root. The middle one matters because the healthcheck
+      # is what an orchestrator restarts on -- it runs `curl` inside the container against
+      # $DASHCAM_PORT, so a slimmed base image or a renamed port variable turns every
+      # deployment into a restart loop while a curl from the runner still passes.
       - name: Smoke test the image
         run: |
+          set -u
+          trap 'docker rm -f dashcam-smoke >/dev/null 2>&1 || true' EXIT
+
           docker run -d --name dashcam-smoke \
             -e DASHCAM_DATA_DIR=/data \
             -e DASHCAM_FOOTAGE_DIR=/dashcam \
             -p 8080:8080 \
             dashcam-analyser:ci
 
+          ok=""
           for i in $(seq 1 45); do
             if curl -fsS http://127.0.0.1:8080/health > /tmp/health.json 2>/dev/null; then
-              echo "health endpoint responded:"
-              cat /tmp/health.json
-              echo
-              # The UI must actually be served, not just the API.
-              curl -fsS http://127.0.0.1:8080/ -o /dev/null
-              echo "UI served OK"
-              docker rm -f dashcam-smoke
-              exit 0
+              ok=1
+              break
             fi
             sleep 2
           done
+          if [ -z "$ok" ]; then
+            echo "::error::the container never served /health; logs follow:"
+            docker logs dashcam-smoke
+            exit 1
+          fi
+          echo "health endpoint responded:"
+          cat /tmp/health.json
+          echo
 
-          echo "container failed to become healthy; logs follow:"
-          docker logs dashcam-smoke
-          docker rm -f dashcam-smoke
-          exit 1
+          # The UI must actually be served, not just the API.
+          curl -fsS http://127.0.0.1:8080/ -o /dev/null
+          echo "UI served OK"
+
+          # The image's own healthcheck, on its own terms. Docker only starts reporting a
+          # status once the first probe has run, so this waits for it to leave "starting"
+          # rather than reading it once.
+          status=starting
+          for i in $(seq 1 60); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' dashcam-smoke)"
+            [ "$status" = starting ] || break
+            sleep 2
+          done
+          if [ "$status" != healthy ]; then
+            echo "::error::the image's HEALTHCHECK reports '$status' while /health answers"
+            docker inspect -f '{{json .State.Health}}' dashcam-smoke
+            exit 1
+          fi
+          echo "HEALTHCHECK: $status"
+
+          # The entrypoint drops to the unprivileged account before exec'ing the app. A
+          # release that serves perfectly well as root is still a release nobody should
+          # mount their footage share into.
+          app_user="$(docker exec dashcam-smoke sh -c 'ps -o user= -p 1; echo ---; ps -o user= -C python | head -1')"
+          echo "process owners: $app_user"
+          if docker exec dashcam-smoke sh -c 'ps -o user=,comm= | grep -q "^root *python"'; then
+            echo "::error::the app is running as root; the entrypoint did not drop privileges"
+            docker exec dashcam-smoke ps -o user=,pid=,comm=
+            exit 1
+          fi
+          echo "privilege drop OK"

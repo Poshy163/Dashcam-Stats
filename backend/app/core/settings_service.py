@@ -53,7 +53,6 @@ __all__ = [
     "SettingsService",
     "SettingsUnsubscribe",
     "coerce_setting",
-    "describe_settings",
     "get_settings_service",
     "init_settings_service",
     "set_settings_service",
@@ -752,6 +751,24 @@ class SettingsService:
             except Exception:  # pragma: no cover - no tzdata available at all
                 return UTC
 
+    def get_or_default(self, key: str) -> Any:
+        """The current value, or the schema's default when the cache cannot answer.
+
+        The fallback that a dozen call sites used to write by hand, each restating a
+        literal that also lives in ``settings_schema``. Two of those copies had already
+        drifted, and one of them mattered: the ingest arrival gate fell back to ``0.0``
+        against a schema default of 120, which does not weaken the gate -- it disables it,
+        so a pull fires as the car is leaving rather than when it arrives. A default is not
+        a thing to write down twice.
+        """
+        defn = SETTINGS_BY_KEY.get(key)
+        try:
+            return self.get_nowait(key)
+        except Exception:
+            if defn is None:
+                raise
+            return defn.default
+
     async def max_workers(self) -> int:
         return int(self.get_nowait("processing.max_workers"))
 
@@ -933,11 +950,6 @@ async def shutdown_settings_service() -> None:
         service, _instance = _instance, None
     if service is not None:
         await service.aclose()
-
-
-def describe_settings() -> list[dict[str, Any]]:
-    """Module-level catalogue export for the settings API."""
-    return get_settings_service().describe_settings()
 
 
 def local_zone() -> tzinfo:

@@ -863,6 +863,64 @@ class TestRouteOverlay:
                 worst = max(worst, haversine_m(a_lat, a_lon, b_lat, b_lon))
         assert worst < 100, f"a {worst:.0f} m chord was drawn across the gap"
 
+    @pytest.fixture
+    async def a_journey_of_two_clips(self, db_session):
+        """Two consecutive recordings in one journey, each carrying a clip-start sentinel."""
+        from datetime import UTC, datetime, timedelta
+
+        from app.db.models import Journey, TelemetryPoint
+
+        async with session_scope() as session:
+            base = datetime(2026, 8, 4, 17, 43, tzinfo=UTC)
+            j = Journey(started_at=base, ended_at=base + timedelta(minutes=2), duration_s=120.0)
+            session.add(j)
+            await session.flush()
+            step = 0
+            for clip in range(2):
+                rec = Recording(
+                    rel_path=f"clip{clip}.ts",
+                    filename=f"clip{clip}.ts",
+                    size_bytes=1,
+                    state=RecordingState.COMPLETED,
+                    journey_id=j.id,
+                    started_at=base + timedelta(seconds=step),
+                )
+                session.add(rec)
+                await session.flush()
+                for offset in range(30):
+                    session.add(
+                        TelemetryPoint(
+                            recording_id=rec.id,
+                            journey_id=j.id,
+                            t_offset_s=float(offset),
+                            captured_at=base + timedelta(seconds=step),
+                            lat=-34.8088 + step * 1.5e-4,
+                            lon=138.6769 + step * 0.5e-4,
+                            has_fix=True,
+                            speed_kmh=55.0,
+                            # What `classify` writes: the first drawable fix of every clip,
+                            # because its forward walk has no anchor yet within that clip.
+                            breaks_segment=offset == 0,
+                        )
+                    )
+                    step += 1
+            await session.flush()
+
+    async def test_a_clip_boundary_is_not_a_break_in_the_overlay(
+        self, client, a_journey_of_two_clips
+    ):
+        """The overlay and the journey-detail view must cut the line in the same places.
+
+        `breaks_segment` is set on the first drawable fix of every recording as bookkeeping,
+        not as a claim about the road. `single_track` suppresses it for the journey-detail
+        map; this endpoint did not, so a journey of thirty clips drew as thirty disconnected
+        pieces here and as one continuous line there, from the same rows.
+        """
+        body = (await client.get("/api/map/routes?simplify_m=0")).json()
+        assert body["segments"] == 1, (
+            f"the clip boundary split the route into {body['segments']} pieces"
+        )
+
     async def test_simplification_does_not_reunite_the_gap(self, client, a_drive_with_a_tunnel):
         # Splitting has to happen before simplifying: run the other way round,
         # Douglas-Peucker treats the two ends of a dropout as collinear with everything

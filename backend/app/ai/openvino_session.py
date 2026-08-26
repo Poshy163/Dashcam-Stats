@@ -56,6 +56,11 @@ _GPU_CONTEXT_FAILURE_MARKERS = (
 
 #: Set once the iGPU has failed in this process; never cleared without a restart.
 _gpu_disabled_reason: str | None = None
+
+#: Whether the durable marker has already been written in this process. Tracked apart from
+#: ``_gpu_disabled_reason`` because a *transient* disable sets that first and would
+#: otherwise make the real abort's durable request a no-op.
+_gpu_failure_persisted: bool = False
 _gpu_state_lock = threading.Lock()
 
 
@@ -84,11 +89,17 @@ def disable_gpu_backend(reason: str, *, durable: bool = False) -> bool:
     detections because the model helper catches its own inference errors. Re-arming the GPU
     on the next job would simply reproduce that.
     """
-    global _gpu_disabled_reason, _devices_cache, _device_cache
+    global _gpu_disabled_reason, _devices_cache, _device_cache, _gpu_failure_persisted
     with _gpu_state_lock:
         first = _gpu_disabled_reason is None
         if first:
             _gpu_disabled_reason = reason
+        # Decided under the same lock that owns the reason. This is reached from worker
+        # threads, so an unsynchronised test-and-set lets two of them both conclude they
+        # are the first to persist and both write the marker.
+        should_persist = durable and not _gpu_failure_persisted
+        if should_persist:
+            _gpu_failure_persisted = True
 
     # Drop the GPU from the *cached* device list and re-resolve from that, in Python.
     #
@@ -111,8 +122,25 @@ def disable_gpu_backend(reason: str, *, durable: bool = False) -> bool:
             remaining_devices=remaining,
             durable=durable,
         )
-        if durable:
-            _persist_gpu_failure(reason)
+
+    # Persisted on its own terms, not on being the *first* disable.
+    #
+    # The two are different questions and conflating them lost the marker in the case it
+    # exists for. `ensure_cpu` disables the backend non-durably for a transient condition --
+    # a stuck ffmpeg child making the media slot unsafe -- so by the time the driver
+    # genuinely aborts, `first` is already False and the durable call did nothing. The next
+    # restart then re-armed the iGPU and walked into the same native abort, which is the
+    # crash loop this marker was written to break.
+    #
+    # The file write stays outside the lock; only the decision is inside it.
+    if should_persist:
+        if not first:
+            log.error(
+                "the Intel GPU inference context has failed after an earlier, milder "
+                "disable; recording it so the next start does not re-arm the chip",
+                reason=reason,
+            )
+        _persist_gpu_failure(reason)
     return first
 
 
@@ -191,9 +219,13 @@ def restore_gpu_failure_state() -> str | None:
 
 def clear_gpu_failure_state() -> bool:
     """Forget the durable verdict, so the iGPU is tried again after a driver change."""
-    global _gpu_disabled_reason
+    global _gpu_disabled_reason, _gpu_failure_persisted
     with _gpu_state_lock:
         _gpu_disabled_reason = None
+        # Cleared with the reason, or the *next* abort in this same process would find the
+        # marker already "written", skip persisting it, and leave nothing on disk for the
+        # restart to read -- re-arming a chip that has just aborted twice.
+        _gpu_failure_persisted = False
     _clear_device_cache()
     try:
         _gpu_failure_marker_path().unlink(missing_ok=True)
@@ -216,9 +248,12 @@ def gpu_inference_engaged() -> bool:
 
 def reset_gpu_backend_for_tests() -> None:
     """Clear the one-way disable. Intended for isolated tests."""
-    global _gpu_disabled_reason
+    global _gpu_disabled_reason, _gpu_failure_persisted
     with _gpu_state_lock:
         _gpu_disabled_reason = None
+        # Tracked separately from the reason, so it has to be cleared separately too --
+        # otherwise one test's durable disable decides whether the next one's is written.
+        _gpu_failure_persisted = False
     _clear_device_cache()
 
 
@@ -342,39 +377,40 @@ def _resolve_device(requested: str) -> str | None:
 
 
 def cpu_inference_threads() -> int:
-    """How many threads one CPU inference session may use.
+    """How many threads one CPU inference session may use: half the logical CPUs, floor 2.
 
-    Unbounded, an OpenVINO CPU session spreads across every core it can see -- which is
-    right for one session and wrong for several. FFmpeg, OpenCV and ONNX Runtime are all
-    already bounded per job by ``native_thread_budget``; inference was the one native
-    runtime that was not, so raising the worker count multiplied whole-machine thread pools
-    rather than dividing the machine between them. With the iGPU out of service and every
-    detection running here, that is the setting that decides whether more workers help.
+    Unbounded, an OpenVINO CPU session spreads across every core it can see, which on a
+    host also running two ffmpeg decoders is a thread pool per runtime all claiming the
+    whole machine. This is the bound for the inference half.
 
-    Each worker gets an equal share of the logical CPUs, and its media threads come out of
-    that share rather than on top of it.
+    The session is **process-wide**, not per worker, and it used to be sized as though it
+    were per worker -- one worker's share of the CPUs, minus that worker's media budget.
+    That had it backwards: the shared detector *shrank* as workers were added, going from
+    four threads at one worker to the floor of two at two on an eight-thread host, while
+    ffmpeg's aggregate grew with each one. Turning the concurrency up made the single thing
+    doing the inference slower.
+
+    Half is a deliberate over-subscription rather than a division of the machine.
+    ``native_thread_budget`` already hands the workers' decoders roughly the whole CPU
+    count between them, and subtracting that leaves nothing at all; but a decoder spends
+    much of its life waiting on I/O, so sizing inference as though it did not would leave
+    the CPU idle while the queue drains. The floor of two keeps a single-threaded detector
+    off a large host, which would be a stranger failure than the contention.
     """
     import os
 
-    from app.core.resources import native_thread_budget
-
     cpus = max(1, os.cpu_count() or 1)
-    workers = 1
-    try:
-        from app.core.settings_service import get_settings_service
-
-        workers = max(1, int(get_settings_service().get_nowait("processing.max_workers")))
-    except Exception:
-        pass
-
-    share = max(1, cpus // workers)
-    try:
-        media = native_thread_budget()
-    except Exception:
-        media = 0
-    # Never below two: a single-threaded detector on a twenty-core host would be a
-    # stranger failure than the oversubscription this exists to prevent.
-    return max(2, share - media)
+    # Half the machine, floored at two.
+    #
+    # Worker-count-independent on purpose, because the session is: `native_thread_budget`
+    # already divides the machine between the workers' ffmpeg pools, so subtracting that
+    # aggregate from the total leaves nothing at all and the floor takes over. On the
+    # deployment this is written for -- eight threads, two workers, the iGPU out of service
+    # so every detection runs here -- the old arithmetic gave the process's only inference
+    # session two threads while ffmpeg held the rest, and gave it fewer the more workers
+    # were added. Half is the ordinary answer for a shared CPU pool running beside decoders
+    # that spend much of their time waiting on I/O.
+    return max(2, cpus // 2)
 
 
 def selected_performance_hint(device: str | None = None) -> str:
@@ -665,11 +701,3 @@ def use_openvino_session(owner: type[Any]) -> Iterator[None]:
             yield
         finally:
             module.ort = original
-
-
-def reset_runtime_for_tests() -> None:
-    """Clear process-wide runtime state. Intended for isolated tests."""
-    global _core
-    with _core_lock:
-        _core = None
-    reset_gpu_backend_for_tests()

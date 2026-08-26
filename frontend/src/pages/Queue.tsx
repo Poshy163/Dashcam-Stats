@@ -22,8 +22,17 @@ export default function Queue() {
   const page = Number(params.get('page') ?? 1)
   const client = useQueryClient()
 
+  // The same query key the shell's nav badge uses, deliberately.
+  //
+  // This page used to keep a second copy under its own key, so every mutation site in the
+  // app had to remember to invalidate both — two of them did not, and the badge went stale
+  // after a reprocess started from a recording. It also meant the Queue page asked
+  // /api/jobs/stats twice on two unsynchronised timers, thirty-two requests a minute for
+  // one set of counts, each running four aggregate queries. Sharing the key lets React
+  // Query serve both observers from one fetch while this page's shorter interval still
+  // decides how often that fetch happens.
   const stats = useQuery({
-    queryKey: ['queue-stats-page'],
+    queryKey: ['queue-stats'],
     queryFn: api.jobs.stats,
     refetchInterval: 3_000,
   })
@@ -51,7 +60,6 @@ export default function Queue() {
 
   const invalidate = () => {
     client.invalidateQueries({ queryKey: ['jobs'] })
-    client.invalidateQueries({ queryKey: ['queue-stats-page'] })
     client.invalidateQueries({ queryKey: ['queue-stats'] })
   }
 

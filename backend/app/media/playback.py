@@ -52,6 +52,37 @@ def cache_dir() -> Path:
     return path
 
 
+def export_dir() -> Path:
+    """Where trimmed download clips are kept, beside the remuxed streams."""
+    path = get_config().cache_dir / "exports"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _touch(path: Path) -> None:
+    """Mark a cached file as recently used, so the LRU sweep treats it as hot.
+
+    The stream cache has always done this on a hit; the export cache did not, and now that
+    the two share one eviction pass it matters -- an export kept the mtime of the moment it
+    was created, so the ones people actually download sorted oldest and were evicted first.
+    """
+    with contextlib.suppress(OSError):
+        os.utime(path)
+
+
+def _cache_dirs() -> tuple[Path, ...]:
+    """Every directory the playback cache budget covers.
+
+    ``exports`` used to be outside it entirely: ``cache_usage``, ``prune_cache`` and
+    ``clear_cache`` all looked only at ``stream``, so one file per (recording, start, end)
+    accumulated there for the life of the deployment with nothing anywhere deleting them,
+    and ``general.stream_cache_gb`` silently applied to half the cache. Both are the same
+    kind of thing -- a disposable copy of footage that is still on the share -- so they
+    share one budget and one LRU sweep.
+    """
+    return (cache_dir(), export_dir())
+
+
 def is_browser_native(path: Path) -> bool:
     return path.suffix.lower() in BROWSER_NATIVE_SUFFIXES
 
@@ -106,7 +137,9 @@ async def _remux(source: Path, target: Path) -> bool:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         with contextlib.suppress(Exception):
-            await proc.wait()
+            # Bounded, like every other wait here. An unbounded one on a child that will
+            # not die is the same hang one line further down.
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
         partial.unlink(missing_ok=True)
         log.warning("remux timed out", file=source.name)
         return False
@@ -156,7 +189,10 @@ async def _remux_plain(source: Path, target: Path) -> bool:
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await proc.communicate()
+    stderr = await _communicate(proc, source, "remux")
+    if stderr is None:
+        partial.unlink(missing_ok=True)
+        return False
     if proc.returncode != 0 or not partial.exists() or partial.stat().st_size == 0:
         partial.unlink(missing_ok=True)
         log.warning(
@@ -165,6 +201,28 @@ async def _remux_plain(source: Path, target: Path) -> bool:
         return False
     partial.replace(target)
     return True
+
+
+async def _communicate(proc, source: Path, what: str) -> bytes | None:
+    """Drain a remux child under a timeout, killing it if it will not finish.
+
+    Two of the three ffmpeg calls in this module awaited ``communicate()`` with no bound.
+    An ffmpeg blocked in an uninterruptible read on a network mount never returns from
+    that, and because these run while holding the per-recording lock, the request never
+    completes *and* every later ``/stream``, ``/export.mp4`` and ``/osd-debug`` for the same
+    recording blocks behind it for the life of the process. Returns the child's stderr, or
+    ``None`` when it had to be killed.
+    """
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=DEFAULT_DECODE_TIMEOUT)
+        return stderr
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        log.warning(f"{what} timed out", file=source.name, timeout_s=DEFAULT_DECODE_TIMEOUT)
+        return None
 
 
 async def ensure_playable(source: Path, recording_id: int) -> Playable:
@@ -200,7 +258,7 @@ async def ensure_playable(source: Path, recording_id: int) -> Playable:
             # still behaves and the failure is visible in the logs rather than a 500.
             return Playable(path=source, media_type="video/mp2t", from_cache=False)
 
-    await asyncio.to_thread(prune_cache)
+    await asyncio.to_thread(prune_cache, keep=target)
     return Playable(path=target, media_type="video/mp4", from_cache=True)
 
 
@@ -209,15 +267,16 @@ async def ensure_export_clip(
 ) -> Path:
     """Create a cached, lossless MP4 excerpt suitable for downloading."""
     playable = await ensure_playable(source, recording_id)
-    export_dir = get_config().cache_dir / "exports"
-    export_dir.mkdir(parents=True, exist_ok=True)
+    exports = export_dir()
     end_key = "end" if end_s is None else f"{end_s:.2f}"
-    target = export_dir / f"{recording_id:08d}-{start_s:.2f}-{end_key}.mp4"
+    target = exports / f"{recording_id:08d}-{start_s:.2f}-{end_key}.mp4"
     if target.is_file() and target.stat().st_size > 0:
+        _touch(target)
         return target
     lock = await _lock_for(-recording_id)
     async with lock:
         if target.is_file() and target.stat().st_size > 0:
+            _touch(target)
             return target
         partial = target.with_suffix(".part.mp4")
         cmd = [
@@ -253,30 +312,46 @@ async def ensure_export_clip(
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        stderr = await _communicate(proc, source, "export")
+        if stderr is None:
+            partial.unlink(missing_ok=True)
+            raise FFmpegError(f"export of {source.name} timed out")
         if proc.returncode != 0 or not partial.is_file() or partial.stat().st_size == 0:
             partial.unlink(missing_ok=True)
             raise FFmpegError(stderr.decode("utf-8", "replace")[-1000:])
         partial.replace(target)
+    # Swept here as well as after a remux: an export is the same kind of disposable copy
+    # and shares the same budget, and this is the only moment one is created.
+    await asyncio.to_thread(prune_cache, keep=target)
     return target
 
 
 def cache_usage() -> tuple[int, int]:
     """``(bytes, files)`` currently held in the playback cache."""
     total = count = 0
-    with contextlib.suppress(OSError):
-        for entry in os.scandir(cache_dir()):
-            if entry.is_file():
-                total += entry.stat().st_size
-                count += 1
+    for directory in _cache_dirs():
+        with contextlib.suppress(OSError):
+            for entry in os.scandir(directory):
+                if entry.is_file():
+                    total += entry.stat().st_size
+                    count += 1
     return total, count
 
 
-def prune_cache(limit_bytes: int | None = None) -> int:
+def prune_cache(limit_bytes: int | None = None, *, keep: Path | None = None) -> int:
     """Evict least-recently-used clips until the cache fits.
 
     Remuxed copies are disposable -- the footage they came from is untouched -- so this
     only ever deletes inside ``/data/cache``. It never looks at the footage directory.
+
+    ``keep`` is the clip the caller is about to hand to a client, and it is exempt. Both
+    callers sweep the moment they finish writing one, and a single remux of a long
+    recording can be larger than the whole configured budget on its own -- at which point
+    the loop below cannot reach the limit no matter what it deletes, and the newest file
+    is deleted along with everything else. The request that paid for that remux would then
+    serve a file that no longer exists. Skipping one entry cannot break the budget any
+    further: the cache was already over it before this file was written, and the next
+    sweep, once nobody is holding it, collects it like any other.
     """
     if limit_bytes is None:
         from app.core.settings_service import get_settings_service
@@ -287,9 +362,22 @@ def prune_cache(limit_bytes: int | None = None) -> int:
             gb = 5.0
         limit_bytes = int(gb * 1024**3)
 
-    try:
-        entries = [e for e in os.scandir(cache_dir()) if e.is_file()]
-    except OSError:
+    protected = None if keep is None else os.path.normcase(os.path.abspath(keep))
+    entries = []
+    for directory in _cache_dirs():
+        try:
+            # `.part.mp4` is a transfer in progress, not a cache entry: evicting one deletes
+            # the file its own ffmpeg is still writing.
+            entries.extend(
+                e
+                for e in os.scandir(directory)
+                if e.is_file()
+                and not e.name.endswith(".part.mp4")
+                and os.path.normcase(os.path.abspath(e.path)) != protected
+            )
+        except OSError:
+            continue
+    if not entries:
         return 0
 
     total = sum(e.stat().st_size for e in entries)
@@ -315,5 +403,6 @@ def prune_cache(limit_bytes: int | None = None) -> int:
 
 
 def clear_cache() -> None:
-    with contextlib.suppress(OSError):
-        shutil.rmtree(cache_dir())
+    for directory in _cache_dirs():
+        with contextlib.suppress(OSError):
+            shutil.rmtree(directory)

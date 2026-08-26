@@ -32,6 +32,7 @@ from app.api.visibility import visible_journey_ids, visible_revision
 from app.auth.service import ensure_credential_loaded
 from app.config import get_config
 from app.core.logging import get_logger
+from app.core.paths import FOOTAGE_MEASURE_TTL_S
 from app.core.settings_service import (
     SettingValidationError,
     get_settings_service,
@@ -58,6 +59,7 @@ from app.pipeline.revisions import outdated_stages
 from app.retention import current_usage, evaluate_safety, plan_idle
 from app.retention import execute as run_retention
 from app.retention import plan as plan_retention
+from app.scanner.discovery import Scanner
 from app.workers import queue
 from app.workers.reset import reset_and_rebuild
 from app.workers.scheduler import get_scheduler
@@ -191,7 +193,9 @@ async def get_status(session: SessionDep):
         ),
     )
 
-    used, files, limit = await current_usage(session)
+    # Cached, because the dashboard polls this every ten seconds and the walk behind it is
+    # one stat per file over a network share. See ``FOOTAGE_MEASURE_TTL_S``.
+    used, files, limit = await current_usage(session, max_age_s=FOOTAGE_MEASURE_TTL_S)
     totals.footage_bytes = used
     totals.footage_files = files
 
@@ -246,7 +250,10 @@ async def get_status(session: SessionDep):
     )
 
     settings = get_settings_service()
-    safety = await evaluate_safety(session)
+    # Same walk, same cache. This endpoint reads exactly one field off the report, and it
+    # used to pay for a second full traversal of the share to get it -- so a single open
+    # dashboard walked the whole tree twelve times a minute, on the event loop.
+    safety = await evaluate_safety(session, measure_max_age_s=FOOTAGE_MEASURE_TTL_S)
     storage = StatusStorage(
         limit_bytes=limit,
         used_bytes=used,
@@ -321,7 +328,16 @@ async def reset_settings(body: SettingsReset):
 
 @router.post("/scan")
 async def scan_now():
-    summary = await get_scheduler().scan_now()
+    try:
+        summary = await get_scheduler().scan_now()
+    except Scanner.AlreadyScanning:
+        # 409 rather than a wait: the caller asked for a scan and one is happening, which is
+        # a different answer from "here is your scan" and a much better one than a request
+        # that hangs for the length of somebody else's walk of a network share.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "A scan is already running. Its results will appear when it finishes.",
+        ) from None
     return {
         "scan_id": summary.scan_run_id,
         "seen": summary.seen,

@@ -84,6 +84,11 @@ _MAX_STEP_M_PER_S = MAX_ROAD_SPEED_MS
 #: so it only ever catches a distance that arithmetic already rules out.
 _IMPLAUSIBLE_M_PER_S = 200.0 * 1000.0 / 3600.0
 
+#: Row ids per ``IN`` clause. SQLite refuses more than 32,766 bound parameters in one
+#: statement, and the journey passes routinely hold the whole library; 900 is the classic
+#: conservative bound and leaves room for the handful of other parameters in the same query.
+_ID_CHUNK = 900
+
 
 def _journey_ready_recording():
     """A recording with no retained stage waiting to be rebuilt."""
@@ -205,7 +210,12 @@ class JourneyBuilder:
             journey = Journey(started_at=cluster.started_at, ended_at=cluster.ended_at)
             session.add(journey)
             await session.flush()
-            await self._attach(session, [r.id for r in cluster.recordings], journey.id)
+            # Only the recordings: `refresh` finds its members through
+            # `Recording.journey_id` and re-points every denormalised copy itself on the way
+            # out, so writing them here as well rewrote `telemetry_points` twice per rebuild.
+            await self._attach(
+                session, [r.id for r in cluster.recordings], journey.id, recordings_only=True
+            )
             await self.refresh(session, journey)
             created += 1
             # One journey, one transaction. Forty-five journeys' worth of refreshing in a
@@ -245,18 +255,38 @@ class JourneyBuilder:
         ordinary journey refresh then has the neighbours' telemetry to recognise their
         sightings as impossible.
         """
-        recordings = list(
-            (
-                await session.execute(
-                    select(Recording).where(
-                        Recording.started_at.isnot(None),
-                        Recording.ignored.is_(False),
-                        _journey_ready_recording(),
+        # Keyset-paged, not loaded whole. This runs on every scheduled scan, and selecting
+        # the entire library instantiated one full ORM object per recording -- sixty-odd
+        # columns each, all of them resident at once, in a process that is also holding an
+        # OpenVINO graph and an ffmpeg decode buffer. The correction itself is per
+        # recording, so nothing here needs to see them together.
+        corrected = 0
+        after = 0
+        while True:
+            batch = list(
+                (
+                    await session.execute(
+                        select(Recording)
+                        .where(
+                            Recording.started_at.isnot(None),
+                            Recording.ignored.is_(False),
+                            Recording.id > after,
+                            _journey_ready_recording(),
+                        )
+                        .order_by(Recording.id.asc())
+                        .limit(_ID_CHUNK)
                     )
-                )
-            ).scalars()
-        )
-        return await self._refresh_start_positions(session, recordings)
+                ).scalars()
+            )
+            if not batch:
+                break
+            after = batch[-1].id
+            corrected += await self._refresh_start_positions(session, batch)
+            # The flush is what makes it safe to let the batch go; without it the identity
+            # map is the only thing holding the pending updates.
+            await session.flush()
+            session.expunge_all()
+        return corrected
 
     @staticmethod
     async def _refresh_start_positions(session: AsyncSession, recordings: list[Recording]) -> int:
@@ -275,30 +305,48 @@ class JourneyBuilder:
             return 0
         ids = [r.id for r in recordings]
 
-        ranked = (
-            select(
-                TelemetryPoint.recording_id,
-                TelemetryPoint.lat,
-                TelemetryPoint.lon,
-                func.row_number()
-                .over(
-                    partition_by=TelemetryPoint.recording_id,
-                    order_by=TelemetryPoint.t_offset_s.asc(),
+        # Chunked, because the callers pass the whole library.
+        #
+        # SQLAlchemy renders `IN` as one bind parameter per element and SQLite refuses more
+        # than 32,766 of them in a statement -- measured, not assumed. Both callers select
+        # every journey-ready recording with no limit, so past that count this raised
+        # `OperationalError: too many SQL variables` on every scheduled scan, and the
+        # scheduler's single try/except then abandoned everything after it: the recluster,
+        # the stale-rollup repair and the duration repair all stopped running, silently,
+        # with one "scheduled task failed" line to show for it. At two-minute clips from two
+        # cameras that ceiling is about 550 hours of driving -- well inside the life of a
+        # permanently installed dashcam.
+        first: dict[int, tuple[float | None, float | None]] = {}
+        for start in range(0, len(ids), _ID_CHUNK):
+            chunk = ids[start : start + _ID_CHUNK]
+            ranked = (
+                select(
+                    TelemetryPoint.recording_id,
+                    TelemetryPoint.lat,
+                    TelemetryPoint.lon,
+                    func.row_number()
+                    .over(
+                        partition_by=TelemetryPoint.recording_id,
+                        order_by=TelemetryPoint.t_offset_s.asc(),
+                    )
+                    .label("rank"),
                 )
-                .label("rank"),
+                .where(
+                    TelemetryPoint.recording_id.in_(chunk),
+                    TelemetryPoint.has_fix.is_(True),
+                    TelemetryPoint.lat.is_not(None),
+                    TelemetryPoint.lon.is_not(None),
+                )
+                .subquery()
             )
-            .where(
-                TelemetryPoint.recording_id.in_(ids),
-                TelemetryPoint.has_fix.is_(True),
-                TelemetryPoint.lat.is_not(None),
-                TelemetryPoint.lon.is_not(None),
+            first.update(
+                {
+                    row.recording_id: (row.lat, row.lon)
+                    for row in (
+                        await session.execute(select(ranked).where(ranked.c.rank == 1))
+                    ).all()
+                }
             )
-            .subquery()
-        )
-        first = {
-            row.recording_id: (row.lat, row.lon)
-            for row in (await session.execute(select(ranked).where(ranked.c.rank == 1))).all()
-        }
 
         changed = 0
         for recording in recordings:
@@ -313,7 +361,11 @@ class JourneyBuilder:
 
     @staticmethod
     async def _attach(
-        session: AsyncSession, recording_ids: list[int], journey_id: int | None
+        session: AsyncSession,
+        recording_ids: list[int],
+        journey_id: int | None,
+        *,
+        recordings_only: bool = False,
     ) -> None:
         """Point recordings at a journey with a statement, never by ORM assignment.
 
@@ -334,10 +386,25 @@ class JourneyBuilder:
         no in-memory state for it to compare against. The denormalised copies of the id go
         with it: they are what the per-journey map and heat map read, and leaving them
         behind outlives the rebuild that orphaned them.
+
+        ``recordings_only`` writes just ``recordings.journey_id``, which is all a caller
+        needs when the full attach is about to happen anyway. The rebuild is that caller: it
+        attached a cluster so ``refresh`` could find the members by ``Recording.journey_id``,
+        and ``refresh`` then attached the same recordings again on its way out -- so the
+        three denormalised copies were rewritten twice per rebuild, on top of the once the
+        cascading DELETE had already nulled them. One of those copies is
+        ``telemetry_points.journey_id``, a row per second of footage per camera, so dropping
+        the duplicate takes a full rewrite of the largest table in the schema out of every
+        scan that sees a new file.
         """
         if not recording_ids:
             return
-        for model in (Recording, TelemetryPoint, TrackedObject, PlateObservation):
+        models = (
+            (Recording,)
+            if recordings_only
+            else (Recording, TelemetryPoint, TrackedObject, PlateObservation)
+        )
+        for model in models:
             column = Recording.id if model is Recording else model.recording_id
             await session.execute(
                 update(model)
@@ -635,6 +702,10 @@ class JourneyBuilder:
                         TelemetryPoint.speed_kmh,
                         TelemetryPoint.captured_at,
                         TelemetryPoint.t_offset_s,
+                        # Selected so `_measure` can actually see it. Without the column the
+                        # guard there was reading a `TrackPoint` attribute that did not
+                        # exist and defaulting to False on every row.
+                        TelemetryPoint.breaks_segment,
                     ).where(
                         TelemetryPoint.recording_id.in_(recording_ids),
                         TelemetryPoint.has_fix.is_(True),
@@ -748,10 +819,44 @@ class JourneyBuilder:
             current = first_by_recording.get(point.recording_id)
             if current is None or (point.t_offset_s or 0.0) < (current.t_offset_s or 0.0):
                 first_by_recording[point.recording_id] = point
+        # The recording-level GPS counters go with it, for exactly the same reason.
+        #
+        # `has_gps`, `gps_point_count` and `gps_rejected_count` are written once by the
+        # telemetry stage and never revisited, and this method is the thing that revisits
+        # the data behind them: `_clear_positions` below has just thrown out every fix the
+        # journey decided could not belong to this drive. Left alone, a recording whose
+        # entire GPS was repudiated still reported `has_gps = true` with N fixes -- so it
+        # kept its green badge in the Recordings grid, answered `?has_gps=true`, and was
+        # classified "healthy" on the Telemetry Health page while its map drew nothing at
+        # all. `retention.idle` reads the same stale numbers to decide whether a clip is
+        # empty enough to delete on its own.
+        rejected_by_recording: dict[int, int] = {}
+        for point in points:
+            if point.id in rejected_ids:
+                rejected_by_recording[point.recording_id] = (
+                    rejected_by_recording.get(point.recording_id, 0) + 1
+                )
+        surviving_by_recording: dict[int, int] = {}
+        for point in located:
+            surviving_by_recording[point.recording_id] = (
+                surviving_by_recording.get(point.recording_id, 0) + 1
+            )
+
         for recording in recordings:
             point = first_by_recording.get(recording.id)
             recording.start_lat = point.lat if point else None
             recording.start_lon = point.lon if point else None
+            newly_rejected = rejected_by_recording.get(recording.id, 0)
+            if not newly_rejected:
+                # Nothing this journey decided changes what the stage recorded, so the
+                # stage's numbers stand. Recomputing them here would overwrite counts the
+                # stage derived from evidence this method never sees -- the OCR statuses
+                # behind `gps_ocr_gap_count`, for instance.
+                continue
+            surviving = surviving_by_recording.get(recording.id, 0)
+            recording.gps_point_count = surviving
+            recording.has_gps = surviving > 0
+            recording.gps_rejected_count = (recording.gps_rejected_count or 0) + newly_rejected
 
         journey.distance_m, journey.avg_speed_kmh = self._measure(track, min_move_m)
         journey.vehicle_count = int(counts[0] or 0)
@@ -989,7 +1094,7 @@ class JourneyBuilder:
             # and this one, so nothing is *known* to have been travelled. The route layer
             # already refuses to draw that leg; measuring it would put a distance on the
             # map's own admission that it does not know the way.
-            if getattr(row, "breaks_segment", False):
+            if row.breaks_segment:
                 anchor = (lat, lon)
                 anchor_time = captured
                 continue

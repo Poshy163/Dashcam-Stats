@@ -10,16 +10,37 @@ from __future__ import annotations
 
 import pytest
 
+from app.core import settings_service
+from app.core.settings_schema import SETTINGS_BY_KEY
 from app.ingest import adb, poller
 from app.ingest.status import get_status, reset_status_for_tests
 
 
 class StubSettings:
+    """Stands in for the settings service, including its schema fallback.
+
+    `get_or_default` is the accessor the ingest code actually uses, and it falls back to
+    the *schema* default rather than to a literal beside the call site. A stub without it
+    would answer None for every unset key, which is how a threshold of 120 seconds becomes
+    a threshold of zero -- the arrival gate silently switched off, which is the bug that
+    accessor exists to prevent.
+    """
+
     def __init__(self, values: dict | None = None) -> None:
         self.values = dict(values or {})
 
     def get_nowait(self, key, default=None):
-        return self.values.get(key, default)
+        if key in self.values:
+            return self.values[key]
+        if default is not None:
+            return default
+        defn = SETTINGS_BY_KEY.get(key)
+        if defn is None:
+            raise KeyError(key)
+        return defn.default
+
+    def get_or_default(self, key):
+        return self.get_nowait(key)
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +55,10 @@ def gate(monkeypatch):
     """A poller whose settings and uptime reads are faked. `set_uptime(v)` decides what the
     unit will answer for its running time on the next `_arrival_ready`."""
     settings = StubSettings()
-    monkeypatch.setattr(poller, "get_settings_service", lambda: settings)
+    # Patched where the accessor actually reads from. The poller's settings reads go
+    # through `app.ingest.models.ingest_setting`, which falls back to the schema default
+    # rather than to a literal written beside the call.
+    monkeypatch.setattr(settings_service, "get_settings_service", lambda: settings)
 
     def set_uptime(value):
         async def fake_uptime(address):

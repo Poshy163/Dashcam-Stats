@@ -38,6 +38,7 @@ from app.db.models import (
     StageState,
 )
 from app.db.session import session_scope
+from app.retention.safety import DISK_VS_INDEX_MIN_RATIO
 from app.scanner.fingerprint import fingerprint_file
 from app.scanner.naming import parse_recording_name, resolve_camera
 from app.scanner.stability import assess
@@ -47,6 +48,14 @@ log = get_logger(__name__)
 #: Rows are flushed in batches so a scan over a very large share holds a bounded amount
 #: of state regardless of how many files it finds.
 _BATCH_SIZE = 200
+
+#: The states ``queue_unprocessed`` will hand to a worker. Declared once because two places
+#: depend on the same answer: the query itself, and the settling branch that has to take a
+#: file *out* of that set while it is still being written.
+QUEUEABLE_STATES: tuple[RecordingState, ...] = (
+    RecordingState.DISCOVERED,
+    RecordingState.METADATA_EXTRACTED,
+)
 
 
 @dataclass(slots=True)
@@ -79,11 +88,10 @@ class ScanSummary:
     warnings: list[str] = field(default_factory=list)
 
 
-#: How far the file count may fall below the index before a scan refuses to conclude that
-#: the difference is deletion. Mirrors the retention guard in :mod:`app.retention.safety`
-#: on purpose: the two are answering the same question — does this directory look like the
-#: one we indexed? — and they should not be able to disagree.
-_DISK_VS_INDEX_MIN_RATIO = 0.5
+# How far the file count may fall below the index before a scan refuses to conclude that the
+# difference is deletion. Imported from retention rather than restated here: the two are
+# answering the same question — does this directory look like the one we indexed? — and a
+# comment saying "these must not disagree" beside a copied literal cannot enforce it.
 
 
 class Scanner:
@@ -92,7 +100,20 @@ class Scanner:
     def __init__(self, footage_dir: Path | None = None) -> None:
         self._footage_dir_override = footage_dir
         #: Directories the walk could not read during the current scan.
-        self._walk_errors = 0
+        #:
+        #: A list rather than a counter so the walk generator can append to state the *run*
+        #: owns. It used to be an integer attribute on this object, zeroed at the top of
+        #: every scan -- and the scheduler holds exactly one Scanner while `POST /api/scan`
+        #: can start a second scan at any moment. A manual scan therefore reset the count a
+        #: scheduled one was still accumulating, and the scheduled scan then concluded it
+        #: had seen the share cleanly and let `_mark_missing` run against a demonstrably
+        #: partial view of it. Marking files missing is the one destructive conclusion this
+        #: module draws, and that counter is the first thing standing in front of it.
+        self._walk_errors: list[str] = []
+        #: One scan at a time. Two concurrent walks also race to insert the same new
+        #: `rel_path`, and that UNIQUE violation surfaces at commit -- outside the per-entry
+        #: guard -- taking the whole scan down with it.
+        self._lock = asyncio.Lock()
 
     async def _reconciliation_blocked(self, summary: ScanSummary) -> str | None:
         """Why this scan must not conclude anything is missing, or ``None`` if it may.
@@ -128,7 +149,7 @@ class Scanner:
                 f"the footage directory looks empty while {indexed} recordings are "
                 "indexed; treating that as an unavailable share rather than as deletions"
             )
-        if summary.seen < indexed * _DISK_VS_INDEX_MIN_RATIO:
+        if summary.seen < indexed * DISK_VS_INDEX_MIN_RATIO:
             return (
                 f"only {summary.seen} files found against {indexed} indexed; a drop this "
                 "large is a mount problem far more often than it is real deletion"
@@ -155,7 +176,11 @@ class Scanner:
     # -- filesystem walk ---------------------------------------------------------------
 
     def _walk(
-        self, root: Path, extensions: frozenset[str], follow_symlinks: bool
+        self,
+        root: Path,
+        extensions: frozenset[str],
+        follow_symlinks: bool,
+        errors: list[str] | None = None,
     ) -> Iterator[_Entry]:
         """Depth-first walk yielding one entry at a time.
 
@@ -199,15 +224,34 @@ class Scanner:
                 # Counted, not just logged. A directory that becomes unreadable partway
                 # through leaves a partial view of the share, and the caller has to know
                 # that before it decides anything is missing.
-                self._walk_errors += 1
+                (self._walk_errors if errors is None else errors).append(str(current))
                 log.warning("could not read directory", path=str(current), error=str(exc))
 
     # -- scan --------------------------------------------------------------------------
 
+    class AlreadyScanning(RuntimeError):
+        """A scan is already walking the share."""
+
     async def scan(self, trigger: str = "scheduled") -> ScanSummary:
+        """Walk the share, refusing to start a second walk over the same one.
+
+        Refuses rather than queues. An `asyncio.Lock` alone would be correct and unpleasant:
+        the scheduler and `POST /api/scan` share one Scanner, so a manual scan issued during
+        a scheduled one would hold the request open for the rest of that walk *and then walk
+        the whole share again* -- and three impatient clicks would queue three full scans
+        behind each other, while the scheduler's own loop, which awaits its tasks in
+        sequence, waited on all of them before it could reclaim a stranded job or prune a
+        log.
+        """
+        if self._lock.locked():
+            raise Scanner.AlreadyScanning("a scan is already running")
+        async with self._lock:
+            return await self._scan(trigger)
+
+    async def _scan(self, trigger: str) -> ScanSummary:
         started = time.monotonic()
         summary = ScanSummary()
-        self._walk_errors = 0
+        walk_errors: list[str] = []
         settings = get_settings_service()
 
         root = await self._footage_dir()
@@ -237,7 +281,7 @@ class Scanner:
         now_ns = time.time_ns()
         settle_ns = int(settle_s * 1_000_000_000)
         seen_paths: set[str] = set()
-        walker = self._walk(root, extensions, follow_symlinks)
+        walker = self._walk(root, extensions, follow_symlinks, walk_errors)
         try:
             while True:
                 # os.scandir/stat on a hard NFS mount may block in the kernel. Pull one
@@ -257,7 +301,7 @@ class Scanner:
         finally:
             walker.close()
 
-        summary.errors += self._walk_errors
+        summary.errors += len(walk_errors)
         skip_reason = await self._reconciliation_blocked(summary)
         if skip_reason is None:
             summary.missing = await self._mark_missing(seen_paths, summary)
@@ -317,12 +361,14 @@ class Scanner:
             )
             existing = {row.rel_path: row for row in rows}
 
+            stamped = datetime.now(UTC)
             for entry in batch:
+                row = existing.get(entry.rel_path)
                 try:
                     await self._reconcile(
                         session,
                         entry,
-                        existing.get(entry.rel_path),
+                        row,
                         summary,
                         now_ns,
                         settle_ns,
@@ -332,6 +378,25 @@ class Scanner:
                 except Exception as exc:
                     summary.errors += 1
                     log.warning("could not index file", file=entry.rel_path, error=str(exc))
+                    continue
+                # Stamped here, and only for a row the scan actually changed.
+                #
+                # This used to be assigned unconditionally at the top of `_reconcile`, and
+                # it quietly made the module docstring above false: an unchanged file cost
+                # one stat *and one UPDATE*, so every scan rewrote every indexed row. On a
+                # library of twenty thousand recordings that is twenty thousand row writes
+                # an hour -- through SQLite's single write lock, competing with the workers
+                # -- for a column that nothing in the application, the API or the UI ever
+                # reads back. Measured on a settled fifty-file library: the whole scan went
+                # from one 50-row `UPDATE recordings SET last_scanned_at=?` to no recording
+                # writes at all.
+                #
+                # "When was this file last seen" is not lost. It is the finish time of the
+                # newest successful `scan_runs` row, which is one row rather than N, and a
+                # recording that has *stopped* being seen is marked `file_missing` by the
+                # reconciliation at the end of the scan.
+                if row is not None and session.is_modified(row, include_collections=False):
+                    row.last_scanned_at = stamped
 
     async def _reconcile(
         self,
@@ -374,6 +439,8 @@ class Scanner:
             )
             if verdict.ready:
                 recording.fingerprint = await fingerprint_file(entry.path, sample_bytes)
+                recording.fingerprint_size_bytes = entry.size
+                recording.fingerprint_mtime_ns = entry.mtime_ns
             elif verdict.invalid:
                 self._mark_invalid(recording, verdict.reason, now)
                 summary.invalid += 1
@@ -384,7 +451,6 @@ class Scanner:
             summary.new += 1
             return
 
-        row.last_scanned_at = now
         if row.file_missing:
             # Reappeared — most often a share that was briefly unmounted.
             row.file_missing = False
@@ -406,10 +472,26 @@ class Scanner:
 
         if verdict.settling:
             summary.unsettled += 1
-            if row.state in (RecordingState.DISCOVERED, RecordingState.INVALID):
-                # A file that has started moving again is no longer a verdict, whatever it
-                # was before -- a zero-byte segment the camera came back and filled in is
-                # exactly this case.
+            # A moved stat is not, on its own, evidence against a verdict about content.
+            #
+            # A recording the *pipeline* condemned -- no decodable video stream, say --
+            # keeps its fingerprint, and demoting it here discarded that verdict: the next
+            # scan then had nothing left to distinguish it from an ordinary file and
+            # requeued it to fail again. Left alone, the provenance check further down
+            # re-reads its bytes on the next scan and decides properly: identical, and the
+            # verdict stands; different, and it is reset like any other changed file.
+            if row.state in QUEUEABLE_STATES:
+                # Held out of the queue while it moves. `queue_unprocessed` selects on
+                # these states plus a non-null fingerprint, so a row that was ready and is
+                # now growing again would otherwise be handed to a worker mid-write --
+                # which is the whole reason this state exists. Both states, from the one
+                # tuple the queueing query uses, so the hold-back cannot fall behind it.
+                row.state = RecordingState.SETTLING
+                row.error_message = None
+            elif row.state is RecordingState.INVALID and row.fingerprint is None:
+                # A file the *scanner* condemned -- zero bytes -- that has started moving
+                # again is no longer a verdict: this is the segment the camera came back
+                # and filled in. The withheld fingerprint is exactly what marks it.
                 row.state = RecordingState.SETTLING
                 row.error_message = None
             return
@@ -420,28 +502,70 @@ class Scanner:
                 summary.invalid += 1
             return
 
-        # Ready. The fast path is a file whose bytes we have already fingerprinted and
-        # whose stat has not moved -- one stat and nothing else, which is what makes a
-        # scan over a large share affordable.
+        # Ready. The fast path is a file whose *current* bytes have already been
+        # fingerprinted -- one stat and nothing else, which is what makes a scan over a
+        # large share affordable.
         #
-        # `fingerprint is None` is what pulls a file out of the settle window, and it is
-        # also what separates the two kinds of invalid. It is withheld while a file is
-        # still moving and cleared when the *scanner* condemns a file, so its absence
-        # means "these bytes have never been read" -- which is true of a segment that was
-        # empty last time and is exactly what should be looked at again now.
+        # The test is against the stat the fingerprint was taken from, not against the one
+        # the previous scan recorded, and that distinction is the whole of the bug this
+        # replaced. `size_changed` compares `entry` with `row.size_bytes`/`row.mtime_ns`,
+        # which are rewritten unconditionally a few lines above so the *stability* check
+        # has a fresh baseline. So a file that changes is "changed" for exactly one scan --
+        # the scan that also, correctly, holds it back for a settling observation and
+        # returns before it gets anywhere near a fingerprint. On the next scan the stat
+        # matches the values that scan wrote, `size_changed` is False, and the file is
+        # skipped. Every line below was unreachable for any row that already had a
+        # fingerprint: a recording whose file was replaced kept the analysis of bytes that
+        # were no longer there, and one that had never been analysed sat in SETTLING
+        # forever, invisible to `queue_unprocessed` and excluded from every bulk rebuild.
         #
-        # A recording the *pipeline* condemned keeps its fingerprint, so it takes the
-        # cheap path below and stays invalid. Without that distinction every scan would
-        # resurrect a file with no video stream, requeue it, and watch it fail again.
+        # That is not a theoretical sequence. `app.ingest.puller` deliberately overwrites a
+        # short local copy with the complete one when a transfer was cut off mid-file.
         #
-        # Without the test at all, a file first seen mid-write and then never touched again
-        # matched on size and mtime forever and was never processed at all.
-        if not size_changed and row.fingerprint is not None:
+        # `fingerprint is None` still separates the two kinds of invalid. It is withheld
+        # while a file is still moving and cleared when the *scanner* condemns a file, so
+        # its absence means "these bytes have never been read". A recording the *pipeline*
+        # condemned keeps its fingerprint, so it takes the cheap path and stays invalid --
+        # without that distinction every scan would resurrect a file with no video stream,
+        # requeue it, and watch it fail again.
+        # A settled row whose bytes are already fingerprinted comes out of SETTLING here,
+        # before the cheap path — because the cheap path is what it would otherwise be
+        # stranded behind.
+        #
+        # The mtime-age branch of `assess` puts a row into SETTLING without its stat having
+        # moved (a file written seconds ago), so its provenance still matches on the very
+        # next scan and the early return below fires forever. The row is by definition
+        # settled: the bytes on disk are the bytes that were read.
+        if row.state is RecordingState.SETTLING and row.fingerprint is not None:
+            row.state = RecordingState.DISCOVERED
+
+        if row.fingerprint is not None and (
+            row.fingerprint_size_bytes,
+            row.fingerprint_mtime_ns,
+        ) == (entry.size, entry.mtime_ns):
             return
 
         fingerprint = await fingerprint_file(entry.path, sample_bytes)
+        # Recorded whatever the digest turns out to be, so the next scan takes the cheap
+        # path either way. Without this a file that is touched without being changed --
+        # `touch`, a share that rewrites mtimes, a restored backup -- would be read again
+        # on every scan for the rest of its life.
+        row.fingerprint_size_bytes = entry.size
+        row.fingerprint_mtime_ns = entry.mtime_ns
+
         if row.fingerprint == fingerprint:
             # A touched file whose bytes are identical must not re-analyse the recording.
+            #
+            # It does have to come back out of SETTLING, though, and this is the upgrade
+            # path rather than an ordinary one: the branch above no longer puts a
+            # fingerprinted row there, but a database written before it did can still hold
+            # rows that were stranded that way -- which is exactly what migration 0011
+            # leaves un-backfilled so they are re-read here. There is no record of what
+            # state they came from, so DISCOVERED is the honest answer: it costs one
+            # analysis pass, after which a genuinely unusable file earns the same verdict
+            # again from a run that can actually judge it.
+            if row.state is RecordingState.SETTLING:
+                row.state = RecordingState.DISCOVERED
             return
 
         row.fingerprint = fingerprint
@@ -470,6 +594,8 @@ class Scanner:
         # been read"; withholding it means a file that later gains content is picked up by
         # the ordinary changed-content path rather than needing a special case.
         row.fingerprint = None
+        row.fingerprint_size_bytes = None
+        row.fingerprint_mtime_ns = None
         log.info("recording cannot be processed", file=row.filename, reason=reason)
 
     async def _mark_missing(self, seen: set[str], summary: ScanSummary) -> int:
@@ -566,12 +692,7 @@ async def queue_unprocessed(session: AsyncSession, limit: int | None = None) -> 
         .where(
             Recording.ignored.is_(False),
             Recording.file_missing.is_(False),
-            Recording.state.in_(
-                [
-                    RecordingState.DISCOVERED,
-                    RecordingState.METADATA_EXTRACTED,
-                ]
-            ),
+            Recording.state.in_(QUEUEABLE_STATES),
             # A fingerprint is deliberately withheld from a file whose mtime is still
             # inside the settle window, which makes its absence an exact marker for "the
             # dashcam is probably still writing this". Without this the settle window did

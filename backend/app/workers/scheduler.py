@@ -36,7 +36,6 @@ class TaskState:
     run: Callable[[], Awaitable[None]]
     enabled: Callable[[], Awaitable[bool]]
     next_run: float = 0.0
-    last_run: float | None = None
     last_error: str | None = None
     runs: int = 0
     failures: int = 0
@@ -121,7 +120,6 @@ class Scheduler:
                     if await task.enabled():
                         await task.run()
                         task.runs += 1
-                        task.last_run = now
                         task.last_error = None
                 except asyncio.CancelledError:
                     raise
@@ -153,6 +151,19 @@ class Scheduler:
             async with session_scope() as session:
                 summary.queued = await queue_unprocessed(session)
 
+        await self._post_scan_maintenance(summary)
+
+    async def _post_scan_maintenance(self, summary) -> None:
+        """Everything that has to happen after a walk, whoever asked for the walk.
+
+        Factored out because the manual path did not do it. "Scan now" ran an
+        *unconditional* full journey rebuild and none of the four self-healing passes, so
+        pressing the button did more work than the scheduler and less good: the rebuild
+        `needs_recluster` exists to avoid, without the start-position correction, the stale
+        rollup repair or the duration repair that make the next one unnecessary. Two paths
+        answering the same question differently is the shape of defect this codebase has
+        been bitten by most often.
+        """
         # New footage almost always extends the most recent journey, so keep boundaries
         # fresh rather than waiting for the next full rebuild.
         if (
@@ -218,6 +229,20 @@ class Scheduler:
     async def _run_reclaim(self) -> None:
         async with session_scope() as session:
             await queue.reclaim_stale(session)
+            # Both halves of the pairing, not just the job.
+            #
+            # `reclaim_stale` only looks at RUNNING job rows, so it cannot see a recording
+            # whose job ended in a state that is not RUNNING -- and cancelling a job is
+            # exactly that. `run_stages` commits `state = PROCESSING` before the first
+            # stage, the cancelled run returns without writing an outcome, and nothing
+            # else demotes the recording: `queue_unprocessed` looks for DISCOVERED and
+            # METADATA_EXTRACTED, "reprocess failed" wants FAILED, and this was the only
+            # periodic task in the process. Every cancelled analysis therefore orphaned one
+            # recording until the next container restart.
+            #
+            # Safe to run on a timer: the predicate excludes anything holding a queued or
+            # running job, so a healthy run in flight is never touched.
+            await queue.release_stranded_recordings(session)
 
     async def _run_prune(self) -> None:
         days = int(get_settings_service().get_nowait("advanced.log_retention_days"))
@@ -231,8 +256,7 @@ class Scheduler:
         if await get_settings_service().auto_process():
             async with session_scope() as session:
                 summary.queued = await queue_unprocessed(session)
-        async with session_scope() as session:
-            await JourneyBuilder().rebuild(session)
+        await self._post_scan_maintenance(summary)
         return summary
 
     async def process_new(self) -> int:

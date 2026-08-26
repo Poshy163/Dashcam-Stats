@@ -117,7 +117,7 @@ def split_indices(
     carry no coordinates at all. The geometric tests in turn cover rows written before the
     flag existed, and anything assembled from more than one recording.
 
-    See :func:`split_at_gaps`, which is this with the indices resolved to points.
+    See :func:`build_polylines`, which is this with the indices resolved to points.
     """
     runs: list[list[int]] = []
     current: list[int] = []
@@ -152,35 +152,21 @@ def build_polyline_indices(
     tolerance_m: float,
     max_gap_s: float = DEFAULT_MAX_GAP_S,
     max_jump_m: float = DEFAULT_MAX_JUMP_M,
+    breaks: Sequence[bool] | None = None,
 ) -> list[list[int]]:
-    """:func:`build_polylines` as indices, for callers carrying more than coordinates."""
+    """:func:`build_polylines` as indices, for callers carrying more than coordinates.
+
+    ``breaks`` was missing here while its sibling had it, so the journey-detail map joined
+    stretches the route overlay drew as broken -- two views of one drive, disagreeing about
+    which roads were taken.
+    """
     lines: list[list[int]] = []
-    for run in split_indices(samples, max_gap_s=max_gap_s, max_jump_m=max_jump_m):
+    for run in split_indices(samples, max_gap_s=max_gap_s, max_jump_m=max_jump_m, breaks=breaks):
         points = [(samples[i][0], samples[i][1]) for i in run]
         kept = [run[i] for i in simplify_indices(points, tolerance_m)]
         if len(kept) > 1:
             lines.append(kept)
     return lines
-
-
-def split_at_gaps(
-    samples: Sequence[tuple[float, float, float | None]],
-    *,
-    max_gap_s: float = DEFAULT_MAX_GAP_S,
-    max_jump_m: float = DEFAULT_MAX_JUMP_M,
-) -> list[list[tuple[float, float]]]:
-    """Break an ordered fix sequence wherever the line should not be drawn.
-
-    Each sample is ``(lat, lon, seconds)``, where ``seconds`` is a monotonic clock for the
-    ordering and may be ``None`` when a reading carried a position but no timestamp. A
-    missing clock is not treated as a gap on its own — the position was still good, and
-    breaking the line there would punch a hole in a real route to no purpose — so distance
-    is what decides in that case.
-    """
-    return [
-        [(samples[i][0], samples[i][1]) for i in run]
-        for run in split_indices(samples, max_gap_s=max_gap_s, max_jump_m=max_jump_m)
-    ]
 
 
 def build_polylines(
@@ -214,6 +200,5 @@ __all__ = [
     "build_polylines",
     "simplify",
     "simplify_indices",
-    "split_at_gaps",
     "split_indices",
 ]

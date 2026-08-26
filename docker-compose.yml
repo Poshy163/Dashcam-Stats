@@ -36,6 +36,14 @@ services:
     # password into this file in clear text and restarting the container. Turn it on
     # before putting the app on a public hostname; see examples/cloudflare-tunnel/.
     environment:
+      # Set this to YOUR timezone. It is the one setting that has to be right before the
+      # first scan: the dashcam's filenames and its burned-in clock are local time with no
+      # zone in them, so this is what decides when every recording actually happened. Get
+      # it wrong and journeys split at the wrong places and date filters miss.
+      #
+      # It seeds Settings > General > Timezone on first boot and is then done with: change
+      # the zone in the UI afterwards, and this line stops mattering. Editing it later does
+      # not silently reinterpret a library that has already been analysed.
       - TZ=Australia/Adelaide
       # - DASHCAM_LOG_LEVEL=INFO
 

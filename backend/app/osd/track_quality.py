@@ -243,7 +243,18 @@ def classify(fixes: Sequence[Fix]) -> list[Verdict]:
     # --- pass 3: forward walk for implied speed and segment breaks --------------------
     # The anchor is the last position still believed, so one bad reading cannot condemn
     # the good one that follows it.
+    #
+    # Rejections are collected rather than written straight in, so the same "refuse to act
+    # if most of what we can see looks wrong" guard pass 2 applies can be applied here too.
+    # Without it this pass had a hole exactly where pass 2 gives up: at three or fewer
+    # trusted fixes the neighbourhood check breaks out immediately, leaving the walk with
+    # no second opinion about which end of a disagreeing pair is lying -- and because a
+    # rejected sample does not advance the anchor, one corrupt *first* fix then condemned
+    # every good fix behind it. A clip that yielded three positions could end up storing
+    # only the corrupt one, which is then what `start_lat`/`start_lon`, the journey bounds
+    # and every sighting in the clip are placed from.
     anchor: int | None = None
+    unreachable: list[tuple[int, float, float]] = []
     for index, fix in enumerate(fixes):
         verdict = verdicts[index]
         if not verdict.drawable:
@@ -263,17 +274,11 @@ def classify(fixes: Sequence[Fix]) -> list[Verdict]:
         )
 
         if distance > reachable_radius_m(dt):
-            # Unreachable from the last trusted point. Whether this sample or the anchor
-            # is the liar was already settled by pass 2, which had both sides to look at;
-            # by here the anchor has survived that and this one has not.
-            verdicts[index] = Verdict(
-                GpsQuality.REJECTED,
-                [GpsReason.IMPLIED_SPEED_OUTLIER],
-                (
-                    f"{distance:.0f} m in {dt:.1f} s implies "
-                    f"{distance / max(1.0, dt) * 3.6:.0f} km/h"
-                ),
-            )
+            # Unreachable from the last trusted point. Whether this sample or the anchor is
+            # the liar is normally settled by pass 2, which had both sides to look at; by
+            # here the anchor has survived that and this one has not. The exception is
+            # handled below, where pass 2 never ran.
+            unreachable.append((index, distance, dt))
             continue
 
         if dt > MAX_GAP_S or distance > MAX_GAP_M:
@@ -286,6 +291,44 @@ def classify(fixes: Sequence[Fix]) -> list[Verdict]:
                 "route broken rather than joined"
             )
         anchor = index
+
+    if unreachable:
+        drawable = sum(1 for v in verdicts if v.drawable)
+        # Scoped to the hole it was written for: the case where pass 2 never ran.
+        #
+        # Pass 2 breaks out at `len(usable) <= MIN_NEIGHBOURS`, and it is the only pass that
+        # can tell which end of a disagreeing pair is lying. Below that threshold the walk
+        # has no second opinion, so one corrupt *first* fix condemns every good fix behind
+        # it -- a clip that yielded three positions could end up storing only the wrong one.
+        #
+        # Above it, pass 2 has already had its say and the walk's verdict is evidence, not a
+        # guess: a long track where half the fixes are unreachable from their anchors is a
+        # recording with real corruption in it, and refusing to reject any of them would
+        # store every impossible position as valid. A single disagreement is never a bad
+        # anchor either -- that is the ordinary case this pass exists for, and it is how a
+        # pair holding one impossible coordinate still loses it.
+        decisive = drawable > MIN_NEIGHBOURS or len(unreachable) < 2
+        for index, distance, dt in unreachable:
+            implied = (
+                f"{distance:.0f} m in {dt:.1f} s implies {distance / max(1.0, dt) * 3.6:.0f} km/h"
+            )
+            if decisive:
+                verdicts[index] = Verdict(
+                    GpsQuality.REJECTED, [GpsReason.IMPLIED_SPEED_OUTLIER], implied
+                )
+                continue
+            # A walk that condemns most of what it saw has not found outliers, it has found
+            # a bad anchor -- the same conclusion `engine._derive` reaches from the same
+            # evidence. With too few fixes to say which end is lying, the honest answer is
+            # to keep both and refuse to join them: nothing is discarded, and no line or
+            # distance is drawn across a leg the data cannot vouch for.
+            kept = verdicts[index]
+            kept.breaks_segment = True
+            kept.reasons.append(GpsReason.GPS_GAP)
+            kept.detail = (
+                f"{implied}, but too few positions here to tell which reading is wrong; "
+                "route broken rather than joined"
+            )
 
     return verdicts
 

@@ -28,7 +28,7 @@ builder and the API share it rather than growing a second copy each.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 from app.osd.validate import clock_is_plausible
@@ -45,6 +45,16 @@ class TrackPoint:
     speed_kmh: float | None
     #: Wall-clock moment, resolved against the recording rather than trusted from the overlay.
     at: datetime
+    #: Nothing trustworthy was recorded between the *previous* position and this one, so a
+    #: consumer must not draw or measure the leg into it.
+    #:
+    #: Carried on the point rather than left in the database because the two consumers that
+    #: need it were reading different things: the route overlay selected the column and
+    #: honoured it, while journey distance ran ``getattr(row, "breaks_segment", False)``
+    #: against a ``TrackPoint`` that had no such field -- a guard that could never fire, so
+    #: every gap the pipeline had explicitly refused to draw was still measured as a
+    #: straight line and added to the drive's distance.
+    breaks_segment: bool = False
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -108,6 +118,9 @@ def single_track(
                     lon=row.lon,
                     speed_kmh=row.speed_kmh,
                     at=at,
+                    # Absent on a row shape that does not carry the column, which is what
+                    # the API's own journey query used to be.
+                    breaks_segment=bool(getattr(row, "breaks_segment", False)),
                 ),
             )
         )
@@ -121,7 +134,26 @@ def single_track(
         current = chosen.get(second)
         if current is None or (is_front and not current[0]):
             chosen[second] = (is_front, point)
-    return [point for _, point in sorted(chosen.values(), key=lambda item: item[1].at)]
+    ordered = [point for _, point in sorted(chosen.values(), key=lambda item: item[1].at)]
+
+    # Drop the clip-start sentinel, which does not survive being concatenated.
+    #
+    # `track_quality.classify` sets `breaks_segment` on the first drawable fix of *every*
+    # recording, unconditionally, because its walk has no anchor yet within that clip.
+    # Inside one recording that is harmless -- every per-recording consumer sets its anchor
+    # from the same row before testing the flag. Merged into one journey-wide track it
+    # becomes a lie: a journey of thirty clips would report thirty breaks, lose the real leg
+    # across each clip boundary from its distance, and draw the route cut at every one. The
+    # flag only means anything where the previous kept position came from the same
+    # recording.
+    previous: int | None = None
+    result: list[TrackPoint] = []
+    for point in ordered:
+        if point.breaks_segment and previous is not None and previous != point.recording_id:
+            point = replace(point, breaks_segment=False)
+        previous = point.recording_id
+        result.append(point)
+    return result
 
 
 __all__ = ["TrackPoint", "moment_of", "single_track"]

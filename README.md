@@ -55,6 +55,14 @@ Deployment variables are `DASHCAM_DATA_DIR`, `DASHCAM_FOOTAGE_DIR`, `DASHCAM_POR
 `DASHCAM_LOG_LEVEL` and `TZ`. That is the whole list — including sign-in, which is a
 setting rather than a variable. See [Sign-in](#sign-in).
 
+**Set `TZ` before the first scan.** The dashcam writes local wall-clock time into its
+filenames and burns it into the picture, with no zone attached, so `TZ` is what decides
+*when* each recording happened. It seeds **Settings → General → Timezone** on first boot
+and is then done with — change the zone in the UI afterwards, so editing this line later
+cannot silently reinterpret a library that has already been analysed. Getting it wrong to
+begin with shifts every timestamp by your real offset, which splits journeys in the wrong
+places and makes date filters miss.
+
 ---
 
 ## Hardware acceleration

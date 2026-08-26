@@ -23,7 +23,14 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import func, select
 
-from app.db.models import JobState, ProcessingJob, Recording, RecordingState, StageState
+from app.db.models import (
+    JobKind,
+    JobState,
+    ProcessingJob,
+    Recording,
+    RecordingState,
+    StageState,
+)
 from app.db.session import session_scope
 from app.workers import queue
 
@@ -599,3 +606,63 @@ class TestTheQueuePageDoesNotShowStaleFailures:
         assert superseded.state is JobState.CANCELLED
         assert stats["failed"] == 0, "the old failure survived an explicit reprocess"
         assert stats["queued"] == 1
+
+
+class TestRetryFailedDoesNotStackAJobAgainstItself:
+    """ "Retry failed" used to hand one recording two queued jobs, from its own history.
+
+    The live-job guard added earlier only looks at jobs that are *currently* QUEUED or
+    RUNNING, which is the wrong question when every job for a recording has already
+    finished badly. `fail` runs `_follow_up_after_thumbnail` on every terminal outcome, so
+    a recording whose thumbnail could not be made and whose analysis then also failed holds
+    two FAILED rows and no live one -- and a single UPDATE flipped both to QUEUED.
+    """
+
+    async def test_only_the_newest_failure_is_requeued(self, db_session):
+        recording_id = await make_recording(db_session, "double-failure.ts")
+        older = ProcessingJob(
+            recording_id=recording_id,
+            kind=JobKind.THUMBNAIL,
+            state=JobState.FAILED,
+            error_message="no frame could be decoded",
+        )
+        newer = ProcessingJob(
+            recording_id=recording_id,
+            kind=JobKind.PROCESS,
+            state=JobState.FAILED,
+            error_message="ffprobe produced no output",
+        )
+        db_session.add_all([older, newer])
+        await db_session.flush()
+
+        assert await queue.retry_failed(db_session) == 1, (
+            "both of one recording's failures were requeued"
+        )
+        await db_session.refresh(older)
+        await db_session.refresh(newer)
+
+        assert newer.state is JobState.QUEUED
+        assert older.state is JobState.FAILED, "the superseded failure was resurrected too"
+        live = (
+            await db_session.execute(
+                select(func.count(ProcessingJob.id)).where(
+                    ProcessingJob.recording_id == recording_id,
+                    ProcessingJob.state == JobState.QUEUED,
+                )
+            )
+        ).scalar()
+        assert live == 1
+
+    async def test_separate_recordings_are_still_both_retried(self, db_session):
+        """The guard is per recording, not a global "one at a time"."""
+        first = await make_recording(db_session, "a.ts")
+        second = await make_recording(db_session, "b.ts")
+        db_session.add_all(
+            [
+                ProcessingJob(recording_id=first, kind=JobKind.PROCESS, state=JobState.FAILED),
+                ProcessingJob(recording_id=second, kind=JobKind.PROCESS, state=JobState.FAILED),
+            ]
+        )
+        await db_session.flush()
+
+        assert await queue.retry_failed(db_session) == 2

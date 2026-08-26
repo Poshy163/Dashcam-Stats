@@ -110,6 +110,30 @@ class TestCoordinatesAreNeverInvented:
         r = parse_osd_text("2026-07-28 13:49:02 E:138.7035 N:-34.7956 62 km/h")
         assert r.lat == pytest.approx(-34.7956)
 
+    @pytest.mark.parametrize(
+        "line",
+        [
+            # The colon in 'E:' read as a minus. `-` and `:` are thin and adjacent in
+            # shape and swap for each other in both directions; only one direction was
+            # guarded. The separator pattern cannot hold a '-', so the stray sign is
+            # absorbed by the coordinate's own optional sign and the reading lands in the
+            # Pacific at full confidence with no problem recorded.
+            "2026-07-28 13:49:02 E-138.7035 N:-34.7956 62 km/h",
+            # The same swap on the latitude, which flips the hemisphere.
+            "2026-07-28 13:49:02 E:8.5417 N-47.3769 62 km/h",
+        ],
+    )
+    def test_a_sign_that_replaced_the_labels_colon_is_refused(self, line):
+        r = parse_osd_text(line)
+        assert r.has_position is False
+        assert r.lat is None and r.lon is None
+
+    def test_a_genuinely_negative_longitude_keeps_its_sign(self):
+        """The western hemisphere still parses: the label's colon is beside the minus."""
+        r = parse_osd_text("2026-07-28 13:49:02 E:-122.4194 N:37.7749 62 km/h")
+        assert r.lon == pytest.approx(-122.4194)
+        assert r.lat == pytest.approx(37.7749)
+
     def test_a_genuine_positive_latitude_is_kept(self):
         # Northern hemisphere: no sign printed at all, and ':' before the digits is the
         # overlay's own separator rather than a damaged minus.

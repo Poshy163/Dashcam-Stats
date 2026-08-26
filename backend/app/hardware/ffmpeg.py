@@ -1286,6 +1286,18 @@ async def iter_frames(
     # already known.
     if label != "software" and str(path) in _hwaccel_refused:
         hwaccel, label = "cpu", "software"
+    # Resolved once, and the decision carried down.
+    #
+    # `_decode_frames` calls `select_hwaccel` again for itself, and that second answer is
+    # what builds the command line -- while the first answer, above, is what decides
+    # whether the media gate is held at all. They consult live state (`software_decode_reason`
+    # reads the gate's health), so they can disagree: resolve to "software" here while the
+    # slot is unhealthy, have a straggling child exit and clear that flag, and the second
+    # call resolves to VAAPI and opens a hardware reader with no slot held -- exactly what
+    # the gate exists to prevent. Pinning the preference to "cpu" short-circuits the second
+    # call, so it can only ever agree with this one.
+    if label == "software":
+        hwaccel = "cpu"
     if on_decoder:
         on_decoder(label)
 
@@ -1333,7 +1345,7 @@ async def iter_frames(
             # consumer has already seen frames and would receive them twice.
             if label == "software" or yielded:
                 raise
-            if _is_empty_window(exc):
+            if is_empty_window(exc):
                 # ffmpeg ran to completion and simply found nothing in the window asked for.
                 # That is a fact about the window, not about the GPU, and software decode
                 # would find exactly the same nothing.
@@ -1440,7 +1452,7 @@ def is_infrastructure_failure(exc: FFmpegError) -> bool:
     return media_gate_unhealthy() is not None
 
 
-def _is_empty_window(exc: FFmpegError) -> bool:
+def is_empty_window(exc: FFmpegError) -> bool:
     """True when ffmpeg exited cleanly having decoded nothing.
 
     The distinction matters because both cases arrive as the same exception. A returncode

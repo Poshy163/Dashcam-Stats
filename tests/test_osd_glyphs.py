@@ -296,3 +296,63 @@ class TestTemplatePersistence:
 
     def test_missing_file_loads_as_none(self, tmp_path):
         assert GlyphTemplates.load(tmp_path / "absent.npz") is None
+
+
+class TestClassificationIsVectorised:
+    """The hot loop of the whole telemetry stage, and its arithmetic.
+
+    Classifying one glyph is a correlation against every learned template. Written as a
+    Python loop of ``np.mean(probe * template)`` that is one temporary array and one numpy
+    call per template per glyph -- about nine hundred of them for a single overlay line,
+    and measured at 8-9 ms of the ~9 ms spent decoding one. As a single matrix product it
+    is the same arithmetic (a mean over elementwise products *is* a dot product over the
+    element count) at roughly a quarter of the cost.
+
+    This asserts the equivalence, because "faster" is only worth anything if the answer is
+    unchanged.
+    """
+
+    @staticmethod
+    def _templates():
+        import numpy as np
+
+        from app.osd.glyphs import TEMPLATE_SHAPE, GlyphTemplates
+
+        rng = np.random.default_rng(11)
+        chars = "0123456789.:-ENkmh/"
+        return GlyphTemplates(
+            templates={c: rng.random(TEMPLATE_SHAPE).astype(np.float32) for c in chars}
+        )
+
+    def test_it_agrees_with_the_per_template_loop(self):
+        import numpy as np
+
+        from app.osd.glyphs import _zscore, normalise
+
+        templates = self._templates()
+        rng = np.random.default_rng(3)
+
+        def reference(bitmap):
+            probe = _zscore(normalise(bitmap))
+            best_char, best_score = "?", -1.0
+            for ch, tz in templates._z.items():
+                score = float(np.mean(probe * tz))
+                if score > best_score:
+                    best_char, best_score = ch, score
+            return best_char, best_score
+
+        for _ in range(60):
+            bitmap = rng.integers(
+                0, 2, size=(int(rng.integers(8, 26)), int(rng.integers(4, 14)))
+            ).astype(np.float32)
+            expected_char, expected_score = reference(bitmap)
+            char, score = templates.classify(bitmap)
+            assert char == expected_char
+            assert score == pytest.approx(expected_score, abs=1e-5)
+
+    def test_an_empty_template_set_still_answers(self):
+        import numpy as np
+
+        from app.osd.glyphs import GlyphTemplates
+
+        assert GlyphTemplates().classify(np.zeros((10, 6), dtype=np.float32)) == ("?", 0.0)

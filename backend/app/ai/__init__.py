@@ -3,50 +3,10 @@
 Every component degrades independently. Missing models or a missing inference runtime
 disable one feature and report themselves unavailable — they never fail a recording or
 stop the container from starting.
+
+Deliberately empty of re-exports. Nothing imported the package facade -- every caller
+names the submodule it wants -- while the facade itself imported all seven of them, so
+``import app.ai.normalise_au`` for a pure-string helper pulled in the detector, the
+tracker, the plate reader and numpy behind them. Importing a leaf module should cost the
+leaf.
 """
-
-from __future__ import annotations
-
-from app.ai.backend import BackendInfo, InferenceBackend, get_backend
-from app.ai.detector import Detection2D, ObjectDetector
-from app.ai.models import COCO_CLASSES, ROAD_CLASSES, describe_models, ensure_model
-from app.ai.normalise_au import NormalisedPlate, normalise, plate_similarity
-from app.ai.plates import (
-    PlateDetector,
-    PlateOCR,
-    PlateReading,
-    PlateVote,
-    crop_with_margin,
-    plate_box_in_frame,
-    select_ocr_candidates,
-    vote_track_plate,
-)
-from app.ai.runtime import describe_runtime, onnx_providers
-from app.ai.tracker import ByteTracker, Track
-
-__all__ = [
-    "COCO_CLASSES",
-    "ROAD_CLASSES",
-    "BackendInfo",
-    "ByteTracker",
-    "Detection2D",
-    "InferenceBackend",
-    "NormalisedPlate",
-    "ObjectDetector",
-    "PlateDetector",
-    "PlateOCR",
-    "PlateReading",
-    "PlateVote",
-    "Track",
-    "crop_with_margin",
-    "describe_models",
-    "describe_runtime",
-    "ensure_model",
-    "get_backend",
-    "normalise",
-    "onnx_providers",
-    "plate_box_in_frame",
-    "plate_similarity",
-    "select_ocr_candidates",
-    "vote_track_plate",
-]

@@ -221,9 +221,13 @@ resolved by guesswork, and each has a named regression test.
    jitter gate (points closer than the 11 m quantisation are not accumulated, otherwise
    stationary noise inflates distance).
 
-A general OCR model (PaddleOCR via OpenVINO) is retained behind a setting as a fallback for
-firmware whose font the templates do not cover, and the per-field confidence is always stored
-so the UI can show uncertainty rather than asserting correctness.
+There is deliberately **no** general-OCR fallback. An earlier version of this document said
+a PaddleOCR model was retained behind a setting for firmware whose font the templates do not
+cover; no such model, dependency or code path ever existed, and the setting that offered it
+was read by nothing while rendering as a working control in the UI. Both are gone. What is
+true is the second half: the per-field confidence is always stored, so the UI shows
+uncertainty rather than asserting correctness. A camera with a different overlay font is
+handled by learning templates from its own footage, which is what `app.osd.glyphs` does.
 
 ---
 

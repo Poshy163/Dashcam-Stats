@@ -27,6 +27,9 @@ from app.ingest.models import (
     UnitInfo,
     UnitState,
 )
+from app.ingest.models import (
+    ingest_setting as _get,
+)
 from app.ingest.status import get_status
 
 log = get_logger(__name__)
@@ -34,17 +37,6 @@ log = get_logger(__name__)
 #: Staged arrivals live here until they are whole. A dot-directory so the scanner's walk
 #: skips it -- see `app.scanner.discovery`.
 STAGING_DIRNAME = ".ingest_staging"
-
-
-def _settings() -> object:
-    return get_settings_service()
-
-
-def _get(key: str, default=None):
-    try:
-        return get_settings_service().get_nowait(f"ingest.{key}")
-    except Exception:
-        return default
 
 
 def _by_directory(files: list[RemoteFile], default: str) -> list[tuple[str, list[RemoteFile]]]:
@@ -194,6 +186,8 @@ async def _move(
     return transferred
 
 
+# NOTE: `already_seen` is the same set `delta` takes, and for the same reason -- see the
+# note on its parameter there.
 async def _rescue_partials(
     info: UnitInfo,
     *,
@@ -203,6 +197,7 @@ async def _rescue_partials(
     port: int,
     timeout_s: int,
     unit_now: int,
+    already_seen: set[str] | None = None,
 ) -> tuple[list[RemoteFile], list[str], dict[str, int]]:
     """Recover cut-short recordings the camera never finished. Best-effort by contract.
 
@@ -227,11 +222,22 @@ async def _rescue_partials(
     if not info.source:
         return [], [], {}
     orphans = await adb.list_orphan_partials(info.address, info.source, unit_now=unit_now)
+    # Local absence is not the only reason to skip one.
+    #
+    # `already_seen` is the set of recordings the library has *deliberately* removed, and
+    # `delta` consults it for exactly the reason its own docstring gives: without it the two
+    # subsystems fight -- the file is absent from disk, so it is asked for again, retention
+    # deletes it again, and every driveway window is spent re-fetching the oldest footage
+    # while today's never gets a turn. A rescued partial is the same class of file and was
+    # not being given the same guard.
+    seen = already_seen or set()
     candidates = [
         item
         for item in orphans
         if not (footage / item.name[len(adb.PARTIAL_PREFIX) :]).exists()
         and not (footage / item.name).exists()
+        and item.name[len(adb.PARTIAL_PREFIX) :] not in seen
+        and item.name not in seen
     ]
     if not candidates:
         return [], [], {}
@@ -520,7 +526,7 @@ async def _drop_still_growing(info: UnitInfo, plan: DeltaPlan, sources: list[str
 
 async def probe_unit() -> UnitInfo:
     """One cheap control round trip, used by the presence poll."""
-    address = str(_get("unit_adb_address", ""))
+    address = adb.normalised_address(str(_get("unit_adb_address", "")))
     return await adb.describe(address, str(_get("source_path_override", "") or ""))
 
 
@@ -585,10 +591,15 @@ async def shutdown() -> None:
     """
     # Fired side effects are best-effort by definition, but they still have to be tidied
     # away. A task left pending when the loop closes prints "Task was destroyed but it is
-    # pending", which reads like a bug in a shutdown path that has to look clean.
-    for side in list(_side_tasks):
+    # pending", which reads like a bug in a shutdown path that has to look clean -- and
+    # cancelling alone does not tidy anything, because the exception is only scheduled.
+    # The gather is what makes this a shutdown rather than a request for one.
+    sides = list(_side_tasks)
+    for side in sides:
         side.cancel()
-    radios.cancel_pending()
+    if sides:
+        await asyncio.gather(*sides, return_exceptions=True)
+    await radios.cancel_pending()
     task = _current
     if task is None or task.done():
         return
@@ -920,6 +931,7 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
                     port=port,
                     timeout_s=timeout_s,
                     unit_now=int(time.time() + skew),
+                    already_seen=await removed,
                 )
             except Exception as exc:
                 log.warning("could not rescue cut-short recordings", error=str(exc))

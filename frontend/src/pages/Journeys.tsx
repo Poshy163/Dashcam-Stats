@@ -5,6 +5,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import Spinner from '@/components/Spinner'
 import { DerivedHint, EmptyState, ErrorState, PageHeader, Pagination } from '@/components/ui'
 import { api } from '@/lib/api'
+import { invalidateAnalysisQueries } from '@/lib/queryInvalidation'
 import { formatDate, formatDistance, formatDuration, formatSpeed, formatTime } from '@/lib/format'
 
 export default function Journeys() {
@@ -24,7 +25,12 @@ export default function Journeys() {
     mutationFn: () => api.journeys.merge(selected),
     onSuccess: () => {
       setSelected([])
-      client.invalidateQueries({ queryKey: ['journeys'] })
+      // Everything derived, not just this list. A merge deletes journey rows and re-parents
+      // every recording's journeyId, so the journey detail view, the Recordings list's
+      // journey filter and both map layers are all stale afterwards — which is precisely
+      // the "one mutation remembers Vehicles and forgets Recordings" problem the shared
+      // helper exists to end.
+      void invalidateAnalysisQueries(client)
     },
   })
 

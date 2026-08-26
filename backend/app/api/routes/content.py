@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import aliased, selectinload
 
 from app.ai.normalise_au import normalise
@@ -36,7 +36,7 @@ from app.api.schemas import (
     TrackedObjectOut,
     VehicleOut,
 )
-from app.api.visibility import visible_journey_ids, visible_revision
+from app.api.visibility import telemetry_quality_view, visible_journey_ids, visible_revision
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service, local_zone
 from app.db.models import (
@@ -238,29 +238,9 @@ async def get_telemetry(recording_id: RowId, session: SessionDep):
     )
     points = []
     for row in rows:
-        quality = row.quality_json or {
-            "source": "overlay_ocr",
-            "ocr_status": "legacy",
-            "time_status": "valid" if row.captured_at is not None else "unknown",
-            "time_source": "overlay" if row.captured_at is not None else "unknown",
-            "gps_status": "valid" if row.has_fix else "unknown",
-            "gps_source": "direct" if row.has_fix else "none",
-            "interpolated": False,
-            "candidate_count": 1,
-            "problems": ["quality unavailable until telemetry is reprocessed"],
-        }
-        # The columns win over the JSON where both exist. A row repaired by the 0009
-        # migration has its verdict in the columns only -- the blob still describes what
-        # the old pipeline believed at the time, which is precisely what was wrong.
-        quality = {
-            **quality,
-            "gps_quality": row.gps_quality,
-            "gps_reason": row.gps_reason or quality.get("gps_reason"),
-            "breaks_segment": bool(row.breaks_segment),
-        }
         points.append(
             TelemetryPointOut.model_validate(row).model_copy(
-                update={"raw_text": row.raw_text, "quality": quality}
+                update={"raw_text": row.raw_text, "quality": telemetry_quality_view(row)}
             )
         )
     return points
@@ -348,62 +328,133 @@ async def patch_recording_event(
     return RecordingOut.model_validate(recording)
 
 
+#: Rows the Telemetry Health page lists. The counts above it are exact; this is the table.
+_TELEMETRY_ISSUE_LIMIT = 250
+
+
+def _telemetry_status_case():
+    """The four telemetry verdicts, as one SQL expression.
+
+    Written in SQL rather than Python because the page it feeds is polled every ten
+    seconds and the answer is four integers. Loading every non-ignored recording as a full
+    ORM object to compute them -- sixty-odd columns each, a JSON column deserialised per
+    row, all of it into the session identity map -- cost tens of megabytes of allocation
+    per poll on a library of any size, and then discarded all but 250 of the results.
+
+    The ladder is the same one the loop used, in the same order, so the two cannot drift:
+    a stage that has not finished is *pending* whatever else the columns say; a stale
+    revision is *degraded*; a recording that read points but never got a fix, and said so
+    on every one of them, is *no_fix*; anything with a gap or a problem is *degraded*; the
+    rest are *healthy*.
+    """
+    return case(
+        (Recording.telemetry_state != StageState.DONE, "pending"),
+        # NULL-safe, and it has to be: `telemetry_revision` is nullable and a database
+        # written before revisions existed carries NULL there. In Python `None != "..."` is
+        # True; in SQL `NULL != '...'` is NULL, so such a row would fall through this rung
+        # and be counted healthy -- while `outdated_stages`, which still compares in Python,
+        # goes on treating it as outdated. The page and the reprocess button would disagree
+        # about the same recording.
+        (
+            func.coalesce(Recording.telemetry_revision, "") != CURRENT_REVISIONS["telemetry"],
+            "degraded",
+        ),
+        (
+            and_(
+                Recording.telemetry_point_count > 0,
+                func.coalesce(Recording.gps_point_count, 0) == 0,
+                Recording.gps_no_fix_count == Recording.telemetry_point_count,
+            ),
+            "no_fix",
+        ),
+        (
+            or_(Recording.gps_gap_count > 0, Recording.telemetry_problem_count > 0),
+            "degraded",
+        ),
+        else_="healthy",
+    )
+
+
 @router.get("/telemetry/quality", response_model=TelemetryQualityOut)
 async def telemetry_quality(session: SessionDep):
-    recordings = list(
-        (
-            await session.execute(
-                select(Recording).where(
-                    Recording.ignored.is_(False), Recording.file_missing.is_(False)
-                )
+    visible = (Recording.ignored.is_(False), Recording.file_missing.is_(False))
+    status_case = _telemetry_status_case()
+
+    # One aggregate query for the tiles: no rows come back, only the tallies.
+    tallies = (
+        await session.execute(
+            select(
+                status_case.label("status"),
+                func.count(Recording.id),
+                func.coalesce(func.sum(Recording.gps_gap_count), 0),
+                func.coalesce(func.sum(Recording.gps_recovered_count), 0),
             )
+            .where(*visible)
+            .group_by(status_case)
         )
-        .scalars()
-        .all()
-    )
+    ).all()
+
     counts = {"healthy": 0, "degraded": 0, "no_fix": 0, "pending": 0}
-    issues: list[TelemetryQualityRecordingOut] = []
-    for recording in recordings:
-        if recording.telemetry_state != StageState.DONE:
-            quality_status = "pending"
-        elif recording.telemetry_revision != CURRENT_REVISIONS["telemetry"]:
-            quality_status = "degraded"
-        elif (
-            recording.telemetry_point_count
-            and not recording.gps_point_count
-            and recording.gps_no_fix_count == recording.telemetry_point_count
-        ):
-            quality_status = "no_fix"
-        elif recording.gps_gap_count or recording.telemetry_problem_count:
-            quality_status = "degraded"
-        else:
-            quality_status = "healthy"
-        counts[quality_status] += 1
-        if quality_status != "healthy":
-            issues.append(
-                TelemetryQualityRecordingOut(
-                    recording_id=recording.id,
-                    filename=recording.filename,
-                    started_at=recording.started_at,
-                    points=recording.telemetry_point_count,
-                    fixes=recording.gps_point_count,
-                    gaps=recording.gps_gap_count,
-                    longest_gap_s=recording.gps_longest_gap_s,
-                    recovered=recording.gps_recovered_count,
-                    real_gps_loss=recording.gps_no_fix_count,
-                    ocr_unreadable=recording.gps_ocr_gap_count,
-                    rejected=recording.gps_rejected_count,
-                    problems=recording.telemetry_problem_count,
-                    status=quality_status,
-                )
+    total = total_gaps = paired = 0
+    for status_value, count, gaps, recovered in tallies:
+        counts[str(status_value)] = int(count)
+        total += int(count)
+        total_gaps += int(gaps or 0)
+        paired += int(recovered or 0)
+
+    # And one bounded column query for the table, ordered by the same key the page sorts
+    # on so the limit takes the worst rows rather than an arbitrary slice.
+    rows = (
+        await session.execute(
+            select(
+                Recording.id,
+                Recording.filename,
+                Recording.started_at,
+                Recording.telemetry_point_count,
+                Recording.gps_point_count,
+                Recording.gps_gap_count,
+                Recording.gps_longest_gap_s,
+                Recording.gps_recovered_count,
+                Recording.gps_no_fix_count,
+                Recording.gps_ocr_gap_count,
+                Recording.gps_rejected_count,
+                Recording.telemetry_problem_count,
+                status_case.label("status"),
             )
-    issues.sort(key=lambda item: (item.longest_gap_s, item.problems, item.points), reverse=True)
+            .where(*visible, status_case != "healthy")
+            .order_by(
+                Recording.gps_longest_gap_s.desc(),
+                Recording.telemetry_problem_count.desc(),
+                Recording.telemetry_point_count.desc(),
+            )
+            .limit(_TELEMETRY_ISSUE_LIMIT)
+        )
+    ).all()
+
+    issues = [
+        TelemetryQualityRecordingOut(
+            recording_id=row.id,
+            filename=row.filename,
+            started_at=row.started_at,
+            points=row.telemetry_point_count,
+            fixes=row.gps_point_count,
+            gaps=row.gps_gap_count,
+            longest_gap_s=row.gps_longest_gap_s,
+            recovered=row.gps_recovered_count,
+            real_gps_loss=row.gps_no_fix_count,
+            ocr_unreadable=row.gps_ocr_gap_count,
+            rejected=row.gps_rejected_count,
+            problems=row.telemetry_problem_count,
+            status=str(row.status),
+        )
+        for row in rows
+    ]
     return TelemetryQualityOut(
-        recordings=len(recordings),
+        recordings=total,
         **counts,
-        total_gaps=sum(recording.gps_gap_count for recording in recordings),
-        paired_recoveries=sum(recording.gps_recovered_count for recording in recordings),
-        issues=issues[:250],
+        total_gaps=total_gaps,
+        paired_recoveries=paired,
+        issues=issues,
     )
 
 
@@ -532,15 +583,19 @@ async def get_journey(journey_id: RowId, session: SessionDep):
                 TelemetryPoint.captured_at,
                 TelemetryPoint.recording_id,
                 TelemetryPoint.t_offset_s,
+                # Carried onto the TrackPoint, so this view breaks the line in the same
+                # places /api/map/routes does.
+                TelemetryPoint.breaks_segment,
             )
             .join(Recording, Recording.id == TelemetryPoint.recording_id)
             .where(
                 TelemetryPoint.journey_id == journey_id,
                 TelemetryPoint.has_fix.is_(True),
-                or_(
-                    Recording.telemetry_revision.is_(None),
-                    Recording.telemetry_revision != INVALIDATED_REVISION,
-                ),
+                # The shared predicate rather than a hand-rolled copy of it. The inline
+                # version this replaced was subtly weaker than the one every other route
+                # uses, so a recording could be drawn here while being hidden everywhere
+                # else.
+                visible_revision(Recording.telemetry_revision),
                 TelemetryPoint.lat.is_not(None),
                 TelemetryPoint.lon.is_not(None),
             )
@@ -569,7 +624,9 @@ async def get_journey(journey_id: RowId, session: SessionDep):
             )
             for i in run
         ]
-        for run in build_polyline_indices(samples, tolerance_m=tolerance)
+        for run in build_polyline_indices(
+            samples, tolerance_m=tolerance, breaks=[p.breaks_segment for p in path]
+        )
     ]
 
     # Validate against JourneyOut, not JourneyDetailOut. They differ by one field, and that
@@ -637,6 +694,29 @@ async def reprocess_journey(journey_id: RowId, body: ReprocessRequest, session: 
 # --------------------------------------------------------------------------------------
 
 
+def _plate_has_visible_observation():
+    """A plate the current analysis still stands behind.
+
+    Lifted out of ``list_plates`` because ``/api/search`` was answering a different
+    question: it applied neither this nor ``dismissed``, so a plate the user had explicitly
+    dismissed, or one hidden by an active reanalysis, came back from search while being
+    absent from the Plates page it links to.
+    """
+    return (
+        select(PlateObservation.id)
+        .join(Recording, Recording.id == PlateObservation.recording_id)
+        .where(
+            PlateObservation.plate_id == Plate.id,
+            # The shared rule, not a hand-rolled copy of it. The inline predicate this
+            # replaced was weaker in two ways every other route cares about: it published
+            # results for a recording that was not finished, and for one the operator had
+            # hidden.
+            visible_revision(Recording.plate_revision),
+        )
+        .exists()
+    )
+
+
 @router.get("/plates", response_model=Paginated[PlateOut])
 async def list_plates(
     session: SessionDep,
@@ -646,18 +726,7 @@ async def list_plates(
     min_confidence: float | None = None,
     sort: str = Query("last_seen_desc"),
 ):
-    visible = (
-        select(PlateObservation.id)
-        .join(Recording, Recording.id == PlateObservation.recording_id)
-        .where(
-            PlateObservation.plate_id == Plate.id,
-            or_(
-                Recording.plate_revision.is_(None), Recording.plate_revision != INVALIDATED_REVISION
-            ),
-        )
-        .exists()
-    )
-    stmt = select(Plate).where(Plate.dismissed.is_(False), visible)
+    stmt = select(Plate).where(Plate.dismissed.is_(False), _plate_has_visible_observation())
     if q:
         # Partial matching is the point: "ABC" must find "ABC123". Both the normalised
         # and the display text are searched, since a plate that failed normalisation is
@@ -747,10 +816,7 @@ async def _with_representative(session, items: list[PlateOut]) -> list[PlateOut]
                 .join(Recording, Recording.id == PlateObservation.recording_id)
                 .where(
                     PlateObservation.plate_id.in_(plate_ids),
-                    or_(
-                        Recording.plate_revision.is_(None),
-                        Recording.plate_revision != INVALIDATED_REVISION,
-                    ),
+                    visible_revision(Recording.plate_revision),
                 )
                 .group_by(PlateObservation.plate_id)
             )
@@ -792,9 +858,8 @@ async def get_plate_observations(plate_id: RowId, session: SessionDep, page: Pag
         .outerjoin(Camera, Camera.id == PlateObservation.camera_id)
         .where(
             PlateObservation.plate_id == plate_id,
-            or_(
-                Recording.plate_revision.is_(None), Recording.plate_revision != INVALIDATED_REVISION
-            ),
+            # The shared rule, like every other published list.
+            visible_revision(Recording.plate_revision),
         )
         .order_by(PlateObservation.captured_at.desc().nullslast())
     )
@@ -805,10 +870,7 @@ async def get_plate_observations(plate_id: RowId, session: SessionDep, page: Pag
                 .join(Recording, Recording.id == PlateObservation.recording_id)
                 .where(
                     PlateObservation.plate_id == plate_id,
-                    or_(
-                        Recording.plate_revision.is_(None),
-                        Recording.plate_revision != INVALIDATED_REVISION,
-                    ),
+                    visible_revision(Recording.plate_revision),
                 )
             )
         ).scalar()
@@ -860,6 +922,15 @@ async def _recount_plate(session, plate: Plate) -> None:
 
 
 async def _move_plate_observations(session, source_id: int, target: Plate) -> None:
+    """Re-point one plate's observations at another, collapsing duplicates.
+
+    Two queries, not one per row. This used to run a `SELECT` inside the loop looking for a
+    matching observation on the target -- a plate seen a few hundred times made a few
+    hundred round trips out of one button press. Worse, that lookup ended in
+    `scalar_one_or_none()`, and `tracked_object_id` is nullable with `ON DELETE SET NULL`:
+    two observations in one recording whose tracks had been deleted both matched `IS NULL`,
+    and the merge answered 500. Building the index once removes both.
+    """
     observations = list(
         (
             await session.execute(
@@ -869,16 +940,23 @@ async def _move_plate_observations(session, source_id: int, target: Plate) -> No
         .scalars()
         .all()
     )
-    for observation in observations:
-        duplicate = (
+    existing: dict[tuple[int | None, int | None], PlateObservation] = {}
+    for row in (
+        (
             await session.execute(
-                select(PlateObservation).where(
-                    PlateObservation.plate_id == target.id,
-                    PlateObservation.recording_id == observation.recording_id,
-                    PlateObservation.tracked_object_id == observation.tracked_object_id,
-                )
+                select(PlateObservation).where(PlateObservation.plate_id == target.id)
             )
-        ).scalar_one_or_none()
+        )
+        .scalars()
+        .all()
+    ):
+        # First one wins, which is the same row `scalar_one_or_none` would have returned
+        # had there only ever been one.
+        existing.setdefault((row.recording_id, row.tracked_object_id), row)
+
+    for observation in observations:
+        key = (observation.recording_id, observation.tracked_object_id)
+        duplicate = existing.get(key)
         if duplicate is not None:
             if observation.ocr_confidence > duplicate.ocr_confidence:
                 duplicate.raw_text = observation.raw_text
@@ -890,6 +968,9 @@ async def _move_plate_observations(session, source_id: int, target: Plate) -> No
         else:
             observation.plate_id = target.id
             observation.normalised_text = target.normalised_text
+            # Now a target observation itself, so a later source row with the same key
+            # collapses onto it rather than being moved alongside it.
+            existing[key] = observation
 
 
 @router.post("/plates/{plate_id}/correct", response_model=PlateOut)
@@ -1202,6 +1283,31 @@ async def retry_job(job_id: RowId, session: SessionDep):
         recording = await session.get(Recording, job.recording_id)
         if recording is not None and recording.ignored:
             raise HTTPException(status.HTTP_409_CONFLICT, "Recording is blacklisted")
+        # Refusing to stack, exactly as `queue.enqueue` does. A recording can legitimately
+        # hold a failed job beside a live one -- a thumbnail that could not be made leaves
+        # its FAILED row next to the analysis job it correctly created -- and requeuing the
+        # failed one then has that recording decoded twice for no benefit.
+        live = (
+            (
+                await session.execute(
+                    select(ProcessingJob).where(
+                        ProcessingJob.recording_id == job.recording_id,
+                        ProcessingJob.id != job.id,
+                        ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if live is not None:
+            # 409, not a 200 carrying a different job's body. The two refusals either side
+            # of this raise, and answering "here you are" while leaving the requested job
+            # failed and untouched is the one shape a caller cannot act on.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This recording already has a queued or running job.",
+            )
     job.state = "queued"
     job.attempts = 0
     job.not_before = None
@@ -1248,10 +1354,14 @@ async def search(session: SessionDep, q: str = Query(..., min_length=1)):
             await session.execute(
                 select(Plate)
                 .where(
+                    # The same two gates the Plates page applies, so search cannot surface
+                    # a plate that page refuses to list.
+                    Plate.dismissed.is_(False),
+                    _plate_has_visible_observation(),
                     or_(
                         Plate.normalised_text.like(plate_pattern),
                         Plate.display_text.like(plate_pattern),
-                    )
+                    ),
                 )
                 .order_by(Plate.last_seen_at.desc().nullslast())
                 .limit(20)
@@ -1285,12 +1395,10 @@ async def search(session: SessionDep, q: str = Query(..., min_length=1)):
             day = datetime.strptime(term, fmt)
         except ValueError:
             continue
-        journey_stmt = (
-            select(Journey)
-            .where(func.date(Journey.started_at) == day.date())
-            .order_by(Journey.started_at.desc())
-            .limit(20)
-        )
+        # Added to the base statement, not a fresh one: replacing it dropped the
+        # `visible_journey_ids()` restriction the title branch keeps, so searching a date
+        # was the one way to reach journeys every other route hides.
+        journey_stmt = journey_stmt.where(func.date(Journey.started_at) == day.date())
         break
     else:
         journey_stmt = journey_stmt.where(Journey.title.ilike(f"%{term}%"))

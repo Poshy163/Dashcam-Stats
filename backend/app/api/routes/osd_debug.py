@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Query, Response, status
 from sqlalchemy import select
 
 from app.api.deps import RowId, SessionDep
+from app.api.visibility import telemetry_quality_view
 from app.core.logging import get_logger
 from app.core.paths import resolve_footage_path
 from app.core.settings_service import get_settings_service
@@ -137,14 +138,7 @@ async def osd_debug(
     expected = recording.started_at + timedelta(seconds=t) if recording.started_at else None
     stored_out = None
     if stored is not None:
-        quality = stored.quality_json or {
-            "ocr_status": "legacy",
-            "time_status": "valid" if stored.captured_at else "unknown",
-            "gps_status": "valid" if stored.has_fix else "unknown",
-            "gps_source": "direct" if stored.has_fix else "none",
-            "interpolated": False,
-            "problems": ["quality unavailable until telemetry is reprocessed"],
-        }
+        quality = telemetry_quality_view(stored)
         stored_out = {
             "t_offset_s": stored.t_offset_s,
             "dt_s": round(abs(stored.t_offset_s - t), 3),

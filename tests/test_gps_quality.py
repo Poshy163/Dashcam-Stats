@@ -427,3 +427,43 @@ class TestTooLittleToJudge:
 
     def test_a_single_fix_is_kept(self):
         assert classify([Fix(t_s=0.0, lat=LAT, lon=LON)])[0].quality is GpsQuality.VALID
+
+
+class TestTheForwardWalkKnowsWhenItIsTheOnlyJudge:
+    """Pass 3 keeps a bad anchor's victims only where pass 2 never got to speak.
+
+    The forward walk cannot tell which end of a disagreeing pair is lying. On a short track
+    that is the only opinion available, and taking it literally means one corrupt *first*
+    fix condemns every good fix behind it — a clip that yielded three positions storing only
+    the wrong one. On a long track the neighbourhood pass has already arbitrated, and its
+    silence is evidence: fixes that are unreachable from their anchors after that are
+    corruption, and keeping them because there are many of them would publish every
+    impossible position in the recording as valid.
+    """
+
+    def test_a_short_track_does_not_let_one_bad_first_fix_condemn_the_rest(self):
+        # Three fixes: the first is nonsense, the last two are a normal 11 m step apart.
+        # Below MIN_NEIGHBOURS, so pass 2 declines and pass 3 is the only judge there is.
+        fixes = [
+            Fix(t_s=0.0, lat=LAT, lon=13.8769),
+            Fix(t_s=1.0, lat=LAT, lon=LON),
+            Fix(t_s=2.0, lat=LAT, lon=LON + 0.0001),
+        ]
+        verdicts = classify(fixes)
+        kept = [v.quality for v in verdicts]
+        assert kept.count(GpsQuality.VALID) >= 2, (
+            "the two good fixes were thrown away with the bad anchor"
+        )
+
+    def test_a_long_track_still_rejects_its_impossible_positions(self):
+        """The majority guard used to swallow these: many disagreements read as one bad anchor."""
+        fixes = [Fix(t_s=float(i), lat=LAT, lon=LON + i * 0.0001) for i in range(12)]
+        # Half the track is thrown to the other side of the world, one fix at a time, so
+        # each is unreachable from the fix before it rather than forming a plausible run.
+        for i in range(1, 12, 2):
+            fixes[i] = Fix(t_s=fixes[i].t_s, lat=fixes[i].lat, lon=13.8769)
+
+        verdicts = classify(fixes)
+        rejected = [i for i, v in enumerate(verdicts) if v.quality is GpsQuality.REJECTED]
+        assert rejected, "a recording full of impossible positions published all of them"
+        assert all(v.lon != 13.8769 for i, v in enumerate(fixes) if verdicts[i].drawable)

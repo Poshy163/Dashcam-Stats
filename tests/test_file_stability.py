@@ -335,3 +335,194 @@ class TestAFileHeldBackByTheSettleWindow:
             assert await queue_unprocessed(session) == 1, (
                 "a file that left the settle window was never processed at all"
             )
+
+
+class TestAFileThatChangesOnDisk:
+    """The escalation ladder's middle rung, which was missing entirely.
+
+    ``size_bytes``/``mtime_ns`` are the *stability* baseline and are rewritten on every
+    scan, so "the stat has moved" is true for exactly one scan — the one that also holds
+    the file back for a stable observation and returns before fingerprinting it. On the
+    next scan the stat matches what that scan wrote, the cheap path fires, and the new
+    bytes are never read.
+
+    ``app.ingest.puller`` overwrites a short local copy with the complete one whenever a
+    transfer is cut off mid-file, so this is ordinary operation rather than a corner case.
+    """
+
+    @staticmethod
+    async def _one() -> Recording:
+        from sqlalchemy import select
+
+        async with session_scope() as session:
+            return (await session.execute(select(Recording))).scalars().one()
+
+    @staticmethod
+    def _settled(path, *, content: bytes, age_s: float) -> None:
+        import os
+
+        path.write_bytes(content)
+        when = time.time() - age_s
+        os.utime(path, (when, when))
+
+    async def test_replaced_content_is_re_fingerprinted_and_requeued(self, db_session, app_config):
+        from app.db.models import StageState
+
+        root = app_config.footage_dir
+        clip = root / "20260803091500_camera_0.ts"
+        self._settled(clip, content=b"\x47" * 4096, age_s=86_400)
+
+        scanner = Scanner(footage_dir=root)
+        await scanner.scan(trigger="test")
+        before = await self._one()
+        assert before.fingerprint is not None
+
+        async with session_scope() as session:
+            row = await session.get(Recording, before.id)
+            row.state = RecordingState.COMPLETED
+            row.metadata_state = StageState.DONE
+
+        # The complete file lands over the truncated one.
+        self._settled(clip, content=b"\x47" * 9000, age_s=86_000)
+
+        # One scan to see the stat move and hold it, one to find it stable.
+        await scanner.scan(trigger="test")
+        summary = await scanner.scan(trigger="test")
+
+        after = await self._one()
+        assert summary.changed == 1
+        assert after.fingerprint != before.fingerprint, "the new bytes were never read"
+        assert after.state is RecordingState.DISCOVERED
+        assert after.metadata_state is StageState.PENDING, "the stale analysis was kept"
+
+    async def test_a_never_analysed_recording_does_not_strand_in_settling(
+        self, db_session, app_config
+    ):
+        root = app_config.footage_dir
+        clip = root / "20260803091500_camera_0.ts"
+        self._settled(clip, content=b"\x47" * 4096, age_s=86_400)
+
+        scanner = Scanner(footage_dir=root)
+        await scanner.scan(trigger="test")
+        self._settled(clip, content=b"\x47" * 9000, age_s=86_000)
+
+        await scanner.scan(trigger="test")
+        assert (await self._one()).state is RecordingState.SETTLING, "the change was not noticed"
+
+        await scanner.scan(trigger="test")
+        assert (await self._one()).state is RecordingState.DISCOVERED
+        async with session_scope() as session:
+            assert await queue_unprocessed(session) == 1, (
+                "the recording was stranded in SETTLING, invisible to the queue forever"
+            )
+
+    async def test_a_touch_does_not_resurrect_a_recording_the_pipeline_condemned(
+        self, db_session, app_config
+    ):
+        """The distinction the whole fingerprint-withholding rule turns on.
+
+        A file the *scanner* condemned -- zero bytes -- has no fingerprint, so a stat that
+        moves is read as "the camera came back and filled it in" and it is re-examined. One
+        the *pipeline* condemned keeps its fingerprint, and a moved stat says nothing about
+        its contents: a restored backup, an rsync without ``--times``, a plain ``touch``.
+        Treating the two alike put an unplayable clip back in the queue to fail again on
+        every scan that saw its mtime move.
+        """
+        import os
+
+        root = app_config.footage_dir
+        clip = root / "20260803091500_camera_0.ts"
+        self._settled(clip, content=b"G" * 4096, age_s=86_400)
+
+        scanner = Scanner(footage_dir=root)
+        await scanner.scan(trigger="test")
+
+        # What the pipeline does to a file with no decodable video stream: INVALID, with
+        # the fingerprint left intact.
+        async with session_scope() as session:
+            row = await session.get(Recording, (await self._one()).id)
+            row.state = RecordingState.INVALID
+            row.error_message = "contains no video stream"
+
+        when = time.time() - 80_000
+        os.utime(clip, (when, when))
+
+        await scanner.scan(trigger="test")
+        assert (await self._one()).state is RecordingState.INVALID, (
+            "a moved mtime discarded a verdict about the file's contents"
+        )
+
+        await scanner.scan(trigger="test")
+        after = await self._one()
+        assert after.state is RecordingState.INVALID
+        async with session_scope() as session:
+            assert await queue_unprocessed(session) == 0, (
+                "an unplayable recording was handed another processing attempt"
+            )
+
+    async def test_a_touch_that_changes_nothing_does_not_reanalyse(self, db_session, app_config):
+        """The other half: a restored backup or a share that rewrites mtimes."""
+        import os
+
+        from app.db.models import StageState
+
+        root = app_config.footage_dir
+        clip = root / "20260803091500_camera_0.ts"
+        self._settled(clip, content=b"\x47" * 4096, age_s=86_400)
+
+        scanner = Scanner(footage_dir=root)
+        await scanner.scan(trigger="test")
+        async with session_scope() as session:
+            row = await session.get(Recording, (await self._one()).id)
+            row.state = RecordingState.COMPLETED
+            row.metadata_state = StageState.DONE
+
+        when = time.time() - 80_000
+        os.utime(clip, (when, when))
+
+        await scanner.scan(trigger="test")
+        summary = await scanner.scan(trigger="test")
+
+        after = await self._one()
+        assert summary.changed == 0
+        assert after.state is RecordingState.COMPLETED
+        assert after.metadata_state is StageState.DONE
+
+    async def test_an_unchanged_library_writes_no_recording_rows(self, db_session, app_config):
+        """The cost claim in the module docstring, asserted rather than assumed.
+
+        ``last_scanned_at`` used to be stamped on every row on every scan, so a settled
+        library of N recordings paid N row writes an hour through SQLite's single write
+        lock for a column nothing reads back.
+        """
+        from sqlalchemy import event
+
+        from app.db.session import get_engine
+
+        root = app_config.footage_dir
+        for index in range(5):
+            self._settled(
+                root / f"2026080312{index:04d}_camera_0.ts", content=b"\x47" * 2048, age_s=86_400
+            )
+
+        scanner = Scanner(footage_dir=root)
+        # Index, then settle, then reach the steady state this is measuring.
+        for _ in range(3):
+            await scanner.scan(trigger="test")
+
+        statements: list[str] = []
+
+        def record(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement.strip())
+
+        engine = get_engine()
+        event.listen(engine.sync_engine, "before_cursor_execute", record)
+        try:
+            await scanner.scan(trigger="test")
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", record)
+
+        wrote_recordings = [s for s in statements if s.upper().startswith("UPDATE RECORDINGS")]
+        assert wrote_recordings == [], (
+            f"a scan that found nothing new rewrote the recordings table: {wrote_recordings}"
+        )

@@ -146,6 +146,12 @@ def app_config(temp_dirs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch):
     cfg.ensure_dirs()
     yield cfg
 
+    # The footage-tree measurement cache is process-wide and keyed on the path. Temporary
+    # directories are unique per test so a stale entry cannot normally be read back, but a
+    # cleared cache is one less thing that can make a test depend on its neighbours.
+    from app.core.paths import forget_tree_measurements
+
+    forget_tree_measurements()
     get_config.cache_clear()
 
 

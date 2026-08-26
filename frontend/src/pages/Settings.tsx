@@ -48,10 +48,10 @@ export default function Settings() {
 
   const refreshQueueAndAnalysis = () => {
     void client.invalidateQueries({ queryKey: ['jobs'] })
+    // One key, which the Queue page and the shell's nav badge both observe. It used to be
+    // two, and a reset that forgot the second left that page showing the previous run's
+    // figures until its next poll.
     void client.invalidateQueries({ queryKey: ['queue-stats'] })
-    // The Queue page keeps its own copy of the same counts, and a reset changes every one
-    // of them. Left cached, it shows the previous run's figures until its next poll.
-    void client.invalidateQueries({ queryKey: ['queue-stats-page'] })
     void invalidateAnalysisQueries(client)
   }
 
@@ -67,7 +67,22 @@ export default function Settings() {
     onSuccess: refreshQueueAndAnalysis,
   })
   const restore = useMutation({ mutationFn: api.system.restore })
+  // Two mutations, because they are two different actions and the panel used to offer only
+  // the first under a label that read as the second. "Run Now" called /retention/plan,
+  // which evaluates and deletes nothing — so with deletion switched on, a user who pressed
+  // it and saw a candidate list reasonably concluded the cleanup had run. It had not, and
+  // there was no way to trigger one from the UI at all.
   const plan = useMutation({ mutationFn: api.retention.plan })
+  const runRetention = useMutation({
+    mutationFn: api.retention.run,
+    // A run really unlinks footage and marks those recordings deleted, so every derived
+    // view is describing files that are gone — thumbnails included. `invalidateAnalysisQueries`
+    // already covers 'status'.
+    onSuccess: () => {
+      plan.reset()
+      void invalidateAnalysisQueries(client)
+    },
+  })
 
   const hardware = useQuery({
     queryKey: ['system-hardware'],
@@ -281,9 +296,29 @@ export default function Settings() {
 
           {category.key === 'storage' && (
             <RetentionPanel
-              result={plan.data}
-              pending={plan.isPending}
-              onRun={() => plan.mutate()}
+              // Whichever ran last, not a fixed precedence: `useMutation` keeps its
+              // `data` until reset, so `run ?? preview` would leave a stale post-run report
+              // on screen for every later Preview.
+              result={runRetention.data ?? plan.data}
+              pending={plan.isPending || runRetention.isPending}
+              onPreview={() => {
+                runRetention.reset()
+                plan.mutate()
+              }}
+              onRun={() => {
+                if (
+                  window.confirm(
+                    'Delete the footage listed by the retention rules? Files removed from ' +
+                      'the share cannot be recovered. Recordings that are protected, flagged ' +
+                      'as events, or being processed are never touched.\n\n' +
+                      'Note that the static-footage cleanup runs regardless of the ' +
+                      '"Actually delete files" switch — it only ever removes clips proven ' +
+                      'to hold nothing.',
+                  )
+                ) {
+                  runRetention.mutate()
+                }
+              }}
             />
           )}
 
@@ -812,20 +847,39 @@ function describeAgent(agent: string | null): string {
 function RetentionPanel({
   result,
   pending,
+  onPreview,
   onRun,
 }: {
   result: RetentionPlan | undefined
   pending: boolean
+  onPreview: () => void
   onRun: () => void
 }) {
+  // The sweep stops the moment it has found enough, so its skip counters are a partial
+  // tally of the rows it happened to walk past -- except here, where it ran to the end of
+  // the library without reaching the target. Then they are complete, and they are the
+  // answer to the only question worth asking at that point: why is it not freeing enough?
+  const shortfall =
+    result !== undefined && result.bytesToFree > 0 && result.wouldFreeBytes < result.bytesToFree
+
   return (
     <section className="card space-y-3 p-4">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <h3 className="text-sm font-semibold">Retention</h3>
-        <button className="btn ml-auto" onClick={onRun} disabled={pending}>
-          {pending ? 'Evaluating…' : 'Run Now'}
+        <button className="btn ml-auto" onClick={onPreview} disabled={pending}>
+          {pending ? 'Working…' : 'Preview'}
+        </button>
+        <button className="btn" onClick={onRun} disabled={pending}>
+          Run now
         </button>
       </div>
+      <p className="text-xs text-content-muted">
+        <strong className="text-content">Preview</strong> evaluates the rules and deletes
+        nothing. <strong className="text-content">Run now</strong> applies them, subject to
+        the safety checks below. The size-based rule also needs “Actually delete files”
+        above; the static-footage rule does not, because it only removes clips proven to
+        hold nothing.
+      </p>
 
       {result && (
         <div className="space-y-2 text-sm">
@@ -838,9 +892,26 @@ function RetentionPanel({
 
           {!result.deletionEnabled && (
             <p className="rounded border border-border bg-surface-sunken p-2 text-xs text-content-muted">
-              This is a <strong className="text-content">report</strong>. Deletion is
-              disabled, so nothing was removed.
+              “Actually delete files” is off, so the size-based rule below is a{' '}
+              <strong className="text-content">report</strong> and removed none of these.
+              The static-footage cleanup is not covered by that switch and may still have
+              removed clips.
             </p>
+          )}
+
+          {shortfall && Object.keys(result.skipped).length > 0 && (
+            <div className="rounded border border-border bg-surface-sunken p-2 text-xs">
+              <p className="text-content-muted">
+                Not enough could be freed. Everything else was kept because:
+              </p>
+              <ul className="tabular mt-1 space-y-0.5 text-content-faint">
+                {Object.entries(result.skipped).map(([reason, count]) => (
+                  <li key={reason}>
+                    {count} — {reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
 
           {result.blocked && (

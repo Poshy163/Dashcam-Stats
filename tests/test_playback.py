@@ -77,6 +77,36 @@ class TestCache:
         assert (directory / "00000004.mp4").exists()
         assert not (directory / "00000000.mp4").exists()
 
+    def test_prune_never_evicts_the_clip_it_was_asked_to_keep(self, app_config):
+        """A remux larger than the whole budget used to delete itself on the way out.
+
+        Both callers sweep the moment they finish writing a clip and then hand that path
+        straight to a `FileResponse`. When one recording remuxes to more than the configured
+        cache size -- a long clip and a small budget, which is a setting away -- the loop
+        can never reach the limit, so it deletes everything it has, newest included, and the
+        request that paid for the transcode serves a file that is no longer there.
+        """
+        directory = cache_dir()
+        cold = directory / "00000001.mp4"
+        cold.write_bytes(b"x" * 1024)
+        fresh = directory / "00000002.mp4"
+        fresh.write_bytes(b"x" * 4096)
+
+        removed = prune_cache(limit_bytes=512, keep=fresh)
+
+        assert fresh.exists(), "the sweep deleted the clip its caller was about to serve"
+        assert not cold.exists(), "the exemption stopped it evicting anything at all"
+        assert removed == 1
+
+    def test_prune_without_a_keep_still_evicts_everything_it_must(self, app_config):
+        """The exemption is opt-in; a scheduled sweep is still free to take the newest."""
+        directory = cache_dir()
+        only = directory / "00000003.mp4"
+        only.write_bytes(b"x" * 4096)
+
+        assert prune_cache(limit_bytes=512) == 1
+        assert not only.exists()
+
     def test_prune_is_a_noop_under_the_limit(self, app_config):
         (cache_dir() / "00000001.mp4").write_bytes(b"x" * 100)
         assert prune_cache(limit_bytes=10 * 1024) == 0

@@ -14,6 +14,7 @@ treated as a fault, never as permission to delete.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_config
 from app.core.logging import get_logger
-from app.core.paths import directory_size, is_mount_point, is_within, is_writable
+from app.core.paths import is_mount_point, is_within, is_writable, measure_tree
 from app.core.settings_service import get_settings_service
 from app.db.models import Recording
 
@@ -30,7 +31,7 @@ log = get_logger(__name__)
 
 #: If the database has indexed many files but the directory now shows far fewer, the
 #: mount is probably wrong or partial. Deleting against that view would be catastrophic.
-_DISK_VS_INDEX_MIN_RATIO = 0.5
+DISK_VS_INDEX_MIN_RATIO = 0.5
 
 
 @dataclass(slots=True)
@@ -72,8 +73,25 @@ class SafetyReport:
         }
 
 
-async def evaluate_safety(session: AsyncSession, footage_dir: Path | None = None) -> SafetyReport:
-    """Run every guard. The result is authoritative: no deletion may proceed on ``ok=False``."""
+async def evaluate_safety(
+    session: AsyncSession,
+    footage_dir: Path | None = None,
+    *,
+    measure_max_age_s: float = 0.0,
+) -> SafetyReport:
+    """Run every guard. The result is authoritative: no deletion may proceed on ``ok=False``.
+
+    Every filesystem call here is made in a worker thread. The footage directory is a
+    network mount in the deployment this is written for, and a single delayed ``stat`` on
+    the event loop stalls the whole process -- the API, video streaming and both workers'
+    heartbeats -- for as long as the storage server takes to answer.
+
+    ``measure_max_age_s`` bounds how stale the file-count walk may be. It defaults to zero,
+    meaning always measure, because every caller that is deciding whether to *delete* needs
+    a count of the share that is in front of it right now. ``/api/status`` is the exception:
+    it wants one boolean off a report it renders every ten seconds, and re-walking a
+    twenty-thousand file share for that is the single most expensive thing the API does.
+    """
     settings = get_settings_service()
     report = SafetyReport(ok=False)
 
@@ -85,7 +103,7 @@ async def evaluate_safety(session: AsyncSession, footage_dir: Path | None = None
         checks = report.checks
 
         # --- 1. it exists at all ------------------------------------------------------
-        exists = root.exists() and root.is_dir()
+        exists = await asyncio.to_thread(lambda: root.exists() and root.is_dir())
         checks.append(
             SafetyCheck(
                 "directory_exists",
@@ -96,7 +114,7 @@ async def evaluate_safety(session: AsyncSession, footage_dir: Path | None = None
         if not exists:
             return _blocked(report)
 
-        resolved = root.resolve()
+        resolved = await asyncio.to_thread(root.resolve)
 
         # --- 2. never anywhere near /data ---------------------------------------------
         data_dir = get_config().data_dir.resolve()
@@ -138,7 +156,7 @@ async def evaluate_safety(session: AsyncSession, footage_dir: Path | None = None
 
         # --- 4. really a mount, not the empty directory under an absent share ---------
         require_mount = bool(settings.get_nowait("storage.require_mountpoint"))
-        mounted = is_mount_point(resolved)
+        mounted = await asyncio.to_thread(is_mount_point, resolved)
         checks.append(
             SafetyCheck(
                 "is_mount_point",
@@ -157,7 +175,9 @@ async def evaluate_safety(session: AsyncSession, footage_dir: Path | None = None
 
         # --- 5. contains a plausible number of files ----------------------------------
         extensions = await settings.media_extensions()
-        total_bytes, file_count = directory_size(resolved, extensions)
+        total_bytes, file_count = await measure_tree(
+            resolved, extensions, max_age_s=measure_max_age_s
+        )
         report.total_bytes = total_bytes
         report.file_count = file_count
 
@@ -190,7 +210,7 @@ async def evaluate_safety(session: AsyncSession, footage_dir: Path | None = None
         )
         report.indexed_count = indexed
 
-        consistent = indexed == 0 or file_count >= indexed * _DISK_VS_INDEX_MIN_RATIO
+        consistent = indexed == 0 or file_count >= indexed * DISK_VS_INDEX_MIN_RATIO
         checks.append(
             SafetyCheck(
                 "consistent_with_index",
@@ -208,7 +228,10 @@ async def evaluate_safety(session: AsyncSession, footage_dir: Path | None = None
             return _blocked(report)
 
         # --- 7. writability, detected rather than assumed -----------------------------
-        writable = is_writable(resolved)
+        # Never cached, whatever ``measure_max_age_s`` says. This is the guard that catches
+        # a share which has gone read-only, and the answer it gives has to be about the
+        # mount as it is at this instant. It is also cheap: one create and one unlink.
+        writable = await asyncio.to_thread(is_writable, resolved)
         report.writable = writable
         checks.append(
             SafetyCheck(

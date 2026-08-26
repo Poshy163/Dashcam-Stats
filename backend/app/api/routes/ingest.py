@@ -71,7 +71,7 @@ async def ingest_show_test() -> dict[str, object]:
             "the address in Settings → Backup / Ingest.",
         )
 
-    address = str(puller._get("unit_adb_address", "") or "").strip()
+    address = adb.normalised_address(str(puller._get("unit_adb_address", "") or ""))
     if not address:
         raise HTTPException(
             http_status.HTTP_409_CONFLICT,

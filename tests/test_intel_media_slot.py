@@ -286,26 +286,31 @@ class TestTheSlotIsNotFreeUntilTheChildIsGone:
             )
 
 
-class TestCpuInferenceIsBoundedPerWorker:
-    """Raising the worker count must divide the machine, not multiply thread pools.
+class TestCpuInferenceIsBounded:
+    """The CPU inference session is bounded, and does not shrink as workers are added.
 
-    FFmpeg, OpenCV and ONNX Runtime were all already bounded per job. OpenVINO CPU
-    inference was not, so each worker's session spread across every core it could see --
-    and with the iGPU out of service and every detection running on the CPU, that is the
-    setting that decides whether a second worker helps or just thrashes the cache.
+    Unbounded, an OpenVINO CPU session spreads across every core it can see. FFmpeg, OpenCV
+    and ONNX Runtime were all already bounded per job; this was the one native runtime that
+    was not, and with the iGPU out of service every detection runs here.
+
+    It was then bounded the wrong way round. The detector is a module-level cache shared by
+    every worker (``app.pipeline.stages._detector_cache``), so there is exactly one session
+    in the process -- but it was sized as one worker's share of the machine minus that
+    worker's media budget, which meant the single shared session got *fewer* threads the
+    more workers were running. On eight logical CPUs that was four threads at one worker and
+    the floor of two at two, while ffmpeg's aggregate grew with each worker added.
     """
 
-    def test_the_budget_shrinks_as_workers_are_added(self, monkeypatch):
+    @staticmethod
+    def _measure(monkeypatch, cpus: int, workers: int) -> int:
         import app.ai.openvino_session as openvino
         import app.core.resources as resources
         import app.core.settings_service as settings_module
 
         class _Settings:
-            workers = 1
-
             def get_nowait(self, key):
                 if key == "processing.max_workers":
-                    return self.workers
+                    return workers
                 if key == "advanced.ffmpeg_threads":
                     return 0
                 raise KeyError(key)
@@ -313,19 +318,25 @@ class TestCpuInferenceIsBoundedPerWorker:
         settings = _Settings()
         monkeypatch.setattr(settings_module, "get_settings_service", lambda: settings)
         monkeypatch.setattr(resources, "get_settings_service", lambda: settings)
-        monkeypatch.setattr("os.cpu_count", lambda: 20)
+        monkeypatch.setattr("os.cpu_count", lambda: cpus)
+        return openvino.cpu_inference_threads()
 
-        seen = {}
-        for workers in (1, 2, 4):
-            settings.workers = workers
-            seen[workers] = openvino.cpu_inference_threads()
+    def test_it_does_not_shrink_as_workers_are_added(self, monkeypatch):
+        seen = {workers: self._measure(monkeypatch, 20, workers) for workers in (1, 2, 4, 8)}
+        assert len(set(seen.values())) == 1, (
+            f"one process-wide session was resized by the worker count: {seen}"
+        )
 
-        assert seen[1] > seen[2] > seen[4], f"the budget did not divide by workers: {seen}"
-        # Media threads come out of each worker's share rather than on top of it, so the
-        # total stays inside the machine.
-        for workers, threads in seen.items():
-            assert threads >= 2
-            assert (threads + resources.native_thread_budget()) * workers <= 20 + workers
+    def test_it_never_takes_the_whole_machine_or_less_than_two_threads(self, monkeypatch):
+        for cpus in (1, 2, 4, 8, 20):
+            threads = self._measure(monkeypatch, cpus, 2)
+            assert threads >= 2, cpus
+            assert threads <= max(2, cpus - 1), cpus
+
+    def test_it_leaves_room_for_the_decoders_feeding_it(self, monkeypatch):
+        """Half the machine on a host with cores to divide."""
+        assert self._measure(monkeypatch, 20, 2) == 10
+        assert self._measure(monkeypatch, 8, 2) == 4
 
     def test_a_cpu_session_is_told_its_budget(self, monkeypatch):
         """The bound is worthless unless it reaches `compile_model`."""

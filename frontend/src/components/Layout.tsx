@@ -69,23 +69,51 @@ export default function Layout({
     onSuccess: () => resetForIdentityChange(client),
   })
 
-  const { data: stats, dataUpdatedAt: statsUpdatedAt } = useQuery({
+  const { data: stats } = useQuery({
     queryKey: ['queue-stats'],
     queryFn: api.jobs.stats,
-    refetchInterval: 5_000,
+    // Five seconds while there is work to watch; twenty when there is not.
+    //
+    // This is mounted on every page, so the fixed five-second poll ran for as long as any
+    // tab was open — twelve requests a minute, each running four aggregate queries, against
+    // a queue that is empty for most of the life of a deployment. Off the Queue page the
+    // only consumers are the nav badge and the derived-page refresh below, and neither is
+    // worth that. Everything that *creates* work invalidates this key directly, so the
+    // slow interval is a backstop rather than how a change is noticed; the Queue page,
+    // which observes the same key, keeps its own three-second interval.
+    refetchInterval: (query) => {
+      const counts = query.state.data
+      return (counts?.queued ?? 0) + (counts?.running ?? 0) > 0 ? 5_000 : 20_000
+    },
   })
 
   const busy = (stats?.running ?? 0) > 0
   const pending = (stats?.queued ?? 0) + (stats?.running ?? 0)
+  const done = stats?.completedToday ?? 0
   const wasBusy = useRef(false)
   const lastMapRefresh = useRef(0)
+  const lastCounts = useRef({ pending: 0, done: 0 })
 
+  // Refresh derived pages when work actually lands, and once more on the transition to
+  // idle — so a thumbnail written by the metadata stage appears without a hard refresh.
+  //
+  // Keyed on the counts, not on when the poll last answered. `dataUpdatedAt` changes on
+  // every successful fetch whether or not anything moved, so this used to invalidate
+  // sixteen query roots — including /api/status, which is a dozen queries with two
+  // full-table joined counts — every five seconds for as long as anything sat in the
+  // queue. A paused backlog did it forever, and on single-writer SQLite that is direct
+  // contention with the very work it is reporting on. `completedToday` and `queued` both
+  // move whenever a job finishes, which is the event this actually cares about.
   useEffect(() => {
     const isBusy = pending > 0
-    // Refresh on every queue poll while work is active, and once more on the transition
-    // to idle. This makes derived pages empty immediately and then repopulate, and lets a
-    // thumbnail written by metadata appear without a hard browser refresh.
-    if (isBusy || wasBusy.current) {
+    // The guard tests what the deps test. `done` was added as a trigger so a job finishing
+    // refreshes the derived pages, but the body still only ran while the queue was busy --
+    // and at the twenty-second idle interval a burst of background work can start and
+    // finish entirely between two polls, so the one case the trigger was added for was the
+    // one it could not serve. Comparing against the last observed counts covers it.
+    const moved = pending !== lastCounts.current.pending || done !== lastCounts.current.done
+    lastCounts.current = { pending, done }
+    if (isBusy || wasBusy.current || moved) {
       const now = Date.now()
       // The heat aggregation is deliberately heavier than a list read. Thirty seconds is
       // live enough to watch it repopulate without executing it every five seconds for a
@@ -95,7 +123,7 @@ export default function Layout({
       void invalidateAnalysisQueries(client, { includeMaps })
     }
     wasBusy.current = isBusy
-  }, [client, pending, statsUpdatedAt])
+  }, [client, pending, done])
 
   useEffect(() => {
     const close = (event: KeyboardEvent) => {
@@ -219,6 +247,9 @@ export default function Layout({
               <span className="hidden sm:inline">Dashcam Analyser</span>
             </NavLink>
 
+            {/* Hidden below 640px, where the header has no room for it -- and Search has no
+                nav entry, so /search used to be unreachable on a phone entirely. The icon
+                below is the way in on those widths. */}
             <form className="ml-auto hidden max-w-lg flex-1 sm:block" onSubmit={submitSearch}>
               <label className="sr-only" htmlFor="global-search">
                 Search plates, recordings and journeys
@@ -234,6 +265,15 @@ export default function Layout({
                 />
               </div>
             </form>
+
+            <NavLink
+              to="/search"
+              className="ml-auto grid h-10 w-10 shrink-0 place-items-center rounded-lg text-content-muted hover:bg-surface-sunken hover:text-content sm:hidden"
+              aria-label="Search"
+              title="Search recordings, plates and journeys"
+            >
+              <SearchIcon className="h-4 w-4" />
+            </NavLink>
 
             <NavLink
               to="/queue"

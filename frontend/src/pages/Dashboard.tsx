@@ -19,9 +19,15 @@ export default function Dashboard() {
     queryFn: api.status,
     refetchInterval: 10_000,
   })
+  // Completed jobs, which is what the heading says. /api/jobs orders by state rank first —
+  // running, then failed, then next-to-be-claimed — deliberately, for the Queue page. With
+  // no state filter, page one of a backlog is entirely work that has *not* finished, so
+  // "the latest work completed" listed queued jobs that had never run, each showing a
+  // plausible "5 minutes ago" beside a `queued` badge, and showed nothing that had actually
+  // completed until the queue emptied.
   const jobs = useQuery({
     queryKey: ['jobs', 'recent'],
-    queryFn: () => api.jobs.list({ pageSize: 8 }),
+    queryFn: () => api.jobs.list({ state: 'completed', pageSize: 6 }),
     refetchInterval: 10_000,
   })
 
@@ -31,7 +37,16 @@ export default function Dashboard() {
 
   const { totals, processing, storage, latestJourney, hardware, features } = status.data
   const storagePct = storage.limitBytes ? storage.usedBytes / storage.limitBytes : 0
-  const processTotal = processing.completed + processing.pending + processing.processing + processing.failed
+  // Every state the ring draws is in the total it is drawn against. "Unusable" was
+  // rendered as a slice of a denominator that excluded it, so the percentages never
+  // summed to the ring and the centre number disagreed with the Recordings tile above.
+  const processTotal =
+    processing.completed +
+    processing.pending +
+    processing.processing +
+    processing.failed +
+    processing.invalid +
+    processing.settling
   const analysedPct = processTotal ? processing.completed / processTotal : 0
   const activePct = processTotal ? processing.processing / processTotal : 0
   const blockedFeatures = features?.filter((feature) => feature.blockedReason) ?? []
@@ -92,7 +107,7 @@ export default function Dashboard() {
               <div className="grid h-full w-full place-items-center rounded-full bg-surface-raised text-center shadow-inner">
                 <div>
                   <div className="tabular text-3xl font-bold tracking-tight">{processTotal.toLocaleString()}</div>
-                  <div className="mt-0.5 text-xs font-medium text-content-muted">in library</div>
+                  <div className="mt-0.5 text-xs font-medium text-content-muted">indexed</div>
                 </div>
               </div>
             </div>
@@ -104,6 +119,9 @@ export default function Dashboard() {
                 <ProgressMetric color="bg-accent" value={processing.processing} label="Processing" />
                 {processing.failed > 0 && <ProgressMetric color="bg-state-error" value={processing.failed} label="Failed" />}
                 <ProgressMetric color="bg-state-warn" value={processing.invalid} label="Unusable" />
+                {processing.settling > 0 && (
+                  <ProgressMetric color="bg-surface-sunken ring-1 ring-border" value={processing.settling} label="Still writing" />
+                )}
                 <ProgressMetric color="bg-accent-muted" value={processing.recordingsToday} label="Added today" />
               </div>
               <div className="mt-5 rounded-lg bg-surface-sunken px-4 py-3 text-sm text-content-muted">
@@ -222,7 +240,7 @@ export default function Dashboard() {
           <EmptyState title="Nothing processed yet" description="Run a scan from Settings to index your footage." />
         )}
         <ul className="divide-y divide-border">
-          {jobs.data?.items.slice(0, 6).map((job) => (
+          {jobs.data?.items.map((job) => (
             <li key={job.id} className="flex items-center gap-3 py-3 text-sm">
               <JobStateBadge state={job.state} />
               <span className="min-w-0 flex-1 truncate font-medium">

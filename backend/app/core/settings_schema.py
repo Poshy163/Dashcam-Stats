@@ -11,10 +11,45 @@ and takes effect without a restart.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 SettingType = Literal["bool", "int", "float", "string", "select", "path", "bytes"]
+
+#: The zone the deployment says it is in, if it says anything.
+#:
+#: ``TZ`` is shipped in docker-compose.yml and documented in the README as the timezone
+#: knob, and until this existed nothing in the application read it. The zone that actually
+#: decides how every filename timestamp is interpreted is ``general.timezone``, whose
+#: default was the author's own -- so a first-time user outside Adelaide who followed the
+#: quick start had every recording's ``started_at`` shifted by their real offset, up to
+#: thirteen and a half hours, which tears journeys apart and moves every date filter. It
+#: failed silently, and the one thing they would reach for to fix it did nothing.
+#:
+#: The fallback is unchanged on purpose. An existing deployment that has neither set the
+#: setting nor exported ``TZ`` keeps interpreting its library exactly as it did yesterday;
+#: this only gives ``TZ`` the meaning it was already documented to have.
+#: The zone every library indexed before ``TZ`` was honoured was read through, whatever
+#: the environment said. ``seed_timezone`` pins this for a database that already holds
+#: recordings, so an upgrade cannot retroactively reinterpret them.
+HISTORICAL_TIMEZONE = "Australia/Adelaide"
+
+_FALLBACK_TIMEZONE = HISTORICAL_TIMEZONE
+
+
+def default_timezone() -> str:
+    name = (os.environ.get("TZ") or "").strip()
+    if not name:
+        return _FALLBACK_TIMEZONE
+    try:
+        ZoneInfo(name)
+    except Exception:
+        # A TZ nobody can resolve is worse than none: it would make every timestamp in the
+        # library depend on a name the tz database has never heard of.
+        return _FALLBACK_TIMEZONE
+    return name
 
 
 @dataclass(frozen=True)
@@ -52,17 +87,30 @@ CATEGORIES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+#: Five entries were removed from this tuple rather than left inert, and the reasoning is
+#: worth keeping: ``telemetry.engine`` offered a general-OCR engine that does not exist
+#: anywhere in the codebase (there is no PaddleOCR code, dependency or model);
+#: ``telemetry.auto_calibrate`` gated a calibration path with no callers;
+#: ``plates.ocr_confidence`` promised to mark readings uncertain, and nothing anywhere
+#: marks a reading uncertain; ``plates.save_frame_thumb`` promised a full-frame image that
+#: is never written; ``plates.dedupe_window_s`` promised a time-window collapse that does
+#: not exist. Every one of them rendered as a working control on the Settings page.
+#:
+#: A setting nobody reads is worse than a missing feature: it tells the operator they have
+#: tried something. Rows already stored against these keys are reported as unknown by
+#: ``_build_cache`` and left in place, so nothing breaks on downgrade.
 SETTINGS: tuple[SettingDef, ...] = (
     # ---------------------------------------------------------------- general
     SettingDef(
         "general.timezone",
         "Timezone",
         "string",
-        "Australia/Adelaide",
+        default_timezone(),
         "general",
         "IANA timezone used to interpret filename timestamps and display times. The "
         "dashcam's on-screen clock is local time with no zone information, so this must "
-        "match the camera's configured zone.",
+        "match the camera's configured zone. Defaults to the container's TZ variable when "
+        "one is set.",
     ),
     SettingDef(
         "general.footage_dir",
@@ -379,31 +427,6 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="telemetry.enabled",
     ),
     SettingDef(
-        "telemetry.engine",
-        "Telemetry OCR engine",
-        "select",
-        "glyph",
-        "telemetry",
-        "Glyph template matching is tuned to this dashcam's fixed overlay font and is both "
-        "faster and more accurate than general OCR. Use the general engine only if your "
-        "camera's font differs.",
-        choices=(
-            ("glyph", "Glyph templates (recommended)"),
-            ("paddle", "General OCR"),
-            ("both", "Glyph, fall back to general OCR"),
-        ),
-        requires="telemetry.enabled",
-    ),
-    SettingDef(
-        "telemetry.auto_calibrate",
-        "Auto-calibrate overlay region",
-        "bool",
-        True,
-        "telemetry",
-        "Locate the overlay automatically on first use rather than assuming a fixed position.",
-        requires="telemetry.enabled",
-    ),
-    SettingDef(
         "telemetry.max_speed_kmh",
         "Implausible speed cutoff",
         "float",
@@ -475,17 +498,6 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="plates.enabled",
     ),
     SettingDef(
-        "plates.ocr_confidence",
-        "OCR confidence threshold",
-        "float",
-        0.5,
-        "plates",
-        "Readings below this are stored but marked uncertain rather than discarded.",
-        minimum=0.0,
-        maximum=1.0,
-        requires="plates.enabled",
-    ),
-    SettingDef(
         "plates.min_store_confidence",
         "Minimum confidence to store",
         "float",
@@ -545,15 +557,6 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="plates.enabled",
     ),
     SettingDef(
-        "plates.save_frame_thumb",
-        "Save full-frame thumbnail",
-        "bool",
-        False,
-        "plates",
-        "Also store a full frame per observation. Uses noticeably more disk.",
-        requires="plates.enabled",
-    ),
-    SettingDef(
         "plates.min_plate_width",
         "Minimum plate width",
         "int",
@@ -563,18 +566,6 @@ SETTINGS: tuple[SettingDef, ...] = (
         minimum=16,
         maximum=400,
         unit="px",
-        requires="plates.enabled",
-    ),
-    SettingDef(
-        "plates.dedupe_window_s",
-        "Deduplication window",
-        "float",
-        120.0,
-        "plates",
-        "Repeat readings of the same plate within this window collapse into one observation.",
-        minimum=0.0,
-        maximum=3600.0,
-        unit="seconds",
         requires="plates.enabled",
     ),
     # --------------------------------------------------------------- journeys
@@ -868,7 +859,9 @@ SETTINGS: tuple[SettingDef, ...] = (
         "select",
         "INFO",
         "advanced",
-        "",
+        "How much detail reaches the container log and the Activity logs page. Debug is "
+        "verbose — per-frame decisions and every stage's timings — and is meant for working "
+        "out why one recording behaved oddly, not for leaving on.",
         choices=(("DEBUG", "Debug"), ("INFO", "Info"), ("WARNING", "Warning"), ("ERROR", "Error")),
     ),
     SettingDef(
@@ -1389,8 +1382,3 @@ SETTINGS: tuple[SettingDef, ...] = (
 SETTINGS_BY_KEY: dict[str, SettingDef] = {s.key: s for s in SETTINGS}
 
 DEFAULTS: dict[str, Any] = {s.key: s.default for s in SETTINGS}
-
-
-def category_of(key: str) -> str | None:
-    d = SETTINGS_BY_KEY.get(key)
-    return d.category if d else None

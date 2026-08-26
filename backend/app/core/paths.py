@@ -20,8 +20,10 @@ question the retention guard actually asks.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
+import time
 from collections.abc import Iterable
 from pathlib import Path, PurePath, PureWindowsPath
 from uuid import uuid4
@@ -29,13 +31,16 @@ from uuid import uuid4
 from app.config import get_config
 
 __all__ = [
+    "FOOTAGE_MEASURE_TTL_S",
     "PathTraversalError",
     "data_root",
     "directory_size",
     "footage_root",
+    "forget_tree_measurements",
     "is_mount_point",
     "is_within",
     "is_writable",
+    "measure_tree",
     "media_root",
     "relative_to_footage",
     "relative_to_media",
@@ -285,6 +290,96 @@ def directory_size(
         except OSError:
             continue
     return total_bytes, total_files
+
+
+#: How long a footage-tree measurement may be reused, in seconds.
+#:
+#: The walk is the single most expensive thing the API does: one ``scandir``/``stat`` per
+#: file over what is usually a network share. ``/api/status`` used to do it *twice* per
+#: request -- once for the storage bar and once inside the retention safety report -- on the
+#: event loop, and the dashboard polls that endpoint every ten seconds. On a twenty-thousand
+#: file share that is ~240,000 stat calls a minute against the NAS, with everything else in
+#: the process (video range requests, the auth gate, both workers' heartbeats) blocked
+#: behind each one.
+#:
+#: A minute is far finer-grained than a storage bar needs, and the number only moves when
+#: the scanner or retention does something -- which is why the deletion path invalidates
+#: this explicitly rather than waiting it out.
+FOOTAGE_MEASURE_TTL_S = 60.0
+
+_measure_cache: dict[tuple[str, tuple[str, ...]], tuple[float, tuple[int, int]]] = {}
+
+#: Bumped whenever the tree is known to have changed. A walk that started before the bump
+#: describes a share that no longer exists, so its result is returned to its own caller but
+#: never cached -- otherwise an invalidation issued mid-walk is undone the moment that walk
+#: finishes, which is exactly when a retention run is deleting things.
+_measure_generation = 0
+
+
+def _measure_key(path: Path | str, extensions: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+    """A cache key that two spellings of the same directory share, without touching disk.
+
+    The *canonical* path matters here: `evaluate_safety` measures a resolved path while
+    `current_usage` measures the setting's raw value, and `general.footage_dir` is free
+    text -- so a non-canonical spelling gave the two callers different keys and neither
+    ever saw the other's entry, which is the whole point of sharing the cache.
+
+    ``normpath`` rather than ``resolve``, though, and that is the difference between a
+    lexical operation and a syscall. ``Path.resolve`` calls ``realpath``, which walks the
+    path component by component against the filesystem -- and this runs on the event loop,
+    on *every* call including a cache hit, against the network mount the whole cache exists
+    to stop touching. A symlinked footage root is the one case ``normpath`` cannot collapse;
+    it costs a duplicate cache entry, not a wrong answer.
+    """
+    return (os.path.normpath(str(path)), extensions)
+
+
+def _normalise_extensions(extensions: Iterable[str] | str | None) -> tuple[str, ...]:
+    if extensions is None:
+        return ()
+    if isinstance(extensions, str):
+        return tuple(sorted(extensions.split(",")))
+    return tuple(sorted(extensions))
+
+
+async def measure_tree(
+    path: Path | str,
+    extensions: Iterable[str] | str | None = None,
+    *,
+    max_age_s: float = 0.0,
+) -> tuple[int, int]:
+    """:func:`directory_size`, off the event loop and optionally memoised.
+
+    ``max_age_s`` of zero -- the default -- always walks, which is what the retention
+    guards want: they are deciding whether to delete, and a cached count is a count of a
+    share that may no longer be the one in front of them. Read-only callers that just want
+    a number on a screen pass :data:`FOOTAGE_MEASURE_TTL_S`.
+    """
+    # Materialised before it is used twice. `sorted()` exhausts a one-shot iterable, so a
+    # generator passed here would leave `directory_size` with nothing to filter on -- and
+    # `directory_size` reads an empty filter as "no filter", counting every file in the
+    # tree. That inflates the storage bar and, worse, `SafetyReport.file_count`, which two
+    # retention guards are decided on.
+    wanted = _normalise_extensions(extensions)
+    key = _measure_key(path, wanted)
+    if max_age_s > 0:
+        cached = _measure_cache.get(key)
+        if cached is not None and (time.monotonic() - cached[0]) < max_age_s:
+            return cached[1]
+
+    generation = _measure_generation
+    result = await asyncio.to_thread(directory_size, path, wanted or None)
+    if generation == _measure_generation:
+        _measure_cache[key] = (time.monotonic(), result)
+    return result
+
+
+def forget_tree_measurements() -> None:
+    """Drop every cached measurement, because the tree has just been changed."""
+    global _measure_generation
+
+    _measure_generation += 1
+    _measure_cache.clear()
 
 
 def is_writable(path: Path | str) -> bool:

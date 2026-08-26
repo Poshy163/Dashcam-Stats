@@ -483,6 +483,15 @@ export interface RetentionPlan {
   blockedReason: string | null
   /** False in the recommended read-only deployment: the plan is a report, not an action. */
   deletionEnabled: boolean
+  /**
+   * Why candidates were passed over, by reason.
+   *
+   * Only exhaustive when the sweep ran out of recordings before it reached its target --
+   * it stops as soon as enough has been found, so anything older than the last candidate
+   * was never examined. The panel shows these only in the case where that is not true,
+   * which is also the only case anyone asks the question.
+   */
+  skipped: Record<string, number>
   safety: SafetyReport
 }
 

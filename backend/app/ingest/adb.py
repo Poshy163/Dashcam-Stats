@@ -30,6 +30,9 @@ from app.ingest.models import RemoteFile, UnitInfo, UnitState
 
 log = get_logger(__name__)
 
+#: The port adb registers a network device on when the address does not name one.
+DEFAULT_ADB_PORT = 5555
+
 #: Control calls are all sub-second against a healthy unit; this only bounds a hung link.
 CONTROL_TIMEOUT_S = 20.0
 
@@ -176,6 +179,23 @@ async def shell(address: str, command: str, *, timeout: float = CONTROL_TIMEOUT_
 #: milliseconds, and one that is not is an ARP miss -- so this is really "how long to wait
 #: before concluding the car is out".
 PRESENCE_TIMEOUT_S = 0.4
+
+
+def normalised_address(address: str) -> str:
+    """An adb address with its port, which is the only form adb itself will match.
+
+    ``is_listening`` supplies a default port when the setting has none, so
+    ``192.168.1.122`` passes the cheap presence check -- while every other call hands the
+    raw string to adb, which registers the device as ``192.168.1.122:5555`` and then
+    answers ``device '192.168.1.122' not found`` for ``-s 192.168.1.122``. The poller
+    therefore took the expensive branch on every tick, spent four process spawns, concluded
+    OFFLINE and repeated, for as long as the setting stayed that way -- behind a UI that
+    said "Car not here". One spelling everywhere removes the disagreement.
+    """
+    address = (address or "").strip()
+    if not address or ":" in address:
+        return address
+    return f"{address}:{DEFAULT_ADB_PORT}"
 
 
 async def is_listening(address: str) -> bool:

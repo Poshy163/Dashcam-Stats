@@ -23,10 +23,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import numpy as np
-
 from app.core.logging import get_logger
-from app.hardware.ffmpeg import DecodeError, FFmpegError, iter_frames, probe
+from app.hardware.ffmpeg import (
+    DecodeError,
+    FFmpegError,
+    is_empty_window,
+    is_infrastructure_failure,
+    iter_frames,
+    probe,
+)
 from app.osd.geo import bearing_deg, haversine_m
 from app.osd.glyphs import (
     GlyphTemplates,
@@ -47,14 +52,11 @@ from app.osd.outliers import (
 )
 from app.osd.parser import OsdReading, parse_osd_text
 from app.osd.reasons import GpsQuality, GpsReason
-from app.osd.region import OsdRegion, calibrate
+from app.osd.region import OsdRegion
 from app.osd.track_quality import Fix, classify
 from app.osd.validate import MAX_PLAUSIBLE_SPEED_KMH, MAX_PLAUSIBLE_SPEED_MS, is_valid_coordinate
 
 log = get_logger(__name__)
-
-#: Kept as module attributes because ``app.osd`` and the migrations import them from here.
-_MAX_PLAUSIBLE_SPEED_KMH = MAX_PLAUSIBLE_SPEED_KMH
 
 
 @dataclass(slots=True)
@@ -106,6 +108,16 @@ class TelemetryResult:
     warnings: list[str] = field(default_factory=list)
     #: The decoder that actually produced frames, after any hardware fallback.
     decoder: str | None = None
+    #: The decode did not run to completion, so ``samples`` describes only as much of the
+    #: recording as ffmpeg managed to hand over. Partial telemetry from a genuinely
+    #: truncated file is still worth keeping; an empty result from a decoder that fell over
+    #: is not, and the caller has to be able to tell those apart before it replaces what is
+    #: already stored. See ``stage_telemetry``.
+    decode_failed: bool = False
+    #: ...and whether the failure was the machine's rather than the file's -- a killed
+    #: ffmpeg, a stalled decode, an unhealthy media gate. Retrying one of those is likely
+    #: to work; retrying a truncated file is not.
+    decode_infrastructure: bool = False
 
     @property
     def fix_count(self) -> int:
@@ -265,24 +277,6 @@ class TelemetryExtractor:
                 if limit is not None and count >= limit:
                     return
 
-    async def calibrate_region(
-        self, path: Path, *, samples: int = 5, hwaccel: str = "auto"
-    ) -> OsdRegion | None:
-        """Locate the overlay by sampling full frames from a recording."""
-        frames: list[np.ndarray] = []
-        try:
-            async with contextlib.aclosing(
-                iter_frames(path, fps=0.5, grayscale=True, hwaccel=hwaccel, duration=samples * 2.0)
-            ) as sampled:
-                async for _, frame in sampled:
-                    frames.append(frame)
-                    if len(frames) >= samples:
-                        break
-        except (FFmpegError, OSError) as exc:
-            log.warning("calibration decode failed", file=path.name, error=str(exc))
-            return None
-        return calibrate(frames)
-
     async def extract(
         self,
         path: Path,
@@ -320,7 +314,10 @@ class TelemetryExtractor:
         # The overlay is stable for a whole second. Looking twice during that second is
         # inexpensive (only a 50-pixel strip crosses the pipe) and avoids making the
         # entire sample depend on one frame whose road texture happens to touch a glyph.
-        candidate_fps = min(4.0, max(sample_fps, sample_fps * 2.0))
+        # Two reads per stored sample, capped. The `max()` this replaced could never pick
+        # its first argument -- `sample_fps` is positive, so `sample_fps * 2` always wins --
+        # and read as though the doubling were conditional.
+        candidate_fps = min(4.0, sample_fps * 2.0)
         buckets: dict[int, list[tuple[float, OsdReading]]] = {}
 
         try:
@@ -347,10 +344,19 @@ class TelemetryExtractor:
                     bucket = math.floor((offset * sample_fps) + 1e-6)
                     buckets.setdefault(bucket, []).append((offset, reading))
         except DecodeError as exc:
-            # Partial telemetry from a damaged file is still worth keeping.
+            # Partial telemetry from a damaged file is still worth keeping. Whether this
+            # *is* a damaged file is the caller's decision, so both facts are recorded
+            # rather than settled here.
             result.warnings.append(f"decode ended early: {exc}")
+            # A clean end with nothing in it is a fact about the file, not about the
+            # decoder, and the caller must be able to tell the two apart -- see
+            # `is_empty_window`.
+            result.decode_failed = not is_empty_window(exc)
+            result.decode_infrastructure = is_infrastructure_failure(exc)
         except FFmpegError as exc:
             result.warnings.append(f"decode failed: {exc}")
+            result.decode_failed = True
+            result.decode_infrastructure = is_infrastructure_failure(exc)
             return result
 
         result.samples = [
@@ -475,8 +481,17 @@ class TelemetryExtractor:
             problems.append(
                 "a sibling frame read the no-fix marker at least as confidently; position discarded"
             )
-        if len(candidates) > 1 and fields:
-            problems.append(f"selected best fields from {len(candidates)} candidate frames")
+        # Deliberately *not* recorded as a problem.
+        #
+        # Two candidate frames per overlay second is the design -- `candidate_fps` is
+        # twice `sample_fps` precisely so each stored sample can be assembled from the
+        # better of two independent reads. Noting that as a "problem" meant every cleanly
+        # parsed sample carried one, `quality_rollup` counted it, `telemetry_problem_count`
+        # came out equal to the point count, and the Telemetry Health page classified every
+        # recording in every library as degraded -- so "Healthy" was unreachable and the one
+        # screen built to separate real GPS loss from OCR noise was entirely false
+        # positives. How many frames were considered is provenance, not a fault, and it is
+        # already stored losslessly as ``quality_json["candidate_count"]``.
 
         time_status = (
             "valid"

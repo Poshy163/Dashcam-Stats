@@ -29,9 +29,17 @@ from app.auth import service
 from app.auth.gate import AuthGate, request_is_https
 from app.auth.service import ensure_credential_loaded, require_login_setting, reset_auth_state
 from app.config import get_config
-from app.core.logging import configure_logging, get_logger, install_db_sink, shutdown_db_sink
+from app.core.logging import (
+    configure_logging,
+    get_db_sink,
+    get_logger,
+    install_db_sink,
+    set_log_level,
+    shutdown_db_sink,
+)
 from app.core.settings_service import get_settings_service, init_settings_service
 from app.db.session import dispose_engine, get_session_factory, init_db
+from app.hardware.detect import detect_hardware_async
 from app.hardware.ffmpeg import media_health
 from app.ingest import origin
 from app.ingest.poller import get_poller
@@ -88,6 +96,52 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # the first entry rather than defaulting and then correcting itself.
     install_db_sink(get_session_factory(), min_level=await settings.log_level())
 
+    # ...and `advanced.log_level` reaches the stdlib chain too, now and on every change.
+    #
+    # Two levels exist and only one of them was wired. `configure_logging` above sets the
+    # root logger from the DASHCAM_LOG_LEVEL *environment* variable, while the setting was
+    # applied to the database sink alone -- and structlog's `filter_by_level` consults the
+    # stdlib logger before the sink's capture processor ever sees a record. So choosing
+    # DEBUG in the UI could not produce a single DEBUG line, at the sink or on stdout, even
+    # across a restart, on a page whose header says changes take effect immediately.
+    # `set_log_level` and `DatabaseLogSink.set_min_level` both existed for this and had no
+    # callers anywhere.
+    def _apply_log_level(change: object = None) -> None:
+        level = str(settings.get_nowait("advanced.log_level"))
+        # The stdlib chain is taken over only once the operator has actually chosen a level.
+        # `DASHCAM_LOG_LEVEL` is one of the five documented deployment variables and
+        # `configure_logging` above has already applied it; overwriting that with the schema
+        # default would make `DASHCAM_LOG_LEVEL=DEBUG` a silent no-op on a fresh deployment.
+        # A real change (`change` is not None) always wins -- that is somebody choosing.
+        if change is not None or not settings.is_default("advanced.log_level"):
+            set_log_level(level)
+        sink = get_db_sink()
+        if sink is not None:
+            sink.set_min_level(level)
+
+    _apply_log_level()
+    unsubscribe_log_level = settings.subscribe(
+        _apply_log_level, keys=("advanced.log_level",), name="log-level"
+    )
+
+    # Warmed in the background, not awaited.
+    #
+    # `detect_hardware()` encodes and decodes a test clip through each render node with
+    # blocking `subprocess.run`, bounded only by a 20-second timeout per probe, and memoises
+    # the answer for the life of the process. Nothing warmed it, so the first caller paid --
+    # normally `worker._run_job_inner`, which asks for it synchronously on the loop, freezing
+    # /health, the SPA and every other job for the duration; and that moment is also when
+    # `warm_models()` is compiling an OpenVINO graph in a thread, putting a VAAPI child on
+    # the iGPU beside it.
+    #
+    # Awaiting it here would trade that for something worse. Uvicorn does not serve until
+    # lifespan startup returns, and the pathological case for those probes is *hanging* --
+    # up to four bounded subprocesses per render node, which on a two-node host is minutes
+    # before /health answers at all, against a HEALTHCHECK whose start period is 45 seconds.
+    # A container that cannot start because its GPU probe is slow is a worse failure than
+    # the one this fixes.
+    hardware = asyncio.create_task(detect_hardware_async(), name="detect-hardware")
+
     pool = get_worker_pool()
     scheduler = get_scheduler()
     # An explicit pause is an operator decision, not process-local state. Restore it before
@@ -117,12 +171,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         log.info("shutting down")
+        hardware.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await hardware
         warm.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await warm
         await get_poller().stop()
         await scheduler.stop()
         await pool.stop()
+        with contextlib.suppress(Exception):
+            unsubscribe_log_level()
         await shutdown_db_sink()
         await dispose_engine()
 

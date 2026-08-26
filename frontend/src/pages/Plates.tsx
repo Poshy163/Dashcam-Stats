@@ -9,10 +9,21 @@ import { formatDateTime } from '@/lib/format'
 
 export default function Plates() {
   const [params, setParams] = useSearchParams()
-  const [term, setTerm] = useState(params.get('q') ?? '')
 
   const page = Number(params.get('page') ?? 1)
   const q = params.get('q') ?? ''
+  // The box follows the URL as well as leading it — the same reconciliation Recordings and
+  // Logs already do. Seeded once and never resynced, it kept showing "ABC" after Back had
+  // taken the filter out of the URL and the list below had gone back to every plate: the
+  // form claiming one thing and the results another, permanently, until something else was
+  // typed. An inbound /plates?q=… link opened while the page was already mounted did the
+  // same in reverse.
+  const [term, setTerm] = useState(q)
+  const [lastUrlQ, setLastUrlQ] = useState(q)
+  if (q !== lastUrlQ) {
+    setLastUrlQ(q)
+    setTerm(q)
+  }
   const sort = params.get('sort') ?? 'last_seen_desc'
   const flagged = params.get('flagged') === 'true' ? true : undefined
 

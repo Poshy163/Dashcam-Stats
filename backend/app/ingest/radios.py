@@ -61,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+import time
 from dataclasses import dataclass
 
 from app.core.logging import get_logger
@@ -627,6 +628,22 @@ def begin_quiet(address: str, *, online_for: float, watchdog_deadline_s: int) ->
 _tasks: set[asyncio.Task] = set()
 
 
+#: How long to leave a failed restore alone before trying it again.
+#:
+#: The poller calls :func:`restore_if_pending` on every tick of the arrival transition, and
+#: an arrival *hold* deliberately keeps that branch live for the whole gate -- at the shipped
+#: two-second poll and two-minute uptime threshold, about sixty ticks. That was harmless
+#: while an accepted ``enable`` cleared the marker on the first one. Now that the marker
+#: survives an enable the radio did not honour -- which is the case worth retrying, and the
+#: reason the verification exists -- every one of those ticks would spawn a task, take the
+#: lock, issue two adb round trips and log twice. A minute between attempts keeps the retry
+#: and drops the storm.
+RESTORE_RETRY_S = 60.0
+
+#: When the last restore attempt was made, per address.
+_last_restore: dict[str, float] = {}
+
+
 def restore_if_pending(address: str) -> None:
     """If a previous window left radios off, put them right. Never blocks the caller.
 
@@ -634,6 +651,11 @@ def restore_if_pending(address: str) -> None:
     restore failed, is usually the next morning on the same driveway. Fired rather than
     awaited so it costs the arriving window nothing; it shares the control channel with
     the run that is starting, and both are sub-second calls.
+
+    Debounced per address, the way the recorder-health collect is: the caller re-fires this
+    on every tick and the marker no longer clears on an unverified success, so without a
+    timer a unit whose radio will not come back would be asked once every two seconds for
+    the length of the arrival hold.
     """
     try:
         pending = str(get_settings_service().get_nowait(MARKER_KEY) or "").strip()
@@ -641,6 +663,13 @@ def restore_if_pending(address: str) -> None:
         pending = ""
     if not pending:
         return
+
+    now = time.monotonic()
+    last = _last_restore.get(address)
+    if last is not None and now - last < RESTORE_RETRY_S:
+        return
+    _last_restore[address] = now
+
     task = asyncio.create_task(_restore_pending(address, pending), name="ingest-radio-restore")
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
@@ -669,18 +698,35 @@ async def _restore_pending(address: str, pending: str) -> None:
             radios=pending,
         )
         if "bluetooth" in pending:
-            if await _set_bluetooth(address, enable=True):
+            # Confirmed, not assumed -- the same rule `_restore_bluetooth` follows, and for
+            # the same reason. A clean `enable` is not proof the radio came back, and this
+            # path used to clear the marker and the on-unit watchdog flag on that alone. On
+            # a unit where the command is accepted but the radio stays down, that stood the
+            # watchdog off, discarded the marker, and left nothing anywhere to try again:
+            # the driver's hands-free stayed off indefinitely while the read-only "Radios
+            # awaiting restore" setting -- which exists so a silent phone is never a mystery
+            # -- read as clean.
+            if await _set_bluetooth(address, enable=True) and await _bluetooth_is_on(address):
                 await _remove_flag(address)
                 await _persist_marker("")
                 log.info("the unit's Bluetooth is back on")
             else:
                 log.warning(
-                    "could not turn the unit's Bluetooth back on; it will be tried "
-                    "again the next time the unit appears"
+                    "could not confirm the unit's Bluetooth is back on; the watchdog on "
+                    "the unit will see to it, or the next arrival"
                 )
 
 
-def cancel_pending() -> None:
-    """Stop any arrival-time restore still in flight, for shutdown."""
-    for task in list(_tasks):
+async def cancel_pending() -> None:
+    """Stop any arrival-time restore still in flight, and wait for it, for shutdown.
+
+    Awaited for the same reason the health tasks are: a restore that is cancelled mid-adb
+    is holding a subprocess, and returning before it has unwound leaves that to the
+    interpreter to notice at exit.
+    """
+    tasks = list(_tasks)
+    for task in tasks:
         task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _last_restore.clear()

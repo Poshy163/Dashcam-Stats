@@ -16,6 +16,7 @@ two cuts, which is where "3 for 1" comes from.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select
@@ -246,3 +247,58 @@ class TestTheNumbersDescribeTheDrive:
         assert journey.start_lat is None and journey.end_lat is None, (
             "a journey with no valid fix must show its location as unknown, not guess one"
         )
+
+
+class TestTheClipStartSentinelDoesNotCrossRecordings:
+    """`breaks_segment` on the first fix of a clip is bookkeeping, not a real break.
+
+    ``track_quality.classify`` sets it on the first drawable fix of *every* recording,
+    unconditionally, because its forward walk has no anchor yet within that clip. Every
+    per-recording consumer sets its anchor from that same row before testing the flag, so
+    inside one recording it means nothing. Concatenated into a journey-wide track it would
+    mean something quite wrong: a journey of thirty clips reporting thirty breaks, losing
+    the real leg across each clip boundary from its distance and drawing the route cut at
+    every one.
+    """
+
+    @staticmethod
+    def _row(recording_id, offset, lat, lon, breaks):
+        from datetime import UTC, datetime
+
+        return SimpleNamespace(
+            recording_id=recording_id,
+            t_offset_s=offset,
+            lat=lat,
+            lon=lon,
+            speed_kmh=50.0,
+            captured_at=datetime(2026, 8, 4, 17, 44, int(offset), tzinfo=UTC),
+            breaks_segment=breaks,
+        )
+
+    def test_the_first_fix_of_a_later_clip_does_not_break_the_track(self):
+        from app.journeys.track import single_track
+
+        rows = [
+            self._row(1, 0, -34.80, 138.70, True),  # clip 1 starts
+            self._row(1, 1, -34.8002, 138.7002, False),
+            self._row(2, 2, -34.8004, 138.7004, True),  # clip 2 starts
+            self._row(2, 3, -34.8006, 138.7006, False),
+        ]
+        track = single_track(rows, {1: None, 2: None}, front_ids={1, 2})
+
+        assert [p.recording_id for p in track] == [1, 1, 2, 2]
+        assert [p.breaks_segment for p in track] == [True, False, False, False], (
+            "the second clip's start sentinel survived into the journey-wide track"
+        )
+
+    def test_a_genuine_break_within_a_clip_is_kept(self):
+        from app.journeys.track import single_track
+
+        rows = [
+            self._row(1, 0, -34.80, 138.70, True),
+            self._row(1, 1, -34.8002, 138.7002, False),
+            self._row(1, 2, -34.8004, 138.7004, True),  # a real dropout mid-clip
+        ]
+        track = single_track(rows, {1: None}, front_ids={1})
+
+        assert [p.breaks_segment for p in track] == [True, False, True]

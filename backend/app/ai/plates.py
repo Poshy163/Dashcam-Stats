@@ -21,6 +21,7 @@ import numpy as np
 
 from app.ai.detector import Detection2D, load_detector
 from app.ai.models import OCR_CONFIG_FILE, ensure_model, model_dir
+from app.ai.normalise_au import plate_similarity
 from app.ai.tracker import sharpness
 from app.core.logging import get_logger
 from app.core.resources import configure_opencv_threads, onnx_session_options
@@ -64,7 +65,10 @@ class PlateVote:
 class PlateDetector:
     """Locates plates within a vehicle crop."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, confidence: float | None = None) -> None:
+        #: See ``ObjectDetector.__init__``: the shared cache keys on this, so it hands the
+        #: value in rather than letting the object read a setting that may have moved.
+        self._confidence = confidence
         self._detector: Any | None = None
         self._loaded = False
 
@@ -77,7 +81,11 @@ class PlateDetector:
             return self.available
         self._loaded = True
 
-        threshold = float(get_settings_service().get_nowait("plates.detection_confidence"))
+        threshold = (
+            float(self._confidence)
+            if self._confidence is not None
+            else float(get_settings_service().get_nowait("plates.detection_confidence"))
+        )
         self._detector = await load_detector("plate-detector", conf_thresh=threshold)
         if self._detector is None:
             log.warning("plate detection unavailable: model could not be obtained")
@@ -239,16 +247,39 @@ def select_ocr_candidates(readings: list[PlateReading], limit: int) -> list[Plat
     return [reading for _, reading in scored[:limit]]
 
 
+#: How alike two reads have to be before they are treated as the same plate.
+#:
+#: The same value :func:`app.ai.normalise_au.plate_similarity` is documented against:
+#: around 0.85 separates "one character misread" from "a different car".
+_SAME_PLATE_SIMILARITY = 0.85
+
+
 def vote_track_plate(readings: list[PlateReading]) -> PlateVote | None:
     """Combine several readings of one vehicle into a single answer.
 
     Voting happens per character position as well as per whole string: separate reads of
     the same plate usually differ by one character, so a positional vote recovers the
     correct text even when no single reading is right end to end.
+
+    That premise only holds while every reading is of *one* plate, and it stopped holding
+    when the stage moved to reading one stored crop per track: the detector is run once on
+    that crop and yields a ``PlateReading`` per detected box, so ``readings`` is now several
+    plates in one picture -- a neighbouring car inside the vehicle box, a truck's tractor
+    and trailer plates -- rather than repeated reads of one. Voting per character across
+    those merged two registrations into a string belonging to neither, stored it with a
+    ``vote_count`` that read as corroboration, and discarded the other plate entirely.
+    So the readings are first narrowed to the ones that agree with the strongest read.
     """
     usable = [r for r in readings if r.usable]
     if not usable:
         return None
+
+    # The most confident read is the reference; anything that disagrees with it by more
+    # than a character or so is a different object, not a vote about this one.
+    anchor = max(usable, key=lambda r: r.ocr_confidence)
+    usable = [
+        r for r in usable if plate_similarity(anchor.raw_text, r.raw_text) >= _SAME_PLATE_SIMILARITY
+    ]
 
     lengths = Counter(len(r.raw_text) for r in usable)
     modal_length, _ = lengths.most_common(1)[0]

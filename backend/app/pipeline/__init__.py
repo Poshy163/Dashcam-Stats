@@ -1,24 +1,6 @@
-"""The per-recording processing pipeline."""
+"""The per-recording processing pipeline.
 
-from __future__ import annotations
-
-from app.pipeline.orchestrator import (
-    REPROCESS_PRESETS,
-    RunReport,
-    expand_stages,
-    pending_stages,
-    run_stages,
-)
-from app.pipeline.stages import STAGE_ORDER, STAGES, StageError, StageResult
-
-__all__ = [
-    "REPROCESS_PRESETS",
-    "STAGES",
-    "STAGE_ORDER",
-    "RunReport",
-    "StageError",
-    "StageResult",
-    "expand_stages",
-    "pending_stages",
-    "run_stages",
-]
+No re-exports; see the note in :mod:`app.scanner`. ``app.pipeline.stages`` alone reaches
+the OSD engine, the detector and the plate reader, so a facade that imports it makes every
+``from app.pipeline import ...`` pay for the entire inference stack.
+"""

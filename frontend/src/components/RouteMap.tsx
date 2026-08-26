@@ -1,6 +1,10 @@
 import { useEffect, useMemo } from 'react'
 import { MapContainer, Marker, Polyline, Popup, TileLayer, useMap } from 'react-leaflet'
 import L from 'leaflet'
+// Imported beside the library rather than in main.tsx, so the ~14 kB of Leaflet CSS
+// is emitted with the lazily-loaded map chunk instead of the stylesheet every page
+// blocks on.
+import 'leaflet/dist/leaflet.css'
 
 import { cn } from '@/lib/cn'
 

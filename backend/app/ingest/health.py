@@ -56,6 +56,8 @@ import base64
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
@@ -283,8 +285,20 @@ def _trips(samples: list[Sample]) -> list[list[Sample]]:
 
 
 def _when(ts: int) -> str:
-    """The unit's own clock rendered readably; it is the only clock the log has."""
-    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    """The unit's own clock rendered readably; it is the only clock the log has.
+
+    Rendered through the *configured* zone rather than ``time.localtime``. libc resolves
+    that against a zone database the slim base image does not ship -- the pip ``tzdata``
+    package serves ``zoneinfo`` and not libc -- so ``TZ`` could not reach it and every
+    incident line came out in UTC while the rest of the UI printed local time. Two clocks
+    disagreeing on one page is worse than either being wrong on its own.
+    """
+    try:
+        zone = ZoneInfo(str(get_settings_service().get_nowait("general.timezone")))
+    except Exception:
+        # Before the settings service exists, or a zone the database has never heard of.
+        zone = UTC
+    return datetime.fromtimestamp(ts, tz=zone).strftime("%Y-%m-%d %H:%M")
 
 
 def analyze(samples: list[Sample]) -> Report:
@@ -458,17 +472,39 @@ async def _publish_report(report: Report) -> None:
     refresh and the per-drive collect; the webhook is not here because only the arrival
     collect should be able to page a phone.
     """
+    global _published
+
     from app.ingest.status import get_status
 
-    get_status().set_recorder_health(report.summary(), ok=report.healthy)
+    summary = report.summary()
+    get_status().set_recorder_health(summary, ok=report.healthy)
+    # Only when the verdict itself has changed.
+    #
+    # `refresh` runs every thirty seconds for as long as the unit is present -- the parked
+    # car, the bench unit -- and the stored string carries a minute-resolution timestamp, so
+    # it differed from the last one at least once a minute even when the report said exactly
+    # the same thing. Each write is a settings round trip and a commit, and a *changed*
+    # value additionally bumps the global settings version, wakes every change waiter and
+    # logs `settings.changed` at INFO, which the database log sink then stores. The
+    # freshness is already published in the status snapshot, which is updated in memory
+    # above. `elevate._remember` keeps the same shadow for the same reason.
+    if summary == _published:
+        return
     try:
         await get_settings_service().set(
             REPORT_KEY,
-            f"as of {time.strftime('%Y-%m-%d %H:%M')}: {report.summary()}",
+            # Same zone as every incident line beside it, for the same reason.
+            f"as of {_when(int(time.time()))}: {summary}",
             internal=True,
         )
+        _published = summary
     except Exception as exc:
         log.debug("could not persist the health report", error=str(exc))
+
+
+#: The last summary written to ``REPORT_KEY``, so an unchanged verdict is not re-stored on
+#: every thirty-second refresh. See :func:`_publish_report`.
+_published: str | None = None
 
 
 async def refresh(address: str) -> None:
@@ -585,14 +621,29 @@ async def _collect_then_arm(address: str, source_dir: str) -> None:
 
 
 async def shutdown() -> None:
-    """Cancel in-flight collect/arm tasks. The remote watcher keeps running, by design —
-    the app going down is exactly the kind of absence it exists to cover, and it is
-    detached from this process's adb sessions anyway."""
-    for task in list(_tasks):
+    """Cancel in-flight collect/arm tasks, and wait for them to actually stop.
+
+    The remote watcher keeps running, by design — the app going down is exactly the kind of
+    absence it exists to cover, and it is detached from this process's adb sessions anyway.
+
+    Awaited, not merely cancelled. ``Task.cancel`` only schedules the exception, so a
+    fire-and-forget collect that is mid-``await`` gets no chance to run its cleanup before
+    the loop closes underneath it -- which leaves an adb subprocess unreaped and prints
+    "Task was destroyed but it is pending" out of a shutdown path that has to look clean.
+    """
+    tasks = list(_tasks)
+    for task in tasks:
         task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def reset_for_tests() -> None:
+    global _published
+
     _last_armed.clear()
     _last_refresh.clear()
     _tasks.clear()
+    # Process-wide like the other two, so one test's published summary cannot decide
+    # whether the next one writes.
+    _published = None

@@ -2,6 +2,10 @@ import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { MapContainer, TileLayer, useMap } from 'react-leaflet'
 import L from 'leaflet'
+// Imported beside the library rather than in main.tsx, so the ~14 kB of Leaflet CSS
+// is emitted with the lazily-loaded map chunk instead of the stylesheet every page
+// blocks on.
+import 'leaflet/dist/leaflet.css'
 import { useEffect } from 'react'
 
 import HeatLayer from '@/components/HeatLayer'
@@ -10,7 +14,12 @@ import Spinner from '@/components/Spinner'
 import { DerivedHint, EmptyState, ErrorState, PageHeader, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
 import { formatDuration } from '@/lib/format'
+import { useMapSettings } from '@/lib/useMapSettings'
 
+// The tile provider comes from the settings the Settings page offers, not from constants
+// here. Those constants meant a user who pointed the app at their own tile server got the
+// journey map from it and this one from OpenStreetMap, under an attribution line naming a
+// provider that was not serving the tiles. `RouteMap`'s own defaults are the fallback.
 const TILES = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'
 const ATTRIBUTION = '&copy; OpenStreetMap contributors'
 
@@ -58,6 +67,7 @@ function FitToData({ points }: { points: [number, number, number][] }) {
 }
 
 export default function HeatmapPage() {
+  const maps = useMapSettings()
   const [precision, setPrecision] = useState(3)
   const [minSpeedKmh, setMinSpeedKmh] = useState(5)
   const [layer, setLayer] = useState<Layer>('both')
@@ -172,7 +182,11 @@ export default function HeatmapPage() {
 
           <div className="overflow-hidden rounded-lg border border-border">
             <MapContainer center={[points[0]![0], points[0]![1]]} zoom={12} scrollWheelZoom className="h-[70vh] w-full">
-              <TileLayer url={TILES} attribution={ATTRIBUTION} maxZoom={19} />
+              <TileLayer
+                url={maps.tileUrl ?? TILES}
+                attribution={maps.attribution ?? ATTRIBUTION}
+                maxZoom={maps.maxZoom ?? 19}
+              />
               <FitToData points={points} />
               {layer !== 'routes' && (
                 <HeatLayer

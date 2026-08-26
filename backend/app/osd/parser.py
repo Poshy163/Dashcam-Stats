@@ -251,10 +251,23 @@ def _sign_is_ambiguous(separator: str | None, value: str | None) -> bool:
     the overlay repeats itself every second — whereas a point in the wrong hemisphere
     drags journey bounds across the planet and is plainly visible on the map.
     """
-    if not separator or not value:
+    if not value:
         return False
     if value[0] in "+-":
-        # The sign decoded explicitly; whatever precedes it is just punctuation.
+        # The sign decoded explicitly -- but only *believe* it when the label's colon is
+        # still there beside it.
+        #
+        # The same two glyphs swap in the other direction, and that direction was
+        # unguarded. `-` and `:` are thin and adjacent in shape (see `_SEP`), and the
+        # separator pattern is `[^\d+-]{0,8}`, which cannot hold a `-` -- so a colon read
+        # as a minus is absorbed into the coordinate's own optional sign instead.
+        # `E-138.6769` then parses as longitude *minus* 138.6769 at full confidence, with
+        # no problem recorded: a point in the Pacific for a drive through Adelaide, and the
+        # mirror image of the case this function was written for. A genuine `N:-34.8088`
+        # keeps its colon and is unaffected; so is the labelled-damage recovery path, whose
+        # separator carries one too.
+        return ":" not in (separator or "")
+    if not separator:
         return False
     # Nothing dot-shaped belongs between ``N:`` and the digits, so anything found there is
     # a glyph that decoded wrongly, and the sign is the most likely casualty.

@@ -181,6 +181,152 @@ class TestSeeding:
         )
         assert definition.default in REGISTRY
 
+    async def test_the_fingerprint_backfill_spares_a_settling_row(self, migrated):
+        """0011's rescue, asserted against the real chain rather than assumed.
+
+        The backfill stamps every fingerprinted row with the stat it currently carries, so
+        an existing library is not re-read on the next scan. The one exception is a row in
+        ``settling`` — the state this whole change set exists to un-strand — which must be
+        left null so the scanner reads its bytes again.
+
+        It is asserted because a migration that matches nothing passes exactly as quietly
+        as one that works, and this predicate is easy to get wrong in a way nothing else
+        catches: ``Enum`` persists the member *name*, so ``state <> 'settling'`` (the
+        member's *value*) excludes nothing at all.
+        """
+        import asyncio
+        from datetime import UTC, datetime
+
+        from alembic import command
+        from sqlalchemy import text
+
+        from app.db.session import alembic_config
+
+        await dispose_engine()
+        config = alembic_config()
+        await asyncio.to_thread(command.downgrade, config, "0010")
+
+        async with session_scope() as session:
+            for name, state in (("stranded.ts", "SETTLING"), ("settled.ts", "COMPLETED")):
+                await session.execute(
+                    text(
+                        "INSERT INTO recordings (rel_path, filename, size_bytes, mtime_ns, "
+                        "fingerprint, state, error_count, metadata_state, telemetry_state, "
+                        "detection_state, plate_state, has_gps, ignored, protected, "
+                        "file_missing, time_from_osd, has_audio, vehicle_count, plate_count, "
+                        "telemetry_point_count, gps_point_count, gps_gap_count, "
+                        "gps_longest_gap_s, gps_recovered_count, gps_no_fix_count, "
+                        "gps_ocr_gap_count, gps_rejected_count, telemetry_problem_count, "
+                        "first_seen_at) "
+                        "VALUES (:p, :p, 100, 123456789, 'abc', :s, 0, 'PENDING', 'PENDING', "
+                        "'PENDING', 'PENDING', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0, 0, "
+                        "0, 0, 0, :t)"
+                    ),
+                    {"p": name, "s": state, "t": datetime.now(UTC)},
+                )
+            await session.commit()
+
+        await dispose_engine()
+        await asyncio.to_thread(command.upgrade, config, "head")
+
+        async with session_scope() as session:
+            rows = dict(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT filename, fingerprint_mtime_ns FROM recordings "
+                            "WHERE filename IN ('stranded.ts', 'settled.ts')"
+                        )
+                    )
+                ).all()
+            )
+
+        assert rows["settled.ts"] == 123456789, (
+            "an ordinary fingerprinted row was not stamped, so the whole library will be "
+            "re-fingerprinted on the next scan"
+        )
+        assert rows["stranded.ts"] is None, (
+            "a settling row was stamped with a stat it never fingerprinted, so it stays "
+            "stranded -- which is the bug this migration exists to fix"
+        )
+
+    async def test_the_timezone_is_seeded_from_the_environment_once(self, migrated, monkeypatch):
+        """`TZ` decides how every filename timestamp is read, so it must be pinned.
+
+        Left as a schema *default* it would be recomputed on every process start, and the
+        day somebody edited the compose file the meaning of an already-analysed library
+        would change underneath it — every journey boundary and date filter, with no
+        migration and no warning. Seeding the row once makes the README's own description
+        true: `TZ` supplies it on first boot, and the setting owns it afterwards.
+        """
+        import importlib
+        from datetime import UTC, datetime
+
+        from sqlalchemy import delete
+
+        import app.core.settings_schema as schema
+        from app.db.models import AppSetting, Recording
+        from app.db.seed import seed_timezone
+
+        key = "general.timezone"
+        async with session_scope() as session:
+            await session.execute(delete(AppSetting).where(AppSetting.key == key))
+
+        monkeypatch.setenv("TZ", "Europe/Berlin")
+        importlib.reload(schema)
+        try:
+            async with session_scope() as session:
+                assert await seed_timezone(session) is True
+
+            async with session_scope() as session:
+                stored = (
+                    await session.execute(select(AppSetting.value).where(AppSetting.key == key))
+                ).scalar_one()
+            assert stored == "Europe/Berlin"
+
+            # And a library that has already been indexed keeps the zone it was read
+            # with, whatever the environment now says. `TZ` did nothing before this
+            # existed, so every recording in such a database was interpreted through the
+            # old hardcoded default; writing the environment's answer over that would
+            # shift every timestamp in the library on an upgrade nobody asked for.
+            async with session_scope() as session:
+                await session.execute(delete(AppSetting).where(AppSetting.key == key))
+                session.add(
+                    Recording(
+                        rel_path="already-indexed.ts",
+                        filename="already-indexed.ts",
+                        first_seen_at=datetime.now(UTC),
+                    )
+                )
+
+            monkeypatch.setenv("TZ", "America/New_York")
+            importlib.reload(schema)
+            async with session_scope() as session:
+                assert await seed_timezone(session) is True
+
+            async with session_scope() as session:
+                stored = (
+                    await session.execute(select(AppSetting.value).where(AppSetting.key == key))
+                ).scalar_one()
+            assert stored == schema.HISTORICAL_TIMEZONE, (
+                "an already-indexed library was retroactively reinterpreted"
+            )
+
+            # And once a row exists, a later TZ change never reaches it.
+            monkeypatch.setenv("TZ", "Asia/Tokyo")
+            importlib.reload(schema)
+            async with session_scope() as session:
+                assert await seed_timezone(session) is False
+
+            async with session_scope() as session:
+                stored = (
+                    await session.execute(select(AppSetting.value).where(AppSetting.key == key))
+                ).scalar_one()
+            assert stored == schema.HISTORICAL_TIMEZONE
+        finally:
+            monkeypatch.delenv("TZ", raising=False)
+            importlib.reload(schema)
+
     async def test_seeding_twice_does_not_duplicate(self, migrated):
         from app.db.seed import seed_defaults
 

@@ -96,6 +96,9 @@ def unit_shell(monkeypatch):
     monkeypatch.setattr(radios, "STOP_SETTLE_POLL_S", 0.01)
     stub = StubSettings()
     monkeypatch.setattr(radios, "get_settings_service", lambda: stub)
+    # The arrival restore is debounced per address across the process, so one test's
+    # attempt would otherwise decide whether the next one is allowed to make its own.
+    monkeypatch.setattr(radios, "_last_restore", {})
 
     class Harness:
         pass
@@ -462,6 +465,9 @@ class TestTheArrivalRestore:
     """The engine stopped mid-transfer yesterday; the car is back on the driveway."""
 
     async def test_a_pending_marker_turns_bluetooth_back_on(self, unit_shell):
+        # The radio reports itself on afterwards, which is what standing the watchdog down
+        # is allowed to depend on.
+        unit_shell.replies["bluetooth_on"] = "1"
         unit_shell.settings.values[radios.MARKER_KEY] = "bluetooth"
 
         radios.restore_if_pending("u:5555")
@@ -470,6 +476,25 @@ class TestTheArrivalRestore:
         assert _issued(unit_shell.commands, "cmd bluetooth_manager enable")
         assert _issued(unit_shell.commands, f"rm -f '{radios.FLAG_PATH}'")
         assert unit_shell.settings.values[radios.MARKER_KEY] == ""
+
+    async def test_an_unverified_enable_keeps_the_marker_and_the_flag(self, unit_shell):
+        """The command was accepted and the radio is still off.
+
+        This is the failure that strands the driver's hands-free: clearing the marker and
+        the on-unit watchdog flag on an unverified `enable` leaves nothing anywhere holding
+        the promise, so the next arrival has nothing to repair and the read-only "Radios
+        awaiting restore" setting reads as clean. The in-run restore has always confirmed
+        before standing down; this path did not.
+        """
+        unit_shell.replies["bluetooth_on"] = "0"
+        unit_shell.settings.values[radios.MARKER_KEY] = "bluetooth"
+
+        radios.restore_if_pending("u:5555")
+        await asyncio.gather(*list(radios._tasks))
+
+        assert _issued(unit_shell.commands, "cmd bluetooth_manager enable")
+        assert not _issued(unit_shell.commands, f"rm -f '{radios.FLAG_PATH}'")
+        assert unit_shell.settings.values[radios.MARKER_KEY] == "bluetooth"
 
     async def test_a_failed_attempt_keeps_the_marker_for_the_next_arrival(self, unit_shell):
         unit_shell.settings.values[radios.MARKER_KEY] = "bluetooth"

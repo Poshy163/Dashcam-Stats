@@ -1,7 +1,4 @@
-"""Grouping recordings into journeys."""
+"""Grouping recordings into journeys.
 
-from __future__ import annotations
-
-from app.journeys.builder import JourneyBuilder
-
-__all__ = ["JourneyBuilder"]
+No re-exports; see the note in :mod:`app.scanner`.
+"""

@@ -128,3 +128,27 @@ class RunResult:
     @property
     def throughput_mbs(self) -> float:
         return round(self.bytes / self.seconds / 1_000_000, 2) if self.seconds > 0 else 0.0
+
+
+def ingest_setting(key: str, default: object = None) -> object:
+    """An ``ingest.*`` setting, falling back to its **schema** default.
+
+    Lives here rather than being copied into `puller` and `reporter`, which held
+    byte-identical versions of it. ``default`` is honoured only for a key the schema does
+    not define, so a literal written beside a call site can no longer disagree with the
+    catalogue -- which two of them already did, including the arrival gate's uptime
+    threshold, whose hand-written ``0.0`` did not weaken the gate but switched it off.
+    """
+    from app.core.settings_service import get_settings_service
+
+    full = f"ingest.{key}"
+    try:
+        return get_settings_service().get_or_default(full)
+    except Exception:
+        # Reached when the settings service is not up at all -- a one-off script, or a
+        # window between processes -- which is exactly the case the hand-written fallbacks
+        # were for, and exactly where they had drifted. The schema still answers.
+        from app.core.settings_schema import SETTINGS_BY_KEY
+
+        defn = SETTINGS_BY_KEY.get(full)
+        return defn.default if defn is not None else default

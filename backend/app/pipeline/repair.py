@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
 from app.core.paths import resolve_footage_path
-from app.db.models import Recording
+from app.db.models import Recording, carry_probe_markers
 from app.hardware.ffmpeg import (
     MAX_PLAUSIBLE_BITRATE,
     MIN_PLAUSIBLE_BITRATE,
@@ -119,11 +119,16 @@ async def repair_durations(session: AsyncSession, *, limit: int = 25) -> int:
         recording.fps = info.fps
         recording.fps_container = info.fps_container
         recording.size_bytes = info.size_bytes
-        recording.probe_json = {
-            "warnings": info.warnings,
-            "pts_wrapped": info.pts_wrapped,
-            "source_damaged": bool(info.warnings),
-        }
+        # Merged, not assigned. Other subsystems keep their own keys in this column and a
+        # duration repair has no business dropping them -- see ``DURABLE_PROBE_KEYS``.
+        recording.probe_json = carry_probe_markers(
+            recording.probe_json,
+            {
+                "warnings": info.warnings,
+                "pts_wrapped": info.pts_wrapped,
+                "source_damaged": bool(info.warnings),
+            },
+        )
         # ended_at is derived from the duration, so it inherited the same lie -- one of
         # these two files claimed to have finished 26 hours after it started.
         if recording.started_at is not None:

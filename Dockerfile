@@ -6,8 +6,15 @@
 FROM node:22-bookworm-slim AS frontend
 
 WORKDIR /build
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+COPY frontend/package.json frontend/package-lock.json ./
+# `npm ci` with no fallback, deliberately.
+#
+# The `|| npm install` this replaced turned the one check that catches a package.json /
+# package-lock.json drift into a warning nobody sees: the release build fell through to
+# `npm install`, resolved versions nobody had tested, and shipped them. If the lockfile is
+# out of step the right outcome is a red build, not a quietly different bundle. The
+# lockfile is committed, so the glob that made it optional was papering over the same gap.
+RUN npm ci --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 
@@ -161,10 +168,19 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     DASHCAM_DATA_DIR=/data \
     DASHCAM_FOOTAGE_DIR=/dashcam \
     DASHCAM_PORT=8080 \
-    DASHCAM_VERSION=${VERSION} \
-    # iHD is the right driver for modern Intel; the entrypoint overrides this if the
-    # detected hardware needs the older i965 or a Mesa driver instead.
-    LIBVA_DRIVER_NAME=iHD
+    DASHCAM_VERSION=${VERSION}
+
+# LIBVA_DRIVER_NAME is deliberately NOT set here.
+#
+# It used to be pinned to `iHD`, with a comment claiming the entrypoint would override it on
+# hardware that needed something else. It did not, and that mattered more than it looks:
+# libva only probes the DRM driver and chooses a backend while the variable is *unset*, so a
+# pinned value silently disables auto-detection everywhere. On AMD and pre-Gen8 Intel the
+# image loaded a driver that could not initialise, every decode fell back to software, and
+# the mesa-va-drivers and i965-va-driver packages installed above for exactly those hosts
+# were unreachable -- while Settings reported `vaapi_driver: iHD`, naming a driver that had
+# never loaded. `docker/entrypoint.sh` now reads the render node's PCI vendor and exports
+# the right name, and leaves an operator-supplied value alone.
 
 # Keep the ADB key on the data volume: the head unit authorises the key, so losing it on an
 # image rebuild means the car has to be re-authorised by hand from its own screen.

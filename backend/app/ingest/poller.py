@@ -26,9 +26,8 @@ import contextlib
 import time
 
 from app.core.logging import get_logger
-from app.core.settings_service import get_settings_service
 from app.ingest import adb, health, puller, radios
-from app.ingest.models import RunState, UnitState
+from app.ingest.models import RunState, UnitInfo, UnitState, ingest_setting
 from app.ingest.status import get_status
 
 log = get_logger(__name__)
@@ -59,6 +58,9 @@ class IngestPoller:
         self._was_online = False
         #: When the last run that found nothing finished, so the re-check can back off.
         self._idle_since: float = 0.0
+        #: The unit as this visit first described it, kept only while the arrival gate is
+        #: holding. See the note in :meth:`_loop`; cleared the moment the port goes quiet.
+        self._visit_info: UnitInfo | None = None
 
     async def start(self) -> None:
         if self._running:
@@ -86,19 +88,17 @@ class IngestPoller:
     def healthy(self) -> bool:
         return self._running and self._task is not None and not self._task.done()
 
+    # Every accessor below falls back to the *schema* default rather than to a literal
+    # written here. Two of these had already drifted: the poll interval fell back to 8 s
+    # against a default of 2, and the arrival gate's uptime threshold fell back to 0
+    # against a default of 120 -- which does not weaken the gate, it disables it, so a pull
+    # fires as the car is pulling off the driveway rather than when it arrives.
+
     def _interval(self) -> float:
-        try:
-            return max(
-                MIN_POLL_S, float(get_settings_service().get_nowait("ingest.poll_interval_s"))
-            )
-        except Exception:
-            return 8.0
+        return max(MIN_POLL_S, float(ingest_setting("poll_interval_s")))
 
     def _enabled(self) -> bool:
-        try:
-            return bool(get_settings_service().get_nowait("ingest.enabled"))
-        except Exception:
-            return False
+        return bool(ingest_setting("enabled"))
 
     def _should_drain_again(self, status) -> bool:
         """Whether to start another pull at a unit that is already here.
@@ -141,24 +141,17 @@ class IngestPoller:
         return False
 
     def _address(self) -> str:
-        try:
-            return str(get_settings_service().get_nowait("ingest.unit_adb_address") or "").strip()
-        except Exception:
-            return ""
+        # Normalised, because the cheap presence check and adb itself disagreed about
+        # an address with no port: the socket connect succeeded against the default port
+        # while `adb -s <host>` answered "device not found", so a poller pointed at
+        # `192.168.1.122` took the expensive branch on every tick forever.
+        return adb.normalised_address(str(ingest_setting("unit_adb_address") or ""))
 
     def _redrain_cooldown_s(self) -> float:
-        try:
-            return max(
-                0.0, float(get_settings_service().get_nowait("ingest.redrain_cooldown_s") or 0)
-            )
-        except Exception:
-            return 60.0
+        return max(0.0, float(ingest_setting("redrain_cooldown_s") or 0))
 
     def _min_uptime_s(self) -> float:
-        try:
-            return max(0.0, float(get_settings_service().get_nowait("ingest.min_uptime_s") or 0))
-        except Exception:
-            return 0.0
+        return max(0.0, float(ingest_setting("min_uptime_s") or 0))
 
     async def _arrival_ready(self, address: str) -> bool:
         """Whether an automatic pull may start, or the unit has only just booted.
@@ -220,6 +213,7 @@ class IngestPoller:
                 if not self._enabled():
                     status.set_state(RunState.DISABLED)
                     self._was_online = False
+                    self._visit_info = None
                     await asyncio.sleep(max(MIN_POLL_S, 15.0))
                     continue
 
@@ -234,10 +228,55 @@ class IngestPoller:
                     status.set_unit_online(False)
                     status.set_state(RunState.OFFLINE)
                     self._was_online = False
+                    self._visit_info = None
                     await asyncio.sleep(self._interval())
                     continue
 
-                info = await puller.probe_unit()
+                # A tick that cannot start anything must not pay for a describe.
+                #
+                # `probe_unit` is four adb process spawns -- disconnect, connect, get-state
+                # and a shell to resolve the card -- and it tears down and rebuilds the ADB
+                # transport each time. That is the right price once per decision; it was
+                # being paid on *every* tick a present unit was seen. On the deployment the
+                # recorder-health card exists for -- a unit parked at home, or a bench unit
+                # -- that is roughly 7,200 spawns an hour, forever, to re-answer a question
+                # whose answer had already been "not yet" for hours. The cooldown between
+                # re-drains does the same thing on a shorter clock while the car sits on the
+                # driveway.
+                #
+                # Asked once per tick and remembered, because `_should_drain_again` is not
+                # a pure predicate: on the IDLE path it arms `_idle_since` and returns
+                # True, so a second call microseconds later sees the backoff it just set
+                # and returns False. Calling it here *and* at the branch below meant the
+                # empty-card re-check could never actually start a pull -- the unit was
+                # re-probed every thirty seconds forever and nothing was ever fetched.
+                drain_again = self._was_online and self._should_drain_again(status)
+                # Only from a state that describes a healthy visit. The early return skips
+                # `probe_unit`, which is also the only thing that notices a unit that has
+                # gone UNAUTHORIZED or dropped its adb transport -- so taking it from any
+                # state would leave the Backup page reporting the last good one forever
+                # while `_was_online` stayed True and no pull could ever start again.
+                if (
+                    self._was_online
+                    and not drain_again
+                    and status.state in (RunState.IDLE, RunState.OK, RunState.PARTIAL)
+                ):
+                    # Cheap and non-destructive, and throttled inside: this is what keeps
+                    # the recorder-health card current on a unit that stays present.
+                    health.on_unit_present(self._address())
+                    await asyncio.sleep(self._interval())
+                    continue
+
+                # During an arrival hold the only thing that changes tick to tick is the
+                # uptime, so the describe from the first tick of the visit is reused rather
+                # than repeated. Only a *good* describe is cached: a unit that has just
+                # booted may not have mounted its card yet, and freezing that answer for the
+                # length of the hold would be exactly the wrong thing to remember.
+                info = (
+                    self._visit_info
+                    if (not self._was_online and self._visit_info is not None)
+                    else await puller.probe_unit()
+                )
                 status.set_unit_online(info.online)
                 if info.state is UnitState.UNAUTHORIZED:
                     status.set_state(RunState.UNAUTHORIZED)
@@ -265,6 +304,16 @@ class IngestPoller:
                         # leaves `_was_online` False so the next tick re-checks, and a real
                         # arrival -- which already has a high uptime -- clears it at once.
                         if await self._arrival_ready(info.address):
+                            # A transfer is about to start, so take a fresh view of the unit
+                            # rather than the one cached through the hold -- the card may
+                            # have been mounted, or replaced, in the minutes since.
+                            if self._visit_info is not None:
+                                info = await puller.probe_unit()
+                                self._visit_info = None
+                                status.set_unit_online(info.online)
+                                if not info.online:
+                                    await asyncio.sleep(self._interval())
+                                    continue
                             log.info(
                                 "the head unit appeared; starting a pull", address=info.address
                             )
@@ -286,8 +335,10 @@ class IngestPoller:
                             # failure, and the one state the poll re-checks while the car
                             # is here. `_was_online` stays False so this stays the arrival
                             # transition until the uptime clears.
+                            if info.online and info.source and not info.card_error:
+                                self._visit_info = info
                             status.set_state(RunState.IDLE)
-                    elif self._should_drain_again(status):
+                    elif drain_again:
                         # The window is not over when the first pull ends, and it used to be
                         # treated as though it were: this fired once on arrival and then sat
                         # idle for as long as the car stayed. Everything the recorder closed
@@ -316,6 +367,12 @@ class IngestPoller:
             except Exception as exc:
                 log.debug("ingest poll failed", error=f"{type(exc).__name__}: {exc}")
                 self._was_online = False
+                # Cleared wherever `_was_online` is, because the two together are what
+                # decides whether the next tick reuses a describe. Left armed on this path,
+                # a transient adb failure -- or the feature being switched off and back on
+                # hours later -- would hand a stale address and card path to the radio
+                # restore and the health collect.
+                self._visit_info = None
 
             await asyncio.sleep(self._interval())
 

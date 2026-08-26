@@ -131,3 +131,79 @@ class TestTheDetectionStageActuallyRuns:
             await stages.stage_detect(session, recording)
 
         assert closed["value"], "the decoder was left for the garbage collector to finalise"
+
+
+class TestTheVehicleCropsAreActuallyWritten:
+    """A tracked vehicle's crop has to reach the disk, and the row has to point at it.
+
+    This is asserted rather than assumed because losing it is silent: `cv2.imwrite` into a
+    missing directory returns False and raises nothing, so `crop_path` is simply None and
+    the stage still reports success with the right number of tracked objects. It happened
+    -- the sweep that clears the previous run's crops was placed *after* the loop that
+    names them, and naming one creates its directory, so every crop of every recording was
+    written into a directory that had just been removed.
+    """
+
+    @pytest.fixture
+    def clip_with_a_vehicle(self, monkeypatch):
+        from app.ai.detector import Detection2D
+
+        class OneCar:
+            device = "CPU"
+            available = True
+
+            async def detect(self, frame, **kwargs):
+                # The same box every frame, so the tracker keeps one object throughout.
+                return [Detection2D(class_label="car", confidence=0.9, x=0.2, y=0.2, w=0.4, h=0.4)]
+
+        async def shared_detector(name, *args, **kwargs):
+            return OneCar()
+
+        async def iter_frames(path, **kwargs):
+            on_decoder = kwargs.get("on_decoder")
+            if on_decoder:
+                on_decoder("software")
+            for index in range(12):
+                # Non-uniform pixels, so the crop has a measurable sharpness and is kept.
+                frame = np.zeros((64, 64, 3), dtype=np.uint8)
+                frame[::2, ::2] = 255
+                yield float(index) / 4.0, frame
+
+        monkeypatch.setattr(stages, "_shared_detector", shared_detector)
+        monkeypatch.setattr(stages, "iter_frames", iter_frames)
+        monkeypatch.setattr(
+            stages.asyncio, "to_thread", lambda fn, *a, **k: _immediate(fn, *a, **k)
+        )
+
+    async def test_the_crop_file_exists_and_the_row_points_at_it(
+        self, db_session, app_config, clip_with_a_vehicle
+    ):
+        from sqlalchemy import select
+
+        from app.db.models import TrackedObject
+        from app.db.session import session_scope
+
+        async with session_scope() as session:
+            recording = Recording(
+                rel_path="20260812120000_camera_0.ts",
+                filename="20260812120000_camera_0.ts",
+                width=64,
+                height=64,
+                duration_s=3.0,
+                video_codec="h264",
+            )
+            session.add(recording)
+            await session.flush()
+            result = await stages.stage_detect(session, recording)
+
+        assert result.ok
+        async with session_scope() as session:
+            tracks = (await session.execute(select(TrackedObject))).scalars().all()
+
+        assert tracks, "the fake car was never tracked, so this proves nothing"
+        stored = [t for t in tracks if t.crop_path]
+        assert stored, "a tracked vehicle was written with no crop path at all"
+        for track in stored:
+            path = app_config.media_dir / track.crop_path
+            assert path.is_file(), f"the row points at {track.crop_path}, which is not on disk"
+            assert path.stat().st_size > 0

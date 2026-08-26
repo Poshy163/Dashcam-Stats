@@ -259,7 +259,10 @@ class TestPlanning:
         # The fixture files are a few kilobytes, so the planner would exit before
         # evaluating eligibility at all. Reporting a large directory is what puts it over
         # the limit and makes it actually walk the candidates.
-        monkeypatch.setattr("app.retention.safety.directory_size", lambda *_a, **_kw: (10 * GB, 12))
+        async def _measured(*_a, **_kw):
+            return (10 * GB, 12)
+
+        monkeypatch.setattr("app.retention.safety.measure_tree", _measured)
 
         result = await plan(session)
 

@@ -157,6 +157,41 @@ NEW_FOOTAGE_PRIORITY = 100
 BULK_PRIORITY = 200
 
 
+#: Keys inside ``recordings.probe_json`` that survive a re-probe.
+#:
+#: Everything else in that blob describes what ffprobe just said, so the metadata stage
+#: replaces it wholesale — which is correct for the container facts and wrong for the one
+#: kind of entry that is not a probe result at all: a marker recording that a decision
+#: about this recording has already been reconsidered once.
+#:
+#: ``media_failure_reviewed`` is the case that bit. ``queue.reconcile_media_failure_hides``
+#: un-hides footage that was condemned while the media stack itself was failing, sets this
+#: marker so the same row is not reconsidered on every restart, and requeues it. The
+#: metadata stage then rewrote ``probe_json`` from the fresh probe and took the marker with
+#: it — so genuinely damaged footage was un-hidden, fully re-decoded and re-hidden on every
+#: single container restart, which is exactly the loop the marker exists to prevent.
+#:
+#: ``damaged_policy`` is the second. ``app.damaged_policy`` records the state a recording
+#: was in before it was hidden, and ``_restore_policy_hidden`` needs that block to put the
+#: row back when the policy is switched to "keep" or the recording stops being damaged.
+#: Losing it to a re-probe meant a hidden recording could never be restored at all: the
+#: restore looked for the block, did not find it, reported "kept", and left ``ignored`` set.
+#:
+#: Kept beside the column rather than in :mod:`app.workers.queue` so the writer and the
+#: reader agree without either importing the other.
+DURABLE_PROBE_KEYS: tuple[str, ...] = ("media_failure_reviewed", "damaged_policy")
+
+
+def carry_probe_markers(previous: object, fresh: dict) -> dict:
+    """Merge the durable markers of *previous* into a freshly probed ``probe_json``."""
+    if not isinstance(previous, dict):
+        return fresh
+    for key in DURABLE_PROBE_KEYS:
+        if key in previous:
+            fresh[key] = previous[key]
+    return fresh
+
+
 class CameraRole(str, enum.Enum):
     FRONT = "front"
     REAR = "rear"
@@ -254,6 +289,19 @@ class Recording(Base):
     # Cheap partial fingerprint (size + head/mid/tail digest). Full hashing the whole
     # library every scan is exactly what the design must avoid.
     fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # The stat the fingerprint above was taken from, which is the only durable evidence
+    # that *these* bytes have been read.
+    #
+    # Comparing the live stat against ``size_bytes``/``mtime_ns`` cannot answer that, and
+    # the scanner used to try. Those two columns are rewritten on every scan so the
+    # stability check has something to compare against next time, so "the stat moved" is
+    # only ever true for the *one* scan that saw it move -- and that scan holds the file
+    # for a settling observation and returns before fingerprinting it. By the next scan
+    # the stat matches again and the cheap path skips the file, so a recording whose file
+    # was replaced kept the analysis of the bytes that are no longer there, and one that
+    # had never been analysed stayed in SETTLING for good.
+    fingerprint_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fingerprint_mtime_ns: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # --- timing -----------------------------------------------------------------------
     # Parsed from the filename; the OSD clock supersedes it once telemetry is read.

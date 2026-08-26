@@ -246,18 +246,43 @@ async def _require_current_password(request: Request, current: str | None) -> No
 
     Before any account exists there is nothing to re-check and nothing to protect, and
     asking for a password nobody has set would be theatre.
+
+    Throttled exactly as ``/api/auth/login`` is, and for a stronger reason. This check is a
+    full scrypt derivation -- 32 MiB and about 125 ms on the shared executor the detection
+    stage and every ffmpeg probe also use -- and in the account-set-but-switch-off state
+    described above the gate lets an unauthenticated caller reach it. Unthrottled, that is
+    an unlimited-rate password oracle that bypasses the login form's own throttle, and a
+    way to keep both KDF slots permanently busy from outside.
     """
     if not service.credential_configured():
         return
     username = service.configured_username()
     if username is None:  # pragma: no cover - guarded by the line above
         return
+
+    address = gate.client_ip(request) or "unknown"
+    address_key = f"ip:{address}"
+    user_key = f"user:{username[:128]}"
+
+    wait = ratelimit.retry_after(address_key)
+    if wait is not None:
+        log.warning("account change throttled", address=address, retry_after=round(wait))
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Too many attempts from this address. Try again later.",
+            headers={"Retry-After": str(max(1, int(wait)))},
+        )
+    delay = ratelimit.delay_for(user_key)
+    if delay:
+        await asyncio.sleep(delay)
+
     if not current or not await service.verify_credential(username, current):
-        address = gate.client_ip(request) or "unknown"
+        ratelimit.record_failure(address_key, user_key)
         log.warning("account change refused: current password wrong", address=address)
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Enter your current password to change the account."
         )
+    ratelimit.record_success(address_key, user_key)
 
 
 def _set_session_cookie(

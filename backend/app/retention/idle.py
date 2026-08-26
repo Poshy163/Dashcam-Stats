@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
-from app.db.models import Recording, RecordingState, StageState
+from app.db.models import JobState, ProcessingJob, Recording, RecordingState, StageState
 from app.retention.planner import _GB, RetentionCandidate, RetentionPlan
 from app.retention.safety import SafetyReport, evaluate_safety
 
@@ -112,8 +112,30 @@ async def plan_idle(session: AsyncSession, safety: SafetyReport | None = None) -
         return result
 
     threshold = float(settings.get_nowait("storage.idle_speed_kmh"))
+    # Never a recording something is working on, which the size-based planner has always
+    # excluded and this rule did not.
+    #
+    # The asymmetry mattered because this is the only rule that deletes without the master
+    # switch. `_static_condition` asks about telemetry and detection, so a recording whose
+    # *plate* stage is still pending -- or one a user has just queued for reprocessing --
+    # satisfied every test while its job sat in the queue, and the file could be unlinked
+    # out from under the worker. The recording was then marked failed for a missing file,
+    # for a reason that had nothing to do with it, and the deletion was irreversible.
+    active_jobs = select(ProcessingJob.recording_id).where(
+        ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),
+        ProcessingJob.recording_id.is_not(None),
+    )
     recordings = (
-        (await session.execute(select(Recording).where(_live(), _static_condition(threshold))))
+        (
+            await session.execute(
+                select(Recording).where(
+                    _live(),
+                    _static_condition(threshold),
+                    Recording.state != RecordingState.PROCESSING,
+                    Recording.id.notin_(active_jobs),
+                )
+            )
+        )
         .scalars()
         .all()
     )

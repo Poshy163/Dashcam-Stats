@@ -740,7 +740,7 @@ async def resolve_api_key(presented: str) -> Principal | None:
     """Turn a presented key into the account's principal, or None.
 
     No cache and no rate limit, unlike the Basic path, because there is nothing expensive
-    here to protect: this is a comparison of two strings, not a scrypt derivation. The
+    here to protect: this is a comparison of two byte strings, not a scrypt derivation. The
     comparison is constant-time all the same -- a bearer credential checked with ``==``
     leaks its prefix to anyone patient enough to measure, and unlike a password there is no
     KDF in front of it to hide behind.
@@ -750,7 +750,13 @@ async def resolve_api_key(presented: str) -> Principal | None:
     expected = configured_api_key()
     if len(expected) < MIN_API_KEY_LENGTH:
         return None
-    if not hmac.compare_digest(presented, expected):
+    # Encoded first, for the same reason `verify_credential` does it: `compare_digest`
+    # raises TypeError on `str` arguments outside ASCII, and `presented` is attacker
+    # controlled -- it arrives from the `?k=` query parameter, the `X-API-Key` header
+    # (which Starlette decodes latin-1, so any byte above 0x7F lands here non-ASCII) or the
+    # key cookie. One such byte turned a wrong-key rejection into a 500 with a stack trace
+    # written into `log_entries`, and made "a key is configured" externally detectable.
+    if not hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
         return None
     await ensure_credential_loaded()
     username = _credential_username

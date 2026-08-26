@@ -8,10 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Camera, CameraRole, OsdProfile
+from app.core.logging import get_logger
+from app.db.models import AppSetting, Camera, CameraRole, OsdProfile, Recording
+
+log = get_logger(__name__)
 
 DEFAULT_OSD_PROFILE_NAME = "default"
 
@@ -122,10 +125,60 @@ async def seed_osd_profile(session: AsyncSession) -> OsdProfile:
     return profile
 
 
+async def seed_timezone(session: AsyncSession) -> bool:
+    """Write ``general.timezone`` from ``TZ`` the first time, and never again.
+
+    ``TZ`` is one of the five documented deployment variables and is what a first-time
+    installer sets; the zone that actually decides when every recording happened is the
+    ``general.timezone`` setting, which takes its *default* from it. A default is recomputed
+    on every process start, so without this row the meaning of an existing library would
+    quietly change the day somebody edited the compose file -- reinterpreting every
+    filename timestamp, and with it every journey boundary and date filter, with no
+    migration and no warning.
+
+    Writing it once turns that into what the README already promises: ``TZ`` seeds the
+    setting on first boot, and after that the setting is where the zone lives.
+
+    **A library that has already been indexed keeps the zone it was indexed with**, which
+    is the whole reason this pins a value rather than leaving a default to be recomputed.
+    ``TZ`` did nothing before this existed, so a deployment holding recordings read every
+    one of their filenames through the old hardcoded default whatever its ``TZ`` said --
+    and writing the environment's answer into such a database would shift every timestamp
+    in it retroactively, splitting journeys at the wrong places and moving every date
+    filter, on an upgrade nobody asked to change anything. The presence of recordings is
+    what separates the two cases, and it is exact: no recordings means nothing has been
+    interpreted yet.
+
+    Returns True when a row was created.
+    """
+    from app.core.settings_schema import HISTORICAL_TIMEZONE, default_timezone
+
+    key = "general.timezone"
+    existing = (
+        await session.execute(select(AppSetting).where(AppSetting.key == key))
+    ).scalar_one_or_none()
+    if existing is not None:
+        return False
+
+    indexed = int((await session.execute(select(func.count(Recording.id)))).scalar() or 0)
+    value = default_timezone() if indexed == 0 else HISTORICAL_TIMEZONE
+    if indexed:
+        log.info(
+            "pinning the timezone this library was already indexed with; change it in "
+            "Settings if it is wrong",
+            timezone=value,
+            recordings=indexed,
+        )
+    session.add(AppSetting(key=key, value=value))
+    await session.flush()
+    return True
+
+
 async def seed_defaults(session: AsyncSession) -> None:
     """Every seed step, in dependency order. Safe to run on every boot."""
     await seed_cameras(session)
     await seed_osd_profile(session)
+    await seed_timezone(session)
 
 
 __all__ = [
@@ -137,4 +190,5 @@ __all__ = [
     "seed_cameras",
     "seed_defaults",
     "seed_osd_profile",
+    "seed_timezone",
 ]

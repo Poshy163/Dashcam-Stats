@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 
 from app.ai.models import DEFAULT_DETECTION_MODEL, REGISTRY, ROAD_CLASSES, ensure_model
-from app.ai.openvino_session import use_openvino_session
+from app.ai.openvino_session import gpu_backend_disabled, use_openvino_session
 from app.core.logging import get_logger
 from app.core.resources import configure_opencv_threads, onnx_session_options
 from app.core.settings_service import get_settings_service
@@ -145,8 +145,12 @@ async def load_detector(name: str, *, conf_thresh: float | None = None) -> Any |
 class ObjectDetector:
     """Road-object detector over sampled frames."""
 
-    def __init__(self, model_name: str | None = None) -> None:
+    def __init__(self, model_name: str | None = None, *, confidence: float | None = None) -> None:
         self._model_name = model_name
+        #: The threshold this instance is compiled for. Passed in by the shared cache,
+        #: which keys on it, rather than read here -- so one object cannot be built for a
+        #: value the cache filed it under something else for.
+        self._confidence = confidence
         self._detector: Any | None = None
         self._spec = None
         self._loaded = False
@@ -198,7 +202,11 @@ class ObjectDetector:
             if spec is None:
                 return False
 
-        threshold = float(settings.get_nowait("processing.detection_confidence"))
+        threshold = (
+            float(self._confidence)
+            if self._confidence is not None
+            else float(settings.get_nowait("processing.detection_confidence"))
+        )
         detector = await load_detector(name, conf_thresh=threshold)
         if detector is None:
             log.warning(
@@ -240,12 +248,27 @@ class ObjectDetector:
             return []
 
         device = (self.device or "").upper()
-        if "GPU" in device and not intel_media_lock().gpu_safe():
-            # A media child that would not die is still holding this chip. Adding an
-            # OpenVINO request to that is the exact state the deployment aborts from, so
-            # this session moves to the CPU rather than waiting for the driver to decide.
-            self._demote_to_cpu(intel_media_lock().unhealthy or "the Intel media slot is unhealthy")
-            device = (self.device or "").upper()
+        if "GPU" in device:
+            # Two independent reasons to get off this chip, and only one of them used to be
+            # asked about.
+            #
+            # `gpu_safe()` reports stuck *ffmpeg* children and says nothing about OpenVINO.
+            # When a `CL_OUT_OF_RESOURCES` takes the inference context down, the session
+            # records the verdict durably and re-raises -- but the upstream library catches
+            # every exception from a batch and returns empty lists, so nothing here ever saw
+            # it. The session stayed compiled for a device that cannot serve it, every
+            # subsequent frame failed the same way, and the stage recorded "0 vehicles" as a
+            # success for the whole remaining queue.
+            #
+            # Reading the recorded verdict is what closes that: the demotion then happens
+            # from an ordinary call site rather than from inside the driver's failing stack,
+            # which is the thing the session's own comment rules out.
+            failure = gpu_backend_disabled()
+            if failure or not intel_media_lock().gpu_safe():
+                self._demote_to_cpu(
+                    failure or intel_media_lock().unhealthy or "the Intel media slot is unhealthy"
+                )
+                device = (self.device or "").upper()
 
         try:
             guard = intel_media_lock() if "GPU" in device else contextlib.nullcontext()

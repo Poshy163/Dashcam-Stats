@@ -180,9 +180,12 @@ class TestItActuallyDeletesWithoutTheMasterSwitch:
         from app.retention import safety as safety_mod
 
         (await get_settings_service().footage_dir())  # ensure configured
-        monkeypatch.setattr(
-            safety_mod, "directory_size", lambda *a, **k: (0, 0)
-        )  # empty dir -> safety fails
+
+        async def _measured(*_a, **_kw):
+            return (0, 0)
+
+        # empty dir -> safety fails
+        monkeypatch.setattr(safety_mod, "measure_tree", _measured)
         await _rec(ready, "desk.ts")
         plan = await plan_idle(ready)
         run = await run_retention(ready, plan, dry_run=False, trigger="idle-cleanup")

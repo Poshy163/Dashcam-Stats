@@ -49,11 +49,69 @@ grant_dri_access() {
     done
 }
 
+select_va_driver() {
+    # The VAAPI backend, chosen from the hardware rather than baked into the image.
+    #
+    # This used to be `ENV LIBVA_DRIVER_NAME=iHD` in the Dockerfile, with a comment saying
+    # the entrypoint would override it where the hardware needed something else. It never
+    # did. libva only probes the DRM driver and picks a backend when the variable is
+    # *unset*; once set it loads that name and nothing else -- so on an AMD iGPU or a
+    # pre-Gen8 Intel the image tried to load iHD, VAAPI init failed, and the
+    # mesa-va-drivers and i965-va-driver packages installed for exactly those hosts were
+    # unreachable. The Settings page then reported `vaapi_driver: iHD`, naming a driver
+    # that had never loaded.
+    if [ -n "${LIBVA_DRIVER_NAME:-}" ]; then
+        log "LIBVA_DRIVER_NAME=${LIBVA_DRIVER_NAME} was set by the operator; leaving it alone"
+        return
+    fi
+
+    shopt -s nullglob
+    local vendors=(/sys/class/drm/renderD*/device/vendor)
+    shopt -u nullglob
+
+    local vendor driver=""
+    for path in "${vendors[@]}"; do
+        vendor="$(cat "$path" 2>/dev/null || true)"
+        case "$vendor" in
+            0x8086) driver="iHD" ;;      # Intel, Gen9 and newer
+            0x1002 | 0x1022) driver="radeonsi" ;;  # AMD
+            0x10de) driver="nouveau" ;;  # NVIDIA, open driver
+        esac
+        if [ -n "$driver" ]; then break; fi
+    done
+
+    if [ -n "$driver" ]; then
+        export LIBVA_DRIVER_NAME="$driver"
+        log "selected VAAPI driver ${driver} for GPU vendor ${vendor}"
+    else
+        # Not an error: libva's own probe is a perfectly good answer, and this is also the
+        # CPU-only case where there is nothing to choose.
+        log "no known GPU vendor found; letting libva choose its own VAAPI driver"
+    fi
+}
+
 prepare_dirs() {
     mkdir -p "$DATA_DIR"
     # Only /data is ours to own. The footage mount is the user's, is frequently read-only,
     # and must never be chowned or written to.
-    if ! chown -R "$APP_USER":"$APP_USER" "$DATA_DIR" 2>/dev/null; then
+    #
+    # Only the entries that are actually wrong, not the whole tree. `chown -R` rewrites the
+    # inode of every thumbnail, plate crop and cached MP4 on the volume on every container
+    # start -- and on every `docker exec entrypoint.sh ...`. On a library with tens of
+    # thousands of derived files that is a burst of pointless metadata writes before the app
+    # has served a single request. One `find` pass costs a stat per entry and writes nothing
+    # when the ownership is already right, which is the normal case.
+    # Numeric ids, not names. `find -group NAME` fails outright when no group of that name
+    # exists, which would exit non-zero, log a false warning and repair nothing -- and the
+    # group the app account belongs to is created by `useradd` rather than by anything this
+    # script can see. `find` otherwise exits 0 when it matches nothing, so the test below
+    # reports a genuine permissions problem rather than "there was nothing to do".
+    local uid gid
+    uid="$(id -u "$APP_USER")"
+    gid="$(id -g "$APP_USER")"
+    if ! find "$DATA_DIR" \( ! -uid "$uid" -o ! -gid "$gid" \) \
+        -exec chown "$uid":"$gid" {} + 2>/dev/null
+    then
         log "WARNING: could not take ownership of ${DATA_DIR}; check volume permissions"
     fi
 
@@ -84,6 +142,10 @@ prepare_adb_key() {
         chown -h "$APP_USER":"$APP_USER" "${home}/.android" 2>/dev/null || true
     fi
 }
+
+# Chosen before privileges are dropped, and in both branches: `gosu` and a compose-set
+# `user:` both inherit this process's environment, so the app sees whatever is exported here.
+select_va_driver
 
 if [ "$(id -u)" = "0" ]; then
     grant_dri_access

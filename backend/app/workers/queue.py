@@ -21,6 +21,7 @@ from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service, local_midnight_utc
 from app.db.models import (
     BULK_PRIORITY,
+    DURABLE_PROBE_KEYS,
     NEW_FOOTAGE_PRIORITY,
     JobKind,
     JobState,
@@ -318,6 +319,31 @@ async def claim_next(session: AsyncSession, worker_id: str) -> ProcessingJob | N
         .limit(1)
         .scalar_subquery()
     )
+
+    # A read-only look before the write.
+    #
+    # `claim_next` is the whole of the idle poll, and its only statement was an UPDATE --
+    # which, matching zero rows or not, opens a write transaction and takes SQLite's single
+    # writer lock. At the shipped defaults that is two workers x 30 polls a minute = 60
+    # writer-lock acquisitions and 60 commits every minute, forever, against a queue whose
+    # scheduled source of work fires once an hour. Under WAL this SELECT takes no writer
+    # lock at all, and it is served by `ix_jobs_claim`.
+    #
+    # Racy by construction, and harmlessly so: the claim below is still the same single
+    # atomic UPDATE, so a stale "yes" costs one zero-row UPDATE and a stale "no" costs one
+    # more idle interval before the job is picked up.
+    runnable = (
+        await session.execute(
+            select(ProcessingJob.id)
+            .where(
+                ProcessingJob.state == JobState.QUEUED,
+                (ProcessingJob.not_before.is_(None)) | (ProcessingJob.not_before <= now),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if runnable is None:
+        return None
 
     claimed = (
         await session.execute(
@@ -622,6 +648,14 @@ async def cancel(session: AsyncSession, job_id: int) -> bool:
     next heartbeat and stops the run. The worker will then decline to write a result over
     the top of it, which it previously did — so a cancelled job came back a few minutes
     later as COMPLETED, or as QUEUED with a retry pending.
+
+    The *recording* is settled here too, and both halves of that matter. Left as it was, it
+    sits in QUEUED or PROCESSING with no job to finish it -- stranded, invisible to
+    `queue_unprocessed`, and showing as processing with no worker forever. Demoted to
+    DISCOVERED it would be picked straight back up by the next scan, which makes the Cancel
+    button do nothing at all. FAILED is the honest answer: the analysis did not finish, by
+    request; the recording stays visible and says why; "reprocess failed" is how it comes
+    back, which is the same gesture as the Retry button beside the job.
     """
     job = await session.get(ProcessingJob, job_id)
     if job is None or job.state not in (JobState.QUEUED, JobState.RUNNING):
@@ -629,17 +663,82 @@ async def cancel(session: AsyncSession, job_id: int) -> bool:
     job.state = JobState.CANCELLED
     job.finished_at = datetime.now(UTC)
     job.worker_id = None
+
+    if job.recording_id is not None:
+        # Only when nothing else is still working on it -- a bulk reprocess can leave a
+        # second job for the same recording, and cancelling one of them is not a decision
+        # about the other.
+        other = (
+            await session.execute(
+                select(ProcessingJob.id)
+                .where(
+                    ProcessingJob.recording_id == job.recording_id,
+                    ProcessingJob.id != job.id,
+                    ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if other is None:
+            recording = await session.get(Recording, job.recording_id)
+            if recording is not None and recording.state in (
+                RecordingState.QUEUED,
+                RecordingState.PROCESSING,
+            ):
+                recording.state = RecordingState.FAILED
+                recording.error_message = "processing was cancelled"
+
     await session.flush()
     return True
 
 
 async def retry_failed(session: AsyncSession) -> int:
-    """Requeue visible failed jobs, never resurrecting blacklisted footage."""
+    """Requeue visible failed jobs, never resurrecting blacklisted footage.
+
+    A recording that already holds a live job is skipped, which is the same refusal to stack
+    that :func:`enqueue` makes. Without it "Retry failed" could hand one recording two
+    queued jobs, and the state that produces is not exotic: ``fail`` runs
+    ``_follow_up_after_thumbnail`` on every terminal outcome, so a thumbnail job that cannot
+    be made leaves a FAILED thumbnail row beside the QUEUED analysis job it correctly
+    created. Flipping the first back to QUEUED then decodes that recording twice --
+    ``claim_next`` keeps the two from running at once, so it is wasted work rather than
+    corruption, but it is still wasted work nobody asked for.
+
+    The same refusal has to hold *within* this statement, which is the case the live-job
+    check cannot see. A recording that failed twice -- a failed thumbnail and a failed
+    analysis, the pairing above, both now terminal -- has two FAILED rows and no live one,
+    so both matched and both were queued. Only the newest survives; it is the one carrying
+    the most recent view of what the recording still needs, and the older row stays FAILED
+    as the record of what happened rather than becoming a second decode of the same file.
+    """
     visible_recordings = select(Recording.id).where(Recording.ignored.is_(False))
+    live = ProcessingJob.__table__.alias("live")
+    already_live = (
+        select(live.c.id)
+        .where(
+            live.c.state.in_([JobState.QUEUED, JobState.RUNNING]),
+            live.c.recording_id.is_not(None),
+            live.c.recording_id == ProcessingJob.recording_id,
+        )
+        .exists()
+    )
+    newer_failure = ProcessingJob.__table__.alias("newer_failure")
+    superseded = (
+        select(newer_failure.c.id)
+        .where(
+            newer_failure.c.state == JobState.FAILED,
+            newer_failure.c.recording_id.is_not(None),
+            newer_failure.c.recording_id == ProcessingJob.recording_id,
+            newer_failure.c.id > ProcessingJob.id,
+        )
+        .exists()
+    )
     result = await session.execute(
         update(ProcessingJob)
         .where(
             ProcessingJob.state == JobState.FAILED,
+            ~already_live,
+            ~superseded,
             or_(
                 ProcessingJob.recording_id.is_(None),
                 ProcessingJob.recording_id.in_(visible_recordings),
@@ -849,7 +948,11 @@ async def reconcile_misclassified_probe_crashes(session: AsyncSession) -> int:
 
 
 #: Marks a recording whose hide has already been reconsidered, so this runs once.
-_MEDIA_REVIEW_KEY = "media_failure_reviewed"
+#:
+#: Named in :data:`app.db.models.DURABLE_PROBE_KEYS` so the metadata stage carries it over
+#: when it rewrites ``probe_json`` from a fresh probe. Without that the marker was wiped by
+#: the very reprocess this function queues, and the review happened again on every restart.
+_MEDIA_REVIEW_KEY = DURABLE_PROBE_KEYS[0]
 
 
 async def reconcile_media_failure_hides(session: AsyncSession) -> int:
@@ -1012,16 +1115,34 @@ async def release_stranded_recordings(session: AsyncSession) -> int:
     Demoted rather than requeued directly: the state it goes back to is the one the
     scanner would have left it in, so the ordinary queueing path picks it up and there is
     no second place that decides what work a recording needs.
+
+    A recording whose most recent job was *cancelled* is left alone. It is not stranded --
+    somebody stopped it on purpose, and `cancel` has already settled it -- and requeueing it
+    here would undo that decision on a sixty-second timer, which is the Cancel button
+    quietly not working.
     """
     active = select(ProcessingJob.recording_id).where(
         ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),
         ProcessingJob.recording_id.isnot(None),
+    )
+    newest = ProcessingJob.__table__.alias("newest")
+    later = ProcessingJob.__table__.alias("later")
+    cancelled_last = select(newest.c.recording_id).where(
+        newest.c.state == JobState.CANCELLED,
+        newest.c.recording_id.is_not(None),
+        ~select(later.c.id)
+        .where(
+            later.c.recording_id == newest.c.recording_id,
+            later.c.id > newest.c.id,
+        )
+        .exists(),
     )
     result = await session.execute(
         update(Recording)
         .where(
             Recording.state.in_([RecordingState.PROCESSING, RecordingState.QUEUED]),
             Recording.id.notin_(active),
+            Recording.id.notin_(cancelled_last),
         )
         .values(state=RecordingState.DISCOVERED)
         .execution_options(synchronize_session=False)

@@ -11,8 +11,11 @@ UPDATE runs, SQLite returns SQLITE_BUSY *immediately* rather than waiting, becau
 could deadlock. The result was a steady trickle of `OperationalError: database is locked`
 in the worker loop, each one an abandoned job.
 
-`BEGIN IMMEDIATE` takes the write lock at the start of the transaction, so contention
-becomes an ordinary wait instead of an instant failure.
+`BEGIN IMMEDIATE` was the first answer and was the wrong one: it takes the write lock at
+the start of *every* transaction, including the read-only ones every API request opens, so
+they queued behind the workers' long writes and then failed on BEGIN itself. The fix lives
+where the problem does instead -- `queue.claim_next` chooses its candidate inside the
+UPDATE, so there is no snapshot to invalidate and nothing to upgrade.
 
 A note on what these tests do and do not prove. The concurrency cases below exercise real
 parallel claims and writes, but they pass with or without the fix on a fast local disk --
@@ -22,9 +25,9 @@ either: the failing interleaving is "read, let someone else write, then write", 
 the fix in place the second writer simply *waits*, so a scripted version deadlocks by
 design rather than failing.
 
-`test_write_lock_is_taken_eagerly` is therefore the assertion that actually prevents
-regression -- it fails the moment the `begin` handler is removed. The rest are smoke tests
-that the claim stays atomic and no work is dropped.
+`TestClaimIsOneStatement` is therefore where the regression guard actually lives: one half
+asserts the claim keeps its shape, the other that nothing has re-installed a `begin`
+handler. The rest are smoke tests that the claim stays atomic and no work is dropped.
 """
 
 from __future__ import annotations
@@ -160,16 +163,24 @@ class TestClaimIsOneStatement:
         import inspect
 
         source = inspect.getsource(queue.claim_next)
-        update_at = source.find("update(ProcessingJob)")
-        assert update_at != -1, "claim_next no longer issues an UPDATE"
+        assert "update(ProcessingJob)" in source, "claim_next no longer issues an UPDATE"
 
-        # A standalone `await session.execute(select(...))` before the UPDATE is the
-        # read-then-write pattern this guards against. The subquery form embeds the
-        # select in the statement instead.
+        # The candidate is chosen *inside* the claiming statement, and the UPDATE filters
+        # on that subquery rather than on an id fetched beforehand. Those two together are
+        # the property: a read whose result is bound into a later write is the shape that
+        # takes a snapshot and then needs a lock upgrade.
         assert "scalar_subquery()" in source, (
             "claim_next should select the candidate inside the UPDATE, not beforehand"
         )
-        assert "execute(\n            select(" not in source
+        assert "ProcessingJob.id == next_queued" in source, (
+            "the UPDATE no longer filters on the embedded subquery"
+        )
+
+        # A read-only SELECT before it is fine and is deliberately there: under WAL it
+        # takes no write lock at all, and it is what stops an idle worker opening a write
+        # transaction thirty times a minute to discover the queue is still empty. Its
+        # result decides only whether to bother, never which row is claimed.
+        assert "runnable is None" in source
 
     async def test_transactions_stay_deferred(self, db_session):
         """Forcing BEGIN IMMEDIATE starves readers.

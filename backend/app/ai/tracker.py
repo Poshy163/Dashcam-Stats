@@ -183,7 +183,10 @@ class Track:
             self.best_score = score
             self.best_offset_s = offset_s
             self.best_box = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
-            self.best_crop = crop
+            # Copied here, and only here. `_crop` hands over a view into the decoded frame,
+            # and `iter_frames` builds each frame over a fresh buffer -- so retaining the
+            # view would pin a whole 1080p frame per track for the length of the recording.
+            self.best_crop = None if crop is None else np.ascontiguousarray(crop)
 
 
 class ByteTracker:
@@ -336,4 +339,8 @@ def _crop(frame: np.ndarray | None, detection: Detection2D) -> np.ndarray | None
     x1, y1, x2, y2 = detection.to_pixels(width, height)
     if x2 <= x1 or y2 <= y1:
         return None
-    return frame[y1:y2, x1:x2].copy()
+    # A view, not a copy. The caller scores it and keeps at most one per track, so
+    # copying here paid for roughly 2,400 crops a minute of footage to retain a handful.
+    # `sharpness` only reads pixels and is happy with a non-contiguous view; the copy that
+    # is genuinely needed happens in `consider_best`, on the winning branch.
+    return frame[y1:y2, x1:x2]

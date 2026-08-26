@@ -580,16 +580,16 @@ class TestEmptyWindowIsNotAHardwareFailure:
     """
 
     def test_a_clean_exit_with_no_frames_is_a_window_not_a_device(self):
-        from app.hardware.ffmpeg import DecodeError, _is_empty_window
+        from app.hardware.ffmpeg import DecodeError, is_empty_window
 
         exc = DecodeError("no frames decoded from clip.ts", stderr="", returncode=0)
-        assert _is_empty_window(exc)
+        assert is_empty_window(exc)
 
     def test_a_failed_decoder_is_still_a_device_failure(self):
-        from app.hardware.ffmpeg import DecodeError, _is_empty_window
+        from app.hardware.ffmpeg import DecodeError, is_empty_window
 
-        assert not _is_empty_window(DecodeError("no frames decoded", stderr="", returncode=1))
-        assert not _is_empty_window(
+        assert not is_empty_window(DecodeError("no frames decoded", stderr="", returncode=1))
+        assert not is_empty_window(
             DecodeError(
                 "no frames decoded",
                 stderr="Failed to initialise VAAPI connection: -1 (unknown libva error)",
@@ -985,7 +985,7 @@ class TestAProvenFileIsNotDemoted:
 
         async def decode(path, **kwargs):
             if state["fail"] and kwargs.get("hwaccel") != "cpu":
-                # Non-zero exit, so _is_empty_window deliberately does not apply.
+                # Non-zero exit, so is_empty_window deliberately does not apply.
                 raise ffmpeg_module.DecodeError(
                     "no frames decoded from clip.ts", stderr="", returncode=1
                 )

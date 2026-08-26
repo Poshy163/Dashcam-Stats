@@ -19,6 +19,7 @@ from app.core.logging import get_logger, log_context
 from app.core.settings_service import get_settings_service
 from app.damaged_policy import apply_damaged_policy
 from app.db.models import JobKind, JobState, ProcessingJob, Recording
+from app.db.retry import is_locked_error
 from app.db.session import session_scope
 from app.hardware.detect import detect_hardware
 from app.pipeline.orchestrator import RunReport, pending_stages, run_stages
@@ -90,13 +91,18 @@ class WorkerPool:
 
     def __init__(self) -> None:
         self._workers: dict[int, asyncio.Task[None]] = {}
+        #: Worker indices asked to stop after their current job, when the concurrency
+        #: setting was lowered. See :meth:`_supervise`.
+        self._retiring: set[int] = set()
+        #: Worker indices currently inside a run, so the shrink above can tell which ones
+        #: are safe to cancel outright.
+        self._busy: set[int] = set()
         self._active: dict[int, ActiveJob] = {}
         #: The in-flight run for each job, so a cancellation can interrupt it.
         self._work: dict[int, asyncio.Task] = {}
         self._running = False
         self._supervisor: asyncio.Task[None] | None = None
         self._pool_id = uuid.uuid4().hex[:8]
-        self._unsubscribe = None
 
     # -- lifecycle ---------------------------------------------------------------------
 
@@ -115,13 +121,11 @@ class WorkerPool:
             await queue.reconcile_misclassified_probe_crashes(session)
             await queue.reconcile_media_failure_hides(session)
 
+        # No settings subscription. The supervisor already reads `processing.max_workers`
+        # on every heartbeat, which is what actually resizes the pool; the subscription that
+        # used to sit here registered a callback that did nothing, behind a `hasattr` guard
+        # against a method on our own settings service.
         self._supervisor = asyncio.create_task(self._supervise(), name="worker-supervisor")
-        settings = get_settings_service()
-        self._unsubscribe = (
-            settings.subscribe(lambda _change: None, keys=("processing.max_workers",))
-            if hasattr(settings, "subscribe")
-            else None
-        )
         log.info("worker pool started", pool=self._pool_id)
 
     async def stop(self) -> None:
@@ -139,10 +143,6 @@ class WorkerPool:
                 await task
         self._workers.clear()
 
-        if callable(self._unsubscribe):
-            with contextlib.suppress(Exception):
-                self._unsubscribe()
-
         # Hand back anything still in flight so the next start picks it up immediately
         # rather than waiting for the heartbeat timeout.
         async with session_scope() as session:
@@ -159,17 +159,40 @@ class WorkerPool:
                 for index in list(self._workers):
                     if self._workers[index].done():
                         self._workers.pop(index, None)
+                        self._retiring.discard(index)
+                        self._busy.discard(index)
 
-                while len(self._workers) < desired:
+                while len(self._workers) - len(self._retiring) < desired:
+                    # Prefer un-retiring one that has not stopped yet over starting a new
+                    # task: the setting going down and straight back up is common while
+                    # somebody is tuning it.
+                    revived = next(iter(sorted(self._retiring)), None)
+                    if revived is not None:
+                        self._retiring.discard(revived)
+                        continue
                     index = next(i for i in range(desired + 1) if i not in self._workers)
                     self._workers[index] = asyncio.create_task(
                         self._worker(index), name=f"worker-{index}"
                     )
 
-                while len(self._workers) > desired:
-                    index = max(self._workers)
-                    task = self._workers.pop(index)
-                    task.cancel()
+                # Retired, not cancelled, when the worker is in the middle of something.
+                #
+                # Cancelling a busy worker unwinds through `_run_job_inner` with
+                # `active.cancelled` False, so the run re-raises rather than recording an
+                # outcome: the job row stays RUNNING with a dead heartbeat, shows as a
+                # phantom running job for the whole reclaim timeout, and is then requeued by
+                # `reclaim_stale` -- which, unlike `reclaim_interrupted`, does not refund the
+                # attempt. Lowering the worker count in the UI therefore cost a retry
+                # attempt and a full re-decode of whatever was in flight.
+                while len(self._workers) - len(self._retiring) > desired:
+                    index = max(i for i in self._workers if i not in self._retiring)
+                    task = self._workers[index]
+                    if index in self._busy:
+                        self._retiring.add(index)
+                        log.info("worker will stop after its current job", worker=index)
+                    else:
+                        self._workers.pop(index, None)
+                        task.cancel()
 
             except Exception as exc:
                 log.warning("worker supervisor error", error=str(exc))
@@ -180,9 +203,17 @@ class WorkerPool:
 
     async def _worker(self, index: int) -> None:
         worker_id = f"{self._pool_id}-{os.getpid()}-{index}"
-        while self._running:
+        while self._running and index not in self._retiring:
             try:
                 job = None
+                # Busy from the moment the claim starts, not from when it has committed.
+                #
+                # The shrink decides on this flag, and between `claim_next` flipping a row
+                # to RUNNING and this worker reaching `_run_job` there are several awaits --
+                # a `session.get`, the session's own commit. A cancellation landing in that
+                # window kills a worker that already owns a RUNNING job, which is exactly
+                # the outcome retiring was introduced to prevent.
+                self._busy.add(index)
                 async with session_scope() as session:
                     job = await queue.claim_next(session, worker_id)
                     if job is not None:
@@ -199,16 +230,22 @@ class WorkerPool:
                         filename = recording.filename if recording else f"job {job.id}"
 
                 if job is None:
+                    self._busy.discard(index)
                     await asyncio.sleep(_IDLE_SLEEP_S)
                     continue
 
-                await self._run_job(job_id, recording_id, kind, stages, filename)
+                try:
+                    await self._run_job(job_id, recording_id, kind, stages, filename)
+                finally:
+                    self._busy.discard(index)
 
             except asyncio.CancelledError:
+                self._busy.discard(index)
                 raise
             except Exception as exc:
                 # A worker must never die on an unexpected error, or the pool silently
                 # shrinks and processing stops with no visible cause.
+                self._busy.discard(index)
                 log.exception("worker loop error", worker=worker_id, error=str(exc))
                 await asyncio.sleep(_IDLE_SLEEP_S)
 
@@ -294,6 +331,28 @@ class WorkerPool:
                 if not active.cancelled:
                     raise
                 log.info("job cancelled", job_id=job_id, file=filename)
+                return
+            except Exception as exc:
+                # An exception that escapes the run has to be recorded as an outcome, not
+                # allowed to unwind past `_finish`.
+                #
+                # `run_stages` catches everything a stage raises, but it is not the only
+                # code inside `work`: `apply_damaged_policy`, the final `session.flush()`
+                # and `session_scope`'s own commit all run after the last stage and outside
+                # that guard. A lock taken at that instant used to propagate to the worker
+                # loop, which logged "worker loop error" and moved on -- leaving the row
+                # RUNNING with a dead heartbeat, a phantom running job on the Queue page
+                # for the whole reclaim timeout, and then a requeue that spends an attempt
+                # and decodes the recording again from the first frame. Which is precisely
+                # what the `_finish` retry loop exists to prevent, reached through a
+                # different door.
+                log.exception("processing run raised", job_id=job_id, file=filename)
+                await self._finish(
+                    job_id,
+                    active,
+                    fail=f"{type(exc).__name__}: {exc}",
+                    transient=is_locked_error(exc),
+                )
                 return
 
             if report is None:
@@ -412,6 +471,7 @@ class WorkerPool:
         report=None,
         fail: str | None = None,
         permanent: bool = False,
+        transient: bool = False,
         note: str | None = None,
     ) -> None:
         """Record how a job ended, in a session of its own, retrying if the write fails.
@@ -435,7 +495,9 @@ class WorkerPool:
                         log.info("job was cancelled; not recording its outcome", job_id=job_id)
                         return
                     if fail is not None:
-                        await queue.fail(session, job, fail, permanent=permanent)
+                        await queue.fail(
+                            session, job, fail, permanent=permanent, transient=transient
+                        )
                     elif report is not None and not report.ok:
                         await queue.fail(
                             session,

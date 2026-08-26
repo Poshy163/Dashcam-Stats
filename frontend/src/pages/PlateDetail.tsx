@@ -15,8 +15,11 @@ import {
 } from '@/components/ui'
 import { api, mediaUrl } from '@/lib/api'
 import { formatCoords, formatDateTime } from '@/lib/format'
+import { invalidateAnalysisQueries } from '@/lib/queryInvalidation'
+import { useMapSettings } from '@/lib/useMapSettings'
 
 export default function PlateDetail() {
+  const maps = useMapSettings()
   const { id } = useParams()
   const plateId = Number(id)
   const client = useQueryClient()
@@ -46,6 +49,10 @@ export default function PlateDetail() {
     mutationFn: () => api.plates.correct(plateId, correctedText),
     onSuccess: (updated) => {
       client.invalidateQueries({ queryKey: ['plates'] })
+      // The sightings below carry the plate's text too. When a correction does not change
+      // the plate id there is no navigation to remount them, so without this the list kept
+      // showing the pre-correction rows.
+      client.invalidateQueries({ queryKey: ['plate-observations', plateId] })
       navigate(`/plates/${updated.id}`, { replace: updated.id !== plateId })
       client.setQueryData(['plate', updated.id], updated)
     },
@@ -53,7 +60,10 @@ export default function PlateDetail() {
   const merge = useMutation({
     mutationFn: () => api.plates.merge(plateId, Number(mergeTarget)),
     onSuccess: (updated) => {
-      client.invalidateQueries({ queryKey: ['plates'] })
+      // A merge moves observations between plates and deletes one of them, so the absorbed
+      // plate's own detail and sightings queries are stale rather than merely out of date —
+      // pressing Back re-rendered a plate that no longer exists straight from cache.
+      void invalidateAnalysisQueries(client)
       navigate(`/plates/${updated.id}`, { replace: true })
     },
   })
@@ -117,7 +127,7 @@ export default function PlateDetail() {
       </div>
 
       {markers.length > 0 ? (
-        <RouteMap markers={markers} className="h-80 w-full" />
+        <RouteMap markers={markers} className="h-80 w-full" {...maps} />
       ) : (
         <EmptyState
           title="No mapped sightings"

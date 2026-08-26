@@ -18,8 +18,8 @@ from __future__ import annotations
 import json
 
 from app.core.logging import get_logger
-from app.core.settings_service import get_settings_service
 from app.ingest.models import DeltaPlan, RunResult
+from app.ingest.models import ingest_setting as _get
 from app.ingest.status import get_status
 
 log = get_logger(__name__)
@@ -31,13 +31,6 @@ _MQTT_SENSORS = (
     ("dashcam_backup_remaining", "Dashcam Files Remaining", "files_remaining", None, None),
     ("dashcam_backup_backlog", "Dashcam Backlog", "backlog_gb", "GB", "data_size"),
 )
-
-
-def _get(key: str, default=None):
-    try:
-        return get_settings_service().get_nowait(f"ingest.{key}")
-    except Exception:
-        return default
 
 
 def _payload(event: str, plan: DeltaPlan | None, result: RunResult | None) -> dict[str, object]:

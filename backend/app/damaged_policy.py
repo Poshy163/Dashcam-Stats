@@ -15,7 +15,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
-from app.core.paths import PathTraversalError, safe_join
+from app.core.paths import PathTraversalError, forget_tree_measurements, safe_join
 from app.core.settings_service import get_settings_service
 from app.db.models import Recording, RecordingState
 from app.retention.safety import SafetyReport, evaluate_safety
@@ -179,6 +179,10 @@ async def apply_damaged_policy(
             error=str(exc),
         )
         return "blocked"
+
+    # The share is not what it was measured to be a moment ago. Retention's own delete
+    # path does this too; this is the other place footage leaves the tree.
+    forget_tree_measurements()
 
     probe = _probe(recording)
     policy = _remember_original_state(recording, probe)

@@ -29,7 +29,7 @@ from app.osd.glyphs import (
 )
 from app.osd.locate import FixSample, FixTrack, Located
 from app.osd.parser import OsdReading, enforce_monotonic, parse_osd_text
-from app.osd.region import DEFAULT_REGION, OsdRegion, calibrate
+from app.osd.region import DEFAULT_REGION, OsdRegion
 from app.osd.validate import clock_is_plausible, coordinate_problem, is_valid_coordinate
 
 __all__ = [
@@ -46,7 +46,6 @@ __all__ = [
     "TemplateLearner",
     "bearing_deg",
     "binarise",
-    "calibrate",
     "clock_is_plausible",
     "coordinate_problem",
     "decode_line",

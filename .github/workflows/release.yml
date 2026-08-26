@@ -15,7 +15,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The tests, run as part of this workflow rather than beside it.
+  #
+  # `needs: ci` below waits for every job in ci.yml, so a red build cannot publish. Calling
+  # it keeps `github.ref` pointing at the branch or tag being released, which is what makes
+  # the tag derivation below correct — and it means a fork's pull request can never reach
+  # this workflow at all.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   publish:
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
       contents: read

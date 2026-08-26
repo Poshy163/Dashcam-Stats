@@ -18,7 +18,6 @@ Rounding is honest about the source data. The overlay prints four decimal places
 
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime
 from typing import Annotated
 
@@ -63,6 +62,11 @@ DEFAULT_SIMPLIFY_M = 15.0
 #: drawing than the map is worth, so the response says it was cut rather than quietly
 #: handing back a partial road network that looks complete.
 MAX_ROUTE_POINTS = 250_000
+
+#: Rows fetched per round trip while streaming the route query. Large enough that the
+#: per-batch overhead is invisible, small enough that the buffer stays a rounding error
+#: next to the journey being assembled.
+_ROUTE_FETCH_BATCH = 2_000
 
 
 def _drawable_quality():
@@ -273,34 +277,67 @@ async def routes(
     if journey_id is not None:
         stmt = stmt.where(TelemetryPoint.journey_id == journey_id)
 
-    # Grouped in Python rather than by a query per journey: one ordered pass over the
-    # fixes costs a single round trip, where a query per journey is 45 of them on this
-    # library and grows with every drive taken.
-    by_journey: dict[int | None, list[tuple[float, float, float | None]]] = defaultdict(list)
-    breaks_by_journey: dict[int | None, list[bool]] = defaultdict(list)
-    for row in (await session.execute(stmt)).all():
-        seconds = row.captured_at.timestamp() if row.captured_at is not None else None
-        by_journey[row.journey_id].append((float(row.lat), float(row.lon), seconds))
-        breaks_by_journey[row.journey_id].append(bool(row.breaks_segment))
-
+    # Streamed one journey at a time, not collected and then capped.
+    #
+    # The rows are ordered by journey, so a journey's fixes arrive contiguously and can be
+    # simplified the moment the next one starts. That is what makes the cap below actually
+    # bound anything: `max_points` used to be applied *after* every drawable fix in the
+    # library had already been materialised in Python, so on a mature library opening the
+    # Heatmap page allocated hundreds of megabytes -- in a process that is also holding an
+    # OpenVINO graph and an ffmpeg decode buffer -- before discarding all but a fraction.
+    # Only one drive is ever resident now, and the read stops as soon as the cap is hit.
     lines: list[list[list[float]]] = []
     points_sent = 0
     truncated = False
-    for journey, fixes in by_journey.items():
-        for segment in build_polylines(
-            fixes, tolerance_m=simplify_m, breaks=breaks_by_journey[journey]
-        ):
+    journeys = 0
+
+    fixes: list[tuple[float, float, float | None]] = []
+    breaks: list[bool] = []
+
+    def emit() -> bool:
+        """Simplify the buffered journey into ``lines``. True when the cap was reached."""
+        nonlocal points_sent, truncated, journeys
+        journeys += 1
+        for segment in build_polylines(fixes, tolerance_m=simplify_m, breaks=breaks):
             if points_sent + len(segment) > max_points:
                 truncated = True
-                break
+                return True
             lines.append([[round(lat, 4), round(lon, 4)] for lat, lon in segment])
             points_sent += len(segment)
-        if truncated:
-            break
+        return False
+
+    current: int | None = None
+    started = False
+    previous_recording: int | None = None
+    result = await session.stream(stmt.execution_options(yield_per=_ROUTE_FETCH_BATCH))
+    try:
+        async for row in result:
+            if started and row.journey_id != current:
+                if emit():
+                    break
+                fixes = []
+                breaks = []
+            current = row.journey_id
+            started = True
+            seconds = row.captured_at.timestamp() if row.captured_at is not None else None
+            fixes.append((float(row.lat), float(row.lon), seconds))
+            # The stored flag is set on the first drawable fix of *every* recording, because
+            # the per-clip walk that sets it has no anchor yet at that point. Across a
+            # journey it would mean a break at every clip boundary -- which is not what the
+            # journey-detail view draws, and the two must agree. `single_track` applies the
+            # same suppression for that view.
+            clip_start = previous_recording is not None and previous_recording != row.recording_id
+            previous_recording = row.recording_id
+            breaks.append(bool(row.breaks_segment) and not clip_start)
+        else:
+            if started:
+                emit()
+    finally:
+        await result.close()
 
     return RoutesOut(
         lines=lines,
-        journeys=len(by_journey),
+        journeys=journeys,
         segments=len(lines),
         points=points_sent,
         simplify_m=simplify_m,

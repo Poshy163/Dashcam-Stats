@@ -29,15 +29,18 @@ export default defineConfig({
     outDir: 'dist',
     sourcemap: false,
     chunkSizeWarningLimit: 900,
-    rollupOptions: {
-      output: {
-        // Leaflet and the charting library are large and change rarely; splitting them
-        // out keeps the app chunk small across redeploys.
-        manualChunks: {
-          map: ['leaflet', 'react-leaflet'],
-          charts: ['recharts'],
-        },
-      },
-    },
+    // No `manualChunks`, deliberately.
+    //
+    // Naming `['leaflet', 'react-leaflet']` as a chunk looked like it would keep the map
+    // out of the app bundle, and did the opposite. `react-leaflet` imports React, so React
+    // was pulled into that chunk with it; the entry then has to import the chunk to get
+    // React, so `index.html` emitted a `modulepreload` for it and every visitor downloaded
+    // ~91 kB gzip of Leaflet before first paint whether or not they ever opened a map. The
+    // route-level `React.lazy` split in App.tsx was defeated for the single largest
+    // dependency in the app, and recharts was dragged in behind React too -- its "own"
+    // chunk built out at 400 bytes.
+    //
+    // Vite's default splitting already gives every lazily-imported route its own chunk and
+    // hoists genuinely shared code, which is what was wanted in the first place.
   },
 })

@@ -8,6 +8,7 @@ that actually lives.
 
 from __future__ import annotations
 
+import asyncio
 import mimetypes
 import re
 
@@ -103,8 +104,12 @@ async def stream_recording(
     if recording.file_missing:
         raise HTTPException(status.HTTP_410_GONE, "This recording is no longer on disk")
 
+    # Both the resolution and the stat below can enter a hard network mount, so neither runs
+    # on the event loop. Everything else in the process -- /health, the SPA, the queue polls,
+    # the workers' heartbeats -- is behind whichever of them the storage server is slowest
+    # to answer.
     try:
-        path = resolve_footage_path(recording.rel_path, must_exist=True)
+        path = await asyncio.to_thread(resolve_footage_path, recording.rel_path, must_exist=True)
     except PathTraversalError:
         log.error("stored recording path failed validation", recording_id=recording_id)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid recording path") from None
@@ -116,7 +121,7 @@ async def stream_recording(
     playable = await ensure_playable(path, recording_id)
     path = playable.path
 
-    size = path.stat().st_size
+    size = (await asyncio.to_thread(path.stat)).st_size
     media_type = playable.media_type
     base_headers = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"}
 
@@ -134,15 +139,25 @@ async def stream_recording(
     length = end - start + 1
 
     async def body():
-        with path.open("rb") as fh:
-            fh.seek(start)
+        # Read in a worker thread, one chunk at a time.
+        #
+        # ``FileResponse`` (the no-range branch above) already does this through anyio; this
+        # branch is hand-rolled and did not, so every seek in the player -- and a browser
+        # asking for ``bytes=0-``, which is most of them -- pulled the whole clip through
+        # the event loop a megabyte at a time. On the NFS mount this design assumes, one
+        # slow read stalls the entire process.
+        fh = await asyncio.to_thread(path.open, "rb")
+        try:
+            await asyncio.to_thread(fh.seek, start)
             remaining = length
             while remaining > 0:
-                chunk = fh.read(min(_CHUNK, remaining))
+                chunk = await asyncio.to_thread(fh.read, min(_CHUNK, remaining))
                 if not chunk:
                     break
                 remaining -= len(chunk)
                 yield chunk
+        finally:
+            await asyncio.to_thread(fh.close)
 
     return StreamingResponse(
         body(),
@@ -173,7 +188,9 @@ async def export_recording(
     if recording.duration_s is not None and start >= recording.duration_s:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Start is outside the recording")
     try:
-        source = resolve_footage_path(recording.rel_path, must_exist=True)
+        # Off the loop, like its sibling in `stream_recording`: this is the call that
+        # enters the network mount.
+        source = await asyncio.to_thread(resolve_footage_path, recording.rel_path, must_exist=True)
         clip = await ensure_export_clip(source, recording.id, start_s=start, end_s=end)
     except (PathTraversalError, FileNotFoundError):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording file not found") from None

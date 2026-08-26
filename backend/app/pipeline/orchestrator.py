@@ -223,6 +223,24 @@ async def invalidate_recordings(
     return selected
 
 
+#: Keys a stage writes as evidence *for* the failure it is about to raise, rather than as
+#: part of the work it was doing. See :func:`_revive`.
+_PROBE_EVIDENCE_KEYS = ("probe_failure",)
+
+
+def recording_probe_evidence(session: AsyncSession, recording_id: int) -> dict[str, object]:
+    """Read the failure evidence off the identity-mapped recording, before any rollback.
+
+    Returns an empty dict when there is nothing to carry, which is the ordinary case: only
+    a conclusive probe rejection writes one of these.
+    """
+    recording = session.identity_map.get(session.identity_key(Recording, recording_id), None)
+    probe = getattr(recording, "probe_json", None)
+    if not isinstance(probe, dict):
+        return {}
+    return {key: probe[key] for key in _PROBE_EVIDENCE_KEYS if key in probe}
+
+
 async def _revive(session: AsyncSession, recording_id: int) -> Recording | None:
     """Get the session back into a state where the failure can actually be recorded.
 
@@ -245,13 +263,29 @@ async def _revive(session: AsyncSession, recording_id: int) -> Recording | None:
     greenlet and raises ``MissingGreenlet``: the failure handler would then fail in a third
     way, on the line meant to repair the first two.
 
-    Unconditional, because it costs nothing: every stage that succeeded has already
-    committed, so there is never uncommitted work here worth keeping -- only the failed
-    stage's half-written attempt, which is exactly what should go.
+    Not quite unconditional, and the exception is deliberate. "The failed stage's
+    half-written attempt is exactly what should go" is true of everything a stage was
+    part-way through -- and false of the evidence a stage writes *because* it is about to
+    fail. ``stage_inspect`` records ``probe_json["probe_failure"]`` with the return code and
+    stderr of a conclusive ffprobe rejection and then raises in the same breath, with no
+    query in between, so the assignment is still unflushed when this runs. The rollback
+    discarded it, and ``queue.reconcile_misclassified_probe_crashes`` -- the only reader --
+    then could not tell a demuxer's verdict about the bytes from an ffprobe killed by
+    SIGABRT, which is the difference between leaving a file condemned and resurrecting it.
+
+    So the durable half is carried across the rollback by value. It is a plain dict of
+    strings and ints read before the rollback expires the instance, which is what makes it
+    safe to touch afterwards.
     """
+    carried = recording_probe_evidence(session, recording_id)
     try:
         await session.rollback()
-        return await session.get(Recording, recording_id)
+        recording = await session.get(Recording, recording_id)
+        if recording is not None and carried:
+            probe = dict(recording.probe_json) if isinstance(recording.probe_json, dict) else {}
+            probe.update(carried)
+            recording.probe_json = probe
+        return recording
     except Exception as exc:  # pragma: no cover - defensive
         log.warning("could not reset the session after a stage failure", error=str(exc))
         return None
@@ -325,9 +359,16 @@ async def run_stages(
                 result.stats = {}
             result.stats["elapsed_s"] = elapsed
             report.stages.append(result)
-            if attr:
+            if attr and not result.retryable:
                 # The stage itself owns DONE/SKIPPED; the revision says which code wrote
                 # the stored result and is committed atomically with that state.
+                #
+                # Not stamped when the stage skipped itself because a resource was missing
+                # rather than because the operator switched it off. A revision means "this
+                # is what the current pipeline produced for this recording", and a stage
+                # that never ran produced nothing -- claiming otherwise is what let a whole
+                # queue drain, with a model that had failed to compile, into a library
+                # marked analysed and invisible to "reprocess outdated".
                 setattr(recording, REVISION_FIELDS[name], CURRENT_REVISIONS[name])
             if stage_complete:
                 stage_complete(result)
