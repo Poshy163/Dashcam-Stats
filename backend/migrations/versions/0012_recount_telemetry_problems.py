@@ -51,17 +51,36 @@ _NOISE_LIKE = "selected best fields from % candidate frames"
 
 #: The rule from ``quality_rollup``, in SQL: a sample is a problem when it holds a problem
 #: string that is not the noise above, or when its OCR outright failed.
+#:
+#: Both guards on the way in are load-bearing, and neither is hypothetical -- each was
+#: reproduced against SQLite before this migration was allowed near a real library:
+#:
+#: * ``json_valid`` -- ``json_extract`` raises "malformed JSON" rather than returning NULL
+#:   when the column holds an empty string or anything that is not JSON. A NULL column is
+#:   fine, but an empty string is not, and the difference is invisible until it happens.
+#: * ``json_type(...) = 'array'`` -- ``json_each`` over a scalar raises the same way, so a
+#:   ``problems`` key holding a bare string would take the whole statement down. It also
+#:   keeps this in step with ``real_problems``, which returns nothing for a non-list.
+#:
+#: An unreadable sample counts as no problem rather than as a problem: this recount exists
+#: to stop the page inventing faults, and it should not invent a different one on the way.
+#: A migration that raises leaves the container unable to start, which is a far worse
+#: failure than a counter that stays as it was.
 _RECOUNT = f"""
 UPDATE recordings
    SET telemetry_problem_count = (
        SELECT COUNT(*)
          FROM telemetry_points tp
         WHERE tp.recording_id = recordings.id
+          AND json_valid(tp.quality_json)
           AND (
-              EXISTS (
-                  SELECT 1
-                    FROM json_each(json_extract(tp.quality_json, '$.problems')) je
-                   WHERE je.value NOT LIKE '{_NOISE_LIKE}'
+              (
+                  json_type(tp.quality_json, '$.problems') = 'array'
+                  AND EXISTS (
+                      SELECT 1
+                        FROM json_each(tp.quality_json, '$.problems') je
+                       WHERE je.value NOT LIKE '{_NOISE_LIKE}'
+                  )
               )
               OR json_extract(tp.quality_json, '$.ocr_status') IN ('failed', 'rejected')
           )
@@ -95,6 +114,8 @@ def _recount_in_python(bind: sa.engine.Connection) -> None:
             try:
                 quality = json.loads(raw) if isinstance(raw, str) else raw
             except (TypeError, ValueError):
+                # Unreadable, so nothing can be asserted about it. Skipped rather than
+                # counted, for the same reason the SQL above skips it.
                 continue
             if not isinstance(quality, dict):
                 continue

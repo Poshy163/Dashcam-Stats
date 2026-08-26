@@ -480,3 +480,87 @@ class TestTheProblemRecount:
         ]
         _gaps, _longest, problems, *_rest = quality_rollup(rows)
         assert problems == 2, "the rollup still counts the candidate-count noise"
+
+    async def test_the_recount_survives_the_json_a_real_library_actually_holds(self, migrated):
+        """A migration that raises leaves the container unable to start.
+
+        `json_extract` does not return NULL for a column that is not JSON -- it raises
+        "malformed JSON" -- and `json_each` raises the same way over a scalar. A NULL
+        column is fine; an empty string is not, and the difference is invisible until a
+        real library hits it. Every shape here was reproduced against SQLite first.
+        """
+        import asyncio
+        from datetime import UTC, datetime
+
+        from alembic import command
+        from sqlalchemy import text
+
+        from app.db.session import alembic_config
+
+        noise = "selected best fields from 2 candidate frames"
+        # (filename, raw quality_json text per sample, expected recount)
+        cases = [
+            ("null.ts", [None], 0),
+            ("empty.ts", [""], 0),
+            ("garbage.ts", ["not json at all"], 0),
+            ("nokey.ts", ["{}"], 0),
+            ("nullkey.ts", ['{"problems": null}'], 0),
+            ("scalar.ts", ['{"problems": "not a list"}'], 0),
+            ("noise.ts", [json.dumps({"problems": [noise]})], 0),
+            ("real.ts", [json.dumps({"problems": ["overlay unreadable"]})], 1),
+            ("ocr.ts", ['{"problems": [], "ocr_status": "failed"}'], 1),
+            ("mixed.ts", [json.dumps({"problems": [noise, "overlay unreadable"]}), None], 1),
+        ]
+
+        await dispose_engine()
+        config = alembic_config()
+        await asyncio.to_thread(command.downgrade, config, "0011")
+
+        async with session_scope() as session:
+            for name, samples, _ in cases:
+                await session.execute(
+                    text(
+                        "INSERT INTO recordings (rel_path, filename, size_bytes, mtime_ns, "
+                        "state, error_count, metadata_state, telemetry_state, "
+                        "detection_state, plate_state, has_gps, ignored, protected, "
+                        "file_missing, time_from_osd, has_audio, vehicle_count, plate_count, "
+                        "telemetry_point_count, gps_point_count, gps_gap_count, "
+                        "gps_longest_gap_s, gps_recovered_count, gps_no_fix_count, "
+                        "gps_ocr_gap_count, gps_rejected_count, telemetry_problem_count, "
+                        "first_seen_at) "
+                        "VALUES (:p, :p, 100, 1, 'COMPLETED', 0, 'DONE', 'DONE', "
+                        "'DONE', 'DONE', 1, 0, 0, 0, 0, 0, 0, 0, :n, :n, 0, 0.0, 0, 0, "
+                        "0, 0, :n, :t)"
+                    ),
+                    {"p": name, "n": len(samples), "t": datetime.now(UTC)},
+                )
+                rid = (
+                    await session.execute(
+                        text("SELECT id FROM recordings WHERE rel_path = :p"), {"p": name}
+                    )
+                ).scalar_one()
+                for offset, raw in enumerate(samples):
+                    await session.execute(
+                        text(
+                            "INSERT INTO telemetry_points (recording_id, t_offset_s, has_fix, "
+                            "quality_json) VALUES (:rid, :o, 1, :q)"
+                        ),
+                        {"rid": rid, "o": float(offset), "q": raw},
+                    )
+            await session.commit()
+
+        await dispose_engine()
+        # The assertion is partly that this does not raise at all.
+        await asyncio.to_thread(command.upgrade, config, "head")
+
+        async with session_scope() as session:
+            counted = dict(
+                (
+                    await session.execute(
+                        text("SELECT rel_path, telemetry_problem_count FROM recordings")
+                    )
+                ).all()
+            )
+
+        for name, _samples, expected in cases:
+            assert counted[name] == expected, f"{name}: got {counted[name]}, expected {expected}"
