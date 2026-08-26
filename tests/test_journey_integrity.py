@@ -302,3 +302,48 @@ class TestTheClipStartSentinelDoesNotCrossRecordings:
         track = single_track(rows, {1: None}, front_ids={1})
 
         assert [p.breaks_segment for p in track] == [True, False, True]
+
+
+class TestTheTilesCountWhatThePageShows:
+    """A journey must not count a member it then declines to list.
+
+    ``get_journey`` selects members on ``ignored is False`` as well as the revisions;
+    ``refresh`` selected on the revisions alone. So a journey holding a hidden recording
+    reported one more member than it displayed, and every tile derived from that list --
+    the count, the distance, the vehicle and plate totals -- was measured over a recording
+    the page refuses to show. Hiding damaged footage is routine here (``damaged_policy``
+    does it after every scan), which is what made the two disagree in ordinary use rather
+    than in some corner.
+    """
+
+    async def test_a_hidden_recording_is_not_counted_as_a_member(self, db_session, cameras):
+        await drive(db_session, cameras, clips=4)
+        await JourneyBuilder().rebuild(db_session)
+        journey = (await db_session.execute(select(Journey))).scalars().first()
+        before = journey.recording_count
+        assert before > 1
+
+        # What `damaged_policy._hide` does to a clip it finds unusable.
+        member = (
+            await db_session.execute(
+                select(Recording).where(Recording.journey_id == journey.id).limit(1)
+            )
+        ).scalar_one()
+        member.ignored = True
+        await db_session.flush()
+
+        await JourneyBuilder().refresh(db_session, journey)
+        await db_session.flush()
+
+        listed = (
+            await db_session.execute(
+                select(func.count(Recording.id)).where(
+                    Recording.journey_id == journey.id,
+                    Recording.ignored.is_(False),
+                )
+            )
+        ).scalar()
+        assert journey.recording_count == listed, (
+            f"journey counts {journey.recording_count} members but its page lists {listed}"
+        )
+        assert journey.recording_count == before - 1

@@ -564,3 +564,142 @@ class TestTheProblemRecount:
 
         for name, _samples, expected in cases:
             assert counted[name] == expected, f"{name}: got {counted[name]}, expected {expected}"
+
+
+class TestTheJourneyRollupRecount:
+    """0013, against the real chain.
+
+    Two derived values on `journeys` were measured against rows their own page excludes:
+    a distance walked straight through the breaks the route layer declines to draw, and a
+    member count taken without the `ignored` test `get_journey` has always applied. Both
+    are re-derived from stored rows; neither needs a frame decoded.
+    """
+
+    async def test_a_hidden_member_stops_being_counted(self, migrated):
+        import asyncio
+        from datetime import UTC, datetime, timedelta
+
+        from alembic import command
+        from sqlalchemy import text
+
+        from app.db.session import alembic_config
+
+        await dispose_engine()
+        config = alembic_config()
+        await asyncio.to_thread(command.downgrade, config, "0012")
+
+        base = datetime(2026, 8, 4, 17, 43, tzinfo=UTC)
+        async with session_scope() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO journeys (started_at, ended_at, duration_s, recording_count, "
+                    "has_gps, distance_m, manual, vehicle_count, unique_plate_count, created_at, updated_at) "
+                    "VALUES (:s, :e, 120.0, 3, 1, 5000.0, 0, 0, 0, :s, :s)"
+                ),
+                {"s": base, "e": base + timedelta(minutes=2)},
+            )
+            jid = (await session.execute(text("SELECT id FROM journeys"))).scalar_one()
+            # one visible, one hidden, one invalidated — the count must end up 1
+            for name, ignored, rev in (
+                ("visible.ts", 0, None),
+                ("hidden.ts", 1, None),
+                ("reanalysing.ts", 0, "invalidated"),
+            ):
+                await session.execute(
+                    text(
+                        "INSERT INTO recordings (rel_path, filename, size_bytes, mtime_ns, "
+                        "state, error_count, metadata_state, telemetry_state, detection_state, "
+                        "plate_state, telemetry_revision, has_gps, ignored, protected, "
+                        "file_missing, time_from_osd, has_audio, vehicle_count, plate_count, "
+                        "telemetry_point_count, gps_point_count, gps_gap_count, "
+                        "gps_longest_gap_s, gps_recovered_count, gps_no_fix_count, "
+                        "gps_ocr_gap_count, gps_rejected_count, telemetry_problem_count, "
+                        "journey_id, first_seen_at) "
+                        "VALUES (:p, :p, 1, 1, 'COMPLETED', 0, 'DONE', 'DONE', 'DONE', 'DONE', "
+                        ":rev, 1, :ig, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0, 0, 0, 0, 0, :j, :t)"
+                    ),
+                    {"p": name, "ig": ignored, "rev": rev, "j": jid, "t": base},
+                )
+            await session.commit()
+
+        await dispose_engine()
+        await asyncio.to_thread(command.upgrade, config, "head")
+
+        async with session_scope() as session:
+            count = (
+                await session.execute(text("SELECT recording_count FROM journeys"))
+            ).scalar_one()
+        assert count == 1, f"hidden and reanalysing members were counted; got {count}"
+
+    async def test_a_journey_holding_a_break_is_handed_back_for_remeasurement(self, migrated):
+        """Cleared, not recomputed here: the breaks-aware walk is Python.
+
+        `repair_stale` already looks for exactly this shape — `has_gps` with no distance is
+        a state no correctly refreshed journey can be in — so clearing it is what routes the
+        journey back through `refresh` without duplicating the walk in SQL.
+        """
+        import asyncio
+        from datetime import UTC, datetime, timedelta
+
+        from alembic import command
+        from sqlalchemy import text
+
+        from app.db.session import alembic_config
+
+        await dispose_engine()
+        config = alembic_config()
+        await asyncio.to_thread(command.downgrade, config, "0012")
+
+        base = datetime(2026, 8, 4, 17, 43, tzinfo=UTC)
+        async with session_scope() as session:
+            for breaks in (1, 0):
+                await session.execute(
+                    text(
+                        "INSERT INTO journeys (started_at, ended_at, duration_s, "
+                        "recording_count, has_gps, distance_m, manual, vehicle_count, "
+                        "unique_plate_count, created_at, updated_at) "
+                        "VALUES (:s, :e, 120.0, 1, 1, 5000.0, 0, 0, 0, :s, :s)"
+                    ),
+                    {"s": base, "e": base + timedelta(minutes=2)},
+                )
+                jid = (await session.execute(text("SELECT MAX(id) FROM journeys"))).scalar_one()
+                await session.execute(
+                    text(
+                        "INSERT INTO recordings (rel_path, filename, size_bytes, mtime_ns, "
+                        "state, error_count, metadata_state, telemetry_state, detection_state, "
+                        "plate_state, has_gps, ignored, protected, file_missing, time_from_osd, "
+                        "has_audio, vehicle_count, plate_count, telemetry_point_count, "
+                        "gps_point_count, gps_gap_count, gps_longest_gap_s, gps_recovered_count, "
+                        "gps_no_fix_count, gps_ocr_gap_count, gps_rejected_count, "
+                        "telemetry_problem_count, journey_id, first_seen_at) "
+                        "VALUES (:p, :p, 1, 1, 'COMPLETED', 0, 'DONE', 'DONE', 'DONE', 'DONE', "
+                        "1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0.0, 0, 0, 0, 0, 0, :j, :t)"
+                    ),
+                    {"p": f"j{jid}.ts", "j": jid, "t": base},
+                )
+                rid = (
+                    await session.execute(
+                        text("SELECT id FROM recordings WHERE rel_path = :p"),
+                        {"p": f"j{jid}.ts"},
+                    )
+                ).scalar_one()
+                await session.execute(
+                    text(
+                        "INSERT INTO telemetry_points (recording_id, t_offset_s, has_fix, "
+                        "lat, lon, breaks_segment) "
+                        "VALUES (:r, 0.0, 1, -34.8, 138.6, :b)"
+                    ),
+                    {"r": rid, "b": breaks},
+                )
+            await session.commit()
+
+        await dispose_engine()
+        await asyncio.to_thread(command.upgrade, config, "head")
+
+        async with session_scope() as session:
+            rows = (
+                await session.execute(text("SELECT id, distance_m FROM journeys ORDER BY id"))
+            ).all()
+        with_break, without = rows
+        assert with_break[1] is None, "the journey holding a break kept its stale distance"
+        assert without[1] == 5000.0, "a journey with no break was needlessly cleared"

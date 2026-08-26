@@ -667,6 +667,16 @@ class JourneyBuilder:
                     select(Recording)
                     .where(
                         Recording.journey_id == journey.id,
+                        # The same members the journey's own page lists. `get_journey`
+                        # selects on `ignored is False` as well as the revisions
+                        # (api/routes/content.py, via `visible_revision`), and this query
+                        # did not -- so a journey holding a hidden recording counted a
+                        # member it then declined to show, and every tile derived from
+                        # this list said so: the count, the distance, the vehicle and
+                        # plate totals. Hiding damaged footage is routine here, which is
+                        # what made the two disagree in ordinary use rather than in some
+                        # corner.
+                        Recording.ignored.is_(False),
                         _journey_ready_recording(),
                     )
                     .order_by(Recording.started_at.asc())
