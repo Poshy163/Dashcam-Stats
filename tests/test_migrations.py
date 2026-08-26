@@ -7,6 +7,8 @@ declares rather than assumed to agree.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import inspect, select
 
@@ -371,3 +373,110 @@ class TestSchemaGuarantees:
                 assert "BLOB" not in str(column.type).upper(), (
                     f"{table.name}.{column.name} would store binary data in the database"
                 )
+
+
+class TestTheProblemRecount:
+    """0012, against the real chain: a clean recording must stop calling itself degraded.
+
+    The extractor used to record a "problem" on every sample assembled from more than one
+    candidate frame, which is every cleanly parsed sample. `quality_rollup` counted it, so
+    `telemetry_problem_count` equalled the point count on healthy recordings and the
+    Telemetry Health page put an entire library into "degraded" -- 1,976 of 2,057 on the
+    library this was found on, every one of them holding a fix on every sample.
+
+    The extractor no longer writes it, which does nothing for rows already stored. This
+    migration counts them again from the per-sample strings still in `quality_json`, so no
+    video is read. Asserted here because a recount that matches nothing passes as quietly
+    as one that works.
+    """
+
+    async def test_the_noise_is_recounted_and_real_faults_are_kept(self, migrated):
+        import asyncio
+        from datetime import UTC, datetime
+
+        from alembic import command
+        from sqlalchemy import text
+
+        from app.db.session import alembic_config
+
+        noise = "selected best fields from 2 candidate frames"
+        # (filename, per-sample quality, stale stored count, what the recount must produce)
+        cases = [
+            ("clean.ts", [{"problems": [noise]}] * 4, 4, 0),
+            (
+                "mixed.ts",
+                [{"problems": [noise]}, {"problems": [noise, "overlay unreadable"]}],
+                2,
+                1,
+            ),
+            ("faulty.ts", [{"problems": ["overlay unreadable"]}] * 3, 3, 3),
+            ("ocr.ts", [{"problems": [], "ocr_status": "failed"}], 1, 1),
+            ("untouched.ts", [], 0, 0),
+        ]
+
+        await dispose_engine()
+        config = alembic_config()
+        await asyncio.to_thread(command.downgrade, config, "0011")
+
+        async with session_scope() as session:
+            for name, samples, stale, _ in cases:
+                await session.execute(
+                    text(
+                        "INSERT INTO recordings (rel_path, filename, size_bytes, mtime_ns, "
+                        "state, error_count, metadata_state, telemetry_state, "
+                        "detection_state, plate_state, has_gps, ignored, protected, "
+                        "file_missing, time_from_osd, has_audio, vehicle_count, plate_count, "
+                        "telemetry_point_count, gps_point_count, gps_gap_count, "
+                        "gps_longest_gap_s, gps_recovered_count, gps_no_fix_count, "
+                        "gps_ocr_gap_count, gps_rejected_count, telemetry_problem_count, "
+                        "first_seen_at) "
+                        "VALUES (:p, :p, 100, 1, 'COMPLETED', 0, 'DONE', 'DONE', "
+                        "'DONE', 'DONE', 1, 0, 0, 0, 0, 0, 0, 0, :n, :n, 0, 0.0, 0, 0, "
+                        "0, 0, :stale, :t)"
+                    ),
+                    {"p": name, "n": len(samples), "stale": stale, "t": datetime.now(UTC)},
+                )
+                rid = (
+                    await session.execute(
+                        text("SELECT id FROM recordings WHERE rel_path = :p"), {"p": name}
+                    )
+                ).scalar_one()
+                for offset, quality in enumerate(samples):
+                    await session.execute(
+                        text(
+                            "INSERT INTO telemetry_points (recording_id, t_offset_s, has_fix, "
+                            "quality_json) VALUES (:rid, :o, 1, :q)"
+                        ),
+                        {"rid": rid, "o": float(offset), "q": json.dumps(quality)},
+                    )
+            await session.commit()
+
+        await dispose_engine()
+        await asyncio.to_thread(command.upgrade, config, "head")
+
+        async with session_scope() as session:
+            counted = dict(
+                (
+                    await session.execute(
+                        text("SELECT rel_path, telemetry_problem_count FROM recordings")
+                    )
+                ).all()
+            )
+
+        for name, _samples, stale, expected in cases:
+            assert counted[name] == expected, (
+                f"{name}: stored {stale}, recount produced {counted[name]}, expected {expected}"
+            )
+
+    async def test_a_recount_agrees_with_a_rollup_over_the_same_rows(self, migrated):
+        """The migration and `quality_rollup` must not drift; they answer one question."""
+        from app.pipeline.telemetry_quality import quality_rollup
+
+        noise = "selected best fields from 2 candidate frames"
+        rows = [
+            {"t_offset_s": 0.0, "has_fix": True, "quality_json": {"problems": [noise]}},
+            {"t_offset_s": 1.0, "has_fix": True, "quality_json": {"problems": [noise, "bad"]}},
+            {"t_offset_s": 2.0, "has_fix": True, "quality_json": {"ocr_status": "failed"}},
+        ]
+        _gaps, _longest, problems, *_rest = quality_rollup(rows)
+        assert problems == 2, "the rollup still counts the candidate-count noise"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 
 from sqlalchemy import select
@@ -13,6 +14,25 @@ from app.osd.reasons import GpsQuality
 from app.osd.track_quality import Fix, classify
 
 log = get_logger(__name__)
+
+#: A "problem" the extractor used to record on every cleanly parsed sample.
+#:
+#: Two candidate frames per overlay second is the design, so this said nothing except that
+#: the extractor did its job. It was counted all the same, which made
+#: ``telemetry_problem_count`` equal the point count on healthy recordings and put every
+#: library on the Telemetry Health page into "degraded". The extractor no longer writes it;
+#: this is here because the rows it already wrote are still in the database, and a rollup
+#: recomputed over them must reach the same verdict as one computed from fresh samples.
+#: Matched rather than deleted from ``quality_json``: how many frames were considered is
+#: real provenance, and it stays where it was recorded.
+_LEGACY_CANDIDATE_NOISE = re.compile(r"^selected best fields from \d+ candidate frames$")
+
+
+def real_problems(problems: object) -> list[str]:
+    """The entries in a stored ``problems`` list that describe an actual fault."""
+    if not isinstance(problems, (list, tuple)):
+        return []
+    return [str(p) for p in problems if not _LEGACY_CANDIDATE_NOISE.match(str(p))]
 
 
 def quality_rollup(rows: Iterable[object]) -> tuple[int, float, int, int, int, int]:
@@ -34,7 +54,10 @@ def quality_rollup(rows: Iterable[object]) -> tuple[int, float, int, int, int, i
             offset = float(getattr(row, "t_offset_s", 0.0))
             quality = getattr(row, "quality_json", None) or {}
             has_fix = bool(getattr(row, "has_fix", False))
-        if quality.get("problems") or quality.get("ocr_status") in {"failed", "rejected"}:
+        if real_problems(quality.get("problems")) or quality.get("ocr_status") in {
+            "failed",
+            "rejected",
+        }:
             problems += 1
         if not has_fix:
             gps_status = quality.get("gps_status")
