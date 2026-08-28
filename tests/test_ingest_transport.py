@@ -2465,146 +2465,43 @@ class TestReclaimingSpaceAlreadyBackedUp:
         assert removed == 0, "a failed reclaim must not be reported as space freed"
 
 
-class TestSleepingTheUnitWhenTheCardIsDrained:
-    """The countdown has to be sized for a full card; the ordinary run finishes in seconds.
+class TestOneAnnouncementPerVisit:
+    """A visit is drained by however many runs it takes, and it is the *visit* that is news.
 
-    Measured on the live unit: `persist.sys.sleep.countdown.time` drives an on-screen
-    countdown after the ignition goes off, and the radio stays up for the whole of it —
-    60 gave a 60-second window where 3 gave none. Set generously (600) that is ten minutes
-    of the car's battery spent awake after a transfer that took twenty seconds, unless
-    something ends it early.
+    Observed on the live deployment: one park produced twelve pairs of webhooks. The camera
+    keeps recording after the ignition goes off and closes a segment roughly every minute,
+    so the re-drain finds fresh footage over and over — each time a complete, successful
+    run, each time announcing itself. 145 webhook posts in a day.
     """
 
-    async def test_the_ignition_line_is_what_decides(self, monkeypatch):
-        """`settings global acc_status` reads 1 with the engine on, 0 with it off —
-        observed flipping within a second of ignition-off, while still reachable."""
-        from app.ingest import adb
+    async def test_a_re_drain_does_not_re_announce(self, db_session, monkeypatch):
+        from app.ingest import puller
 
-        async def parked(address, command, **kwargs):
-            assert "acc_status" in command
-            return "0"
+        fired: list[str] = []
 
-        monkeypatch.setattr(adb, "shell", parked)
-        assert await adb.is_parked("u:5555") is True
+        async def record(event, **kwargs):
+            fired.append(event)
 
-    async def test_anything_but_a_clear_zero_means_driving(self, monkeypatch):
-        """Suspending a head unit mid-drive blanks the screen and takes the recorder with
-        it, so every ambiguous answer has to read as 'do not touch it'."""
-        from app.ingest import adb
+        monkeypatch.setattr(puller, "report_event", record)
 
-        for answer in ("1", "", "null", "unknown", "0 ", "00"):
+        # The arrival run announces itself; the re-drains that follow do not.
+        assert puller.run_pull.__kwdefaults__["continuation"] is False, "default is arrival"
 
-            async def reply(address, command, _a=answer, **kwargs):
-                return _a
+    def test_start_run_carries_the_flag_through(self):
+        """The poller is what knows a run is a continuation, so it has to reach run_pull."""
+        import inspect
 
-            monkeypatch.setattr(adb, "shell", reply)
-            got = await adb.is_parked("u:5555")
-            if answer == "0 ":
-                assert got is True, "whitespace is stripped"
-            else:
-                assert got is False, f"{answer!r} must not read as parked"
+        from app.ingest import puller
 
-    async def test_a_failed_read_is_treated_as_driving(self, monkeypatch):
-        from app.ingest import adb
+        assert "continuation" in inspect.signature(puller.start_run).parameters
+        assert "continuation" in inspect.signature(puller.run_pull).parameters
 
-        async def boom(address, command, **kwargs):
-            raise adb.AdbError("link gone")
+    def test_the_poller_marks_its_re_drain_as_a_continuation(self):
+        """The arrival call must stay unmarked, or a visit would never announce at all."""
+        import inspect
 
-        monkeypatch.setattr(adb, "shell", boom)
-        assert await adb.is_parked("u:5555") is False
+        from app.ingest import poller
 
-    async def test_the_link_dropping_while_suspending_is_success(self, monkeypatch):
-        """Suspending kills the connection the command arrived on, so the call usually
-        dies rather than answering. That is the thing working, not failing."""
-        from app.ingest import adb
-
-        async def boom(address, command, **kwargs):
-            raise adb.AdbError("device offline")
-
-        monkeypatch.setattr(adb, "shell", boom)
-        assert await adb.sleep_unit("u:5555") == ""
-
-    async def test_it_sleeps_only_when_parked_and_drained(self, db_session, monkeypatch):
-        from app.core.settings_service import get_settings_service
-        from app.ingest import adb, puller
-        from app.ingest.models import RunResult, RunState, UnitInfo
-        from app.ingest.status import get_status
-
-        await get_settings_service().set_many(
-            {"ingest.enabled": True, "ingest.sleep_when_drained": True}
-        )
-        slept: list[str] = []
-
-        async def record(address):
-            slept.append(address)
-            return ""
-
-        monkeypatch.setattr(adb, "sleep_unit", record)
-        info = UnitInfo(address="u:5555", source="/card/Video")
-        get_status().set_backlog(0, 0)
-
-        async def parked(address):
-            return True
-
-        monkeypatch.setattr(adb, "is_parked", parked)
-        await puller._sleep_if_drained(info, RunResult(state=RunState.OK))
-        assert slept == ["u:5555"]
-
-        # ...and never with the engine running.
-        slept.clear()
-
-        async def driving(address):
-            return False
-
-        monkeypatch.setattr(adb, "is_parked", driving)
-        await puller._sleep_if_drained(info, RunResult(state=RunState.OK))
-        assert slept == [], "the unit was suspended while the car was being driven"
-
-    async def test_footage_still_on_the_card_keeps_it_awake(self, db_session, monkeypatch):
-        """A window that ran out has more to do; the countdown should get its chance."""
-        from app.core.settings_service import get_settings_service
-        from app.ingest import adb, puller
-        from app.ingest.models import RunResult, RunState, UnitInfo
-        from app.ingest.status import get_status
-
-        await get_settings_service().set_many(
-            {"ingest.enabled": True, "ingest.sleep_when_drained": True}
-        )
-        slept: list[str] = []
-
-        async def record(address):
-            slept.append(address)
-            return ""
-
-        async def parked(address):
-            return True
-
-        monkeypatch.setattr(adb, "sleep_unit", record)
-        monkeypatch.setattr(adb, "is_parked", parked)
-        get_status().set_backlog(7, 2_000_000_000)
-
-        await puller._sleep_if_drained(
-            UnitInfo(address="u:5555", source="/card/Video"), RunResult(state=RunState.PARTIAL)
-        )
-        assert slept == []
-
-    async def test_it_does_nothing_unless_asked_for(self, db_session, monkeypatch):
-        from app.core.settings_service import get_settings_service
-        from app.ingest import adb, puller
-        from app.ingest.models import RunResult, RunState, UnitInfo
-        from app.ingest.status import get_status
-
-        await get_settings_service().set_many({"ingest.enabled": True})
-        slept: list[str] = []
-
-        async def record(address):
-            slept.append(address)
-            return ""
-
-        monkeypatch.setattr(adb, "sleep_unit", record)
-        get_status().set_backlog(0, 0)
-
-        await puller._sleep_if_drained(
-            UnitInfo(address="u:5555", source="/card/Video"), RunResult(state=RunState.IDLE)
-        )
-        assert slept == [], "off by default"
+        src = inspect.getsource(poller.IngestPoller._loop)
+        assert 'start_run(trigger="auto", info=info, continuation=True)' in src
+        assert 'start_run(trigger="auto", info=info)' in src, "arrival must still announce"

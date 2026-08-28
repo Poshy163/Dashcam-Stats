@@ -53,50 +53,6 @@ def _by_directory(files: list[RemoteFile], default: str) -> list[tuple[str, list
     return list(batches.items())
 
 
-async def _sleep_if_drained(info: UnitInfo | None, result: RunResult) -> None:
-    """Put the unit to sleep once there is nothing left to copy. Never raises.
-
-    The head unit stays awake for a fixed countdown after the ignition goes off --
-    ``persist.sys.sleep.countdown.time`` on the unit, and the whole reason a window exists
-    at all. That countdown has to be sized for the worst case, a full card over a slow
-    link, so the ordinary run finishes long before it expires and the unit spends the
-    remainder awake on the car's battery having already copied everything.
-
-    Three conditions, and all of them matter:
-
-    * the operator asked for it;
-    * the run ended with the card drained -- ``OK`` with nothing outstanding, or ``IDLE``,
-      which is what a card the library already holds produces every window;
-    * the unit's own ignition line says the engine is off.
-
-    That last one is not a nicety. Suspending a head unit mid-drive blanks the screen and
-    takes the recorder with it, so the state is read from the unit rather than inferred
-    from anything on this side, and anything short of a clear "parked" is treated as
-    driving. See ``adb.is_parked``.
-    """
-    if info is None or not info.address:
-        return
-    if not bool(_get("sleep_when_drained", False)):
-        return
-    if result.state not in (RunState.OK, RunState.IDLE):
-        return
-    status = get_status()
-    if status.backlog_files:
-        # Something is still on the card -- a window that ran out, a camera filter, a file
-        # that would not transfer. Leaving it awake gives the countdown a chance to finish
-        # the job.
-        return
-    if not await adb.is_parked(info.address):
-        log.debug("not sleeping the head unit: the engine is still running")
-        return
-
-    reason = await adb.sleep_unit(info.address)
-    if reason:
-        log.warning("could not put the head unit to sleep", reason=reason[:200])
-    else:
-        log.info("card drained and the engine is off; sending the head unit to sleep")
-
-
 async def _reclaim(info: UnitInfo, items: list[RemoteFile]) -> int:
     """Remove recordings the library already holds from the card. Returns how many went.
 
@@ -607,7 +563,9 @@ def _preflight(tracked: list[asyncio.Task], coro) -> asyncio.Task:
     return task
 
 
-def start_run(*, trigger: str, info: UnitInfo | None = None) -> asyncio.Task[RunResult]:
+def start_run(
+    *, trigger: str, info: UnitInfo | None = None, continuation: bool = False
+) -> asyncio.Task[RunResult]:
     """Begin a pull in the background and keep hold of it.
 
     ``info`` is the caller's *own* fresh look at the unit, handed over rather than thrown
@@ -620,7 +578,8 @@ def start_run(*, trigger: str, info: UnitInfo | None = None) -> asyncio.Task[Run
     if _current is not None and not _current.done():
         return _current
     _current = asyncio.create_task(
-        run_pull(trigger=trigger, info=info), name=f"ingest-pull-{trigger}"
+        run_pull(trigger=trigger, info=info, continuation=continuation),
+        name=f"ingest-pull-{trigger}",
     )
     return _current
 
@@ -660,8 +619,18 @@ async def shutdown() -> None:
     log.info("stopped an in-flight transfer for shutdown")
 
 
-async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> RunResult:
-    """Fetch everything the unit has that we do not. Safe to call from anywhere."""
+async def run_pull(
+    *, trigger: str = "auto", info: UnitInfo | None = None, continuation: bool = False
+) -> RunResult:
+    """Fetch everything the unit has that we do not. Safe to call from anywhere.
+
+    ``continuation`` marks a re-drain of a visit that has already been announced. A
+    window is drained by however many runs it takes -- one per batch of segments the
+    camera closes while the car sits there -- and each of those used to fire its own
+    pair of webhooks. One park produced twelve, because the recorder keeps writing a
+    segment a minute after the ignition goes off and every one of them is a fresh run.
+    The visit is the event worth announcing, not the runs inside it.
+    """
     status = get_status()
     if not bool(_get("enabled", False)):
         status.set_state(RunState.DISABLED)
@@ -841,7 +810,8 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
         # practice -- an unreachable webhook host -- is precisely the one that takes the
         # full ten seconds. At 34 MB/s that is 340 MB of footage left on the card so a
         # notification could go out marginally sooner. Nothing downstream reads its result.
-        _fire_and_forget(report_event("started", plan=plan))
+        if not continuation:
+            _fire_and_forget(report_event("started", plan=plan))
 
         # The car's own screen, if the operator asked for it. Also fired rather than
         # awaited: `am start` against a cold browser is not fast, and a courtesy display
@@ -1044,19 +1014,13 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
         # phone every single time the engine started -- and, because anything that is not
         # OK reports as an error, it would call "nothing new to copy" a failure. The live
         # state is on /api/ingest/status for anyone who wants to look.
-        if result.state not in (RunState.IDLE, RunState.OFFLINE):
+        if result.state not in (RunState.IDLE, RunState.OFFLINE) and not continuation:
             with contextlib.suppress(Exception):
                 await _persist(result, trigger)
             with contextlib.suppress(Exception):
                 await report_event(
                     "finished" if result.state is RunState.OK else "error", result=result
                 )
-
-        # Last of all, and deliberately so: this suspends the unit, which takes the control
-        # channel down with it. Anything that still needed to talk to the car has had its
-        # turn by now.
-        with contextlib.suppress(Exception):
-            await _sleep_if_drained(info, result)
 
     return result
 

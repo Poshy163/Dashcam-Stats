@@ -350,7 +350,7 @@ class IngestPoller:
                         # 2 MB/s while it does, so that one window alone left ~840 MB behind
                         # with the car still sitting on the driveway.
                         log.info("the head unit is still here; looking for more to copy")
-                        puller.start_run(trigger="auto", info=info)
+                        puller.start_run(trigger="auto", info=info, continuation=True)
                     # `_was_online` is set the moment a pull actually starts (above), not
                     # merely because the unit is present -- otherwise the arrival gate's
                     # hold would be mistaken for a window already under way, and the next

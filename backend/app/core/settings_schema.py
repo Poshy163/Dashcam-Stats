@@ -1296,20 +1296,6 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
-        "ingest.sleep_when_drained",
-        "Send the dashcam to sleep once everything is copied",
-        "bool",
-        False,
-        "ingest",
-        "The head unit stays awake for a fixed countdown after the ignition goes off, and "
-        "that countdown has to be generous enough for a full card — so the ordinary window, "
-        "which finishes in seconds, leaves it sitting awake on the car's battery for the "
-        "remainder. With this on, the app puts it to sleep as soon as there is nothing left "
-        "to copy. It only ever does that with the engine off, read from the unit's own "
-        "ignition line, so it cannot blank the screen while you are driving.",
-        requires="ingest.enabled",
-    ),
-    SettingDef(
         "ingest.delete_after_verify",
         "Delete from the card after copying",
         "bool",

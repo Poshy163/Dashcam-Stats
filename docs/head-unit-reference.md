@@ -159,8 +159,8 @@ This is the **only** lever that changes how much footage a park is worth. At 32 
 minutes is ~19 GB. Before it was found the working window was ~40 s, and the conclusion
 "sleep is a hard cutoff, nothing left in software" — which was wrong.
 
-`ingest.sleep_when_drained` ends the window early once the card is empty, via
-`svc power forcesuspend`, gated on `acc_status == 0` so it can never fire while driving.
+There is no early-sleep. It was tried (`svc power forcesuspend` once the card was
+drained) and removed — see "do not repeat these" below.
 
 ### Do not repeat these
 
@@ -170,6 +170,12 @@ minutes is ~19 GB. Before it was found the working window was ~40 s, and the con
   Leave it empty.
 - Sleep itself **drops the radio completely** — no ping, no ADB. Extending
   `persist.sys.time.system_sleep` gains nothing for backups; only the *countdown* does.
+- **Do not suspend the unit early to save battery.** `svc power forcesuspend` works, but
+  the camera keeps recording after ignition-off and closes a segment about every minute,
+  which wakes the unit straight back up. The result is a suspend/resume loop — measured
+  at roughly one cycle a minute for the whole countdown — that re-announces itself each
+  time and puts a suspend in the middle of an active recording. The countdown expiring is
+  the only thing that should end the window.
 - There is no way to keep the unit awake indefinitely, and you would not want one: no
   battery, constant 12 V, and no voltage cutoff available to us, so a stalled sync would
   flatten the car battery. Always leave the countdown as the backstop.
