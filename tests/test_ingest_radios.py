@@ -401,7 +401,15 @@ class TestTheHotspot:
 
         assert not _issued(unit_shell.commands, "softap")
 
-    async def test_with_no_recoverable_config_it_is_stopped_but_never_guessed_at(self, unit_shell):
+    async def test_with_no_recoverable_config_it_is_left_alone_entirely(self, unit_shell):
+        """It used to be stopped anyway, on the reasoning that a hotspot nobody could
+        restore was still worth the airtime. The deployment disagreed: fifteen stops and
+        zero starts, because reading the SSID and passphrase back needs a permission the
+        shell user does not have — `is-softap-enabled` answers uid 2000 with a
+        SecurityException. Every transfer took the driver's hotspot away for good.
+
+        Quieting it is worth a little airtime on a single-stream radio. It is not worth
+        that, so the trade is only taken when it can be reversed."""
         unit_shell.replies["bluetooth_on"] = "0"
         unit_shell.replies["ip -o addr"] = [_IP_WITH_AP, _IP_NO_AP]
         unit_shell.replies["dumpsys wifi"] = "nothing useful in here"
@@ -410,7 +418,8 @@ class TestTheHotspot:
         await quiet._task
         await quiet.finish()
 
-        assert _issued(unit_shell.commands, "service call tethering")
+        assert not _issued(unit_shell.commands, "service call tethering")
+        assert not _issued(unit_shell.commands, "stop-softap")
         assert not _issued(unit_shell.commands, "start-softap")
 
 

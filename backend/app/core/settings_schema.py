@@ -1296,6 +1296,50 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.manage_sleep_window",
+        "Hold the dashcam awake while it still has footage to give",
+        "bool",
+        False,
+        "ingest",
+        "The head unit stays awake for a fixed countdown after the ignition goes off, and "
+        "the WiFi stays up for all of it — so that countdown is the whole backup window. "
+        "With this on, the app widens it while the car is here and narrows it again the "
+        "moment the card is empty, then sends the unit to sleep rather than leaving it "
+        "waiting out the rest on the car's battery. A unit the app never reaches — parked "
+        "away from home — keeps the short value and sleeps promptly.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.sleep_window_s",
+        "Awake time while there is footage to copy",
+        "int",
+        900,
+        "ingest",
+        "How long the head unit stays awake after the ignition goes off while the app is "
+        "in touch with it. At the measured transfer rate this is far more than a day of "
+        "footage; the app cuts it short as soon as the card is drained, so the full value "
+        "is only ever spent on a genuinely large backlog.",
+        minimum=30,
+        maximum=3600,
+        unit="seconds",
+        requires="ingest.manage_sleep_window",
+    ),
+    SettingDef(
+        "ingest.sleep_window_idle_s",
+        "Awake time otherwise",
+        "int",
+        60,
+        "ingest",
+        "What the countdown is set back to once the card is empty, and what a unit the app "
+        "cannot reach keeps. This is the value that applies when the car is parked away "
+        "from home, so it is the one that decides how much of the car's battery a park "
+        "costs when no backup is possible.",
+        minimum=5,
+        maximum=600,
+        unit="seconds",
+        requires="ingest.manage_sleep_window",
+    ),
+    SettingDef(
         "ingest.delete_after_verify",
         "Delete from the card after copying",
         "bool",

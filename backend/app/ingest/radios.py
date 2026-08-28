@@ -521,6 +521,25 @@ class RadioQuiet:
         except adb.AdbError as exc:
             log.debug("could not read the hotspot configuration", error=str(exc))
 
+        if config is None:
+            # Refuse to stop what cannot be started again. `cmd wifi stop-softap` works
+            # from the shell user, but reading the SSID and passphrase back does not --
+            # `is-softap-enabled` answers uid 2000 with a SecurityException -- so a stop
+            # here is permanent until somebody re-enables the hotspot on the unit by hand.
+            # Measured on the live deployment before this guard existed: fifteen stops,
+            # zero starts. Every transfer took the hotspot away for good and the restore
+            # side was not failing, it was correctly declining to guess at a passphrase.
+            #
+            # Quieting the hotspot is worth a little airtime on a single-stream radio. It
+            # is not worth the driver's hotspot, so the trade is only taken when it can be
+            # reversed.
+            log.info(
+                "leaving the unit's hotspot alone: its configuration cannot be read back, "
+                "so stopping it could not be undone",
+                iface=iface,
+            )
+            return
+
         stopped, why = await _stop_hotspot(self.address)
         if not stopped:
             log.warning(
@@ -538,7 +557,7 @@ class RadioQuiet:
         if config:
             self.hotspot_restore = config
             log.info("stopped the unit's hotspot for the transfer", iface=iface)
-        else:
+        else:  # pragma: no cover - guarded above; kept so a future caller cannot regress
             log.warning(
                 "stopped the unit's hotspot, but its configuration could not be "
                 "recovered, so it will not be started again from here; the unit "

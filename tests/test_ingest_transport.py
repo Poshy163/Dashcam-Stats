@@ -2505,3 +2505,132 @@ class TestOneAnnouncementPerVisit:
         src = inspect.getsource(poller.IngestPoller._loop)
         assert 'start_run(trigger="auto", info=info, continuation=True)' in src
         assert 'start_run(trigger="auto", info=info)' in src, "arrival must still announce"
+
+
+class TestTheSleepWindowIsManagedNotLeftWide:
+    """The countdown persists on the unit, so leaving it long is a decision about a car
+    parked somewhere the app will never reach — where the window buys nothing and the
+    battery pays for it anyway."""
+
+    async def test_it_is_widened_only_when_asked_for(self, db_session, monkeypatch):
+        from app.core.settings_service import get_settings_service
+        from app.ingest import adb, puller
+
+        set_to: list[int] = []
+
+        async def current(address):
+            return 60
+
+        async def setter(address, seconds):
+            set_to.append(seconds)
+            return True
+
+        monkeypatch.setattr(adb, "sleep_countdown", current)
+        monkeypatch.setattr(adb, "set_sleep_countdown", setter)
+
+        await get_settings_service().set_many({"ingest.enabled": True})
+        await puller.widen_sleep_window("u:5555")
+        assert set_to == [], "off by default"
+
+        await get_settings_service().set_many(
+            {"ingest.manage_sleep_window": True, "ingest.sleep_window_s": 900}
+        )
+        await puller.widen_sleep_window("u:5555")
+        assert set_to == [900]
+
+    async def test_draining_narrows_it_and_sleeps_once(self, db_session, monkeypatch):
+        from app.core.settings_service import get_settings_service
+        from app.ingest import adb, puller
+
+        set_to: list[int] = []
+        slept: list[str] = []
+
+        async def current(address):
+            return 900
+
+        async def setter(address, seconds):
+            set_to.append(seconds)
+            return True
+
+        async def parked(address):
+            return True
+
+        async def sleeper(address):
+            slept.append(address)
+            return ""
+
+        monkeypatch.setattr(adb, "sleep_countdown", current)
+        monkeypatch.setattr(adb, "set_sleep_countdown", setter)
+        monkeypatch.setattr(adb, "is_parked", parked)
+        monkeypatch.setattr(adb, "sleep_unit", sleeper)
+        await get_settings_service().set_many(
+            {
+                "ingest.enabled": True,
+                "ingest.manage_sleep_window": True,
+                "ingest.sleep_window_idle_s": 60,
+            }
+        )
+        puller.forget_sleep_state()
+
+        await puller.close_sleep_window("u:5555", drained=True)
+        assert set_to == [60], "the short value is put back before sleeping"
+        assert slept == ["u:5555"]
+
+        # The unit wakes itself a minute later; it must not be re-suspended on a loop.
+        await puller.close_sleep_window("u:5555", drained=True)
+        assert slept == ["u:5555"], "the unit was suspended twice in one visit"
+
+        # ...until the car has actually left and come back.
+        puller.forget_sleep_state()
+        await puller.close_sleep_window("u:5555", drained=True)
+        assert slept == ["u:5555", "u:5555"]
+
+    async def test_it_never_sleeps_a_car_being_driven(self, db_session, monkeypatch):
+        from app.core.settings_service import get_settings_service
+        from app.ingest import adb, puller
+
+        slept: list[str] = []
+
+        async def driving(address):
+            return False
+
+        async def sleeper(address):
+            slept.append(address)
+            return ""
+
+        async def current(address):
+            return 900
+
+        async def setter(address, seconds):
+            return True
+
+        monkeypatch.setattr(adb, "is_parked", driving)
+        monkeypatch.setattr(adb, "sleep_unit", sleeper)
+        monkeypatch.setattr(adb, "sleep_countdown", current)
+        monkeypatch.setattr(adb, "set_sleep_countdown", setter)
+        await get_settings_service().set_many(
+            {"ingest.enabled": True, "ingest.manage_sleep_window": True}
+        )
+        puller.forget_sleep_state()
+
+        await puller.close_sleep_window("u:5555", drained=True)
+        assert slept == []
+
+    async def test_footage_still_on_the_card_keeps_the_window_open(self, db_session, monkeypatch):
+        from app.core.settings_service import get_settings_service
+        from app.ingest import adb, puller
+
+        slept: list[str] = []
+
+        async def sleeper(address):
+            slept.append(address)
+            return ""
+
+        monkeypatch.setattr(adb, "sleep_unit", sleeper)
+        await get_settings_service().set_many(
+            {"ingest.enabled": True, "ingest.manage_sleep_window": True}
+        )
+        puller.forget_sleep_state()
+
+        await puller.close_sleep_window("u:5555", drained=False)
+        assert slept == []

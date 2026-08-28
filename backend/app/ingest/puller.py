@@ -53,6 +53,70 @@ def _by_directory(files: list[RemoteFile], default: str) -> list[tuple[str, list
     return list(batches.items())
 
 
+#: Visits whose sleep has already been asked for, so it is asked once and not on a loop.
+#:
+#: The unit wakes itself a minute or so after being suspended -- the camera keeps recording
+#: through the ignition-off window and closes a segment about every minute -- and an earlier
+#: version re-suspended it on every one of those wakes. That is a suspend/resume cycle a
+#: minute for the whole countdown, each one landing in the middle of an active recording.
+#: Once per visit, then leave it to the countdown.
+_slept_for: set[str] = set()
+
+
+def forget_sleep_state() -> None:
+    """Let the next visit ask for its own sleep. Called when the unit goes away."""
+    _slept_for.clear()
+
+
+async def widen_sleep_window(address: str) -> None:
+    """Give the unit a long ignition-off window, because the app is here to use it.
+
+    The countdown is the backup window: the radio stays up for the whole of it, so it is
+    the only thing that decides how much a park is worth. It is widened on arrival rather
+    than left permanently long because the value persists on the unit, and a unit parked
+    somewhere the app cannot reach would otherwise hold the car's battery open for the full
+    fifteen minutes for no possible benefit. Narrowed again by :func:`close_sleep_window`.
+    """
+    if not bool(_get("manage_sleep_window", False)):
+        return
+    wanted = int(_get("sleep_window_s", 900))
+    if await adb.sleep_countdown(address) == wanted:
+        return
+    if await adb.set_sleep_countdown(address, wanted):
+        log.info("widened the head unit's ignition-off window", seconds=wanted)
+
+
+async def close_sleep_window(address: str, *, drained: bool) -> None:
+    """Narrow the window and, if there is nothing left to copy, sleep the unit now.
+
+    Two separate things, and the order matters. The countdown is put back to its short
+    value first, so that a unit which drives away before -- or instead of -- sleeping is
+    already carrying the value that costs the least battery. Only then is the sleep asked
+    for, and only with the card drained and the engine off.
+    """
+    if not bool(_get("manage_sleep_window", False)) or not address:
+        return
+    if not drained:
+        return
+    if not await adb.is_parked(address):
+        # Still being driven. Narrowing the window now would strand the next ignition-off
+        # with the short value before anything had a chance to widen it.
+        return
+
+    idle = int(_get("sleep_window_idle_s", 60))
+    if await adb.sleep_countdown(address) != idle:
+        await adb.set_sleep_countdown(address, idle)
+
+    if address in _slept_for:
+        return
+    _slept_for.add(address)
+    reason = await adb.sleep_unit(address)
+    if reason:
+        log.warning("could not put the head unit to sleep", reason=reason[:200])
+    else:
+        log.info("card drained and the engine is off; sending the head unit to sleep")
+
+
 async def _reclaim(info: UnitInfo, items: list[RemoteFile]) -> int:
     """Remove recordings the library already holds from the card. Returns how many went.
 
@@ -673,6 +737,10 @@ async def run_pull(
             )
             return result
 
+        # The window this run gets to use. Fired, not awaited: it is two control calls and
+        # the transfer must not queue behind them.
+        _fire_and_forget(widen_sleep_window(info.address))
+
         # Started before the unit is asked anything, and awaited only where each result is
         # actually needed. Not one of the three depends on the card: two are database reads
         # and the third walks the staging directory on the (NFS) share. They ran in series
@@ -1021,6 +1089,15 @@ async def run_pull(
                 await report_event(
                     "finished" if result.state is RunState.OK else "error", result=result
                 )
+
+        # Last of all: this can suspend the unit, which takes the control channel down with
+        # it. Everything else that needed the car has had its turn.
+        with contextlib.suppress(Exception):
+            await close_sleep_window(
+                info.address if info else "",
+                drained=result.state in (RunState.OK, RunState.IDLE)
+                and not get_status().backlog_files,
+            )
 
     return result
 

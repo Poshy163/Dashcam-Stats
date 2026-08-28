@@ -641,6 +641,87 @@ async def show_url(address: str, url: str) -> str:
     return ""
 
 
+#: The unit's own ignition line, as ``settings global acc_status`` reports it.
+#:
+#: Measured on the live unit: ``1`` with the engine on, flipping to ``0`` within a second
+#: of it going off while the unit is still awake and on the network. That window -- awake,
+#: reachable, engine off -- is the only moment it can be observed, and it is what makes
+#: touching the unit's power state safe to automate.
+PARKED = "0"
+
+#: How long the unit stays awake after the ignition goes off, in seconds.
+#:
+#: The single most valuable thing found on this device. It drives an on-screen countdown
+#: and **the radio stays up for the whole of it**, so it is the only lever that changes how
+#: much footage a park is worth: at the shipped value of 3 the unit was gone before
+#: anything could connect, at 60 it stayed reachable for the full minute.
+SLEEP_COUNTDOWN_PROP = "persist.sys.sleep.countdown.time"
+
+
+async def is_parked(address: str) -> bool:
+    """Whether the ignition is off, according to the unit's own ACC line.
+
+    Conservative by construction: anything other than a clear ``0`` reads as *not* parked.
+    Its callers suspend the head unit, and the cost of being wrong in that direction is
+    blanking the screen -- and possibly the recorder -- on somebody who is driving. A
+    failed read, an unexpected value, or a control channel that has gone away all mean
+    "leave it alone".
+    """
+    try:
+        answer = (await shell(address, "settings get global acc_status", timeout=10.0)).strip()
+    except AdbError as exc:
+        log.debug("could not read the ignition state", error=str(exc))
+        return False
+    return answer == PARKED
+
+
+async def sleep_countdown(address: str) -> int:
+    """How many seconds the unit currently stays awake after ignition-off. 0 if unknown."""
+    try:
+        answer = (await shell(address, f"getprop {SLEEP_COUNTDOWN_PROP}", timeout=10.0)).strip()
+        return int(answer)
+    except (AdbError, ValueError):
+        return 0
+
+
+async def set_sleep_countdown(address: str, seconds: int) -> bool:
+    """Set how long the unit stays awake after the ignition goes off.
+
+    Writable from an ordinary shell because this unit runs SELinux ``Permissive``; there is
+    no root involved. Verified by reading it back rather than trusting the exit status,
+    because ``setprop`` says nothing at all when it is refused.
+    """
+    wanted = max(1, int(seconds))
+    try:
+        await shell(address, f"setprop {SLEEP_COUNTDOWN_PROP} {wanted}", timeout=10.0)
+    except AdbError as exc:
+        log.debug("could not set the sleep countdown", error=str(exc))
+        return False
+    return await sleep_countdown(address) == wanted
+
+
+async def sleep_unit(address: str) -> str:
+    """Suspend the head unit now. Returns "" on success, or why not.
+
+    ``svc power forcesuspend`` rather than a vendor broadcast: it is documented, it is what
+    the platform itself uses, and it does not depend on guessing at an unexported receiver.
+
+    Never raises. Failing to sleep the unit costs a little of the car's battery; it must
+    not be able to turn a completed transfer into a failed run, and the countdown expiring
+    is the backstop for everything this misses.
+    """
+    try:
+        reply = await shell(address, "svc power forcesuspend", timeout=10.0)
+    except AdbError as exc:
+        # The ordinary outcome: suspending takes down the link the command arrived on, so
+        # the call dies rather than answering. That is it working.
+        log.debug("the link dropped while suspending the head unit", error=str(exc))
+        return ""
+    if "Error" in reply or "Exception" in reply:
+        return reply[:200]
+    return ""
+
+
 async def delete(address: str, source: str, names: list[str]) -> int:
     """Remove files from the unit. Only ever called for verified, committed copies.
 

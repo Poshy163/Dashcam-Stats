@@ -228,6 +228,10 @@ class IngestPoller:
                     status.set_unit_online(False)
                     status.set_state(RunState.OFFLINE)
                     self._was_online = False
+                    # The visit is over, so the next one may ask for its own sleep. Kept
+                    # here rather than in the run: a run that ended because the car left
+                    # cannot tell that from one that ended because it had finished.
+                    puller.forget_sleep_state()
                     self._visit_info = None
                     await asyncio.sleep(self._interval())
                     continue
