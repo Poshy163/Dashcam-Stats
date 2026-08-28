@@ -53,6 +53,50 @@ def _by_directory(files: list[RemoteFile], default: str) -> list[tuple[str, list
     return list(batches.items())
 
 
+async def _sleep_if_drained(info: UnitInfo | None, result: RunResult) -> None:
+    """Put the unit to sleep once there is nothing left to copy. Never raises.
+
+    The head unit stays awake for a fixed countdown after the ignition goes off --
+    ``persist.sys.sleep.countdown.time`` on the unit, and the whole reason a window exists
+    at all. That countdown has to be sized for the worst case, a full card over a slow
+    link, so the ordinary run finishes long before it expires and the unit spends the
+    remainder awake on the car's battery having already copied everything.
+
+    Three conditions, and all of them matter:
+
+    * the operator asked for it;
+    * the run ended with the card drained -- ``OK`` with nothing outstanding, or ``IDLE``,
+      which is what a card the library already holds produces every window;
+    * the unit's own ignition line says the engine is off.
+
+    That last one is not a nicety. Suspending a head unit mid-drive blanks the screen and
+    takes the recorder with it, so the state is read from the unit rather than inferred
+    from anything on this side, and anything short of a clear "parked" is treated as
+    driving. See ``adb.is_parked``.
+    """
+    if info is None or not info.address:
+        return
+    if not bool(_get("sleep_when_drained", False)):
+        return
+    if result.state not in (RunState.OK, RunState.IDLE):
+        return
+    status = get_status()
+    if status.backlog_files:
+        # Something is still on the card -- a window that ran out, a camera filter, a file
+        # that would not transfer. Leaving it awake gives the countdown a chance to finish
+        # the job.
+        return
+    if not await adb.is_parked(info.address):
+        log.debug("not sleeping the head unit: the engine is still running")
+        return
+
+    reason = await adb.sleep_unit(info.address)
+    if reason:
+        log.warning("could not put the head unit to sleep", reason=reason[:200])
+    else:
+        log.info("card drained and the engine is off; sending the head unit to sleep")
+
+
 async def _reclaim(info: UnitInfo, items: list[RemoteFile]) -> int:
     """Remove recordings the library already holds from the card. Returns how many went.
 
@@ -1007,6 +1051,12 @@ async def run_pull(*, trigger: str = "auto", info: UnitInfo | None = None) -> Ru
                 await report_event(
                     "finished" if result.state is RunState.OK else "error", result=result
                 )
+
+        # Last of all, and deliberately so: this suspends the unit, which takes the control
+        # channel down with it. Anything that still needed to talk to the car has had its
+        # turn by now.
+        with contextlib.suppress(Exception):
+            await _sleep_if_drained(info, result)
 
     return result
 

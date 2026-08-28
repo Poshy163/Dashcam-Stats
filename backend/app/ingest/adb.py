@@ -641,6 +641,61 @@ async def show_url(address: str, url: str) -> str:
     return ""
 
 
+#: What the unit's ACC (ignition) line reads as when the engine is off.
+#:
+#: Measured on the live unit: ``settings global acc_status`` is ``1`` with the ignition on
+#: and flips to ``0`` within a second of it going off, while the unit is still awake and on
+#: the network. That window -- awake, reachable, engine off -- is the only moment this can
+#: be observed at all, and it is what makes sleeping the unit safe to automate.
+PARKED = "0"
+
+
+async def is_parked(address: str) -> bool:
+    """Whether the ignition is off, according to the unit's own ACC line.
+
+    Conservative by construction: anything other than a clear ``0`` reads as *not* parked.
+    The only caller suspends the head unit, and the cost of being wrong in that direction is
+    blanking the screen -- and possibly the recorder -- on somebody who is driving. A
+    failed read, an unexpected value or a control channel that has gone away all mean "do
+    not touch it".
+    """
+    try:
+        answer = (await shell(address, "settings get global acc_status", timeout=10.0)).strip()
+    except AdbError as exc:
+        log.debug("could not read the ignition state", error=str(exc))
+        return False
+    return answer == PARKED
+
+
+async def sleep_unit(address: str) -> str:
+    """Put the head unit to sleep now. Returns "" on success, or why not.
+
+    Only ever called once the card is drained *and* :func:`is_parked` agrees the engine is
+    off. It exists because the sleep countdown has to be generous enough for the worst case
+    -- a full card, a slow window -- and the ordinary case finishes long before it expires.
+    Without this the unit would sit awake on the car's battery for the remainder of the
+    countdown having already copied everything.
+
+    ``svc power forcesuspend`` rather than a vendor broadcast: it is a documented shell
+    command, it is what the platform itself uses, and it does not depend on guessing at an
+    unexported receiver.
+
+    Never raises. Failing to sleep the unit costs some battery; it must not be able to turn
+    a completed transfer into a failed run. The countdown expiring is the backstop.
+    """
+    try:
+        reply = await shell(address, "svc power forcesuspend", timeout=10.0)
+    except AdbError as exc:
+        # Expected in the ordinary case: suspending kills the link this command arrived on,
+        # so the call frequently dies rather than answering. That is success, not failure,
+        # and the caller confirms by looking at whether the unit went away.
+        log.debug("the link dropped while suspending the head unit", error=str(exc))
+        return ""
+    if "Error" in reply or "Exception" in reply:
+        return reply[:200]
+    return ""
+
+
 async def delete(address: str, source: str, names: list[str]) -> int:
     """Remove files from the unit. Only ever called for verified, committed copies.
 
