@@ -1,5 +1,7 @@
 # Dashcam → NAS backup: transport, progress and recording-pause investigation
 
+> **Device facts now live in [`head-unit-reference.md`](head-unit-reference.md)** — properties, storage layout, shell permissions, the ignition/sleep window and the benchmark results, captured from the live unit so this work can continue while the car is off the network.
+
 Research only. No device was probed and no device-control code was written. Everything below
 is either read out of this repository or validated against AOSP / toybox / platform-tools
 sources, with the unverified parts explicitly marked as questions for the device-probing agent.
