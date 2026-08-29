@@ -3,9 +3,9 @@ import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 
 import Spinner from '@/components/Spinner'
-import { EmptyState, ErrorState, PageHeader, Pagination } from '@/components/ui'
+import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
-import { formatDateTime, formatDuration, formatSpeed } from '@/lib/format'
+import { formatDateTime, formatDuration, formatRelative, formatSpeed } from '@/lib/format'
 
 const IMPORT_STATE_STYLE: Record<string, { label: string; className: string }> = {
   imported: { label: 'In Home Assistant', className: 'bg-state-ok/15 text-state-ok' },
@@ -35,6 +35,11 @@ export default function ObdDrives() {
     queryFn: () => api.obd.drives({ page, pageSize: 20 }),
     refetchInterval: 30_000,
   })
+  const totals = useQuery({
+    queryKey: ['obd-drives-summary'],
+    queryFn: api.obd.drivesSummary,
+    refetchInterval: 30_000,
+  })
 
   if (query.isLoading) return <Spinner label="Loading drives…" className="py-24" />
   if (query.isError) return <ErrorState error={query.error} retry={() => query.refetch()} />
@@ -47,6 +52,47 @@ export default function ObdDrives() {
         title="OBD drives"
         subtitle="Every recorded drive, kept at the logger's full sample resolution. Home Assistant holds the hourly rollups; the traces live here."
       />
+
+      {totals.data && totals.data.driveCount > 0 && (
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-6">
+          <StatTile
+            label="Drives"
+            value={totals.data.driveCount.toLocaleString()}
+            hint={
+              totals.data.lastDriveAt ? `last ${formatRelative(totals.data.lastDriveAt)}` : undefined
+            }
+          />
+          <StatTile
+            label="Distance"
+            value={`${totals.data.totalDistanceKm.toFixed(1)} km`}
+            hint={`${formatDuration(totals.data.totalDurationS)} driven`}
+          />
+          <StatTile
+            label="Fuel used"
+            value={`${totals.data.totalFuelUsedL.toFixed(2)} L`}
+            hint={
+              totals.data.averageFuelConsumptionL100km != null
+                ? `${totals.data.averageFuelConsumptionL100km.toFixed(1)} L/100 km overall`
+                : undefined
+            }
+          />
+          <StatTile
+            label="Idle time"
+            value={formatDuration(totals.data.totalIdleDurationS)}
+            hint={
+              totals.data.totalDurationS > 0
+                ? `${Math.round((totals.data.totalIdleDurationS / totals.data.totalDurationS) * 100)}% of driving time`
+                : undefined
+            }
+          />
+          <StatTile label="Top speed" value={formatSpeed(totals.data.maximumSpeedKmh)} />
+          <StatTile
+            label="Samples stored"
+            value={totals.data.totalSampleCount.toLocaleString()}
+            hint="full resolution, kept forever"
+          />
+        </div>
+      )}
 
       {data.items.length === 0 ? (
         <EmptyState

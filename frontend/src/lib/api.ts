@@ -285,11 +285,29 @@ export interface OBDDriveSummary {
   estimatedFuelUsedL: number | null
   averageFuelConsumptionL100km: number | null
   maximumCoolantTemperatureC: number | null
+  maximumEngineLoadPct: number | null
+  missingDataDurationS: number | null
+  expectedSampleCount: number
   receivedSamplePercentage: number | null
   sampleCount: number
   errorCount: number
   dtcsObserved: string[]
   importState: string
+}
+
+export interface OBDDrivesTotals {
+  driveCount: number
+  totalDistanceKm: number
+  totalDurationS: number
+  totalIdleDurationS: number
+  totalFuelUsedL: number
+  averageFuelConsumptionL100km: number | null
+  maximumSpeedKmh: number | null
+  maximumRpm: number | null
+  maximumCoolantTemperatureC: number | null
+  totalSampleCount: number
+  firstDriveAt: string | null
+  lastDriveAt: string | null
 }
 
 export interface OBDSeriesSample {
@@ -306,8 +324,10 @@ export interface OBDSeriesSample {
   shortTermFuelTrimPct: number | null
   longTermFuelTrimPct: number | null
   oxygenSensor1VoltageV: number | null
+  oxygenSensor2VoltageV: number | null
   adapterVoltageV: number | null
   estimatedFuelRateLH: number | null
+  estimatedFuelConsumptionL100km: number | null
 }
 
 export interface OBDDriveSeries {
@@ -472,6 +492,7 @@ export const api = {
     status: () => request<OBDStatus>('/obd/status'),
     bundles: (query?: Query) => request<Paginated<OBDBundle>>('/obd/bundles', { query }),
     drives: (query?: Query) => request<Paginated<OBDDriveSummary>>('/obd/drives', { query }),
+    drivesSummary: () => request<OBDDrivesTotals>('/obd/drives/summary'),
     driveSeries: (driveId: string) =>
       request<OBDDriveSeries>(`/obd/drives/${encodeURIComponent(driveId)}/series`),
     validate: (id: number) =>

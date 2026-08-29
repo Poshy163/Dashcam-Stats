@@ -2769,3 +2769,39 @@ class TestDriveSeriesApi:
     async def test_unknown_drive_series_is_a_404(self, db_session, client):
         response = await client.get("/api/obd/drives/drive_missing/series")
         assert response.status_code == 404
+
+    async def test_summary_totals_are_consistent_with_the_drive_list(
+        self, db_session, app_config, client
+    ):
+        for drive_id in ("drive_summary_a", "drive_summary_b"):
+            path = make_bundle(app_config.obd_verified_dir, drive_id)
+            checked = validate_bundle(path, config=app_config)
+            async with session_scope() as session:
+                await store_validated_bundle(session, checked)
+
+        listing = (await client.get("/api/obd/drives")).json()
+        summary_response = await client.get("/api/obd/drives/summary")
+        assert summary_response.status_code == 200
+        summary = summary_response.json()
+
+        assert summary["drive_count"] == listing["total"] == 2
+        assert summary["total_sample_count"] == sum(
+            item["sample_count"] for item in listing["items"]
+        )
+        assert summary["total_distance_km"] == pytest.approx(
+            sum(item["distance_km"] or 0 for item in listing["items"])
+        )
+        assert summary["total_duration_s"] == pytest.approx(
+            sum(item["duration_s"] or 0 for item in listing["items"])
+        )
+        assert summary["first_drive_at"] == min(item["started_at"] for item in listing["items"])
+        assert summary["last_drive_at"] == max(item["finished_at"] for item in listing["items"])
+
+    async def test_summary_of_an_empty_library_is_all_zeroes(self, db_session, client):
+        response = await client.get("/api/obd/drives/summary")
+        assert response.status_code == 200
+        summary = response.json()
+        assert summary["drive_count"] == 0
+        assert summary["total_distance_km"] == 0.0
+        assert summary["average_fuel_consumption_l_100km"] is None
+        assert summary["first_drive_at"] is None

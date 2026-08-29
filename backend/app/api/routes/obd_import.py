@@ -101,6 +101,9 @@ def _drive(row: OBDDrive) -> dict[str, object]:
         "estimated_fuel_used_l": row.estimated_fuel_used_l,
         "average_fuel_consumption_l_100km": row.average_fuel_consumption_l_100km,
         "maximum_coolant_temperature_c": row.maximum_coolant_temperature_c,
+        "maximum_engine_load_pct": row.maximum_engine_load_pct,
+        "missing_data_duration_s": row.missing_data_duration_s,
+        "expected_sample_count": row.expected_sample_count,
         "received_sample_percentage": row.received_sample_percentage,
         "sample_count": row.sample_count,
         "error_count": row.error_count,
@@ -126,8 +129,10 @@ def _series_sample(row: OBDSample) -> dict[str, object]:
         "short_term_fuel_trim_pct": row.short_term_fuel_trim_bank_1_pct,
         "long_term_fuel_trim_pct": row.long_term_fuel_trim_bank_1_pct,
         "oxygen_sensor_1_voltage_v": row.oxygen_sensor_1_voltage_v,
+        "oxygen_sensor_2_voltage_v": row.oxygen_sensor_2_voltage_v,
         "adapter_voltage_v": row.adapter_voltage_v,
         "estimated_fuel_rate_l_h": row.estimated_fuel_rate_l_h,
+        "estimated_fuel_consumption_l_100km": row.estimated_fuel_consumption_l_100km,
     }
 
 
@@ -153,6 +158,62 @@ async def list_drives(session: SessionDep, page: PaginationDep) -> dict[str, obj
         "page": page.page,
         "page_size": page.page_size,
         "pages": page.pages(total),
+    }
+
+
+@router.get("/drives/summary", summary="Aggregate rollups across every imported drive")
+async def drives_summary(session: SessionDep) -> dict[str, object]:
+    (
+        count,
+        distance,
+        duration,
+        idle,
+        fuel,
+        max_speed,
+        max_rpm,
+        max_coolant,
+        samples,
+    ) = (
+        await session.execute(
+            select(
+                func.count(OBDDrive.id),
+                func.sum(OBDDrive.distance_km),
+                func.sum(OBDDrive.duration_s),
+                func.sum(OBDDrive.idle_duration_s),
+                func.sum(OBDDrive.estimated_fuel_used_l),
+                func.max(OBDDrive.maximum_speed_kmh),
+                func.max(OBDDrive.maximum_rpm),
+                func.max(OBDDrive.maximum_coolant_temperature_c),
+                func.sum(OBDDrive.sample_count),
+            )
+        )
+    ).one()
+    # Ordered single-row selects rather than min()/max() aggregates: SQLite hands an
+    # aggregate over a typed datetime column back through the driver as its raw stored
+    # string, sidestepping the UtcDateTime decoder.
+    first = (
+        await session.execute(select(OBDDrive.started_at).order_by(OBDDrive.started_at.asc()))
+    ).scalar()
+    last = (
+        await session.execute(select(OBDDrive.finished_at).order_by(OBDDrive.finished_at.desc()))
+    ).scalar()
+    total_distance = float(distance or 0.0)
+    total_fuel = float(fuel or 0.0)
+    return {
+        "drive_count": int(count or 0),
+        "total_distance_km": total_distance,
+        "total_duration_s": float(duration or 0.0),
+        "total_idle_duration_s": float(idle or 0.0),
+        "total_fuel_used_l": total_fuel,
+        "average_fuel_consumption_l_100km": (
+            total_fuel / total_distance * 100.0 if total_distance > 0 else None
+        ),
+        "maximum_speed_kmh": float(max_speed) if max_speed is not None else None,
+        "maximum_rpm": float(max_rpm) if max_rpm is not None else None,
+        "maximum_coolant_temperature_c": (float(max_coolant) if max_coolant is not None else None),
+        "total_sample_count": int(samples or 0),
+        "first_drive_at": first.isoformat() if first else None,
+        "last_drive_at": last.isoformat() if last else None,
     }
 
 
