@@ -139,6 +139,26 @@ class JobKind(str, enum.Enum):
     JOURNEY_REBUILD = "journey_rebuild"
 
 
+class OBDBundleState(str, enum.Enum):
+    """Durable state of the OBD copy/import pipeline.
+
+    This is deliberately separate from :class:`JobState`.  A media job can be rebuilt
+    from the footage, while an OBD bundle is itself the irreplaceable source until Home
+    Assistant acknowledges it.  Folding the two queues together would also let a slow HA
+    outage consume media workers, which is exactly the coupling the backup path must avoid.
+    """
+
+    WAITING_FOR_BACKUP = "waiting_for_backup"
+    COPYING = "copying"
+    VALIDATING = "validating"
+    READY_TO_IMPORT = "ready_to_import"
+    IMPORTING = "importing"
+    IMPORTED = "imported"
+    RETRY_WAIT = "retry_wait"
+    FAILED = "failed"
+    QUARANTINED = "quarantined"
+
+
 #: The values ``processing_jobs.priority`` is meant to take. Lower runs first, and these
 #: three tiers are the whole ordering policy -- within a tier the claim works through the
 #: footage chronologically, so the tier is the only thing that can put one recording in
@@ -749,6 +769,189 @@ class IngestRun(Base):
     bytes_transferred: Mapped[int] = mapped_column(Integer, default=0)
     throughput_mbs_avg: Mapped[float] = mapped_column(Float, default=0.0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class OBDBundle(Base):
+    """One immutable logger export and its independent Home Assistant queue state."""
+
+    __tablename__ = "obd_bundles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    drive_id: Mapped[str] = mapped_column(String(64), index=True)
+    bundle_hash: Mapped[str] = mapped_column(String(64), index=True)
+    schema_version: Mapped[int] = mapped_column(Integer)
+    filename: Mapped[str] = mapped_column(String(255), unique=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+
+    vehicle_id: Mapped[str] = mapped_column(String(128), index=True)
+    adapter_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    logger_id: Mapped[str] = mapped_column(String(128))
+    logger_version: Mapped[str] = mapped_column(String(64))
+    drive_started_at: Mapped[datetime] = mapped_column(UtcDateTime, index=True)
+    drive_finished_at: Mapped[datetime] = mapped_column(UtcDateTime)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    diagnostic_count: Mapped[int] = mapped_column(Integer, default=0)
+    # False means the row is a durable rejection record created before an untrusted
+    # manifest could be parsed. Filename/hash/error remain authoritative; the remaining
+    # metadata fields are safe placeholders until manual validation promotes the row.
+    metadata_trusted: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+    # Kept as a string so new states can be rolled forward without SQLite having to
+    # rebuild a native Enum constraint.  Values are owned by OBDBundleState above.
+    state: Mapped[str] = mapped_column(
+        String(32), default=OBDBundleState.WAITING_FOR_BACKUP.value, index=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True, index=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_kind: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    last_http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    copied_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    import_started_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    imported_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True, index=True)
+    remote_deleted_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
+
+    duplicate: Mapped[bool] = mapped_column(Boolean, default=False)
+    ha_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    validation_warnings: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
+    drive: Mapped[OBDDrive | None] = relationship(back_populates="bundle", uselist=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "drive_id",
+            "bundle_hash",
+            "schema_version",
+            name="uq_obd_bundle_identity",
+        ),
+        Index("ix_obd_bundle_claim", "state", "next_attempt_at", "drive_started_at", "id"),
+    )
+
+
+class OBDDrive(Base):
+    """High-level drive metadata and rollups retained by the analytics server."""
+
+    __tablename__ = "obd_drives"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    bundle_id: Mapped[int] = mapped_column(
+        ForeignKey("obd_bundles.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    drive_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    vehicle_id: Mapped[str] = mapped_column(String(128), index=True)
+    started_at: Mapped[datetime] = mapped_column(UtcDateTime, index=True)
+    finished_at: Mapped[datetime] = mapped_column(UtcDateTime)
+    original_timezone: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    start_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    stop_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    obd_protocol: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    completion_status: Mapped[str] = mapped_column(String(32))
+    clean_end: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    duration_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    distance_km: Mapped[float | None] = mapped_column(Float, nullable=True)
+    average_speed_kmh: Mapped[float | None] = mapped_column(Float, nullable=True)
+    maximum_speed_kmh: Mapped[float | None] = mapped_column(Float, nullable=True)
+    average_rpm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    maximum_rpm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    idle_duration_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    estimated_fuel_used_l: Mapped[float | None] = mapped_column(Float, nullable=True)
+    average_fuel_consumption_l_100km: Mapped[float | None] = mapped_column(Float, nullable=True)
+    maximum_coolant_temperature_c: Mapped[float | None] = mapped_column(Float, nullable=True)
+    maximum_engine_load_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    missing_data_duration_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expected_sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    received_sample_percentage: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_count: Mapped[int] = mapped_column(Integer, default=0)
+    dtcs_observed: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    units: Mapped[dict] = mapped_column(JSON)
+    manifest_json: Mapped[dict] = mapped_column(JSON)
+    summary_json: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+
+    bundle: Mapped[OBDBundle] = relationship(back_populates="drive")
+    samples: Mapped[list[OBDSample]] = relationship(
+        back_populates="drive", cascade="all, delete-orphan"
+    )
+    diagnostics: Mapped[list[OBDDiagnostic]] = relationship(
+        back_populates="drive", cascade="all, delete-orphan"
+    )
+
+
+class OBDSample(Base):
+    """One logger sample.  Units are explicit in ``OBDDrive.units`` and column names."""
+
+    __tablename__ = "obd_samples"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    drive_db_id: Mapped[int] = mapped_column(
+        ForeignKey("obd_drives.id", ondelete="CASCADE"), index=True
+    )
+    sample_id: Mapped[str] = mapped_column(String(96), unique=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    captured_at: Mapped[datetime] = mapped_column(UtcDateTime, index=True)
+    ecu_data_status: Mapped[str] = mapped_column(String(32))
+
+    engine_rpm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    vehicle_speed_kmh: Mapped[float | None] = mapped_column(Float, nullable=True)
+    coolant_temperature_c: Mapped[float | None] = mapped_column(Float, nullable=True)
+    intake_air_temperature_c: Mapped[float | None] = mapped_column(Float, nullable=True)
+    engine_load_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    throttle_position_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    timing_advance_deg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mass_air_flow_g_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    short_term_fuel_trim_bank_1_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    long_term_fuel_trim_bank_1_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fuel_system_status: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    oxygen_sensors_present: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    obd_standard: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    distance_with_mil_km: Mapped[float | None] = mapped_column(Float, nullable=True)
+    oxygen_sensor_1_voltage_v: Mapped[float | None] = mapped_column(Float, nullable=True)
+    oxygen_sensor_1_short_term_fuel_trim_pct: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    oxygen_sensor_2_voltage_v: Mapped[float | None] = mapped_column(Float, nullable=True)
+    oxygen_sensor_2_short_term_fuel_trim_pct: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    adapter_voltage_v: Mapped[float | None] = mapped_column(Float, nullable=True)
+    estimated_fuel_rate_l_h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    estimated_fuel_consumption_l_100km: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quality_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    raw_json: Mapped[dict] = mapped_column(JSON)
+
+    drive: Mapped[OBDDrive] = relationship(back_populates="samples")
+
+    __table_args__ = (
+        UniqueConstraint("drive_db_id", "sequence", name="uq_obd_sample_drive_sequence"),
+        Index("ix_obd_samples_drive_time", "drive_db_id", "captured_at"),
+    )
+
+
+class OBDDiagnostic(Base):
+    """Sparse diagnostic/connection event, separate from high-frequency samples."""
+
+    __tablename__ = "obd_diagnostics"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    drive_db_id: Mapped[int] = mapped_column(
+        ForeignKey("obd_drives.id", ondelete="CASCADE"), index=True
+    )
+    event_hash: Mapped[str] = mapped_column(String(64))
+    observed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(64), index=True)
+    payload_json: Mapped[dict] = mapped_column(JSON)
+
+    drive: Mapped[OBDDrive] = relationship(back_populates="diagnostics")
+
+    __table_args__ = (
+        UniqueConstraint("drive_db_id", "event_hash", name="uq_obd_diagnostic_event"),
+    )
 
 
 class AppSetting(Base):

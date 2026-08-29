@@ -81,6 +81,51 @@ class TestMigrations:
         assert len({c.key for c in cameras}) == len(cameras)
         await dispose_engine()
 
+    async def test_stale_revision_is_backed_up_once_before_upgrade(self, app_config):
+        import asyncio
+        import sqlite3
+
+        from alembic import command
+
+        from app.db.session import alembic_config
+
+        await init_db(seed=False)
+        await dispose_engine()
+        await asyncio.to_thread(command.downgrade, alembic_config(), "0013")
+
+        await init_db(seed=False)
+        backups = sorted((app_config.data_dir / "backups").glob("pre-migration-0013-to-0014-*.db"))
+        assert len(backups) == 1
+        with sqlite3.connect(backups[0]) as connection:
+            assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+                "0013",
+            )
+
+        await dispose_engine()
+        await init_db(seed=False)
+        assert len(list((app_config.data_dir / "backups").glob("pre-migration-*.db"))) == 1
+        await dispose_engine()
+
+    async def test_backup_failure_aborts_schema_upgrade(self, app_config, monkeypatch):
+        import asyncio
+
+        from alembic import command
+
+        from app.db import backup
+        from app.db.session import alembic_config
+
+        await init_db(seed=False)
+        await dispose_engine()
+        await asyncio.to_thread(command.downgrade, alembic_config(), "0013")
+
+        def fail_backup(*_args):
+            raise OSError("backup volume is unavailable")
+
+        monkeypatch.setattr(backup, "create_pre_migration_backup", fail_backup)
+        with pytest.raises(OSError, match="backup volume"):
+            await init_db(seed=False)
+        assert current_revision() == "0013"
+
     async def test_sqlite_runs_in_wal_mode(self, migrated):
         # WAL is what makes one writer plus many readers safe, which is the whole basis
         # for choosing SQLite over Postgres here.

@@ -18,6 +18,17 @@ frontend/dist/
 frontend/.vite/
 *.tsbuildinfo
 
+# Android / Gradle
+.gradle/
+.kotlin/
+local.properties
+keystore.properties
+*.jks
+*.keystore
+*.apk
+captures/
+.cxx/
+
 # Application data — never commit a database or anyone's footage
 data/
 *.db
@@ -41,7 +52,12 @@ tests/fixtures/*.mp4
 !.env.example
 *.pem
 *.key
+*.p12
+*.pfx
+.cosign/
+.gnupg/
 credentials*
+secrets/
 smb*.conf
 
 # Editors / OS

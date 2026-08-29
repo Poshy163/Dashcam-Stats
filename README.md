@@ -51,9 +51,11 @@ interval, detection thresholds, retention limits, map tiles — is on the Settin
 | `/data` | Database, settings, thumbnails, plate crops and models. **Never** touched by retention. Back this up. |
 | `/dev/dri` | The iGPU, used for hardware video decode and AI inference. Optional — without it everything still works on CPU, just slower. |
 
-Deployment variables are `DASHCAM_DATA_DIR`, `DASHCAM_FOOTAGE_DIR`, `DASHCAM_PORT`,
-`DASHCAM_LOG_LEVEL` and `TZ`. That is the whole list — including sign-in, which is a
-setting rather than a variable. See [Sign-in](#sign-in).
+Core deployment variables are `DASHCAM_DATA_DIR`, `DASHCAM_FOOTAGE_DIR`, `DASHCAM_PORT`,
+`DASHCAM_LOG_LEVEL` and `TZ`. Sign-in remains a UI setting. The optional dashcam OBD
+pipeline adds only Home Assistant's URL, import path and a **token-file path**; the token
+itself is a Docker secret and is never a setting or database value. See
+[OBD server import](docs/obd-server-import.md).
 
 **Set `TZ` before the first scan.** The dashcam writes local wall-clock time into its
 filenames and burns it into the picture, with no zone attached, so `TZ` is what decides
@@ -248,6 +250,17 @@ What that means in practice:
 Transferred files land in the same directory the scanner already watches, so they are
 analysed like anything else with no further configuration.
 
+### OBD-II drive bundles
+
+The optional Android companion can publish an atomic OBD bundle beside its redacted
+`status.json`. The arrival backup validates and stores every five-second sample in the
+analytics database before deleting the dashcam copy. Home Assistant delivery uses a
+separate persistent queue, so an unavailable or misconfigured HA instance cannot fail or
+delay footage backup. The Backup page shows logger ownership/state, pending copies,
+validation failures and HA retries. Setup, secret handling, recovery and API controls are
+in [docs/obd-server-import.md](docs/obd-server-import.md); the companion and ownership
+cutover are in [docs/obd-dashcam-logger.md](docs/obd-dashcam-logger.md).
+
 Home Assistant integration — a REST sensor, a webhook for phone notifications, and
 optional MQTT discovery — is documented with copy-paste config in
 [`examples/homeassistant/`](examples/homeassistant/README.md).
@@ -312,6 +325,11 @@ GET  /api/ingest/status           live backup progress — also the Home Assista
 POST /api/ingest/run              pull from the head unit now
 POST /api/ingest/cancel           stop the running transfer
 GET  /api/ingest/history          past transfers
+GET  /api/obd/status              logger, verified-copy and Home Assistant queue health
+GET  /api/obd/bundles             durable OBD bundle/import rows (optional state filter)
+POST /api/obd/bundles/{id}/validate revalidate the retained copy; quarantine on failure
+POST /api/obd/bundles/{id}/retry  retry a verified failed Home Assistant import
+POST /api/obd/queue/rebuild       recover claims and register orphan verified copies
 GET  /api/settings                the settings catalogue and current values
 POST /api/scan                    scan now
 POST /api/retention/plan          evaluate retention (report-only unless enabled)

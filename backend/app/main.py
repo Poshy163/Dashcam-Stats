@@ -23,7 +23,7 @@ from starlette.responses import RedirectResponse, Response
 from app.ai.openvino_session import restore_gpu_failure_state
 from app.ai.runtime import describe_media_policy
 from app.api.errors import install_error_handlers
-from app.api.routes import auth, content, heatmap, ingest, media, osd_debug, system
+from app.api.routes import auth, content, heatmap, ingest, media, obd_import, osd_debug, system
 from app.api.schemas import HealthOut
 from app.auth import service
 from app.auth.gate import AuthGate, request_is_https
@@ -42,6 +42,7 @@ from app.db.session import dispose_engine, get_session_factory, init_db
 from app.hardware.detect import detect_hardware_async
 from app.hardware.ffmpeg import media_health
 from app.ingest import origin
+from app.ingest.ha_import_queue import get_import_worker
 from app.ingest.poller import get_poller
 from app.pipeline.stages import warm_models
 from app.workers import queue
@@ -157,6 +158,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     restore_gpu_failure_state()
     await pool.start()
     await scheduler.start()
+    # Its own durable queue: an HA outage never occupies a footage worker or changes a
+    # backup run's result.  Startup reconciles any import interrupted by the last process.
+    await get_import_worker().start()
     # Its own ticker rather than a scheduler task: the shared scheduler floors every
     # interval at thirty seconds, and the head unit is only on the network for a minute or
     # two while the engine runs.
@@ -178,6 +182,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await warm
         await get_poller().stop()
+        await get_import_worker().stop()
         await scheduler.stop()
         await pool.stop()
         with contextlib.suppress(Exception):
@@ -225,6 +230,7 @@ def create_app() -> FastAPI:
     app.include_router(heatmap.router)
     app.include_router(osd_debug.router)
     app.include_router(ingest.router)
+    app.include_router(obd_import.router)
 
     @app.get("/health", response_model=HealthOut, tags=["health"])
     async def health() -> Response:

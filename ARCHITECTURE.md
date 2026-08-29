@@ -138,7 +138,9 @@ volumes:
 
 Environment variables are deliberately minimal — `DASHCAM_DATA_DIR`, `DASHCAM_FOOTAGE_DIR`,
 `DASHCAM_PORT`, `DASHCAM_LOG_LEVEL`. Everything else is a row in `app_settings`, edited
-through the UI and applied without a restart.
+through the UI and applied without a restart. The optional OBD-to-Home-Assistant bridge is
+the security exception: its URL and token-file path are deployment configuration, while the
+bearer token exists only in a mounted secret file and is never copied into `app_settings`.
 
 Authentication used to be the exception, as `DASHCAM_AUTH_USERNAME` and
 `DASHCAM_AUTH_PASSWORD`. It is not any more, and section 9 explains why that mattered.
@@ -1086,3 +1088,44 @@ already in the code before any of this was added:
   apex is same-site to this one and can post here with the cookie attached. The gate checks
   `Origin` on cookie-authenticated writes, and over HTTPS the cookie is named
   `__Host-dashcam_session`, which no sibling host can write.
+
+---
+
+## 10. Dashcam-hosted OBD history
+
+The companion logger produces one immutable, atomically published
+`<drive_id>.obd2.zip`. Arrival backup is the trust boundary: it accepts only the four v1
+root members, verifies declared sizes and SHA-256 hashes, streams the nested gzip within
+size/ratio/record limits, then atomically retains the original under `/data/obd/verified`.
+The queue identity is `(drive_id, bundle_sha256, schema_version)`.
+
+Server SQLite is the primary five-second history. Bundle metadata, summary, sparse
+diagnostics and all samples enter under one transaction with unique drive, sample ID and
+drive-sequence constraints; the device's drive error count is preserved, and missing values
+remain SQL NULL rather than invented zeroes.
+Only then may ingest remove the dashcam copy. This operation is fenced from footage ingest,
+so a malformed bundle or unavailable logger status cannot change the footage result.
+
+Home Assistant delivery is a second persistent state machine. It sends a bounded gzip JSON
+document containing the latest sample and hourly UTC statistics, not raw samples or paths.
+Claims run oldest first, HTTP 429/5xx/network errors back off deterministically, terminal
+schema/auth errors wait for an explicit retry, and interrupted claims recover after restart.
+Revalidation precedes every delivery; corrupt retained bytes move to quarantine. Startup
+does only cheap claim recovery synchronously and scans for orphan archives in the worker so
+the retained history cannot become a growing `/health` gate.
+
+If validation fails before a manifest can be trusted, the safe filename, observed hash,
+size and redacted rejection are still durable. A repaired/newly supported quarantine copy
+is promoted in the same row only after its raw history transaction succeeds. Manual
+validation is rejected while a copy/validation/import claim is active.
+
+Hourly rows carry separate speed/RPM observation counts in addition to total sample count.
+This is necessary because overlapping-hour averages are weighted in Home Assistant and a
+missing PID is not a zero-valued observation.
+Integration intervals and expected observations are split at UTC-hour boundaries, so a
+boundary-crossing sample gap cannot charge the entire distance/runtime/fuel/missing interval
+to the earlier hour.
+
+The bearer token is intentionally absent from the data model, settings catalogue, UI and
+logs. Deployment supplies only a regular, non-symlink token file with safe permissions.
+Detailed setup and recovery are in `docs/obd-server-import.md`.

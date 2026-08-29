@@ -216,8 +216,24 @@ def alembic_config() -> AlembicConfig:
 
 
 def upgrade_to_head() -> None:
-    """Blocking. Call via ``asyncio.to_thread`` from async code."""
-    command.upgrade(alembic_config(), "head")
+    """Back up an existing stale SQLite schema, then upgrade it to Alembic head."""
+    config = get_config()
+    alembic = alembic_config()
+    if not config.database_url and config.db_path.is_file() and config.db_path.stat().st_size:
+        from alembic.script import ScriptDirectory
+
+        revision = current_revision()
+        head = ScriptDirectory.from_config(alembic).get_current_head()
+        # ``None`` is the ordinary brand-new database (SQLite may create the file while
+        # inspecting it). It contains no user schema to preserve. Any stamped, stale
+        # deployment gets exactly one backup because the next boot is already at head.
+        if revision is not None and head is not None and revision != head:
+            from app.db.backup import create_pre_migration_backup
+
+            # Deliberately outside a suppress/finally: if backup or integrity validation
+            # fails, Alembic must not touch the current database.
+            create_pre_migration_backup(revision, head)
+    command.upgrade(alembic, "head")
 
 
 def current_revision() -> str | None:

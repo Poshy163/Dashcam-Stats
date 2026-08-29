@@ -27,7 +27,7 @@ import socket
 import tarfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,9 +52,21 @@ SOCKET_TIMEOUT_S = 30.0
 
 _READ_SIZE = 1 << 20
 
+# Legacy/test callers that do not provide authoritative remote sizes are still bounded.
+# Production footage and OBD callers pass a name -> size mapping, which makes the effective
+# limits the exact inventory selected for that one tar stream.
+DEFAULT_MAX_MEMBER_BYTES = 16 * 1024 * 1024 * 1024
+DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024 * 1024
+TAR_STREAM_BASE_OVERHEAD = 64 * 1024
+TAR_STREAM_MEMBER_OVERHEAD = 2 * 1024
+
 
 class TransferCancelled(RuntimeError):
     """The operator asked for the pull to stop, or the app is shutting down."""
+
+
+class UnsafeArchiveError(RuntimeError):
+    """The stream does not match the bounded flat inventory requested from the unit."""
 
 
 @dataclass(slots=True)
@@ -85,10 +97,12 @@ class _CountingReader:
         source,
         on_bytes: Callable[[int], None] | None,
         cancel: threading.Event | None,
+        maximum: int,
     ) -> None:
         self._source = source
         self._on_bytes = on_bytes
         self._cancel = cancel
+        self._maximum = maximum
         self.total = 0
 
     def read(self, size: int = -1) -> bytes:
@@ -96,6 +110,8 @@ class _CountingReader:
             raise TransferCancelled("the transfer was cancelled")
         chunk = self._source.read(_READ_SIZE if size is None or size < 0 else size)
         if chunk:
+            if self.total + len(chunk) > self._maximum:
+                raise UnsafeArchiveError("the raw archive stream exceeds its byte limit")
             self.total += len(chunk)
             if self._on_bytes is not None:
                 self._on_bytes(len(chunk))
@@ -123,7 +139,9 @@ def receive(
     port: int,
     staging: Path,
     *,
-    expected: set[str] | None = None,
+    expected: Mapping[str, int] | set[str] | None = None,
+    max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
+    max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     on_file_started: Callable[[str], None] | None = None,
     on_file_done: Callable[[str], None] | None = None,
     on_bytes: Callable[[int], None] | None = None,
@@ -138,6 +156,25 @@ def receive(
     """
     started = time.monotonic()
     result = TransferResult()
+    if max_member_bytes < 0 or max_total_bytes < 0:
+        result.error = "archive byte limits must be non-negative"
+        return result
+    expected_names = set(expected) if expected is not None else None
+    expected_sizes: dict[str, int] | None = None
+    if isinstance(expected, Mapping):
+        expected_sizes = dict(expected)
+        if any(
+            isinstance(size, bool) or not isinstance(size, int) or size < 0
+            for size in expected_sizes.values()
+        ):
+            result.error = "the expected archive inventory contains an invalid size"
+            return result
+        max_total_bytes = min(max_total_bytes, sum(expected_sizes.values()))
+    raw_stream_limit = (
+        max_total_bytes
+        + TAR_STREAM_BASE_OVERHEAD
+        + TAR_STREAM_MEMBER_OVERHEAD * len(expected_names or ())
+    )
     if not staging.parent.is_dir():
         # Never ``parents=True``. The staging directory lives inside the footage share, so
         # creating its parent would materialise the share's own mount point and write a
@@ -158,19 +195,45 @@ def receive(
     reader: _CountingReader | None = None
     try:
         with sock, sock.makefile("rb", buffering=_READ_SIZE) as stream:
-            reader = _CountingReader(stream, on_bytes, cancel)
+            reader = _CountingReader(stream, on_bytes, cancel, raw_stream_limit)
             # ``r|`` is the streaming reader: it never seeks, which is the only thing that
             # works over a socket.
             with tarfile.open(fileobj=reader, mode="r|") as archive:
+                seen: set[str] = set()
+                copied_bytes = 0
                 for member in archive:
                     if not member.isfile():
-                        continue
+                        raise UnsafeArchiveError(
+                            f"the archive contains unsupported member type: {member.name}"
+                        )
                     name = Path(member.name).name
-                    if not name or name.startswith(".") or "/" in member.name:
+                    if (
+                        not name
+                        or name.startswith(".")
+                        or member.name != name
+                        or "/" in member.name
+                        or "\\" in member.name
+                    ):
                         # The unit is asked for a flat list of its own recordings; anything
                         # with a path in it is not something this should be writing.
-                        log.warning("skipped an unexpected archive member", member=member.name)
-                        continue
+                        raise UnsafeArchiveError(
+                            f"the archive contains an unsafe member path: {member.name}"
+                        )
+                    if expected_names is not None and name not in expected_names:
+                        raise UnsafeArchiveError(
+                            f"the archive contains an unrequested member: {name}"
+                        )
+                    if name in seen:
+                        raise UnsafeArchiveError(f"the archive repeats member: {name}")
+                    if member.size < 0 or member.size > max_member_bytes:
+                        raise UnsafeArchiveError(f"archive member {name} exceeds its byte limit")
+                    if expected_sizes is not None and member.size != expected_sizes[name]:
+                        raise UnsafeArchiveError(
+                            f"archive member {name} does not match its inventoried size"
+                        )
+                    if copied_bytes + member.size > max_total_bytes:
+                        raise UnsafeArchiveError("the archive exceeds its total byte limit")
+                    seen.add(name)
                     if on_file_started is not None:
                         on_file_started(name)
                     extracted = archive.extractfile(member)
@@ -178,8 +241,19 @@ def receive(
                         continue
                     target = staging / name
                     with open(target, "wb") as handle:
+                        member_bytes = 0
                         while chunk := extracted.read(_READ_SIZE):
+                            member_bytes += len(chunk)
+                            if member_bytes > member.size:
+                                raise UnsafeArchiveError(
+                                    f"archive member {name} exceeded its declared size"
+                                )
                             handle.write(chunk)
+                    if member_bytes != member.size:
+                        raise UnsafeArchiveError(
+                            f"archive member {name} ended before its declared size"
+                        )
+                    copied_bytes += member_bytes
                     result.files.append(name)
                     if on_file_done is not None:
                         on_file_done(name)
@@ -187,11 +261,13 @@ def receive(
             # socket that dies exactly on a 512-byte member boundary looks to tarfile like
             # the end of the archive, so the only honest test is whether everything asked
             # for actually arrived.
-            missing = (expected or set()) - set(result.files)
+            missing = (expected_names or set()) - set(result.files)
             result.complete = not missing
             if missing:
                 result.error = f"the stream ended with {len(missing)} file(s) still to come"
     except TransferCancelled as exc:
+        result.error = str(exc)
+    except UnsafeArchiveError as exc:
         result.error = str(exc)
     except (OSError, tarfile.TarError, EOFError) as exc:
         # The expected ending when the car leaves: the socket dies mid-member. Everything

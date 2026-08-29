@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 
 import { EmptyState, ErrorState, PageHeader, ProgressBar, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
-import type { IngestStatus } from '@/lib/api'
+import type { IngestStatus, OBDBundle } from '@/lib/api'
 import { formatBytes, formatDateTime, formatDuration, formatRelative } from '@/lib/format'
 
 /** How the state reads to a person, and how alarming it should look. */
@@ -53,15 +53,34 @@ export default function Backup() {
     refetchInterval: status.data?.state === 'running' ? 10_000 : 60_000,
   })
 
+  const obdStatus = useQuery({
+    queryKey: ['obd-status'],
+    queryFn: api.obd.status,
+    refetchInterval: 10_000,
+  })
+  const obdBundles = useQuery({
+    queryKey: ['obd-bundles'],
+    queryFn: () => api.obd.bundles({ pageSize: 10 }),
+    refetchInterval: 15_000,
+  })
+
   const invalidate = () => {
     client.invalidateQueries({ queryKey: ['ingest-status'] })
     client.invalidateQueries({ queryKey: ['ingest-history'] })
+    client.invalidateQueries({ queryKey: ['obd-status'] })
+    client.invalidateQueries({ queryKey: ['obd-bundles'] })
   }
   const pullNow = useMutation({ mutationFn: api.ingest.run, onSuccess: invalidate })
   const cancel = useMutation({ mutationFn: api.ingest.cancel, onSuccess: invalidate })
   // Deliberately not invalidating anything: this changes what is on the car's screen, not
   // anything this page displays.
   const showTest = useMutation({ mutationFn: api.ingest.showTest })
+  const retryObd = useMutation({ mutationFn: (id: number) => api.obd.retry(id), onSuccess: invalidate })
+  const validateObd = useMutation({
+    mutationFn: (id: number) => api.obd.validate(id),
+    onSuccess: invalidate,
+  })
+  const rebuildObd = useMutation({ mutationFn: api.obd.rebuild, onSuccess: invalidate })
 
   if (status.isError) return <ErrorState error={status.error} retry={() => status.refetch()} />
 
@@ -260,6 +279,223 @@ export default function Backup() {
           <div className="mt-1 break-words text-content-muted">{data.lastError}</div>
         </div>
       )}
+
+      <div className="mb-3 mt-8 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold">OBD telemetry</h2>
+          <p className="mt-0.5 text-sm text-content-muted">
+            Immutable drive bundles are copied separately, validated, then retried to Home
+            Assistant without holding up footage.
+          </p>
+        </div>
+        <button
+          className="btn"
+          disabled={rebuildObd.isPending}
+          onClick={() => rebuildObd.mutate()}
+        >
+          {rebuildObd.isPending ? 'Rebuilding…' : 'Rebuild OBD queue'}
+        </button>
+      </div>
+
+      {obdStatus.isError ? (
+        <ErrorState error={obdStatus.error} retry={() => obdStatus.refetch()} />
+      ) : (
+        <>
+          <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-8">
+            <StatTile
+              label="Logger"
+              value={obdStatus.data?.logger?.state ?? (data?.unitOnline ? 'Unknown' : 'Car away')}
+              hint={
+                obdStatus.data?.logger?.lastDriveFinishedAtUtc
+                  ? `last drive ${formatRelative(obdStatus.data.logger.lastDriveFinishedAtUtc)}`
+                  : 'best-effort status from the unit'
+              }
+              tone={obdStatus.data?.logger?.state === 'ecu_online' ? 'busy' : 'default'}
+            />
+            <StatTile
+              label="Waiting on camera"
+              value={String(obdStatus.data?.waitingOnUnit ?? 0)}
+              hint="completed drive bundles"
+              tone={(obdStatus.data?.waitingOnUnit ?? 0) > 0 ? 'warn' : 'ok'}
+            />
+            <StatTile
+              label="Waiting for HA"
+              value={String(obdStatus.data?.waitingForHomeAssistant ?? 0)}
+              hint={obdStatus.data?.currentImport ?? 'oldest drive is sent first'}
+              tone={(obdStatus.data?.waitingForHomeAssistant ?? 0) > 0 ? 'busy' : 'ok'}
+            />
+            <StatTile
+              label="Imported drives"
+              value={String(obdStatus.data?.importedDriveCount ?? 0)}
+              hint={
+                obdStatus.data?.lastSuccessfulHomeAssistantSync
+                  ? `last sync ${formatRelative(obdStatus.data.lastSuccessfulHomeAssistantSync)}`
+                  : 'no successful sync yet'
+              }
+              tone="ok"
+            />
+            <StatTile
+              label="Duplicate acks"
+              value={String(obdStatus.data?.duplicateCount ?? 0)}
+              hint={
+                (obdStatus.data?.copyThroughputMbs ?? 0) > 0
+                  ? `last copy ${obdStatus.data?.copyThroughputMbs.toFixed(1)} MB/s`
+                  : 'safe idempotent HA replays'
+              }
+              tone="default"
+            />
+            <StatTile
+              label="Failed bundles"
+              value={String(obdStatus.data?.failedCount ?? 0)}
+              hint={`${obdStatus.data?.importsLastHour ?? 0} imported in the last hour`}
+              tone={(obdStatus.data?.failedCount ?? 0) > 0 ? 'error' : 'ok'}
+            />
+            <StatTile
+              label="Last completed drive"
+              value={
+                obdStatus.data?.lastCompletedDrive?.driveId ??
+                obdStatus.data?.logger?.lastDriveId ??
+                'None'
+              }
+              hint={
+                obdStatus.data?.lastCompletedDrive?.driveFinishedAt
+                  ? `server copy ${formatRelative(obdStatus.data.lastCompletedDrive.driveFinishedAt)}`
+                  : obdStatus.data?.logger?.lastDriveFinishedAtUtc
+                    ? `unit ${formatRelative(obdStatus.data.logger.lastDriveFinishedAtUtc)}`
+                    : 'no completed drive observed'
+              }
+              tone={obdStatus.data?.lastCompletedDrive ? 'ok' : 'default'}
+            />
+            <StatTile
+              label="Home Assistant auth"
+              value={
+                obdStatus.data?.homeAssistantAuthentication === 'configured'
+                  ? 'Configured'
+                  : obdStatus.data?.homeAssistantAuthentication === 'invalid'
+                    ? 'Invalid'
+                    : 'Not configured'
+              }
+              hint={
+                obdStatus.data?.homeAssistantConfigurationError ??
+                'token loaded from a protected file; never displayed'
+              }
+              tone={
+                obdStatus.data?.homeAssistantAuthentication === 'configured' ? 'ok' : 'warn'
+              }
+            />
+          </div>
+
+          {obdStatus.data?.homeAssistantAuthentication !== 'configured' && (
+            <div className="card mb-6 border-state-warn/40 px-5 py-4 text-sm">
+              <div className="font-medium text-state-warn">
+                Home Assistant import is{' '}
+                {obdStatus.data?.homeAssistantAuthentication === 'invalid'
+                  ? 'misconfigured'
+                  : 'not configured'}
+              </div>
+              <div className="mt-1 text-content-muted">
+                {obdStatus.data?.homeAssistantConfigurationError ??
+                  'Set HA_URL and mount HA_TOKEN_FILE as a Docker secret. The token is never shown here.'}
+              </div>
+            </div>
+          )}
+
+          {obdStatus.data && !obdStatus.data.workerRunning && (
+            <div className="card mb-6 border-state-error/40 px-5 py-4 text-sm">
+              <div className="font-medium text-state-error">OBD import worker is not running</div>
+              <div className="mt-1 text-content-muted">
+                Verified samples remain safe on this server, but Home Assistant delivery
+                needs the service to be restarted or its server error investigated.
+              </div>
+            </div>
+          )}
+
+          {(obdStatus.data?.lastImportError || obdStatus.data?.lastCopyError) && (
+            <div className="card mb-6 px-5 py-4 text-sm">
+              <div className="font-medium text-state-warn">Last OBD problem</div>
+              <div className="mt-1 break-words text-content-muted">
+                {obdStatus.data.lastImportError ?? obdStatus.data.lastCopyError}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {obdBundles.data?.items.length ? (
+        <div className="card mb-8 overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-xs uppercase tracking-wide text-content-faint">
+                <th className="px-4 py-3 font-medium">Drive</th>
+                <th className="px-4 py-3 font-medium">Samples</th>
+                <th className="px-4 py-3 font-medium">State</th>
+                <th className="px-4 py-3 font-medium">Attempts</th>
+                <th className="px-4 py-3 font-medium"><span className="sr-only">Actions</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              {obdBundles.data.items.map((bundle: OBDBundle) => (
+                <tr key={bundle.id} className="border-t border-border">
+                  <td className="whitespace-nowrap px-4 py-3">
+                    {formatDateTime(bundle.driveStartedAt)}
+                    <div className="max-w-56 truncate text-xs text-content-faint">
+                      {bundle.driveId}
+                    </div>
+                  </td>
+                  <td className="tabular px-4 py-3">{bundle.sampleCount}</td>
+                  <td className="px-4 py-3">
+                    <span
+                      className={
+                        bundle.state === 'imported'
+                          ? 'text-state-ok'
+                          : bundle.state === 'failed' || bundle.state === 'quarantined'
+                            ? 'text-state-error'
+                            : 'text-state-warn'
+                      }
+                    >
+                      {bundle.state.replaceAll('_', ' ')}
+                    </span>
+                    {bundle.lastError && (
+                      <div className="mt-0.5 max-w-md truncate text-xs text-content-faint">
+                        {bundle.lastError}
+                      </div>
+                    )}
+                    {!bundle.metadataTrusted && (
+                      <div className="mt-0.5 text-xs text-content-faint">
+                        Manifest untrusted — repair and validate before import
+                      </div>
+                    )}
+                  </td>
+                  <td className="tabular px-4 py-3">{bundle.attempts}</td>
+                  <td className="whitespace-nowrap px-4 py-3 text-right">
+                    <button
+                      className="btn mr-2"
+                      disabled={
+                        validateObd.isPending ||
+                        ['waiting_for_backup', 'copying', 'validating', 'importing'].includes(
+                          bundle.state,
+                        )
+                      }
+                      onClick={() => validateObd.mutate(bundle.id)}
+                    >
+                      Validate
+                    </button>
+                    {['ready_to_import', 'retry_wait', 'failed'].includes(bundle.state) && (
+                      <button
+                        className="btn"
+                        disabled={retryObd.isPending}
+                        onClick={() => retryObd.mutate(bundle.id)}
+                      >
+                        Retry
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
 
       <h2 className="mb-3 text-lg font-semibold">Recent transfers</h2>
       {history.isError ? (

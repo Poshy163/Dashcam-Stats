@@ -225,6 +225,71 @@ export interface IngestRun {
   error: string | null
 }
 
+export interface OBDLoggerStatus {
+  schemaVersion?: number
+  loggerVersion?: string
+  state?: string
+  ownershipEnabled?: boolean
+  adapterState?: string
+  vehicleState?: string
+  currentDriveId?: string | null
+  lastDriveId?: string | null
+  lastDriveFinishedAtUtc?: string | null
+  pendingBundleCount?: number
+  sampleCount?: number
+  lastError?: string | null
+  lastErrorAtUtc?: string | null
+  updatedAtUtc?: string | null
+}
+
+export interface OBDBundle {
+  id: number
+  driveId: string
+  schemaVersion: number
+  bundleSha256: string
+  filename: string
+  sizeBytes: number
+  vehicleId: string
+  driveStartedAt: string
+  driveFinishedAt: string
+  sampleCount: number
+  diagnosticCount: number
+  metadataTrusted: boolean
+  state: string
+  attempts: number
+  nextAttemptAt: string | null
+  lastError: string | null
+  failureKind: string | null
+  lastHttpStatus: number | null
+  verifiedAt: string | null
+  importedAt: string | null
+  duplicate: boolean
+  warnings: string[]
+}
+
+export interface OBDStatus {
+  logger: OBDLoggerStatus | null
+  loggerCheckedAt: string | null
+  waitingOnUnit: number
+  currentBundleCopy: string | null
+  lastCopyAt: string | null
+  lastCopyError: string | null
+  copyThroughputMbs: number
+  homeAssistantAuthentication: 'configured' | 'invalid' | 'not_configured'
+  homeAssistantConfigurationError: string | null
+  counts: Record<string, number>
+  waitingForHomeAssistant: number
+  currentImport: string | null
+  lastCompletedDrive: OBDBundle | null
+  importedDriveCount: number
+  duplicateCount: number
+  failedCount: number
+  lastSuccessfulHomeAssistantSync: string | null
+  lastImportError: string | null
+  importsLastHour: number
+  workerRunning: boolean
+}
+
 export interface RecordingFilters extends Query {
   page?: number
   pageSize?: number
@@ -351,6 +416,24 @@ export const api = {
     // The URL comes back with the API key masked — it is rendered straight into the page.
     showTest: () => post<{ shown: boolean; url: string }>('/ingest/show-test'),
     history: (query?: Query) => request<Paginated<IngestRun>>('/ingest/history', { query }),
+  },
+
+  obd: {
+    status: () => request<OBDStatus>('/obd/status'),
+    bundles: (query?: Query) => request<Paginated<OBDBundle>>('/obd/bundles', { query }),
+    validate: (id: number) =>
+      post<{ valid: boolean; bundle: OBDBundle }>(`/obd/bundles/${id}/validate`),
+    retry: (id: number) =>
+      post<{ queued: boolean; alreadyImported?: boolean; bundle: OBDBundle }>(
+        `/obd/bundles/${id}/retry`,
+      ),
+    rebuild: () =>
+      post<{
+        recoveredImports: number
+        registered: number
+        duplicates: number
+        quarantined: number
+      }>('/obd/queue/rebuild'),
   },
 
   settings: {

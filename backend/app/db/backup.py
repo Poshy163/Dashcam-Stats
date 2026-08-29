@@ -55,6 +55,47 @@ def create_backup() -> Path:
     return target
 
 
+def create_pre_migration_backup(from_revision: str, to_revision: str) -> Path:
+    """Create and validate an atomic snapshot before Alembic changes an existing DB."""
+    source_path = get_config().db_path
+    if not source_path.is_file():
+        raise FileNotFoundError("Database file does not exist")
+    safe_from = "".join(char for char in from_revision if char.isalnum() or char in "-_")
+    safe_to = "".join(char for char in to_revision if char.isalnum() or char in "-_")
+    if not safe_from or not safe_to:
+        raise ValueError("Migration revisions are not safe backup filename components")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+    directory = backup_dir()
+    target = directory / f"pre-migration-{safe_from}-to-{safe_to}-{stamp}.db"
+    temporary = directory / f".{target.name}.tmp"
+    try:
+        source: sqlite3.Connection | None = None
+        destination: sqlite3.Connection | None = None
+        try:
+            source = sqlite3.connect(str(source_path))
+            destination = sqlite3.connect(str(temporary))
+            source.backup(destination)
+        finally:
+            if destination is not None:
+                destination.close()
+            if source is not None:
+                source.close()
+        validate_database(temporary)
+        with temporary.open("r+b") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        if os.name != "nt":
+            descriptor = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
 def stage_restore(data: bytes) -> Path:
     directory = backup_dir()
     temporary = directory / "restore-upload.tmp"

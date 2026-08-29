@@ -15,6 +15,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from app.config import get_config
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
 from app.ingest import adb, band, elevate, origin, radios, transport
@@ -29,6 +30,11 @@ from app.ingest.models import (
 )
 from app.ingest.models import (
     ingest_setting as _get,
+)
+from app.ingest.obd_transfer import (
+    get_obd_transfer_status,
+    inventory_remote_bundles,
+    sync_remote_bundles,
 )
 from app.ingest.status import get_status
 
@@ -223,7 +229,7 @@ async def _move(
                 host,
                 port,
                 staging,
-                expected={item.name for item in batch},
+                expected={item.name: item.size for item in batch},
                 on_file_started=status.file_started,
                 on_file_done=status.file_done,
                 on_bytes=status.add_bytes,
@@ -710,6 +716,7 @@ async def run_pull(
     staging = footage / STAGING_DIRNAME
     preflight: list[asyncio.Task] = []
     quiet: radios.RadioQuiet | None = None
+    obd_result = None
 
     try:
         # Only if nobody has already looked. The presence poll describes the unit
@@ -754,6 +761,14 @@ async def run_pull(
         # the critical path. What it answers -- how far the unit's clock is from this
         # one -- is what makes the active-segment guard mean anything at all.
         clock = _preflight(preflight, adb.unit_clock(info.address))
+        # OBD exports are a second, failure-isolated inventory.  It overlaps the footage
+        # listing and is awaited before the idle return so a visit with no new video can
+        # still deliver a completed drive.  Any exception is fenced below; telemetry must
+        # never turn a successful footage backup into a failed one.
+        obd_inventory = _preflight(
+            preflight,
+            inventory_remote_bundles(info.address, get_config().obd_remote_ready_dir),
+        )
 
         status.set_phase(Phase.SCANNING)
         sources = [info.source]
@@ -796,6 +811,11 @@ async def run_pull(
         if plan.files:
             await _drop_still_growing(info, plan, sources)
         status.plan(plan)
+        try:
+            remote_obd = await obd_inventory
+        except Exception as exc:
+            remote_obd = []
+            log.warning("could not inventory OBD exports; footage will continue", error=str(exc))
 
         # Before the idle return, not after it. A card whose whole contents the library
         # already holds produces exactly that idle run, every window, forever -- so leaving
@@ -816,7 +836,7 @@ async def run_pull(
                     "not reclaiming card space: the footage directory is not safe", reason=why
                 )
 
-        if not plan.files:
+        if not plan.files and not remote_obd:
             result = RunResult(state=RunState.IDLE)
             return result
 
@@ -853,6 +873,34 @@ async def run_pull(
             # cooldown inside `elevate` stops that retry restarting the daemon again, so
             # the second run simply transfers without root.
             result = RunResult(state=RunState.IDLE)
+            return result
+
+        # Small immutable OBD archives go first so the drive survives even if the unit's
+        # short post-ignition window closes partway through the much larger footage set.
+        # The stage owns its own temp directory, hashes, validation and DB transaction;
+        # all failures stay on its queue/status and are deliberately excluded from the
+        # footage result below.
+        if remote_obd:
+            status.set_phase(Phase.TRANSFERRING)
+            try:
+                obd_result = await sync_remote_bundles(
+                    info, ingest_status=status, remote=remote_obd
+                )
+            except Exception as exc:
+                log.exception("OBD backup failed without affecting footage", error=str(exc))
+
+        if not plan.files:
+            if obd_result is not None and (obd_result.copied or obd_result.duplicates):
+                result = RunResult(
+                    state=RunState.OK,
+                    files=obd_result.copied + obd_result.duplicates,
+                    bytes=obd_result.bytes,
+                    seconds=obd_result.seconds,
+                )
+            else:
+                # IDLE keeps the visit eligible for another drain.  The OBD status carries
+                # the validation/copy error; the footage pipeline does not inherit it.
+                result = RunResult(state=RunState.IDLE)
             return result
 
         log.info(
@@ -1033,16 +1081,19 @@ async def run_pull(
                 else RunState.ERROR
             )
         )
+        committed_footage_bytes = sum(expected[name] for name in committed)
         result = RunResult(
             state=state,
-            files=len(committed),
-            bytes=sum(expected[name] for name in committed),
-            seconds=transferred.seconds,
+            files=len(committed)
+            + (obd_result.copied + obd_result.duplicates if obd_result is not None else 0),
+            bytes=committed_footage_bytes + (obd_result.bytes if obd_result is not None else 0),
+            seconds=transferred.seconds + (obd_result.seconds if obd_result is not None else 0),
             error=None if state is RunState.OK else transferred.error,
         )
         status.set_backlog(
             max(0, plan.backlog_files - len(committed)),
-            max(0, plan.backlog_bytes - result.bytes),
+            # OBD archives share the run summary but are not footage backlog bytes.
+            max(0, plan.backlog_bytes - committed_footage_bytes),
         )
         log.info(
             "pull finished",
@@ -1096,7 +1147,12 @@ async def run_pull(
             await close_sleep_window(
                 info.address if info else "",
                 drained=result.state in (RunState.OK, RunState.IDLE)
-                and not get_status().backlog_files,
+                and not get_status().backlog_files
+                and not get_obd_transfer_status().snapshot()["waiting_on_unit"],
+                # A quarantined/interrupted OBD export is still data on the unit even
+                # when the footage delta is empty.  Leave the visit open for a re-drain.
+                # (Folded into the bool here rather than changing close_sleep_window's
+                # public contract.)
             )
 
     return result

@@ -41,6 +41,17 @@ def _tar_bytes(files: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
+def _tar_member_bytes(files: list[tuple[str, bytes]]) -> bytes:
+    """Build a stream which can intentionally contain duplicate member names."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name, payload in files:
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    return buffer.getvalue()
+
+
 class FakeProcess:
     """Stands in for the `adb shell` child that carries the listener."""
 
@@ -316,9 +327,106 @@ class TestTheTransport:
 
         result = transport.receive("127.0.0.1", port, tmp_path)
 
-        assert result.files == ["good.ts"]
+        assert result.files == []
+        assert "unsafe member path" in (result.error or "")
         assert not (tmp_path.parent / "passwd").exists()
         assert not (Path("/etc") / "passwd").is_symlink()
+
+    async def test_non_file_member_aborts_without_streaming_its_payload(self, tmp_path):
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            member = tarfile.TarInfo("unexpected-link")
+            member.type = tarfile.SYMTYPE
+            member.linkname = "elsewhere"
+            archive.addfile(member)
+        port = _serve(buffer.getvalue())
+
+        result = transport.receive("127.0.0.1", port, tmp_path)
+
+        assert result.files == []
+        assert "unsupported member type" in (result.error or "")
+        assert list(tmp_path.iterdir()) == []
+
+    def test_counting_reader_aborts_continuous_raw_bytes_at_stream_ceiling(self):
+        class Continuous:
+            def read(self, size):
+                return b"x" * size
+
+            def close(self):
+                return None
+
+        reader = transport._CountingReader(Continuous(), None, None, 2048)
+
+        assert len(reader.read(1024)) == 1024
+        assert len(reader.read(1024)) == 1024
+        with pytest.raises(transport.UnsafeArchiveError, match="raw archive stream"):
+            reader.read(1)
+
+    @pytest.mark.parametrize(
+        ("payload", "expected", "member_limit", "total_limit", "error"),
+        [
+            (
+                [("surprise.ts", b"x" * 8), ("good.ts", b"yes")],
+                {"good.ts": 3},
+                1024,
+                1024,
+                "unrequested",
+            ),
+            (
+                [("good.ts", b"larger-than-inventory")],
+                {"good.ts": 3},
+                1024,
+                1024,
+                "inventoried size",
+            ),
+            (
+                [("good.ts", b"one"), ("good.ts", b"two")],
+                {"good.ts": 3},
+                1024,
+                1024,
+                "repeats",
+            ),
+            (
+                [("large.ts", b"1234")],
+                {"large.ts"},
+                3,
+                1024,
+                "member large.ts exceeds",
+            ),
+            (
+                [("one.ts", b"123"), ("two.ts", b"456")],
+                {"one.ts", "two.ts"},
+                1024,
+                5,
+                "total byte limit",
+            ),
+        ],
+    )
+    async def test_hostile_archive_is_bounded_before_member_write(
+        self,
+        tmp_path,
+        payload,
+        expected,
+        member_limit,
+        total_limit,
+        error,
+    ):
+        port = _serve(_tar_member_bytes(payload))
+
+        result = transport.receive(
+            "127.0.0.1",
+            port,
+            tmp_path,
+            expected=expected,
+            max_member_bytes=member_limit,
+            max_total_bytes=total_limit,
+        )
+
+        assert not result.complete
+        assert error in (result.error or "")
+        if error in {"unrequested", "inventoried size", "member large.ts exceeds"}:
+            assert list(tmp_path.iterdir()) == []
+        assert "two.ts" not in result.files
 
 
 class TestSingleFlight:
@@ -1279,6 +1387,38 @@ class TestARunEndToEnd:
         for name in landed:
             assert (footage / name).read_bytes() == unit.payload[name], "a partial file landed"
         assert list((footage / STAGING_DIRNAME).iterdir()) == [], "staging was left dirty"
+
+    async def test_obd_bytes_do_not_reduce_the_footage_backlog(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """Telemetry shares the run summary, but never the footage backlog counter."""
+        from app.ingest import puller
+        from app.ingest.models import RemoteFile, RunState
+        from app.ingest.obd_transfer import OBDTransferResult
+        from app.ingest.status import get_status
+
+        blob = _tar_bytes(unit.payload)
+        unit.served["truncate"] = len(blob) // 2
+
+        async def obd_inventory(_address, source):
+            return [RemoteFile("drive-1.obd2.zip", 1_000_000, 0, source)]
+
+        async def obd_sync(_info, **_kwargs):
+            return OBDTransferResult(copied=1, bytes=1_000_000, seconds=0.1)
+
+        monkeypatch.setattr(puller, "inventory_remote_bundles", obd_inventory)
+        monkeypatch.setattr(puller, "sync_remote_bundles", obd_sync)
+        await self._enable()
+
+        result = await puller.run_pull(trigger="manual")
+
+        landed_footage_bytes = sum(
+            path.stat().st_size for path in app_config.footage_dir.glob("*.ts")
+        )
+        expected_footage_backlog = sum(map(len, unit.payload.values())) - landed_footage_bytes
+        assert result.state is RunState.PARTIAL
+        assert result.bytes == landed_footage_bytes + 1_000_000
+        assert get_status().backlog_bytes == expected_footage_backlog
 
     async def test_an_unmounted_share_stops_the_run_before_anything_moves(
         self, db_session, unit, app_config
