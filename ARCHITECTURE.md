@@ -1129,3 +1129,15 @@ to the earlier hour.
 The bearer token is intentionally absent from the data model, settings catalogue, UI and
 logs. Deployment supplies only a regular, non-symlink token file with safe permissions.
 Detailed setup and recovery are in `docs/obd-server-import.md`.
+
+Because Home Assistant keeps only hourly statistics long-term and cannot be backdated,
+the server is also the presentation layer for full resolution: `/api/obd/drives`,
+`/drives/summary`, `/drives/{id}/series` and `/drives/for-journey/{id}` back the **OBD
+drives** pages, which chart every retained sample and join drives to footage journeys by
+UTC span overlap. Ingest coordinates with the on-unit logger rather than competing with
+it: radio quieting yields to the logger's published Bluetooth ownership in every state,
+receipt success requires an independent readback of the final receipt path before the
+only source copy may be deleted, and a pull that fails while the unit stays online
+retries on a bounded 15/30/60 s schedule instead of waiting for the next drive. The
+connective map of all three codebases — logger, server, HA integration — is
+`docs/obd-system-overview.md`.
