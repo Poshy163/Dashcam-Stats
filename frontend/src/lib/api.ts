@@ -267,6 +267,56 @@ export interface OBDBundle {
   warnings: string[]
 }
 
+export interface OBDDriveSummary {
+  driveId: string
+  vehicleId: string
+  startedAt: string
+  finishedAt: string
+  originalTimezone: string | null
+  completionStatus: string
+  cleanEnd: boolean
+  durationS: number | null
+  distanceKm: number | null
+  averageSpeedKmh: number | null
+  maximumSpeedKmh: number | null
+  averageRpm: number | null
+  maximumRpm: number | null
+  idleDurationS: number | null
+  estimatedFuelUsedL: number | null
+  averageFuelConsumptionL100km: number | null
+  maximumCoolantTemperatureC: number | null
+  receivedSamplePercentage: number | null
+  sampleCount: number
+  errorCount: number
+  dtcsObserved: string[]
+  importState: string
+}
+
+export interface OBDSeriesSample {
+  t: string
+  sequence: number
+  engineRpm: number | null
+  vehicleSpeedKmh: number | null
+  coolantTemperatureC: number | null
+  intakeAirTemperatureC: number | null
+  engineLoadPct: number | null
+  throttlePositionPct: number | null
+  timingAdvanceDeg: number | null
+  massAirFlowGS: number | null
+  shortTermFuelTrimPct: number | null
+  longTermFuelTrimPct: number | null
+  oxygenSensor1VoltageV: number | null
+  adapterVoltageV: number | null
+  estimatedFuelRateLH: number | null
+}
+
+export interface OBDDriveSeries {
+  drive: OBDDriveSummary
+  units: Record<string, string>
+  samples: OBDSeriesSample[]
+  diagnostics: { observedAt: string | null; kind: string; payload: Record<string, unknown> }[]
+}
+
 export interface OBDStatus {
   logger: OBDLoggerStatus | null
   loggerCheckedAt: string | null
@@ -421,6 +471,9 @@ export const api = {
   obd: {
     status: () => request<OBDStatus>('/obd/status'),
     bundles: (query?: Query) => request<Paginated<OBDBundle>>('/obd/bundles', { query }),
+    drives: (query?: Query) => request<Paginated<OBDDriveSummary>>('/obd/drives', { query }),
+    driveSeries: (driveId: string) =>
+      request<OBDDriveSeries>(`/obd/drives/${encodeURIComponent(driveId)}/series`),
     validate: (id: number) =>
       post<{ valid: boolean; bundle: OBDBundle }>(`/obd/bundles/${id}/validate`),
     retry: (id: number) =>

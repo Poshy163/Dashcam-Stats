@@ -21,6 +21,7 @@ const LIBRARY_NAV: NavItem[] = [
   { to: '/journeys', label: 'Journeys', icon: RouteIcon },
   { to: '/heatmap', label: 'Map', icon: HeatIcon },
   { to: '/telemetry-health', label: 'Telemetry health', icon: PulseIcon },
+  { to: '/obd', label: 'OBD drives', icon: GaugeIcon },
   { to: '/plates', label: 'Plates', icon: PlateIcon },
   { to: '/vehicles', label: 'Vehicles', icon: CarIcon },
 ]
@@ -341,6 +342,9 @@ function HeatIcon({ className }: IconProps) {
 }
 function PulseIcon({ className }: IconProps) {
   return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M2 10h3l2-5 3.5 10 2.5-7 1.5 2H18" strokeLinecap="round" strokeLinejoin="round" /></svg>
+}
+function GaugeIcon({ className }: IconProps) {
+  return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M3 14a7.5 7.5 0 1 1 14 0" strokeLinecap="round" /><path d="M10 13.5 13.5 8" strokeLinecap="round" /><circle cx="10" cy="14" r="1.2" /></svg>
 }
 function PlateIcon({ className }: IconProps) {
   return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><rect x="1.5" y="5" width="17" height="10" rx="1.5" /><path d="M5 9v2M8 9v2M11 9v2M14 9v2" strokeLinecap="round" /></svg>

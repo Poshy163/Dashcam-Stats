@@ -129,10 +129,18 @@ The same controls are available over the authenticated API:
 ```text
 GET  /api/obd/status
 GET  /api/obd/bundles?state=retry_wait
+GET  /api/obd/drives
+GET  /api/obd/drives/{drive_id}/series
 POST /api/obd/bundles/{id}/validate
 POST /api/obd/bundles/{id}/retry
 POST /api/obd/queue/rebuild
 ```
+
+The two `drives` endpoints back the **OBD drives** page. Home Assistant's long-term
+statistics are hourly and its state machine cannot be backdated, so the full 5-second
+sample resolution is only reachable here: the list returns each drive's stored rollups,
+and `series` returns every retained sample (ordered by sequence, original UTC timestamps)
+plus the drive's sparse diagnostic events for charting.
 
 - Use **Validate** after investigating a retained copy. A failed revalidation moves the
   bytes to quarantine and disables HA retry. Pre-registration rejection rows are explicitly

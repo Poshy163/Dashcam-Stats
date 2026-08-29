@@ -18,6 +18,8 @@ const Journeys = lazy(() => import('@/pages/Journeys'))
 const Heatmap = lazy(() => import('@/pages/Heatmap'))
 const TelemetryHealth = lazy(() => import('@/pages/TelemetryHealth'))
 const JourneyDetail = lazy(() => import('@/pages/JourneyDetail'))
+const ObdDrives = lazy(() => import('@/pages/ObdDrives'))
+const ObdDriveDetail = lazy(() => import('@/pages/ObdDriveDetail'))
 const Plates = lazy(() => import('@/pages/Plates'))
 const PlateDetail = lazy(() => import('@/pages/PlateDetail'))
 const Vehicles = lazy(() => import('@/pages/Vehicles'))
@@ -94,6 +96,8 @@ export default function App() {
             <Route path="/journeys/:id" element={<JourneyDetail />} />
             <Route path="/heatmap" element={<Heatmap />} />
             <Route path="/telemetry-health" element={<TelemetryHealth />} />
+            <Route path="/obd" element={<ObdDrives />} />
+            <Route path="/obd/:driveId" element={<ObdDriveDetail />} />
             <Route path="/plates" element={<Plates />} />
             <Route path="/plates/:id" element={<PlateDetail />} />
             <Route path="/vehicles" element={<Vehicles />} />

@@ -2708,3 +2708,64 @@ class TestTransferIsolation:
 
 async def _async_value(value):
     return value
+
+
+class TestDriveSeriesApi:
+    """The dashboard's drive list and full-resolution chart data.
+
+    HA keeps hourly statistics forever and nothing finer; the server keeps every sample.
+    These endpoints are what makes that retained resolution actually reachable.
+    """
+
+    async def test_drive_list_and_series_return_every_sample(self, db_session, app_config, client):
+        samples = [_sample("drive_series_api", sequence) for sequence in range(5)]
+        diagnostics = [
+            {
+                "diagnostic_id": "diag_series_confirmed",
+                "drive_id": "drive_series_api",
+                "timestamp_utc": BASE.isoformat(),
+                "kind": "confirmed_dtcs",
+                "payload": {"codes": ["P0420"]},
+            }
+        ]
+        path = make_bundle(
+            app_config.obd_verified_dir,
+            "drive_series_api",
+            samples=samples,
+            diagnostics=diagnostics,
+        )
+        checked = validate_bundle(path, config=app_config)
+        async with session_scope() as session:
+            await store_validated_bundle(session, checked)
+
+        listing = await client.get("/api/obd/drives")
+        assert listing.status_code == 200
+        body = listing.json()
+        assert body["total"] == 1
+        item = body["items"][0]
+        assert item["drive_id"] == "drive_series_api"
+        assert item["vehicle_id"] == "tiida_c11"
+        assert item["sample_count"] == 5
+        assert item["import_state"] == OBDBundleState.READY_TO_IMPORT.value
+
+        series = await client.get("/api/obd/drives/drive_series_api/series")
+        assert series.status_code == 200
+        payload = series.json()
+        assert payload["drive"]["drive_id"] == "drive_series_api"
+        assert [item["sequence"] for item in payload["samples"]] == [0, 1, 2, 3, 4]
+        assert [item["engine_rpm"] for item in payload["samples"]] == [900, 1000, 1100, 1200, 1300]
+        assert [item["vehicle_speed_kmh"] for item in payload["samples"]] == [20, 21, 22, 23, 24]
+        assert payload["samples"][0]["t"] == BASE.isoformat()
+        assert payload["samples"][1]["t"] == (BASE + timedelta(seconds=5)).isoformat()
+        assert payload["samples"][0]["adapter_voltage_v"] == 14.1
+        assert payload["diagnostics"] == [
+            {
+                "observed_at": BASE.isoformat(),
+                "kind": "confirmed_dtcs",
+                "payload": {"codes": ["P0420"]},
+            }
+        ]
+
+    async def test_unknown_drive_series_is_a_404(self, db_session, client):
+        response = await client.get("/api/obd/drives/drive_missing/series")
+        assert response.status_code == 404

@@ -7,9 +7,10 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, select, update
+from sqlalchemy.orm import joinedload
 
 from app.api.deps import PaginationDep, RowId, SessionDep
-from app.db.models import OBDBundle, OBDBundleState, utcnow
+from app.db.models import OBDBundle, OBDBundleState, OBDDiagnostic, OBDDrive, OBDSample, utcnow
 from app.ingest.ha_import_queue import (
     configuration_status,
     get_import_worker,
@@ -78,6 +79,135 @@ def _bundle(row: OBDBundle) -> dict[str, object]:
         "imported_at": row.imported_at.isoformat() if row.imported_at else None,
         "duplicate": row.duplicate,
         "warnings": row.validation_warnings or [],
+    }
+
+
+def _drive(row: OBDDrive) -> dict[str, object]:
+    return {
+        "drive_id": row.drive_id,
+        "vehicle_id": row.vehicle_id,
+        "started_at": row.started_at.isoformat(),
+        "finished_at": row.finished_at.isoformat(),
+        "original_timezone": row.original_timezone,
+        "completion_status": row.completion_status,
+        "clean_end": row.clean_end,
+        "duration_s": row.duration_s,
+        "distance_km": row.distance_km,
+        "average_speed_kmh": row.average_speed_kmh,
+        "maximum_speed_kmh": row.maximum_speed_kmh,
+        "average_rpm": row.average_rpm,
+        "maximum_rpm": row.maximum_rpm,
+        "idle_duration_s": row.idle_duration_s,
+        "estimated_fuel_used_l": row.estimated_fuel_used_l,
+        "average_fuel_consumption_l_100km": row.average_fuel_consumption_l_100km,
+        "maximum_coolant_temperature_c": row.maximum_coolant_temperature_c,
+        "received_sample_percentage": row.received_sample_percentage,
+        "sample_count": row.sample_count,
+        "error_count": row.error_count,
+        "dtcs_observed": row.dtcs_observed or [],
+        # The queue row's state says how far along the HA hand-off is; the drive row
+        # itself only exists once validation and registration have already succeeded.
+        "import_state": row.bundle.state,
+    }
+
+
+def _series_sample(row: OBDSample) -> dict[str, object]:
+    return {
+        "t": row.captured_at.isoformat(),
+        "sequence": row.sequence,
+        "engine_rpm": row.engine_rpm,
+        "vehicle_speed_kmh": row.vehicle_speed_kmh,
+        "coolant_temperature_c": row.coolant_temperature_c,
+        "intake_air_temperature_c": row.intake_air_temperature_c,
+        "engine_load_pct": row.engine_load_pct,
+        "throttle_position_pct": row.throttle_position_pct,
+        "timing_advance_deg": row.timing_advance_deg,
+        "mass_air_flow_g_s": row.mass_air_flow_g_s,
+        "short_term_fuel_trim_pct": row.short_term_fuel_trim_bank_1_pct,
+        "long_term_fuel_trim_pct": row.long_term_fuel_trim_bank_1_pct,
+        "oxygen_sensor_1_voltage_v": row.oxygen_sensor_1_voltage_v,
+        "adapter_voltage_v": row.adapter_voltage_v,
+        "estimated_fuel_rate_l_h": row.estimated_fuel_rate_l_h,
+    }
+
+
+@router.get("/drives", summary="List imported drives with their rollups")
+async def list_drives(session: SessionDep, page: PaginationDep) -> dict[str, object]:
+    total = int((await session.execute(select(func.count(OBDDrive.id)))).scalar() or 0)
+    rows = (
+        (
+            await session.execute(
+                select(OBDDrive)
+                .options(joinedload(OBDDrive.bundle))
+                .order_by(OBDDrive.started_at.desc(), OBDDrive.id.desc())
+                .offset(page.offset)
+                .limit(page.page_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "items": [_drive(row) for row in rows],
+        "total": total,
+        "page": page.page,
+        "page_size": page.page_size,
+        "pages": page.pages(total),
+    }
+
+
+@router.get(
+    "/drives/{drive_id}/series",
+    summary="Full-resolution samples and diagnostic events for one drive",
+)
+async def drive_series(drive_id: str, session: SessionDep) -> dict[str, object]:
+    drive = (
+        (
+            await session.execute(
+                select(OBDDrive)
+                .options(joinedload(OBDDrive.bundle))
+                .where(OBDDrive.drive_id == drive_id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if drive is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "OBD drive was not found")
+    samples = (
+        (
+            await session.execute(
+                select(OBDSample)
+                .where(OBDSample.drive_db_id == drive.id)
+                .order_by(OBDSample.sequence.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    diagnostics = (
+        (
+            await session.execute(
+                select(OBDDiagnostic)
+                .where(OBDDiagnostic.drive_db_id == drive.id)
+                .order_by(OBDDiagnostic.observed_at.asc(), OBDDiagnostic.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "drive": _drive(drive),
+        "units": drive.units,
+        "samples": [_series_sample(row) for row in samples],
+        "diagnostics": [
+            {
+                "observed_at": row.observed_at.isoformat() if row.observed_at else None,
+                "kind": row.kind,
+                "payload": row.payload_json,
+            }
+            for row in diagnostics
+        ],
     }
 
 
