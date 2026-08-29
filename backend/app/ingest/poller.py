@@ -50,6 +50,15 @@ MIN_POLL_S = 1.0
 #: every five minutes. Thirty seconds is well inside that and costs one `stat` of the card.
 IDLE_RECHECK_S = 30.0
 
+#: Delays before retrying a failed pull while the same unit remains online.
+#:
+#: A transfer can fail for a one-off reason (the observed case was a receive timeout with
+#: the ADB socket still reachable), so requiring the unit to disappear before trying again
+#: strands a ready bundle indefinitely.  The finite schedule gives transient failures
+#: another chance without turning a persistently broken unit into an unbounded retry loop.
+#: The budget is reset when the visit ends or a non-error result is observed.
+ERROR_RETRY_DELAYS_S = (15.0, 30.0, 60.0)
+
 
 class IngestPoller:
     def __init__(self) -> None:
@@ -58,6 +67,8 @@ class IngestPoller:
         self._was_online = False
         #: When the last run that found nothing finished, so the re-check can back off.
         self._idle_since: float = 0.0
+        #: Retries already started for consecutive errors during this online visit.
+        self._error_retries_started = 0
         #: The unit as this visit first described it, kept only while the arrival gate is
         #: holding. See the note in :meth:`_loop`; cleared the moment the port goes quiet.
         self._visit_info: UnitInfo | None = None
@@ -115,9 +126,11 @@ class IngestPoller:
         the car sits there -- so that one waits out :data:`IDLE_RECHECK_S`, which is well
         inside the five minutes it takes the camera to close another segment.
 
-        Errors and offline runs are left to the arrival transition rather than retried in a
-        loop; a unit that is answering its ADB port but failing every pull should not have
-        that failure driven at it on a timer.
+        A failed run gets a small, finite retry budget during the same online visit. A
+        receive timeout does not mean the ready files disappeared, and waiting for another
+        offline/online edge can strand them for a whole day. The delays grow between tries
+        and the budget stops after :data:`ERROR_RETRY_DELAYS_S`, so a persistently broken
+        unit is not driven in a hot loop.
 
         The run that moved files waits out a cooldown first. Each run quiets the unit's
         Bluetooth and hotspot and restores them on the way out, so going again the instant
@@ -127,6 +140,11 @@ class IngestPoller:
         cooldown leaves the radios on, and the screen alone, for a minute between passes;
         the sweeps inside the run itself catch most of what used to need a re-drain anyway.
         """
+        if status.state is not RunState.ERROR:
+            # Success (or any other explicit outcome) ends an error streak. CANCELLED is
+            # still terminal below; clearing an old error budget does not restart it.
+            self._error_retries_started = 0
+
         if status.state is RunState.IDLE:
             now = time.monotonic()
             if self._idle_since and now - self._idle_since < IDLE_RECHECK_S:
@@ -136,6 +154,14 @@ class IngestPoller:
         if status.state in (RunState.OK, RunState.PARTIAL):
             self._idle_since = 0.0
             return status.since_finished() >= self._redrain_cooldown_s()
+        if status.state is RunState.ERROR:
+            if self._error_retries_started >= len(ERROR_RETRY_DELAYS_S):
+                return False
+            delay = ERROR_RETRY_DELAYS_S[self._error_retries_started]
+            if status.since_finished() < delay:
+                return False
+            self._error_retries_started += 1
+            return True
         # CANCELLED is deliberately not in that list. Somebody pressed Stop; starting the
         # same transfer again two seconds later is not a re-drain, it is ignoring them.
         return False
@@ -213,6 +239,7 @@ class IngestPoller:
                 if not self._enabled():
                     status.set_state(RunState.DISABLED)
                     self._was_online = False
+                    self._error_retries_started = 0
                     self._visit_info = None
                     await asyncio.sleep(max(MIN_POLL_S, 15.0))
                     continue
@@ -228,6 +255,7 @@ class IngestPoller:
                     status.set_unit_online(False)
                     status.set_state(RunState.OFFLINE)
                     self._was_online = False
+                    self._error_retries_started = 0
                     # The visit is over, so the next one may ask for its own sleep. Kept
                     # here rather than in the run: a run that ended because the car left
                     # cannot tell that from one that ended because it had finished.
@@ -255,15 +283,17 @@ class IngestPoller:
                 # empty-card re-check could never actually start a pull -- the unit was
                 # re-probed every thirty seconds forever and nothing was ever fetched.
                 drain_again = self._was_online and self._should_drain_again(status)
-                # Only from a state that describes a healthy visit. The early return skips
-                # `probe_unit`, which is also the only thing that notices a unit that has
-                # gone UNAUTHORIZED or dropped its adb transport -- so taking it from any
-                # state would leave the Backup page reporting the last good one forever
-                # while `_was_online` stayed True and no pull could ever start again.
+                # Healthy results wait here for their normal re-drain clock. ERROR waits
+                # here for its bounded retry clock (or permanently once that visit's retry
+                # budget is exhausted), instead of reconnecting ADB on every poll tick.
+                # The cheap socket check above still notices the visit ending, and a due
+                # retry takes the full probe path before it starts. Other failure states
+                # deliberately keep probing so an authorization/card-state change is seen.
                 if (
                     self._was_online
                     and not drain_again
-                    and status.state in (RunState.IDLE, RunState.OK, RunState.PARTIAL)
+                    and status.state
+                    in (RunState.IDLE, RunState.OK, RunState.PARTIAL, RunState.ERROR)
                 ):
                     # Cheap and non-destructive, and throttled inside: this is what keeps
                     # the recorder-health card current on a unit that stays present.
@@ -287,6 +317,7 @@ class IngestPoller:
                 elif not info.online:
                     status.set_state(RunState.OFFLINE)
                     self._was_online = False
+                    self._error_retries_started = 0
                 else:
                     if not self._was_online:
                         # If a previous window ended with the unit's radios still off --
@@ -322,6 +353,7 @@ class IngestPoller:
                                 "the head unit appeared; starting a pull", address=info.address
                             )
                             self._idle_since = 0.0
+                            self._error_retries_started = 0
                             # Not awaited: a pull runs for as long as the window lasts and
                             # the poll has to keep ticking underneath it. `start_run` keeps
                             # the reference so the task cannot be collected and shutdown can
@@ -353,7 +385,16 @@ class IngestPoller:
                         # A 13.5 GB run takes seven minutes, and the camera writes about
                         # 2 MB/s while it does, so that one window alone left ~840 MB behind
                         # with the car still sitting on the driveway.
-                        log.info("the head unit is still here; looking for more to copy")
+                        if status.state is RunState.ERROR:
+                            log.warning(
+                                "the previous automatic pull failed while the head unit "
+                                "remained online; retrying",
+                                retry=self._error_retries_started,
+                                retry_limit=len(ERROR_RETRY_DELAYS_S),
+                                last_error=status.last_error,
+                            )
+                        else:
+                            log.info("the head unit is still here; looking for more to copy")
                         puller.start_run(trigger="auto", info=info, continuation=True)
                     # `_was_online` is set the moment a pull actually starts (above), not
                     # merely because the unit is present -- otherwise the arrival gate's
@@ -371,6 +412,7 @@ class IngestPoller:
             except Exception as exc:
                 log.debug("ingest poll failed", error=f"{type(exc).__name__}: {exc}")
                 self._was_online = False
+                self._error_retries_started = 0
                 # Cleared wherever `_was_online` is, because the two together are what
                 # decides whether the next tick reuses a describe. Left armed on this path,
                 # a transient adb failure -- or the feature being switched off and back on

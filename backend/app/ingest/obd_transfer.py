@@ -289,6 +289,20 @@ async def write_verification_receipt(
     )
     await adb.shell(address, command, timeout=10.0)
 
+    # Do not treat completion of the mutating shell session as proof that the final path is
+    # readable. ADB can disappear after the partial write or around the rename, and its
+    # client-side result cannot authorise deletion of the only source copy. Re-open the
+    # final receipt in a separate authoritative shell round trip and compare its exact
+    # canonical bytes before returning success to the deletion path.
+    readback_command = (
+        f"[ -f '{target}' ] && [ ! -L '{target}' ] && "
+        f"[ \"$(wc -c < '{target}')\" -eq {body_size} ] && "
+        f"cat '{target}'"
+    )
+    readback = await adb.shell(address, readback_command, timeout=10.0)
+    if readback != body:
+        raise adb.AdbError("verification receipt final readback content mismatch")
+
 
 def _clean_staging(config: AppConfig) -> None:
     root = config.obd_staging_dir.resolve()

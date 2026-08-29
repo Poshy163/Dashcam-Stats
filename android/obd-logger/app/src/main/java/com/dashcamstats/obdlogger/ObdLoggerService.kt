@@ -257,17 +257,62 @@ class ObdLoggerService : Service() {
         lifecycle: EngineLifecycle,
     ) {
         val diagnosticScan = DiagnosticScan(elm, driveId)
+        val malformedLivePids = LivePidMalformedTracker()
         var sequence = 0L
         while (scope.isActive) {
             val cycleStarted = SystemClock.elapsedRealtime()
             val requested = ObdPollPlan.requestedPids(sequence, supported)
             val values = linkedMapOf<String, Any>()
             val missing = mutableListOf<Int>()
-            for (pid in requested) {
-                val decoded = elm.query(pid)
-                if (decoded.isEmpty()) missing += pid else values.putAll(decoded)
+            for ((requestedIndex, pid) in requested.withIndex()) {
+                if (malformedLivePids.isMalformed(pid)) {
+                    missing += pid
+                    continue
+                }
+                val result = try {
+                    pollLivePid(pid, elm::query)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    persistPartialSample(
+                        driveId,
+                        sequence,
+                        values,
+                        missing + requested.drop(requestedIndex),
+                    )
+                    throw error
+                }
+                when (result) {
+                    LivePidPollResult.Missing -> {
+                        missing += pid
+                    }
+                    is LivePidPollResult.Values -> {
+                        values.putAll(result.decoded)
+                    }
+                    is LivePidPollResult.Malformed -> {
+                        missing += pid
+                        val message = safeError(result.error)
+                        if (malformedLivePids.markMalformed(pid)) {
+                            database.incrementError(driveId)
+                            database.addDiagnostic(
+                                driveId,
+                                "parser_failure",
+                                JSONObject()
+                                    .put("category", "live_pid_%02X".format(pid))
+                                    .put("message", message)
+                            )
+                        }
+                    }
+                }
             }
-            elm.readVoltage()?.let { values["adapter_voltage"] = it }
+            try {
+                elm.readVoltage()?.let { values["adapter_voltage"] = it }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                persistPartialSample(driveId, sequence, values, missing)
+                throw error
+            }
             values.putAll(ElmProtocol.estimates(values))
             val sampleTimestamp = Instant.now().toString()
             database.addSample(
@@ -294,6 +339,24 @@ class ObdLoggerService : Service() {
             publish("ecu_online", config)
             delay((5_000 - (SystemClock.elapsedRealtime() - cycleStarted)).coerceAtLeast(0))
         }
+    }
+
+    private fun persistPartialSample(
+        driveId: String,
+        sequence: Long,
+        observedValues: Map<String, Any>,
+        missingPids: List<Int>,
+    ) {
+        if (observedValues.isEmpty()) return
+        val values = LinkedHashMap(observedValues)
+        values.putAll(ElmProtocol.estimates(values))
+        partialSampleAfterTransportFailure(
+            driveId = driveId,
+            sequence = sequence,
+            timestampUtc = Instant.now().toString(),
+            values = values,
+            missingPids = missingPids,
+        )?.let(database::addSample)
     }
 
     private data class DiagnosticStep(

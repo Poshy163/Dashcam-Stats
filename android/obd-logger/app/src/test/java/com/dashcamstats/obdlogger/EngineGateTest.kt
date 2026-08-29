@@ -1,8 +1,10 @@
 package com.dashcamstats.obdlogger
 
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.file.Files
@@ -59,6 +61,71 @@ class EngineGateTest {
         assertEquals(listOf(0x0C, 0x03, 0x15, 0x13, 0x1C, 0x21), queried)
         assertTrue(missing.isEmpty())
         assertEquals(listOf(0x0C), ObdPollPlan.requestedPids(sequence = 1, supported = supported))
+    }
+
+    @Test
+    fun malformedOptionalLivePidIsMissingAndDoesNotPoisonTheNextPid() = runTest {
+        val queried = mutableListOf<Int>()
+        val malformed = pollLivePid(0x15) { pid ->
+            queried += pid
+            val badChecksum = "48\r6B\r10\r41\r15\r80\r00\r>"
+            val payload = ElmProtocol.requirePayload(badChecksum, "0115", pid, 2, 0x10).second
+            ElmProtocol.decode(pid, payload)
+        }
+        assertTrue(malformed is LivePidPollResult.Malformed)
+
+        val next = pollLivePid(0x0C) { pid ->
+            queried += pid
+            mapOf("engine_rpm" to 850.0)
+        }
+        assertEquals(listOf(0x15, 0x0C), queried)
+        assertEquals(
+            mapOf("engine_rpm" to 850.0),
+            (next as LivePidPollResult.Values).decoded,
+        )
+    }
+
+    @Test
+    fun livePidPollerNeverDowngradesTransportFailuresToMissingValues() {
+        val disconnected = assertThrows(ElmException::class.java) {
+            runTest {
+                pollLivePid(0x15) { throw ElmException("BLE disconnected") }
+            }
+        }
+        assertEquals("BLE disconnected", disconnected.message)
+    }
+
+    @Test
+    fun malformedLivePidIsSuppressedForTheRestOfTheConnection() {
+        val tracker = LivePidMalformedTracker()
+        assertFalse(tracker.isMalformed(0x15))
+        assertTrue(tracker.markMalformed(0x15))
+        assertTrue(tracker.isMalformed(0x15))
+        assertFalse(tracker.markMalformed(0x15))
+        assertFalse(tracker.isMalformed(0x0C))
+    }
+
+    @Test
+    fun fatalTransportFailurePersistsOnlyNonemptyPartialValuesWithStableSequence() {
+        assertNull(
+            partialSampleAfterTransportFailure(
+                "drive-1", 7, "2026-08-29T12:00:00Z", emptyMap(), listOf(0x15),
+            ),
+        )
+
+        val sample = partialSampleAfterTransportFailure(
+            driveId = "drive-1",
+            sequence = 7,
+            timestampUtc = "2026-08-29T12:00:00Z",
+            values = linkedMapOf("engine_rpm" to 850.0),
+            missingPids = listOf(0x15, 0x15, 0x21),
+        )!!
+        assertEquals("drive-1-7", sample.sampleId)
+        assertEquals(7, sample.sequence)
+        assertEquals(mapOf("engine_rpm" to 850.0), sample.values)
+        assertEquals("failed_after_partial", sample.transportQuality)
+        assertEquals("partial", sample.parserQuality)
+        assertEquals(listOf(0x15, 0x21), sample.missingPids)
     }
 
     @Test

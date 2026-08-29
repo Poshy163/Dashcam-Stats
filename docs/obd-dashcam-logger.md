@@ -117,6 +117,12 @@ with a fresh `ATZ` only after bounded exponential backoff. Sparse diagnostic sca
 Mode 02 freeze-frame number 0 (including explicit empty/no-data evidence). Strict parsing requires
 the complete `48 6B <source>` ISO header, learned ECU source, exact length and checksum. A malformed
 reply is recorded as a parser failure; it is never treated as an empty PID or cleared DTC list.
+Because `command()` only returns once the next ELM prompt arrives, a malformed but prompt-complete
+reply to an optional live PID leaves the command stream synchronized: it is recorded once as a
+parser failure, that PID is suppressed for the rest of the connection, and the loop continues.
+Only transport-level faults (missing prompt, overflow, failed write, disconnect) still taint and
+reconnect, and a fatal fault mid-cycle first persists the partial sample already gathered, marked
+`failed_after_partial`/`partial`, so observed values survive the reconnect.
 The scan is interleaved at one diagnostic command after each committed fast sample, so a slow
 optional ECU response cannot pause the sample loop for an entire multi-command scan. They never
 send Mode 04/08 or clear DTCs.

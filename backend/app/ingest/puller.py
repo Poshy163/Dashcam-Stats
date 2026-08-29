@@ -34,6 +34,7 @@ from app.ingest.models import (
 from app.ingest.obd_transfer import (
     get_obd_transfer_status,
     inventory_remote_bundles,
+    read_logger_status,
     sync_remote_bundles,
 )
 from app.ingest.status import get_status
@@ -72,6 +73,17 @@ _slept_for: set[str] = set()
 def forget_sleep_state() -> None:
     """Let the next visit ask for its own sleep. Called when the unit goes away."""
     _slept_for.clear()
+
+
+def _obd_logger_owns_bluetooth(logger_status: object) -> bool:
+    """Whether the dashcam logger has reserved the unit's Bluetooth radio.
+
+    State is deliberately not part of this decision. ``parked`` still needs adapter-local
+    voltage probes to notice the next engine start, and ``backoff`` needs the radio for its
+    bounded reconnect. Treating a new/disabled state with ownership enabled conservatively
+    only costs transfer throughput; disabling Bluetooth on an active owner loses telemetry.
+    """
+    return isinstance(logger_status, dict) and logger_status.get("ownership_enabled") is True
 
 
 async def widen_sleep_window(address: str) -> None:
@@ -769,6 +781,14 @@ async def run_pull(
             preflight,
             inventory_remote_bundles(info.address, get_config().obd_remote_ready_dir),
         )
+        # Read the public logger status on every visit, even when no completed bundle is
+        # waiting. Radio ownership matters while a drive is in progress, which is exactly
+        # when there is normally nothing in ready/ yet. Started beside the inventories so
+        # its bounded ADB read does not extend the transfer's critical path.
+        obd_logger = _preflight(
+            preflight,
+            read_logger_status(info.address, get_config().obd_remote_status_file),
+        )
 
         status.set_phase(Phase.SCANNING)
         sources = [info.source]
@@ -816,6 +836,21 @@ async def run_pull(
         except Exception as exc:
             remote_obd = []
             log.warning("could not inventory OBD exports; footage will continue", error=str(exc))
+        previous_logger = get_obd_transfer_status().snapshot()["logger"]
+        try:
+            observed_logger = await obd_logger
+        except Exception as exc:
+            observed_logger = None
+            log.warning("could not read OBD logger status; footage will continue", error=str(exc))
+        if observed_logger is not None:
+            get_obd_transfer_status().set_logger(observed_logger)
+        elif _obd_logger_owns_bluetooth(previous_logger):
+            # A transient/malformed read must not turn a prior positive ownership signal
+            # into permission to kill the logger. The public snapshot's checked-at time
+            # remains unchanged, making the staleness visible while preserving safety.
+            observed_logger = previous_logger
+        else:
+            get_obd_transfer_status().set_logger(None)
 
         # Before the idle return, not after it. A card whose whole contents the library
         # already holds produces exactly that idle run, every window, forever -- so leaving
@@ -968,7 +1003,12 @@ async def run_pull(
         # never touches them; the run's `finally` puts back whatever was taken. The
         # deadline covers one listener timeout per directory the plan can have, plus
         # slack, so the on-unit watchdog cannot fire mid-run.
-        if bool(_get("quiet_radios", False)):
+        if bool(_get("quiet_radios", False)) and _obd_logger_owns_bluetooth(observed_logger):
+            log.info(
+                "leaving the unit's radios on because the OBD logger owns Bluetooth",
+                logger_state=observed_logger.get("state"),
+            )
+        elif bool(_get("quiet_radios", False)):
             quiet = radios.begin_quiet(
                 info.address,
                 online_for=status.online_for(),

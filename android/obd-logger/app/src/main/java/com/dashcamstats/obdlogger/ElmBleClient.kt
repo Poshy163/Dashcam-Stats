@@ -232,9 +232,11 @@ class ElmBleClient(private val context: Context, private val address: String) {
         if (ElmProtocol.hasTransportError(reply)) throw ElmException("transport error for $command")
         val source = ecuSource ?: throw ElmException("ECU source is not learned")
         rejectNegative(reply, command, 0x01, source)
-        return parseOrTaint {
-            ElmProtocol.requirePayload(reply, command, pid, length, source).second
-        }
+        // command() only returns after receiving the next ELM prompt, so the command stream is
+        // synchronized even when this optional PID's ISO frame is malformed. Reject the value
+        // without tainting the connection; the poller records it as missing and continues. A
+        // missing prompt, overflow, failed write or disconnect is still tainted in command().
+        return ElmProtocol.requirePayload(reply, command, pid, length, source).second
     }
 
     suspend fun queryDtcs(mode: Int): List<String> {
@@ -253,7 +255,7 @@ class ElmBleClient(private val context: Context, private val address: String) {
         rejectNegative(reply, command, mode, source)
         return DtcQueryResult(
             ElmProtocol.dtcs(
-                parseOrTaint { ElmProtocol.requireModePayloads(reply, command, mode, source) },
+                ElmProtocol.requireModePayloads(reply, command, mode, source),
             ),
             "ok",
         )
@@ -265,12 +267,10 @@ class ElmBleClient(private val context: Context, private val address: String) {
         if (reply.uppercase().contains("NO DATA")) return emptySet()
         if (ElmProtocol.hasTransportError(reply)) throw ElmException("transport error for 0900")
         rejectNegative(reply, "0900", 0x09, source)
-        return parseOrTaint {
-            ElmProtocol.mode09Supported(reply, source)
-                ?: throw ElmProtocolException(
-                    "0900 reply failed ISO header/source/checksum validation",
-                )
-        }
+        return ElmProtocol.mode09Supported(reply, source)
+            ?: throw ElmProtocolException(
+                "0900 reply failed ISO header/source/checksum validation",
+            )
     }
 
     suspend fun queryMode09Count(pid: Int): Int? {
@@ -281,10 +281,8 @@ class ElmBleClient(private val context: Context, private val address: String) {
         if (reply.uppercase().contains("NO DATA")) return null
         if (ElmProtocol.hasTransportError(reply)) throw ElmException("transport error for $command")
         rejectNegative(reply, command, 0x09, source)
-        return parseOrTaint {
-            ElmProtocol.mode09Count(reply, pid, source)
-                ?: throw ElmProtocolException("$command reply failed ISO count validation")
-        }
+        return ElmProtocol.mode09Count(reply, pid, source)
+            ?: throw ElmProtocolException("$command reply failed ISO count validation")
     }
 
     suspend fun queryCalibrationId(): String? {
@@ -293,10 +291,8 @@ class ElmBleClient(private val context: Context, private val address: String) {
         if (reply.uppercase().contains("NO DATA")) return null
         if (ElmProtocol.hasTransportError(reply)) throw ElmException("transport error for 0904")
         rejectNegative(reply, "0904", 0x09, source)
-        return parseOrTaint {
-            ElmProtocol.mode09Text(reply, "0904", 4, source)
-                ?: throw ElmProtocolException("0904 reply failed ISO framing or sequence validation")
-        }
+        return ElmProtocol.mode09Text(reply, "0904", 4, source)
+            ?: throw ElmProtocolException("0904 reply failed ISO framing or sequence validation")
     }
 
     suspend fun queryCalibrationVerificationNumbers(): List<String> {
@@ -305,10 +301,8 @@ class ElmBleClient(private val context: Context, private val address: String) {
         if (reply.uppercase().contains("NO DATA")) return emptyList()
         if (ElmProtocol.hasTransportError(reply)) throw ElmException("transport error for 0906")
         rejectNegative(reply, "0906", 0x09, source)
-        return parseOrTaint {
-            ElmProtocol.mode09Cvns(reply, source).takeIf { it.isNotEmpty() }
-                ?: throw ElmProtocolException("0906 reply failed ISO framing or sequence validation")
-        }
+        return ElmProtocol.mode09Cvns(reply, source).takeIf { it.isNotEmpty() }
+            ?: throw ElmProtocolException("0906 reply failed ISO framing or sequence validation")
     }
 
     suspend fun queryFreezeFramePayload(pid: Int, length: Int, frame: Int = 0): ByteArray? {
@@ -320,18 +314,15 @@ class ElmBleClient(private val context: Context, private val address: String) {
         if (reply.uppercase().contains("NO DATA")) return null
         if (ElmProtocol.hasTransportError(reply)) throw ElmException("transport error for $command")
         rejectNegative(reply, command, 0x02, source)
-        val payload = parseOrTaint {
-            ElmProtocol.requirePayload(
-                reply,
-                command,
-                pid,
-                length + 1,
-                source,
-                mode = 0x02,
-            ).second
-        }
+        val payload = ElmProtocol.requirePayload(
+            reply,
+            command,
+            pid,
+            length + 1,
+            source,
+            mode = 0x02,
+        ).second
         if (payload.firstOrNull()?.toInt()?.and(0xFF) != frame) {
-            commandSession.taint()
             throw ElmProtocolException("$command reply carried the wrong freeze-frame number")
         }
         return payload.drop(1).toByteArray()

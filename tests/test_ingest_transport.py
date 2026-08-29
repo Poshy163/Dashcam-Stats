@@ -1124,6 +1124,26 @@ def test_unit_online_only_means_device(state, expected):
     assert UnitInfo(address="x", state=UnitState(state)).online is expected
 
 
+@pytest.mark.parametrize(
+    "state",
+    ["parked", "probing", "ecu_online", "backoff", "disabled", "future_state"],
+)
+def test_obd_logger_ownership_reserves_bluetooth_in_every_state(state):
+    """Ownership is the contract; parked/backoff are not permission to break detection."""
+    from app.ingest.puller import _obd_logger_owns_bluetooth
+
+    assert _obd_logger_owns_bluetooth({"ownership_enabled": True, "state": state})
+
+
+def test_only_an_explicit_boolean_ownership_signal_reserves_bluetooth():
+    from app.ingest.puller import _obd_logger_owns_bluetooth
+
+    assert not _obd_logger_owns_bluetooth(None)
+    assert not _obd_logger_owns_bluetooth({})
+    assert not _obd_logger_owns_bluetooth({"ownership_enabled": False, "state": "parked"})
+    assert not _obd_logger_owns_bluetooth({"ownership_enabled": "true", "state": "ecu_online"})
+
+
 class TestARunEndToEnd:
     """The whole orchestration against a fake unit: delta, transfer, commit, history.
 
@@ -1136,9 +1156,11 @@ class TestARunEndToEnd:
         """A head unit holding two recordings, serving them over a loopback socket."""
         from app.ingest import adb, puller
         from app.ingest.models import UnitInfo, UnitState
+        from app.ingest.obd_transfer import get_obd_transfer_status
         from app.ingest.status import reset_status_for_tests
 
         reset_status_for_tests()
+        get_obd_transfer_status().set_logger(None)
         payload = {
             "20260812120000_camera_0.ts": b"a" * 4096,
             "20260812120100_camera_0.ts": b"b" * 4096,
@@ -1512,6 +1534,72 @@ class TestARunEndToEnd:
         assert disables, "Bluetooth was never turned off for the transfer"
         assert enables, "Bluetooth was never turned back on afterwards"
         assert disables[0] < enables[0]
+
+    async def test_an_obd_owner_keeps_bluetooth_and_hotspot_on(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """Footage still moves, but radio quieting yields to the live logger owner."""
+        from app.ingest import adb, puller, radios
+        from app.ingest.models import RunState
+        from app.ingest.obd_transfer import get_obd_transfer_status
+
+        monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        commands: list[str] = []
+        observed: dict[str, str] = {}
+
+        async def shell(address, command, **kwargs):
+            commands.append(command)
+            return "1" if "bluetooth_on" in command else ""
+
+        async def logger_status(address, path):
+            observed.update(address=address, path=path)
+            return {"ownership_enabled": True, "state": "ecu_online"}
+
+        monkeypatch.setattr(adb, "shell", shell)
+        monkeypatch.setattr(puller, "read_logger_status", logger_status)
+        await self._enable(**{"ingest.quiet_radios": True})
+
+        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+
+        assert observed["address"] == "127.0.0.1:5555"
+        assert observed["path"] == app_config.obd_remote_status_file
+        assert not any("bluetooth_manager disable" in command for command in commands)
+        assert not any("svc bluetooth disable" in command for command in commands)
+        assert not any("service call tethering" in command for command in commands)
+        assert get_obd_transfer_status().snapshot()["logger"] == {
+            "ownership_enabled": True,
+            "state": "ecu_online",
+        }
+
+    async def test_a_transient_status_read_keeps_last_known_obd_ownership(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """One failed ADB read cannot become permission to interrupt an active drive."""
+        from app.ingest import adb, puller, radios
+        from app.ingest.models import RunState
+        from app.ingest.obd_transfer import get_obd_transfer_status
+
+        monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        commands: list[str] = []
+
+        async def shell(address, command, **kwargs):
+            commands.append(command)
+            return "1" if "bluetooth_on" in command else ""
+
+        async def missing_status(address, path):
+            return None
+
+        get_obd_transfer_status().set_logger({"ownership_enabled": True, "state": "backoff"})
+        monkeypatch.setattr(adb, "shell", shell)
+        monkeypatch.setattr(puller, "read_logger_status", missing_status)
+        await self._enable(**{"ingest.quiet_radios": True})
+
+        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+        assert not any("bluetooth_manager disable" in command for command in commands)
+        assert get_obd_transfer_status().snapshot()["logger"] == {
+            "ownership_enabled": True,
+            "state": "backoff",
+        }
 
     async def test_an_idle_window_never_touches_the_radios(
         self, db_session, unit, app_config, monkeypatch
@@ -2241,13 +2329,67 @@ class TestDrainingWhileTheCarIsStillHere:
 
         assert poller._should_drain_again(self._status(RunState.CANCELLED)) is False
 
-    def test_a_failing_unit_is_not_retried_on_a_timer(self):
-        """A unit answering its port but failing every pull should not be driven at."""
+    def test_a_failed_run_waits_before_its_first_retry(self):
+        """The observed timeout is recoverable, but never on the next poll tick."""
+        from app.ingest.models import RunResult, RunState
+
+        poller = self._poller()
+        status = self._status(RunState.IDLE)
+        status.try_begin()
+        status.finish(RunResult(state=RunState.ERROR, error="TimeoutError"))
+
+        assert poller._should_drain_again(status) is False
+
+    def test_consecutive_failures_get_only_the_bounded_retry_schedule(self):
+        """Each retry waits longer, and exhausting the schedule ends work for the visit."""
+        import time as _time
+
+        from app.ingest import poller as poller_mod
+        from app.ingest.models import RunResult, RunState
+
+        poller = self._poller()
+        status = self._status(RunState.IDLE)
+        status.try_begin()
+        status.finish(RunResult(state=RunState.ERROR, error="TimeoutError"))
+
+        for delay in poller_mod.ERROR_RETRY_DELAYS_S:
+            status._finished_at = _time.monotonic() - delay - 1
+            assert poller._should_drain_again(status) is True
+
+            # The retry failed too. `finish` anchors the next, longer delay to this new
+            # failure rather than to the first one in the streak.
+            status.try_begin()
+            status.finish(RunResult(state=RunState.ERROR, error="TimeoutError"))
+            assert poller._should_drain_again(status) is False
+
+        status._finished_at = _time.monotonic() - max(poller_mod.ERROR_RETRY_DELAYS_S) - 100
+        assert poller._should_drain_again(status) is False
+
+    def test_a_non_error_result_rearms_the_retry_budget(self):
+        """A later independent failure is not punished for an earlier recovered streak."""
+        import time as _time
+
+        from app.ingest import poller as poller_mod
+        from app.ingest.models import RunResult, RunState
+
+        poller = self._poller()
+        poller._error_retries_started = len(poller_mod.ERROR_RETRY_DELAYS_S)
+
+        assert poller._should_drain_again(self._status(RunState.OK)) is True
+
+        status = self._status(RunState.IDLE)
+        status.try_begin()
+        status.finish(RunResult(state=RunState.ERROR, error="TimeoutError"))
+        status._finished_at = _time.monotonic() - poller_mod.ERROR_RETRY_DELAYS_S[0] - 1
+
+        assert poller._should_drain_again(status) is True
+
+    def test_non_retryable_failures_still_wait_for_a_new_visit(self):
         from app.ingest.models import RunState
 
         poller = self._poller()
 
-        for state in (RunState.ERROR, RunState.OFFLINE, RunState.UNAUTHORIZED):
+        for state in (RunState.OFFLINE, RunState.UNAUTHORIZED):
             assert poller._should_drain_again(self._status(state)) is False, state
 
     def test_moving_files_clears_an_earlier_idle_backoff(self):

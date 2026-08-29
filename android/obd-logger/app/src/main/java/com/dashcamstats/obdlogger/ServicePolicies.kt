@@ -94,6 +94,56 @@ class DiagnosticScanFailureTracker {
     fun finalStatus(successStatus: String): String = failure ?: successStatus
 }
 
+internal sealed interface LivePidPollResult {
+    data class Values(val decoded: Map<String, Any>) : LivePidPollResult
+    data object Missing : LivePidPollResult
+    data class Malformed(val error: ElmProtocolException) : LivePidPollResult
+}
+
+/**
+ * A malformed, prompt-complete optional PID is a missing value, not a lost connection.
+ * Deliberately catch only parser validation failures: BLE errors, ELM prompt timeouts and
+ * cancellations must escape so the caller aborts the drive and reconnects.
+ */
+internal suspend fun pollLivePid(
+    pid: Int,
+    query: suspend (Int) -> Map<String, Any>,
+): LivePidPollResult = try {
+    query(pid).takeIf { it.isNotEmpty() }
+        ?.let { LivePidPollResult.Values(it) }
+        ?: LivePidPollResult.Missing
+} catch (error: ElmProtocolException) {
+    LivePidPollResult.Malformed(error)
+}
+
+/** Suppresses a malformed advertised PID until the next fresh connection. */
+internal class LivePidMalformedTracker {
+    private val malformed = mutableSetOf<Int>()
+
+    fun isMalformed(pid: Int): Boolean = pid in malformed
+
+    fun markMalformed(pid: Int): Boolean = malformed.add(pid)
+}
+
+/** Build the one durable partial row allowed before a fatal live transport failure. */
+internal fun partialSampleAfterTransportFailure(
+    driveId: String,
+    sequence: Long,
+    timestampUtc: String,
+    values: Map<String, Any>,
+    missingPids: List<Int>,
+): SampleRecord? = values.takeIf { it.isNotEmpty() }?.let {
+    SampleRecord(
+        driveId = driveId,
+        sequence = sequence,
+        timestampUtc = timestampUtc,
+        values = LinkedHashMap(it),
+        transportQuality = "failed_after_partial",
+        parserQuality = "partial",
+        missingPids = missingPids.distinct(),
+    )
+}
+
 data class StorageVolumeState(val removable: Boolean, val mounted: Boolean)
 
 object RemovableStoragePolicy {

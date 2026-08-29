@@ -47,6 +47,18 @@ from app.ingest.transport import TransferResult
 BASE = datetime(2026, 8, 29, 1, 0, tzinfo=UTC)
 
 
+def _receipt_body(drive_id: str, bundle_sha256: str) -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "drive_id": drive_id,
+            "bundle_sha256": bundle_sha256,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
 def _sample(
     drive_id: str,
     sequence: int,
@@ -1825,6 +1837,56 @@ class TestTransferIsolation:
                 bundle_sha256=digest,
             )
 
+    async def test_receipt_success_requires_a_separate_exact_final_readback(self, monkeypatch):
+        calls: list[str] = []
+        digest = "b" * 64
+        body = _receipt_body("drive_readback", digest)
+
+        async def shell(_address, command, **_kwargs):
+            calls.append(command)
+            return "" if len(calls) == 1 else body
+
+        monkeypatch.setattr(obd_transfer.adb, "shell", shell)
+
+        await obd_transfer.write_verification_receipt(
+            "unit",
+            "/safe/receipts",
+            drive_id="drive_readback",
+            bundle_sha256=digest,
+        )
+
+        assert len(calls) == 2
+        assert "drive_readback.verified.json.partial" in calls[0]
+        assert "mv -f" in calls[0]
+        assert ".partial" not in calls[1]
+        assert "cat '/safe/receipts/drive_readback.verified.json'" in calls[1]
+
+    @pytest.mark.parametrize("failure", ["disconnect", "partial_only"])
+    async def test_receipt_readback_failure_never_returns_success(self, monkeypatch, failure):
+        calls: list[str] = []
+
+        async def shell(_address, command, **_kwargs):
+            calls.append(command)
+            if len(calls) == 1:
+                return ""
+            assert ".partial" not in command
+            if failure == "disconnect":
+                raise obd_transfer.adb.AdbError("device offline during receipt readback")
+            # A producer left only the partial path; the authoritative final-path command
+            # cannot produce the expected body.
+            return ""
+
+        monkeypatch.setattr(obd_transfer.adb, "shell", shell)
+
+        with pytest.raises(obd_transfer.adb.AdbError):
+            await obd_transfer.write_verification_receipt(
+                "unit",
+                "/safe/receipts",
+                drive_id="drive_readback_failure",
+                bundle_sha256="c" * 64,
+            )
+        assert len(calls) == 2
+
     async def test_same_size_corrupt_local_copy_is_not_trusted(self, db_session, app_config):
         path = make_bundle(app_config.obd_verified_dir, "drive_local_hash")
         checked = validate_bundle(path, config=app_config)
@@ -1992,13 +2054,17 @@ class TestTransferIsolation:
             poison_path.name: poison_path.read_bytes(),
             following_path.name: following_path.read_bytes(),
         }
+        following_receipt = _receipt_body(
+            "drive_sample_following",
+            hashlib.sha256(bodies[following_path.name]).hexdigest(),
+        )
         deleted: list[str] = []
 
         async def no_status(*_args, **_kwargs):
             return None
 
-        async def receipt_shell(*_args, **_kwargs):
-            return ""
+        async def receipt_shell(_address, command, **_kwargs):
+            return "" if ".partial" in command else following_receipt
 
         async def delete(_address, _source, names):
             deleted.extend(names)
@@ -2074,6 +2140,7 @@ class TestTransferIsolation:
 
         deleted: list[str] = []
         events: list[str] = []
+        expected_receipt = _receipt_body("drive_exact_repair", checked.bundle_sha256)
 
         async def no_status(*_args, **_kwargs):
             return None
@@ -2084,12 +2151,12 @@ class TestTransferIsolation:
             return len(names)
 
         async def receipt_shell(_address, command, **_kwargs):
+            if ".partial" not in command:
+                assert "drive_exact_repair.verified.json" in command
+                return expected_receipt
             events.append("receipt")
             assert "drive_exact_repair.verified.json.partial" in command
-            assert (
-                '{"schema_version":1,"drive_id":"drive_exact_repair",'
-                f'"bundle_sha256":"{checked.bundle_sha256}"}}'
-            ) in command
+            assert expected_receipt in command
             assert "mv -f" in command
             assert "[ ! -L '/storage/Tfcard/Android/data/" in command
             assert "$(cat '/storage/Tfcard/Android/data/" in command
@@ -2164,6 +2231,7 @@ class TestTransferIsolation:
 
         deleted: list[str] = []
         events: list[str] = []
+        expected_receipt = _receipt_body("drive_crash_repair", checked.bundle_sha256)
 
         async def no_status(*_args, **_kwargs):
             return None
@@ -2174,6 +2242,9 @@ class TestTransferIsolation:
             return len(names)
 
         async def receipt_shell(_address, command, **_kwargs):
+            if ".partial" not in command:
+                assert "drive_crash_repair.verified.json" in command
+                return expected_receipt
             events.append("receipt")
             assert "drive_crash_repair.verified.json.partial" in command
             return ""
@@ -2229,11 +2300,15 @@ class TestTransferIsolation:
             row.last_error = "Home Assistant rejected its token"
 
         events: list[str] = []
+        expected_receipt = _receipt_body("drive_failed_before_receipt", checked.bundle_sha256)
 
         async def no_status(*_args, **_kwargs):
             return None
 
         async def receipt_shell(_address, command, **_kwargs):
+            if ".partial" not in command:
+                assert "drive_failed_before_receipt.verified.json" in command
+                return expected_receipt
             events.append("receipt")
             assert "drive_failed_before_receipt.verified.json.partial" in command
             assert checked.bundle_sha256 in command
@@ -2354,7 +2429,7 @@ class TestTransferIsolation:
         [
             "receipts root is a symlink",
             "receipt target is a directory",
-            "receipt readback content mismatch",
+            "verification receipt final readback content mismatch",
         ],
     )
     async def test_receipt_failure_retains_verified_duplicate_on_unit(
@@ -2365,16 +2440,27 @@ class TestTransferIsolation:
         async with session_scope() as session:
             await store_validated_bundle(session, checked)
         deleted: list[str] = []
+        receipt_calls = 0
 
         async def no_status(*_args, **_kwargs):
             return None
 
         async def receipt_failure(*_args, **_kwargs):
+            nonlocal receipt_calls
+            receipt_calls += 1
+            if (
+                failure_message == "verification receipt final readback content mismatch"
+                and receipt_calls == 1
+            ):
+                # The mutating write/rename round trip completed; only the independent
+                # final-path readback reveals that the receipt is not authoritative.
+                return ""
+            if failure_message == "verification receipt final readback content mismatch":
+                return "partial-only content"
             raise obd_transfer.adb.AdbError(failure_message)
 
-        async def delete(_address, _source, names):
-            deleted.extend(names)
-            return len(names)
+        async def delete(_address, _source, *, filename, bundle_sha256):
+            deleted.append(filename)
 
         monkeypatch.setattr(obd_transfer, "read_logger_status", no_status)
         monkeypatch.setattr(
@@ -2383,7 +2469,7 @@ class TestTransferIsolation:
             lambda *_args, **_kwargs: _async_value(checked.bundle_sha256),
         )
         monkeypatch.setattr(obd_transfer.adb, "shell", receipt_failure)
-        monkeypatch.setattr(obd_transfer.adb, "delete", delete)
+        monkeypatch.setattr(obd_transfer, "_delete_remote_if_hash", delete)
         monkeypatch.setattr(
             obd_transfer.transport,
             "receive",
@@ -2403,6 +2489,9 @@ class TestTransferIsolation:
         assert result.duplicates == result.removed_from_unit == 0
         assert failure_message in (result.error or "")
         assert deleted == []
+        assert receipt_calls == (
+            2 if failure_message == "verification receipt final readback content mismatch" else 1
+        )
         assert obd_transfer.get_obd_transfer_status().snapshot()["waiting_on_unit"] >= 1
 
     async def test_receipt_failure_retains_freshly_registered_bundle_on_unit(

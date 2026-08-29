@@ -57,6 +57,15 @@ Confirm all three through ADB on the physical unit before relying on an arrival 
 or malformed `status.json` is best-effort status only and never fails bundle or footage
 backup.
 
+`status.json` is also read at the start of every footage pull, whether or not a bundle is
+waiting. While it reports `ownership_enabled: true` the pull leaves the unit's Bluetooth and
+hotspot alone instead of quieting them for transfer throughput — the logger owns that radio in
+every state, including `parked` and `backoff`, because voltage probing is how it notices the
+next engine start. A transient failed read never downgrades a previously observed positive
+ownership signal. Separately, a footage run that fails while the unit stays online is retried
+on a bounded backoff (15 s, 30 s, 60 s) within the same visit rather than waiting for the next
+offline/online edge, so one receive timeout cannot strand a ready bundle for a whole day.
+
 ## Durable flow
 
 1. Inventory accepts only `<safe-drive-id>.obd2.zip`, ignores sibling `.partial` files and
