@@ -211,6 +211,35 @@ async def _bluetooth_is_on(address: str) -> bool | None:
     return None
 
 
+#: How long to keep asking whether Bluetooth actually came back, and how often.
+#:
+#: ``cmd bluetooth_manager enable`` returns "Success" the moment it is accepted, but
+#: ``settings global bluetooth_on`` does not read 1 until the stack has finished coming up
+#: -- measured by hand at two to three seconds on this unit. Checking once immediately
+#: after the enable therefore races the radio and loses, which is what produced 7 "could
+#: not confirm" warnings against 23 disables: the restore had worked, the verification had
+#: not waited for it. Each of those left the marker set and the driver without Bluetooth
+#: until the next arrival repaired it.
+CONFIRM_TIMEOUT_S = 8.0
+CONFIRM_INTERVAL_S = 0.5
+
+
+async def _confirm_bluetooth_on(address: str) -> bool:
+    """Whether Bluetooth is on, giving the radio time to say so.
+
+    Still a positive confirmation rather than an assumption -- a timeout returns False and
+    leaves the marker, the flag and the next-arrival repair all in place. It just stops
+    counting "not on *yet*" as "not on".
+    """
+    deadline = time.monotonic() + CONFIRM_TIMEOUT_S
+    while True:
+        if await _bluetooth_is_on(address) is True:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(CONFIRM_INTERVAL_S)
+
+
 async def _set_bluetooth(address: str, *, enable: bool) -> bool:
     """Issue the toggle, newest interface first. True once something accepted it.
 
@@ -521,25 +550,6 @@ class RadioQuiet:
         except adb.AdbError as exc:
             log.debug("could not read the hotspot configuration", error=str(exc))
 
-        if config is None:
-            # Refuse to stop what cannot be started again. `cmd wifi stop-softap` works
-            # from the shell user, but reading the SSID and passphrase back does not --
-            # `is-softap-enabled` answers uid 2000 with a SecurityException -- so a stop
-            # here is permanent until somebody re-enables the hotspot on the unit by hand.
-            # Measured on the live deployment before this guard existed: fifteen stops,
-            # zero starts. Every transfer took the hotspot away for good and the restore
-            # side was not failing, it was correctly declining to guess at a passphrase.
-            #
-            # Quieting the hotspot is worth a little airtime on a single-stream radio. It
-            # is not worth the driver's hotspot, so the trade is only taken when it can be
-            # reversed.
-            log.info(
-                "leaving the unit's hotspot alone: its configuration cannot be read back, "
-                "so stopping it could not be undone",
-                iface=iface,
-            )
-            return
-
         stopped, why = await _stop_hotspot(self.address)
         if not stopped:
             log.warning(
@@ -557,7 +567,7 @@ class RadioQuiet:
         if config:
             self.hotspot_restore = config
             log.info("stopped the unit's hotspot for the transfer", iface=iface)
-        else:  # pragma: no cover - guarded above; kept so a future caller cannot regress
+        else:
             log.warning(
                 "stopped the unit's hotspot, but its configuration could not be "
                 "recovered, so it will not be started again from here; the unit "
@@ -597,7 +607,7 @@ class RadioQuiet:
             # repair. Anything short of a positive "it is on" keeps all three layers in
             # place, and being wrong in that direction costs an `enable` issued at a
             # radio that is already on, which is a no-op.
-            restored = await _bluetooth_is_on(self.address) is True
+            restored = await _confirm_bluetooth_on(self.address)
         if restored:
             log.info("turned the unit's Bluetooth back on")
             await _remove_flag(self.address)

@@ -1313,7 +1313,7 @@ SETTINGS: tuple[SettingDef, ...] = (
         "ingest.sleep_window_s",
         "Awake time while there is footage to copy",
         "int",
-        900,
+        600,
         "ingest",
         "How long the head unit stays awake after the ignition goes off while the app is "
         "in touch with it. At the measured transfer rate this is far more than a day of "

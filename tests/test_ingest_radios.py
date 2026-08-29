@@ -401,15 +401,10 @@ class TestTheHotspot:
 
         assert not _issued(unit_shell.commands, "softap")
 
-    async def test_with_no_recoverable_config_it_is_left_alone_entirely(self, unit_shell):
-        """It used to be stopped anyway, on the reasoning that a hotspot nobody could
-        restore was still worth the airtime. The deployment disagreed: fifteen stops and
-        zero starts, because reading the SSID and passphrase back needs a permission the
-        shell user does not have — `is-softap-enabled` answers uid 2000 with a
-        SecurityException. Every transfer took the driver's hotspot away for good.
-
-        Quieting it is worth a little airtime on a single-stream radio. It is not worth
-        that, so the trade is only taken when it can be reversed."""
+    async def test_with_no_recoverable_config_it_is_stopped_but_never_guessed_at(self, unit_shell):
+        """Stopping it is the operator's call, and they have made it: the transfer gets the
+        radio to itself. What must not happen is inventing a passphrase to start it again,
+        so the stop is taken and the restore declines, loudly."""
         unit_shell.replies["bluetooth_on"] = "0"
         unit_shell.replies["ip -o addr"] = [_IP_WITH_AP, _IP_NO_AP]
         unit_shell.replies["dumpsys wifi"] = "nothing useful in here"
@@ -418,9 +413,43 @@ class TestTheHotspot:
         await quiet._task
         await quiet.finish()
 
-        assert not _issued(unit_shell.commands, "service call tethering")
-        assert not _issued(unit_shell.commands, "stop-softap")
+        assert _issued(unit_shell.commands, "service call tethering")
         assert not _issued(unit_shell.commands, "start-softap")
+
+
+class TestConfirmingBluetoothCameBack:
+    """`enable` returns Success immediately; `bluetooth_on` needs a moment to agree.
+
+    Checking once straight after the enable raced the radio and lost, which is what turned
+    a working restore into 7 "could not confirm" warnings against 23 disables — each one
+    leaving the marker set and the driver without Bluetooth until the next arrival.
+    """
+
+    async def test_it_waits_for_the_radio_rather_than_asking_once(self, monkeypatch):
+        calls = {"n": 0}
+
+        async def slow(address):
+            calls["n"] += 1
+            return calls["n"] >= 3
+
+        monkeypatch.setattr(radios, "_bluetooth_is_on", slow)
+        monkeypatch.setattr(radios, "CONFIRM_INTERVAL_S", 0.01)
+
+        assert await radios._confirm_bluetooth_on(UNIT) is True
+        assert calls["n"] >= 3, "it gave up before the radio had come up"
+
+    async def test_it_still_gives_up_rather_than_assuming(self, monkeypatch):
+        """A timeout must stay False: the marker, the flag and the next-arrival repair are
+        all held in place by a negative answer."""
+
+        async def never(address):
+            return False
+
+        monkeypatch.setattr(radios, "_bluetooth_is_on", never)
+        monkeypatch.setattr(radios, "CONFIRM_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(radios, "CONFIRM_INTERVAL_S", 0.01)
+
+        assert await radios._confirm_bluetooth_on(UNIT) is False
 
 
 class TestTheRefusalCheck:
