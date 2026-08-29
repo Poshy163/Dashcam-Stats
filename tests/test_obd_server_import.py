@@ -2797,6 +2797,47 @@ class TestDriveSeriesApi:
         assert summary["first_drive_at"] == min(item["started_at"] for item in listing["items"])
         assert summary["last_drive_at"] == max(item["finished_at"] for item in listing["items"])
 
+    async def test_journey_and_drive_link_by_time_overlap(self, db_session, app_config, client):
+        from app.db.models import Journey
+
+        path = make_bundle(app_config.obd_verified_dir, "drive_journey_link")
+        checked = validate_bundle(path, config=app_config)
+        async with session_scope() as session:
+            await store_validated_bundle(session, checked)
+            # Overlapping the drive (BASE .. BASE+5s), plus a decoy from an hour earlier.
+            overlapping = Journey(
+                started_at=BASE - timedelta(seconds=30),
+                ended_at=BASE + timedelta(seconds=60),
+                duration_s=90.0,
+                title="the school run",
+            )
+            decoy = Journey(
+                started_at=BASE - timedelta(hours=1),
+                ended_at=BASE - timedelta(minutes=50),
+                duration_s=600.0,
+            )
+            session.add_all([overlapping, decoy])
+            await session.flush()
+            journey_id = overlapping.id
+            decoy_id = decoy.id
+
+        matched = await client.get(f"/api/obd/drives/for-journey/{journey_id}")
+        assert matched.status_code == 200
+        assert matched.json()["drive"]["drive_id"] == "drive_journey_link"
+        assert matched.json()["overlap_s"] == pytest.approx(5.0)
+
+        unmatched = await client.get(f"/api/obd/drives/for-journey/{decoy_id}")
+        assert unmatched.status_code == 200
+        assert unmatched.json() == {"drive": None, "overlap_s": None}
+
+        missing = await client.get("/api/obd/drives/for-journey/999999")
+        assert missing.status_code == 404
+
+        series = (await client.get("/api/obd/drives/drive_journey_link/series")).json()
+        assert series["journey"]["id"] == journey_id
+        assert series["journey"]["title"] == "the school run"
+        assert series["journey"]["overlap_s"] == pytest.approx(5.0)
+
     async def test_summary_of_an_empty_library_is_all_zeroes(self, db_session, client):
         response = await client.get("/api/obd/drives/summary")
         assert response.status_code == 200

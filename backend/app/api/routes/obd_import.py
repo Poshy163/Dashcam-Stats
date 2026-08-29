@@ -10,7 +10,15 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import joinedload
 
 from app.api.deps import PaginationDep, RowId, SessionDep
-from app.db.models import OBDBundle, OBDBundleState, OBDDiagnostic, OBDDrive, OBDSample, utcnow
+from app.db.models import (
+    Journey,
+    OBDBundle,
+    OBDBundleState,
+    OBDDiagnostic,
+    OBDDrive,
+    OBDSample,
+    utcnow,
+)
 from app.ingest.ha_import_queue import (
     configuration_status,
     get_import_worker,
@@ -218,6 +226,72 @@ async def drives_summary(session: SessionDep) -> dict[str, object]:
 
 
 @router.get(
+    "/drives/for-journey/{journey_id}",
+    summary="The OBD drive that overlaps one footage journey, if any",
+)
+async def drive_for_journey(journey_id: RowId, session: SessionDep) -> dict[str, object]:
+    journey = await session.get(Journey, journey_id)
+    if journey is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Journey was not found")
+    # Candidates by span overlap, best match by overlap length. Both sides are UTC, so a
+    # dashcam journey and an OBD drive of the same trip overlap for essentially its whole
+    # duration; anything touching the window at all is still offered, because the logger
+    # starts on voltage and the camera on power — their edges rarely agree to the second.
+    candidates = (
+        (
+            await session.execute(
+                select(OBDDrive)
+                .options(joinedload(OBDDrive.bundle))
+                .where(
+                    OBDDrive.started_at < journey.ended_at,
+                    OBDDrive.finished_at > journey.started_at,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    best = None
+    best_overlap = 0.0
+    for row in candidates:
+        overlap = (
+            min(row.finished_at, journey.ended_at) - max(row.started_at, journey.started_at)
+        ).total_seconds()
+        if overlap > best_overlap:
+            best, best_overlap = row, overlap
+    return {
+        "drive": _drive(best) if best else None,
+        "overlap_s": best_overlap if best else None,
+    }
+
+
+async def _journey_for_drive(session, drive: OBDDrive) -> dict[str, object] | None:
+    candidates = (
+        (
+            await session.execute(
+                select(Journey).where(
+                    Journey.started_at < drive.finished_at,
+                    Journey.ended_at > drive.started_at,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    best = None
+    best_overlap = 0.0
+    for row in candidates:
+        overlap = (
+            min(row.ended_at, drive.finished_at) - max(row.started_at, drive.started_at)
+        ).total_seconds()
+        if overlap > best_overlap:
+            best, best_overlap = row, overlap
+    if best is None:
+        return None
+    return {"id": best.id, "title": best.title, "overlap_s": best_overlap}
+
+
+@router.get(
     "/drives/{drive_id}/series",
     summary="Full-resolution samples and diagnostic events for one drive",
 )
@@ -259,6 +333,7 @@ async def drive_series(drive_id: str, session: SessionDep) -> dict[str, object]:
     )
     return {
         "drive": _drive(drive),
+        "journey": await _journey_for_drive(session, drive),
         "units": drive.units,
         "samples": [_series_sample(row) for row in samples],
         "diagnostics": [

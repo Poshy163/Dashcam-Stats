@@ -332,6 +332,7 @@ export interface OBDSeriesSample {
 
 export interface OBDDriveSeries {
   drive: OBDDriveSummary
+  journey: { id: number; title: string | null; overlapS: number } | null
   units: Record<string, string>
   samples: OBDSeriesSample[]
   diagnostics: { observedAt: string | null; kind: string; payload: Record<string, unknown> }[]
@@ -495,6 +496,10 @@ export const api = {
     drivesSummary: () => request<OBDDrivesTotals>('/obd/drives/summary'),
     driveSeries: (driveId: string) =>
       request<OBDDriveSeries>(`/obd/drives/${encodeURIComponent(driveId)}/series`),
+    driveForJourney: (journeyId: number) =>
+      request<{ drive: OBDDriveSummary | null; overlapS: number | null }>(
+        `/obd/drives/for-journey/${journeyId}`,
+      ),
     validate: (id: number) =>
       post<{ valid: boolean; bundle: OBDBundle }>(`/obd/bundles/${id}/validate`),
     retry: (id: number) =>

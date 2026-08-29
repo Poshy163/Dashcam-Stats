@@ -51,6 +51,15 @@ export default function JourneyDetail() {
   // Shared with the Heatmap and the plate map, which both used to hard-code their tiles.
   const mapSettings = useMapSettings()
 
+  // The OBD drive covering the same span, matched server-side by time overlap. Footage
+  // and telemetry are recorded by different devices, so the join lives on the server
+  // where both clocks are already normalised to UTC.
+  const obd = useQuery({
+    queryKey: ['obd-for-journey', journeyId],
+    queryFn: () => api.obd.driveForJourney(journeyId),
+    enabled: Number.isFinite(journeyId),
+  })
+
   // Coordinates only, for the map; the recording and offset on each point stay behind for
   // the click handler to resolve.
   const drawable = useMemo<[number, number][][]>(
@@ -143,6 +152,80 @@ export default function JourneyDetail() {
           title="No GPS for this journey"
           description="The camera had no satellite fix during these recordings, so there is no route to draw."
         />
+      )}
+
+      {obd.data?.drive && (
+        <section>
+          <div className="mb-2 flex items-baseline justify-between gap-3">
+            <h2 className="text-sm font-semibold">Engine telemetry</h2>
+            <Link
+              className="text-sm font-semibold text-accent hover:underline"
+              to={`/obd/${obd.data.drive.driveId}`}
+            >
+              Full charts →
+            </Link>
+          </div>
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
+            <StatTile
+              label="Engine time"
+              value={formatDuration(obd.data.drive.durationS)}
+              hint={
+                obd.data.drive.idleDurationS != null
+                  ? `${formatDuration(obd.data.drive.idleDurationS)} idle`
+                  : undefined
+              }
+            />
+            <StatTile
+              label="Fuel used"
+              value={
+                obd.data.drive.estimatedFuelUsedL != null
+                  ? `${obd.data.drive.estimatedFuelUsedL.toFixed(2)} L`
+                  : '—'
+              }
+              hint={
+                obd.data.drive.averageFuelConsumptionL100km != null
+                  ? `${obd.data.drive.averageFuelConsumptionL100km.toFixed(1)} L/100 km`
+                  : undefined
+              }
+            />
+            <StatTile
+              label="Average RPM"
+              value={
+                obd.data.drive.averageRpm != null
+                  ? Math.round(obd.data.drive.averageRpm).toLocaleString()
+                  : '—'
+              }
+              hint={
+                obd.data.drive.maximumRpm != null
+                  ? `peak ${Math.round(obd.data.drive.maximumRpm).toLocaleString()}`
+                  : undefined
+              }
+            />
+            <StatTile
+              label="Peak coolant"
+              value={
+                obd.data.drive.maximumCoolantTemperatureC != null
+                  ? `${Math.round(obd.data.drive.maximumCoolantTemperatureC)}°C`
+                  : '—'
+              }
+            />
+            <StatTile
+              label="OBD top speed"
+              value={formatSpeed(obd.data.drive.maximumSpeedKmh)}
+              hint="from the ECU, not GPS"
+            />
+            <StatTile
+              label="Samples"
+              value={obd.data.drive.sampleCount.toLocaleString()}
+              tone={obd.data.drive.dtcsObserved.length > 0 ? 'warn' : 'default'}
+              hint={
+                obd.data.drive.dtcsObserved.length > 0
+                  ? `DTCs: ${obd.data.drive.dtcsObserved.join(', ')}`
+                  : undefined
+              }
+            />
+          </div>
+        </section>
       )}
 
       <section>

@@ -26,11 +26,14 @@ const PAD_B = 22
 /** Consecutive samples further apart than this are a gap, not a long interval. */
 const GAP_S = 15
 
-function formatTick(value: number): string {
-  const magnitude = Math.abs(value)
-  if (magnitude >= 1000) return Math.round(value).toLocaleString()
-  if (magnitude >= 10) return value.toFixed(0)
-  return value.toFixed(1)
+function formatTick(value: number, span?: number): string {
+  // Decimals follow the axis range, not the value's size: a 12.1–12.9 V axis labelled
+  // to whole volts reads 13/13/13/12, which is four gridlines and two numbers.
+  const scale = span ?? Math.abs(value)
+  if (Math.abs(value) >= 1000) return Math.round(value).toLocaleString()
+  if (scale >= 20) return value.toFixed(0)
+  if (scale >= 2) return value.toFixed(1)
+  return value.toFixed(2)
 }
 
 function formatElapsed(seconds: number): string {
@@ -50,11 +53,14 @@ function TimeChart({
   title,
   unit,
   elapsedS,
+  timesIso,
   series,
 }: {
   title: string
   unit: string
   elapsedS: number[]
+  /** Original sample timestamps, so the tooltip can name the wall-clock moment. */
+  timesIso: string[]
   series: Series[]
 }) {
   const svgRef = useRef<SVGSVGElement>(null)
@@ -86,20 +92,45 @@ function TimeChart({
   const gridValues = [0, 1, 2, 3].map((i) => min + ((max - min) * i) / 3)
   const tickTimes = [0, 0.25, 0.5, 0.75, 1].map((f) => tFirst + domain * f)
 
-  const segments = (values: (number | null)[]): string[] => {
-    const out: string[] = []
-    let current: string[] = []
+  // Not every metric arrives every cycle: the poll plan reads coolant, trims and the O2
+  // sensors on a slower tier, so their series are mostly nulls with a value every few
+  // samples. Splitting on every null therefore produced only single-point "lines" and the
+  // chart drew nothing while its own legend quoted a range. Instead, each series bridges
+  // separations up to 2.5x its own median observation cadence — a slow tier joins up, a
+  // fast series still breaks where the link actually dropped — and anything left isolated
+  // is drawn as a dot rather than discarded.
+  const segments = (values: (number | null)[]): { lines: string[]; dots: [number, number][] } => {
+    const observed: { t: number; v: number }[] = []
     values.forEach((v, i) => {
       const t = elapsedS[i]
-      if (v == null || t == null) {
-        if (current.length > 1) out.push(current.join(' '))
-        current = []
-      } else {
-        current.push(`${x(t).toFixed(1)},${y(v).toFixed(1)}`)
-      }
+      if (v != null && t != null) observed.push({ t, v })
     })
-    if (current.length > 1) out.push(current.join(' '))
-    return out
+    if (observed.length === 0) return { lines: [], dots: [] }
+    const separations = observed
+      .slice(1)
+      .map((o, i) => o.t - (observed[i]?.t ?? o.t))
+      .sort((a, b) => a - b)
+    const median = separations[Math.floor(separations.length / 2)] ?? 0
+    const bridge = Math.max(GAP_S, median * 2.5)
+
+    const lines: string[] = []
+    const dots: [number, number][] = []
+    let run: { t: number; v: number }[] = []
+    const flush = () => {
+      if (run.length > 1) {
+        lines.push(run.map((o) => `${x(o.t).toFixed(1)},${y(o.v).toFixed(1)}`).join(' '))
+      } else if (run.length === 1 && run[0]) {
+        dots.push([x(run[0].t), y(run[0].v)])
+      }
+      run = []
+    }
+    for (const o of observed) {
+      const previous = run[run.length - 1]
+      if (previous && o.t - previous.t > bridge) flush()
+      run.push(o)
+    }
+    flush()
+    return { lines, dots }
   }
 
   const stats = (values: (number | null)[]) => {
@@ -132,12 +163,33 @@ function TimeChart({
   }
 
   const hoverT = hover != null ? elapsedS[hover] : null
+  const hoverClock = hover != null ? formatDateTime(timesIso[hover]) : null
+  const tooltipTitle = hoverT != null ? `${formatElapsed(hoverT)} · ${hoverClock}` : ''
+  // A slow-tier metric usually has no reading at the exact hovered sample; the nearest
+  // observation within 30 s is what the bridged line is claiming there anyway.
+  const valueNear = (values: (number | null)[]): number | null => {
+    if (hover == null || hoverT == null) return null
+    const direct = values[hover]
+    if (direct != null) return direct
+    let best: number | null = null
+    let bestDistance = 30
+    values.forEach((v, i) => {
+      const t = elapsedS[i]
+      if (v == null || t == null) return
+      const distance = Math.abs(t - hoverT)
+      if (distance <= bestDistance) {
+        bestDistance = distance
+        best = v
+      }
+    })
+    return best
+  }
   const tooltipRows =
     hover != null
       ? drawn.map((s) => ({
           label: s.label,
           colorClass: s.colorClass,
-          value: s.values[hover] ?? null,
+          value: valueNear(s.values),
         }))
       : []
   const tooltipW =
@@ -145,6 +197,7 @@ function TimeChart({
     6.4 *
       Math.max(
         8,
+        tooltipTitle.length,
         ...tooltipRows.map(
           (row) => `${row.label} ${row.value != null ? formatTick(row.value) : '—'} ${unit}`.length,
         ),
@@ -200,7 +253,7 @@ function TimeChart({
               fill="currentColor"
               className="text-content-faint"
             >
-              {formatTick(v)}
+              {formatTick(v, max - min)}
             </text>
           </g>
         ))}
@@ -217,20 +270,27 @@ function TimeChart({
             {formatElapsed(t)}
           </text>
         ))}
-        {drawn.map((s) =>
-          segments(s.values).map((points, i) => (
-            <polyline
-              key={`${s.label}-${i}`}
-              points={points}
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={1.75}
-              strokeLinejoin="round"
-              strokeLinecap="round"
-              className={s.colorClass}
-            />
-          )),
-        )}
+        {drawn.map((s) => {
+          const { lines, dots } = segments(s.values)
+          return (
+            <g key={s.label} className={s.colorClass}>
+              {lines.map((points, i) => (
+                <polyline
+                  key={i}
+                  points={points}
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={1.75}
+                  strokeLinejoin="round"
+                  strokeLinecap="round"
+                />
+              ))}
+              {dots.map(([cx, cy], i) => (
+                <circle key={`dot-${i}`} cx={cx} cy={cy} r={2.5} fill="currentColor" />
+              ))}
+            </g>
+          )
+        })}
         {hover != null && hoverT != null && (
           <g pointerEvents="none">
             <line
@@ -272,7 +332,7 @@ function TimeChart({
               fill="currentColor"
               className="text-content"
             >
-              {formatElapsed(hoverT)}
+              {tooltipTitle}
             </text>
             {tooltipRows.map((row, i) => (
               <text
@@ -449,7 +509,8 @@ export default function ObdDriveDetail() {
   if (query.isLoading) return <Spinner label="Loading drive…" className="py-24" />
   if (query.isError) return <ErrorState error={query.error} retry={() => query.refetch()} />
   if (!query.data) return null
-  const { drive, samples, diagnostics } = query.data
+  const { drive, journey, samples, diagnostics } = query.data
+  const timesIso = samples.map((s) => s.t)
 
   // Instantaneous L/100 km is meaningless while (nearly) stopped — the divisor is the
   // speed — so the trace only claims the moving parts of the drive.
@@ -468,9 +529,16 @@ export default function ObdDriveDetail() {
           </>
         }
         actions={
-          <Link to="/obd" className="btn">
-            All drives
-          </Link>
+          <>
+            {journey && (
+              <Link to={`/journeys/${journey.id}`} className="btn">
+                {journey.title ? `Journey: ${journey.title}` : 'View journey footage'}
+              </Link>
+            )}
+            <Link to="/obd" className="btn">
+              All drives
+            </Link>
+          </>
         }
       />
 
@@ -583,6 +651,7 @@ export default function ObdDriveDetail() {
               title="Speed"
               unit="km/h"
               elapsedS={elapsedS}
+              timesIso={timesIso}
               series={[
                 {
                   label: 'Vehicle speed',
@@ -595,6 +664,7 @@ export default function ObdDriveDetail() {
               title="Engine RPM"
               unit="rpm"
               elapsedS={elapsedS}
+              timesIso={timesIso}
               series={[
                 {
                   label: 'RPM',
@@ -607,6 +677,7 @@ export default function ObdDriveDetail() {
               title="Temperatures"
               unit="°C"
               elapsedS={elapsedS}
+              timesIso={timesIso}
               series={[
                 {
                   label: 'Coolant',
@@ -624,6 +695,7 @@ export default function ObdDriveDetail() {
               title="Adapter voltage"
               unit="V"
               elapsedS={elapsedS}
+              timesIso={timesIso}
               series={[
                 {
                   label: 'Voltage',
@@ -636,6 +708,7 @@ export default function ObdDriveDetail() {
               title="Load and throttle"
               unit="%"
               elapsedS={elapsedS}
+              timesIso={timesIso}
               series={[
                 {
                   label: 'Engine load',
@@ -653,6 +726,7 @@ export default function ObdDriveDetail() {
               title="Fuel trims"
               unit="%"
               elapsedS={elapsedS}
+              timesIso={timesIso}
               series={[
                 {
                   label: 'Short term',
@@ -670,6 +744,7 @@ export default function ObdDriveDetail() {
               title="Fuel rate"
               unit="L/h"
               elapsedS={elapsedS}
+              timesIso={timesIso}
               series={[
                 {
                   label: 'Estimated fuel rate',
@@ -682,6 +757,7 @@ export default function ObdDriveDetail() {
               title="Consumption while moving"
               unit="L/100 km"
               elapsedS={elapsedS}
+              timesIso={timesIso}
               series={[
                 {
                   label: 'Est. consumption (5+ km/h)',
@@ -694,6 +770,7 @@ export default function ObdDriveDetail() {
               title="Oxygen sensors"
               unit="V"
               elapsedS={elapsedS}
+              timesIso={timesIso}
               series={[
                 {
                   label: 'Sensor 1',
@@ -711,6 +788,7 @@ export default function ObdDriveDetail() {
               title="Mass air flow and timing"
               unit="g/s · °"
               elapsedS={elapsedS}
+              timesIso={timesIso}
               series={[
                 {
                   label: 'MAF',
