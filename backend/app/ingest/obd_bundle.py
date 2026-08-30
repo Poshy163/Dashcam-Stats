@@ -280,7 +280,11 @@ class ValidatedBundle:
             "latest_values": self.latest_values,
             "summary": summary,
             "statistics": self.statistics,
-            "diagnostics": diagnostics_for_ha(self.diagnostics_document),
+            "diagnostics": diagnostics_for_ha(
+                self.diagnostics_document,
+                start_time_utc=summary["start_time_utc"],
+                finish_time_utc=summary["finish_time_utc"],
+            ),
         }
 
 
@@ -1590,14 +1594,37 @@ def validate_bundle(path: Path, *, config: AppConfig | None = None) -> Validated
     )
 
 
-def diagnostics_for_ha(document: dict[str, Any]) -> dict[str, Any]:
-    """Reduce sparse events to the endpoint's strict, identifier-free metadata object."""
+def diagnostics_for_ha(
+    document: dict[str, Any],
+    *,
+    start_time_utc: object,
+    finish_time_utc: object,
+) -> dict[str, Any]:
+    """Reduce drive-window events to HA's strict, identifier-free metadata object.
+
+    The immutable producer bundle can legitimately contain finalisation diagnostics after the
+    last valid sample.  Reconciliation projects that evidence-based sample time as the canonical
+    drive finish.  Home Assistant requires every projected diagnostic timestamp to fall inside
+    that canonical window, so keep later lifecycle evidence in the server's raw diagnostic table
+    and exclude it only from this bounded aggregate projection.
+    """
+    started = _utc(start_time_utc, field_name="HA diagnostics start_time_utc")
+    finished = _utc(finish_time_utc, field_name="HA diagnostics finish_time_utc")
+    if finished < started:
+        raise HAPayloadError("Home Assistant diagnostic window is invalid")
+    events = [
+        event
+        for event in document.get("events", [])
+        if started
+        <= _utc(event.get("timestamp_utc"), field_name="diagnostic.timestamp_utc")
+        <= finished
+    ]
     result: dict[str, Any] = {
-        "event_count": len(document.get("events", [])),
+        "event_count": len(events),
         "parser_failure_count": 0,
         "connection_failure_count": 0,
     }
-    for event in document.get("events", []):
+    for event in events:
         kind = event.get("kind")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         observed = event.get("timestamp_utc")

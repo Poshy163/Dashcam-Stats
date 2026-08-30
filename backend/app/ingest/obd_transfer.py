@@ -192,6 +192,10 @@ _LOGGER_KEYS = frozenset(
     {
         "schema_version",
         "logger_version",
+        "app_version_name",
+        "app_version_code",
+        "poll_plan_version",
+        "build_git_sha",
         "state",
         "ownership_enabled",
         "adapter_state",
@@ -213,6 +217,8 @@ _LOGGER_KEYS = frozenset(
 
 _LOGGER_CAPABILITY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _LOGGER_METRIC_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+_LOGGER_APP_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+_LOGGER_BUILD_GIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{12}|unknown)$")
 MAX_LOGGER_CAPABILITIES = 32
 MAX_LOGGER_METRICS = 64
 LOGGER_PACKAGE = "com.dashcamstats.obdlogger"
@@ -329,6 +335,15 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
             metrics = _clean_logger_metrics(item)
             if metrics is not None:
                 clean[key] = metrics
+        elif key == "app_version_name":
+            if isinstance(item, str) and _LOGGER_APP_VERSION_RE.fullmatch(item):
+                clean[key] = item
+        elif key in {"app_version_code", "poll_plan_version"}:
+            if isinstance(item, int) and not isinstance(item, bool) and 1 <= item <= 2_147_483_647:
+                clean[key] = item
+        elif key == "build_git_sha":
+            if isinstance(item, str) and _LOGGER_BUILD_GIT_SHA_RE.fullmatch(item):
+                clean[key] = item
         elif isinstance(item, str):
             clean[key] = redact(item)[:256]
         elif isinstance(item, (bool, int, float)) or item is None:

@@ -141,6 +141,75 @@ class EngineGateTest {
     }
 
     @Test
+    fun parkedProbeIsAdapterLocalAndFullInitializationIsDeferred() {
+        assertEquals("ATRV", ElmAdapterCommandPlan.parkedVoltageProbe)
+        assertFalse(ElmAdapterCommandPlan.parkedVoltageProbe.startsWith("01"))
+        assertFalse(ElmAdapterCommandPlan.fullInitialization.contains("ATRV"))
+        assertTrue(ElmAdapterCommandPlan.fullInitialization.contains("ATZ"))
+        assertTrue(ElmAdapterCommandPlan.fullInitialization.all(ElmProtocol::isSafe))
+        assertTrue(ElmAdapterCommandPlan.fullInitialization.none { it.startsWith("01") })
+        assertFalse(parkedVoltageWarrantsInitialization(null, voltageOn = 13.2))
+        assertFalse(parkedVoltageWarrantsInitialization(Double.NaN, voltageOn = 13.2))
+        assertFalse(parkedVoltageWarrantsInitialization(Double.POSITIVE_INFINITY, voltageOn = 13.2))
+        assertFalse(parkedVoltageWarrantsInitialization(13.19, voltageOn = 13.2))
+        assertTrue(parkedVoltageWarrantsInitialization(13.2, voltageOn = 13.2))
+        assertTrue(parkedVoltageWarrantsInitialization(14.1, voltageOn = 13.2))
+    }
+
+    @Test
+    fun parkedVoltageProbeExecutesOnlyAtrvAndHonorsQuiesceBoundaries() {
+        val commands = mutableListOf<String>()
+        runTest {
+            val voltage = probeParkedAdapterVoltage(quiesceRequested = { false }) { command ->
+                commands += command
+                "ATRV\r12.4 V\r>"
+            }
+            assertEquals(12.4, voltage!!, 0.001)
+        }
+        assertEquals(listOf("ATRV"), commands)
+
+        val beforeCommands = mutableListOf<String>()
+        assertThrows(ElmQuiesceRequestedException::class.java) {
+            runTest {
+                probeParkedAdapterVoltage(quiesceRequested = { true }) { command ->
+                    beforeCommands += command
+                    "12.4 V\r>"
+                }
+            }
+        }
+        assertTrue(beforeCommands.isEmpty())
+
+        var quiesceChecks = 0
+        val afterCommands = mutableListOf<String>()
+        assertThrows(ElmQuiesceRequestedException::class.java) {
+            runTest {
+                probeParkedAdapterVoltage(quiesceRequested = { ++quiesceChecks == 2 }) { command ->
+                    afterCommands += command
+                    "12.4 V\r>"
+                }
+            }
+        }
+        assertEquals(listOf("ATRV"), afterCommands)
+        assertEquals(2, quiesceChecks)
+    }
+
+    @Test
+    fun onlyFailureArmsAReconnectAttempt() {
+        val tracker = ReconnectAttemptTracker()
+        assertFalse(tracker.nextAttemptIsReconnect())
+        assertFalse(tracker.nextAttemptIsReconnect())
+
+        tracker.connectionFailed()
+        assertTrue(tracker.nextAttemptIsReconnect())
+        assertFalse(tracker.nextAttemptIsReconnect())
+
+        tracker.connectionFailed()
+        tracker.connectionFailed()
+        assertTrue(tracker.nextAttemptIsReconnect())
+        assertFalse(tracker.nextAttemptIsReconnect())
+    }
+
+    @Test
     fun fatalTransportFailurePersistsOnlyNonemptyPartialValuesWithStableSequence() {
         assertNull(
             partialSampleAfterTransportFailure(
@@ -231,6 +300,26 @@ class EngineGateTest {
             ServiceStartupDecision.START,
             ServiceStartupGate.decide(canRun = true, hasPermissions = true),
         )
+    }
+
+    @Test
+    fun databaseInitializationIsGatedBehindForegroundPromotion() {
+        val gate = ForegroundFirstStartupGate()
+        var databaseInitialized = false
+
+        val error = assertThrows(IllegalStateException::class.java) {
+            gate.afterForeground { databaseInitialized = true }
+        }
+        assertEquals("database initialization requires foreground promotion", error.message)
+        assertFalse(databaseInitialized)
+
+        gate.markForegroundStarted()
+        val result = gate.afterForeground {
+            databaseInitialized = true
+            "opened"
+        }
+        assertTrue(databaseInitialized)
+        assertEquals("opened", result)
     }
 
     @Test

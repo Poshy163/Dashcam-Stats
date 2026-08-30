@@ -94,6 +94,7 @@ data class ExportedDriveRetentionCandidate(
 data class VerifiedExportedDrive(val driveId: String, val bundleSha256: String)
 
 internal val TERMINAL_DRIVE_STATUSES = setOf("complete", "interrupted", "recovered", "failed")
+internal const val OBD_DATABASE_SYNCHRONOUS_MODE = "FULL"
 
 class ObdDatabase(
     context: Context,
@@ -151,7 +152,16 @@ class ObdDatabase(
         super.onConfigure(db)
         db.setForeignKeyConstraintsEnabled(true)
         db.rawQuery("PRAGMA busy_timeout=30000", null).close()
-        db.rawQuery("PRAGMA synchronous=NORMAL", null).close()
+        // The head unit can lose power abruptly when its external supply is removed.  In WAL
+        // mode NORMAL may acknowledge a sample and still roll that transaction back after a
+        // hard power loss.  Samples are only written every five seconds, so prefer the bounded
+        // fsync cost of FULL and do not claim a row is persisted before it is power-loss durable.
+        db.execSQL("PRAGMA synchronous=$OBD_DATABASE_SYNCHRONOUS_MODE")
+        val synchronousMode = db.rawQuery("PRAGMA synchronous", null).use { cursor ->
+            check(cursor.moveToFirst()) { "OBD SQLite synchronous mode could not be read back" }
+            cursor.getInt(0)
+        }
+        check(synchronousMode == 2) { "OBD SQLite refused synchronous=FULL" }
         val hasDriveSchema = db.rawQuery(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='drives' LIMIT 1",
             null,

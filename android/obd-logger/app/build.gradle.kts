@@ -54,6 +54,19 @@ if (hasReleaseSigning && resolvedReleaseKeystore?.isFile != true) {
     throw GradleException("The configured OBD release keystore path is not a readable file.")
 }
 
+val buildGitSha = sequenceOf(
+    providers.environmentVariable("GITHUB_SHA").orNull,
+    runCatching {
+        providers.exec {
+            workingDir(rootProject.rootDir)
+            commandLine("git", "rev-parse", "--verify", "HEAD")
+            isIgnoreExitValue = true
+        }.standardOutput.asText.get().trim()
+    }.getOrNull(),
+).mapNotNull { candidate ->
+    candidate?.lowercase()?.takeIf { it.matches(Regex("[0-9a-f]{40,64}")) }
+}.firstOrNull()?.take(12) ?: "unknown"
+
 android {
     namespace = "com.dashcamstats.obdlogger"
     compileSdk = 35
@@ -62,8 +75,9 @@ android {
         applicationId = "com.dashcamstats.obdlogger"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "0.2.0"
+        versionCode = 4
+        versionName = "0.2.1"
+        buildConfigField("String", "BUILD_GIT_SHA", "\"$buildGitSha\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

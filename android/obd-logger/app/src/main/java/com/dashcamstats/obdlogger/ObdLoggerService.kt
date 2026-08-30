@@ -39,7 +39,8 @@ class ObdLoggerService : Service() {
     private var ingestionRequestId: String? = null
     private var startupRecoveredDrive: DriveFinalization? = null
     private val pipelineMetrics = PipelineMetrics()
-    private var connectionAttempts = 0L
+    private val foregroundFirstStartupGate = ForegroundFirstStartupGate()
+    @Volatile
     private var startupAllowed = false
     private var pendingStartupRecoveryReason = "process_terminated"
     private val statusWriteGate = StatusWriteGate()
@@ -78,12 +79,13 @@ class ObdLoggerService : Service() {
                 stopSelf()
                 return
             }
-            ServiceStartupDecision.START -> startupAllowed = true
+            ServiceStartupDecision.START -> {
+                createNotificationChannel()
+                startConnectedDeviceForeground("Starting safely")
+                foregroundFirstStartupGate.markForegroundStarted()
+                startupAllowed = true
+            }
         }
-        database = ObdDatabase(this)
-        exporter = BundleExporter(this, database)
-        createNotificationChannel()
-        startConnectedDeviceForeground("Starting safely")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -95,7 +97,7 @@ class ObdLoggerService : Service() {
             pendingStartupRecoveryReason = startupRecoveryReason(
                 intent?.getStringExtra(EXTRA_STARTUP_RECOVERY_REASON),
             )
-            worker = scope.launch { runLogger() }
+            worker = scope.launch { initializeAndRunLogger() }
         }
         return START_STICKY
     }
@@ -113,11 +115,45 @@ class ObdLoggerService : Service() {
         super.onDestroy()
     }
 
+    /**
+     * Database construction can checkpoint, copy and validate an existing database during an
+     * upgrade. Keep all of that work on the service IO scope and only publish the lateinit fields
+     * after both collaborators were constructed successfully.
+     */
+    private suspend fun initializeAndRunLogger() {
+        try {
+            val initializedDatabase = foregroundFirstStartupGate.afterForeground {
+                ObdDatabase(this@ObdLoggerService)
+            }
+            val initializedExporter = BundleExporter(this@ObdLoggerService, initializedDatabase)
+            database = initializedDatabase
+            exporter = initializedExporter
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            startupAllowed = false
+            val config = runCatching { LoggerPreferences.load(this@ObdLoggerService) }.getOrNull()
+            val message = safeError(error)
+            runCatching {
+                StatusPublisher.error(
+                    this@ObdLoggerService,
+                    config?.ownershipTransferred == true,
+                    "startup_failed",
+                    message,
+                )
+            }
+            runCatching { updateNotification("Logger startup failed") }
+            stopSelf()
+            return
+        }
+        runLogger()
+    }
+
     private suspend fun runLogger() {
         var recovered = false
         var recoveryReason = pendingStartupRecoveryReason
         var clearLeaseAfterBoot = recoveryReason == "device_restart"
         var failure = 0
+        val reconnectAttempts = ReconnectAttemptTracker()
         while (scope.isActive) {
             var config: LoggerConfig? = null
             var retryDelayMillis: Long? = null
@@ -182,7 +218,15 @@ class ObdLoggerService : Service() {
                             // leaves the terminal drive waiting for this safe export attempt.
                             drainPendingExports()
                             startupRecoveredDrive = null
-                            runOneConnection(loadedConfig, deviceRoot)
+                            val reconnecting = reconnectAttempts.nextAttemptIsReconnect()
+                            try {
+                                runOneConnection(loadedConfig, deviceRoot, reconnecting)
+                            } catch (error: Exception) {
+                                if (error !is CancellationException) {
+                                    reconnectAttempts.connectionFailed()
+                                }
+                                throw error
+                            }
                             failure = 0
                         }
                         is IngestionRequestRead.Invalid -> {
@@ -232,11 +276,14 @@ class ObdLoggerService : Service() {
         }
     }
 
-    private suspend fun runOneConnection(config: LoggerConfig, deviceRoot: File) {
+    private suspend fun runOneConnection(
+        config: LoggerConfig,
+        deviceRoot: File,
+        reconnecting: Boolean,
+    ) {
         updateNotification("Checking adapter voltage")
         publish("parked", config)
-        if (connectionAttempts > 0) pipelineMetrics.reconnectAttempted()
-        connectionAttempts = (connectionAttempts + 1).coerceAtMost(Int.MAX_VALUE.toLong())
+        if (reconnecting) pipelineMetrics.reconnectAttempted()
         val driveClock = MonotonicUtcClock(
             anchorUtc = Instant.now(),
             anchorElapsedMillis = SystemClock.elapsedRealtime(),
@@ -257,6 +304,29 @@ class ObdLoggerService : Service() {
         )
         val controlPresent = {
             IngestionQuiesceFiles.readRequest(deviceRoot) !is IngestionRequestRead.Absent
+        }
+        val parkedVoltage = try {
+            elm.probeAdapterVoltage(controlPresent)
+        } catch (_: ElmQuiesceRequestedException) {
+            elm.disconnect(false)
+            client = null
+            return
+        }
+        if (controlPresent()) {
+            elm.disconnect(false)
+            client = null
+            return
+        }
+        if (!parkedVoltageWarrantsInitialization(parkedVoltage, config.voltageOn)) {
+            // No protocol was opened and no ECU command was sent, so a local GATT close is the
+            // complete parked teardown. In particular, do not turn a cheap voltage probe into an
+            // ATZ/configuration/ATPC cycle while the engine remains off.
+            elm.disconnect(false)
+            client = null
+            updateNotification("Parked; next safe voltage check in 30 s")
+            publish("parked", config)
+            waitForNextParkedProbe(deviceRoot, 30_000)
+            return
         }
         val voltage = try {
             elm.initialize(controlPresent)

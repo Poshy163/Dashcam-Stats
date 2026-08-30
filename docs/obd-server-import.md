@@ -58,7 +58,10 @@ or malformed `status.json` is best-effort status only and never fails bundle or 
 backup.
 
 `status.json` is also read at the start of every footage pull, whether or not a bundle is
-waiting. While it reports `ownership_enabled: true` the pull leaves the unit's Bluetooth and
+waiting. Schema v3 build identity (`app_version_name`, `app_version_code`,
+`poll_plan_version`, `build_git_sha`) is strictly bounded, redacted with the rest of the
+logger snapshot and passed through under `logger` by `/api/obd/status`; unknown fields remain
+dropped. While status reports `ownership_enabled: true` the pull leaves the unit's Bluetooth and
 hotspot alone instead of quieting them for transfer throughput — the logger owns that radio in
 every state, including `parked` and `backoff`, because voltage probing is how it notices the
 next engine start. A transient failed read never downgrades a previously observed positive
@@ -127,7 +130,15 @@ revalidated immediately before an HA attempt and through the manual Validate act
 
 The Backup page is the normal control surface. It shows the companion's redacted
 `ecu_online`/parked state, device pending count, copy throughput, queue states, the current
-HA import, authentication/configuration status, last success and last error.
+HA import, authentication/configuration status, last success and last error. The API's nested
+`logger` snapshot additionally exposes the exact app version/code, poll plan and build revision
+for unattended deployment verification.
+
+When reconciliation moves an interrupted drive's canonical end back to its last valid sample,
+later finalisation diagnostics remain untouched in the server's raw diagnostic table. They are
+excluded only from the bounded Home Assistant aggregate projection, whose timestamps must remain
+inside that canonical drive window. This preserves the evidence while preventing a valid
+interrupted drive from being stranded by HA's strict timestamp contract.
 
 The same controls are available over the authenticated API:
 

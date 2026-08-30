@@ -156,7 +156,7 @@ class BundleExporter(
                 .put("adapter_id", drive.optNullable("adapter_id"))
                 .put("logger_id", drive.getString("logger_id"))
                 .put("logger_version", drive.getString("logger_version"))
-                .put("poll_plan_version", 2)
+                .put("poll_plan_version", ObdPollPlan.VERSION)
                 .put("start_time_utc", drive.getString("start_time_utc"))
                 .put("finish_time_utc", drive.getString("finish_time_utc"))
                 .put("last_sample_at_utc", drive.optNullable("last_sample_at_utc"))
@@ -486,7 +486,10 @@ class BundleExporter(
         val finish = Instant.parse(manifest.getString("finish_time_utc"))
         check(!finish.isBefore(start)) { "manifest drive time range is reversed" }
         if (!hardened) return
-        check(manifest.get("poll_plan_version") is Number && manifest.getInt("poll_plan_version") == 2)
+        check(
+            manifest.get("poll_plan_version") is Number &&
+                manifest.getInt("poll_plan_version") == ObdPollPlan.VERSION,
+        )
         val lastSample = manifest.instantOrNull("last_sample_at_utc")
         val lastResponse = manifest.instantOrNull("last_successful_obd_response_at_utc")
         val noticed = manifest.instantOrNull("termination_noticed_at_utc")

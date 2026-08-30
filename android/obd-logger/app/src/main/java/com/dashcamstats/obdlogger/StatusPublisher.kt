@@ -52,6 +52,8 @@ data class PublicStatus(
     val lastErrorAtUtc: String? = null,
 )
 
+internal const val PUBLIC_STATUS_SCHEMA_VERSION = 3
+
 object StatusPublisher {
     fun publish(context: Context, status: PublicStatus) {
         val root = DeviceFiles.removableRootOrNull(context)
@@ -89,7 +91,11 @@ object StatusPublisher {
     }
 
     internal fun buildStatusJson(status: PublicStatus, pendingCount: Int): JSONObject = JSONObject()
-            .put("schema_version", 2)
+            .put("schema_version", PUBLIC_STATUS_SCHEMA_VERSION)
+            .put("app_version_name", BuildConfig.VERSION_NAME)
+            .put("app_version_code", BuildConfig.VERSION_CODE)
+            .put("poll_plan_version", ObdPollPlan.VERSION)
+            .put("build_git_sha", BuildConfig.BUILD_GIT_SHA)
             .put("capabilities", org.json.JSONArray(listOf("ingestion_quiesce_v1")))
             .put("state", status.state)
             .put("ownership_enabled", status.ownershipEnabled)

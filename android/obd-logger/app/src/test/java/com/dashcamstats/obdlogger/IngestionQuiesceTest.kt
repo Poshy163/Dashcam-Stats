@@ -1,5 +1,7 @@
 package com.dashcamstats.obdlogger
 
+import android.content.Context
+import androidx.test.core.app.ApplicationProvider
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -224,7 +226,7 @@ class IngestionQuiesceTest {
     }
 
     @Test
-    fun statusV2AndMetricsAreFixedSchemaBoundedAndPayloadFree() {
+    fun statusV3IdentifiesTheExactBuildAndKeepsMetricsBoundedAndPayloadFree() {
         val metrics = PipelineMetrics(maximumCounter = 2)
         repeat(5) { metrics.commandRequested() }
         metrics.notificationReceived()
@@ -248,12 +250,50 @@ class IngestionQuiesceTest {
             ),
             pendingCount = 3,
         )
-        assertEquals(2, status.getInt("schema_version"))
+        assertLandingIdentity(status)
         assertEquals("ingestion_quiesce_v1", status.getJSONArray("capabilities").getString(0))
         assertEquals("drive-current", status.getString("current_drive_id"))
         assertEquals(3, status.getInt("pending_bundle_count"))
         assertEquals(1L, status.getJSONObject("metrics").getLong("maximum_queue_depth"))
         assertFalse(status.toString().contains("payload"))
+    }
+
+    @Test
+    fun fallbackErrorStatusAlsoIdentifiesTheExactBuild() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val root = DeviceFiles.fallbackStatusRoot(context)
+        root.deleteRecursively()
+        try {
+            StatusPublisher.storageUnavailable(
+                context,
+                PublicStatus(
+                    state = "storage_unavailable",
+                    ownershipEnabled = true,
+                    lastError = "removable storage is unavailable",
+                    lastErrorAtUtc = "2026-08-30T00:00:00Z",
+                ),
+            )
+
+            val status = JSONObject(File(root, "status.json").readText())
+            assertLandingIdentity(status)
+            assertEquals("storage_unavailable", status.getString("state"))
+            assertEquals("removable storage is unavailable", status.getString("last_error"))
+            assertEquals(0, status.getInt("pending_bundle_count"))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    private fun assertLandingIdentity(status: JSONObject) {
+        assertEquals(PUBLIC_STATUS_SCHEMA_VERSION, status.getInt("schema_version"))
+        assertEquals(BuildConfig.VERSION_NAME, status.getString("app_version_name"))
+        assertEquals(BuildConfig.VERSION_CODE, status.getInt("app_version_code"))
+        assertEquals(ObdPollPlan.VERSION, status.getInt("poll_plan_version"))
+        assertEquals(BuildConfig.BUILD_GIT_SHA, status.getString("build_git_sha"))
+        assertTrue(
+            BuildConfig.BUILD_GIT_SHA == "unknown" ||
+                BuildConfig.BUILD_GIT_SHA.matches(Regex("[0-9a-f]{12}")),
+        )
     }
 
     private fun validRequest(): String = requestJson(

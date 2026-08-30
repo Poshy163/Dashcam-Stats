@@ -57,6 +57,26 @@ object ServiceStartupGate {
     }
 }
 
+/**
+ * Prevent database construction from drifting ahead of foreground promotion. Android gives a
+ * service started with startForegroundService only a short deadline to call startForeground;
+ * migration backup, WAL checkpointing and integrity checks must therefore remain behind this
+ * explicit gate.
+ */
+internal class ForegroundFirstStartupGate {
+    @Volatile
+    private var foregroundStarted = false
+
+    fun markForegroundStarted() {
+        foregroundStarted = true
+    }
+
+    fun <T> afterForeground(block: () -> T): T {
+        check(foregroundStarted) { "database initialization requires foreground promotion" }
+        return block()
+    }
+}
+
 class StatusWriteGate(private val heartbeatMillis: Long = 300_000) {
     private var lastSignature: String? = null
     private var lastWriteAt: Long? = null
@@ -81,6 +101,21 @@ class StatusWriteGate(private val heartbeatMillis: Long = 300_000) {
         }
     }
 }
+
+/** Normal parked probes are not reconnects; only a failed connection arms the next attempt. */
+internal class ReconnectAttemptTracker {
+    private var pending = false
+
+    fun nextAttemptIsReconnect(): Boolean = pending.also { pending = false }
+
+    fun connectionFailed() {
+        pending = true
+    }
+}
+
+/** Null or low adapter voltage keeps the logger entirely outside the ECU protocol path. */
+internal fun parkedVoltageWarrantsInitialization(voltage: Double?, voltageOn: Double): Boolean =
+    voltage?.isFinite() == true && voltage >= voltageOn
 
 /**
  * Only fields whose change warrants an immediate durable status write belong in this signature.
@@ -243,6 +278,8 @@ object RemovableStoragePolicy {
 }
 
 object ObdPollPlan {
+    const val VERSION = 2
+
     private val fast = listOf(0x04, 0x0C, 0x0D, 0x0E, 0x10, 0x11)
     private val medium = listOf(0x03, 0x05, 0x06, 0x07, 0x0F, 0x14, 0x15)
     private val slow = listOf(0x13, 0x1C, 0x21)

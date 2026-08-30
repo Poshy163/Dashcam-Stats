@@ -763,6 +763,44 @@ class TestBundleValidation:
                 config=app_config,
             )
 
+    def test_canonical_finish_excludes_later_finalisation_diagnostics_from_ha(
+        self, tmp_path, app_config
+    ):
+        checked = validate_bundle(
+            make_bundle(tmp_path, "drive_canonical_diagnostic_window"),
+            config=app_config,
+        )
+        checked.diagnostics_document["events"] = [
+            {
+                "diagnostic_id": "inside",
+                "drive_id": checked.drive_id,
+                "timestamp_utc": BASE.isoformat(),
+                "kind": "parser_failure",
+                "payload": {"category": "live_pid_15", "message": "bounded"},
+            },
+            {
+                "diagnostic_id": "after_effective_end",
+                "drive_id": checked.drive_id,
+                "timestamp_utc": (BASE + timedelta(seconds=10)).isoformat(),
+                "kind": "pipeline_metrics",
+                "payload": {},
+            },
+        ]
+        # The immutable producer lifecycle can run past the last valid sample.  The server
+        # retains that later event, while the reconciled HA projection ends at the sample.
+        checked.summary["finish_time_utc"] = (BASE + timedelta(seconds=10)).isoformat()
+        checked.summary["duration_s"] = 10.0
+        canonical = dict(checked.summary)
+        canonical["finish_time_utc"] = (BASE + timedelta(seconds=5)).isoformat()
+        canonical["duration_s"] = 5.0
+
+        projected = checked.ha_payload(canonical_summary=canonical)["diagnostics"]
+
+        assert projected["event_count"] == 1
+        assert projected["parser_failure_count"] == 1
+        assert projected["last_event_timestamp_utc"] == BASE.isoformat()
+        assert len(checked.diagnostics_document["events"]) == 2
+
     def test_later_failed_dtc_modes_cannot_reuse_an_older_successful_scan(
         self, tmp_path, app_config
     ):
@@ -2013,8 +2051,12 @@ class TestTransferIsolation:
 
     async def test_logger_status_accepts_canonical_redacted_fixture(self, monkeypatch):
         fixture = {
-            "schema_version": 1,
+            "schema_version": 3,
             "logger_version": "1.0.0",
+            "app_version_name": "0.2.0",
+            "app_version_code": 3,
+            "poll_plan_version": 2,
+            "build_git_sha": "0123456789ab",
             "state": "ecu_online",
             "ownership_enabled": True,
             "adapter_state": "connected",
@@ -2039,7 +2081,56 @@ class TestTransferIsolation:
         assert status["ownership_enabled"] is True
         assert status["last_drive_id"] == "drive_previous"
         assert status["pending_bundle_count"] == 3
+        assert status["app_version_name"] == "0.2.0"
+        assert status["app_version_code"] == 3
+        assert status["poll_plan_version"] == 2
+        assert status["build_git_sha"] == "0123456789ab"
         assert "private_adapter_address" not in status
+
+    async def test_logger_build_identity_rejects_unbounded_or_mistyped_values(self, monkeypatch):
+        fixture = {
+            "schema_version": 3,
+            "app_version_name": "secret value with spaces",
+            "app_version_code": True,
+            "poll_plan_version": -1,
+            "build_git_sha": "not-a-git-revision",
+            "state": "parked",
+            "ownership_enabled": True,
+        }
+        monkeypatch.setattr(
+            obd_transfer.adb,
+            "shell",
+            lambda *_args, **_kwargs: _async_value(json.dumps(fixture)),
+        )
+
+        status = await obd_transfer.read_logger_status("unit", "/safe/status.json")
+
+        assert status == {
+            "schema_version": 3,
+            "state": "parked",
+            "ownership_enabled": True,
+        }
+
+    async def test_obd_status_api_exposes_logger_build_identity(self, client, monkeypatch):
+        identity = {
+            "schema_version": 3,
+            "app_version_name": "0.2.0",
+            "app_version_code": 3,
+            "poll_plan_version": 2,
+            "build_git_sha": "0123456789ab",
+        }
+
+        class TransferStatus:
+            @staticmethod
+            def snapshot():
+                return {"logger": identity}
+
+        monkeypatch.setattr(obd_api, "get_obd_transfer_status", TransferStatus)
+
+        response = await client.get("/api/obd/status")
+
+        assert response.status_code == 200
+        assert response.json()["logger"] == identity
 
     async def test_remote_inventory_is_oldest_first_and_ignores_partial(self, monkeypatch):
         monkeypatch.setattr(

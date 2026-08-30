@@ -161,6 +161,14 @@ class ObdDatabaseRetentionTest {
                 cursor.getString(0).lowercase()
             },
         )
+        assertEquals("FULL", OBD_DATABASE_SYNCHRONOUS_MODE)
+        assertEquals(
+            2,
+            database.readableDatabase.rawQuery("PRAGMA synchronous", null).use { cursor ->
+                cursor.moveToFirst()
+                cursor.getInt(0)
+            },
+        )
     }
 
     @Test

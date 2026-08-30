@@ -27,6 +27,29 @@ class ElmQuiesceRequestedException : ElmException("ingestion quiesce requested")
 class ElmCommandRejectedException(message: String) : ElmException(message)
 data class DtcQueryResult(val codes: List<String>, val status: String)
 
+/**
+ * Keep the parked gate adapter-local.  In particular, do not reset/configure the ELM or send a
+ * Mode 01 request until the cheap voltage probe says the engine-on threshold may have been met.
+ */
+internal object ElmAdapterCommandPlan {
+    const val parkedVoltageProbe = "ATRV"
+
+    val fullInitialization = listOf(
+        "ATZ", "ATI", "ATD", "ATD0", "ATE0", "ATL0", "ATH1", "ATSP0", "ATE0",
+        "ATH1", "ATM0", "ATS0", "ATAT1", "ATAL", "ATST64",
+    )
+}
+
+internal suspend fun probeParkedAdapterVoltage(
+    quiesceRequested: () -> Boolean,
+    execute: suspend (String) -> String,
+): Double? {
+    if (quiesceRequested()) throw ElmQuiesceRequestedException()
+    val voltage = ElmProtocol.voltage(execute(ElmAdapterCommandPlan.parkedVoltageProbe))
+    if (quiesceRequested()) throw ElmQuiesceRequestedException()
+    return voltage
+}
+
 @SuppressLint("MissingPermission")
 class ElmBleClient(
     private val context: Context,
@@ -210,17 +233,16 @@ class ElmBleClient(
         }
     }
 
+    suspend fun probeAdapterVoltage(quiesceRequested: () -> Boolean = { false }): Double? {
+        return probeParkedAdapterVoltage(quiesceRequested) { value -> command(value) }
+    }
+
     suspend fun initialize(quiesceRequested: () -> Boolean = { false }): Double? {
-        val commands = listOf(
-            "ATZ", "ATI", "ATD", "ATD0", "ATE0", "ATL0", "ATH1", "ATSP0", "ATE0",
-            "ATH1", "ATM0", "ATS0", "ATAT1", "ATAL", "ATST64",
-        )
-        for (command in commands) {
+        for (command in ElmAdapterCommandPlan.fullInitialization) {
             if (quiesceRequested()) throw ElmQuiesceRequestedException()
             command(command, if (command == "ATZ") 12_000 else 6_000)
         }
-        if (quiesceRequested()) throw ElmQuiesceRequestedException()
-        return ElmProtocol.voltage(command("ATRV"))
+        return probeAdapterVoltage(quiesceRequested)
     }
 
     suspend fun proveEcu(quiesceRequested: () -> Boolean = { false }): Set<Int> {

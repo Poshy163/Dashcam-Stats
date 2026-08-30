@@ -17,7 +17,9 @@ logger would therefore be test code, not something this unit can run.
 
 The companion uses a `connectedDevice` foreground service, a low-importance persistent
 notification, `BOOT_COMPLETED`, Android's Nearby Devices permissions, app-private SQLite in WAL
-mode, and app-specific removable external storage. It holds no indefinite wake lock. If boot
+mode, and app-specific removable external storage. Foreground promotion happens before database
+migration or integrity work; database/exporter initialization then runs on the service IO scope so
+a large upgrade cannot consume Android's foreground-start deadline. It holds no indefinite wake lock. If boot
 finds Bluetooth permission missing it disables itself, publishes a redacted error and waits for
 the operator to reopen the setup screen; it does not retry in a tight loop.
 
@@ -33,10 +35,15 @@ Default host-readable paths (verify the removable-volume alias on the physical u
 
 The backup server's `DASHCAM_OBD_REMOTE_READY_DIR`, `DASHCAM_OBD_REMOTE_STATUS_FILE`, and
 `DASHCAM_OBD_REMOTE_RECEIPTS_DIR` settings are overrides for a unit whose app-specific path
-resolves differently. Status schema v2 publishes `ingestion_quiesce_v1`, current/last drive
+resolves differently. Status schema v3 publishes `ingestion_quiesce_v1`, current/last drive
 identity, last sample, pending bundle count, the correlated ingestion request ID and fixed-schema
-saturating pipeline counters. It contains no adapter address, VIN, credentials, command/response
-payload or telemetry.
+saturating pipeline counters. Every ordinary, error and internal-storage fallback payload also
+identifies the installed artifact with `app_version_name`, `app_version_code`,
+`poll_plan_version` and `build_git_sha`. The build revision is a validated 12-character lower-case
+Git revision sourced from `GITHUB_SHA` or the checkout's `HEAD`; it is `unknown` only when neither
+is available. Gradle injects it directly into `BuildConfig` without generating a tracked file.
+These fields are passed through under `logger` by `GET /api/obd/status`. Status contains no adapter
+address, VIN, credentials, command/response payload or telemetry.
 
 ## Build, sign and install
 
@@ -107,11 +114,12 @@ Do not enable the persistent ownership checkbox until the cutover below is compl
 6. Run the ordinary arrival backup and confirm the server validates the bundle before deleting it
    from the dashcam.
 
-Parked checks use only the known ELM reset/configuration sequence and adapter-local `ATRV`; they do
-not send a Mode 01 request until voltage reaches the configured 13.2 V start threshold. Live stop
-uses the 13.0 V threshold, a 30-second grace, and a recent RPM above 300 veto. Every command passes
-a read-only allowlist. Mode 04/08, raw monitors, security/programming/reset requests and persistent
-ELM writes are absent and refused.
+Parked checks issue one adapter-local `ATRV`; they do not reset or configure the ELM and do not send
+a Mode 01 request while voltage remains below the configured 13.2 V start threshold. Only after
+that cheap gate passes does the logger run the known reset/configuration sequence and require a
+checksum-valid ECU response. Live stop uses the 13.0 V threshold, a 30-second grace, and a recent
+RPM above 300 veto. Every command passes a read-only allowlist. Mode 04/08, raw monitors,
+security/programming/reset requests and persistent ELM writes are absent and refused.
 
 Before device ingestion takes Bluetooth away, the controller atomically writes the exact
 five-field schema-v1 `control/ingestion-request.json` (`schema_version`, safe `request_id`,
@@ -146,7 +154,7 @@ per-PID cooldown and is retried; a transient MAF failure can recover, while a re
 advertised PID backs off to at most one retry per 12 sample cycles. Strict source, length and
 checksum validation is unchanged. Medium PIDs are phase-distributed across three cycles and slow
 PIDs across phases 0/4/8 of each 12-cycle window, preserving each PID's cadence without putting
-every optional command in the same cycle. App `0.2.0` identifies this plan and hardened bundles
+every optional command in the same cycle. App `0.2.1` identifies this plan and hardened bundles
 declare `poll_plan_version=2`.
 Only transport-level faults (missing prompt, overflow, failed write, disconnect) still taint and
 reconnect, and a fatal fault mid-cycle first persists the partial sample already gathered, marked
@@ -159,7 +167,9 @@ send Mode 04/08 or clear DTCs.
 
 SQLite stores drives, samples and sparse diagnostics transactionally with stable UUIDv7 drive IDs,
 stable `<drive_id>-<sequence>` sample IDs, UTC timestamps, explicit values and parser/transport
-quality. Each connection captures one UTC anchor and advances drive/sample/response/notice time
+quality. WAL uses `synchronous=FULL`: an externally powered head unit can disappear without a clean
+shutdown, so a committed sample is not reported as persisted until SQLite has crossed the
+power-loss durability boundary. Each connection captures one UTC anchor and advances drive/sample/response/notice time
 only from Android elapsed realtime, so NTP or manual wall-clock changes cannot regress a drive's
 sequence timestamps. Recovery clamps later lifecycle clocks to the final sequence sample when the
 wall clock was corrected backward, and bundle creation is likewise ordered after finalisation.
@@ -179,11 +189,11 @@ Zero-sample crash remnants are retained in SQLite with
 `export_status=not_exportable_zero_samples`; no server-invalid empty bundle is published.
 Every terminal drive also receives a bounded `pipeline_metrics` diagnostic covering command,
 notification/fragment/frame, timeout, checksum/parser, sample/persistence/drop, BLE disconnect,
-reconnect and direct-path queue depth counters without raw payloads.
-`status.json` keeps the latest sampled timestamp and bounded metrics snapshot, but durable status
-writes occur immediately only for state/ownership/drive/request/error changes and otherwise on a
-five-minute heartbeat. SQLite sample commits remain independent, avoiding an extra TF-card fsync
-and atomic rename on every five-second polling cycle.
+failure-triggered reconnect and direct-path queue depth counters without raw payloads.
+`status.json` keeps the latest sampled timestamp, bounded metrics snapshot and immutable build/poll
+identity, but durable status writes occur immediately only for state/ownership/drive/request/error
+changes and otherwise on a five-minute heartbeat. SQLite sample commits remain independent,
+avoiding an extra TF-card fsync and atomic rename on every five-second polling cycle.
 
 Before an on-device schema upgrade, the logger forces a complete WAL checkpoint, validates the
 source, then publishes a synced main-only migration snapshot with a ready marker; SQLite SHM is
