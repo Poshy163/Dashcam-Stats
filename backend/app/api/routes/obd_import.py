@@ -702,10 +702,15 @@ async def validate_one(bundle_id: RowId, session: SessionDep) -> dict[str, objec
     was_untrusted = not row.metadata_trusted
     if was_untrusted:
         try:
-            # Store from the still-recoverable quarantine path first. A drive/hash
-            # conflict therefore leaves the bytes and placeholder coherent, while a
-            # successful promotion transactionally writes all raw history before READY.
+            # Store from the still-recoverable path first. Keep the durable queue claim
+            # in VALIDATING while committing the trusted identity and raw history: the
+            # filesystem promotion below cannot share this database transaction, so a
+            # crash must leave recovery with either quarantine+trusted or verified+trusted.
             row = await store_validated_bundle(session, checked)
+            row.state = OBDBundleState.VALIDATING.value
+            row.next_attempt_at = None
+            row.updated_at = utcnow()
+            await session.commit()
         except BundleError as exc:
             row.state = (
                 OBDBundleState.QUARANTINED.value if was_quarantined else OBDBundleState.FAILED.value
@@ -729,6 +734,14 @@ async def validate_one(bundle_id: RowId, session: SessionDep) -> dict[str, objec
         row.next_attempt_at = utcnow()
         row.failure_kind = None
         row.last_error = None
+    elif was_untrusted:
+        # The trusted history was committed above while the row remained claimed. A
+        # non-quarantined rejected copy is already in the verified directory, so only
+        # the final durable queue transition remains.
+        row.state = OBDBundleState.READY_TO_IMPORT.value
+        row.next_attempt_at = utcnow()
+        row.failure_kind = None
+        row.last_error = None
     elif row.state == OBDBundleState.VALIDATING.value:
         row.state = original_state
         row.next_attempt_at = original_next_attempt_at
@@ -742,6 +755,11 @@ async def validate_one(bundle_id: RowId, session: SessionDep) -> dict[str, objec
             drive,
             summary_source=checked.summary_source,
         )
+    # Publish the final state before waking the worker. Besides avoiding a missed wake,
+    # this is the second half of the filesystem/database promotion protocol: if this
+    # commit fails after a quarantine move, startup recovery sees verified+trusted while
+    # the last durable state is VALIDATING and safely requeues it.
+    await session.commit()
     get_import_worker().wake()
     return {"valid": True, "bundle": _bundle(row)}
 

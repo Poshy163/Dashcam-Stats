@@ -609,6 +609,42 @@ export default function Backup() {
         </>
       )}
 
+      {validateObd.data && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`card mb-4 px-4 py-3 text-sm ${
+            validateObd.data.valid ? 'border-state-ok/40' : 'border-state-error/50'
+          }`}
+        >
+          <div
+            className={`font-medium ${
+              validateObd.data.valid ? 'text-state-ok' : 'text-state-error'
+            }`}
+          >
+            {validateObd.data.valid ? 'OBD bundle validated' : 'OBD bundle is still invalid'}
+          </div>
+          <div className="mt-1 break-words text-content-muted">
+            {validateObd.data.valid
+              ? `The retained archive passed validation. Current state: ${validateObd.data.bundle.state.replaceAll('_', ' ')}.`
+              : (validateObd.data.bundle.lastError ??
+                'The retained archive failed validation again. No data was deleted.')}
+          </div>
+        </div>
+      )}
+
+      {validateObd.isError && (
+        <div
+          role="alert"
+          className="card mb-4 border-state-error/50 px-4 py-3 text-sm"
+        >
+          <div className="font-medium text-state-error">OBD validation request failed</div>
+          <div className="mt-1 break-words text-content-muted">
+            {validateObd.error instanceof Error ? validateObd.error.message : 'Something went wrong'}
+          </div>
+        </div>
+      )}
+
       {obdBundles.data?.items.length ? (
         <div className="card mb-8 overflow-x-auto">
           <table className="w-full text-sm">
@@ -664,9 +700,14 @@ export default function Backup() {
                           bundle.state,
                         )
                       }
-                      onClick={() => validateObd.mutate(bundle.id)}
+                      onClick={() => {
+                        validateObd.reset()
+                        validateObd.mutate(bundle.id)
+                      }}
                     >
-                      Validate
+                      {validateObd.isPending && validateObd.variables === bundle.id
+                        ? 'Validating…'
+                        : 'Validate'}
                     </button>
                     {['ready_to_import', 'retry_wait', 'failed'].includes(bundle.state) && (
                       <button

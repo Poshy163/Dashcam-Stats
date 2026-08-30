@@ -6,6 +6,7 @@ import asyncio
 import gzip
 import hashlib
 import json
+import re
 import threading
 import time
 import zipfile
@@ -45,6 +46,96 @@ from app.ingest.obd_bundle import (
 from app.ingest.transport import TransferResult
 
 BASE = datetime(2026, 8, 29, 1, 0, tzinfo=UTC)
+
+
+def _legacy_pipeline_metrics() -> dict[str, int]:
+    return {
+        "commands_requested": 0,
+        "commands_completed": 0,
+        "command_timeouts": 0,
+        "notifications_received": 0,
+        "notification_fragments_received": 0,
+        "frames_assembled": 0,
+        "checksum_failures": 0,
+        "parse_failures": 0,
+        "samples_created": 0,
+        "samples_queued": 0,
+        "samples_persisted": 0,
+        "samples_dropped": 0,
+        "database_write_failures": 0,
+        "ble_disconnects": 0,
+        "reconnect_attempts": 0,
+        "radio_shutdowns": 0,
+        "queue_depth": 0,
+        "maximum_queue_depth": 0,
+    }
+
+
+def _current_pipeline_metrics() -> dict[str, int | float]:
+    return {
+        "commands_requested": 3,
+        "commands_blocked": 1,
+        "commands_sent": 3,
+        "commands_completed": 2,
+        "command_timeouts": 1,
+        "adapter_local_commands": 2,
+        "vehicle_bus_commands": 1,
+        "ble_connection_attempts": 1,
+        "adapter_targets_resolved": 1,
+        "gatt_connections_established": 1,
+        "notification_subscriptions_enabled": 1,
+        "ble_connection_successes": 1,
+        "ble_connection_failures": 0,
+        "voltage_reads_successful": 1,
+        "voltage_reads_failed": 0,
+        "invalid_voltage_responses": 0,
+        "notifications_received": 2,
+        "notification_fragments_received": 2,
+        "frames_assembled": 2,
+        "checksum_failures": 0,
+        "parse_failures": 0,
+        "samples_created": 1,
+        "samples_queued": 1,
+        "samples_persisted": 1,
+        "samples_dropped": 0,
+        "database_write_failures": 0,
+        "ble_disconnects": 1,
+        "reconnect_attempts": 0,
+        "radio_shutdowns": 0,
+        "queue_depth": 0,
+        "maximum_queue_depth": 1,
+        "observation_window_ms": 1_000,
+        "polling_duty_cycle_percent": 48.0,
+        "connection_time_samples": 1,
+        "median_connection_time_ms": 340.0,
+        "maximum_connection_time_ms": 340,
+        "total_connection_time_ms": 340,
+        "command_response_time_samples": 2,
+        "median_command_response_time_ms": 100.0,
+        "maximum_command_response_time_ms": 120,
+        "total_command_response_time_ms": 200,
+        "voltage_response_time_samples": 1,
+        "median_voltage_response_time_ms": 120.0,
+        "maximum_voltage_response_time_ms": 120,
+        "total_voltage_response_time_ms": 120,
+        "connected_time_samples": 1,
+        "median_connected_time_ms": 480.0,
+        "maximum_connected_time_ms": 480,
+        "total_connected_time_ms": 480,
+    }
+
+
+def _pipeline_diagnostic(
+    drive_id: str,
+    payload: dict[str, int | float],
+) -> dict:
+    return {
+        "diagnostic_id": f"diag_{drive_id}",
+        "drive_id": drive_id,
+        "timestamp_utc": BASE.isoformat(),
+        "kind": "pipeline_metrics",
+        "payload": payload,
+    }
 
 
 def _receipt_body(drive_id: str, bundle_sha256: str) -> str:
@@ -1140,33 +1231,13 @@ class TestBundleValidation:
         finished = BASE + timedelta(seconds=5)
         noticed = BASE + timedelta(seconds=6)
         finalised = BASE + timedelta(seconds=7)
-        metric_keys = {
-            "commands_requested",
-            "commands_completed",
-            "command_timeouts",
-            "notifications_received",
-            "notification_fragments_received",
-            "frames_assembled",
-            "checksum_failures",
-            "parse_failures",
-            "samples_created",
-            "samples_queued",
-            "samples_persisted",
-            "samples_dropped",
-            "database_write_failures",
-            "ble_disconnects",
-            "reconnect_attempts",
-            "radio_shutdowns",
-            "queue_depth",
-            "maximum_queue_depth",
-        }
         diagnostics = [
             {
                 "diagnostic_id": "diag_pipeline_metrics",
                 "drive_id": drive_id,
                 "timestamp_utc": noticed.isoformat(),
                 "kind": "pipeline_metrics",
-                "payload": dict.fromkeys(metric_keys, 0),
+                "payload": _legacy_pipeline_metrics(),
             }
         ]
         manifest_lifecycle = {
@@ -1202,6 +1273,294 @@ class TestBundleValidation:
         )
 
         assert checked.diagnostics_document["events"][0]["kind"] == "pipeline_metrics"
+
+    def test_current_android_pipeline_metrics_are_accepted(self, tmp_path, app_config):
+        drive_id = "drive_current_metrics"
+        payload = _current_pipeline_metrics()
+        assert frozenset(payload) == (
+            obd_bundle.PIPELINE_METRIC_FIELDS_CURRENT_REQUIRED
+            | obd_bundle.PIPELINE_METRIC_FIELDS_CURRENT_OPTIONAL
+        )
+
+        checked = validate_bundle(
+            make_bundle(
+                tmp_path,
+                drive_id,
+                diagnostics=[_pipeline_diagnostic(drive_id, payload)],
+            ),
+            config=app_config,
+        )
+
+        assert checked.diagnostics_document["events"][0]["payload"] == payload
+
+    def test_current_android_empty_timing_metrics_are_accepted(self, tmp_path, app_config):
+        drive_id = "drive_empty_metrics"
+        payload = _current_pipeline_metrics()
+        for name in obd_bundle.PIPELINE_METRIC_TIMING_NAMES_CURRENT:
+            payload[f"{name}_samples"] = 0
+            payload.pop(f"median_{name}_ms")
+            payload[f"maximum_{name}_ms"] = 0
+            payload[f"total_{name}_ms"] = 0
+        payload["polling_duty_cycle_percent"] = 0.0
+
+        checked = validate_bundle(
+            make_bundle(
+                tmp_path,
+                drive_id,
+                diagnostics=[_pipeline_diagnostic(drive_id, payload)],
+            ),
+            config=app_config,
+        )
+
+        assert (
+            "median_connected_time_ms" not in checked.diagnostics_document["events"][0]["payload"]
+        )
+
+    @pytest.mark.parametrize("field", ["polling_duty_cycle_percent", "median_connected_time_ms"])
+    def test_pipeline_metrics_reject_non_finite_floats(
+        self,
+        tmp_path,
+        app_config,
+        field,
+    ):
+        drive_id = f"drive_nan_{field}"
+        payload = _current_pipeline_metrics()
+        payload[field] = float("nan")
+
+        with pytest.raises(BundleError, match="non-finite JSON number"):
+            validate_bundle(
+                make_bundle(
+                    tmp_path,
+                    drive_id,
+                    diagnostics=[_pipeline_diagnostic(drive_id, payload)],
+                ),
+                config=app_config,
+            )
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("commands_requested", True, "must be an integer"),
+            ("observation_window_ms", 0, "must be an integer"),
+            ("polling_duty_cycle_percent", 101.0, "is above 100"),
+            ("connection_time_samples", 257, "must be an integer"),
+        ],
+    )
+    def test_pipeline_metrics_reject_invalid_types_and_ranges(
+        self,
+        tmp_path,
+        app_config,
+        field,
+        value,
+        message,
+    ):
+        drive_id = f"drive_bad_range_{field}"
+        payload = _current_pipeline_metrics()
+        payload[field] = value
+
+        with pytest.raises(BundleError, match=message):
+            validate_bundle(
+                make_bundle(
+                    tmp_path,
+                    drive_id,
+                    diagnostics=[_pipeline_diagnostic(drive_id, payload)],
+                ),
+                config=app_config,
+            )
+
+    @pytest.mark.parametrize("mutation", ["unknown", "missing"])
+    def test_pipeline_metrics_reject_field_drift(
+        self,
+        tmp_path,
+        app_config,
+        mutation,
+    ):
+        drive_id = f"drive_field_{mutation}"
+        payload = _current_pipeline_metrics()
+        if mutation == "unknown":
+            payload["future_unreviewed_metric"] = 1
+        else:
+            payload.pop("commands_blocked")
+
+        with pytest.raises(BundleError, match="fields do not match a supported shape"):
+            validate_bundle(
+                make_bundle(
+                    tmp_path,
+                    drive_id,
+                    diagnostics=[_pipeline_diagnostic(drive_id, payload)],
+                ),
+                config=app_config,
+            )
+
+    @pytest.mark.parametrize("mutation", ["missing_nonempty", "present_empty"])
+    def test_pipeline_metrics_require_medians_exactly_when_samples_exist(
+        self,
+        tmp_path,
+        app_config,
+        mutation,
+    ):
+        drive_id = f"drive_median_{mutation}"
+        payload = _current_pipeline_metrics()
+        if mutation == "missing_nonempty":
+            payload.pop("median_connection_time_ms")
+            message = "connection_time median is missing"
+        else:
+            payload["connection_time_samples"] = 0
+            payload["maximum_connection_time_ms"] = 0
+            payload["total_connection_time_ms"] = 0
+            message = "connection_time median requires timing samples"
+
+        with pytest.raises(BundleError, match=message):
+            validate_bundle(
+                make_bundle(
+                    tmp_path,
+                    drive_id,
+                    diagnostics=[_pipeline_diagnostic(drive_id, payload)],
+                ),
+                config=app_config,
+            )
+
+    @pytest.mark.parametrize("mutation", ["empty_nonzero", "median_over_max", "max_over_total"])
+    def test_pipeline_metrics_reject_inconsistent_timings(
+        self,
+        tmp_path,
+        app_config,
+        mutation,
+    ):
+        drive_id = f"drive_timing_{mutation}"
+        payload = _current_pipeline_metrics()
+        if mutation == "empty_nonzero":
+            payload["connection_time_samples"] = 0
+            payload.pop("median_connection_time_ms")
+            payload["maximum_connection_time_ms"] = 1
+            payload["total_connection_time_ms"] = 1
+            message = "empty timing is inconsistent"
+        elif mutation == "median_over_max":
+            payload["median_connection_time_ms"] = 341.0
+            message = "connection_time timing is inconsistent"
+        else:
+            payload["maximum_connection_time_ms"] = 341
+            message = "connection_time timing is inconsistent"
+
+        with pytest.raises(BundleError, match=message):
+            validate_bundle(
+                make_bundle(
+                    tmp_path,
+                    drive_id,
+                    diagnostics=[_pipeline_diagnostic(drive_id, payload)],
+                ),
+                config=app_config,
+            )
+
+    def test_pipeline_metrics_reject_inconsistent_duty_cycle(self, tmp_path, app_config):
+        drive_id = "drive_bad_duty"
+        payload = _current_pipeline_metrics()
+        payload["polling_duty_cycle_percent"] = 47.0
+
+        with pytest.raises(BundleError, match="polling duty cycle is inconsistent"):
+            validate_bundle(
+                make_bundle(
+                    tmp_path,
+                    drive_id,
+                    diagnostics=[_pipeline_diagnostic(drive_id, payload)],
+                ),
+                config=app_config,
+            )
+
+    def test_pipeline_metrics_accept_clamped_duty_cycle(self, tmp_path, app_config):
+        drive_id = "drive_clamped_duty"
+        payload = _current_pipeline_metrics()
+        # Android measures the observation window and connected sessions with different
+        # monotonic clocks. A session spanning deep sleep can therefore exceed the window,
+        # and the producer deliberately clamps the emitted duty cycle to 100 percent.
+        payload["observation_window_ms"] = 400
+        payload["polling_duty_cycle_percent"] = 100.0
+
+        checked = validate_bundle(
+            make_bundle(
+                tmp_path,
+                drive_id,
+                diagnostics=[_pipeline_diagnostic(drive_id, payload)],
+            ),
+            config=app_config,
+        )
+
+        assert checked.diagnostics_document["events"][0]["payload"] == payload
+
+    def test_pipeline_metric_contract_matches_android_source(self):
+        source_path = (
+            Path(__file__).parents[1]
+            / "android"
+            / "obd-logger"
+            / "app"
+            / "src"
+            / "main"
+            / "java"
+            / "com"
+            / "dashcamstats"
+            / "obdlogger"
+            / "PipelineMetrics.kt"
+        )
+        source = source_path.read_text(encoding="utf-8")
+        counters_match = re.search(
+            r"private val counters = linkedMapOf\((.*?)\n    \)",
+            source,
+            re.DOTALL,
+        )
+        timings_match = re.search(
+            r"val timings = linkedMapOf\((.*?)\n        \)",
+            source,
+            re.DOTALL,
+        )
+        json_match = re.search(
+            r"fun toJson\(\): JSONObject = JSONObject\(\)\.also \{ body ->(.*?)\n    \}",
+            source,
+            re.DOTALL,
+        )
+        assert counters_match is not None
+        assert timings_match is not None
+        assert json_match is not None
+
+        counter_fields = frozenset(re.findall(r'"([a-z0-9_]+)"\s+to\s+0L', counters_match.group(1)))
+        timing_names = frozenset(
+            re.findall(
+                r'"([a-z0-9_]+)"\s+to\s+\w+Timing\.snapshot\(\)',
+                timings_match.group(1),
+            )
+        )
+        literal_json_fields = frozenset(
+            re.findall(r'body\.put\("([a-z0-9_]+)"', json_match.group(1))
+        )
+        timing_required_fields = frozenset(
+            field_name
+            for name in timing_names
+            for field_name in (
+                f"{name}_samples",
+                f"maximum_{name}_ms",
+                f"total_{name}_ms",
+            )
+        )
+        timing_optional_fields = frozenset(f"median_{name}_ms" for name in timing_names)
+
+        assert counter_fields == obd_bundle.PIPELINE_METRIC_COUNTER_FIELDS_CURRENT
+        assert timing_names == obd_bundle.PIPELINE_METRIC_TIMING_NAMES_CURRENT
+        assert literal_json_fields == {
+            "queue_depth",
+            "maximum_queue_depth",
+            "observation_window_ms",
+            "polling_duty_cycle_percent",
+        }
+        assert counter_fields | literal_json_fields | timing_required_fields == (
+            obd_bundle.PIPELINE_METRIC_FIELDS_CURRENT_REQUIRED
+        )
+        assert timing_optional_fields == obd_bundle.PIPELINE_METRIC_FIELDS_CURRENT_OPTIONAL
+        for template in (
+            'body.put("${name}_samples", timing.sampleCount)',
+            'body.put("median_${name}_ms", it)',
+            'body.put("maximum_${name}_ms", timing.maximumMillis)',
+            'body.put("total_${name}_ms", timing.totalMillis)',
+        ):
+            assert template in json_match.group(1)
 
 
 class TestTransactionalHistory:
@@ -1781,6 +2140,20 @@ class TestRecoveryAndAPI:
         async with session_scope() as session:
             return await store_validated_bundle(session, checked)
 
+    async def _rejected(self, app_config, drive_id: str) -> tuple[int, Path]:
+        path = make_bundle(app_config.obd_quarantine_dir, drive_id)
+        bundle_hash, size_bytes = file_sha256(path)
+        async with session_scope() as session:
+            row = await store_rejected_bundle(
+                session,
+                filename=path.name,
+                bundle_hash=bundle_hash,
+                size_bytes=size_bytes,
+                error="unsupported before server upgrade",
+                quarantined=True,
+            )
+            return row.id, path
+
     async def test_projection_version_queues_exactly_one_existing_ha_refresh(
         self, db_session, app_config
     ):
@@ -2318,6 +2691,90 @@ class TestRecoveryAndAPI:
                     .where(OBDDrive.bundle_id == row_id)
                 )
             ).scalar_one() == 2
+
+    async def test_manual_validation_crash_before_quarantine_move_is_recoverable(
+        self,
+        db_session,
+        app_config,
+        monkeypatch,
+    ):
+        row_id, quarantined = await self._rejected(
+            app_config,
+            "drive_validate_crash_before_move",
+        )
+        verified = app_config.obd_verified_dir / quarantined.name
+
+        def crash_before_move(*_args, **_kwargs):
+            raise RuntimeError("simulated crash before quarantine move")
+
+        monkeypatch.setattr(obd_api, "restore_from_quarantine", crash_before_move)
+
+        with pytest.raises(RuntimeError, match="simulated crash before quarantine move"):
+            async with session_scope() as session:
+                await obd_api.validate_one(row_id, session)
+
+        assert quarantined.exists()
+        assert not verified.exists()
+        async with session_scope() as session:
+            claimed = await session.get(OBDBundle, row_id)
+            assert claimed.metadata_trusted is True
+            assert claimed.state == OBDBundleState.VALIDATING.value
+            assert (
+                await session.execute(
+                    select(func.count(OBDSample.id))
+                    .join(OBDDrive)
+                    .where(OBDDrive.bundle_id == row_id)
+                )
+            ).scalar_one() == 2
+
+        assert await queue.recover_interrupted_validations(config=app_config) == 1
+        async with session_scope() as session:
+            recovered = await session.get(OBDBundle, row_id)
+            assert recovered.metadata_trusted is True
+            assert recovered.state == OBDBundleState.QUARANTINED.value
+            assert recovered.failure_kind == "interrupted"
+
+    async def test_manual_validation_crash_after_quarantine_move_is_recoverable(
+        self,
+        db_session,
+        app_config,
+        monkeypatch,
+    ):
+        row_id, quarantined = await self._rejected(
+            app_config,
+            "drive_validate_crash_after_move",
+        )
+        verified = app_config.obd_verified_dir / quarantined.name
+
+        async def crash_after_move(*_args, **_kwargs):
+            raise RuntimeError("simulated crash after quarantine move")
+
+        monkeypatch.setattr(obd_api, "reconcile_drive_projection", crash_after_move)
+
+        with pytest.raises(RuntimeError, match="simulated crash after quarantine move"):
+            async with session_scope() as session:
+                await obd_api.validate_one(row_id, session)
+
+        assert not quarantined.exists()
+        assert verified.exists()
+        async with session_scope() as session:
+            claimed = await session.get(OBDBundle, row_id)
+            assert claimed.metadata_trusted is True
+            assert claimed.state == OBDBundleState.VALIDATING.value
+            assert (
+                await session.execute(
+                    select(func.count(OBDSample.id))
+                    .join(OBDDrive)
+                    .where(OBDDrive.bundle_id == row_id)
+                )
+            ).scalar_one() == 2
+
+        assert await queue.recover_interrupted_validations(config=app_config) == 1
+        async with session_scope() as session:
+            recovered = await session.get(OBDBundle, row_id)
+            assert recovered.metadata_trusted is True
+            assert recovered.state == OBDBundleState.READY_TO_IMPORT.value
+            assert recovered.failure_kind == "interrupted"
 
 
 class TestTransferIsolation:

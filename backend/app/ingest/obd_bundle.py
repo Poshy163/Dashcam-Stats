@@ -49,7 +49,7 @@ DTC_RE = re.compile(r"^[PCBU][0-9A-F]{4}$")
 PID_HEX_RE = re.compile(r"^[0-9A-F]{2}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SAFE_REASON_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-PIPELINE_METRIC_FIELDS = frozenset(
+PIPELINE_METRIC_FIELDS_V1 = frozenset(
     {
         "commands_requested",
         "commands_completed",
@@ -71,6 +71,80 @@ PIPELINE_METRIC_FIELDS = frozenset(
         "maximum_queue_depth",
     }
 )
+# Android extended the diagnostic without changing the surrounding diagnostics-v1 envelope.
+# Keep both exact shapes: already-exported legacy drives remain readable, while the current
+# producer is still fail-closed for unknown fields. The timing medians are the only conditional
+# keys -- JSONObject omits them when a rolling distribution has no samples.
+PIPELINE_METRIC_COUNTER_FIELDS_CURRENT = frozenset(
+    {
+        "commands_requested",
+        "commands_blocked",
+        "commands_sent",
+        "commands_completed",
+        "command_timeouts",
+        "adapter_local_commands",
+        "vehicle_bus_commands",
+        "ble_connection_attempts",
+        "adapter_targets_resolved",
+        "gatt_connections_established",
+        "notification_subscriptions_enabled",
+        "ble_connection_successes",
+        "ble_connection_failures",
+        "voltage_reads_successful",
+        "voltage_reads_failed",
+        "invalid_voltage_responses",
+        "notifications_received",
+        "notification_fragments_received",
+        "frames_assembled",
+        "checksum_failures",
+        "parse_failures",
+        "samples_created",
+        "samples_queued",
+        "samples_persisted",
+        "samples_dropped",
+        "database_write_failures",
+        "ble_disconnects",
+        "reconnect_attempts",
+        "radio_shutdowns",
+    }
+)
+PIPELINE_METRIC_TIMING_NAMES_CURRENT = frozenset(
+    {
+        "connection_time",
+        "command_response_time",
+        "voltage_response_time",
+        "connected_time",
+    }
+)
+PIPELINE_METRIC_FIELDS_CURRENT_REQUIRED = (
+    PIPELINE_METRIC_COUNTER_FIELDS_CURRENT
+    | frozenset(
+        {
+            "queue_depth",
+            "maximum_queue_depth",
+            "observation_window_ms",
+            "polling_duty_cycle_percent",
+        }
+    )
+    | frozenset(
+        field_name
+        for name in PIPELINE_METRIC_TIMING_NAMES_CURRENT
+        for field_name in (
+            f"{name}_samples",
+            f"maximum_{name}_ms",
+            f"total_{name}_ms",
+        )
+    )
+)
+PIPELINE_METRIC_FIELDS_CURRENT_OPTIONAL = frozenset(
+    f"median_{name}_ms" for name in PIPELINE_METRIC_TIMING_NAMES_CURRENT
+)
+# Compatibility for code which imported the original constant before the two supported
+# shapes were named explicitly.
+PIPELINE_METRIC_FIELDS = PIPELINE_METRIC_FIELDS_V1
+PIPELINE_METRIC_COUNTER_MAXIMUM = 2**31 - 1
+PIPELINE_METRIC_TIMING_MAXIMUM_MS = 1_000_000_000_000
+PIPELINE_METRIC_TIMING_SAMPLE_LIMIT = 256
 MAX_JSON_MEMBER_BYTES = 2 * 1024 * 1024
 MAX_SAMPLE_LINE_BYTES = 64 * 1024
 MAX_DIAGNOSTIC_EVENTS = 4096
@@ -375,6 +449,151 @@ def _number(
     if maximum is not None and result > maximum:
         raise BundleError(f"{field_name} is above {maximum}")
     return result
+
+
+def _validate_pipeline_metrics(payload: dict[str, Any]) -> None:
+    fields = frozenset(payload)
+    queue_fields = {"queue_depth", "maximum_queue_depth"}
+
+    if fields == PIPELINE_METRIC_FIELDS_V1:
+        for field_name in PIPELINE_METRIC_FIELDS_V1:
+            maximum = 1 if field_name in queue_fields else PIPELINE_METRIC_COUNTER_MAXIMUM
+            _integer(
+                payload[field_name],
+                field_name=f"diagnostic.pipeline_metrics.{field_name}",
+                maximum=maximum,
+            )
+    else:
+        allowed = PIPELINE_METRIC_FIELDS_CURRENT_REQUIRED | PIPELINE_METRIC_FIELDS_CURRENT_OPTIONAL
+        missing = PIPELINE_METRIC_FIELDS_CURRENT_REQUIRED - fields
+        extras = fields - allowed
+        if missing or extras:
+            raise BundleError(
+                "diagnostic pipeline_metrics fields do not match a supported shape "
+                f"(missing={sorted(missing)}, extras={sorted(extras)})"
+            )
+
+        for field_name in PIPELINE_METRIC_COUNTER_FIELDS_CURRENT:
+            _integer(
+                payload[field_name],
+                field_name=f"diagnostic.pipeline_metrics.{field_name}",
+                maximum=PIPELINE_METRIC_COUNTER_MAXIMUM,
+            )
+        for field_name in queue_fields:
+            _integer(
+                payload[field_name],
+                field_name=f"diagnostic.pipeline_metrics.{field_name}",
+                maximum=1,
+            )
+        observation_window_ms = _integer(
+            payload["observation_window_ms"],
+            field_name="diagnostic.pipeline_metrics.observation_window_ms",
+            minimum=1,
+            maximum=PIPELINE_METRIC_TIMING_MAXIMUM_MS,
+        )
+        duty_cycle = _number(
+            payload["polling_duty_cycle_percent"],
+            field_name="diagnostic.pipeline_metrics.polling_duty_cycle_percent",
+            minimum=0,
+            maximum=100,
+            nullable=False,
+        )
+        assert duty_cycle is not None
+
+        timing_values: dict[str, tuple[int, float | None, int, int]] = {}
+        for name in PIPELINE_METRIC_TIMING_NAMES_CURRENT:
+            sample_count = _integer(
+                payload[f"{name}_samples"],
+                field_name=f"diagnostic.pipeline_metrics.{name}_samples",
+                maximum=PIPELINE_METRIC_TIMING_SAMPLE_LIMIT,
+            )
+            maximum_ms = _integer(
+                payload[f"maximum_{name}_ms"],
+                field_name=f"diagnostic.pipeline_metrics.maximum_{name}_ms",
+                maximum=PIPELINE_METRIC_TIMING_MAXIMUM_MS,
+            )
+            total_ms = _integer(
+                payload[f"total_{name}_ms"],
+                field_name=f"diagnostic.pipeline_metrics.total_{name}_ms",
+                maximum=PIPELINE_METRIC_TIMING_MAXIMUM_MS,
+            )
+            median_field = f"median_{name}_ms"
+            median_ms: float | None = None
+            if sample_count == 0:
+                if median_field in payload:
+                    raise BundleError(
+                        f"diagnostic pipeline_metrics {name} median requires timing samples"
+                    )
+                if maximum_ms != 0 or total_ms != 0:
+                    raise BundleError(
+                        f"diagnostic pipeline_metrics {name} empty timing is inconsistent"
+                    )
+            else:
+                if median_field not in payload:
+                    raise BundleError(f"diagnostic pipeline_metrics {name} median is missing")
+                median_ms = _number(
+                    payload[median_field],
+                    field_name=f"diagnostic.pipeline_metrics.{median_field}",
+                    minimum=0,
+                    maximum=PIPELINE_METRIC_TIMING_MAXIMUM_MS,
+                    nullable=False,
+                )
+                assert median_ms is not None
+                if median_ms > maximum_ms or maximum_ms > total_ms:
+                    raise BundleError(f"diagnostic pipeline_metrics {name} timing is inconsistent")
+            timing_values[name] = (sample_count, median_ms, maximum_ms, total_ms)
+
+        if (
+            payload["commands_sent"] > payload["commands_requested"]
+            or payload["commands_completed"] > payload["commands_sent"]
+        ):
+            raise BundleError("diagnostic pipeline_metrics command counts are inconsistent")
+        if payload["command_timeouts"] > payload["commands_sent"]:
+            raise BundleError("diagnostic pipeline_metrics timeout count is inconsistent")
+        if (
+            payload["adapter_local_commands"] > payload["commands_requested"]
+            or payload["vehicle_bus_commands"] > payload["commands_requested"]
+        ):
+            raise BundleError("diagnostic pipeline_metrics command categories are inconsistent")
+        if payload["checksum_failures"] > payload["parse_failures"]:
+            raise BundleError("diagnostic pipeline_metrics parser counts are inconsistent")
+        if payload["samples_queued"] > payload["samples_created"]:
+            raise BundleError("diagnostic pipeline_metrics sample creation counts are inconsistent")
+
+        sample_dependencies = {
+            "connection_time": payload["ble_connection_successes"],
+            "command_response_time": payload["commands_completed"],
+            "connected_time": payload["ble_connection_successes"],
+        }
+        for name, counter in sample_dependencies.items():
+            if timing_values[name][0] > counter:
+                raise BundleError(
+                    f"diagnostic pipeline_metrics {name} sample count is inconsistent"
+                )
+        if timing_values["voltage_response_time"][0] > timing_values["command_response_time"][0]:
+            raise BundleError(
+                "diagnostic pipeline_metrics voltage timing sample count is inconsistent"
+            )
+
+        connected_total_ms = timing_values["connected_time"][3]
+        expected_duty_cycle = min(
+            100.0,
+            connected_total_ms / observation_window_ms * 100.0,
+        )
+        if not math.isclose(
+            duty_cycle,
+            expected_duty_cycle,
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        ):
+            raise BundleError("diagnostic pipeline_metrics polling duty cycle is inconsistent")
+
+    if payload["queue_depth"] > payload["maximum_queue_depth"]:
+        raise BundleError("diagnostic pipeline_metrics queue depth is inconsistent")
+    if payload["commands_completed"] > payload["commands_requested"]:
+        raise BundleError("diagnostic pipeline_metrics command counts are inconsistent")
+    if payload["samples_persisted"] + payload["samples_dropped"] > payload["samples_queued"]:
+        raise BundleError("diagnostic pipeline_metrics sample counts are inconsistent")
 
 
 def _sha256_stream(source: BinaryIO) -> tuple[str, int]:
@@ -1257,24 +1476,7 @@ def _validate_diagnostics(
             _text(payload["category"], field_name=f"diagnostic.{kind}.category", maximum=128)
             _text(payload["message"], field_name=f"diagnostic.{kind}.message", maximum=1024)
         elif kind == "pipeline_metrics":
-            if set(payload) != PIPELINE_METRIC_FIELDS:
-                raise BundleError("diagnostic pipeline_metrics fields do not match v1")
-            for field_name in PIPELINE_METRIC_FIELDS:
-                maximum = 1 if field_name in {"queue_depth", "maximum_queue_depth"} else 2**31 - 1
-                _integer(
-                    payload[field_name],
-                    field_name=f"diagnostic.pipeline_metrics.{field_name}",
-                    maximum=maximum,
-                )
-            if payload["queue_depth"] > payload["maximum_queue_depth"]:
-                raise BundleError("diagnostic pipeline_metrics queue depth is inconsistent")
-            if payload["commands_completed"] > payload["commands_requested"]:
-                raise BundleError("diagnostic pipeline_metrics command counts are inconsistent")
-            if (
-                payload["samples_persisted"] + payload["samples_dropped"]
-                > payload["samples_queued"]
-            ):
-                raise BundleError("diagnostic pipeline_metrics sample counts are inconsistent")
+            _validate_pipeline_metrics(payload)
     return value
 
 
