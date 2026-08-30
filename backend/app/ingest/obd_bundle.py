@@ -1594,31 +1594,45 @@ def validate_bundle(path: Path, *, config: AppConfig | None = None) -> Validated
     )
 
 
+_DIAGNOSTIC_WINDOW_UNSET = object()
+
+
 def diagnostics_for_ha(
     document: dict[str, Any],
     *,
-    start_time_utc: object,
-    finish_time_utc: object,
+    start_time_utc: object = _DIAGNOSTIC_WINDOW_UNSET,
+    finish_time_utc: object = _DIAGNOSTIC_WINDOW_UNSET,
 ) -> dict[str, Any]:
-    """Reduce drive-window events to HA's strict, identifier-free metadata object.
+    """Reduce events to HA's strict, identifier-free metadata object.
 
     The immutable producer bundle can legitimately contain finalisation diagnostics after the
     last valid sample.  Reconciliation projects that evidence-based sample time as the canonical
     drive finish.  Home Assistant requires every projected diagnostic timestamp to fall inside
     that canonical window, so keep later lifecycle evidence in the server's raw diagnostic table
     and exclude it only from this bounded aggregate projection.
+
+    Omitting both bounds deliberately reproduces the projection-v1 aggregate.  That legacy
+    projection is emitted only as bounded amendment proof, allowing Home Assistant to verify an
+    already-imported v1 payload without copying raw diagnostic events into the request.
     """
-    started = _utc(start_time_utc, field_name="HA diagnostics start_time_utc")
-    finished = _utc(finish_time_utc, field_name="HA diagnostics finish_time_utc")
-    if finished < started:
-        raise HAPayloadError("Home Assistant diagnostic window is invalid")
-    events = [
-        event
-        for event in document.get("events", [])
-        if started
-        <= _utc(event.get("timestamp_utc"), field_name="diagnostic.timestamp_utc")
-        <= finished
-    ]
+    start_unset = start_time_utc is _DIAGNOSTIC_WINDOW_UNSET
+    finish_unset = finish_time_utc is _DIAGNOSTIC_WINDOW_UNSET
+    if start_unset != finish_unset:
+        raise HAPayloadError("Home Assistant diagnostic window is incomplete")
+    if start_unset:
+        events = document.get("events", [])
+    else:
+        started = _utc(start_time_utc, field_name="HA diagnostics start_time_utc")
+        finished = _utc(finish_time_utc, field_name="HA diagnostics finish_time_utc")
+        if finished < started:
+            raise HAPayloadError("Home Assistant diagnostic window is invalid")
+        events = [
+            event
+            for event in document.get("events", [])
+            if started
+            <= _utc(event.get("timestamp_utc"), field_name="diagnostic.timestamp_utc")
+            <= finished
+        ]
     result: dict[str, Any] = {
         "event_count": len(events),
         "parser_failure_count": 0,

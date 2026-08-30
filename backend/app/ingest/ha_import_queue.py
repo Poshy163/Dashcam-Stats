@@ -28,6 +28,7 @@ from app.ingest.obd_bundle import (
     BundleError,
     HAPayloadError,
     bundle_path_for,
+    diagnostics_for_ha,
     file_sha256,
     is_bundle_name,
     store_rejected_bundle,
@@ -41,7 +42,7 @@ log = get_logger(__name__)
 MAX_HA_BODY_BYTES = 8 * 1024 * 1024
 MAX_ERROR_TEXT = 1000
 MAX_RESPONSE_BYTES = 256 * 1024
-HA_PROJECTION_VERSION = 2
+HA_PROJECTION_VERSION = 3
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}")
 _SUCCESS_FIELDS = frozenset(
     {
@@ -420,10 +421,25 @@ async def post_bundle(
         )
         payload["projection_version"] = HA_PROJECTION_VERSION
         if canonical_summary is not None:
-            # HA can accept a one-way projection amendment only after proving that the
-            # bundle-derived body it already stored is exactly the predecessor.  The
-            # original producer summary supplies that proof without exposing raw rows.
-            payload["supersedes_summary"] = bundle.ha_payload()["summary"]
+            # HA accepts a one-way projection amendment only after proving that the body it
+            # already stored is exactly one of the two predecessor contracts.  A lost HA
+            # acknowledgement can leave the server unable to know whether v1 or v2 landed,
+            # so both bounded candidates are self-contained.  V1 used the producer summary
+            # and legacy unwindowed aggregate; v2 used this canonical summary and the
+            # current windowed aggregate.  Raw diagnostic events never leave the validated
+            # bundle or get rewritten.
+            producer_summary = bundle.ha_payload()["summary"]
+            legacy_diagnostics = diagnostics_for_ha(bundle.diagnostics_document)
+            payload["supersedes_projections"] = {
+                "1": {
+                    "summary": producer_summary,
+                    "diagnostics": legacy_diagnostics,
+                },
+                "2": {
+                    "summary": payload["summary"],
+                    "diagnostics": payload["diagnostics"],
+                },
+            }
         raw = json.dumps(
             payload,
             ensure_ascii=False,
@@ -712,8 +728,37 @@ async def _mark_temporary(bundle_id: int, error: TemporaryImportError, *, attemp
         row.updated_at = now
 
 
+_SERVER_PROJECTION_VERSION_KEY = "_server_projection_version"
+
+
+def _prior_success_result(row: OBDBundle) -> dict | None:
+    """Return only an acknowledgement shape that this server could have persisted."""
+    result = row.ha_result
+    if not isinstance(result, dict):
+        return None
+    if result.get("status") not in {"ok", "already_imported"}:
+        return None
+    if result.get("drive_id") != row.drive_id:
+        return None
+    if set(result) - (_SUCCESS_FIELDS | {_SERVER_PROJECTION_VERSION_KEY}):
+        return None
+    return result
+
+
+def _has_stale_projection_marker(result: dict) -> bool:
+    """Accept a missing legacy-v1 marker or a valid older integer, never a rollback."""
+    if _SERVER_PROJECTION_VERSION_KEY not in result:
+        return True
+    version = result[_SERVER_PROJECTION_VERSION_KEY]
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and 1 <= version < HA_PROJECTION_VERSION
+    )
+
+
 async def enqueue_stale_projections() -> int:
-    """Queue one idempotent HA refresh when the server projection contract changes."""
+    """Queue one proven-forward HA refresh when the projection contract changes."""
     queued = 0
     now = utcnow()
     async with session_scope() as session:
@@ -721,7 +766,12 @@ async def enqueue_stale_projections() -> int:
             (
                 await session.execute(
                     select(OBDBundle).where(
-                        OBDBundle.state == OBDBundleState.IMPORTED.value,
+                        OBDBundle.state.in_(
+                            [
+                                OBDBundleState.IMPORTED.value,
+                                OBDBundleState.FAILED.value,
+                            ]
+                        ),
                         OBDBundle.metadata_trusted.is_(True),
                     )
                 )
@@ -730,8 +780,14 @@ async def enqueue_stale_projections() -> int:
             .all()
         )
         for row in rows:
-            result = row.ha_result if isinstance(row.ha_result, dict) else {}
-            if result.get("_server_projection_version") == HA_PROJECTION_VERSION:
+            result = _prior_success_result(row)
+            if result is None or not _has_stale_projection_marker(result):
+                continue
+            # IMPORTED is itself durable success evidence.  FAILED is safe to revive only
+            # when it retains both halves of an earlier committed import: the timestamp and
+            # the allowlisted acknowledgement above.  That is the v1/v2-refresh failure
+            # pattern; an ordinary first-import failure has no imported_at and stays failed.
+            if row.state == OBDBundleState.FAILED.value and row.imported_at is None:
                 continue
             row.state = OBDBundleState.READY_TO_IMPORT.value
             row.next_attempt_at = now

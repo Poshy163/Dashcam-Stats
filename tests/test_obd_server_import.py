@@ -1398,10 +1398,10 @@ class TestHAClient:
             "statistics",
             "diagnostics",
         }
-        assert body["projection_version"] == 2
+        assert body["projection_version"] == 3
         assert capture["headers"]["Authorization"] == "Bearer secret-token-value"
         assert checked.bundle_sha256 in capture["headers"]["Idempotency-Key"]
-        assert capture["headers"]["Idempotency-Key"].endswith("projection-v2")
+        assert capture["headers"]["Idempotency-Key"].endswith("projection-v3")
         assert client_options["trust_env"] is False
 
     async def test_canonical_summary_and_lifecycle_are_sent_and_strictly_acknowledged(
@@ -1454,9 +1454,144 @@ class TestHAClient:
 
         assert body["summary"]["distance_km"] == 0.125
         assert body["summary"]["lifecycle_status"] == "complete"
-        assert body["projection_version"] == 2
-        assert body["supersedes_summary"]["distance_km"] == checked.summary["distance_km"]
+        assert body["projection_version"] == 3
+        assert set(body["supersedes_projections"]) == {"1", "2"}
+        assert (
+            body["supersedes_projections"]["1"]["summary"]["distance_km"]
+            == checked.summary["distance_km"]
+        )
+        assert body["supersedes_projections"]["2"]["summary"] == body["summary"]
+        assert (
+            body["supersedes_projections"]["1"]["diagnostics"]
+            == body["supersedes_projections"]["2"]["diagnostics"]
+            == body["diagnostics"]
+        )
         assert result["drive_lifecycle"] == response_lifecycle
+
+    async def test_projection_v3_proves_historical_v1_and_v2_diagnostics(
+        self, tmp_path, ha_config, monkeypatch
+    ):
+        drive_id = "drive_projection_v3"
+        producer_finish = BASE + timedelta(seconds=10)
+        canonical_finish = BASE + timedelta(seconds=5)
+        diagnostics = [
+            {
+                "diagnostic_id": "inside",
+                "drive_id": drive_id,
+                "timestamp_utc": BASE.isoformat(),
+                "kind": "parser_failure",
+                "payload": {
+                    "category": "live_pid_15",
+                    "message": "private transport detail stays in the raw bundle",
+                },
+            },
+            {
+                "diagnostic_id": "after_canonical_finish",
+                "drive_id": drive_id,
+                "timestamp_utc": producer_finish.isoformat(),
+                "kind": "connection_failure",
+                "payload": {
+                    "category": "ble_disconnect",
+                    "message": "finalisation evidence stays in the raw bundle",
+                },
+            },
+        ]
+        checked = validate_bundle(
+            make_bundle(
+                tmp_path,
+                drive_id,
+                diagnostics=diagnostics,
+                summary_patch={
+                    "finish_time_utc": producer_finish.isoformat(),
+                    "duration_s": 10.0,
+                },
+                manifest_patch={
+                    "finish_time_utc": producer_finish.isoformat(),
+                    "created_at_utc": producer_finish.isoformat(),
+                },
+            ),
+            config=ha_config,
+        )
+        canonical = dict(checked.summary)
+        canonical["finish_time_utc"] = canonical_finish.isoformat()
+        canonical["duration_s"] = 5.0
+        raw_diagnostics_before = json.dumps(
+            checked.diagnostics_document,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        capture: dict = {}
+        monkeypatch.setattr(
+            queue.httpx,
+            "AsyncClient",
+            lambda **_kwargs: _FakeClient(
+                _response(200, {"status": "ok", "drive_id": checked.drive_id}),
+                capture,
+            ),
+        )
+
+        await post_bundle(checked, canonical_summary=canonical, config=ha_config)
+        body = json.loads(gzip.decompress(capture["body"]))
+
+        assert body["projection_version"] == 3
+        assert set(body["supersedes_projections"]) == {"1", "2"}
+        assert all(
+            set(candidate) == {"summary", "diagnostics"}
+            for candidate in body["supersedes_projections"].values()
+        )
+        assert body["diagnostics"] == {
+            "event_count": 1,
+            "parser_failure_count": 1,
+            "connection_failure_count": 0,
+            "last_event_timestamp_utc": BASE.isoformat(),
+        }
+        legacy = {
+            "event_count": 2,
+            "parser_failure_count": 1,
+            "connection_failure_count": 1,
+            "last_event_timestamp_utc": producer_finish.isoformat(),
+        }
+        assert body["supersedes_projections"]["1"] == {
+            "summary": checked.ha_payload()["summary"],
+            "diagnostics": legacy,
+        }
+        assert body["supersedes_projections"]["2"] == {
+            "summary": body["summary"],
+            "diagnostics": body["diagnostics"],
+        }
+        assert "private transport detail" not in json.dumps(body["supersedes_projections"])
+        assert (
+            json.dumps(
+                checked.diagnostics_document,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            == raw_diagnostics_before
+        )
+
+    async def test_projection_amendment_candidates_are_counted_by_the_body_limit(
+        self, tmp_path, ha_config, monkeypatch
+    ):
+        checked = validate_bundle(make_bundle(tmp_path, "drive_projection_size"), config=ha_config)
+        canonical = dict(checked.summary)
+        base = checked.ha_payload(canonical_summary=canonical)
+        base["projection_version"] = queue.HA_PROJECTION_VERSION
+        base_size = len(
+            json.dumps(
+                base,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        monkeypatch.setattr(queue, "MAX_HA_BODY_BYTES", base_size + 1)
+
+        with pytest.raises(PermanentImportError, match="above the 8 MiB") as caught:
+            await post_bundle(checked, canonical_summary=canonical, config=ha_config)
+
+        assert caught.value.kind == "payload"
 
     async def test_invalid_canonical_projection_is_not_an_integrity_error(
         self, tmp_path, ha_config
@@ -1653,7 +1788,12 @@ class TestRecoveryAndAPI:
         async with session_scope() as session:
             stored = await session.get(OBDBundle, row.id)
             stored.state = OBDBundleState.IMPORTED.value
-            stored.ha_result = {"status": "ok"}
+            stored.next_attempt_at = None
+            stored.ha_result = {
+                "status": "ok",
+                "drive_id": stored.drive_id,
+                "_server_projection_version": 2,
+            }
 
         assert await queue.enqueue_stale_projections() == 1
         async with session_scope() as session:
@@ -1662,10 +1802,157 @@ class TestRecoveryAndAPI:
             queued.state = OBDBundleState.IMPORTED.value
             queued.ha_result = {
                 "status": "ok",
+                "drive_id": queued.drive_id,
                 "_server_projection_version": queue.HA_PROJECTION_VERSION,
             }
 
         assert await queue.enqueue_stale_projections() == 0
+
+    async def test_legacy_import_without_marker_queues_one_projection_refresh(
+        self, db_session, app_config
+    ):
+        row = await self._stored(app_config, "drive_projection_legacy")
+        async with session_scope() as session:
+            stored = await session.get(OBDBundle, row.id)
+            stored.state = OBDBundleState.IMPORTED.value
+            stored.next_attempt_at = None
+            stored.ha_result = {
+                "status": "ok",
+                "drive_id": stored.drive_id,
+            }
+
+        assert await queue.enqueue_stale_projections() == 1
+        async with session_scope() as session:
+            queued = await session.get(OBDBundle, row.id)
+            assert queued.state == OBDBundleState.READY_TO_IMPORT.value
+
+    @pytest.mark.parametrize(
+        ("marker", "suffix"),
+        [
+            (queue.HA_PROJECTION_VERSION, "current"),
+            (queue.HA_PROJECTION_VERSION + 1, "future"),
+            ("2", "string"),
+            (True, "boolean"),
+            (0, "zero"),
+            (None, "null"),
+        ],
+    )
+    async def test_projection_refresh_never_downgrades_or_accepts_malformed_markers(
+        self, marker, suffix, db_session, app_config
+    ):
+        row = await self._stored(app_config, f"drive_projection_guard_{suffix}")
+        async with session_scope() as session:
+            stored = await session.get(OBDBundle, row.id)
+            stored.state = OBDBundleState.IMPORTED.value
+            stored.next_attempt_at = None
+            stored.ha_result = {
+                "status": "ok",
+                "drive_id": stored.drive_id,
+                "_server_projection_version": marker,
+            }
+            stored.last_error = "must remain untouched"
+
+        assert await queue.enqueue_stale_projections() == 0
+        async with session_scope() as session:
+            untouched = await session.get(OBDBundle, row.id)
+            assert untouched.state == OBDBundleState.IMPORTED.value
+            assert untouched.next_attempt_at is None
+            assert untouched.last_error == "must remain untouched"
+
+    async def test_failed_legacy_v1_refresh_with_prior_success_is_requeued_for_v3(
+        self, db_session, app_config
+    ):
+        row = await self._stored(app_config, "drive_projection_failed_v1")
+        async with session_scope() as session:
+            failed = await session.get(OBDBundle, row.id)
+            failed.state = OBDBundleState.FAILED.value
+            failed.next_attempt_at = None
+            failed.imported_at = BASE
+            failed.ha_result = {
+                "status": "ok",
+                "drive_id": failed.drive_id,
+            }
+            failed.last_error = "projection amendment does not match the imported payload"
+            failed.failure_kind = "permanent"
+            failed.last_http_status = 409
+
+        assert await queue.enqueue_stale_projections() == 1
+        async with session_scope() as session:
+            queued = await session.get(OBDBundle, row.id)
+            assert queued.state == OBDBundleState.READY_TO_IMPORT.value
+            assert queued.imported_at == BASE
+            assert queued.next_attempt_at is not None
+            assert queued.last_error is None
+            assert queued.failure_kind is None
+            assert queued.last_http_status == 409
+
+    async def test_failed_older_projection_with_prior_success_is_requeued(
+        self, db_session, app_config
+    ):
+        row = await self._stored(app_config, "drive_projection_failed_v2")
+        async with session_scope() as session:
+            failed = await session.get(OBDBundle, row.id)
+            failed.state = OBDBundleState.FAILED.value
+            failed.next_attempt_at = None
+            failed.imported_at = BASE
+            failed.ha_result = {
+                "status": "already_imported",
+                "drive_id": failed.drive_id,
+                "_server_projection_version": 2,
+            }
+
+        assert await queue.enqueue_stale_projections() == 1
+        async with session_scope() as session:
+            queued = await session.get(OBDBundle, row.id)
+            assert queued.state == OBDBundleState.READY_TO_IMPORT.value
+
+    async def test_ordinary_failed_import_is_not_automatically_requeued(
+        self, db_session, app_config
+    ):
+        row = await self._stored(app_config, "drive_projection_first_failure")
+        async with session_scope() as session:
+            failed = await session.get(OBDBundle, row.id)
+            failed.state = OBDBundleState.FAILED.value
+            failed.next_attempt_at = None
+            failed.imported_at = None
+            failed.ha_result = {
+                "status": "ok",
+                "drive_id": failed.drive_id,
+                "_server_projection_version": 2,
+            }
+            failed.last_error = "first import failed"
+            failed.failure_kind = "permanent"
+
+        assert await queue.enqueue_stale_projections() == 0
+        async with session_scope() as session:
+            untouched = await session.get(OBDBundle, row.id)
+            assert untouched.state == OBDBundleState.FAILED.value
+            assert untouched.next_attempt_at is None
+            assert untouched.last_error == "first import failed"
+            assert untouched.failure_kind == "permanent"
+
+    async def test_failed_refresh_requires_an_allowlisted_prior_success_result(
+        self, db_session, app_config
+    ):
+        row = await self._stored(app_config, "drive_projection_bad_prior_result")
+        async with session_scope() as session:
+            failed = await session.get(OBDBundle, row.id)
+            failed.state = OBDBundleState.FAILED.value
+            failed.next_attempt_at = None
+            failed.imported_at = BASE
+            failed.ha_result = {
+                "status": "ok",
+                "drive_id": failed.drive_id,
+                "_server_projection_version": 2,
+                "untrusted_extra": "not an acknowledgement this server persists",
+            }
+            failed.last_error = "must remain failed"
+
+        assert await queue.enqueue_stale_projections() == 0
+        async with session_scope() as session:
+            untouched = await session.get(OBDBundle, row.id)
+            assert untouched.state == OBDBundleState.FAILED.value
+            assert untouched.last_error == "must remain failed"
 
     async def test_restart_requeues_importing(self, db_session, app_config):
         row = await self._stored(app_config)
@@ -1791,7 +2078,7 @@ class TestRecoveryAndAPI:
                 "status": "ok",
                 "drive_id": "drive_retry_success",
                 "accepted_samples": 1,
-                "_server_projection_version": 2,
+                "_server_projection_version": 3,
             }
 
     async def test_worker_survives_one_iteration_exception(

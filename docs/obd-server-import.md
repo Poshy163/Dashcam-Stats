@@ -99,10 +99,10 @@ offline/online edge, so one receive timeout cannot strand a ready bundle for a w
    filename, observed SHA-256, size and redacted error. It therefore remains in counts and
    manual recovery after restart rather than becoming an untracked `.bad` file.
 5. The independent HA worker claims the oldest eligible drive and revalidates its retained
-   bytes. Its gzip JSON request uses `(drive_id, bundle_sha256, schema_version)` as the
-   idempotency key. HTTP 404 during HA route startup, 408, 425, 429 (including HA's busy
-   response), 5xx and transport failures use capped exponential retry and `Retry-After`;
-   other 4xx responses stop for operator action.
+   bytes. Its gzip JSON request uses `(drive_id, bundle_sha256, schema_version,
+   projection_version)` as the idempotency key. HTTP 404 during HA route startup, 408, 425,
+   429 (including HA's busy response), 5xx and transport failures use capped exponential
+   retry and `Retry-After`; other 4xx responses stop for operator action.
 
 The HA body keeps the literal final sample for drive/session identity, marks its existing
 v1 `ecu_data_status` field `last_known` (never a live ECU claim), and adds a strict
@@ -113,6 +113,19 @@ same rule: DTC, MIL, readiness, calibration, protocol, CVN and freeze-frame cont
 carry their original event timestamps, and older drives never regress newer retained state.
 Hardened lifecycle fields stay in the server API; the HA request strips them from its
 strict legacy summary shape and uses the existing `clean_end` field for compatibility.
+
+Projection version 3 can amend an identity that Home Assistant already accepted without
+weakening immutable-payload checks. The request carries exactly two self-contained,
+proof-only `supersedes_projections` candidates: version 1 pairs the producer summary with
+the legacy unwindowed diagnostic aggregate, while version 2 pairs the reconciled summary
+with the canonical-window diagnostic aggregate sent by the corrected v2 refresh. This
+bounded pair covers a lost acknowledgement where the server cannot know which predecessor
+committed. Home Assistant selects only its recorded version and requires that candidate's
+semantic fingerprint to match before applying v3; same-version changes and downgrades remain
+conflicts. The current v3 diagnostics are likewise filtered to the canonical drive window.
+The predecessor candidates contain only the same strict, identifier-free aggregate
+allowlist—not raw diagnostic events—and the complete encoded request remains subject to the
+8 MiB body limit.
 
 Each hourly row carries total `sample_count` plus `speed_sample_count` and
 `rpm_sample_count`. The latter two count only non-null readings, so Home Assistant can merge
@@ -126,6 +139,14 @@ made. Orphan discovery then runs in the background, so an archive history cannot
 `/health`. Known, unchanged archive sizes are not rehashed on every boot; each one is still
 revalidated immediately before an HA attempt and through the manual Validate action.
 
+A projection-version startup refresh is forward-only. Imported rows are queued only when
+their persisted, allowlisted HA success result has no marker (legacy v1) or a valid positive
+integer marker below the server's current version. Current, future and malformed markers are
+left untouched, preventing an older server image from scheduling a projection rollback. A
+failed row is revived automatically only when it also retains `imported_at` plus that durable
+prior-success result, proving that the failure happened during a later projection refresh.
+Ordinary failed first imports remain failed for operator review.
+
 ## Operations and recovery
 
 The Backup page is the normal control surface. It shows the companion's redacted
@@ -137,8 +158,10 @@ for unattended deployment verification.
 When reconciliation moves an interrupted drive's canonical end back to its last valid sample,
 later finalisation diagnostics remain untouched in the server's raw diagnostic table. They are
 excluded only from the bounded Home Assistant aggregate projection, whose timestamps must remain
-inside that canonical drive window. This preserves the evidence while preventing a valid
-interrupted drive from being stranded by HA's strict timestamp contract.
+inside that canonical drive window. The unwindowed aggregate appears only in the v1 candidate of
+the bounded v3 predecessor proof described above; it is never applied as current state. This
+preserves the evidence while preventing a valid interrupted drive from being stranded by HA's
+strict timestamp contract.
 
 The same controls are available over the authenticated API:
 
