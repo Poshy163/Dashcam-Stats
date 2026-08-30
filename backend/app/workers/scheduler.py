@@ -109,8 +109,14 @@ class Scheduler:
         now = time.monotonic()
         for index, task in enumerate(self._tasks):
             # Stagger the first run. Firing every task at once on boot would have the
-            # scan, retention and pruning all hitting the database simultaneously.
-            task.next_run = now + 10.0 + index * 5.0 + random.uniform(0, 5)
+            # scan, retention and pruning all hitting the database simultaneously.  The
+            # exception is retention: run it once immediately on every service restart so
+            # already-analysed junk and over-limit old footage free space without waiting
+            # as long as the configured (six-hour by default) interval.  The loop is
+            # serial, so the later staggered tasks cannot race this startup sweep.
+            task.next_run = (
+                now if task.name == "retention" else now + 10.0 + index * 5.0 + random.uniform(0, 5)
+            )
 
         if self._pending_idle_recordings:
             self._post_process_idle_due_at = now + _POST_PROCESS_IDLE_DEBOUNCE_S

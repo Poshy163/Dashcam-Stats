@@ -116,6 +116,10 @@ async def plan_idle(
     """
     settings = get_settings_service()
     result = RetentionPlan()
+    # Unlike ordinary retention, this policy is a discard verdict.  The recording row is
+    # retained as a tombstone, but execute() hides it from every statistics view as soon
+    # as its source file has actually been removed.
+    result.exclude_from_stats = True
     result.safety = safety if safety is not None else await evaluate_safety(session)
 
     if not bool(settings.get_nowait("storage.delete_idle")):
