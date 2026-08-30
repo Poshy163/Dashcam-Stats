@@ -35,15 +35,20 @@ Default host-readable paths (verify the removable-volume alias on the physical u
 
 The backup server's `DASHCAM_OBD_REMOTE_READY_DIR`, `DASHCAM_OBD_REMOTE_STATUS_FILE`, and
 `DASHCAM_OBD_REMOTE_RECEIPTS_DIR` settings are overrides for a unit whose app-specific path
-resolves differently. Status schema v3 publishes `ingestion_quiesce_v1`, current/last drive
-identity, last sample, pending bundle count, the correlated ingestion request ID and fixed-schema
-saturating pipeline counters. Every ordinary, error and internal-storage fallback payload also
+resolves differently. Status schema v4 publishes `ingestion_quiesce_v1`,
+`voltage_only_audit_v1` and `controlled_voltage_only_mode_v1`, current/last drive identity,
+last sample, pending bundle count, the correlated ingestion request ID and fixed-schema
+saturating pipeline counters. It also keeps adapter reachability, transient BLE connection, ECU,
+engine and drive state independent; exposes the last reported BLE owner and producer update time;
+and publishes a bounded ATRV value, source, original sample time, freshness and quality. Every
+ordinary, error and internal-storage fallback payload also
 identifies the installed artifact with `app_version_name`, `app_version_code`,
 `poll_plan_version` and `build_git_sha`. The build revision is a validated 12-character lower-case
 Git revision sourced from `GITHUB_SHA` or the checkout's `HEAD`; it is `unknown` only when neither
 is available. Gradle injects it directly into `BuildConfig` without generating a tracked file.
 These fields are passed through under `logger` by `GET /api/obd/status`. Status contains no adapter
-address, VIN, credentials, command/response payload or telemetry.
+address, VIN, credentials, arbitrary command/response payload or ECU telemetry. The only retained
+response text is the validated numeric ATRV token, such as `12.7 V`.
 
 ## Build, sign and install
 
@@ -96,7 +101,13 @@ On first launch, enter a lower-case stable vehicle ID and the BLE adapter addres
 and persists a bounded random logger ID on first run; it does not derive it from a raw Android or
 hardware identifier. The value can be replaced manually with another bounded deployment ID.
 The setup screen also persists the engine-on/off voltage hysteresis (both bounded to 10–16 V,
-with off strictly below on) and the 0–300 second off grace. Invalid values disable the logger.
+with off strictly below on), the 0–300 second off grace and a 15–3600 second parked interval.
+Controlled voltage-only mode is an absolute fence that permits `ATRV` but never reset,
+initialisation or ECU commands, even if voltage crosses the engine-on threshold. A protected build
+can force the same fence with `-PobdVoltageOnlyAudit=true` for a physical audit, then be replaced by
+the ordinary production build. Saving a changed runtime mode cancels and joins the active worker,
+closes its BLE client, then starts a new worker under the new immutable command policy. Invalid
+values disable the logger.
 The app asks only for Nearby Devices (`BLUETOOTH_CONNECT`) plus notification permission on
 Android 13+. It uses direct configured-MAC GATT and never calls a Bluetooth scan API, so it does
 not request `BLUETOOTH_SCAN` or location.
@@ -114,10 +125,11 @@ Do not enable the persistent ownership checkbox until the cutover below is compl
 6. Run the ordinary arrival backup and confirm the server validates the bundle before deleting it
    from the dashcam.
 
-Parked checks issue one adapter-local `ATRV`; they do not reset or configure the ELM and do not send
-a Mode 01 request while voltage remains below the configured 13.2 V start threshold. Only after
-that cheap gate passes does the logger run the known reset/configuration sequence and require a
-checksum-valid ECU response. Live stop uses the 13.0 V threshold, a 30-second grace, and a recent
+Parked checks issue exactly one adapter-local `ATRV`; they do not reset or configure the ELM and do
+not send a Mode 01 request while voltage remains below the configured 13.2 V start threshold. In
+controlled voltage-only mode they cannot progress past this command at any voltage. Otherwise,
+only after that cheap gate passes does the logger run the known reset/configuration sequence and
+require a checksum-valid ECU response. Live stop uses the 13.0 V threshold, a 30-second grace, and a recent
 RPM above 300 veto. Every command passes a read-only allowlist. Mode 04/08, raw monitors,
 security/programming/reset requests and persistent ELM writes are absent and refused.
 
@@ -140,10 +152,19 @@ reboot invalidates any prior hold before polling. While a current request persis
 fresh malformed input), the logger neither reconnects nor polls the ECU; controller removal or
 safe lease expiry clears the acknowledgement and resumes.
 
+Every allowed command is classified as `adapter_local` or `vehicle_bus` before the FFF1 write. The
+public metrics distinguish requested/sent/completed commands, adapter-local and vehicle-bus
+counts, target resolution, GATT establishment, notification subscription, successful/failed
+voltage reads, connection failures, invalid voltage replies, disconnects, median/maximum timings,
+total connected time and polling duty cycle. Strict ATRV parsing requires exactly one numeric `V`
+token in the conservative 9.0–16.5 V range; empty, `?`, `NO DATA`, suffix-free, ambiguous and
+out-of-range replies are invalid rather than clamped.
+
 The single FFF1 command stream is prompt-delimited and bounded. A missing prompt, failed protocol
 search, write uncertainty, overflow, multiple prompts, non-whitespace trailing bytes or an idle
 notification taints the session without carrying bytes into the next command; the service closes GATT and starts again
-with a fresh `ATZ` only after bounded exponential backoff. Sparse diagnostic scans read Modes
+with a fresh `ATZ` only after bounded exponential backoff with jitter, capped at five minutes.
+Sparse diagnostic scans read Modes
 03/07/0A, Mode 01 readiness/MIL, supported Mode 09 calibration evidence, and correctly framed
 Mode 02 freeze-frame number 0 (including explicit empty/no-data evidence). Strict parsing requires
 the complete `48 6B <source>` ISO header, learned ECU source, exact length and checksum. A malformed
@@ -154,7 +175,7 @@ per-PID cooldown and is retried; a transient MAF failure can recover, while a re
 advertised PID backs off to at most one retry per 12 sample cycles. Strict source, length and
 checksum validation is unchanged. Medium PIDs are phase-distributed across three cycles and slow
 PIDs across phases 0/4/8 of each 12-cycle window, preserving each PID's cadence without putting
-every optional command in the same cycle. App `0.2.1` identifies this plan and hardened bundles
+every optional command in the same cycle. App `0.2.2` identifies this plan and hardened bundles
 declare `poll_plan_version=2`.
 Only transport-level faults (missing prompt, overflow, failed write, disconnect) still taint and
 reconnect, and a fatal fault mid-cycle first persists the partial sample already gathered, marked
@@ -192,7 +213,7 @@ notification/fragment/frame, timeout, checksum/parser, sample/persistence/drop, 
 failure-triggered reconnect and direct-path queue depth counters without raw payloads.
 `status.json` keeps the latest sampled timestamp, bounded metrics snapshot and immutable build/poll
 identity, but durable status writes occur immediately only for state/ownership/drive/request/error
-changes and otherwise on a five-minute heartbeat. SQLite sample commits remain independent,
+changes and otherwise on a one-minute heartbeat. SQLite sample commits remain independent,
 avoiding an extra TF-card fsync and atomic rename on every five-second polling cycle.
 
 Before an on-device schema upgrade, the logger forces a complete WAL checkpoint, validates the

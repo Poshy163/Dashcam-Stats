@@ -48,11 +48,25 @@ data class PublicStatus(
     val ingestionRequestId: String? = null,
     val lastSampleAtUtc: String? = null,
     val metrics: PipelineMetricsSnapshot = PipelineMetricsSnapshot.EMPTY,
+    val adapterReachable: Boolean = false,
+    val adapterConnected: Boolean = false,
+    val ecuConnected: Boolean = false,
+    val engineRunning: Boolean = false,
+    val vehicleState: String = state,
+    val batteryVoltage: Double? = null,
+    val batteryVoltageSource: String? = null,
+    val batteryVoltageSampleAtUtc: String? = null,
+    val batteryVoltageFresh: Boolean = false,
+    val batteryVoltageRawResponse: String? = null,
+    val batteryVoltageQuality: String = "unavailable",
+    val bleOwner: String = if (ownershipEnabled) "dashcam_full_obd" else "unowned",
+    val headUnitState: String = "awake",
+    val voltageOnlyMode: Boolean = false,
     val lastError: String? = null,
     val lastErrorAtUtc: String? = null,
 )
 
-internal const val PUBLIC_STATUS_SCHEMA_VERSION = 3
+internal const val PUBLIC_STATUS_SCHEMA_VERSION = 4
 
 object StatusPublisher {
     fun publish(context: Context, status: PublicStatus) {
@@ -96,7 +110,16 @@ object StatusPublisher {
             .put("app_version_code", BuildConfig.VERSION_CODE)
             .put("poll_plan_version", ObdPollPlan.VERSION)
             .put("build_git_sha", BuildConfig.BUILD_GIT_SHA)
-            .put("capabilities", org.json.JSONArray(listOf("ingestion_quiesce_v1")))
+            .put(
+                "capabilities",
+                org.json.JSONArray(
+                    listOf(
+                        "ingestion_quiesce_v1",
+                        "voltage_only_audit_v1",
+                        "controlled_voltage_only_mode_v1",
+                    ),
+                ),
+            )
             .put("state", status.state)
             .put("ownership_enabled", status.ownershipEnabled)
             .put("current_drive_id", status.currentDriveId ?: JSONObject.NULL)
@@ -106,6 +129,21 @@ object StatusPublisher {
             .put("ingestion_request_id", status.ingestionRequestId ?: JSONObject.NULL)
             .put("last_sample_at_utc", status.lastSampleAtUtc ?: JSONObject.NULL)
             .put("metrics", status.metrics.toJson())
+            .put("adapter_reachable", status.adapterReachable)
+            .put("adapter_connected", status.adapterConnected)
+            .put("ecu_connected", status.ecuConnected)
+            .put("engine_running", status.engineRunning)
+            .put("vehicle_state", status.vehicleState)
+            .put("battery_voltage", status.batteryVoltage ?: JSONObject.NULL)
+            .put("battery_voltage_source", status.batteryVoltageSource ?: JSONObject.NULL)
+            .put("battery_voltage_sample_at_utc", status.batteryVoltageSampleAtUtc ?: JSONObject.NULL)
+            .put("battery_voltage_fresh", status.batteryVoltageFresh)
+            .put("battery_voltage_raw_response", status.batteryVoltageRawResponse ?: JSONObject.NULL)
+            .put("battery_voltage_quality", status.batteryVoltageQuality)
+            .put("ble_owner", status.bleOwner)
+            .put("head_unit_state", status.headUnitState)
+            .put("voltage_only_mode", status.voltageOnlyMode)
+            .put("updated_at_utc", Instant.now().toString())
             .put("last_error", status.lastError ?: JSONObject.NULL)
             .put("last_error_at_utc", status.lastErrorAtUtc ?: JSONObject.NULL)
 

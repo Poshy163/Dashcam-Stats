@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 
+import { ObdLoggerCard } from '@/components/ObdLoggerCard'
 import { EmptyState, ErrorState, PageHeader, ProgressBar, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
 import type { IngestStatus, OBDBundle } from '@/lib/api'
@@ -303,14 +304,20 @@ export default function Backup() {
         <>
           <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-8">
             <StatTile
-              label="Logger"
+              label="Logger state"
               value={obdStatus.data?.logger?.state ?? (data?.unitOnline ? 'Unknown' : 'Car away')}
               hint={
                 obdStatus.data?.logger?.lastDriveFinishedAtUtc
                   ? `last drive ${formatRelative(obdStatus.data.logger.lastDriveFinishedAtUtc)}`
                   : 'best-effort status from the unit'
               }
-              tone={obdStatus.data?.logger?.state === 'ecu_online' ? 'busy' : 'default'}
+              tone={
+                obdStatus.data?.logger?.ecuConnected === true ||
+                (obdStatus.data?.logger?.ecuConnected === undefined &&
+                  obdStatus.data?.logger?.state === 'ecu_online')
+                  ? 'busy'
+                  : 'default'
+              }
             />
             <StatTile
               label="Waiting on camera"
@@ -384,6 +391,11 @@ export default function Backup() {
               }
             />
           </div>
+
+          <ObdLoggerCard
+            logger={obdStatus.data?.logger}
+            checkedAt={obdStatus.data?.loggerCheckedAt}
+          />
 
           {obdStatus.data?.homeAssistantAuthentication !== 'configured' && (
             <div className="card mb-6 border-state-warn/40 px-5 py-4 text-sm">

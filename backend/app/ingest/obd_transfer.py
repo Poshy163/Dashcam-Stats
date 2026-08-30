@@ -130,13 +130,16 @@ class OBDTransferStatus:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            logger = dict(self.logger) if isinstance(self.logger, dict) else self.logger
+            if isinstance(logger, dict):
+                _reconcile_logger_voltage_freshness(logger)
             logger_pending = (
-                self.logger.get("pending_bundle_count", 0) if isinstance(self.logger, dict) else 0
+                logger.get("pending_bundle_count", 0) if isinstance(logger, dict) else 0
             )
             if not isinstance(logger_pending, int) or logger_pending < 0:
                 logger_pending = 0
             return {
-                "logger": self.logger,
+                "logger": logger,
                 "logger_checked_at": (
                     self.logger_checked_at.isoformat() if self.logger_checked_at else None
                 ),
@@ -199,7 +202,20 @@ _LOGGER_KEYS = frozenset(
         "state",
         "ownership_enabled",
         "adapter_state",
+        "adapter_reachable",
+        "adapter_connected",
+        "ecu_connected",
+        "engine_running",
         "vehicle_state",
+        "battery_voltage",
+        "battery_voltage_source",
+        "battery_voltage_sample_at_utc",
+        "battery_voltage_fresh",
+        "battery_voltage_raw_response",
+        "battery_voltage_quality",
+        "ble_owner",
+        "head_unit_state",
+        "voltage_only_mode",
         "current_drive_id",
         "last_drive_id",
         "last_drive_finished_at_utc",
@@ -219,8 +235,10 @@ _LOGGER_CAPABILITY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _LOGGER_METRIC_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _LOGGER_APP_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _LOGGER_BUILD_GIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{12}|unknown)$")
+_LOGGER_STATE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 MAX_LOGGER_CAPABILITIES = 32
 MAX_LOGGER_METRICS = 64
+LOGGER_VOLTAGE_FRESHNESS_SECONDS = 75
 LOGGER_PACKAGE = "com.dashcamstats.obdlogger"
 _STATUS_FILE_PREFIX = "__DASHCAM_LOGGER_STATUS_FILE__\n"
 _STATUS_NOT_INSTALLED = "__DASHCAM_LOGGER_NOT_INSTALLED__"
@@ -259,6 +277,50 @@ def _clean_logger_metrics(value: object) -> dict[str, int | float] | None:
             return None
         clean[key] = item
     return clean
+
+
+def _clean_logger_timestamp(value: object) -> str | None:
+    """Accept one bounded timezone-aware ISO timestamp and normalize it to UTC."""
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC).isoformat()
+
+
+def _reconcile_logger_voltage_freshness(
+    status: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Derive fresh/reachable from validated evidence, never a persisted app boolean."""
+    schema_version = status.get("schema_version")
+    if not isinstance(schema_version, int) or schema_version < 4:
+        return
+    sample_at = _clean_logger_timestamp(status.get("battery_voltage_sample_at_utc"))
+    reference = now or utcnow()
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    age_seconds = (
+        (reference.astimezone(UTC) - datetime.fromisoformat(sample_at)).total_seconds()
+        if sample_at is not None
+        else None
+    )
+    fresh = (
+        isinstance(status.get("battery_voltage"), float)
+        and status.get("battery_voltage_source") == "dashcam_elm_atrv"
+        and status.get("battery_voltage_quality") == "valid"
+        and age_seconds is not None
+        and -5 <= age_seconds <= LOGGER_VOLTAGE_FRESHNESS_SECONDS
+    )
+    status["battery_voltage_fresh"] = fresh
+    status["adapter_reachable"] = fresh
+    if not fresh and status.get("battery_voltage_quality") == "valid":
+        status["battery_voltage_quality"] = "stale" if sample_at is not None else "unavailable"
 
 
 async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
@@ -324,6 +386,15 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return {"state": "invalid_status", "last_error": "logger status is not an object"}
     clean: dict[str, Any] = {}
+    boolean_keys = {
+        "ownership_enabled",
+        "adapter_reachable",
+        "adapter_connected",
+        "ecu_connected",
+        "engine_running",
+        "battery_voltage_fresh",
+        "voltage_only_mode",
+    }
     for key, item in value.items():
         if key not in _LOGGER_KEYS:
             continue
@@ -338,16 +409,71 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
         elif key == "app_version_name":
             if isinstance(item, str) and _LOGGER_APP_VERSION_RE.fullmatch(item):
                 clean[key] = item
+        elif key in {"state", "adapter_state"}:
+            if isinstance(item, str) and _LOGGER_STATE_RE.fullmatch(item):
+                clean[key] = item
+        elif key == "schema_version":
+            if isinstance(item, int) and not isinstance(item, bool) and 1 <= item <= 100:
+                clean[key] = item
         elif key in {"app_version_code", "poll_plan_version"}:
             if isinstance(item, int) and not isinstance(item, bool) and 1 <= item <= 2_147_483_647:
+                clean[key] = item
+        elif key in {"pending_bundle_count", "sample_count"}:
+            if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 1_000_000_000:
                 clean[key] = item
         elif key == "build_git_sha":
             if isinstance(item, str) and _LOGGER_BUILD_GIT_SHA_RE.fullmatch(item):
                 clean[key] = item
+        elif key == "battery_voltage":
+            if (
+                isinstance(item, (int, float))
+                and not isinstance(item, bool)
+                and math.isfinite(float(item))
+                and 9.0 <= float(item) <= 16.5
+            ):
+                clean[key] = float(item)
+        elif key == "battery_voltage_raw_response":
+            if isinstance(item, str):
+                match = re.fullmatch(r"([0-9]{1,2}(?:\.[0-9]+)?) V", item)
+                if match and 9.0 <= float(match.group(1)) <= 16.5:
+                    clean[key] = item
+        elif key == "battery_voltage_source":
+            if item in {"dashcam_elm_atrv"}:
+                clean[key] = item
+        elif key == "battery_voltage_sample_at_utc":
+            if timestamp := _clean_logger_timestamp(item):
+                clean[key] = timestamp
+        elif key == "battery_voltage_quality":
+            if item in {"valid", "stale", "invalid", "failed", "unavailable"}:
+                clean[key] = item
+        elif key == "ble_owner":
+            if item in {
+                "unowned",
+                "dashcam_voltage_only",
+                "dashcam_full_obd",
+                "home_assistant_voltage_only",
+                "phone_reserved",
+                "transitioning",
+                "conflict_detected",
+            }:
+                clean[key] = item
+        elif key == "head_unit_state":
+            if item in {"awake", "sleep_requested", "asleep", "unknown"}:
+                clean[key] = item
+        elif key == "updated_at_utc":
+            if timestamp := _clean_logger_timestamp(item):
+                clean[key] = timestamp
+        elif key in boolean_keys:
+            if isinstance(item, bool):
+                clean[key] = item
+        elif key == "vehicle_state":
+            if item in {"parked", "ecu_online", "engine_running", "unknown"}:
+                clean[key] = item
         elif isinstance(item, str):
             clean[key] = redact(item)[:256]
-        elif isinstance(item, (bool, int, float)) or item is None:
+        elif item is None:
             clean[key] = item
+    _reconcile_logger_voltage_freshness(clean)
     return clean
 
 

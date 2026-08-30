@@ -228,10 +228,36 @@ export interface IngestRun {
 export interface OBDLoggerStatus {
   schemaVersion?: number
   loggerVersion?: string
+  appVersionName?: string
+  appVersionCode?: number
+  pollPlanVersion?: number
+  buildGitSha?: string
+  capabilities?: string[]
   state?: string
   ownershipEnabled?: boolean
   adapterState?: string
+  adapterReachable?: boolean
+  adapterConnected?: boolean
+  ecuConnected?: boolean
+  engineRunning?: boolean
   vehicleState?: string
+  batteryVoltage?: number | null
+  batteryVoltageSource?: 'dashcam_elm_atrv' | string | null
+  batteryVoltageSampleAtUtc?: string | null
+  batteryVoltageFresh?: boolean
+  batteryVoltageRawResponse?: string | null
+  batteryVoltageQuality?: 'valid' | 'stale' | 'invalid' | 'failed' | 'unavailable' | string
+  bleOwner?:
+    | 'unowned'
+    | 'dashcam_voltage_only'
+    | 'dashcam_full_obd'
+    | 'home_assistant_voltage_only'
+    | 'phone_reserved'
+    | 'transitioning'
+    | 'conflict_detected'
+    | string
+  headUnitState?: 'awake' | 'sleep_requested' | 'asleep' | 'unknown' | string
+  voltageOnlyMode?: boolean
   currentDriveId?: string | null
   lastDriveId?: string | null
   lastDriveFinishedAtUtc?: string | null

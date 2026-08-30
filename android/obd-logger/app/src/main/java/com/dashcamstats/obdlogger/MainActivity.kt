@@ -11,6 +11,7 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 
 class MainActivity : Activity() {
@@ -20,6 +21,8 @@ class MainActivity : Activity() {
     private lateinit var voltageOn: EditText
     private lateinit var voltageOff: EditText
     private lateinit var offGraceSeconds: EditText
+    private lateinit var parkedIntervalSeconds: EditText
+    private lateinit var voltageOnlyMode: CheckBox
     private lateinit var ownership: CheckBox
     private lateinit var enabled: CheckBox
     private lateinit var status: TextView
@@ -53,6 +56,18 @@ class MainActivity : Activity() {
         ).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
         }
+        parkedIntervalSeconds = field(
+            layout,
+            "Parked voltage interval (15–3600 seconds)",
+            current.parkedIntervalSeconds.toString(),
+        ).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        voltageOnlyMode = CheckBox(this).apply {
+            text = "Controlled voltage-only mode (ATRV only; never initialise the ECU)"
+            isChecked = current.voltageOnlyMode
+        }
+        layout.addView(voltageOnlyMode)
         ownership = CheckBox(this).apply {
             text = "I explicitly transferred adapter ownership from Home Assistant and phones"
             isChecked = current.ownershipTransferred
@@ -69,7 +84,7 @@ class MainActivity : Activity() {
             setOnClickListener { saveAndApply() }
         })
         layout.addView(status)
-        setContentView(layout)
+        setContentView(ScrollView(this).apply { addView(layout) })
     }
 
     private fun field(parent: LinearLayout, hint: String, value: String): EditText {
@@ -99,10 +114,13 @@ class MainActivity : Activity() {
             voltageOn = voltageOn.text.toString().toDoubleOrNull() ?: Double.NaN,
             voltageOff = voltageOff.text.toString().toDoubleOrNull() ?: Double.NaN,
             offGraceSeconds = offGraceSeconds.text.toString().toLongOrNull() ?: -1,
+            parkedIntervalSeconds = parkedIntervalSeconds.text.toString().toLongOrNull() ?: -1,
+            voltageOnlyMode = voltageOnlyMode.isChecked,
         )
         if (!config.thresholdConfigurationValid) {
             rejectConfiguration(
-                "Use 10.0–16.0 V, engine-off below engine-on, and 0–300 seconds grace",
+                "Use 10.0–16.0 V, engine-off below engine-on, 0–300 seconds grace, " +
+                    "and a 15–3600 second parked interval",
             )
             return
         }
@@ -176,7 +194,9 @@ class MainActivity : Activity() {
             status.text = "Ownership, valid adapter address, vehicle ID and logger ID are required"
             return
         }
-        val service = Intent(this, ObdLoggerService::class.java)
+        val service = Intent(this, ObdLoggerService::class.java).setAction(
+            ObdLoggerService.ACTION_RELOAD_CONFIGURATION,
+        )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(service)
         else startService(service)
         status.text = "Logger starting"

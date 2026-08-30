@@ -4,6 +4,17 @@ import java.time.Instant
 
 enum class ServiceStartupDecision { START, STOP_DISABLED, STOP_PERMISSION_REQUIRED }
 
+enum class ServiceWorkerDecision { START, RESTART_FOR_CONFIGURATION, KEEP_RUNNING }
+
+internal fun serviceWorkerDecision(
+    workerActive: Boolean,
+    configurationReloadRequested: Boolean,
+): ServiceWorkerDecision = when {
+    workerActive && configurationReloadRequested -> ServiceWorkerDecision.RESTART_FOR_CONFIGURATION
+    workerActive -> ServiceWorkerDecision.KEEP_RUNNING
+    else -> ServiceWorkerDecision.START
+}
+
 internal const val EXTRA_STARTUP_RECOVERY_REASON =
     "com.dashcamstats.obdlogger.extra.STARTUP_RECOVERY_REASON"
 
@@ -77,7 +88,7 @@ internal class ForegroundFirstStartupGate {
     }
 }
 
-class StatusWriteGate(private val heartbeatMillis: Long = 300_000) {
+class StatusWriteGate(private val heartbeatMillis: Long = 60_000) {
     private var lastSignature: String? = null
     private var lastWriteAt: Long? = null
 
@@ -113,9 +124,77 @@ internal class ReconnectAttemptTracker {
     }
 }
 
+/** Bounded retry delay with jitter so two clients do not remain phase-locked after a conflict. */
+internal class BoundedExponentialBackoff(
+    private val baseDelayMillis: Long = 2_000,
+    private val maximumDelayMillis: Long = 300_000,
+    private val jitterFraction: Double = 0.2,
+    private val randomUnit: () -> Double = { kotlin.random.Random.nextDouble() },
+) {
+    private var failures = 0
+
+    init {
+        require(baseDelayMillis in 1..maximumDelayMillis)
+        require(jitterFraction in 0.0..0.5)
+    }
+
+    fun reset() {
+        failures = 0
+    }
+
+    fun nextDelayMillis(): Long {
+        failures = (failures + 1).coerceAtMost(31)
+        var delay = baseDelayMillis
+        repeat(failures - 1) {
+            delay = (delay * 2).coerceAtMost(maximumDelayMillis)
+        }
+        val unit = randomUnit().coerceIn(0.0, 1.0)
+        val factor = (1.0 - jitterFraction) + (2.0 * jitterFraction * unit)
+        return (delay * factor).toLong().coerceIn(1L, maximumDelayMillis)
+    }
+}
+
 /** Null or low adapter voltage keeps the logger entirely outside the ECU protocol path. */
 internal fun parkedVoltageWarrantsInitialization(voltage: Double?, voltageOn: Double): Boolean =
     voltage?.isFinite() == true && voltage >= voltageOn
+
+/** Audit mode is an absolute fence: voltage can never authorise adapter reset or ECU probing. */
+internal fun parkedProbeMayInitialize(
+    voltageOnlyMode: Boolean,
+    voltage: Double?,
+    voltageOn: Double,
+): Boolean = !voltageOnlyMode && parkedVoltageWarrantsInitialization(voltage, voltageOn)
+
+internal data class VoltagePublicState(
+    val fresh: Boolean,
+    val quality: String,
+    val adapterReachable: Boolean,
+)
+
+/** Convert one probe into public freshness semantics without extending its lifetime on restart. */
+internal fun voltagePublicState(
+    probe: VoltageProbeSnapshot?,
+    nowUtc: Instant,
+    freshnessSeconds: Long,
+): VoltagePublicState {
+    require(freshnessSeconds >= 1)
+    val ageSeconds = probe?.let {
+        runCatching { nowUtc.epochSecond - Instant.parse(it.sampleAtUtc).epochSecond }.getOrNull()
+    }
+    val fresh = probe?.result == "valid" &&
+        ageSeconds != null && ageSeconds in -5..freshnessSeconds
+    val quality = when {
+        probe == null -> "unavailable"
+        probe.result != "valid" -> probe.result
+        fresh -> "valid"
+        else -> "stale"
+    }
+    return VoltagePublicState(
+        fresh = fresh,
+        quality = quality,
+        adapterReachable = probe?.result == "valid" && fresh,
+    )
+}
 
 /**
  * Only fields whose change warrants an immediate durable status write belong in this signature.
@@ -125,6 +204,17 @@ internal fun parkedVoltageWarrantsInitialization(voltage: Double?, voltageOn: Do
 internal fun durableStatusSignature(status: PublicStatus): String = listOf(
     status.state,
     status.ownershipEnabled.toString(),
+    status.adapterReachable.toString(),
+    status.adapterConnected.toString(),
+    status.ecuConnected.toString(),
+    status.engineRunning.toString(),
+    status.vehicleState,
+    status.batteryVoltageSource.orEmpty(),
+    status.batteryVoltageFresh.toString(),
+    status.batteryVoltageQuality,
+    status.bleOwner,
+    status.headUnitState,
+    status.voltageOnlyMode.toString(),
     status.currentDriveId.orEmpty(),
     status.lastDriveId.orEmpty(),
     status.lastDriveFinishedAtUtc.orEmpty(),

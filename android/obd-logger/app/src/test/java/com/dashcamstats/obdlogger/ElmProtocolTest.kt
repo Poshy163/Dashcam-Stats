@@ -35,6 +35,84 @@ class ElmProtocolTest {
     }
 
     @Test
+    fun everyAllowedCommandHasAnExplicitAdapterOrVehicleCategory() {
+        listOf("ATRV", "ATZ", "ATI", "ATE0", "ATPC").forEach { command ->
+            assertEquals(command, ElmCommandCategory.ADAPTER_LOCAL, ElmProtocol.commandCategory(command))
+        }
+        listOf("0100", "010C", "020000", "03", "07", "0902").forEach { command ->
+            assertEquals(command, ElmCommandCategory.VEHICLE_BUS, ElmProtocol.commandCategory(command))
+        }
+        listOf("04", "ATMA", "ATMR", "ATSH7E0", "garbage").forEach { command ->
+            assertNull(command, ElmProtocol.commandCategory(command))
+        }
+    }
+
+    @Test
+    fun voltageOnlyPolicyAllowsExactlyAtrvAndFailsClosedBeforeWriting() {
+        assertTrue(ElmProtocol.commandAllowed(ElmCommandPolicy.VOLTAGE_ONLY, "ATRV"))
+        listOf(
+            "ATZ",
+            "ATI",
+            "ATPC",
+            "0100",
+            "010C",
+            "03",
+            "ATMA",
+            "ATFI",
+            "ATCV1234",
+            "ATPP01SVFF",
+            "ATRV\r",
+            "ATRV\n",
+            "ATR\tV",
+            "ATRV\u0000",
+            "ATRV\r0100",
+        ).forEach { command ->
+            assertFalse(command, ElmProtocol.commandAllowed(ElmCommandPolicy.VOLTAGE_ONLY, command))
+        }
+        assertTrue(ElmProtocol.commandAllowed(ElmCommandPolicy.FULL_OBD, "ATRV"))
+        assertTrue(ElmProtocol.commandAllowed(ElmCommandPolicy.FULL_OBD, "0100"))
+        assertFalse(ElmProtocol.commandAllowed(ElmCommandPolicy.FULL_OBD, "ATFI"))
+
+        val oneShotGate = ElmCommandWriteGate(ElmCommandPolicy.VOLTAGE_ONLY)
+        assertEquals(ElmCommandCategory.ADAPTER_LOCAL, oneShotGate.authorize("ATRV"))
+        assertNull(oneShotGate.authorize("ATRV"))
+        assertNull(oneShotGate.authorize("0100"))
+
+        val fullGate = ElmCommandWriteGate(ElmCommandPolicy.FULL_OBD)
+        assertEquals(ElmCommandCategory.ADAPTER_LOCAL, fullGate.authorize("ATRV"))
+        assertEquals(ElmCommandCategory.VEHICLE_BUS, fullGate.authorize("0100"))
+        assertEquals(ElmCommandCategory.VEHICLE_BUS, fullGate.authorize("0100"))
+    }
+
+    @Test
+    fun voltageRequiresOneRealisticNumericVSuffixedResult() {
+        assertEquals(12.74, ElmProtocol.voltage("ATRV\r12.74 V\r>")!!, 0.0001)
+        assertEquals("12.74 V", ElmProtocol.sanitizedVoltageResponse("ATRV\r12.74 V\r>"))
+        assertEquals(12.7, ElmProtocol.voltage("12.7V\r>")!!, 0.0001)
+
+        listOf(
+            "",
+            "?\r>",
+            "NO DATA\r>",
+            "NO DATA\r12.7 V\r>",
+            "? 12.7 V\r>",
+            "-12.7 V\r>",
+            "twelve volts\r>",
+            "12.7\r>",
+            "12.7 V",
+            "8.99 V\r>",
+            "16.51 V\r>",
+            "12.7 V\r13.1 V\r>",
+            "12.7 V trailing 13.1 V",
+            "ATRV\r12.7 V\rOK\r>",
+            "ATRV\r12.7 V\r>\r>",
+        ).forEach { response ->
+            assertNull(response, ElmProtocol.voltage(response))
+            assertNull(response, ElmProtocol.sanitizedVoltageResponse(response))
+        }
+    }
+
+    @Test
     fun sparseDiagnosticsDecodeDtcReadinessAndCalibrationId() {
         val dtc = iso(0x43, 0x01, 0x33, 0, 0, 0, 0)
         assertEquals(

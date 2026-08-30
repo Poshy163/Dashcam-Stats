@@ -154,6 +154,8 @@ class EngineGateTest {
         assertFalse(parkedVoltageWarrantsInitialization(13.19, voltageOn = 13.2))
         assertTrue(parkedVoltageWarrantsInitialization(13.2, voltageOn = 13.2))
         assertTrue(parkedVoltageWarrantsInitialization(14.1, voltageOn = 13.2))
+        assertFalse(parkedProbeMayInitialize(true, 14.1, voltageOn = 13.2))
+        assertTrue(parkedProbeMayInitialize(false, 14.1, voltageOn = 13.2))
     }
 
     @Test
@@ -194,6 +196,34 @@ class EngineGateTest {
     }
 
     @Test
+    fun voltageFreshnessExpiresWithoutTurningStaleDataIntoReachability() {
+        val probe = VoltageProbeSnapshot(
+            result = "valid",
+            sampleAtUtc = "2026-08-30T00:00:00Z",
+            parsedVoltage = 12.7,
+            sanitizedRawResponse = "12.7 V",
+        )
+
+        val fresh = voltagePublicState(probe, Instant.parse("2026-08-30T00:01:15Z"), 75)
+        assertTrue(fresh.fresh)
+        assertTrue(fresh.adapterReachable)
+        assertEquals("valid", fresh.quality)
+
+        val stale = voltagePublicState(probe, Instant.parse("2026-08-30T00:01:16Z"), 75)
+        assertFalse(stale.fresh)
+        assertFalse(stale.adapterReachable)
+        assertEquals("stale", stale.quality)
+
+        val invalid = voltagePublicState(
+            VoltageProbeSnapshot("invalid", "2026-08-30T00:01:16Z"),
+            Instant.parse("2026-08-30T00:01:16Z"),
+            75,
+        )
+        assertFalse(invalid.fresh)
+        assertEquals("invalid", invalid.quality)
+    }
+
+    @Test
     fun onlyFailureArmsAReconnectAttempt() {
         val tracker = ReconnectAttemptTracker()
         assertFalse(tracker.nextAttemptIsReconnect())
@@ -207,6 +237,30 @@ class EngineGateTest {
         tracker.connectionFailed()
         assertTrue(tracker.nextAttemptIsReconnect())
         assertFalse(tracker.nextAttemptIsReconnect())
+    }
+
+    @Test
+    fun retryBackoffIsBoundedJitteredAndResettable() {
+        val centered = BoundedExponentialBackoff(
+            baseDelayMillis = 2_000,
+            maximumDelayMillis = 300_000,
+            jitterFraction = 0.2,
+            randomUnit = { 0.5 },
+        )
+        assertEquals(2_000L, centered.nextDelayMillis())
+        assertEquals(4_000L, centered.nextDelayMillis())
+        assertEquals(8_000L, centered.nextDelayMillis())
+        repeat(20) { centered.nextDelayMillis() }
+        assertEquals(300_000L, centered.nextDelayMillis())
+        centered.reset()
+        assertEquals(2_000L, centered.nextDelayMillis())
+
+        val lowJitter = BoundedExponentialBackoff(randomUnit = { 0.0 })
+        val highJitter = BoundedExponentialBackoff(randomUnit = { 1.0 })
+        assertEquals(1_600L, lowJitter.nextDelayMillis())
+        assertEquals(2_400L, highJitter.nextDelayMillis())
+        repeat(30) { highJitter.nextDelayMillis() }
+        assertTrue(highJitter.nextDelayMillis() <= 300_000L)
     }
 
     @Test
@@ -303,6 +357,22 @@ class EngineGateTest {
     }
 
     @Test
+    fun savedConfigurationRestartsAnActiveWorkerBeforeApplyingNewPolicy() {
+        assertEquals(
+            ServiceWorkerDecision.RESTART_FOR_CONFIGURATION,
+            serviceWorkerDecision(workerActive = true, configurationReloadRequested = true),
+        )
+        assertEquals(
+            ServiceWorkerDecision.KEEP_RUNNING,
+            serviceWorkerDecision(workerActive = true, configurationReloadRequested = false),
+        )
+        assertEquals(
+            ServiceWorkerDecision.START,
+            serviceWorkerDecision(workerActive = false, configurationReloadRequested = true),
+        )
+    }
+
+    @Test
     fun databaseInitializationIsGatedBehindForegroundPromotion() {
         val gate = ForegroundFirstStartupGate()
         var databaseInitialized = false
@@ -324,7 +394,7 @@ class EngineGateTest {
 
     @Test
     fun unchangedStatusIsDurableOnlyOnACoarseHeartbeat() {
-        val gate = StatusWriteGate(heartbeatMillis = 60_000)
+        val gate = StatusWriteGate()
         assertTrue(gate.shouldWrite("ecu_online", 0))
         assertFalse(gate.shouldWrite("ecu_online", 5_000))
         assertTrue(gate.shouldWrite("backoff", 5_001))
@@ -332,6 +402,35 @@ class EngineGateTest {
         assertTrue(gate.shouldWrite("backoff", 65_001))
         gate.writeFailed("backoff")
         assertTrue(gate.shouldWrite("backoff", 65_002))
+    }
+
+    @Test
+    fun voltageEvidenceTransitionsPublishWithoutWaitingForTheHeartbeat() {
+        val gate = StatusWriteGate()
+        val unavailable = PublicStatus(
+            state = "parked",
+            ownershipEnabled = true,
+            batteryVoltageQuality = "unavailable",
+        )
+        val valid = unavailable.copy(
+            adapterReachable = true,
+            batteryVoltage = 12.7,
+            batteryVoltageSource = "dashcam_elm_atrv",
+            batteryVoltageFresh = true,
+            batteryVoltageQuality = "valid",
+        )
+        val failed = valid.copy(
+            adapterReachable = false,
+            batteryVoltage = null,
+            batteryVoltageFresh = false,
+            batteryVoltageQuality = "failed",
+        )
+
+        assertTrue(gate.shouldWrite(durableStatusSignature(unavailable), 0))
+        assertTrue(gate.shouldWrite(durableStatusSignature(valid), 30_000))
+        assertTrue(gate.shouldWrite(durableStatusSignature(failed), 45_000))
+        assertFalse(gate.shouldWrite(durableStatusSignature(failed), 59_999))
+        assertTrue(gate.shouldWrite(durableStatusSignature(failed), 105_000))
     }
 
     @Test
@@ -429,6 +528,26 @@ class EngineGateTest {
                 "logger-1",
                 voltageOn = 13.0,
                 voltageOff = 13.0,
+            ).thresholdConfigurationValid,
+        )
+        assertFalse(
+            LoggerConfig(
+                true,
+                true,
+                "00:11:22:33:44:55",
+                "tiida",
+                "logger-1",
+                parkedIntervalSeconds = 14,
+            ).thresholdConfigurationValid,
+        )
+        assertFalse(
+            LoggerConfig(
+                true,
+                true,
+                "00:11:22:33:44:55",
+                "tiida",
+                "logger-1",
+                parkedIntervalSeconds = 3_601,
             ).thresholdConfigurationValid,
         )
         assertFalse(

@@ -16,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -24,7 +25,6 @@ import org.json.JSONObject
 import java.io.File
 import java.time.Instant
 import java.time.ZoneId
-import kotlin.math.min
 
 class ObdLoggerService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -43,6 +43,8 @@ class ObdLoggerService : Service() {
     @Volatile
     private var startupAllowed = false
     private var pendingStartupRecoveryReason = "process_terminated"
+    @Volatile
+    private var collaboratorsInitialized = false
     private val statusWriteGate = StatusWriteGate()
 
     private sealed interface RecordingExit {
@@ -93,11 +95,29 @@ class ObdLoggerService : Service() {
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
-        if (worker?.isActive != true) {
-            pendingStartupRecoveryReason = startupRecoveryReason(
-                intent?.getStringExtra(EXTRA_STARTUP_RECOVERY_REASON),
+        when (
+            serviceWorkerDecision(
+                workerActive = worker?.isActive == true,
+                configurationReloadRequested = intent?.action == ACTION_RELOAD_CONFIGURATION,
             )
-            worker = scope.launch { initializeAndRunLogger() }
+        ) {
+            ServiceWorkerDecision.START -> {
+                pendingStartupRecoveryReason = startupRecoveryReason(
+                    intent?.getStringExtra(EXTRA_STARTUP_RECOVERY_REASON),
+                )
+                worker = scope.launch { initializeAndRunLogger() }
+            }
+            ServiceWorkerDecision.RESTART_FOR_CONFIGURATION -> {
+                val previous = checkNotNull(worker)
+                worker = scope.launch {
+                    previous.cancelAndJoin()
+                    client?.disconnect(false)
+                    client = null
+                    pendingStartupRecoveryReason = "process_terminated"
+                    if (collaboratorsInitialized) runLogger() else initializeAndRunLogger()
+                }
+            }
+            ServiceWorkerDecision.KEEP_RUNNING -> Unit
         }
         return START_STICKY
     }
@@ -128,6 +148,7 @@ class ObdLoggerService : Service() {
             val initializedExporter = BundleExporter(this@ObdLoggerService, initializedDatabase)
             database = initializedDatabase
             exporter = initializedExporter
+            collaboratorsInitialized = true
         } catch (error: Exception) {
             if (error is CancellationException) throw error
             startupAllowed = false
@@ -152,7 +173,7 @@ class ObdLoggerService : Service() {
         var recovered = false
         var recoveryReason = pendingStartupRecoveryReason
         var clearLeaseAfterBoot = recoveryReason == "device_restart"
-        var failure = 0
+        val failureBackoff = BoundedExponentialBackoff()
         val reconnectAttempts = ReconnectAttemptTracker()
         while (scope.isActive) {
             var config: LoggerConfig? = null
@@ -227,7 +248,7 @@ class ObdLoggerService : Service() {
                                 }
                                 throw error
                             }
-                            failure = 0
+                            failureBackoff.reset()
                         }
                         is IngestionRequestRead.Invalid -> {
                             ingestionRequestId = null
@@ -239,7 +260,7 @@ class ObdLoggerService : Service() {
                             ingestionRequestId = requestRead.request.requestId
                             prepareParkedForIngestion(deviceRoot, loadedConfig, requestRead.request)
                             retryDelayMillis = 500
-                            failure = 0
+                            failureBackoff.reset()
                         }
                     }
                 }
@@ -249,7 +270,6 @@ class ObdLoggerService : Service() {
                 // failed. Re-run interrupted-drive recovery before any new connection attempt.
                 recovered = false
                 recoveryReason = "process_terminated"
-                failure += 1
                 val message = safeError(error)
                 val statusConfig = config ?: runCatching { LoggerPreferences.load(this) }.getOrNull()
                 val root = DeviceFiles.removableRootOrNull(this)
@@ -261,9 +281,7 @@ class ObdLoggerService : Service() {
                 }
                 if (statusConfig != null) publish("backoff", statusConfig, message)
                 runCatching { updateNotification("Waiting after logger failure") }
-                val delaySeconds = if (failure <= 5) min(1L shl failure, 32L) else 300L
-                retryDelayMillis = delaySeconds * 1000
-                if (failure > 5) failure = 0
+                retryDelayMillis = failureBackoff.nextDelayMillis()
             } finally {
                 try {
                     client?.disconnect(false)
@@ -294,6 +312,11 @@ class ObdLoggerService : Service() {
             config.adapterAddress,
             pipelineMetrics,
             driveClock::nowUtc,
+            if (config.voltageOnlyMode || BuildConfig.VOLTAGE_ONLY_AUDIT) {
+                ElmCommandPolicy.VOLTAGE_ONLY
+            } else {
+                ElmCommandPolicy.FULL_OBD
+            },
         )
         client = elm
         elm.connect()
@@ -317,15 +340,18 @@ class ObdLoggerService : Service() {
             client = null
             return
         }
-        if (!parkedVoltageWarrantsInitialization(parkedVoltage, config.voltageOn)) {
+        val voltageOnlyMode = config.voltageOnlyMode || BuildConfig.VOLTAGE_ONLY_AUDIT
+        if (!parkedProbeMayInitialize(voltageOnlyMode, parkedVoltage, config.voltageOn)) {
             // No protocol was opened and no ECU command was sent, so a local GATT close is the
             // complete parked teardown. In particular, do not turn a cheap voltage probe into an
             // ATZ/configuration/ATPC cycle while the engine remains off.
             elm.disconnect(false)
             client = null
-            updateNotification("Parked; next safe voltage check in 30 s")
+            updateNotification(
+                "Parked; next safe voltage check in ${config.parkedIntervalSeconds} s",
+            )
             publish("parked", config)
-            waitForNextParkedProbe(deviceRoot, 30_000)
+            waitForNextParkedProbe(deviceRoot, config.parkedIntervalSeconds * 1_000)
             return
         }
         val voltage = try {
@@ -342,9 +368,11 @@ class ObdLoggerService : Service() {
         }
         if (!lifecycle.observeParkedVoltage(voltage)) {
             elm.disconnect(closeProtocol = !controlPresent())
-            updateNotification("Parked; next safe voltage check in 30 s")
+            updateNotification(
+                "Parked; next safe voltage check in ${config.parkedIntervalSeconds} s",
+            )
             publish("parked", config)
-            waitForNextParkedProbe(deviceRoot, 30_000)
+            waitForNextParkedProbe(deviceRoot, config.parkedIntervalSeconds * 1_000)
             return
         }
         publish("probing", config)
@@ -1146,6 +1174,22 @@ class ObdLoggerService : Service() {
     }
 
     private fun publish(state: String, config: LoggerConfig, error: String? = null) {
+        val metrics = pipelineMetrics.snapshot()
+        val voltageProbe = metrics.lastVoltageProbe
+        val voltageState = voltagePublicState(
+            voltageProbe,
+            Instant.now(),
+            VOLTAGE_FRESHNESS_SECONDS,
+        )
+        val ecuConnected = state == "ecu_online"
+        val controlledVoltageOnly = config.voltageOnlyMode || BuildConfig.VOLTAGE_ONLY_AUDIT
+        val bleOwner = when {
+            !config.ownershipTransferred -> "unowned"
+            state == "ingestion_ready" -> "unowned"
+            state.startsWith("ingestion_") -> "transitioning"
+            controlledVoltageOnly -> "dashcam_voltage_only"
+            else -> "dashcam_full_obd"
+        }
         val status = PublicStatus(
             state = state,
             ownershipEnabled = config.ownershipTransferred,
@@ -1154,7 +1198,20 @@ class ObdLoggerService : Service() {
             lastDriveFinishedAtUtc = lastDriveFinished,
             ingestionRequestId = ingestionRequestId,
             lastSampleAtUtc = lastSampleAt,
-            metrics = pipelineMetrics.snapshot(),
+            metrics = metrics,
+            adapterReachable = voltageState.adapterReachable,
+            adapterConnected = client?.isConnected == true,
+            ecuConnected = ecuConnected,
+            engineRunning = ecuConnected && currentDriveId != null,
+            vehicleState = if (ecuConnected) "ecu_online" else "parked",
+            batteryVoltage = voltageProbe?.parsedVoltage,
+            batteryVoltageSource = voltageProbe?.parsedVoltage?.let { "dashcam_elm_atrv" },
+            batteryVoltageSampleAtUtc = voltageProbe?.sampleAtUtc,
+            batteryVoltageFresh = voltageState.fresh,
+            batteryVoltageRawResponse = voltageProbe?.sanitizedRawResponse,
+            batteryVoltageQuality = voltageState.quality,
+            bleOwner = bleOwner,
+            voltageOnlyMode = controlledVoltageOnly,
             lastError = error,
             lastErrorAtUtc = error?.let { Instant.now().toString() },
         )
@@ -1227,5 +1284,8 @@ class ObdLoggerService : Service() {
     companion object {
         private const val CHANNEL = "obd_logger"
         private const val NOTIFICATION_ID = 1107
+        private const val VOLTAGE_FRESHNESS_SECONDS = 75L
+        const val ACTION_RELOAD_CONFIGURATION =
+            "com.dashcamstats.obdlogger.action.RELOAD_CONFIGURATION"
     }
 }

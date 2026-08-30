@@ -2,7 +2,32 @@ package com.dashcamstats.obdlogger
 
 class ElmProtocolException(message: String) : RuntimeException(message)
 
+enum class ElmCommandCategory(val metricName: String) {
+    ADAPTER_LOCAL("adapter_local"),
+    VEHICLE_BUS("vehicle_bus"),
+}
+
+enum class ElmCommandPolicy { FULL_OBD, VOLTAGE_ONLY }
+
+/** Stateful, fail-closed gate used by the production BLE write path. */
+internal class ElmCommandWriteGate(private val policy: ElmCommandPolicy) {
+    private var voltageOnlyCommandConsumed = false
+
+    @Synchronized
+    fun authorize(command: String): ElmCommandCategory? {
+        if (!ElmProtocol.commandAllowed(policy, command)) return null
+        if (policy == ElmCommandPolicy.VOLTAGE_ONLY) {
+            if (voltageOnlyCommandConsumed) return null
+            voltageOnlyCommandConsumed = true
+        }
+        return ElmProtocol.commandCategory(command)
+    }
+}
+
 object ElmProtocol {
+    const val MIN_ADAPTER_VOLTAGE = 9.0
+    const val MAX_ADAPTER_VOLTAGE = 16.5
+
     val pidLengths = mapOf(
         0x01 to 4,
         0x03 to 2,
@@ -70,18 +95,71 @@ object ElmProtocol {
 
     fun normalize(command: String): String = command.filterNot(Char::isWhitespace).uppercase()
 
-    fun isSafe(command: String): Boolean {
+    fun commandCategory(command: String): ElmCommandCategory? {
+        if (command.any(Char::isISOControl)) return null
         val value = normalize(command)
-        if (value in safeAt || value in safeDiagnostics || freezeFrame.matches(value)) return true
-        if (value.length == 4 && value.startsWith("01")) {
-            return value.substring(2).toIntOrNull(16)?.let { it in pidLengths || it == 0 } == true
+        if (value in safeAt) return ElmCommandCategory.ADAPTER_LOCAL
+        if (value in safeDiagnostics || freezeFrame.matches(value)) {
+            return ElmCommandCategory.VEHICLE_BUS
         }
-        return false
+        if (value.length == 4 && value.startsWith("01")) {
+            return if (
+                value.substring(2).toIntOrNull(16)?.let { it in pidLengths || it == 0 } == true
+            ) {
+                ElmCommandCategory.VEHICLE_BUS
+            } else {
+                null
+            }
+        }
+        return null
     }
 
-    fun voltage(response: String): Double? =
-        Regex("(?<![0-9.])([0-9]{1,2}(?:\\.[0-9]+)?)\\s*V", RegexOption.IGNORE_CASE)
-            .find(response)?.groupValues?.get(1)?.toDoubleOrNull()
+    fun isSafe(command: String): Boolean = commandCategory(command) != null
+
+    /** The voltage-only policy is enforced immediately before every BLE write. */
+    fun commandAllowed(policy: ElmCommandPolicy, command: String): Boolean {
+        if (commandCategory(command) == null) return false
+        val normalized = normalize(command)
+        return policy == ElmCommandPolicy.FULL_OBD ||
+            normalized == ElmAdapterCommandPlan.parkedVoltageProbe
+    }
+
+    private val voltageLinePattern =
+        Regex("^([0-9]{1,2}(?:\\.[0-9]+)?)\\s*V$", RegexOption.IGNORE_CASE)
+
+    private fun parsedVoltageResult(response: String): Pair<Double, String>? {
+        val framed = response.trim()
+        if (!framed.endsWith(">") || framed.dropLast(1).contains('>')) return null
+        val lines = framed.dropLast(1)
+            .split('\r', '\n')
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+            .toMutableList()
+        if (lines.firstOrNull()?.let(::normalize) == ElmAdapterCommandPlan.parkedVoltageProbe) {
+            lines.removeAt(0)
+        }
+        if (lines.size != 1) return null
+        val match = voltageLinePattern.matchEntire(lines.single()) ?: return null
+        val token = match.groupValues[1]
+        val value = token.toDoubleOrNull() ?: return null
+        if (!value.isFinite() || value !in MIN_ADAPTER_VOLTAGE..MAX_ADAPTER_VOLTAGE) return null
+        return value to "$token V"
+    }
+
+    /**
+     * Parse one unambiguous adapter-voltage result.
+     *
+     * A missing suffix, more than one voltage token, and values outside a conservative 12 V
+     * automotive electrical range are invalid. Never clamp malformed input into validity.
+     */
+    fun voltage(response: String): Double? {
+        return parsedVoltageResult(response)?.first
+    }
+
+    /** Return only the bounded numeric token from a validated ATRV response. */
+    fun sanitizedVoltageResponse(response: String): String? {
+        return parsedVoltageResult(response)?.second
+    }
 
     fun protocolNumber(response: String): String? {
         val value = normalize(response.replace("ATDPN", "").replace(">", ""))

@@ -56,11 +56,13 @@ class ElmBleClient(
     private val address: String,
     private val metrics: PipelineMetrics = PipelineMetrics(),
     private val utcNow: () -> String = { Instant.now().toString() },
+    private val commandPolicy: ElmCommandPolicy = ElmCommandPolicy.FULL_OBD,
 ) {
     private val serviceUuid = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb")
     private val characteristicUuid = UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb")
     private val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     private val commandMutex = Mutex()
+    private val commandWriteGate = ElmCommandWriteGate(commandPolicy)
     private val commandSession = ElmCommandSession()
     private val responseClock = SuccessfulResponseClock()
     private var gatt: BluetoothGatt? = null
@@ -68,9 +70,15 @@ class ElmBleClient(
     private var connection: CompletableDeferred<Unit>? = null
     private var response: CompletableDeferred<String>? = null
     private var lastCommandAt = 0L
+    @Volatile
+    private var gattConnected = false
+    @Volatile
+    private var connectedAtElapsed: Long? = null
     private var disconnectRecorded = false
     var ecuSource: Int? = null
         private set
+    val isConnected: Boolean
+        get() = gattConnected
     val lastSuccessfulResponseAtUtc: String?
         get() = responseClock.lastSuccessfulResponseAtUtc
 
@@ -88,6 +96,9 @@ class ElmBleClient(
             }
             if (newState == BluetoothProfile.STATE_CONNECTED && !gatt.discoverServices()) {
                 connection?.completeExceptionally(ElmException("could not start GATT discovery"))
+            } else if (newState == BluetoothProfile.STATE_CONNECTED) {
+                gattConnected = true
+                metrics.gattConnectionEstablished()
             }
         }
 
@@ -122,6 +133,7 @@ class ElmBleClient(
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             if (descriptor.uuid == cccdUuid && status == BluetoothGatt.GATT_SUCCESS) {
+                metrics.notificationSubscriptionEnabled()
                 connection?.complete(Unit)
             } else if (descriptor.uuid == cccdUuid) {
                 connection?.completeExceptionally(ElmException("FFF1 notification setup failed ($status)"))
@@ -173,42 +185,60 @@ class ElmBleClient(
     }
 
     suspend fun connect() {
-        if (!hasBluetoothPermissions(context)) throw ElmException("Nearby Devices permission is missing")
-        val manager = context.getSystemService(BluetoothManager::class.java)
-        val adapter = manager?.adapter ?: throw ElmException("Bluetooth is unavailable")
-        if (!adapter.isEnabled) throw ElmException("Bluetooth is disabled")
-        val device: BluetoothDevice = try {
-            adapter.getRemoteDevice(address)
-        } catch (error: IllegalArgumentException) {
-            throw ElmException("configured adapter address is invalid")
-        }
-        connection = CompletableDeferred()
-        responseClock.freshConnection()
-        disconnectRecorded = false
-        gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+        val startedAt = SystemClock.elapsedRealtime()
+        metrics.connectionAttempted()
         try {
+            if (!hasBluetoothPermissions(context)) {
+                throw ElmException("Nearby Devices permission is missing")
+            }
+            val manager = context.getSystemService(BluetoothManager::class.java)
+            val adapter = manager?.adapter ?: throw ElmException("Bluetooth is unavailable")
+            if (!adapter.isEnabled) throw ElmException("Bluetooth is disabled")
+            val device: BluetoothDevice = try {
+                adapter.getRemoteDevice(address)
+            } catch (_: IllegalArgumentException) {
+                throw ElmException("configured adapter address is invalid")
+            }
+            metrics.adapterTargetResolved()
+            connection = CompletableDeferred()
+            responseClock.freshConnection()
+            disconnectRecorded = false
+            gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
             withTimeout(20_000) { connection!!.await() }
+            if (!gattConnected) throw ElmException("BLE disconnected before setup completed")
             commandSession.freshConnection()
+            val connectedAt = SystemClock.elapsedRealtime()
+            connectedAtElapsed = connectedAt
+            metrics.connectionSucceeded(connectedAt - startedAt)
         } catch (_: TimeoutCancellationException) {
+            metrics.connectionFailed()
             disconnect(false)
             throw ElmException("BLE connection timed out; adapter may have another owner")
         } catch (cancelled: CancellationException) {
             disconnect(false)
             throw cancelled
         } catch (error: Exception) {
+            metrics.connectionFailed()
             disconnect(false)
             throw error
         }
     }
 
     suspend fun command(value: String, timeoutMillis: Long = 6_000): String = commandMutex.withLock {
+        val category = commandWriteGate.authorize(value)
+        if (category == null) {
+            metrics.commandBlocked()
+            throw ElmCommandRejectedException(
+                "OBD command refused by ${commandPolicy.name.lowercase()} policy",
+            )
+        }
         val command = ElmProtocol.normalize(value)
-        if (!ElmProtocol.isSafe(command)) throw ElmException("unsafe OBD command refused: $command")
         val activeGatt = gatt ?: throw ElmException("BLE is not connected")
         val target = characteristic ?: throw ElmException("FFF1 is unresolved")
         val since = SystemClock.elapsedRealtime() - lastCommandAt
         if (since < 100) delay(100 - since)
-        metrics.commandRequested()
+        val startedAt = SystemClock.elapsedRealtime()
+        metrics.commandRequested(category)
         commandSession.beginCommand()
         response = CompletableDeferred()
         target.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
@@ -218,9 +248,13 @@ class ElmBleClient(
                 commandSession.taint()
                 throw ElmException("FFF1 write was rejected")
             }
+            metrics.commandSent()
             try {
                 commandSession.awaitResponse(response!!, command, timeoutMillis).also {
-                    metrics.commandCompleted()
+                    metrics.commandCompleted(
+                        durationMillis = SystemClock.elapsedRealtime() - startedAt,
+                        voltageCommand = command == ElmAdapterCommandPlan.parkedVoltageProbe,
+                    )
                     responseClock.responseCompleted(utcNow())
                 }
             } catch (error: ElmCommandTimeoutException) {
@@ -234,7 +268,7 @@ class ElmBleClient(
     }
 
     suspend fun probeAdapterVoltage(quiesceRequested: () -> Boolean = { false }): Double? {
-        return probeParkedAdapterVoltage(quiesceRequested) { value -> command(value) }
+        return executeVoltageCommand(quiesceRequested)
     }
 
     suspend fun initialize(quiesceRequested: () -> Boolean = { false }): Double? {
@@ -415,7 +449,27 @@ class ElmBleClient(
         throw error
     }
 
-    suspend fun readVoltage(): Double? = ElmProtocol.voltage(command("ATRV"))
+    suspend fun readVoltage(): Double? = executeVoltageCommand()
+
+    private suspend fun executeVoltageCommand(
+        quiesceRequested: () -> Boolean = { false },
+    ): Double? {
+        var rawResponse: String? = null
+        return try {
+            val voltage = probeParkedAdapterVoltage(quiesceRequested) { requestedCommand ->
+                command(requestedCommand).also { rawResponse = it }
+            }
+            val sampleAtUtc = utcNow()
+            if (voltage == null) metrics.voltageReadInvalid(sampleAtUtc)
+            else metrics.voltageReadSucceeded(checkNotNull(rawResponse), voltage, sampleAtUtc)
+            voltage
+        } catch (error: Exception) {
+            if (error !is CancellationException && error !is ElmQuiesceRequestedException) {
+                metrics.voltageReadFailed(utcNow())
+            }
+            throw error
+        }
+    }
 
     suspend fun disconnect(closeProtocol: Boolean = true) {
         if (closeProtocol && gatt != null && !commandSession.isTainted) {
@@ -450,6 +504,13 @@ class ElmBleClient(
     private fun recordDisconnectOnce() {
         if (disconnectRecorded) return
         disconnectRecorded = true
+        gattConnected = false
+        connectedAtElapsed?.let { connectedAt ->
+            metrics.connectedSessionClosed(
+                (SystemClock.elapsedRealtime() - connectedAt).coerceAtLeast(0L),
+            )
+        }
+        connectedAtElapsed = null
         metrics.bleDisconnected()
     }
 }

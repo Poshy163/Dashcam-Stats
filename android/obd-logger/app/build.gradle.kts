@@ -49,6 +49,12 @@ if (productionSigningRequested && releaseSigningInputs.any { it == null }) {
 }
 
 val hasReleaseSigning = releaseSigningInputs.all { it != null }
+val voltageOnlyAuditText = providers.gradleProperty("obdVoltageOnlyAudit").orNull ?: "false"
+val voltageOnlyAudit = when (voltageOnlyAuditText) {
+    "true" -> true
+    "false" -> false
+    else -> throw GradleException("obdVoltageOnlyAudit must be exactly true or false.")
+}
 val resolvedReleaseKeystore = releaseKeystorePath?.let(rootProject::file)
 if (hasReleaseSigning && resolvedReleaseKeystore?.isFile != true) {
     throw GradleException("The configured OBD release keystore path is not a readable file.")
@@ -75,9 +81,10 @@ android {
         applicationId = "com.dashcamstats.obdlogger"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.2.1"
+        versionCode = 5
+        versionName = "0.2.2"
         buildConfigField("String", "BUILD_GIT_SHA", "\"$buildGitSha\"")
+        buildConfigField("boolean", "VOLTAGE_ONLY_AUDIT", voltageOnlyAudit.toString())
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

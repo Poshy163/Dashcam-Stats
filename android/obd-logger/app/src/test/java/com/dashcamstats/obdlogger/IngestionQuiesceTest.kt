@@ -5,6 +5,7 @@ import androidx.test.core.app.ApplicationProvider
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -226,16 +227,31 @@ class IngestionQuiesceTest {
     }
 
     @Test
-    fun statusV3IdentifiesTheExactBuildAndKeepsMetricsBoundedAndPayloadFree() {
-        val metrics = PipelineMetrics(maximumCounter = 2)
-        repeat(5) { metrics.commandRequested() }
+    fun statusV4IdentifiesTheBuildAndPublishesBoundedVoltageOnlyEvidence() {
+        var monotonicMillis = 1_000L
+        val metrics = PipelineMetrics(maximumCounter = 2) { monotonicMillis }
+        repeat(5) { metrics.commandRequested(ElmCommandCategory.ADAPTER_LOCAL) }
+        metrics.commandSent()
+        metrics.commandCompleted(durationMillis = 120, voltageCommand = true)
+        metrics.connectionAttempted()
+        metrics.connectionSucceeded(340)
+        metrics.voltageReadSucceeded("ATRV\r12.74 V\r>", 12.74, "2026-08-30T00:00:04Z")
+        metrics.connectedSessionClosed(480)
         metrics.notificationReceived()
         metrics.sampleCreated()
         metrics.sampleQueued()
         metrics.samplePersisted()
         metrics.parserFailure(checksumFailure = true)
+        monotonicMillis = 2_000L
         val snapshot = metrics.snapshot()
         assertEquals(2L, snapshot.values.getValue("commands_requested"))
+        assertEquals(0L, snapshot.values.getValue("commands_blocked"))
+        assertEquals(2L, snapshot.values.getValue("adapter_local_commands"))
+        assertEquals(1L, snapshot.values.getValue("commands_sent"))
+        assertEquals(0L, snapshot.values.getValue("vehicle_bus_commands"))
+        assertEquals(1L, snapshot.values.getValue("voltage_reads_successful"))
+        assertEquals(120.0, snapshot.timings.getValue("voltage_response_time").medianMillis!!, 0.0)
+        assertEquals(48.0, snapshot.pollingDutyCyclePercent, 0.0)
         assertEquals(0L, snapshot.queueDepth)
         assertEquals(1L, snapshot.maximumQueueDepth)
 
@@ -247,15 +263,32 @@ class IngestionQuiesceTest {
                 ingestionRequestId = "request-1234",
                 lastSampleAtUtc = "2026-08-30T00:00:05Z",
                 metrics = snapshot,
+                adapterReachable = true,
+                batteryVoltage = 12.74,
+                batteryVoltageSource = "dashcam_elm_atrv",
+                batteryVoltageSampleAtUtc = "2026-08-30T00:00:04Z",
+                batteryVoltageFresh = true,
+                batteryVoltageRawResponse = "12.74 V",
+                batteryVoltageQuality = "valid",
+                bleOwner = "dashcam_voltage_only",
+                voltageOnlyMode = true,
             ),
             pendingCount = 3,
         )
         assertLandingIdentity(status)
         assertEquals("ingestion_quiesce_v1", status.getJSONArray("capabilities").getString(0))
+        assertEquals("voltage_only_audit_v1", status.getJSONArray("capabilities").getString(1))
         assertEquals("drive-current", status.getString("current_drive_id"))
         assertEquals(3, status.getInt("pending_bundle_count"))
         assertEquals(1L, status.getJSONObject("metrics").getLong("maximum_queue_depth"))
+        assertEquals(0L, status.getJSONObject("metrics").getLong("vehicle_bus_commands"))
+        assertEquals(12.74, status.getDouble("battery_voltage"), 0.0)
+        assertEquals("12.74 V", status.getString("battery_voltage_raw_response"))
+        assertEquals("dashcam_voltage_only", status.getString("ble_owner"))
+        assertNotNull(Instant.parse(status.getString("updated_at_utc")))
+        assertTrue(status.getBoolean("voltage_only_mode"))
         assertFalse(status.toString().contains("payload"))
+        assertFalse(status.toString().contains("ATRV"))
     }
 
     @Test

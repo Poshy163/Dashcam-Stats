@@ -78,10 +78,12 @@ ECU ──BLE/ELM327──► Android logger ──TF card──► server inges
 - **Command allowlist.** Read-only Modes 01/02/03/07/09/0A plus adapter-local AT. Mode
   04/08, monitors, resets and persistent ELM writes are refused outright.
 - **Public status file** at
-  `…/Android/data/com.dashcamstats.obdlogger/files/obd/status.json`: schema-v3 state,
-  ownership flag, last drive, pending bundle count, last error, app version name/code,
-  poll-plan version and the validated 12-character build Git revision (or `unknown` when
-  built without VCS metadata). The same identity is present in fallback/error status and
+  `…/Android/data/com.dashcamstats.obdlogger/files/obd/status.json`: schema-v4 state,
+  ownership/controlled-voltage-mode flags, independent adapter/BLE/ECU/engine state, bounded
+  ATRV value/source/time/freshness/quality, command-category and timing metrics, last drive,
+  pending bundle count, last error, app version name/code, poll-plan version and the validated
+  12-character build Git revision (or `unknown` when built without VCS metadata). The same
+  identity is present in fallback/error status and
   is exposed under `logger` by `/api/obd/status`. It is best-effort telemetry for the
   server — never a control channel.
 - `pending_bundle_count` stays non-zero until the logger's next drain pass (engine start

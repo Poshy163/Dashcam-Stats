@@ -15,10 +15,13 @@ data class LoggerConfig(
     val voltageOn: Double = 13.2,
     val voltageOff: Double = 13.0,
     val offGraceSeconds: Long = 30,
+    val parkedIntervalSeconds: Long = 30,
+    val voltageOnlyMode: Boolean = false,
 ) {
     val thresholdConfigurationValid: Boolean
         get() = voltageOn in 10.0..16.0 && voltageOff in 10.0..16.0 &&
-            voltageOff < voltageOn && offGraceSeconds in 0L..300L
+            voltageOff < voltageOn && offGraceSeconds in 0L..300L &&
+            parkedIntervalSeconds in 15L..3_600L
 
     val canRun: Boolean
         get() = enabled && ownershipTransferred && adapterAddress.matches(MAC) &&
@@ -54,6 +57,8 @@ object LoggerPreferences {
             voltageOn = prefs.getString("voltage_on", "13.2")?.toDoubleOrNull() ?: Double.NaN,
             voltageOff = prefs.getString("voltage_off", "13.0")?.toDoubleOrNull() ?: Double.NaN,
             offGraceSeconds = prefs.getLong("off_grace_seconds", 30),
+            parkedIntervalSeconds = prefs.getLong("parked_interval_seconds", 30),
+            voltageOnlyMode = prefs.getBoolean("voltage_only_mode", false),
         )
     }
 
@@ -68,6 +73,8 @@ object LoggerPreferences {
             .putString("voltage_on", config.voltageOn.toString())
             .putString("voltage_off", config.voltageOff.toString())
             .putLong("off_grace_seconds", config.offGraceSeconds)
+            .putLong("parked_interval_seconds", config.parkedIntervalSeconds)
+            .putBoolean("voltage_only_mode", config.voltageOnlyMode)
             .apply()
     }
 

@@ -2336,18 +2336,57 @@ class TestTransferIsolation:
         assert delete_failed.snapshot()["waiting_on_unit"] == 1
         assert delete_failed.snapshot()["logger"]["pending_bundle_count"] == 1
 
+    def test_cached_logger_voltage_cannot_remain_fresh_indefinitely(self, monkeypatch):
+        cached = obd_transfer.OBDTransferStatus()
+        cached.set_logger(
+            {
+                "schema_version": 4,
+                "state": "parked",
+                "adapter_reachable": True,
+                "battery_voltage": 12.7,
+                "battery_voltage_source": "dashcam_elm_atrv",
+                "battery_voltage_sample_at_utc": "2026-08-30T00:58:00+00:00",
+                "battery_voltage_fresh": True,
+                "battery_voltage_quality": "valid",
+            }
+        )
+        monkeypatch.setattr(
+            obd_transfer,
+            "utcnow",
+            lambda: datetime(2026, 8, 30, 1, 0, tzinfo=UTC),
+        )
+
+        logger = cached.snapshot()["logger"]
+
+        assert logger["battery_voltage_fresh"] is False
+        assert logger["adapter_reachable"] is False
+        assert logger["battery_voltage_quality"] == "stale"
+
     async def test_logger_status_accepts_canonical_redacted_fixture(self, monkeypatch):
         fixture = {
-            "schema_version": 3,
+            "schema_version": 4,
             "logger_version": "1.0.0",
             "app_version_name": "0.2.0",
             "app_version_code": 3,
             "poll_plan_version": 2,
             "build_git_sha": "0123456789ab",
-            "state": "ecu_online",
+            "state": "parked",
             "ownership_enabled": True,
             "adapter_state": "connected",
             "vehicle_state": "engine_running",
+            "adapter_reachable": True,
+            "adapter_connected": False,
+            "ecu_connected": False,
+            "engine_running": False,
+            "battery_voltage": 12.74,
+            "battery_voltage_source": "dashcam_elm_atrv",
+            "battery_voltage_sample_at_utc": "2026-08-30T00:59:59+00:00",
+            "battery_voltage_fresh": True,
+            "battery_voltage_raw_response": "12.74 V",
+            "battery_voltage_quality": "valid",
+            "ble_owner": "dashcam_voltage_only",
+            "head_unit_state": "awake",
+            "voltage_only_mode": True,
             "current_drive_id": "drive_current",
             "last_drive_id": "drive_previous",
             "last_drive_finished_at_utc": "2026-08-29T00:00:00+00:00",
@@ -2363,6 +2402,11 @@ class TestTransferIsolation:
             "shell",
             lambda *_args, **_kwargs: _async_value(json.dumps(fixture)),
         )
+        monkeypatch.setattr(
+            obd_transfer,
+            "utcnow",
+            lambda: datetime(2026, 8, 30, 1, 0, tzinfo=UTC),
+        )
         status = await obd_transfer.read_logger_status("unit", "/safe/status.json")
         assert status is not None
         assert status["ownership_enabled"] is True
@@ -2372,7 +2416,120 @@ class TestTransferIsolation:
         assert status["app_version_code"] == 3
         assert status["poll_plan_version"] == 2
         assert status["build_git_sha"] == "0123456789ab"
+        assert status["battery_voltage"] == 12.74
+        assert status["battery_voltage_raw_response"] == "12.74 V"
+        assert status["battery_voltage_source"] == "dashcam_elm_atrv"
+        assert status["battery_voltage_fresh"] is True
+        assert status["ble_owner"] == "dashcam_voltage_only"
+        assert status["voltage_only_mode"] is True
         assert "private_adapter_address" not in status
+
+    async def test_logger_status_recomputes_stale_voltage_from_sample_time(self, monkeypatch):
+        fixture = {
+            "schema_version": 4,
+            "state": "parked",
+            "adapter_reachable": True,
+            "battery_voltage": 12.7,
+            "battery_voltage_source": "dashcam_elm_atrv",
+            "battery_voltage_sample_at_utc": "2026-08-30T00:58:00Z",
+            "battery_voltage_fresh": True,
+            "battery_voltage_quality": "valid",
+        }
+        monkeypatch.setattr(
+            obd_transfer.adb,
+            "shell",
+            lambda *_args, **_kwargs: _async_value(json.dumps(fixture)),
+        )
+        monkeypatch.setattr(
+            obd_transfer,
+            "utcnow",
+            lambda: datetime(2026, 8, 30, 1, 0, tzinfo=UTC),
+        )
+
+        status = await obd_transfer.read_logger_status("unit", "/safe/status.json")
+
+        assert status is not None
+        assert status["battery_voltage"] == 12.7
+        assert status["battery_voltage_fresh"] is False
+        assert status["adapter_reachable"] is False
+        assert status["battery_voltage_quality"] == "stale"
+
+    async def test_logger_status_rejects_mistyped_v4_evidence(self, monkeypatch):
+        fixture = {
+            "schema_version": 4,
+            "state": "parked",
+            "adapter_reachable": "false",
+            "adapter_connected": 0,
+            "ecu_connected": None,
+            "engine_running": "no",
+            "battery_voltage_fresh": 1,
+            "voltage_only_mode": "true",
+            "battery_voltage_sample_at_utc": "not-a-timestamp",
+            "vehicle_state": "flying",
+        }
+        monkeypatch.setattr(
+            obd_transfer.adb,
+            "shell",
+            lambda *_args, **_kwargs: _async_value(json.dumps(fixture)),
+        )
+
+        status = await obd_transfer.read_logger_status("unit", "/safe/status.json")
+
+        assert status == {
+            "schema_version": 4,
+            "state": "parked",
+            "battery_voltage_fresh": False,
+            "adapter_reachable": False,
+        }
+
+    async def test_logger_status_rejects_non_string_state_and_nonfinite_counts(self, monkeypatch):
+        fixture = {
+            "schema_version": 4,
+            "state": 7,
+            "adapter_state": False,
+            "pending_bundle_count": float("nan"),
+            "sample_count": -1,
+        }
+        monkeypatch.setattr(
+            obd_transfer.adb,
+            "shell",
+            lambda *_args, **_kwargs: _async_value(json.dumps(fixture)),
+        )
+
+        status = await obd_transfer.read_logger_status("unit", "/safe/status.json")
+
+        assert status == {
+            "schema_version": 4,
+            "battery_voltage_fresh": False,
+            "adapter_reachable": False,
+        }
+
+    async def test_logger_status_rejects_invalid_voltage_and_ownership_metadata(self, monkeypatch):
+        fixture = {
+            "schema_version": 4,
+            "state": "parked",
+            "battery_voltage": 99.0,
+            "battery_voltage_source": "hostile_source",
+            "battery_voltage_raw_response": "99 V",
+            "battery_voltage_quality": "perfect",
+            "ble_owner": "everyone",
+            "head_unit_state": "definitely asleep",
+            "battery_voltage_fresh": False,
+        }
+        monkeypatch.setattr(
+            obd_transfer.adb,
+            "shell",
+            lambda *_args, **_kwargs: _async_value(json.dumps(fixture)),
+        )
+
+        status = await obd_transfer.read_logger_status("unit", "/safe/status.json")
+
+        assert status == {
+            "schema_version": 4,
+            "state": "parked",
+            "battery_voltage_fresh": False,
+            "adapter_reachable": False,
+        }
 
     async def test_logger_build_identity_rejects_unbounded_or_mistyped_values(self, monkeypatch):
         fixture = {
