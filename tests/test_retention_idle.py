@@ -107,6 +107,7 @@ class TestWhatGoes:
         plan = await plan_idle(ready)
         assert _names(plan) == {"desk.ts"}
         assert plan.candidates[0].reason.startswith("static")
+        assert plan.exclude_from_stats is True
 
     async def test_it_is_judged_per_clip_not_per_journey(self, ready):
         """A false detection in one clip must not save the empty ones beside it — the whole
@@ -267,6 +268,7 @@ class TestItActuallyDeletesWithoutTheMasterSwitch:
         assert run.deleted_count == 1, "the static clip must be removed without the switch"
         assert not (footage / "desk.ts").exists()
         assert desk.state is RecordingState.DELETED and desk.file_missing is True
+        assert desk.ignored is True, "discarded junk must not contribute to any stats view"
 
     async def test_an_unsafe_mount_still_blocks_deletion(self, ready, temp_dirs, monkeypatch):
         """Self-authorising does not mean unguarded: a footage dir that is not safe to write

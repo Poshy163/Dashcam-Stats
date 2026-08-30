@@ -288,6 +288,14 @@ The footage directory grows forever, so retention keeps it under a configurable 
 runs in report-only mode: it calculates what it *would* remove and shows you the plan.
 Turning on actual deletion requires both an explicit setting and a writable mount.
 
+Retention is evaluated immediately when the service starts and then at the configured
+interval, so restarting after enabling deletion clears eligible old footage without a
+six-hour wait. Static, fully analysed clips where the car never moved and no object or
+plate was detected are discarded automatically when that dedicated setting is enabled;
+their files are deleted and their tombstones are hidden from recordings, maps, journeys
+and statistics. Incomplete analysis, protected/event footage, moving clips and clips with
+any detection are never handled by this rule.
+
 Deletion refuses to run unless every safety check passes:
 
 * the footage directory exists and is a real mount point, not an empty stand-in;

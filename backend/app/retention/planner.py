@@ -80,6 +80,10 @@ class RetentionPlan:
     blocked: bool = False
     blocked_reason: str | None = None
     deletion_enabled: bool = False
+    # Some retention policies remove only the source video while preserving what was
+    # learned from it.  A clip proven to be wholly static and empty is different: it is
+    # junk, not archived evidence, and must disappear from maps, journeys and totals too.
+    exclude_from_stats: bool = False
     safety: SafetyReport | None = None
     skipped_reasons: dict[str, int] = field(default_factory=dict)
 
@@ -105,6 +109,7 @@ class RetentionPlan:
             "blocked": self.blocked,
             "blocked_reason": self.blocked_reason,
             "deletion_enabled": self.deletion_enabled,
+            "exclude_from_stats": self.exclude_from_stats,
             "over_limit": self.over_limit,
             "skipped": self.skipped_reasons,
             "candidates": [c.as_dict() for c in self.candidates],
@@ -353,10 +358,20 @@ async def execute(
     now = datetime.now(UTC)
     for start in range(0, len(removed_ids), _ROW_UPDATE_BATCH):
         batch = removed_ids[start : start + _ROW_UPDATE_BATCH]
+        values: dict[str, object] = {
+            "file_missing": True,
+            "deleted_at": now,
+            "state": RecordingState.DELETED,
+        }
+        if retention_plan.exclude_from_stats:
+            # ``ignored`` is the shared visibility gate used by recording, journey, map
+            # and status queries.  Keep the tombstone for auditability and duplicate-scan
+            # protection, but make a junk clip contribute to none of those views.
+            values["ignored"] = True
         await session.execute(
             update(Recording)
             .where(Recording.id.in_(batch))
-            .values(file_missing=True, deleted_at=now, state=RecordingState.DELETED)
+            .values(**values)
             # `fetch`, not False: a caller holding one of these `Recording` instances --
             # the scheduler's session does, and so does every test -- must see the row it
             # is looking at change. One extra SELECT per batch, against the N `session.get`
