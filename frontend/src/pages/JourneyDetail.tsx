@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import RouteMap from '@/components/RouteMap'
+import JourneyPlayer from '@/components/JourneyPlayer'
 import Spinner from '@/components/Spinner'
 import { DerivedHint, EmptyState, ErrorState, PageHeader, StatTile, StateBadge } from '@/components/ui'
 import { api } from '@/lib/api'
@@ -128,6 +129,8 @@ export default function JourneyDetail() {
         />
         <StatTile label="Unique plates" value={journey.uniquePlateCount} />
       </div>
+
+      <JourneyPlayer journey={journey} driveId={obd.data?.drive?.driveId} />
 
       {journey.hasGps ? (
         <RouteMap
