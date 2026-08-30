@@ -12,7 +12,7 @@ Two rules run through all of these:
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any, Generic, TypeVar
+from typing import Annotated, Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -509,6 +509,43 @@ class RetentionPlanOut(BaseModel):
     candidates: list[RetentionCandidateOut] = Field(default_factory=list)
     skipped: dict[str, int] = Field(default_factory=dict)
     safety: SafetyReportOut | None = None
+
+
+class IngestRadioDeviceStateOut(BaseModel):
+    """Bounded evidence for one radio; never contains commands or recovery material."""
+
+    baseline: Literal["on", "off", "transport", "unknown"]
+    disable_attempted: bool
+    disable_verified: bool
+    restore_attempted: bool
+    restore_verified: bool
+
+
+class IngestRadioLoggerStateOut(BaseModel):
+    quiesce_capable: bool
+    quiesce_attempted: bool
+    quiesce_verified: bool
+    resume_attempted: bool
+    resume_verified: bool
+
+
+class IngestRadioTransitionOut(BaseModel):
+    phase: str = Field(max_length=32)
+    active: bool
+    recovery_required: bool
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    bluetooth: IngestRadioDeviceStateOut
+    hotspot: IngestRadioDeviceStateOut
+    obd_logger: IngestRadioLoggerStateOut
+
+
+class IngestRadioStatusOut(BaseModel):
+    """Credential-free current/latest transition state rendered by the Backup page."""
+
+    quieting_enabled: bool
+    transition: IngestRadioTransitionOut | None = None
 
 
 class StatusTotals(BaseModel):

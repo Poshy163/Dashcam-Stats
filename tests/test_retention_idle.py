@@ -7,12 +7,14 @@ is never touched, and a false detection in a sibling clip does not save an empty
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from app.core.settings_service import get_settings_service
 from app.db.models import Journey, Recording, RecordingState, StageState
+from app.pipeline.revisions import CURRENT_REVISIONS
 from app.retention import execute as run_retention
 from app.retention.idle import plan_idle
 
@@ -34,21 +36,37 @@ async def _rec(
     journey: Journey | None = None,
     telemetry=StageState.DONE,
     detection=StageState.DONE,
+    metadata=StageState.DONE,
+    plate_state=StageState.DONE,
     plates: int = 0,
     vehicles: int = 0,
     protected: bool = False,
     event: str | None = None,
     size: int = 2048,
+    state: RecordingState = RecordingState.COMPLETED,
+    ignored: bool = False,
+    metadata_revision: str = CURRENT_REVISIONS["metadata"],
+    telemetry_revision: str = CURRENT_REVISIONS["telemetry"],
+    detection_revision: str = CURRENT_REVISIONS["detection"],
+    plate_revision: str = CURRENT_REVISIONS["plates"],
 ) -> Recording:
     recording = Recording(
         rel_path=name,
         filename=name,
         size_bytes=size,
         started_at=datetime.now(UTC) - timedelta(days=5),
-        state=RecordingState.COMPLETED,
+        state=state,
+        ignored=ignored,
+        processed_at=datetime.now(UTC),
+        metadata_state=metadata,
         journey_id=journey.id if journey else None,
         telemetry_state=telemetry,
         detection_state=detection,
+        plate_state=plate_state,
+        metadata_revision=metadata_revision,
+        telemetry_revision=telemetry_revision,
+        detection_revision=detection_revision,
+        plate_revision=plate_revision,
         telemetry_point_count=60 if telemetry == StageState.DONE else 0,
         max_speed_kmh=max_speed,
         avg_speed_kmh=max_speed,
@@ -100,6 +118,14 @@ class TestWhatGoes:
         plan = await plan_idle(ready)
         assert _names(plan) == {"empty_a.ts", "empty_b.ts"}, "the empty siblings should still go"
 
+    async def test_a_post_processing_plan_only_considers_the_notified_batch(self, ready):
+        first = await _rec(ready, "finished_now.ts")
+        await _rec(ready, "waiting_for_periodic_pass.ts")
+
+        plan = await plan_idle(ready, recording_ids=[first.id])
+
+        assert _names(plan) == {"finished_now.ts"}
+
 
 class TestWhatStays:
     async def test_a_clip_that_moved_is_kept(self, ready):
@@ -124,6 +150,28 @@ class TestWhatStays:
         """Silence is not evidence: unknown speed or unknown object count means leave it."""
         await _rec(ready, "no_telemetry.ts", telemetry=StageState.PENDING, max_speed=None)
         await _rec(ready, "no_detection.ts", detection=StageState.PENDING)
+        plan = await plan_idle(ready)
+        assert plan.candidates == []
+
+    async def test_a_recording_that_failed_after_empty_detection_is_kept(self, ready):
+        """Stage zeroes are not a final verdict when a later stage failed."""
+        await _rec(
+            ready,
+            "failed_after_detection.ts",
+            state=RecordingState.FAILED,
+            plate_state=StageState.FAILED,
+        )
+        plan = await plan_idle(ready)
+        assert plan.candidates == []
+
+    async def test_an_ignored_recording_is_kept(self, ready):
+        await _rec(ready, "ignored.ts", ignored=True)
+        plan = await plan_idle(ready)
+        assert plan.candidates == []
+
+    async def test_outdated_or_unsettled_analysis_is_kept(self, ready):
+        await _rec(ready, "outdated.ts", detection_revision="detection-old")
+        await _rec(ready, "plate_pending.ts", plate_state=StageState.PENDING)
         plan = await plan_idle(ready)
         assert plan.candidates == []
 
@@ -154,6 +202,52 @@ class TestTheSwitchesAndGuards:
         plan = await plan_idle(ready)
         assert plan.blocked
         assert plan.blocked_reason and "single-run limit" in plan.blocked_reason
+
+    async def test_post_processing_requests_are_coalesced_into_one_bounded_batch(
+        self, ready, monkeypatch
+    ):
+        from app.workers.scheduler import Scheduler
+
+        scheduler = Scheduler()
+        scheduler._running = True
+        seen: list[tuple[int, ...]] = []
+
+        async def record_batch(recording_ids: tuple[int, ...]) -> None:
+            seen.append(recording_ids)
+
+        monkeypatch.setattr(scheduler, "_run_post_process_idle_cleanup", record_batch)
+        monkeypatch.setattr("app.workers.scheduler._POST_PROCESS_IDLE_DEBOUNCE_S", 0.0)
+        monkeypatch.setattr("app.workers.scheduler._POST_PROCESS_IDLE_MIN_INTERVAL_S", 0.0)
+
+        assert scheduler.request_idle_cleanup(11)
+        assert scheduler.request_idle_cleanup(12)
+        assert scheduler.request_idle_cleanup(11), "duplicate notifications are harmless"
+        assert await scheduler._run_due_post_process_idle_cleanup(now=float("inf"))
+
+        assert seen == [(11, 12)]
+        assert scheduler._pending_idle_recordings == set()
+
+    async def test_a_cancelled_post_processing_pass_keeps_its_notifications(
+        self, ready, monkeypatch
+    ):
+        from app.workers.scheduler import Scheduler
+
+        scheduler = Scheduler()
+        scheduler._running = True
+
+        async def cancel_batch(recording_ids: tuple[int, ...]) -> None:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(scheduler, "_run_post_process_idle_cleanup", cancel_batch)
+        monkeypatch.setattr("app.workers.scheduler._POST_PROCESS_IDLE_DEBOUNCE_S", 0.0)
+        monkeypatch.setattr("app.workers.scheduler._POST_PROCESS_IDLE_MIN_INTERVAL_S", 0.0)
+
+        assert scheduler.request_idle_cleanup(11)
+        with pytest.raises(asyncio.CancelledError):
+            await scheduler._run_due_post_process_idle_cleanup(now=float("inf"))
+
+        assert scheduler._pending_idle_recordings == {11}
+        assert scheduler._post_process_idle_due_at is not None
 
 
 class TestItActuallyDeletesWithoutTheMasterSwitch:

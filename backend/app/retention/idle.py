@@ -30,12 +30,15 @@ off for anyone who does not want it.
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
 from app.db.models import JobState, ProcessingJob, Recording, RecordingState, StageState
+from app.pipeline.revisions import CURRENT_REVISIONS
 from app.retention.planner import _GB, RetentionCandidate, RetentionPlan
 from app.retention.safety import SafetyReport, evaluate_safety
 
@@ -54,18 +57,30 @@ IDLE_DISTANCE_M = 50.0
 
 
 def _static_condition(threshold_kmh: float):
-    """The per-clip test: analysed, and proven to hold nothing.
+    """The per-clip test: settled, current analysis that proved there is nothing.
 
     A SQL expression so it can be a ``WHERE`` directly. ``file_missing``/``DELETED`` are
     left out because callers restrict to live rows.
 
-    Both stages must be ``DONE`` — silence is not evidence. A clip whose telemetry has not
-    been read has an unknown speed, and one whose detection has not run has an unknown
-    object count; either way it cannot be called empty, so it is left alone.
+    Telemetry and detection must be ``DONE`` — silence is not evidence. Metadata and plate
+    analysis must be settled too, and every persisted stage result must belong to the
+    current pipeline revision. This matters after a partial reprocess: detection may have
+    finished empty before the plate stage failed, leaving apparently persuasive zeroes on
+    a recording whose overall verdict is ``FAILED``. Only ``COMPLETED`` is final enough to
+    delete, and an ignored recording is deliberately outside all automatic processing.
     """
     return and_(
+        Recording.state == RecordingState.COMPLETED,
+        Recording.ignored.is_(False),
+        Recording.processed_at.isnot(None),
+        Recording.metadata_state == StageState.DONE,
         Recording.telemetry_state == StageState.DONE,
         Recording.detection_state == StageState.DONE,
+        Recording.plate_state.in_([StageState.DONE, StageState.SKIPPED]),
+        Recording.metadata_revision == CURRENT_REVISIONS["metadata"],
+        Recording.telemetry_revision == CURRENT_REVISIONS["telemetry"],
+        Recording.detection_revision == CURRENT_REVISIONS["detection"],
+        Recording.plate_revision == CURRENT_REVISIONS["plates"],
         Recording.max_speed_kmh.isnot(None),
         Recording.max_speed_kmh < threshold_kmh,
         or_(Recording.distance_m.is_(None), Recording.distance_m < IDLE_DISTANCE_M),
@@ -83,14 +98,21 @@ def _live():
     )
 
 
-async def plan_idle(session: AsyncSession, safety: SafetyReport | None = None) -> RetentionPlan:
+async def plan_idle(
+    session: AsyncSession,
+    safety: SafetyReport | None = None,
+    *,
+    recording_ids: Collection[int] | None = None,
+) -> RetentionPlan:
     """Which clips would be removed for being static and empty.
 
     Returns a :class:`RetentionPlan` handed straight to :func:`app.retention.planner.execute`.
     ``deletion_enabled`` is set true by the rule itself — it authorises its own removals (see
     the module docstring) — so the scheduler runs it with ``dry_run=False`` and it acts
     without the master switch. ``safety`` may be passed in when the caller already evaluated
-    it, so the footage tree is walked once a cycle.
+    it, so the footage tree is walked once a cycle. ``recording_ids`` narrows a
+    post-processing pass to the bounded batch that just finished; the periodic pass omits
+    it and remains the full-library safety net.
     """
     settings = get_settings_service()
     result = RetentionPlan()
@@ -112,6 +134,9 @@ async def plan_idle(session: AsyncSession, safety: SafetyReport | None = None) -
         return result
 
     threshold = float(settings.get_nowait("storage.idle_speed_kmh"))
+    limited_to = tuple(set(recording_ids)) if recording_ids is not None else None
+    if limited_to == ():
+        return result
     # Never a recording something is working on, which the size-based planner has always
     # excluded and this rule did not.
     #
@@ -125,20 +150,19 @@ async def plan_idle(session: AsyncSession, safety: SafetyReport | None = None) -
         ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),
         ProcessingJob.recording_id.is_not(None),
     )
-    recordings = (
-        (
-            await session.execute(
-                select(Recording).where(
-                    _live(),
-                    _static_condition(threshold),
-                    Recording.state != RecordingState.PROCESSING,
-                    Recording.id.notin_(active_jobs),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    predicates = [
+        _live(),
+        _static_condition(threshold),
+        # Kept even though COMPLETED is now required: a queued reprocess normally demotes
+        # the recording, but the job row is the authoritative ownership marker and this
+        # guard protects future queue paths that may intentionally leave the final state.
+        Recording.state != RecordingState.PROCESSING,
+        Recording.id.notin_(active_jobs),
+    ]
+    if limited_to is not None:
+        predicates.append(Recording.id.in_(limited_to))
+
+    recordings = (await session.execute(select(Recording).where(*predicates))).scalars().all()
     for recording in recordings:
         result.candidates.append(
             RetentionCandidate(

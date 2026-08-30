@@ -1158,7 +1158,8 @@ SETTINGS: tuple[SettingDef, ...] = (
         "The head unit's WiFi is a single-stream chip shared with its Bluetooth and its "
         "own hotspot, and the transfer already runs at that radio's measured ceiling — "
         "anything else using it is paid for in footage left on the card. This turns them "
-        "off while recordings are moving and back on when the run ends. It waits until "
+        "off while recordings are moving, then restores each one to the exact state it "
+        "had before the run. It waits until "
         "the unit has been on the network for ten seconds, so a car that is only turning "
         "around keeps its phone connection. If the engine stops mid-transfer, a watchdog "
         "left on the unit turns Bluetooth back on by itself, and anything still off is "
@@ -1232,16 +1233,17 @@ SETTINGS: tuple[SettingDef, ...] = (
         "bool",
         False,
         "ingest",
-        "Android only lets root stop a hotspot, so without this the hotspot keeps "
-        "sharing the transfer's radio however the setting above is set. This runs "
-        "'adb root' once per transfer, before any copying starts, which works only if "
-        "the unit runs a debuggable build — most do not, and on those it is asked once, "
-        "answered no, and never asked again. Two things worth knowing before turning it "
-        "on: the unit's ADB stays root until the engine stops (it reverts on its own at "
-        "the next start, and nothing here puts it back sooner), and restarting ADB "
-        "briefly drops the control channel — if it does not come back, that window is "
-        "lost and the next engine start fixes it. Whether your unit allows it at all is "
-        "reported below.",
+        "The app first asks Android's tethering service to stop the hotspot through the "
+        "unrooted shell binder and verifies that the serving interface disappeared. That "
+        "works on some production units. If the hotspot remains up, Android's WiFi "
+        "fallback normally needs root; this runs 'adb root' once per transfer so that "
+        "fallback can be tried. It works only on a debuggable build — most production "
+        "builds refuse, and after a permanent refusal the app stops asking. Two things "
+        "worth knowing before turning it on: the unit's ADB stays root until the engine "
+        "stops (it reverts on its own at the next start, and nothing here puts it back "
+        "sooner), and restarting ADB briefly drops the control channel. If it does not "
+        "come back, that transfer window is lost and the next engine start fixes it. "
+        "Whether your unit allows it is reported below.",
         dangerous=True,
         requires="ingest.quiet_radios",
     ),
@@ -1263,12 +1265,12 @@ SETTINGS: tuple[SettingDef, ...] = (
         "string",
         "",
         "ingest",
-        "The head unit's own words from the last time it refused to stop its hotspot "
-        "for a transfer. Android only lets root stop a soft AP, so on most units this "
-        "reads as a SecurityException for uid 2000 — permanent until the unit's ADB "
-        "runs as root, and nothing this app can work around. Turn the hotspot off on "
-        "the unit itself if the throughput matters. Cleared automatically if a stop "
-        "ever succeeds.",
+        "The head unit's own words from the last time both supported stop paths left its "
+        "hotspot serving. The app tries Android's unrooted tethering binder first, then "
+        "the WiFi command as a fallback; that fallback commonly reports a "
+        "SecurityException unless ADB is running as root. Turn the hotspot off on the "
+        "unit itself if both paths are refused and the throughput matters. Cleared "
+        "automatically if a verified stop succeeds.",
         read_only=True,
         requires="ingest.quiet_radios",
     ),

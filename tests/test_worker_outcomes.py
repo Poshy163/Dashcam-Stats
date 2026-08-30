@@ -88,6 +88,15 @@ def _report(ok: bool = True) -> RunReport:
 
 
 class TestRecordingTheOutcome:
+    async def test_a_completed_analysis_notifies_the_cleanup_scheduler(self, job, monkeypatch):
+        requested: list[int] = []
+        monkeypatch.setattr("app.workers.worker._request_idle_cleanup", requested.append)
+        pool = WorkerPool()
+        active = ActiveJob(job_id=job, recording_id=1, filename="outcome.ts")
+
+        assert await pool._finish(job, active, report=_report())
+        assert requested == [1]
+
     async def test_a_transient_failure_does_not_lose_the_run(self, job, monkeypatch):
         """The whole point: a lock at the wrong moment must not discard finished work."""
         pool = WorkerPool()

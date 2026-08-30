@@ -4,7 +4,12 @@ import { Link } from 'react-router-dom'
 import { ObdLoggerCard } from '@/components/ObdLoggerCard'
 import { EmptyState, ErrorState, PageHeader, ProgressBar, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
-import type { IngestStatus, OBDBundle } from '@/lib/api'
+import type {
+  IngestRadioDeviceState,
+  IngestRadioStatus,
+  IngestStatus,
+  OBDBundle,
+} from '@/lib/api'
 import { formatBytes, formatDateTime, formatDuration, formatRelative } from '@/lib/format'
 
 /** How the state reads to a person, and how alarming it should look. */
@@ -37,6 +42,113 @@ const PHASES: Record<IngestStatus['phase'], string> = {
   verifying: 'Checking what arrived',
 }
 
+type RadioTone = 'default' | 'ok' | 'warn' | 'error' | 'busy'
+
+function radioSummary(status: IngestRadioStatus): {
+  title: string
+  detail: string
+  tone: RadioTone
+} {
+  const transition = status.transition
+  // Durable recovery wins over the current setting. A user may switch quieting off after
+  // an interrupted run, but that does not cancel the obligation to restore what it changed.
+  if (transition?.recoveryRequired) {
+    return {
+      title: 'Radio recovery still required',
+      detail:
+        'The original Bluetooth or hotspot state has not been verified yet. Recovery will retry when the dashcam is reachable.',
+      tone: 'error',
+    }
+  }
+  if (transition?.active) {
+    if (['restoring_radios', 'resuming_obd'].includes(transition.phase)) {
+      return {
+        title: 'Restoring the original radio state',
+        detail: 'The backup has finished using the quiet-radio window and is verifying recovery.',
+        tone: 'busy',
+      }
+    }
+    if (transition.phase === 'ingesting') {
+      return {
+        title: 'Backup radio window active',
+        detail: 'Any radio changed by the app will be returned to its captured starting state.',
+        tone: 'busy',
+      }
+    }
+    return {
+      title: 'Preparing a safe radio transition',
+      detail: 'The starting state is captured before Bluetooth or the hotspot can be changed.',
+      tone: 'busy',
+    }
+  }
+  if (!status.quietingEnabled) {
+    return {
+      title: 'Radio quieting is off',
+      detail: 'Backups leave Bluetooth and the hotspot in their current state.',
+      tone: 'default',
+    }
+  }
+  if (!transition) {
+    return {
+      title: 'Radio quieting is ready',
+      detail: 'No backup has needed to change either radio yet.',
+      tone: 'ok',
+    }
+  }
+
+  const changed =
+    transition.bluetooth.disableAttempted || transition.hotspot.disableAttempted
+  const restored =
+    (!transition.bluetooth.disableAttempted || transition.bluetooth.restoreVerified) &&
+    (!transition.hotspot.disableAttempted || transition.hotspot.restoreVerified)
+  if (changed && restored) {
+    return {
+      title: 'Original radio state restored',
+      detail: 'The latest backup verified every radio it needed to put back.',
+      tone: 'ok',
+    }
+  }
+  if (!changed) {
+    return {
+      title: 'Radios left unchanged',
+      detail: 'The latest transition made no radio change that needed restoring.',
+      tone: 'ok',
+    }
+  }
+  return {
+    title: 'Radio restore was not verified',
+    detail: 'The latest transition is closed, but its recorded restore evidence is incomplete.',
+    tone: 'error',
+  }
+}
+
+function radioEvidence(label: string, radio: IngestRadioDeviceState, active: boolean): string {
+  const baseline =
+    radio.baseline === 'transport'
+      ? 'carried the transfer'
+      : radio.baseline === 'unknown'
+        ? 'was not captured'
+        : `was ${radio.baseline}`
+
+  if (!radio.disableAttempted) {
+    if (radio.disableVerified && radio.baseline === 'off') return `${label} was already off.`
+    if (radio.disableVerified && radio.baseline === 'transport') {
+      return `${label} carried the transfer and was intentionally left alone.`
+    }
+    return `${label} baseline ${baseline}; no change was attempted.`
+  }
+
+  const quiet = radio.disableVerified ? 'off verified' : 'off not verified'
+  const restore = radio.restoreAttempted
+    ? radio.restoreVerified
+      ? 'restore verified'
+      : 'restore not verified'
+    : active
+      ? 'restore pending'
+      : 'restore not attempted'
+  return `${label} ${baseline}; ${quiet}; ${restore}.`
+}
+
 export default function Backup() {
   const client = useQueryClient()
 
@@ -54,6 +166,12 @@ export default function Backup() {
     refetchInterval: status.data?.state === 'running' ? 10_000 : 60_000,
   })
 
+  const radioStatus = useQuery({
+    queryKey: ['ingest-radio-status'],
+    queryFn: api.ingest.radioStatus,
+    refetchInterval: status.data?.state === 'running' ? 1_500 : 15_000,
+  })
+
   const obdStatus = useQuery({
     queryKey: ['obd-status'],
     queryFn: api.obd.status,
@@ -68,6 +186,7 @@ export default function Backup() {
   const invalidate = () => {
     client.invalidateQueries({ queryKey: ['ingest-status'] })
     client.invalidateQueries({ queryKey: ['ingest-history'] })
+    client.invalidateQueries({ queryKey: ['ingest-radio-status'] })
     client.invalidateQueries({ queryKey: ['obd-status'] })
     client.invalidateQueries({ queryKey: ['obd-bundles'] })
   }
@@ -93,6 +212,27 @@ export default function Backup() {
   // a full card — invisible, until it renders as 100.01% and a bar overshooting its track.
   const fraction =
     data && data.bytesTotal > 0 ? Math.min(1, data.bytesDone / data.bytesTotal) : 0
+  const radio = radioStatus.data ? radioSummary(radioStatus.data) : null
+  const radioToneClass =
+    radio?.tone === 'error'
+      ? 'border-state-error/50'
+      : radio?.tone === 'warn'
+        ? 'border-state-warn/40'
+        : radio?.tone === 'ok'
+          ? 'border-state-ok/40'
+          : radio?.tone === 'busy'
+            ? 'border-accent/40'
+            : ''
+  const radioTitleClass =
+    radio?.tone === 'error'
+      ? 'text-state-error'
+      : radio?.tone === 'warn'
+        ? 'text-state-warn'
+        : radio?.tone === 'ok'
+          ? 'text-state-ok'
+          : radio?.tone === 'busy'
+            ? 'text-accent'
+            : ''
 
   return (
     <div>
@@ -200,6 +340,42 @@ export default function Backup() {
               Checked {formatRelative(data.recorderHealthAt)}
             </div>
           )}
+        </div>
+      )}
+
+      {radio && (
+        <div className={`card mb-6 px-5 py-4 text-sm ${radioToneClass}`}>
+          <div className={`font-medium ${radioTitleClass}`}>{radio.title}</div>
+          <div className="mt-1 text-content-muted">{radio.detail}</div>
+          {radioStatus.data?.transition && (
+            <div className="mt-2 space-y-0.5 text-xs text-content-faint">
+              <div>
+                {radioEvidence(
+                  'Bluetooth',
+                  radioStatus.data.transition.bluetooth,
+                  radioStatus.data.transition.active,
+                )}
+              </div>
+              <div>
+                {radioEvidence(
+                  'Hotspot',
+                  radioStatus.data.transition.hotspot,
+                  radioStatus.data.transition.active,
+                )}
+              </div>
+              <div>Updated {formatRelative(radioStatus.data.transition.updatedAt)}</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {radioStatus.isError && (
+        <div className="card mb-6 border-state-warn/40 px-5 py-4 text-sm">
+          <div className="font-medium text-state-warn">Radio safety status unavailable</div>
+          <div className="mt-1 text-content-muted">
+            Backup progress is still available, but its durable radio-transition evidence could
+            not be loaded.
+          </div>
         </div>
       )}
 

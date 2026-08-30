@@ -213,6 +213,40 @@ export interface IngestStatus {
   lastError: string | null
 }
 
+export interface IngestRadioDeviceState {
+  /** Exact state observed before the transition; transport means the hotspot carries ADB. */
+  baseline: 'on' | 'off' | 'transport' | 'unknown'
+  disableAttempted: boolean
+  disableVerified: boolean
+  restoreAttempted: boolean
+  restoreVerified: boolean
+}
+
+export interface IngestRadioTransitionStatus {
+  /** Durable state-machine phase. Kept open so an older UI can render a newer phase. */
+  phase: string
+  active: boolean
+  recoveryRequired: boolean
+  createdAt: string
+  updatedAt: string
+  completedAt: string | null
+  bluetooth: IngestRadioDeviceState
+  hotspot: IngestRadioDeviceState
+  obdLogger: {
+    quiesceCapable: boolean
+    quiesceAttempted: boolean
+    quiesceVerified: boolean
+    resumeAttempted: boolean
+    resumeVerified: boolean
+  }
+}
+
+/** Durable safety evidence for the current, or most recent, radio transition. */
+export interface IngestRadioStatus {
+  quietingEnabled: boolean
+  transition: IngestRadioTransitionStatus | null
+}
+
 export interface IngestRun {
   id: number
   startedAt: string | null
@@ -606,6 +640,7 @@ export const api = {
 
   ingest: {
     status: () => request<IngestStatus>('/ingest/status'),
+    radioStatus: () => request<IngestRadioStatus>('/ingest/radio-status'),
     run: () => post<{ started: boolean; state: string }>('/ingest/run'),
     cancel: () => post<{ cancelled: boolean }>('/ingest/cancel'),
     // The URL comes back with the API key masked — it is rendered straight into the page.

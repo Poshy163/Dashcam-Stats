@@ -147,6 +147,7 @@ class TestWriteEndpoints:
         from app.core.settings_service import get_settings_service
         from app.db.models import Recording, RecordingState, StageState
         from app.db.session import session_scope
+        from app.pipeline.revisions import CURRENT_REVISIONS
 
         footage = await get_settings_service().footage_dir()
         for i in range(12):
@@ -158,15 +159,26 @@ class TestWriteEndpoints:
         ).status_code == 200
 
         async with session_scope() as session:
+            processed_at = datetime.now(UTC)
+            settled = {
+                "state": RecordingState.COMPLETED,
+                "processed_at": processed_at,
+                "metadata_state": StageState.DONE,
+                "telemetry_state": StageState.DONE,
+                "detection_state": StageState.DONE,
+                "plate_state": StageState.DONE,
+                "metadata_revision": CURRENT_REVISIONS["metadata"],
+                "telemetry_revision": CURRENT_REVISIONS["telemetry"],
+                "detection_revision": CURRENT_REVISIONS["detection"],
+                "plate_revision": CURRENT_REVISIONS["plates"],
+            }
             session.add(
                 Recording(
                     rel_path="desk.ts",
                     filename="desk.ts",
                     size_bytes=2048,
                     started_at=datetime.now(UTC) - timedelta(days=3),
-                    state=RecordingState.COMPLETED,
-                    telemetry_state=StageState.DONE,
-                    detection_state=StageState.DONE,
+                    **settled,
                     telemetry_point_count=60,
                     max_speed_kmh=0.0,
                 )
@@ -179,9 +191,7 @@ class TestWriteEndpoints:
                     filename="drive.ts",
                     size_bytes=2_000_000,
                     started_at=datetime.now(UTC) - timedelta(days=3),
-                    state=RecordingState.COMPLETED,
-                    telemetry_state=StageState.DONE,
-                    detection_state=StageState.DONE,
+                    **settled,
                     telemetry_point_count=60,
                     max_speed_kmh=55.0,
                     distance_m=900.0,

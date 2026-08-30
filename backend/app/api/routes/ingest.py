@@ -11,9 +11,10 @@ from fastapi import APIRouter, HTTPException
 from fastapi import status as http_status
 from sqlalchemy import func, select
 
-from app.api.deps import PaginationDep, SessionDep
+from app.api.deps import PaginationDep, SessionDep, SettingsDep
+from app.api.schemas import IngestRadioStatusOut
 from app.core.logging import get_logger
-from app.db.models import IngestRun
+from app.db.models import IngestRadioTransition, IngestRun
 from app.ingest.models import RunState
 from app.ingest.puller import start_run
 from app.ingest.status import get_status
@@ -26,6 +27,76 @@ router = APIRouter(prefix="/api", tags=["ingest"])
 @router.get("/ingest/status", summary="Live ingest progress")
 async def ingest_status() -> dict[str, object]:
     return get_status().snapshot()
+
+
+def _radio_baseline(value: str) -> str:
+    """Keep the public contract bounded even if an old/corrupt row has another value."""
+    return value if value in {"on", "off", "transport"} else "unknown"
+
+
+def _radio_state(row: IngestRadioTransition, name: str) -> dict[str, object]:
+    return {
+        "baseline": _radio_baseline(str(getattr(row, f"{name}_before", "unknown"))),
+        "disable_attempted": bool(getattr(row, f"{name}_disable_attempted")),
+        "disable_verified": bool(getattr(row, f"{name}_disable_verified")),
+        "restore_attempted": bool(getattr(row, f"{name}_restore_attempted")),
+        "restore_verified": bool(getattr(row, f"{name}_restore_verified")),
+    }
+
+
+@router.get(
+    "/ingest/radio-status",
+    response_model=IngestRadioStatusOut,
+    summary="Latest radio transition safety state",
+)
+async def ingest_radio_status(
+    session: SessionDep,
+    settings: SettingsDep,
+) -> dict[str, object]:
+    """Expose radio safety evidence without leaking device or hotspot credentials.
+
+    Live byte progress stays on the memory-only ``/ingest/status`` endpoint. Radio
+    transitions are deliberately durable, so this separate, slower endpoint reads the
+    current transition (when one exists) or the most recently finished transition.
+
+    Device addresses, lease tokens, logger paths, hotspot capsule references, capabilities
+    and raw error text are intentionally omitted. The latter may include command output;
+    the Backup page only needs to know whether recovery is still required.
+    """
+    row = await session.scalar(
+        select(IngestRadioTransition)
+        .order_by(
+            IngestRadioTransition.active.desc(),
+            IngestRadioTransition.recovery_required.desc(),
+            IngestRadioTransition.created_at.desc(),
+        )
+        .limit(1)
+    )
+    result: dict[str, object] = {
+        "quieting_enabled": bool(settings.get_nowait("ingest.quiet_radios")),
+        "transition": None,
+    }
+    if row is None:
+        return result
+
+    result["transition"] = {
+        "phase": row.phase,
+        "active": bool(row.active),
+        "recovery_required": bool(row.recovery_required),
+        "created_at": row.created_at.isoformat(),
+        "updated_at": row.updated_at.isoformat(),
+        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+        "bluetooth": _radio_state(row, "bluetooth"),
+        "hotspot": _radio_state(row, "hotspot"),
+        "obd_logger": {
+            "quiesce_capable": bool(row.logger_quiesce_capable),
+            "quiesce_attempted": row.logger_quiesce_requested_at is not None,
+            "quiesce_verified": row.logger_quiesce_acked_at is not None,
+            "resume_attempted": bool(row.logger_resume_attempted),
+            "resume_verified": bool(row.logger_resume_verified),
+        },
+    }
+    return result
 
 
 @router.post("/ingest/run", summary="Pull from the head unit now")

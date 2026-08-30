@@ -28,6 +28,16 @@ from app.workers import queue
 
 log = get_logger(__name__)
 
+#: Completed jobs arrive from several workers. They notify this one scheduler instead of
+#: running retention themselves, so deletion remains serial with the normal scheduled
+#: pass. The short debounce coalesces siblings that finish together; the cooldown bounds
+#: expensive share safety walks during a long reprocessing backlog while still shrinking
+#: the old six-hour delay to at most a few minutes.
+_POST_PROCESS_IDLE_DEBOUNCE_S = 30.0
+_POST_PROCESS_IDLE_MIN_INTERVAL_S = 5 * 60.0
+_POST_PROCESS_IDLE_BATCH_SIZE = 64
+_POST_PROCESS_IDLE_QUEUE_LIMIT = 512
+
 
 @dataclass(slots=True)
 class TaskState:
@@ -58,6 +68,10 @@ class Scheduler:
         self._running = False
         self._tasks: list[TaskState] = []
         self._scanner = Scanner()
+        self._pending_idle_recordings: set[int] = set()
+        self._post_process_idle_due_at: float | None = None
+        self._last_idle_cleanup_at = 0.0
+        self._idle_cleanup_overflow_reported = False
 
     async def start(self) -> None:
         if self._running:
@@ -98,6 +112,9 @@ class Scheduler:
             # scan, retention and pruning all hitting the database simultaneously.
             task.next_run = now + 10.0 + index * 5.0 + random.uniform(0, 5)
 
+        if self._pending_idle_recordings:
+            self._post_process_idle_due_at = now + _POST_PROCESS_IDLE_DEBOUNCE_S
+
         self._task = asyncio.create_task(self._loop(), name="scheduler")
         log.info("scheduler started", tasks=[t.name for t in self._tasks])
 
@@ -133,6 +150,16 @@ class Scheduler:
                     except Exception:
                         interval = 300.0
                     task.next_run = time.monotonic() + interval
+
+            # Worker completions are coalesced here, after periodic work. There is only
+            # one scheduler loop, so this cannot race the scheduled retention pass or
+            # turn N workers into N simultaneous deletion runs.
+            try:
+                await self._run_due_post_process_idle_cleanup()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("post-processing static cleanup failed", error=str(exc))
 
             await asyncio.sleep(1.0)
 
@@ -223,8 +250,102 @@ class Scheduler:
             # touches footage proven worthless), so this runs for real -- dry_run=False --
             # while the mount-writable and fraction guards inside still apply. The size-based
             # plan has just evaluated safety, so hand it over rather than walk the tree twice.
+            # Snapshot notifications already present: this full-library query subsumes
+            # them. Notifications arriving while it runs are left pending because they
+            # may have committed after the query took its view of the database.
+            covered_notifications = set(self._pending_idle_recordings)
             idle = await plan_idle(session, plan.safety)
             await run_retention(session, idle, dry_run=False, trigger="idle-cleanup")
+            self._pending_idle_recordings.difference_update(covered_notifications)
+        self._idle_cleanup_finished()
+
+    async def _run_post_process_idle_cleanup(self, recording_ids: tuple[int, ...]) -> None:
+        """Delete only the bounded group of recordings whose analysis just settled."""
+        async with session_scope() as session:
+            idle = await plan_idle(session, recording_ids=recording_ids)
+            await run_retention(
+                session,
+                idle,
+                dry_run=False,
+                trigger="post-process-idle-cleanup",
+            )
+
+    async def _run_due_post_process_idle_cleanup(self, now: float | None = None) -> bool:
+        """Run one due batch. Returns whether a cleanup attempt was made."""
+        moment = time.monotonic() if now is None else now
+        due = self._post_process_idle_due_at
+        if due is None or moment < due or not self._pending_idle_recordings:
+            return False
+
+        recording_ids = tuple(sorted(self._pending_idle_recordings))[:_POST_PROCESS_IDLE_BATCH_SIZE]
+        self._pending_idle_recordings.difference_update(recording_ids)
+        self._post_process_idle_due_at = None
+        try:
+            await self._run_post_process_idle_cleanup(recording_ids)
+        except asyncio.CancelledError:
+            # A normal service stop can interrupt the safety walk before it has acted.
+            # Keep the notification batch for an in-process scheduler restart. A process
+            # restart still has the periodic full pass, and a partially completed retry is
+            # safe because the database and filesystem guards are re-evaluated.
+            self._restore_pending_idle(recording_ids)
+            raise
+        except Exception:
+            # A failed mount or database attempt must not turn into a tight retry loop.
+            # Put the bounded batch back; the cooldown below delays it, and the periodic
+            # full-library pass remains a second route to the same recordings.
+            self._restore_pending_idle(recording_ids)
+            raise
+        finally:
+            self._idle_cleanup_finished()
+        return True
+
+    def request_idle_cleanup(self, recording_id: int) -> bool:
+        """Coalesce one successful analysis into a scheduler-owned cleanup batch."""
+        if (
+            not self._running
+            or recording_id <= 0
+            or not bool(get_settings_service().get_nowait("storage.delete_idle"))
+        ):
+            return False
+        if recording_id in self._pending_idle_recordings:
+            return True
+        if len(self._pending_idle_recordings) >= _POST_PROCESS_IDLE_QUEUE_LIMIT:
+            if not self._idle_cleanup_overflow_reported:
+                log.warning(
+                    "post-processing static cleanup queue reached its safety limit",
+                    limit=_POST_PROCESS_IDLE_QUEUE_LIMIT,
+                )
+                self._idle_cleanup_overflow_reported = True
+            return False
+
+        self._pending_idle_recordings.add(recording_id)
+        now = time.monotonic()
+        due = max(
+            now + _POST_PROCESS_IDLE_DEBOUNCE_S,
+            self._last_idle_cleanup_at + _POST_PROCESS_IDLE_MIN_INTERVAL_S,
+        )
+        # Keep the first deadline. Constant arrivals must coalesce, not postpone cleanup
+        # forever by moving the debounce window on every worker completion.
+        if self._post_process_idle_due_at is None:
+            self._post_process_idle_due_at = due
+        else:
+            self._post_process_idle_due_at = min(self._post_process_idle_due_at, due)
+        return True
+
+    def _restore_pending_idle(self, recording_ids: tuple[int, ...]) -> None:
+        room = max(0, _POST_PROCESS_IDLE_QUEUE_LIMIT - len(self._pending_idle_recordings))
+        self._pending_idle_recordings.update(recording_ids[:room])
+
+    def _idle_cleanup_finished(self) -> None:
+        self._last_idle_cleanup_at = time.monotonic()
+        if not self._pending_idle_recordings:
+            self._post_process_idle_due_at = None
+            self._idle_cleanup_overflow_reported = False
+            return
+        self._post_process_idle_due_at = max(
+            self._last_idle_cleanup_at + _POST_PROCESS_IDLE_MIN_INTERVAL_S,
+            time.monotonic() + _POST_PROCESS_IDLE_DEBOUNCE_S,
+        )
 
     async def _run_reclaim(self) -> None:
         async with session_scope() as session:

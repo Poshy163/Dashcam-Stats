@@ -28,6 +28,19 @@ from app.workers import queue
 
 log = get_logger(__name__)
 
+
+def _request_idle_cleanup(recording_id: int) -> None:
+    """Notify the scheduler after the successful outcome transaction has committed.
+
+    Imported lazily to keep the existing workers -> queue -> scheduler module graph from
+    becoming a startup cycle. The scheduler is the sole cleanup owner; a worker never
+    plans or deletes footage itself.
+    """
+    from app.workers.scheduler import get_scheduler
+
+    get_scheduler().request_idle_cleanup(recording_id)
+
+
 #: How often a running job reports progress. Frequent enough for a live UI, rare enough
 #: that the writes are invisible next to the decoding work.
 _HEARTBEAT_INTERVAL_S = 3.0
@@ -473,7 +486,7 @@ class WorkerPool:
         permanent: bool = False,
         transient: bool = False,
         note: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Record how a job ended, in a session of its own, retrying if the write fails.
 
         Separate from the run on purpose. These few writes are the only durable trace that
@@ -485,15 +498,16 @@ class WorkerPool:
         last: Exception | None = None
         for attempt in range(_FINISH_ATTEMPTS):
             try:
+                completed_analysis_id: int | None = None
                 async with session_scope() as session:
                     job = await session.get(ProcessingJob, job_id)
                     if job is None:
-                        return
+                        return False
                     if job.state == JobState.CANCELLED:
                         # Someone asked for this to stop. Writing the result now would
                         # resurrect it -- as COMPLETED, or as QUEUED with a retry pending.
                         log.info("job was cancelled; not recording its outcome", job_id=job_id)
-                        return
+                        return False
                     if fail is not None:
                         await queue.fail(
                             session, job, fail, permanent=permanent, transient=transient
@@ -515,7 +529,28 @@ class WorkerPool:
                             decoder=active.decoder,
                             device=active.inference_device,
                         )
-                return
+                        if (
+                            report is not None
+                            and report.ok
+                            and job.recording_id is not None
+                            and job.kind in (JobKind.PROCESS, JobKind.REPROCESS)
+                        ):
+                            completed_analysis_id = job.recording_id
+                # The context manager has committed the outcome. Scheduling before this
+                # point lets cleanup see a RUNNING job and then loses the only notification.
+                if completed_analysis_id is not None:
+                    try:
+                        _request_idle_cleanup(completed_analysis_id)
+                    except Exception as exc:
+                        # Cleanup has its six-hour periodic fallback. Its notification is
+                        # never allowed to turn an already committed successful job back
+                        # into an outcome-write retry (or claim that the outcome was lost).
+                        log.warning(
+                            "could not schedule post-processing static cleanup",
+                            recording_id=completed_analysis_id,
+                            error=str(exc),
+                        )
+                return True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -531,6 +566,7 @@ class WorkerPool:
             attempts=_FINISH_ATTEMPTS,
             error=str(last),
         )
+        return False
 
     async def _heartbeat(self, active: ActiveJob) -> None:
         """Publish progress, and notice if the job has been cancelled underneath us.
