@@ -8,6 +8,7 @@ import email.utils
 import gzip
 import ipaddress
 import json
+import math
 import os
 import re
 import stat
@@ -20,10 +21,12 @@ from sqlalchemy import func, or_, select
 
 from app.config import AppConfig, get_config
 from app.core.logging import get_logger
-from app.db.models import OBDBundle, OBDBundleState, utcnow
+from app.db.models import OBDBundle, OBDBundleState, OBDDrive, utcnow
 from app.db.session import session_scope
 from app.ingest.obd_bundle import (
+    SAFE_REASON_RE,
     BundleError,
+    HAPayloadError,
     bundle_path_for,
     file_sha256,
     is_bundle_name,
@@ -31,12 +34,14 @@ from app.ingest.obd_bundle import (
     store_validated_bundle,
     validate_bundle,
 )
+from app.ingest.obd_reconciliation import reconcile_drive_projection
 
 log = get_logger(__name__)
 
 MAX_HA_BODY_BYTES = 8 * 1024 * 1024
 MAX_ERROR_TEXT = 1000
 MAX_RESPONSE_BYTES = 256 * 1024
+HA_PROJECTION_VERSION = 2
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}")
 _SUCCESS_FIELDS = frozenset(
     {
@@ -50,6 +55,20 @@ _SUCCESS_FIELDS = frozenset(
         "raw_samples_stored",
         "warnings",
         "errors",
+        "drive_lifecycle",
+    }
+)
+_SUCCESS_LIFECYCLE_FIELDS = frozenset(
+    {
+        "status",
+        "interruption_reason",
+        "clean_end",
+        "sample_count",
+        "expected_sample_count",
+        "missing_data_duration_s",
+        "received_sample_percentage",
+        "gap_count",
+        "longest_gap_s",
     }
 )
 _SUCCESS_COUNTERS = frozenset(
@@ -286,27 +305,149 @@ def _success_result(value: object, *, drive_id: str, token: str) -> dict:
                 f"Home Assistant success field {field_name} is invalid", kind="protocol"
             )
         clean[field_name] = [redact(item, token=token) for item in items]
+    if "drive_lifecycle" in value:
+        lifecycle = value["drive_lifecycle"]
+        if not isinstance(lifecycle, dict) or set(lifecycle) != _SUCCESS_LIFECYCLE_FIELDS:
+            raise PermanentImportError(
+                "Home Assistant drive_lifecycle response is invalid", kind="protocol"
+            )
+        lifecycle_status = lifecycle.get("status")
+        reason = lifecycle.get("interruption_reason")
+        clean_end = lifecycle.get("clean_end")
+        if lifecycle_status not in {"complete", "interrupted", "recovered"}:
+            raise PermanentImportError(
+                "Home Assistant drive_lifecycle status is invalid", kind="protocol"
+            )
+        if reason is not None and (
+            not isinstance(reason, str) or not SAFE_REASON_RE.fullmatch(reason)
+        ):
+            raise PermanentImportError(
+                "Home Assistant drive_lifecycle reason is invalid", kind="protocol"
+            )
+        if not isinstance(clean_end, bool) or (lifecycle_status == "complete") != clean_end:
+            raise PermanentImportError(
+                "Home Assistant drive_lifecycle clean-end state is invalid", kind="protocol"
+            )
+        if lifecycle_status == "complete" and reason is not None:
+            raise PermanentImportError(
+                "Home Assistant drive_lifecycle reason is invalid", kind="protocol"
+            )
+        if lifecycle_status != "complete" and reason is None:
+            raise PermanentImportError(
+                "Home Assistant interrupted lifecycle is missing its reason", kind="protocol"
+            )
+        counters: dict[str, int] = {}
+        for field_name in ("sample_count", "expected_sample_count"):
+            item = lifecycle.get(field_name)
+            if isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= 2**63 - 1:
+                raise PermanentImportError(
+                    f"Home Assistant drive_lifecycle {field_name} is invalid", kind="protocol"
+                )
+            counters[field_name] = item
+        if counters["expected_sample_count"] < counters["sample_count"]:
+            raise PermanentImportError(
+                "Home Assistant drive_lifecycle sample counts are invalid", kind="protocol"
+            )
+        numbers: dict[str, float] = {}
+        for field_name, maximum in (
+            ("missing_data_duration_s", 31 * 24 * 3600.0),
+            ("received_sample_percentage", 100.0),
+        ):
+            item = lifecycle.get(field_name)
+            if (
+                isinstance(item, bool)
+                or not isinstance(item, (int, float))
+                or not math.isfinite(float(item))
+                or not 0 <= float(item) <= maximum
+            ):
+                raise PermanentImportError(
+                    f"Home Assistant drive_lifecycle {field_name} is invalid", kind="protocol"
+                )
+            numbers[field_name] = float(item)
+        gap_count = lifecycle.get("gap_count")
+        if gap_count is not None and (
+            isinstance(gap_count, bool)
+            or not isinstance(gap_count, int)
+            or not 0 <= gap_count <= 10_000_000
+        ):
+            raise PermanentImportError(
+                "Home Assistant drive_lifecycle gap_count is invalid", kind="protocol"
+            )
+        longest_gap = lifecycle.get("longest_gap_s")
+        if longest_gap is not None and (
+            isinstance(longest_gap, bool)
+            or not isinstance(longest_gap, (int, float))
+            or not math.isfinite(float(longest_gap))
+            or not 0 <= float(longest_gap) <= 31 * 24 * 3600
+        ):
+            raise PermanentImportError(
+                "Home Assistant drive_lifecycle longest_gap_s is invalid", kind="protocol"
+            )
+        if (gap_count is None) != (longest_gap is None) or (
+            gap_count is not None
+            and longest_gap is not None
+            and ((gap_count == 0) != (float(longest_gap) == 0.0))
+        ):
+            raise PermanentImportError(
+                "Home Assistant drive_lifecycle gap fields disagree", kind="protocol"
+            )
+        clean["drive_lifecycle"] = {
+            "status": lifecycle_status,
+            "interruption_reason": reason,
+            "clean_end": clean_end,
+            **counters,
+            **numbers,
+            "gap_count": gap_count,
+            "longest_gap_s": float(longest_gap) if longest_gap is not None else None,
+        }
     return clean
 
 
-async def post_bundle(bundle, *, config: AppConfig | None = None) -> dict:
+async def post_bundle(
+    bundle,
+    *,
+    lifecycle: dict[str, object] | None = None,
+    canonical_summary: dict[str, object] | None = None,
+    config: AppConfig | None = None,
+) -> dict:
     """Send one bounded, gzip-compressed idempotent batch and classify every failure."""
     cfg = config or get_config()
     url = import_url(cfg)
-    token = await asyncio.to_thread(load_token, cfg)
-    raw = json.dumps(
-        bundle.ha_payload(), ensure_ascii=False, separators=(",", ":"), allow_nan=False
-    ).encode("utf-8")
+    try:
+        payload = bundle.ha_payload(
+            lifecycle=lifecycle,
+            canonical_summary=canonical_summary,
+        )
+        payload["projection_version"] = HA_PROJECTION_VERSION
+        if canonical_summary is not None:
+            # HA can accept a one-way projection amendment only after proving that the
+            # bundle-derived body it already stored is exactly the predecessor.  The
+            # original producer summary supplies that proof without exposing raw rows.
+            payload["supersedes_summary"] = bundle.ha_payload()["summary"]
+        raw = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (HAPayloadError, TypeError, ValueError) as exc:
+        raise PermanentImportError(
+            f"canonical Home Assistant projection is invalid: {exc}", kind="projection"
+        ) from None
     if len(raw) > MAX_HA_BODY_BYTES:
         raise PermanentImportError(
             f"HA import body is {len(raw)} bytes, above the 8 MiB v1 limit", kind="payload"
         )
+    token = await asyncio.to_thread(load_token, cfg)
     body = await asyncio.to_thread(gzip.compress, raw, 6)
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Content-Encoding": "gzip",
-        "Idempotency-Key": (f"{bundle.drive_id}:{bundle.bundle_sha256}:{bundle.schema_version}"),
+        "Idempotency-Key": (
+            f"{bundle.drive_id}:{bundle.bundle_sha256}:{bundle.schema_version}:"
+            f"projection-v{HA_PROJECTION_VERSION}"
+        ),
     }
     try:
         async with (
@@ -534,7 +675,7 @@ async def _mark_success(bundle_id: int, result: dict) -> None:
         row.failure_kind = None
         row.last_http_status = 200
         row.duplicate = result.get("status") == "already_imported"
-        row.ha_result = result
+        row.ha_result = {**result, "_server_projection_version": HA_PROJECTION_VERSION}
         row.updated_at = now
 
 
@@ -571,25 +712,82 @@ async def _mark_temporary(bundle_id: int, error: TemporaryImportError, *, attemp
         row.updated_at = now
 
 
-async def import_one(bundle_id: int) -> None:
+async def enqueue_stale_projections() -> int:
+    """Queue one idempotent HA refresh when the server projection contract changes."""
+    queued = 0
+    now = utcnow()
     async with session_scope() as session:
-        row = await session.get(OBDBundle, bundle_id)
-        if row is None:
-            return
-        attempts = row.attempts
-        try:
-            path = bundle_path_for(row)
-        except BundleError as exc:
-            # No bytes were moved, so keep DB state coherent with the verified directory.
-            await _mark_permanent(bundle_id, exc, status=None, kind="local_path")
-            return
+        rows = (
+            (
+                await session.execute(
+                    select(OBDBundle).where(
+                        OBDBundle.state == OBDBundleState.IMPORTED.value,
+                        OBDBundle.metadata_trusted.is_(True),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            result = row.ha_result if isinstance(row.ha_result, dict) else {}
+            if result.get("_server_projection_version") == HA_PROJECTION_VERSION:
+                continue
+            row.state = OBDBundleState.READY_TO_IMPORT.value
+            row.next_attempt_at = now
+            row.import_started_at = None
+            row.last_error = None
+            row.failure_kind = None
+            row.updated_at = now
+            queued += 1
+    return queued
 
+
+async def import_one(bundle_id: int) -> None:
+    attempts = 0
+    path: Path | None = None
     try:
+        async with session_scope() as session:
+            row = await session.get(OBDBundle, bundle_id)
+            if row is None:
+                return
+            attempts = row.attempts
+            path = bundle_path_for(row)
+            drive = (
+                await session.execute(select(OBDDrive).where(OBDDrive.bundle_id == row.id))
+            ).scalar_one_or_none()
+            if drive is None:
+                raise PermanentImportError(
+                    "verified OBD bundle has no drive projection", kind="projection"
+                )
+            projection = await reconcile_drive_projection(session, drive)
+            if projection["status"] != "ready":
+                raise PermanentImportError(
+                    "OBD lifecycle projection could not be rebuilt", kind="projection"
+                )
+            reason = drive.interruption_reason
+            if reason is not None and not SAFE_REASON_RE.fullmatch(reason):
+                reason = "unclean_end"
+            lifecycle: dict[str, object] = {
+                "lifecycle_status": drive.lifecycle_status,
+                "interruption_reason": reason,
+                "gap_count": drive.gap_count,
+                "longest_gap_s": float(drive.longest_gap_s or 0.0),
+            }
+            canonical_summary = dict(drive.summary_json)
+        assert path is not None
         validated = await asyncio.to_thread(validate_bundle, path)
         if validated.bundle_sha256 != row.bundle_hash:
             raise BundleError("verified bundle SHA-256 changed on disk")
-        result = await post_bundle(validated)
+        result = await post_bundle(
+            validated,
+            lifecycle=lifecycle,
+            canonical_summary=canonical_summary,
+        )
     except BundleError as exc:
+        if path is None:
+            await _mark_permanent(bundle_id, exc, status=None, kind="local_path")
+            return
         try:
             await asyncio.to_thread(move_to_quarantine, path)
         except (BundleError, OSError) as move_error:
@@ -813,6 +1011,13 @@ class HAImportWorker:
     async def _run(self) -> None:
         try:
             await rebuild_queue()
+            queued = await enqueue_stale_projections()
+            if queued:
+                log.info(
+                    "queued Home Assistant refreshes for a newer OBD projection",
+                    drives=queued,
+                    projection_version=HA_PROJECTION_VERSION,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -881,6 +1086,7 @@ __all__ = [
     "PermanentImportError",
     "TemporaryImportError",
     "configuration_status",
+    "enqueue_stale_projections",
     "get_import_worker",
     "import_one",
     "import_url",

@@ -21,6 +21,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.time.Instant
 import java.time.ZoneId
 import kotlin.math.min
@@ -31,10 +32,22 @@ class ObdLoggerService : Service() {
     private lateinit var exporter: BundleExporter
     private var worker: Job? = null
     private var client: ElmBleClient? = null
+    private var currentDriveId: String? = null
     private var lastDriveId: String? = null
     private var lastDriveFinished: String? = null
+    private var lastSampleAt: String? = null
+    private var ingestionRequestId: String? = null
+    private var startupRecoveredDrive: DriveFinalization? = null
+    private val pipelineMetrics = PipelineMetrics()
+    private var connectionAttempts = 0L
     private var startupAllowed = false
+    private var pendingStartupRecoveryReason = "process_terminated"
     private val statusWriteGate = StatusWriteGate()
+
+    private sealed interface RecordingExit {
+        data object EngineStopped : RecordingExit
+        data class Quiesce(val requestRead: IngestionRequestRead) : RecordingExit
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -78,7 +91,12 @@ class ObdLoggerService : Service() {
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
-        if (worker?.isActive != true) worker = scope.launch { runLogger() }
+        if (worker?.isActive != true) {
+            pendingStartupRecoveryReason = startupRecoveryReason(
+                intent?.getStringExtra(EXTRA_STARTUP_RECOVERY_REASON),
+            )
+            worker = scope.launch { runLogger() }
+        }
         return START_STICKY
     }
 
@@ -97,18 +115,31 @@ class ObdLoggerService : Service() {
 
     private suspend fun runLogger() {
         var recovered = false
+        var recoveryReason = pendingStartupRecoveryReason
+        var clearLeaseAfterBoot = recoveryReason == "device_restart"
         var failure = 0
         while (scope.isActive) {
             var config: LoggerConfig? = null
             var retryDelayMillis: Long? = null
             try {
                 if (!recovered) {
-                    database.recoverInterrupted()
+                    val recoveredDrives = database.recoverInterrupted(recoveryReason)
+                    for (drive in recoveredDrives) {
+                        database.addDiagnostic(
+                            drive.driveId,
+                            "pipeline_metrics",
+                            pipelineMetrics.snapshot().toJson(),
+                            drive.finalisedAtUtc,
+                        )
+                    }
+                    startupRecoveredDrive = recoveredDrives.lastOrNull()
                     database.lastCompletedDrive()?.let { last ->
                         lastDriveId = last.driveId
                         lastDriveFinished = last.finishedAtUtc
+                        lastSampleAt = last.lastSampleAtUtc
                     }
                     recovered = true
+                    recoveryReason = "process_terminated"
                 }
                 val loadedConfig = LoggerPreferences.load(this)
                 config = loadedConfig
@@ -127,7 +158,8 @@ class ObdLoggerService : Service() {
                     stopSelf()
                     return
                 }
-                if (DeviceFiles.removableRootOrNull(this) == null) {
+                val deviceRoot = DeviceFiles.removableRootOrNull(this)
+                if (deviceRoot == null) {
                     publish(
                         "storage_unavailable",
                         loadedConfig,
@@ -136,20 +168,53 @@ class ObdLoggerService : Service() {
                     updateNotification("Waiting for removable TF storage")
                     retryDelayMillis = 30_000
                 } else {
-                    // A process death after finishDrive(), or a prior filesystem failure, leaves
-                    // the complete drive waiting for this next safe export attempt.
-                    drainPendingExports()
-                    runOneConnection(loadedConfig)
-                    failure = 0
+                    if (clearLeaseAfterBoot) {
+                        IngestionQuiesceFiles.clearLeaseAfterBoot(deviceRoot)
+                        ingestionRequestId = null
+                        clearLeaseAfterBoot = false
+                    }
+                    when (val requestRead = IngestionQuiesceFiles.readRequest(deviceRoot)) {
+                        IngestionRequestRead.Absent -> {
+                            val resumed = IngestionQuiesceFiles.clearAcknowledgement(deviceRoot)
+                            ingestionRequestId = null
+                            if (resumed) publish("parked", loadedConfig)
+                            // A process death after finalisation, or a prior filesystem failure,
+                            // leaves the terminal drive waiting for this safe export attempt.
+                            drainPendingExports()
+                            startupRecoveredDrive = null
+                            runOneConnection(loadedConfig, deviceRoot)
+                            failure = 0
+                        }
+                        is IngestionRequestRead.Invalid -> {
+                            ingestionRequestId = null
+                            publish("ingestion_request_invalid", loadedConfig, requestRead.reason)
+                            updateNotification("Ingestion request is invalid; OBD polling paused")
+                            retryDelayMillis = 1_000
+                        }
+                        is IngestionRequestRead.Valid -> {
+                            ingestionRequestId = requestRead.request.requestId
+                            prepareParkedForIngestion(deviceRoot, loadedConfig, requestRead.request)
+                            retryDelayMillis = 500
+                            failure = 0
+                        }
+                    }
                 }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 // The failed stage may have committed startDrive before a later DB/status call
                 // failed. Re-run interrupted-drive recovery before any new connection attempt.
                 recovered = false
+                recoveryReason = "process_terminated"
                 failure += 1
                 val message = safeError(error)
                 val statusConfig = config ?: runCatching { LoggerPreferences.load(this) }.getOrNull()
+                val root = DeviceFiles.removableRootOrNull(this)
+                val request = root?.let(IngestionQuiesceFiles::readRequest)
+                if (root != null && request is IngestionRequestRead.Valid) {
+                    runCatching {
+                        IngestionQuiesceFiles.publishFailed(root, request.request, message)
+                    }
+                }
                 if (statusConfig != null) publish("backoff", statusConfig, message)
                 runCatching { updateNotification("Waiting after logger failure") }
                 val delaySeconds = if (failure <= 5) min(1L shl failure, 32L) else 300L
@@ -167,10 +232,22 @@ class ObdLoggerService : Service() {
         }
     }
 
-    private suspend fun runOneConnection(config: LoggerConfig) {
+    private suspend fun runOneConnection(config: LoggerConfig, deviceRoot: File) {
         updateNotification("Checking adapter voltage")
         publish("parked", config)
-        val elm = ElmBleClient(this, config.adapterAddress)
+        if (connectionAttempts > 0) pipelineMetrics.reconnectAttempted()
+        connectionAttempts = (connectionAttempts + 1).coerceAtMost(Int.MAX_VALUE.toLong())
+        val driveClock = MonotonicUtcClock(
+            anchorUtc = Instant.now(),
+            anchorElapsedMillis = SystemClock.elapsedRealtime(),
+            elapsedRealtimeMillis = SystemClock::elapsedRealtime,
+        )
+        val elm = ElmBleClient(
+            this,
+            config.adapterAddress,
+            pipelineMetrics,
+            driveClock::nowUtc,
+        )
         client = elm
         elm.connect()
         val lifecycle = EngineLifecycle(
@@ -178,25 +255,52 @@ class ObdLoggerService : Service() {
             voltageOff = config.voltageOff,
             graceMillis = config.offGraceSeconds * 1000,
         )
-        val voltage = elm.initialize()
+        val controlPresent = {
+            IngestionQuiesceFiles.readRequest(deviceRoot) !is IngestionRequestRead.Absent
+        }
+        val voltage = try {
+            elm.initialize(controlPresent)
+        } catch (_: ElmQuiesceRequestedException) {
+            elm.disconnect(false)
+            client = null
+            return
+        }
+        if (controlPresent()) {
+            elm.disconnect(false)
+            client = null
+            return
+        }
         if (!lifecycle.observeParkedVoltage(voltage)) {
-            elm.disconnect()
+            elm.disconnect(closeProtocol = !controlPresent())
             updateNotification("Parked; next safe voltage check in 30 s")
             publish("parked", config)
-            delay(30_000)
+            waitForNextParkedProbe(deviceRoot, 30_000)
             return
         }
         publish("probing", config)
         updateNotification("Proving ECU response")
-        val supported = elm.proveEcu()
-        val protocolNumber = try {
-            elm.queryProtocolNumber()
-        } catch (_: Exception) {
-            null
+        val supported = try {
+            elm.proveEcu(controlPresent)
+        } catch (_: ElmQuiesceRequestedException) {
+            elm.disconnect(false)
+            client = null
+            return
+        }
+        if (controlPresent()) {
+            elm.disconnect(false)
+            client = null
+            return
+        }
+        val protocolNumber = elm.queryProtocolNumber()
+        if (controlPresent()) {
+            elm.disconnect(false)
+            client = null
+            return
         }
         check(lifecycle.acceptChecksumValidEcuProof(true))
-        val driveId = uuid7()
-        val startedAt = Instant.now().toString()
+        val startedAt = driveClock.nowUtc()
+        val driveId = uuid7(Instant.parse(startedAt).toEpochMilli())
+        elm.beginDriveEvidence()
         database.startDrive(
             DriveRecord(
                 driveId = driveId,
@@ -210,43 +314,119 @@ class ObdLoggerService : Service() {
                 obdProtocol = "AUTO, ISO 9141-2",
             ),
         )
-        database.addDiagnostic(
-            driveId,
-            "protocol_change",
-            JSONObject()
-                .put("protocol", "AUTO, ISO 9141-2")
-                .put("protocol_number", protocolNumber ?: JSONObject.NULL),
-            startedAt,
-        )
-        database.addDiagnostic(
-            driveId,
-            "mode01_support",
-            JSONObject().put("supported_pids", JSONArray(supported.sorted())),
-            startedAt,
-        )
-        publish("ecu_online", config)
-        updateNotification("Recording vehicle telemetry")
+        currentDriveId = driveId
         try {
-            recordDrive(config, elm, driveId, supported, lifecycle)
-        } catch (error: Exception) {
-            database.incrementError(driveId)
             database.addDiagnostic(
                 driveId,
-                if (error is ElmProtocolException) "parser_failure" else "connection_failure",
+                "protocol_change",
                 JSONObject()
-                    .put("category", if (error is ElmProtocolException) "live_pid" else "ble_or_elm")
-                    .put("message", safeError(error)),
+                    .put("protocol", "AUTO, ISO 9141-2")
+                    .put("protocol_number", protocolNumber ?: JSONObject.NULL),
+                startedAt,
             )
-            lastDriveFinished = database.finishDrive(driveId, "connection_lost", false)
-            lastDriveId = driveId
+            database.addDiagnostic(
+                driveId,
+                "mode01_support",
+                JSONObject().put("supported_pids", JSONArray(supported.sorted())),
+                startedAt,
+            )
+            publish("ecu_online", config)
+            updateNotification("Recording vehicle telemetry")
+            when (
+                val exit = recordDrive(
+                    config, elm, driveId, supported, lifecycle, deviceRoot, driveClock,
+                )
+            ) {
+                RecordingExit.EngineStopped -> {
+                    val finalised = finalizeActiveDrive(
+                        driveId,
+                        "engine_stopped",
+                        elm.lastSuccessfulResponseAtUtc,
+                        driveClock.nowUtc(),
+                        driveClock::nowUtc,
+                    )
+                    drainPendingExports()
+                    elm.disconnect()
+                    client = null
+                    publish("parked", config)
+                    check(finalised.status == "complete")
+                }
+                is RecordingExit.Quiesce -> {
+                    val request = (exit.requestRead as? IngestionRequestRead.Valid)?.request
+                    val finalised = finalizeActiveDrive(
+                        driveId,
+                        "ingestion_requested",
+                        elm.lastSuccessfulResponseAtUtc,
+                        driveClock.nowUtc(),
+                        driveClock::nowUtc,
+                    )
+                    val exported = exportTerminalDriveForIngestion(finalised)
+                    drainPendingExportsStrict()
+                    database.checkpointForIngestion()
+                    elm.disconnect(false)
+                    client = null
+                    if (request == null) {
+                        publish(
+                            "ingestion_request_invalid",
+                            config,
+                            (exit.requestRead as IngestionRequestRead.Invalid).reason,
+                        )
+                    } else if (requestStillActive(deviceRoot, request)) {
+                        ingestionRequestId = request.requestId
+                        IngestionQuiesceFiles.publishReady(
+                            deviceRoot,
+                            request,
+                            acknowledgementMetadata(finalised, exported),
+                        )
+                        publish("ingestion_ready", config)
+                        updateNotification("OBD persisted; ready for ingestion")
+                    } else {
+                        ingestionRequestId = null
+                        IngestionQuiesceFiles.clearAcknowledgement(deviceRoot)
+                        publish("parked", config, "ingestion request removed before acknowledgement")
+                    }
+                }
+            }
+        } catch (error: Exception) {
+            val reason = when (error) {
+                is CancellationException -> if (
+                    runCatching { LoggerPreferences.load(this).canRun }.getOrDefault(true)
+                ) {
+                    "process_terminated"
+                } else {
+                    "administratively_disabled"
+                }
+                is ElmCommandTimeoutException -> "command_timeout"
+                is ElmProtocolException -> "parser_failure"
+                is android.database.SQLException -> "database_fault"
+                else -> "connection_lost"
+            }
+            val faultAtUtc = driveClock.nowUtc()
+            if (error is ElmProtocolException) recordParserFailure(error)
+            runCatching { database.incrementError(driveId) }
+            runCatching { database.recordProcessingError(driveId, safeError(error)) }
+            runCatching {
+                database.addDiagnostic(
+                    driveId,
+                    if (error is ElmProtocolException) "parser_failure" else "connection_failure",
+                    JSONObject()
+                        .put("category", if (error is ElmProtocolException) "live_pid" else "ble_or_elm")
+                        .put("message", safeError(error)),
+                    faultAtUtc,
+                )
+            }
+            runCatching {
+                finalizeActiveDrive(
+                    driveId,
+                    reason,
+                    elm.lastSuccessfulResponseAtUtc,
+                    faultAtUtc,
+                    driveClock::nowUtc,
+                )
+            }
             drainPendingExports()
             throw error
         }
-        elm.disconnect()
-        lastDriveFinished = database.finishDrive(driveId, "engine_stopped", true)
-        lastDriveId = driveId
-        drainPendingExports()
-        publish("parked", config)
     }
 
     private suspend fun recordDrive(
@@ -255,17 +435,30 @@ class ObdLoggerService : Service() {
         driveId: String,
         supported: Set<Int>,
         lifecycle: EngineLifecycle,
-    ) {
+        deviceRoot: File,
+        driveClock: MonotonicUtcClock,
+    ): RecordingExit {
         val diagnosticScan = DiagnosticScan(elm, driveId)
         val malformedLivePids = LivePidMalformedTracker()
         var sequence = 0L
         while (scope.isActive) {
+            currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
             val cycleStarted = SystemClock.elapsedRealtime()
             val requested = ObdPollPlan.requestedPids(sequence, supported)
             val values = linkedMapOf<String, Any>()
             val missing = mutableListOf<Int>()
             for ((requestedIndex, pid) in requested.withIndex()) {
-                if (malformedLivePids.isMalformed(pid)) {
+                currentQuiesceRequest(deviceRoot)?.let {
+                    persistPartialSample(
+                        driveId,
+                        sequence,
+                        values,
+                        missing + requested.drop(requestedIndex),
+                        driveClock.nowUtc(),
+                    )
+                    return RecordingExit.Quiesce(it)
+                }
+                if (!malformedLivePids.shouldPoll(pid, sequence)) {
                     missing += pid
                     continue
                 }
@@ -279,43 +472,61 @@ class ObdLoggerService : Service() {
                         sequence,
                         values,
                         missing + requested.drop(requestedIndex),
+                        driveClock.nowUtc(),
                     )
                     throw error
                 }
                 when (result) {
                     LivePidPollResult.Missing -> {
+                        malformedLivePids.recordValid(pid)
                         missing += pid
                     }
                     is LivePidPollResult.Values -> {
+                        malformedLivePids.recordValid(pid)
                         values.putAll(result.decoded)
                     }
                     is LivePidPollResult.Malformed -> {
                         missing += pid
+                        recordParserFailure(result.error)
                         val message = safeError(result.error)
-                        if (malformedLivePids.markMalformed(pid)) {
-                            database.incrementError(driveId)
-                            database.addDiagnostic(
-                                driveId,
-                                "parser_failure",
-                                JSONObject()
-                                    .put("category", "live_pid_%02X".format(pid))
-                                    .put("message", message)
-                            )
-                        }
+                        malformedLivePids.recordMalformed(pid, sequence)
+                        database.incrementError(driveId)
+                        database.addDiagnostic(
+                            driveId,
+                            "parser_failure",
+                            JSONObject()
+                                .put("category", "live_pid_%02X".format(pid))
+                                .put("message", message),
+                            driveClock.nowUtc(),
+                        )
                     }
                 }
+                currentQuiesceRequest(deviceRoot)?.let {
+                    persistPartialSample(
+                        driveId,
+                        sequence,
+                        values,
+                        missing + requested.drop(requestedIndex + 1),
+                        driveClock.nowUtc(),
+                    )
+                    return RecordingExit.Quiesce(it)
+                }
+            }
+            currentQuiesceRequest(deviceRoot)?.let {
+                persistPartialSample(driveId, sequence, values, missing, driveClock.nowUtc())
+                return RecordingExit.Quiesce(it)
             }
             try {
                 elm.readVoltage()?.let { values["adapter_voltage"] = it }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                persistPartialSample(driveId, sequence, values, missing)
+                persistPartialSample(driveId, sequence, values, missing, driveClock.nowUtc())
                 throw error
             }
             values.putAll(ElmProtocol.estimates(values))
-            val sampleTimestamp = Instant.now().toString()
-            database.addSample(
+            val sampleTimestamp = driveClock.nowUtc()
+            persistSample(
                 SampleRecord(
                     driveId = driveId,
                     sequence = sequence,
@@ -325,20 +536,23 @@ class ObdLoggerService : Service() {
                     missingPids = missing,
                 ),
             )
+            currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
             // At most one sparse diagnostic command is allowed after a committed sample.
             // Even a 6-second prompt timeout therefore cannot turn a scan into a minute-long
             // hole in the fast stream. ElmBleClient's mutex still serializes the FFF1 channel.
             diagnosticScan.runOne(sequence, sampleTimestamp)
+            currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
             val running = lifecycle.remainsRecording(
                 SystemClock.elapsedRealtime(),
                 values["adapter_voltage"] as? Double,
                 values["engine_rpm"] as? Double,
             )
-            if (!running) return
+            if (!running) return RecordingExit.EngineStopped
             sequence += 1
             publish("ecu_online", config)
             delay((5_000 - (SystemClock.elapsedRealtime() - cycleStarted)).coerceAtLeast(0))
         }
+        throw CancellationException("logger scope stopped")
     }
 
     private fun persistPartialSample(
@@ -346,6 +560,7 @@ class ObdLoggerService : Service() {
         sequence: Long,
         observedValues: Map<String, Any>,
         missingPids: List<Int>,
+        timestampUtc: String,
     ) {
         if (observedValues.isEmpty()) return
         val values = LinkedHashMap(observedValues)
@@ -353,11 +568,137 @@ class ObdLoggerService : Service() {
         partialSampleAfterTransportFailure(
             driveId = driveId,
             sequence = sequence,
-            timestampUtc = Instant.now().toString(),
+            timestampUtc = timestampUtc,
             values = values,
             missingPids = missingPids,
-        )?.let(database::addSample)
+        )?.let(::persistSample)
     }
+
+    private fun persistSample(sample: SampleRecord): Boolean {
+        pipelineMetrics.sampleCreated()
+        pipelineMetrics.sampleQueued()
+        return try {
+            val inserted = database.addSample(sample)
+            if (inserted) {
+                pipelineMetrics.samplePersisted()
+                lastSampleAt = sample.timestampUtc
+            } else {
+                pipelineMetrics.sampleDropped()
+            }
+            inserted
+        } catch (error: Exception) {
+            pipelineMetrics.databaseWriteFailed()
+            throw error
+        }
+    }
+
+    private fun currentQuiesceRequest(deviceRoot: File): IngestionRequestRead? =
+        IngestionQuiesceFiles.readRequest(deviceRoot).takeUnless {
+            it is IngestionRequestRead.Absent
+        }
+
+    private fun recordParserFailure(error: ElmProtocolException) {
+        pipelineMetrics.parserFailure(
+            checksumFailure = error.message?.contains("checksum", ignoreCase = true) == true,
+        )
+    }
+
+    private fun finalizeActiveDrive(
+        driveId: String,
+        stopReason: String,
+        lastSuccessfulResponseAtUtc: String?,
+        noticedAtUtc: String,
+        finalisedAtUtc: () -> String,
+    ): DriveFinalization {
+        val noticedAt = Instant.parse(noticedAtUtc).toString()
+        database.addDiagnostic(
+            driveId,
+            "pipeline_metrics",
+            pipelineMetrics.snapshot().toJson(),
+            noticedAt,
+        )
+        database.markFinalising(
+            driveId,
+            stopReason,
+            noticedAt,
+            lastSuccessfulResponseAtUtc,
+        )
+        val finalised = database.finalizeDrive(
+            driveId = driveId,
+            stopReason = stopReason,
+            noticedAtUtc = noticedAt,
+            requestedFinishAtUtc = if (stopReason == "engine_stopped") noticedAt else null,
+            lastSuccessfulResponseAtUtc = lastSuccessfulResponseAtUtc,
+            finalisedAtUtc = finalisedAtUtc(),
+        )
+        currentDriveId = null
+        lastDriveId = driveId
+        lastDriveFinished = finalised.finishTimeUtc
+        lastSampleAt = finalised.lastSampleAtUtc
+        return finalised
+    }
+
+    private fun exportTerminalDriveForIngestion(finalised: DriveFinalization): ExportedBundle? {
+        if (finalised.sampleCount <= 0) {
+            database.prepareCompletedExports()
+            return null
+        }
+        return exporter.export(finalised.driveId)
+    }
+
+    private fun acknowledgementMetadata(
+        finalised: DriveFinalization,
+        exported: ExportedBundle?,
+    ): IngestionAckMetadata = IngestionAckMetadata(
+        driveId = finalised.driveId,
+        lastSampleAtUtc = finalised.lastSampleAtUtc,
+        bundleFilename = exported?.file?.name,
+        bundleSha256 = exported?.sha256,
+    )
+
+    private fun prepareParkedForIngestion(
+        deviceRoot: File,
+        config: LoggerConfig,
+        request: IngestionRequest,
+    ) {
+        if (!requestStillActive(deviceRoot, request)) return
+        if (IngestionQuiesceFiles.isReadyFor(deviceRoot, request.requestId)) {
+            startupRecoveredDrive = null
+            publish("ingestion_ready", config)
+            updateNotification("OBD persisted; ready for ingestion")
+            return
+        }
+        drainPendingExportsStrict()
+        database.checkpointForIngestion()
+        if (!requestStillActive(deviceRoot, request)) return
+        val metadata = startupRecoveredDrive?.let { recoveredDrive ->
+            val actualBundle = if (recoveredDrive.sampleCount > 0) {
+                // Revalidate/recreate the local immutable file even when a prior server receipt
+                // allowed retention to prune it. An ACK must never name a file that is absent.
+                exporter.export(recoveredDrive.driveId)
+            } else {
+                null
+            }
+            acknowledgementMetadata(recoveredDrive, actualBundle)
+        } ?: IngestionAckMetadata()
+        IngestionQuiesceFiles.publishReady(deviceRoot, request, metadata)
+        startupRecoveredDrive = null
+        publish("ingestion_ready", config)
+        updateNotification("OBD persisted; ready for ingestion")
+    }
+
+    private suspend fun waitForNextParkedProbe(deviceRoot: File, durationMillis: Long) {
+        val started = SystemClock.elapsedRealtime()
+        while (scope.isActive && SystemClock.elapsedRealtime() - started < durationMillis) {
+            if (IngestionQuiesceFiles.readRequest(deviceRoot) !is IngestionRequestRead.Absent) return
+            val remaining = durationMillis - (SystemClock.elapsedRealtime() - started)
+            delay(minOf(250L, remaining.coerceAtLeast(1L)))
+        }
+    }
+
+    private fun requestStillActive(deviceRoot: File, request: IngestionRequest): Boolean =
+        (IngestionQuiesceFiles.readRequest(deviceRoot) as? IngestionRequestRead.Valid)
+            ?.request?.requestId == request.requestId
 
     private data class DiagnosticStep(
         val category: String,
@@ -388,6 +729,7 @@ class ObdLoggerService : Service() {
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
+                if (error is ElmProtocolException) recordParserFailure(error)
                 val status = diagnosticProbeStatus(error)
                 when {
                     step.category == "readiness" -> storeScanStatus(
@@ -706,6 +1048,13 @@ class ObdLoggerService : Service() {
         }
     }
 
+    /** Unlike background draining, quiesce cannot acknowledge success after an export failure. */
+    private fun drainPendingExportsStrict() {
+        exporter.reconcileMissingExports()
+        for (driveId in database.prepareCompletedExports()) exporter.export(driveId)
+        runCatching { exporter.enforceRetention() }
+    }
+
     private fun exportSafely(driveId: String) {
         try {
             exporter.export(driveId)
@@ -727,22 +1076,20 @@ class ObdLoggerService : Service() {
     }
 
     private fun publish(state: String, config: LoggerConfig, error: String? = null) {
-        val signature = listOf(
-            state,
-            config.ownershipTransferred.toString(),
-            lastDriveId.orEmpty(),
-            lastDriveFinished.orEmpty(),
-            error.orEmpty(),
-        ).joinToString("\u0000")
-        if (!statusWriteGate.shouldWrite(signature, SystemClock.elapsedRealtime())) return
         val status = PublicStatus(
             state = state,
             ownershipEnabled = config.ownershipTransferred,
+            currentDriveId = currentDriveId,
             lastDriveId = lastDriveId,
             lastDriveFinishedAtUtc = lastDriveFinished,
+            ingestionRequestId = ingestionRequestId,
+            lastSampleAtUtc = lastSampleAt,
+            metrics = pipelineMetrics.snapshot(),
             lastError = error,
             lastErrorAtUtc = error?.let { Instant.now().toString() },
         )
+        val signature = durableStatusSignature(status)
+        if (!statusWriteGate.shouldWrite(signature, SystemClock.elapsedRealtime())) return
         runCatching {
             StatusPublisher.publish(this, status)
         }.onFailure {
@@ -751,8 +1098,7 @@ class ObdLoggerService : Service() {
     }
 
     private fun safeError(error: Exception): String {
-        val raw = error.message ?: error.javaClass.simpleName
-        return raw.replace(Regex("[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}"), "<adapter>").take(240)
+        return boundedRedactedError(error.message, fallback = error.javaClass.simpleName)
     }
 
     private fun createNotificationChannel() {

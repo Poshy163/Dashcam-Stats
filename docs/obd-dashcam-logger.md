@@ -25,15 +25,18 @@ Default host-readable paths (verify the removable-volume alias on the physical u
 
 ```text
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/status.json
+/storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/control/ingestion-request.json
+/storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/control/ingestion-ack.json
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/ready/<drive_id>.obd2.zip
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/receipts/<drive_id>.verified.json
 ```
 
 The backup server's `DASHCAM_OBD_REMOTE_READY_DIR`, `DASHCAM_OBD_REMOTE_STATUS_FILE`, and
 `DASHCAM_OBD_REMOTE_RECEIPTS_DIR` settings are overrides for a unit whose app-specific path
-resolves differently. `status.json` contains only
-state, the ownership gate, last-drive metadata, pending count and a bounded redacted error. It
-contains no adapter address, VIN, credentials or telemetry payload.
+resolves differently. Status schema v2 publishes `ingestion_quiesce_v1`, current/last drive
+identity, last sample, pending bundle count, the correlated ingestion request ID and fixed-schema
+saturating pipeline counters. It contains no adapter address, VIN, credentials, command/response
+payload or telemetry.
 
 ## Build, sign and install
 
@@ -110,16 +113,41 @@ uses the 13.0 V threshold, a 30-second grace, and a recent RPM above 300 veto. E
 a read-only allowlist. Mode 04/08, raw monitors, security/programming/reset requests and persistent
 ELM writes are absent and refused.
 
+Before device ingestion takes Bluetooth away, the controller atomically writes the exact
+five-field schema-v1 `control/ingestion-request.json` (`schema_version`, safe `request_id`,
+`action=prepare_for_ingest`, `requested_at_utc`, `deadline_at_utc`). The logger checks between
+commands: it schedules no new PID after seeing the file, lets the current bounded command finish,
+persists any non-empty partial sample, records final pipeline metrics, finalises atomically, exports
+and validates the immutable bundle, performs a FULL WAL checkpoint, then closes BLE. Only then does
+it atomically publish the exact nine-field acknowledgement containing the correlated ID, state,
+ready time, nullable drive/sample/bundle identity and nullable bounded error. A parked logger can
+acknowledge with null drive metadata. A stale startup request first recovers and exports any
+`recording`/`finalising` drive. `deadline_at_utc` is the overall quiesce hold lease: its requested
+duration must be 1–600 seconds, with only 60 seconds of bounded clock-skew tolerance. An expired
+lease, an overlong lease, or a request materially in the future is atomically removed with its
+correlated acknowledgement and treated as absent, so a controller crash cannot pause logging
+forever. A malformed request blocks only while its safe file timestamp is within the same bounded
+lease-and-skew horizon; an older crash remnant is atomically removed with its acknowledgement. A
+reboot invalidates any prior hold before polling. While a current request persists (including
+fresh malformed input), the logger neither reconnects nor polls the ECU; controller removal or
+safe lease expiry clears the acknowledgement and resumes.
+
 The single FFF1 command stream is prompt-delimited and bounded. A missing prompt, failed protocol
-search, write uncertainty or overflow taints the session; the service closes GATT and starts again
+search, write uncertainty, overflow, multiple prompts, non-whitespace trailing bytes or an idle
+notification taints the session without carrying bytes into the next command; the service closes GATT and starts again
 with a fresh `ATZ` only after bounded exponential backoff. Sparse diagnostic scans read Modes
 03/07/0A, Mode 01 readiness/MIL, supported Mode 09 calibration evidence, and correctly framed
 Mode 02 freeze-frame number 0 (including explicit empty/no-data evidence). Strict parsing requires
 the complete `48 6B <source>` ISO header, learned ECU source, exact length and checksum. A malformed
 reply is recorded as a parser failure; it is never treated as an empty PID or cleared DTC list.
 Because `command()` only returns once the next ELM prompt arrives, a malformed but prompt-complete
-reply to an optional live PID leaves the command stream synchronized: it is recorded once as a
-parser failure, that PID is suppressed for the rest of the connection, and the loop continues.
+reply to an optional live PID leaves the command stream synchronized. That PID enters a bounded
+per-PID cooldown and is retried; a transient MAF failure can recover, while a repeatedly malformed
+advertised PID backs off to at most one retry per 12 sample cycles. Strict source, length and
+checksum validation is unchanged. Medium PIDs are phase-distributed across three cycles and slow
+PIDs across phases 0/4/8 of each 12-cycle window, preserving each PID's cadence without putting
+every optional command in the same cycle. App `0.2.0` identifies this plan and hardened bundles
+declare `poll_plan_version=2`.
 Only transport-level faults (missing prompt, overflow, failed write, disconnect) still taint and
 reconnect, and a fatal fault mid-cycle first persists the partial sample already gathered, marked
 `failed_after_partial`/`partial`, so observed values survive the reconnect.
@@ -131,13 +159,39 @@ send Mode 04/08 or clear DTCs.
 
 SQLite stores drives, samples and sparse diagnostics transactionally with stable UUIDv7 drive IDs,
 stable `<drive_id>-<sequence>` sample IDs, UTC timestamps, explicit values and parser/transport
-quality. Diagnostics deduplicate only an unchanged consecutive value of the same kind; a real
-`A → B → A` transition keeps all three observations and timestamps. A process restart closes an
-interrupted drive at its final persisted sample timestamp (not
-at the later reboot time), marks it unclean and drains every completed, unexported drive before
-starting another drive. This also retries a crash after `finishDrive` and prior export failures.
+quality. Each connection captures one UTC anchor and advances drive/sample/response/notice time
+only from Android elapsed realtime, so NTP or manual wall-clock changes cannot regress a drive's
+sequence timestamps. Recovery clamps later lifecycle clocks to the final sequence sample when the
+wall clock was corrected backward, and bundle creation is likewise ordered after finalisation.
+Diagnostics deduplicate only an unchanged consecutive value of the same kind; a real
+`A → B → A` transition keeps all three observations and timestamps. Startup recovery closes an
+orphaned `recording` or `finalising` drive at its final persisted sample timestamp (not at the
+later notice time) and drains every terminal unexported drive before starting another drive. Only
+an actual `BOOT_COMPLETED` launch labels a stale recording `recovered` with `device_restart`;
+ordinary service/process recreation labels it `interrupted` with `process_terminated`, while a
+pre-existing `finalising` marker keeps its original reason. Live connection, command, parser, ingestion, administrative and process
+faults end as `interrupted`; only the engine-off gate produces clean `complete`. Finalisation first
+persists a `finalising` marker and then atomically fixes the terminal status, reason, evidence-based
+finish, last sample, real last prompt-complete response, later notice time and finalisation time.
+Repeating either finalisation or startup reconciliation leaves those clocks and export identity
+unchanged. This also retries a crash after finalisation and prior export failures.
 Zero-sample crash remnants are retained in SQLite with
 `export_status=not_exportable_zero_samples`; no server-invalid empty bundle is published.
+Every terminal drive also receives a bounded `pipeline_metrics` diagnostic covering command,
+notification/fragment/frame, timeout, checksum/parser, sample/persistence/drop, BLE disconnect,
+reconnect and direct-path queue depth counters without raw payloads.
+`status.json` keeps the latest sampled timestamp and bounded metrics snapshot, but durable status
+writes occur immediately only for state/ownership/drive/request/error changes and otherwise on a
+five-minute heartbeat. SQLite sample commits remain independent, avoiding an extra TF-card fsync
+and atomic rename on every five-second polling cycle.
+
+Before an on-device schema upgrade, the logger forces a complete WAL checkpoint, validates the
+source, then publishes a synced main-only migration snapshot with a ready marker; SQLite SHM is
+never treated as durable backup data. Restore copies and validates a staged main file before an
+atomic replacement, keeps a synced full-set restore marker until stale WAL/SHM/journal files are
+removed and the restored database passes `quick_check`, and replays that marker after power loss.
+The live main file is never pre-deleted. A valid retained backup is also recovered before open when
+the main file is absent or corrupt.
 
 Each final `<drive_id>.obd2.zip` is `ZIP_STORED` and contains exactly:
 
@@ -150,8 +204,8 @@ summary.json
 
 The exporter writes `<drive_id>.obd2.zip.partial`, flushes the payloads and archive, validates
 member names/sizes/SHA-256 hashes, then renames it atomically. The manifest records schema version
-1, identity/times, `completion_status=complete` for an ordinary finish or `recovered` for a drive
-closed after interruption, the separate `clean_end` flag, exact units, counts, and a
+1, identity/times, `completion_status=complete`, `interrupted` or `recovered`, the separate
+`clean_end` flag, lifecycle clocks/reason, exact units, counts, and a
 size/hash/count map for all three payload members. The whole-file SHA-256 is recorded in SQLite
 and recomputed by the server after copy; it cannot be embedded in the archive it hashes. The
 server is the primary high-resolution history. Home Assistant receives the final sample identity,

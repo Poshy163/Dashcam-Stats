@@ -153,8 +153,8 @@ Tables (`backend/app/db/models.py`): `obd_bundles` (queue + identity), `obd_driv
 (per-drive rollups, units, manifest/summary JSON), `obd_samples` (every sample, typed
 columns per metric, `(drive_db_id, sequence)` unique), `obd_diagnostics` (sparse events).
 
-Authenticated API (session cookie, or `X-API-Key` header / `?k=` once a key is configured
-in Settings → security):
+Authenticated API (session cookie or `X-API-Key` header once a key is configured in
+Settings → security; do not put standing credentials in API URLs):
 
 ```text
 GET  /api/obd/status                      logger/transfer/queue snapshot
@@ -162,7 +162,9 @@ GET  /api/obd/bundles                     queue rows (filter by state)
 GET  /api/obd/drives                      drive list with rollups + import_state
 GET  /api/obd/drives/summary              library-wide aggregate totals
 GET  /api/obd/drives/{drive_id}/series    every sample + diagnostics + journey link
+GET  /api/obd/drives/{drive_id}/bundle    hash-checked immutable archive download
 GET  /api/obd/drives/for-journey/{id}     best time-overlap drive for a footage journey
+POST /api/obd/drives/{drive_id}/reprocess rebuild lifecycle/gap projection idempotently
 POST /api/obd/bundles/{id}/validate       manual revalidation / quarantine promotion
 POST /api/obd/bundles/{id}/retry          re-queue a failed HA import
 POST /api/obd/queue/rebuild               re-register orphans in /data/obd/verified
@@ -185,15 +187,14 @@ carries `journey {id, title, overlap_s}`, and `for-journey` returns the drive.
 
 Chart rendering rules (all in `ObdDriveDetail.tsx`, no chart library):
 
-- Series bridge gaps up to **2.5× their own median observation cadence** — a slow-tier
-  PID (value every ~20 s) draws as a line while a fast series still breaks where the link
-  actually dropped. Isolated observations render as dots, never silently discarded. (The
-  original renderer split on every null and dropped single-point runs, which made sparse
-  tiers invisible while the legend quoted their range.)
+- Series bridge only up to **1.5× the explicit poll-plan cadence** (5/15/60 s by tier).
+  Sparse or interrupted data therefore cannot teach the renderer that a long outage was
+  normal. Isolated observations render as measured dots, never silently discarded; the
+  legend names the last observation time and marks it stale beyond the same threshold.
 - Tooltips follow mouse **and touch** (`pointermove`, `touch-action: pan-y` so the head
   unit's screen still scrolls), snap to the nearest sample, and show elapsed time plus
-  wall-clock date/time; a null at the exact sample falls back to the nearest observation
-  within 30 s — which is what the bridged line claims there anyway.
+  wall-clock date/time; a null at the exact sample remains null rather than borrowing a
+  nearby value. Each series carries its own unit and measured/derived provenance.
 - Axis tick decimals follow the axis *range*, not value magnitude, and an all-non-negative
   series never gets a padded negative floor.
 - Derived time-in-band numbers charge each interval to the sample ending it, capped at

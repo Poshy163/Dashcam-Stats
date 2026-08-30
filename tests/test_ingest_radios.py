@@ -85,7 +85,12 @@ def unit_shell(monkeypatch):
 
     monkeypatch.setattr(adb, "shell", shell)
 
-    async def no_watchdog(address, deadline_s):
+    async def shell_script(address, script, **kwargs):
+        return await shell(address, script, **kwargs)
+
+    monkeypatch.setattr(radios, "_shell_script", shell_script)
+
+    async def no_watchdog(address, deadline_s, **kwargs):
         return None
 
     monkeypatch.setattr(radios, "_arm_watchdog", no_watchdog)
@@ -112,6 +117,65 @@ def unit_shell(monkeypatch):
 
 def _issued(commands: list[str], fragment: str) -> list[int]:
     return [index for index, command in enumerate(commands) if fragment in command]
+
+
+def test_hotspot_passphrase_is_excluded_from_radio_object_representations():
+    snapshot = radios.RadioSnapshot(
+        bluetooth="on",
+        hotspot="on",
+        hotspot_config=("CarSpot", "roadtrip99"),
+    )
+    quiet = radios.RadioQuiet(
+        "unit",
+        online_for=60,
+        watchdog_deadline_s=120,
+        hotspot_restore=("CarSpot", "roadtrip99"),
+    )
+    assert "roadtrip99" not in repr(snapshot)
+    assert "roadtrip99" not in repr(quiet)
+
+
+async def test_hotspot_credentials_travel_over_stdin_not_process_argv(monkeypatch):
+    captured = {}
+
+    class ScriptProcess:
+        returncode = 0
+
+        async def communicate(self, body):
+            captured["body"] = body
+            return b"ok\n", b""
+
+    async def spawn(*args, **kwargs):
+        captured["args"] = args
+        return ScriptProcess()
+
+    monkeypatch.setattr(radios.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(adb, "adb_path", lambda: "adb")
+    reply = await radios._shell_script(
+        "unit:5555",
+        "cmd wifi start-softap 'CarSpot' wpa2 'roadtrip99'",
+        timeout=1,
+    )
+
+    assert reply == "ok"
+    assert "roadtrip99" not in " ".join(captured["args"])
+    assert b"roadtrip99" in captured["body"]
+
+
+async def test_device_identity_is_stable_across_reboots_without_storing_serial(monkeypatch):
+    boot_one = "01234567-89ab-cdef-0123-456789abcdef"
+    boot_two = "11111111-2222-3333-4444-555555555555"
+
+    async def shell(_address, _command, **_kwargs):
+        return f"dashcam-serial-42\n{boot_one}"
+
+    monkeypatch.setattr(adb, "shell", shell)
+    first = await radios.read_device_boot_id("unit:5555")
+    assert first is not None and first.endswith(f"@{boot_one}")
+    assert "dashcam-serial-42" not in first
+    fingerprint = first.partition("@")[0]
+    assert radios.same_device_identity(first, f"{fingerprint}@{boot_two}")
+    assert not radios.same_device_identity(first, f"{'f' * 32}@{boot_two}")
 
 
 @pytest.fixture(autouse=True)
@@ -233,7 +297,7 @@ class TestBluetooth:
     async def test_a_successful_restore_stands_down_the_watchdog(self, unit_shell, monkeypatch):
         watchdog = FakeProcess()
 
-        async def armed(address, deadline_s):
+        async def armed(address, deadline_s, **kwargs):
             return watchdog
 
         monkeypatch.setattr(radios, "_arm_watchdog", armed)
@@ -256,7 +320,7 @@ class TestBluetooth:
         """
         watchdog = FakeProcess()
 
-        async def armed(address, deadline_s):
+        async def armed(address, deadline_s, **kwargs):
             return watchdog
 
         monkeypatch.setattr(radios, "_arm_watchdog", armed)
@@ -281,8 +345,13 @@ class TestTheWatchdog:
             captured["args"] = args
             return FakeProcess()
 
+        async def fake_shell(address, command, **kwargs):
+            assert address == "u:5555"
+            return "armed" if radios.WATCHDOG_READY_PATH in command else ""
+
         monkeypatch.setattr(radios.asyncio, "create_subprocess_exec", fake_spawn)
         monkeypatch.setattr(adb, "adb_path", lambda: "adb")
+        monkeypatch.setattr(adb, "shell", fake_shell)
 
         await radios._arm_watchdog("u:5555", 300)
 
@@ -291,7 +360,144 @@ class TestTheWatchdog:
         assert radios.FLAG_PATH in command
         assert "bluetooth_manager enable" in command
         # The gate: a watchdog whose run already restored must do nothing at all.
-        assert f"[ -f '{radios.FLAG_PATH}' ] || exit 0" in command
+        assert f"[ -f '{radios.FLAG_PATH}' ] ||" in command
+        assert radios.WATCHDOG_READY_PATH in command
+
+    @pytest.mark.parametrize(
+        ("hotspot_baseline", "with_capsule", "expected", "forbidden"),
+        [
+            (
+                "off",
+                False,
+                ("bluetooth_manager enable", "sleep 5", "service call tethering"),
+                ("start-softap",),
+            ),
+            (
+                "on",
+                True,
+                ("bluetooth_manager enable", "sleep 5", "start-softap"),
+                ("service call tethering",),
+            ),
+            (
+                "transport",
+                False,
+                ("bluetooth_manager enable",),
+                ("sleep 5", "service call tethering", "start-softap"),
+            ),
+        ],
+    )
+    async def test_crash_watchdog_restores_exact_hotspot_baseline_after_bluetooth(
+        self,
+        monkeypatch,
+        hotspot_baseline,
+        with_capsule,
+        expected,
+        forbidden,
+    ):
+        captured: dict[str, tuple] = {}
+        capsule = (
+            f"{radios.HOTSPOT_CAPSULE_PREFIX}01234567-89ab-cdef-0123-456789abcdef.json"
+            if with_capsule
+            else None
+        )
+
+        async def fake_spawn(*args, **kwargs):
+            captured["args"] = args
+            return FakeProcess()
+
+        async def fake_shell(_address, command, **_kwargs):
+            return "armed" if radios.WATCHDOG_READY_PATH in command else ""
+
+        monkeypatch.setattr(radios.asyncio, "create_subprocess_exec", fake_spawn)
+        monkeypatch.setattr(adb, "adb_path", lambda: "adb")
+        monkeypatch.setattr(adb, "shell", fake_shell)
+
+        assert await radios._arm_watchdog(
+            "u:5555",
+            300,
+            restore_bluetooth=True,
+            hotspot_baseline=hotspot_baseline,
+            hotspot_capsule_path=capsule,
+        )
+        command = captured["args"][-1]
+        positions = [command.index(fragment) for fragment in expected]
+        assert positions == sorted(positions)
+        assert all(fragment not in command for fragment in forbidden)
+
+    async def test_hotspot_watchdog_retains_recovery_capsule_until_verified(self, monkeypatch):
+        captured: dict[str, tuple] = {}
+        capsule = f"{radios.HOTSPOT_CAPSULE_PREFIX}01234567-89ab-cdef-0123-456789abcdef.json"
+
+        async def fake_spawn(*args, **kwargs):
+            captured["args"] = args
+            return FakeProcess()
+
+        async def fake_shell(_address, command, **_kwargs):
+            return "armed" if radios.WATCHDOG_READY_PATH in command else ""
+
+        monkeypatch.setattr(radios.asyncio, "create_subprocess_exec", fake_spawn)
+        monkeypatch.setattr(adb, "adb_path", lambda: "adb")
+        monkeypatch.setattr(adb, "shell", fake_shell)
+
+        assert await radios._arm_watchdog(
+            "u:5555",
+            300,
+            restore_bluetooth=False,
+            hotspot_capsule_path=capsule,
+        )
+        command = captured["args"][-1]
+        assert "start-softap" in command and capsule in command
+        assert 'rm -f "$capsule"' not in command
+        assert f"rm -f '{radios.FLAG_PATH}'" not in command
+
+    async def test_bluetooth_is_not_touched_without_a_proven_remote_watchdog(self, unit_shell):
+        unit_shell.replies["bluetooth_on"] = "1"
+        controller = radios.RadioController("u:5555", watchdog_deadline_s=300)
+        controller.claim()
+
+        assert not await controller.disable_bluetooth()
+
+        assert not _issued(unit_shell.commands, "bluetooth_manager disable")
+        assert unit_shell.settings.values[radios.MARKER_KEY] == ""
+        await controller.release()
+
+    @pytest.mark.parametrize(
+        ("address", "interfaces", "expected_baseline"),
+        [
+            (
+                UNIT,
+                "23: eth0    inet 192.168.1.122/24 brd 192.168.1.255 scope global eth0\n",
+                "off",
+            ),
+            (
+                "192.168.43.1:5555",
+                "25: ap0    inet 192.168.43.1/24 brd 192.168.43.255 scope global ap0\n",
+                "transport",
+            ),
+        ],
+    )
+    async def test_controller_arms_watchdog_with_persisted_hotspot_classification(
+        self, unit_shell, monkeypatch, address, interfaces, expected_baseline
+    ):
+        observed = {}
+
+        async def armed(_address, _deadline_s, **kwargs):
+            observed.update(kwargs)
+            return FakeProcess()
+
+        monkeypatch.setattr(radios, "_arm_watchdog", armed)
+        unit_shell.replies["bluetooth_on"] = ["1", "0"]
+        unit_shell.replies["ip -o addr"] = interfaces
+        controller = radios.RadioController(address, watchdog_deadline_s=300)
+        controller.claim()
+        try:
+            snapshot = await controller.capture()
+            assert snapshot.hotspot == expected_baseline
+            assert await controller.disable_bluetooth()
+        finally:
+            await controller.release()
+
+        assert observed["hotspot_baseline"] == expected_baseline
 
 
 class TestTheHotspot:
@@ -372,6 +578,84 @@ class TestTheHotspot:
         assert quiet.hotspot_restore is None
         assert not _issued(unit_shell.commands, "start-softap")
 
+    async def test_a_stop_is_not_verified_when_adb_disappears_during_observation(self, unit_shell):
+        """Losing the inventory reply is not evidence that the AP went away."""
+        unit_shell.replies["bluetooth_on"] = "0"
+        unit_shell.replies["ip -o addr"] = [
+            _IP_WITH_AP,
+            adb.AdbError("transport disappeared after stop"),
+        ]
+        unit_shell.replies["dumpsys wifi"] = _DUMP_MODERN
+
+        quiet = radios.begin_quiet(UNIT, online_for=60.0, watchdog_deadline_s=300)
+        await quiet._task
+        await quiet.finish()
+
+        assert _issued(unit_shell.commands, "service call tethering")
+        assert quiet.hotspot_restore is None
+        assert not _issued(unit_shell.commands, "start-softap")
+
+    async def test_durable_off_restore_rejects_an_unreadable_inventory(self, unit_shell):
+        unit_shell.replies["ip -o addr"] = adb.AdbError("unit went away")
+        controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
+
+        assert not await controller.restore_hotspot("off", None)
+
+    async def test_durable_off_restore_catches_a_delayed_bluetooth_hotspot_rearm(
+        self, unit_shell, monkeypatch
+    ):
+        """OFF is not final while the vendor's accepted Bluetooth enable can still add AP."""
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_SETTLE_S", 0.04)
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_POLL_S", 0.005)
+        unit_shell.replies["bluetooth_on"] = "1"
+        # Initially OFF, then the delayed vendor re-arm appears, then the binder stop is
+        # observed. The final OFF reply sticks through the rest of the settle window.
+        unit_shell.replies["ip -o addr"] = [_IP_NO_AP, _IP_WITH_AP, _IP_NO_AP]
+        controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
+
+        assert await controller.restore_bluetooth("on")
+        assert await controller.restore_hotspot("off", None)
+        assert _issued(unit_shell.commands, "service call tethering")
+
+    async def test_fresh_adopter_waits_when_first_controller_dies_during_rearm_settle(
+        self, unit_shell, monkeypatch
+    ):
+        """A's process-local deadline dies with it; B must create a new conservative one."""
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_SETTLE_S", 0.04)
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_POLL_S", 0.005)
+        unit_shell.replies["bluetooth_on"] = "1"
+
+        first = radios.RadioController(UNIT, watchdog_deadline_s=300)
+        assert await first.restore_bluetooth("on")
+        # Process A disappears here before observing the hotspot. B finds Bluetooth ON,
+        # sees no AP at first, then catches and stops the re-arm that A triggered late.
+        second = radios.RadioController(UNIT, watchdog_deadline_s=300)
+        assert await second.restore_bluetooth("on")
+        unit_shell.replies["ip -o addr"] = [_IP_NO_AP, _IP_WITH_AP, _IP_NO_AP]
+
+        assert await second.restore_hotspot("off", None)
+        assert len(_issued(unit_shell.commands, "cmd bluetooth_manager enable")) == 2
+        assert _issued(unit_shell.commands, "service call tethering")
+
+    async def test_durable_on_restore_waits_for_vendor_rearm_before_starting_duplicate(
+        self, unit_shell, monkeypatch
+    ):
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_SETTLE_S", 0.04)
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_POLL_S", 0.005)
+        unit_shell.replies["bluetooth_on"] = "1"
+        unit_shell.replies["ip -o addr"] = [_IP_NO_AP, _IP_WITH_AP]
+        unit_shell.replies["dumpsys wifi"] = _DUMP_MODERN
+        controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
+
+        assert await controller.restore_bluetooth("on")
+        assert await controller.restore_hotspot("on", ("CarSpot", "roadtrip99"))
+        assert not _issued(unit_shell.commands, "cmd wifi start-softap")
+
+    async def test_empty_or_unparseable_inventory_is_unknown_not_proven_off(self, unit_shell):
+        unit_shell.replies["ip -o addr"] = "diagnostic noise without an address"
+
+        assert await radios._serving_ap(UNIT) is None
+
     async def test_nothing_serving_means_nothing_is_issued(self, unit_shell):
         """A dormant `wlan1` is not a hotspot, and a stop nobody needs is a round trip
         that can only produce a misleading log line."""
@@ -400,6 +684,44 @@ class TestTheHotspot:
         await quiet.finish()
 
         assert not _issued(unit_shell.commands, "softap")
+
+    async def test_durable_controller_records_the_active_hotspot_as_transport(self, unit_shell):
+        """The persisted baseline names this separately from OFF, while still issuing no
+        stop command that would tear down ADB and the bulk TCP socket together."""
+        unit_shell.replies["bluetooth_on"] = "0"
+        unit_shell.replies["ip -o addr"] = (
+            "1: lo    inet 127.0.0.1/8 scope host lo\n"
+            "25: ap0    inet 192.168.43.1/24 brd 192.168.43.255 scope global ap0\n"
+        )
+        control = radios.RadioController("192.168.43.1:5555", watchdog_deadline_s=300)
+        control.claim()
+        try:
+            snapshot = await control.capture()
+        finally:
+            await control.release()
+
+        assert snapshot.hotspot == "transport"
+        assert snapshot.hotspot_interface == "ap0"
+        assert snapshot.transport_interface == "ap0"
+        assert not _issued(unit_shell.commands, "service call tethering")
+        assert not _issued(unit_shell.commands, "stop-softap")
+
+    async def test_durable_controller_still_finds_a_separate_ap_beside_sta_transport(
+        self, unit_shell
+    ):
+        unit_shell.replies["bluetooth_on"] = "0"
+        unit_shell.replies["ip -o addr"] = _IP_WITH_AP
+        unit_shell.replies["dumpsys wifi"] = _DUMP_MODERN
+        control = radios.RadioController(UNIT, watchdog_deadline_s=300)
+        control.claim()
+        try:
+            snapshot = await control.capture()
+        finally:
+            await control.release()
+
+        assert snapshot.hotspot == "on"
+        assert snapshot.hotspot_interface == "ap0"
+        assert snapshot.transport_interface == "wlan0"
 
     async def test_with_no_recoverable_config_it_is_stopped_but_never_guessed_at(self, unit_shell):
         """Stopping it is the operator's call, and they have made it: the transfer gets the

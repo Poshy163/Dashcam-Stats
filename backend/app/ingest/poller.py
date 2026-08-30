@@ -26,7 +26,7 @@ import contextlib
 import time
 
 from app.core.logging import get_logger
-from app.ingest import adb, health, puller, radios
+from app.ingest import adb, health, puller, radio_coordinator, radios
 from app.ingest.models import RunState, UnitInfo, UnitState, ingest_setting
 from app.ingest.status import get_status
 
@@ -179,6 +179,34 @@ class IngestPoller:
     def _min_uptime_s(self) -> float:
         return max(0.0, float(ingest_setting("min_uptime_s") or 0))
 
+    async def _recover_pending_while_disabled(self) -> bool:
+        """Reconcile only a durable interrupted transition while ingest is disabled.
+
+        The database-only first probe is load-bearing: a normally disabled installation
+        must make zero network/ADB contact.  Once a pending row exists, a cheap socket
+        probe on the configured and last-known endpoints lets the safety state machine
+        notice the car's next arrival without enabling ordinary footage ingestion.
+        """
+        stored_address = await radio_coordinator.pending_recovery_address()
+        if stored_address is None:
+            return False
+
+        candidates: list[str] = []
+        for candidate in (self._address(), stored_address):
+            candidate = adb.normalised_address(candidate)
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        for candidate in candidates:
+            if not await adb.is_listening(candidate):
+                continue
+            if await radio_coordinator.reconcile_pending(address=candidate):
+                log.info(
+                    "reconciled an interrupted radio transition while ingest is disabled",
+                    address=candidate,
+                )
+                return True
+        return False
+
     async def _arrival_ready(self, address: str) -> bool:
         """Whether an automatic pull may start, or the unit has only just booted.
 
@@ -237,6 +265,10 @@ class IngestPoller:
                     continue
 
                 if not self._enabled():
+                    # Feature disable stops new ingest work, not a previously committed
+                    # promise to restore the driver's radios/logger. This path remains a
+                    # DB lookup only unless such a transition actually exists.
+                    await self._recover_pending_while_disabled()
                     status.set_state(RunState.DISABLED)
                     self._was_online = False
                     self._error_retries_started = 0
@@ -327,6 +359,16 @@ class IngestPoller:
                         # which the transfer below does not use for its bytes. Safe to
                         # re-fire while the arrival gate holds below, because it does
                         # nothing once the marker it reads is clear.
+                        if not await radio_coordinator.reconcile_pending(address=info.address):
+                            # A stale durable transition owns the radios until its exact
+                            # baseline is restored. Keep this as the arrival transition so
+                            # the next tick retries; do not let a second pull manipulate or
+                            # depend on half-restored state.
+                            status.set_state(RunState.IDLE)
+                            if info.source and not info.card_error:
+                                self._visit_info = info
+                            await asyncio.sleep(self._interval())
+                            continue
                         radios.restore_if_pending(info.address)
                         # Collect what the recording watcher saw while the car was away,
                         # and re-arm it for the drive that is starting. Before the arrival

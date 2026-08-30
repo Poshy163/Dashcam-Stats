@@ -205,6 +205,91 @@ class TestBundleValidation:
         assert checked.statistics[0]["rpm_sample_count"] == 2
         assert checked.ha_payload()["units"] == UNITS_V1
         assert "quality" not in checked.ha_payload()["latest_sample"]
+        assert checked.ha_payload()["latest_sample"]["ecu_data_status"] == "last_known"
+
+    def test_hardened_v1_lifecycle_shape_is_exact_and_backward_compatible(
+        self, tmp_path, app_config
+    ):
+        finish = BASE + timedelta(seconds=5)
+        lifecycle = {
+            "last_sample_at_utc": finish.isoformat(),
+            "termination_noticed_at_utc": finish.isoformat(),
+            "finalised_at_utc": finish.isoformat(),
+            "completion_status": "complete",
+            "interruption_reason": None,
+        }
+        checked = validate_bundle(
+            make_bundle(
+                tmp_path,
+                "drive_hardened",
+                summary_patch=lifecycle,
+                manifest_patch={
+                    **lifecycle,
+                    "last_successful_obd_response_at_utc": finish.isoformat(),
+                    "poll_plan_version": 2,
+                },
+            ),
+            config=app_config,
+        )
+        assert checked.manifest["poll_plan_version"] == 2
+        assert checked.summary_source == "producer"
+        assert set(lifecycle).isdisjoint(checked.ha_payload()["summary"])
+        assert checked.ha_payload()["summary"]["clean_end"] is True
+
+    def test_hardened_last_response_may_follow_effective_interrupted_end(
+        self, tmp_path, app_config
+    ):
+        finish = BASE + timedelta(seconds=5)
+        noticed = BASE + timedelta(seconds=10)
+        finalised = BASE + timedelta(seconds=11)
+        lifecycle = {
+            "last_sample_at_utc": finish.isoformat(),
+            "termination_noticed_at_utc": noticed.isoformat(),
+            "finalised_at_utc": finalised.isoformat(),
+            "completion_status": "interrupted",
+            "interruption_reason": "connection_lost",
+        }
+        checked = validate_bundle(
+            make_bundle(
+                tmp_path,
+                "drive_response_after_sample",
+                summary_patch={**lifecycle, "clean_end": False},
+                manifest_patch={
+                    **lifecycle,
+                    "last_successful_obd_response_at_utc": (
+                        BASE + timedelta(seconds=8)
+                    ).isoformat(),
+                    "poll_plan_version": 2,
+                    "stop_reason": "connection_lost",
+                    "clean_end": False,
+                    "created_at_utc": (BASE + timedelta(seconds=12)).isoformat(),
+                },
+            ),
+            config=app_config,
+        )
+        assert (
+            checked.manifest["last_successful_obd_response_at_utc"]
+            == (BASE + timedelta(seconds=8)).isoformat()
+        )
+
+    def test_missing_summary_member_is_derived_without_hiding_raw_history(
+        self, tmp_path, app_config
+    ):
+        path = make_bundle(tmp_path, "drive_missing_summary")
+        replacement = path.with_suffix(".replacement")
+        with zipfile.ZipFile(path, "r") as source:
+            retained = {
+                name: source.read(name) for name in source.namelist() if name != "summary.json"
+            }
+        with zipfile.ZipFile(replacement, "w", compression=zipfile.ZIP_STORED) as target:
+            for name, body in retained.items():
+                target.writestr(name, body)
+        replacement.replace(path)
+
+        checked = validate_bundle(path, config=app_config)
+        assert checked.summary_source == "derived"
+        assert checked.summary["drive_id"] == "drive_missing_summary"
+        assert checked.summary["sample_count"] == 2
 
     def test_partial_bundle_name_is_excluded(self, tmp_path, app_config):
         path = make_bundle(tmp_path)
@@ -213,9 +298,17 @@ class TestBundleValidation:
         with pytest.raises(BundleError, match="filename"):
             validate_bundle(partial, config=app_config)
 
-    def test_manifest_hash_mismatch_is_quarantinable(self, tmp_path, app_config):
-        with pytest.raises(BundleError, match="SHA-256"):
-            validate_bundle(make_bundle(tmp_path, wrong_payload_hash=True), config=app_config)
+    def test_corrupt_summary_hash_falls_back_to_validated_samples(self, tmp_path, app_config):
+        checked = validate_bundle(
+            make_bundle(tmp_path, wrong_payload_hash=True),
+            config=app_config,
+        )
+        assert checked.summary_source == "derived"
+        assert checked.summary["sample_count"] == 2
+        assert checked.warnings == (
+            "summary.json was missing or invalid; the server derived summary fields "
+            "from validated raw samples",
+        )
 
     def test_nested_corrupt_gzip_is_rejected(self, tmp_path, app_config):
         with pytest.raises(BundleError, match="gzip"):
@@ -246,15 +339,16 @@ class TestBundleValidation:
                 make_bundle(tmp_path, "drive_bad_coolant", samples=[sample]),
                 config=app_config,
             )
-        with pytest.raises(BundleError, match="distance_km"):
-            validate_bundle(
-                make_bundle(
-                    tmp_path,
-                    "drive_bad_distance",
-                    summary_patch={"distance_km": 300_001},
-                ),
-                config=app_config,
-            )
+        checked = validate_bundle(
+            make_bundle(
+                tmp_path,
+                "drive_bad_distance",
+                summary_patch={"distance_km": 300_001},
+            ),
+            config=app_config,
+        )
+        assert checked.summary_source == "derived"
+        assert checked.summary["distance_km"] != 300_001
 
     def test_diagnostic_payload_is_validated_before_ha(self, tmp_path, app_config):
         invalid = {
@@ -301,15 +395,16 @@ class TestBundleValidation:
                 make_bundle(tmp_path, "drive_diag_order", diagnostics=diagnostics),
                 config=app_config,
             )
-        with pytest.raises(BundleError, match="expected_sample_count"):
-            validate_bundle(
-                make_bundle(
-                    tmp_path,
-                    "drive_expected",
-                    summary_patch={"expected_sample_count": 1},
-                ),
-                config=app_config,
-            )
+        checked = validate_bundle(
+            make_bundle(
+                tmp_path,
+                "drive_expected",
+                summary_patch={"expected_sample_count": 1},
+            ),
+            config=app_config,
+        )
+        assert checked.summary_source == "derived"
+        assert checked.summary["expected_sample_count"] >= checked.summary["sample_count"]
 
     def test_missing_values_do_not_become_zero_statistics(self):
         samples = [
@@ -1000,6 +1095,76 @@ class TestBundleValidation:
                 config=app_config,
             )
 
+    def test_hardened_pipeline_metrics_may_follow_effective_interrupted_finish(
+        self, tmp_path, app_config
+    ):
+        drive_id = "drive_pipeline_metrics"
+        finished = BASE + timedelta(seconds=5)
+        noticed = BASE + timedelta(seconds=6)
+        finalised = BASE + timedelta(seconds=7)
+        metric_keys = {
+            "commands_requested",
+            "commands_completed",
+            "command_timeouts",
+            "notifications_received",
+            "notification_fragments_received",
+            "frames_assembled",
+            "checksum_failures",
+            "parse_failures",
+            "samples_created",
+            "samples_queued",
+            "samples_persisted",
+            "samples_dropped",
+            "database_write_failures",
+            "ble_disconnects",
+            "reconnect_attempts",
+            "radio_shutdowns",
+            "queue_depth",
+            "maximum_queue_depth",
+        }
+        diagnostics = [
+            {
+                "diagnostic_id": "diag_pipeline_metrics",
+                "drive_id": drive_id,
+                "timestamp_utc": noticed.isoformat(),
+                "kind": "pipeline_metrics",
+                "payload": dict.fromkeys(metric_keys, 0),
+            }
+        ]
+        manifest_lifecycle = {
+            "poll_plan_version": 2,
+            "completion_status": "interrupted",
+            "clean_end": False,
+            "stop_reason": "connection_lost",
+            "last_sample_at_utc": finished.isoformat(),
+            "last_successful_obd_response_at_utc": finished.isoformat(),
+            "termination_noticed_at_utc": noticed.isoformat(),
+            "finalised_at_utc": finalised.isoformat(),
+            "interruption_reason": "connection_lost",
+            "created_at_utc": finalised.isoformat(),
+        }
+        summary_lifecycle = {
+            "clean_end": False,
+            "completion_status": "interrupted",
+            "last_sample_at_utc": finished.isoformat(),
+            "termination_noticed_at_utc": noticed.isoformat(),
+            "finalised_at_utc": finalised.isoformat(),
+            "interruption_reason": "connection_lost",
+        }
+
+        checked = validate_bundle(
+            make_bundle(
+                tmp_path,
+                drive_id,
+                diagnostics=diagnostics,
+                manifest_patch=manifest_lifecycle,
+                summary_patch=summary_lifecycle,
+            ),
+            config=app_config,
+        )
+
+        assert checked.diagnostics_document["events"][0]["kind"] == "pipeline_metrics"
+
 
 class TestTransactionalHistory:
     async def test_stores_high_resolution_rows_exactly_once(self, db_session, app_config):
@@ -1184,6 +1349,7 @@ class TestHAClient:
         assert result["status"] == "ok"
         assert set(body) == {
             "schema_version",
+            "projection_version",
             "drive_id",
             "bundle_sha256",
             "vehicle_id",
@@ -1194,9 +1360,77 @@ class TestHAClient:
             "statistics",
             "diagnostics",
         }
+        assert body["projection_version"] == 2
         assert capture["headers"]["Authorization"] == "Bearer secret-token-value"
         assert checked.bundle_sha256 in capture["headers"]["Idempotency-Key"]
+        assert capture["headers"]["Idempotency-Key"].endswith("projection-v2")
         assert client_options["trust_env"] is False
+
+    async def test_canonical_summary_and_lifecycle_are_sent_and_strictly_acknowledged(
+        self, tmp_path, ha_config, monkeypatch
+    ):
+        checked = validate_bundle(make_bundle(tmp_path), config=ha_config)
+        canonical = dict(checked.summary)
+        canonical["distance_km"] = 0.125
+        lifecycle = {
+            "lifecycle_status": "complete",
+            "interruption_reason": None,
+            "gap_count": 0,
+            "longest_gap_s": 0.0,
+        }
+        response_lifecycle = {
+            "status": "complete",
+            "interruption_reason": None,
+            "clean_end": True,
+            "sample_count": 2,
+            "expected_sample_count": 2,
+            "missing_data_duration_s": 0.0,
+            "received_sample_percentage": 100.0,
+            "gap_count": 0,
+            "longest_gap_s": 0.0,
+        }
+        capture: dict = {}
+        monkeypatch.setattr(
+            queue.httpx,
+            "AsyncClient",
+            lambda **_kwargs: _FakeClient(
+                _response(
+                    200,
+                    {
+                        "status": "ok",
+                        "drive_id": checked.drive_id,
+                        "drive_lifecycle": response_lifecycle,
+                    },
+                ),
+                capture,
+            ),
+        )
+
+        result = await post_bundle(
+            checked,
+            lifecycle=lifecycle,
+            canonical_summary=canonical,
+            config=ha_config,
+        )
+        body = json.loads(gzip.decompress(capture["body"]))
+
+        assert body["summary"]["distance_km"] == 0.125
+        assert body["summary"]["lifecycle_status"] == "complete"
+        assert body["projection_version"] == 2
+        assert body["supersedes_summary"]["distance_km"] == checked.summary["distance_km"]
+        assert result["drive_lifecycle"] == response_lifecycle
+
+    async def test_invalid_canonical_projection_is_not_an_integrity_error(
+        self, tmp_path, ha_config
+    ):
+        checked = validate_bundle(make_bundle(tmp_path), config=ha_config)
+        canonical = dict(checked.summary)
+        canonical["duration_s"] = 999.0
+
+        with pytest.raises(PermanentImportError) as caught:
+            await post_bundle(checked, canonical_summary=canonical, config=ha_config)
+
+        assert caught.value.kind == "projection"
 
     @pytest.mark.parametrize("drive_id", [None, "different_drive"])
     async def test_success_requires_matching_drive_id(
@@ -1374,6 +1608,27 @@ class TestRecoveryAndAPI:
         async with session_scope() as session:
             return await store_validated_bundle(session, checked)
 
+    async def test_projection_version_queues_exactly_one_existing_ha_refresh(
+        self, db_session, app_config
+    ):
+        row = await self._stored(app_config, "drive_projection_refresh")
+        async with session_scope() as session:
+            stored = await session.get(OBDBundle, row.id)
+            stored.state = OBDBundleState.IMPORTED.value
+            stored.ha_result = {"status": "ok"}
+
+        assert await queue.enqueue_stale_projections() == 1
+        async with session_scope() as session:
+            queued = await session.get(OBDBundle, row.id)
+            assert queued.state == OBDBundleState.READY_TO_IMPORT.value
+            queued.state = OBDBundleState.IMPORTED.value
+            queued.ha_result = {
+                "status": "ok",
+                "_server_projection_version": queue.HA_PROJECTION_VERSION,
+            }
+
+        assert await queue.enqueue_stale_projections() == 0
+
     async def test_restart_requeues_importing(self, db_session, app_config):
         row = await self._stored(app_config)
         async with session_scope() as session:
@@ -1498,6 +1753,7 @@ class TestRecoveryAndAPI:
                 "status": "ok",
                 "drive_id": "drive_retry_success",
                 "accepted_samples": 1,
+                "_server_projection_version": 2,
             }
 
     async def test_worker_survives_one_iteration_exception(
@@ -2703,6 +2959,9 @@ class TestTransferIsolation:
 
         assert "unrequested member" in (result.error or "")
         assert result.copied == result.removed_from_unit == 0
+        assert not result.complete
+        assert result.missing == 1
+        assert result.failed == 1
         assert deleted == []
 
 
@@ -2758,6 +3017,11 @@ class TestDriveSeriesApi:
         assert payload["samples"][0]["t"] == BASE.isoformat()
         assert payload["samples"][1]["t"] == (BASE + timedelta(seconds=5)).isoformat()
         assert payload["samples"][0]["adapter_voltage_v"] == 14.1
+        assert payload["samples"][0]["sample_id"] == "sample_drive_series_api_0"
+        assert payload["samples"][0]["ecu_data_status"] == "live"
+        assert payload["samples"][0]["provenance"]["engine_rpm"] == "measured"
+        assert payload["drive"]["processing_status"] == "ready"
+        assert payload["drive"]["gap_analysis"]["poll_plan_version"] == 1
         assert payload["diagnostics"] == [
             {
                 "observed_at": BASE.isoformat(),
@@ -2765,6 +3029,415 @@ class TestDriveSeriesApi:
                 "payload": {"codes": ["P0420"]},
             }
         ]
+
+    async def test_legacy_unclean_complete_is_projected_interrupted_idempotently(
+        self, db_session, app_config, client
+    ):
+        drive_id = "drive_legacy_interrupted"
+        samples = [_sample(drive_id, 0), _sample(drive_id, 1)]
+        observed = BASE + timedelta(seconds=20)
+        path = make_bundle(
+            app_config.obd_verified_dir,
+            drive_id,
+            samples=samples,
+            summary_patch={
+                "finish_time_utc": observed.isoformat(),
+                "duration_s": 20.0,
+                "clean_end": False,
+            },
+            manifest_patch={
+                "finish_time_utc": observed.isoformat(),
+                "created_at_utc": observed.isoformat(),
+                "stop_reason": "connection_lost",
+                "completion_status": "complete",
+                "clean_end": False,
+            },
+        )
+        checked = validate_bundle(path, config=app_config)
+        async with session_scope() as session:
+            await store_validated_bundle(session, checked)
+
+        first = await client.post(f"/api/obd/drives/{drive_id}/reprocess")
+        second = await client.post(f"/api/obd/drives/{drive_id}/reprocess")
+        assert first.status_code == second.status_code == 200
+        projected = second.json()["drive"]
+        assert projected["lifecycle_status"] == "interrupted"
+        assert projected["completion_status"] == "interrupted"
+        assert projected["producer_completion_status"] == "complete"
+        assert projected["interruption_reason"] == "connection_lost"
+        assert projected["finished_at"] == (BASE + timedelta(seconds=5)).isoformat()
+        assert projected["finalization_observed_at"] == observed.isoformat()
+        async with session_scope() as session:
+            assert (
+                int(
+                    (
+                        await session.execute(
+                            select(func.count(OBDSample.id))
+                            .join(OBDDrive)
+                            .where(OBDDrive.drive_id == drive_id)
+                        )
+                    ).scalar()
+                    or 0
+                )
+                == 2
+            )
+
+    async def test_hardened_phase_plan_does_not_count_intentional_spacing_as_missing(
+        self, db_session, app_config, client
+    ):
+        drive_id = "drive_phased_plan"
+        samples = []
+        for sequence in range(7):
+            sample = _sample(drive_id, sequence, telemetry=False)
+            sample.update(engine_rpm=900.0, adapter_voltage=14.0)
+            if sequence % 3 == 1:
+                sample["coolant_temperature"] = 80.0 + sequence
+            samples.append(sample)
+        finish = BASE + timedelta(seconds=30)
+        lifecycle = {
+            "last_sample_at_utc": finish.isoformat(),
+            "termination_noticed_at_utc": finish.isoformat(),
+            "finalised_at_utc": finish.isoformat(),
+            "completion_status": "complete",
+            "interruption_reason": None,
+        }
+        diagnostics = [
+            {
+                "diagnostic_id": "diag_phased_support",
+                "drive_id": drive_id,
+                "timestamp_utc": BASE.isoformat(),
+                "kind": "mode01_support",
+                "payload": {"supported_pids": [0x05, 0x0C]},
+            }
+        ]
+        checked = validate_bundle(
+            make_bundle(
+                app_config.obd_verified_dir,
+                drive_id,
+                samples=samples,
+                diagnostics=diagnostics,
+                summary_patch=lifecycle,
+                manifest_patch={
+                    **lifecycle,
+                    "last_successful_obd_response_at_utc": finish.isoformat(),
+                    "poll_plan_version": 2,
+                },
+            ),
+            config=app_config,
+        )
+        async with session_scope() as session:
+            await store_validated_bundle(session, checked)
+
+        payload = (await client.get(f"/api/obd/drives/{drive_id}/series")).json()
+        quality = payload["drive"]["gap_analysis"]
+        coolant = next(item for item in quality["signals"] if item["name"] == "coolant_temperature")
+        assert quality["poll_plan_version"] == 2
+        assert coolant["expected_observation_count"] == 2
+        assert coolant["received_observation_count"] == 2
+        assert coolant["missing_observation_count"] == 0
+        assert coolant["coverage_percentage"] == 100.0
+
+    async def test_wholly_missing_sequence_cycles_count_for_every_scheduled_phase(
+        self, db_session, app_config, client
+    ):
+        drive_id = "drive_missing_cycles"
+        samples = [
+            {
+                **_sample(drive_id, 0, telemetry=False),
+                "engine_rpm": 900.0,
+                "adapter_voltage": 14.0,
+            },
+            {
+                **_sample(
+                    drive_id,
+                    12,
+                    at=BASE + timedelta(seconds=5),
+                    telemetry=False,
+                ),
+                "engine_rpm": 2100.0,
+                "adapter_voltage": 13.8,
+            },
+        ]
+        finish = BASE + timedelta(seconds=5)
+        lifecycle = {
+            "last_sample_at_utc": finish.isoformat(),
+            "termination_noticed_at_utc": finish.isoformat(),
+            "finalised_at_utc": finish.isoformat(),
+            "completion_status": "complete",
+            "interruption_reason": None,
+        }
+        diagnostics = [
+            {
+                "diagnostic_id": "diag_missing_cycle_support",
+                "drive_id": drive_id,
+                "timestamp_utc": BASE.isoformat(),
+                "kind": "mode01_support",
+                "payload": {"supported_pids": [0x05, 0x0C]},
+            }
+        ]
+        checked = validate_bundle(
+            make_bundle(
+                app_config.obd_verified_dir,
+                drive_id,
+                samples=samples,
+                diagnostics=diagnostics,
+                summary_patch=lifecycle,
+                manifest_patch={
+                    **lifecycle,
+                    "last_successful_obd_response_at_utc": finish.isoformat(),
+                    "poll_plan_version": 2,
+                },
+            ),
+            config=app_config,
+        )
+        async with session_scope() as session:
+            await store_validated_bundle(session, checked)
+            raw_before = list(
+                (
+                    await session.execute(
+                        select(OBDSample.raw_json)
+                        .join(OBDDrive)
+                        .where(OBDDrive.drive_id == drive_id)
+                        .order_by(OBDSample.sequence)
+                    )
+                ).scalars()
+            )
+
+        response = await client.get(f"/api/obd/drives/{drive_id}/series")
+        assert response.status_code == 200
+        drive = response.json()["drive"]
+        quality = drive["gap_analysis"]
+        transport = quality["transport"]
+        rpm = next(item for item in quality["signals"] if item["name"] == "engine_rpm")
+        coolant = next(item for item in quality["signals"] if item["name"] == "coolant_temperature")
+
+        assert quality["expected_cycle_count"] == 13
+        assert quality["expected_cycle_count_capped"] is False
+        assert transport["expected_observation_count"] == 13
+        assert transport["received_observation_count"] == 2
+        assert transport["missing_observation_count"] == 11
+        assert transport["sequence_gap_count"] == 11
+        assert rpm["expected_observation_count"] == 13
+        assert rpm["received_observation_count"] == 2
+        assert rpm["missing_observation_count"] == 11
+        # Coolant is phase one in poll-plan v2: absent cycles 1, 4, 7 and 10 are
+        # scheduled misses even though no sample row exists at any of those sequences.
+        assert coolant["expected_observation_count"] == 4
+        assert coolant["received_observation_count"] == 0
+        assert coolant["missing_observation_count"] == 4
+        assert coolant["missing_run_count"] == 1
+        assert coolant["longest_missing_run"] == 4
+        assert drive["expected_sample_count"] == 13
+        assert drive["received_sample_percentage"] == pytest.approx(200 / 13)
+        assert drive["average_rpm"] == pytest.approx(1500.0)
+        assert drive["distance_km"] is None
+        assert drive["estimated_fuel_used_l"] is None
+        assert drive["summary_source"] == "derived"
+
+        first_reprocess = await client.post(f"/api/obd/drives/{drive_id}/reprocess")
+        second_reprocess = await client.post(f"/api/obd/drives/{drive_id}/reprocess")
+        assert first_reprocess.status_code == second_reprocess.status_code == 200
+        assert first_reprocess.json()["result"]["changed"] is False
+        assert second_reprocess.json()["result"]["changed"] is False
+        assert (
+            first_reprocess.json()["drive"]["summary_generated_at"]
+            == second_reprocess.json()["drive"]["summary_generated_at"]
+        )
+
+        # A damaged projection is materially repaired once; immutable sample evidence is
+        # untouched and the next reconciliation is again a no-op.
+        async with session_scope() as session:
+            row = (
+                await session.execute(select(OBDDrive).where(OBDDrive.drive_id == drive_id))
+            ).scalar_one()
+            row.average_rpm = -1.0
+            row.summary_generated_at = BASE - timedelta(days=1)
+        repaired = await client.post(f"/api/obd/drives/{drive_id}/reprocess")
+        stable = await client.post(f"/api/obd/drives/{drive_id}/reprocess")
+        assert repaired.json()["result"]["changed"] is True
+        assert repaired.json()["drive"]["average_rpm"] == pytest.approx(1500.0)
+        assert stable.json()["result"]["changed"] is False
+        assert (
+            repaired.json()["drive"]["summary_generated_at"]
+            == stable.json()["drive"]["summary_generated_at"]
+        )
+        async with session_scope() as session:
+            raw_after = list(
+                (
+                    await session.execute(
+                        select(OBDSample.raw_json)
+                        .join(OBDDrive)
+                        .where(OBDDrive.drive_id == drive_id)
+                        .order_by(OBDSample.sequence)
+                    )
+                ).scalars()
+            )
+        assert raw_after == raw_before
+
+    async def test_affected_style_timing_rebuilds_every_canonical_rollup_from_raw_samples(
+        self, db_session, app_config, client
+    ):
+        drive_id = "drive_affected_timing"
+        started = BASE
+        first = BASE + timedelta(seconds=12.193799)
+        last = BASE + timedelta(seconds=1612.033636)
+        noticed = last + timedelta(seconds=1.070158)
+        sample_span_s = (last - first).total_seconds()
+        samples: list[dict] = []
+        for sequence in range(245):
+            captured = (
+                last
+                if sequence == 244
+                else first + timedelta(seconds=sample_span_s * sequence / 244)
+            )
+            sample = _sample(drive_id, sequence, at=captured, telemetry=False)
+            sample.update(
+                engine_rpm=1000.0 + sequence,
+                vehicle_speed=36.0,
+                estimated_fuel_rate=2.0,
+                adapter_voltage=14.0,
+            )
+            if sequence % 3 == 0:
+                sample["coolant_temperature"] = 80.0
+            samples.append(sample)
+        diagnostics = [
+            {
+                "diagnostic_id": "diag_affected_support",
+                "drive_id": drive_id,
+                "timestamp_utc": started.isoformat(),
+                "kind": "mode01_support",
+                "payload": {"supported_pids": [0x05, 0x0C, 0x0D]},
+            },
+            {
+                "diagnostic_id": "diag_affected_disconnect",
+                "drive_id": drive_id,
+                "timestamp_utc": noticed.isoformat(),
+                "kind": "connection_failure",
+                "payload": {"category": "ble_or_elm", "message": "write rejected"},
+            },
+        ]
+        checked = validate_bundle(
+            make_bundle(
+                app_config.obd_verified_dir,
+                drive_id,
+                samples=samples,
+                diagnostics=diagnostics,
+                summary_patch={
+                    "start_time_utc": started.isoformat(),
+                    "finish_time_utc": noticed.isoformat(),
+                    "duration_s": (noticed - started).total_seconds(),
+                    "clean_end": False,
+                },
+                manifest_patch={
+                    "start_time_utc": started.isoformat(),
+                    "finish_time_utc": noticed.isoformat(),
+                    "created_at_utc": noticed.isoformat(),
+                    "stop_reason": "connection_lost",
+                    "completion_status": "complete",
+                    "clean_end": False,
+                },
+            ),
+            config=app_config,
+        )
+        async with session_scope() as session:
+            await store_validated_bundle(session, checked)
+
+        response = await client.get(f"/api/obd/drives/{drive_id}/series")
+        assert response.status_code == 200
+        drive = response.json()["drive"]
+        quality = drive["gap_analysis"]
+        transport = quality["transport"]
+        rpm = next(item for item in quality["signals"] if item["name"] == "engine_rpm")
+        coolant = next(item for item in quality["signals"] if item["name"] == "coolant_temperature")
+        expected = int((last - started).total_seconds() // 5) + 1
+
+        assert expected == 323
+        assert drive["lifecycle_status"] == "interrupted"
+        assert drive["finished_at"] == last.isoformat()
+        assert drive["first_sample_at"] == first.isoformat()
+        assert drive["last_sample_at"] == last.isoformat()
+        assert drive["finalization_observed_at"] == noticed.isoformat()
+        assert drive["duration_s"] == pytest.approx((last - started).total_seconds())
+        assert drive["sample_count"] == 245
+        assert drive["expected_sample_count"] == expected
+        assert drive["received_sample_percentage"] == pytest.approx(24500 / expected)
+        assert transport["expected_observation_count"] == expected
+        assert transport["coverage_percentage"] == pytest.approx(
+            drive["received_sample_percentage"]
+        )
+        assert rpm["expected_observation_count"] == expected
+        assert rpm["received_observation_count"] == 245
+        assert coolant["expected_observation_count"] == 108
+        assert coolant["received_observation_count"] == 82
+        assert drive["average_speed_kmh"] == pytest.approx(36.0)
+        assert drive["maximum_speed_kmh"] == pytest.approx(36.0)
+        assert drive["average_rpm"] == pytest.approx(1122.0)
+        assert drive["maximum_rpm"] == pytest.approx(1244.0)
+        assert drive["distance_km"] == pytest.approx(36.0 * sample_span_s / 3600)
+        assert drive["estimated_fuel_used_l"] == pytest.approx(2.0 * sample_span_s / 3600)
+        assert drive["idle_duration_s"] == pytest.approx(0.0)
+        assert drive["summary_source"] == "derived"
+        assert drive["missing_data_duration_s"] == pytest.approx(transport["total_gap_duration_s"])
+
+        async with session_scope() as session:
+            stored = (
+                await session.execute(select(OBDDrive).where(OBDDrive.drive_id == drive_id))
+            ).scalar_one()
+            assert stored.summary_json["finish_time_utc"] == last.isoformat().replace("+00:00", "Z")
+            assert stored.summary_json["duration_s"] == pytest.approx(stored.duration_s)
+            assert stored.summary_json["distance_km"] == pytest.approx(stored.distance_km)
+            assert stored.summary_json["average_speed_kmh"] == pytest.approx(
+                stored.average_speed_kmh
+            )
+            assert stored.summary_json["average_rpm"] == pytest.approx(stored.average_rpm)
+            assert stored.summary_json["estimated_fuel_used_l"] == pytest.approx(
+                stored.estimated_fuel_used_l
+            )
+            assert stored.summary_json["missing_data_duration_s"] == pytest.approx(
+                stored.missing_data_duration_s
+            )
+            assert stored.summary_json["expected_sample_count"] == stored.expected_sample_count
+            assert stored.summary_json["received_sample_percentage"] == pytest.approx(
+                stored.received_sample_percentage
+            )
+            assert stored.summary_json["sample_count"] == stored.sample_count
+
+    async def test_verified_bundle_download_checks_identity(self, db_session, app_config, client):
+        path = make_bundle(app_config.obd_verified_dir, "drive_download")
+        expected = path.read_bytes()
+        checked = validate_bundle(path, config=app_config)
+        async with session_scope() as session:
+            await store_validated_bundle(session, checked)
+
+        response = await client.get("/api/obd/drives/drive_download/bundle")
+        assert response.status_code == 200
+        assert response.content == expected
+        assert response.headers["cache-control"] == "private, no-store"
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+    async def test_missing_summary_remains_visible_in_drive_api(
+        self, db_session, app_config, client
+    ):
+        path = make_bundle(app_config.obd_verified_dir, "drive_api_missing_summary")
+        replacement = path.with_suffix(".replacement")
+        with zipfile.ZipFile(path, "r") as source:
+            retained = {
+                name: source.read(name) for name in source.namelist() if name != "summary.json"
+            }
+        with zipfile.ZipFile(replacement, "w", compression=zipfile.ZIP_STORED) as target:
+            for name, body in retained.items():
+                target.writestr(name, body)
+        replacement.replace(path)
+        checked = validate_bundle(path, config=app_config)
+        async with session_scope() as session:
+            await store_validated_bundle(session, checked)
+
+        response = await client.get("/api/obd/drives/drive_api_missing_summary/series")
+        assert response.status_code == 200
+        drive = response.json()["drive"]
+        assert drive["summary_source"] == "derived"
+        assert drive["sample_count"] == 2
+        assert drive["validation_warnings"]
 
     async def test_unknown_drive_series_is_a_404(self, db_session, client):
         response = await client.get("/api/obd/drives/drive_missing/series")

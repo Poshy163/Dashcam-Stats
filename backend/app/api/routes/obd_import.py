@@ -6,6 +6,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Query, status
+from fastapi.responses import FileResponse
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import joinedload
 
@@ -31,9 +32,11 @@ from app.ingest.ha_import_queue import (
 from app.ingest.obd_bundle import (
     BundleError,
     bundle_path_for,
+    file_sha256,
     store_validated_bundle,
     validate_bundle,
 )
+from app.ingest.obd_reconciliation import SIGNALS, reconcile_drive_projection
 from app.ingest.obd_transfer import get_obd_transfer_status
 
 router = APIRouter(prefix="/api/obd", tags=["obd-import"])
@@ -90,15 +93,42 @@ def _bundle(row: OBDBundle) -> dict[str, object]:
     }
 
 
-def _drive(row: OBDDrive) -> dict[str, object]:
-    return {
+def _drive(row: OBDDrive, *, include_quality: bool = False) -> dict[str, object]:
+    bundle = row.bundle
+    result: dict[str, object] = {
         "drive_id": row.drive_id,
         "vehicle_id": row.vehicle_id,
         "started_at": row.started_at.isoformat(),
         "finished_at": row.finished_at.isoformat(),
         "original_timezone": row.original_timezone,
-        "completion_status": row.completion_status,
+        "start_reason": row.start_reason,
+        "stop_reason": row.stop_reason,
+        "obd_protocol": row.obd_protocol,
+        # Keep the existing field truthful for API clients and expose the literal legacy
+        # producer value separately. manifest_json itself is never rewritten.
+        "completion_status": row.lifecycle_status,
+        "producer_completion_status": row.completion_status,
+        "lifecycle_status": row.lifecycle_status,
         "clean_end": row.clean_end,
+        "interruption_reason": row.interruption_reason,
+        "first_sample_at": row.first_sample_at.isoformat() if row.first_sample_at else None,
+        "last_sample_at": row.last_sample_at.isoformat() if row.last_sample_at else None,
+        "last_successful_response_at": (
+            row.last_successful_response_at.isoformat() if row.last_successful_response_at else None
+        ),
+        "finalization_observed_at": (
+            row.finalization_observed_at.isoformat() if row.finalization_observed_at else None
+        ),
+        "connection_loss_count": row.connection_loss_count,
+        "gap_count": row.gap_count,
+        "longest_gap_s": row.longest_gap_s,
+        "data_completeness_percentage": row.data_completeness_percentage,
+        "processing_status": row.processing_status,
+        "last_processing_error": row.last_processing_error,
+        "summary_source": row.summary_source,
+        "summary_generated_at": (
+            row.summary_generated_at.isoformat() if row.summary_generated_at else None
+        ),
         "duration_s": row.duration_s,
         "distance_km": row.distance_km,
         "average_speed_kmh": row.average_speed_kmh,
@@ -118,14 +148,36 @@ def _drive(row: OBDDrive) -> dict[str, object]:
         "dtcs_observed": row.dtcs_observed or [],
         # The queue row's state says how far along the HA hand-off is; the drive row
         # itself only exists once validation and registration have already succeeded.
-        "import_state": row.bundle.state,
+        "bundle_id": bundle.id,
+        "bundle_filename": bundle.filename,
+        "bundle_sha256": bundle.bundle_hash,
+        "bundle_available": bool(bundle.metadata_trusted and bundle.verified_at),
+        "bundle_download_url": (
+            f"/api/obd/drives/{row.drive_id}/bundle"
+            if bundle.metadata_trusted and bundle.verified_at
+            else None
+        ),
+        "export_status": "available" if bundle.metadata_trusted else "incomplete",
+        "backup_status": "verified" if bundle.verified_at else "pending",
+        "copied_at": bundle.copied_at.isoformat() if bundle.copied_at else None,
+        "verified_at": bundle.verified_at.isoformat() if bundle.verified_at else None,
+        "imported_at": bundle.imported_at.isoformat() if bundle.imported_at else None,
+        "import_state": bundle.state,
+        "bundle_error": bundle.last_error,
+        "validation_warnings": bundle.validation_warnings or [],
     }
+    if include_quality:
+        result["gap_analysis"] = row.gap_analysis_json
+    return result
 
 
 def _series_sample(row: OBDSample) -> dict[str, object]:
-    return {
+    result: dict[str, object] = {
+        "sample_id": row.sample_id,
         "t": row.captured_at.isoformat(),
         "sequence": row.sequence,
+        "ecu_data_status": row.ecu_data_status,
+        "quality": row.quality_json,
         "engine_rpm": row.engine_rpm,
         "vehicle_speed_kmh": row.vehicle_speed_kmh,
         "coolant_temperature_c": row.coolant_temperature_c,
@@ -142,6 +194,10 @@ def _series_sample(row: OBDSample) -> dict[str, object]:
         "estimated_fuel_rate_l_h": row.estimated_fuel_rate_l_h,
         "estimated_fuel_consumption_l_100km": row.estimated_fuel_consumption_l_100km,
     }
+    result["provenance"] = {
+        spec.name: spec.provenance for spec in SIGNALS if getattr(row, spec.attribute) is not None
+    }
+    return result
 
 
 @router.get("/drives", summary="List imported drives with their rollups")
@@ -332,9 +388,21 @@ async def drive_series(drive_id: str, session: SessionDep) -> dict[str, object]:
         .all()
     )
     return {
-        "drive": _drive(drive),
+        "drive": _drive(drive, include_quality=True),
         "journey": await _journey_for_drive(session, drive),
         "units": drive.units,
+        "signal_metadata": [
+            {
+                "name": spec.name,
+                "label": spec.label,
+                "pid": f"{spec.pid:02X}" if spec.pid is not None else None,
+                "tier": spec.tier,
+                "expected_cadence_s": spec.cadence_s,
+                "provenance": spec.provenance,
+                "discrete": spec.discrete,
+            }
+            for spec in SIGNALS
+        ],
         "samples": [_series_sample(row) for row in samples],
         "diagnostics": [
             {
@@ -345,6 +413,88 @@ async def drive_series(drive_id: str, session: SessionDep) -> dict[str, object]:
             for row in diagnostics
         ],
     }
+
+
+@router.post(
+    "/drives/{drive_id}/reprocess",
+    summary="Idempotently rebuild one drive's lifecycle and completeness projection",
+)
+async def reprocess_drive(drive_id: str, session: SessionDep) -> dict[str, object]:
+    drive = (
+        (
+            await session.execute(
+                select(OBDDrive)
+                .options(joinedload(OBDDrive.bundle))
+                .where(OBDDrive.drive_id == drive_id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if drive is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "OBD drive was not found")
+    result = await reconcile_drive_projection(session, drive)
+    ha_refresh_queued = False
+    if result.get("status") == "ready" and drive.bundle.state == OBDBundleState.IMPORTED.value:
+        drive.bundle.state = OBDBundleState.READY_TO_IMPORT.value
+        drive.bundle.next_attempt_at = utcnow()
+        drive.bundle.import_started_at = None
+        drive.bundle.last_error = None
+        drive.bundle.failure_kind = None
+        drive.bundle.updated_at = utcnow()
+        ha_refresh_queued = True
+        get_import_worker().wake()
+    return {
+        "result": result,
+        "drive": _drive(drive, include_quality=True),
+        "ha_refresh_queued": ha_refresh_queued,
+    }
+
+
+@router.get(
+    "/drives/{drive_id}/bundle",
+    summary="Download the immutable verified OBD bundle",
+    response_class=FileResponse,
+)
+async def download_drive_bundle(drive_id: str, session: SessionDep) -> FileResponse:
+    drive = (
+        (
+            await session.execute(
+                select(OBDDrive)
+                .options(joinedload(OBDDrive.bundle))
+                .where(OBDDrive.drive_id == drive_id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if drive is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "OBD drive was not found")
+    row = drive.bundle
+    if not row.metadata_trusted or row.verified_at is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Bundle has no verified server copy")
+    try:
+        path = bundle_path_for(row)
+        digest, size = await asyncio.to_thread(file_sha256, path)
+    except (BundleError, OSError) as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The verified bundle is not currently readable",
+        ) from exc
+    if digest != row.bundle_hash or size != row.size_bytes:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The server copy no longer matches its verified identity",
+        )
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=row.filename,
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/status", summary="OBD logger, backup and Home Assistant queue status")
@@ -583,6 +733,15 @@ async def validate_one(bundle_id: RowId, session: SessionDep) -> dict[str, objec
         row.state = original_state
         row.next_attempt_at = original_next_attempt_at
         row.updated_at = utcnow()
+    drive = (
+        await session.execute(select(OBDDrive).where(OBDDrive.bundle_id == row.id))
+    ).scalar_one_or_none()
+    if drive is not None:
+        await reconcile_drive_projection(
+            session,
+            drive,
+            summary_source=checked.summary_source,
+        )
     get_import_worker().wake()
     return {"valid": True, "bundle": _bundle(row)}
 

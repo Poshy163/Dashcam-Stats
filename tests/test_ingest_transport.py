@@ -1509,22 +1509,44 @@ class TestARunEndToEnd:
         milliseconds; what is under test here is the wiring — the quiet begins once a
         transfer is decided, and the run's own `finally` undoes it.
         """
-        from app.ingest import adb, puller, radios
+        from app.ingest import adb, obd_transfer, puller, radios
         from app.ingest.models import RunState
 
         monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
         commands: list[str] = []
+        bluetooth_on = True
 
         async def shell(address, command, **kwargs):
+            nonlocal bluetooth_on
             commands.append(command)
-            return "1" if "bluetooth_on" in command else ""
+            if "pm path" in command:
+                return obd_transfer._STATUS_NOT_INSTALLED
+            if "kernel/random/boot_id" in command:
+                return "dashcam-unit\n01234567-89ab-cdef-0123-456789abcdef"
+            if "bluetooth_manager disable" in command:
+                bluetooth_on = False
+                return ""
+            if "bluetooth_manager enable" in command:
+                bluetooth_on = True
+                return ""
+            if "bluetooth_on" in command:
+                return "1" if bluetooth_on else "0"
+            if "ip -o addr" in command:
+                # A parsed inventory with no serving AP is proof of OFF. An empty ADB
+                # reply is intentionally unknown and must abort durable radio quieting.
+                return "1: lo    inet 127.0.0.1/8 scope host lo\n"
+            if "printf cleared" in command:
+                return "cleared"
+            return ""
 
         monkeypatch.setattr(adb, "shell", shell)
 
-        async def no_watchdog(address, deadline_s):
-            return None
+        watchdog = FakeProcess()
 
-        monkeypatch.setattr(radios, "_arm_watchdog", no_watchdog)
+        async def armed_watchdog(address, deadline_s, **kwargs):
+            return watchdog
+
+        monkeypatch.setattr(radios, "_arm_watchdog", armed_watchdog)
         await self._enable(**{"ingest.quiet_radios": True})
 
         assert (await puller.run_pull(trigger="manual")).state is RunState.OK
@@ -1601,6 +1623,218 @@ class TestARunEndToEnd:
             "state": "backoff",
         }
 
+    async def test_capable_logger_finalises_and_backs_up_before_awaited_radio_quiet(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """The ack's bundle is discovered on the second inventory, copied, then radios
+        become quiet before the first footage byte. This is the ordering that prevents
+        ingestion from manufacturing an interrupted drive itself."""
+        from app.ingest import obd_control, puller, radios
+        from app.ingest.models import RunState
+        from app.ingest.obd_transfer import OBDTransferResult
+
+        events: list[str] = []
+        inventories = 0
+
+        async def logger_status(_address, _path):
+            return {
+                "schema_version": 2,
+                "state": "ecu_online",
+                "ownership_enabled": True,
+                "capabilities": [obd_control.CAPABILITY],
+            }
+
+        async def obd_inventory(_address, source):
+            nonlocal inventories
+            inventories += 1
+            events.append(f"inventory:{inventories}")
+            if inventories == 1:
+                return []
+            return [RemoteFile("drive-1.obd2.zip", 100, 0, source)]
+
+        async def obd_sync(_info, **_kwargs):
+            events.append("obd-copy")
+            return OBDTransferResult(copied=1, bytes=100, seconds=0.01)
+
+        async def verified(filename, bundle_sha256):
+            assert filename == "drive-1.obd2.zip"
+            assert bundle_sha256 == "0" * 64
+            events.append("bundle-verified")
+            return True
+
+        class Transition:
+            def raise_if_lease_lost(self):
+                return None
+
+            async def prepare_logger(self):
+                events.append("logger-ack")
+                return obd_control.LoggerAck(
+                    request_id="request-1",
+                    state="ready",
+                    ready_at_utc="2026-08-30T01:02:03Z",
+                    drive_id="drive-1",
+                    last_sample_at_utc="2026-08-30T01:02:02Z",
+                    bundle_filename="drive-1.obd2.zip",
+                    bundle_sha256="0" * 64,
+                    error=None,
+                )
+
+            async def mark_obd_transfer_complete(self):
+                events.append("obd-durable")
+
+            async def capture_and_quiet(self):
+                events.append("radios-quiet")
+
+            async def restore(self, **_kwargs):
+                events.append("radios-restored")
+                return True
+
+        async def begin(**_kwargs):
+            events.append("transition-claimed")
+            return Transition()
+
+        real_move = puller._move
+
+        async def move(*args, **kwargs):
+            events.append("footage-copy")
+            return await real_move(*args, **kwargs)
+
+        monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        monkeypatch.setattr(puller, "read_logger_status", logger_status)
+        monkeypatch.setattr(puller, "inventory_remote_bundles", obd_inventory)
+        monkeypatch.setattr(puller, "sync_remote_bundles", obd_sync)
+        monkeypatch.setattr(puller, "verified_bundle_matches", verified)
+        monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
+        monkeypatch.setattr(puller, "_move", move)
+        await self._enable(**{"ingest.quiet_radios": True})
+
+        result = await puller.run_pull(trigger="manual")
+
+        assert result.state is RunState.OK
+        assert events.index("logger-ack") < events.index("inventory:2")
+        assert events.index("inventory:2") < events.index("obd-copy")
+        assert events.index("obd-copy") < events.index("bundle-verified")
+        assert events.index("bundle-verified") < events.index("obd-durable")
+        assert events.index("obd-durable") < events.index("radios-quiet")
+        assert events.index("radios-quiet") < events.index("footage-copy")
+        assert events[-1] == "radios-restored"
+
+    async def test_lease_loss_after_commit_cancels_pull_before_card_reclaim(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        from app.ingest import puller, radios
+        from app.ingest.models import RunState
+
+        holder = {}
+
+        class Transition:
+            def __init__(self, callback):
+                self.callback = callback
+                self.lost = False
+                self.restored = False
+
+            def raise_if_lease_lost(self):
+                if self.lost:
+                    raise puller.radio_coordinator.RadioTransitionError("test lease lost")
+
+            async def mark_obd_transfer_complete(self):
+                return None
+
+            async def capture_and_quiet(self):
+                return None
+
+            async def restore(self, **_kwargs):
+                self.restored = True
+                return True
+
+        async def begin(**kwargs):
+            transition = Transition(kwargs["lease_loss_callback"])
+            holder["transition"] = transition
+            return transition
+
+        async def no_logger(_address, _path):
+            return None
+
+        async def no_obd(_address, _path):
+            return []
+
+        real_commit = puller.commit
+
+        def lose_lease_after_commit(*args, **kwargs):
+            committed = real_commit(*args, **kwargs)
+            transition = holder["transition"]
+            transition.lost = True
+            transition.callback()
+            return committed
+
+        monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        monkeypatch.setattr(puller, "read_logger_status", no_logger)
+        monkeypatch.setattr(puller, "inventory_remote_bundles", no_obd)
+        monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
+        monkeypatch.setattr(puller, "commit", lose_lease_after_commit)
+        await self._enable(
+            **{
+                "ingest.quiet_radios": True,
+                "ingest.delete_after_verify": True,
+            }
+        )
+
+        result = await puller.run_pull(trigger="manual")
+
+        assert result.state is RunState.ERROR
+        assert "lease lost" in (result.error or "")
+        assert unit.deleted == []
+        assert holder["transition"].restored
+
+    async def test_quiesce_failure_leaves_radios_on_and_still_copies_footage(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        from app.ingest import obd_control, puller, radios
+        from app.ingest.models import RunState
+
+        events: list[str] = []
+
+        async def logger_status(_address, _path):
+            return {
+                "schema_version": 2,
+                "state": "ecu_online",
+                "ownership_enabled": True,
+                "capabilities": [obd_control.CAPABILITY],
+            }
+
+        class Transition:
+            def raise_if_lease_lost(self):
+                return None
+
+            async def prepare_logger(self):
+                events.append("quiesce-failed")
+                raise RuntimeError("ack timeout")
+
+            async def capture_and_quiet(self):
+                events.append("unexpected-radio-change")
+
+            async def restore(self, **_kwargs):
+                events.append("request-cleared")
+                return True
+
+        async def begin(**_kwargs):
+            return Transition()
+
+        real_move = puller._move
+
+        async def move(*args, **kwargs):
+            events.append("footage-copy")
+            return await real_move(*args, **kwargs)
+
+        monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        monkeypatch.setattr(puller, "read_logger_status", logger_status)
+        monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
+        monkeypatch.setattr(puller, "_move", move)
+        await self._enable(**{"ingest.quiet_radios": True})
+
+        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+        assert events == ["quiesce-failed", "request-cleared", "footage-copy"]
+
     async def test_an_idle_window_never_touches_the_radios(
         self, db_session, unit, app_config, monkeypatch
     ):
@@ -1619,7 +1853,7 @@ class TestARunEndToEnd:
 
         monkeypatch.setattr(adb, "shell", shell)
 
-        async def no_watchdog(address, deadline_s):
+        async def no_watchdog(address, deadline_s, **kwargs):
             return None
 
         monkeypatch.setattr(radios, "_arm_watchdog", no_watchdog)
@@ -2212,6 +2446,73 @@ async def _configure_account_for_key(client, key: str) -> None:
     ).status_code == 200
     assert (await client.post("/api/auth/logout")).status_code == 204
     client.cookies.clear()
+
+
+class TestDisabledPollerRadioRecovery:
+    async def test_disabled_without_pending_transition_never_contacts_the_unit(self, monkeypatch):
+        from app.ingest import adb, radio_coordinator
+        from app.ingest.poller import IngestPoller
+
+        async def no_pending():
+            return None
+
+        async def contacted(_address):
+            raise AssertionError("disabled poller contacted the unit without durable recovery")
+
+        monkeypatch.setattr(radio_coordinator, "pending_recovery_address", no_pending)
+        monkeypatch.setattr(adb, "is_listening", contacted)
+
+        assert not await IngestPoller()._recover_pending_while_disabled()
+
+    async def test_disabled_poller_reconciles_pending_transition_on_next_arrival(self, monkeypatch):
+        from app.ingest import adb, radio_coordinator
+        from app.ingest.poller import IngestPoller
+
+        probes: list[str] = []
+        reconciled: list[str] = []
+
+        async def pending():
+            return "last-known:5555"
+
+        async def listening(address):
+            probes.append(address)
+            return address == "last-known:5555"
+
+        async def reconcile(*, address):
+            reconciled.append(address)
+            return True
+
+        poller = IngestPoller()
+        monkeypatch.setattr(poller, "_address", lambda: "configured:5555")
+        monkeypatch.setattr(radio_coordinator, "pending_recovery_address", pending)
+        monkeypatch.setattr(radio_coordinator, "reconcile_pending", reconcile)
+        monkeypatch.setattr(adb, "is_listening", listening)
+
+        assert await poller._recover_pending_while_disabled()
+        assert probes == ["configured:5555", "last-known:5555"]
+        assert reconciled == ["last-known:5555"]
+
+    async def test_feature_gate_runs_pending_recovery_ticker_before_sleep(self, monkeypatch):
+        from app.ingest.poller import IngestPoller
+
+        poller = IngestPoller()
+        poller._running = True
+        calls: list[str] = []
+
+        async def recover():
+            calls.append("recover")
+            poller._running = False
+            return True
+
+        async def no_wait(_delay):
+            calls.append("sleep")
+
+        monkeypatch.setattr(poller, "_enabled", lambda: False)
+        monkeypatch.setattr(poller, "_recover_pending_while_disabled", recover)
+        monkeypatch.setattr("app.ingest.poller.asyncio.sleep", no_wait)
+
+        await poller._loop()
+        assert calls == ["recover", "sleep"]
 
 
 class TestDrainingWhileTheCarIsStillHere:

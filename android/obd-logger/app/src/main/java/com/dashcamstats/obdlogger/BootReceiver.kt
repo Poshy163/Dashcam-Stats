@@ -34,7 +34,16 @@ class BootReceiver : BroadcastReceiver() {
             }
             return
         }
-        val service = Intent(context, ObdLoggerService::class.java)
+        val service = Intent(context, ObdLoggerService::class.java).apply {
+            putExtra(
+                EXTRA_STARTUP_RECOVERY_REASON,
+                if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
+                    "device_restart"
+                } else {
+                    "process_terminated"
+                },
+            )
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(service)
         } else {

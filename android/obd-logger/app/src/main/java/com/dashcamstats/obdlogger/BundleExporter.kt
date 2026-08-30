@@ -12,6 +12,7 @@ import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.file.LinkOption
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.time.Instant
 import java.time.ZoneId
 import java.util.zip.CRC32
@@ -25,6 +26,28 @@ data class ExportedBundle(val file: File, val sha256: String)
 internal const val RETAIN_RECENT_EXPORTED_DRIVES = 16
 internal const val RETENTION_CANDIDATE_BATCH = 16
 internal const val RETENTION_DELETE_BATCH = 4
+
+private val LEGACY_MANIFEST_FIELDS = setOf(
+    "schema_version", "bundle_format", "drive_id", "vehicle_id", "adapter_id", "logger_id",
+    "logger_version", "start_time_utc", "finish_time_utc", "original_timezone", "start_reason",
+    "stop_reason", "obd_protocol", "completion_status", "clean_end", "error_count",
+    "sample_count", "diagnostic_count", "created_at_utc", "included_filenames", "units", "files",
+)
+private val HARDENED_MANIFEST_FIELDS = LEGACY_MANIFEST_FIELDS + setOf(
+    "last_sample_at_utc", "last_successful_obd_response_at_utc", "termination_noticed_at_utc",
+    "finalised_at_utc", "interruption_reason", "poll_plan_version",
+)
+private val LEGACY_SUMMARY_FIELDS = setOf(
+    "schema_version", "drive_id", "start_time_utc", "finish_time_utc", "duration_s",
+    "distance_km", "average_speed_kmh", "maximum_speed_kmh", "average_rpm", "maximum_rpm",
+    "idle_duration_s", "estimated_fuel_used_l", "average_fuel_consumption_l_per_100km",
+    "maximum_coolant_temperature_c", "maximum_engine_load_pct", "dtcs_observed", "sample_count",
+    "missing_data_duration_s", "expected_sample_count", "received_sample_percentage", "clean_end",
+)
+private val HARDENED_SUMMARY_FIELDS = LEGACY_SUMMARY_FIELDS + setOf(
+    "last_sample_at_utc", "termination_noticed_at_utc", "finalised_at_utc", "completion_status",
+    "interruption_reason",
+)
 
 class BundleExporter(
     private val context: Context,
@@ -73,7 +96,9 @@ class BundleExporter(
         val work = File(workRoot, "obd-export-$driveId-${System.nanoTime()}").apply { mkdirs() }
         try {
             val drive = database.drive(driveId)
-            check(drive.getString("status") == "complete") { "only completed drives can be exported" }
+            check(drive.getString("status") in TERMINAL_DRIVE_STATUSES) {
+                "only terminal drives can be exported"
+            }
             check(drive.getLong("sample_count") > 0) {
                 "zero-sample drives are retained locally and cannot be exported"
             }
@@ -122,6 +147,7 @@ class BundleExporter(
                         .put("record_count", count),
                 )
             }
+            val createdAtUtc = exportCreatedAtUtc(drive)
             val manifest = JSONObject()
                 .put("schema_version", 1)
                 .put("bundle_format", "dashcam-obd")
@@ -130,8 +156,19 @@ class BundleExporter(
                 .put("adapter_id", drive.optNullable("adapter_id"))
                 .put("logger_id", drive.getString("logger_id"))
                 .put("logger_version", drive.getString("logger_version"))
+                .put("poll_plan_version", 2)
                 .put("start_time_utc", drive.getString("start_time_utc"))
                 .put("finish_time_utc", drive.getString("finish_time_utc"))
+                .put("last_sample_at_utc", drive.optNullable("last_sample_at_utc"))
+                .put(
+                    "last_successful_obd_response_at_utc",
+                    drive.optNullable("last_successful_response_at_utc"),
+                )
+                .put(
+                    "termination_noticed_at_utc",
+                    drive.optNullable("termination_noticed_at_utc"),
+                )
+                .put("finalised_at_utc", drive.optNullable("finalised_at_utc"))
                 .put("original_timezone", drive.optNullable("original_timezone"))
                 .put("start_reason", drive.getString("start_reason"))
                 .put("stop_reason", drive.optNullable("stop_reason"))
@@ -140,13 +177,15 @@ class BundleExporter(
                     "completion_status",
                     completionStatus(
                         if (drive.isNull("stop_reason")) null else drive.getString("stop_reason"),
+                        drive.getString("status"),
                     ),
                 )
+                .put("interruption_reason", drive.optNullable("interruption_reason"))
                 .put("clean_end", drive.optInt("clean_end") == 1)
                 .put("error_count", drive.getLong("error_count"))
                 .put("sample_count", sampleCount)
                 .put("diagnostic_count", diagnostics.size)
-                .put("created_at_utc", Instant.now().toString())
+                .put("created_at_utc", createdAtUtc)
                 .put("included_filenames", JSONArray(members))
                 .put("units", JSONObject(units as Map<*, *>))
                 .put("files", files)
@@ -155,7 +194,11 @@ class BundleExporter(
             if (partial.exists() && !partial.delete()) error("could not clear stale partial bundle")
             writeStoredZip(partial, members.map { name -> name to File(work, name) })
             validate(partial, driveId)
-            check(partial.renameTo(final)) { "could not atomically publish OBD bundle" }
+            try {
+                Files.move(partial.toPath(), final.toPath(), StandardCopyOption.ATOMIC_MOVE)
+            } catch (error: Exception) {
+                throw IllegalStateException("could not atomically publish OBD bundle", error)
+            }
             val digest = hashFile(final)
             database.recordVerifiedExport(driveId, digest)
             return ExportedBundle(final, digest)
@@ -341,6 +384,14 @@ class BundleExporter(
             .put("drive_id", drive.getString("drive_id"))
             .put("start_time_utc", start.toString())
             .put("finish_time_utc", finish.toString())
+            .put("last_sample_at_utc", drive.optNullable("last_sample_at_utc"))
+            .put("termination_noticed_at_utc", drive.optNullable("termination_noticed_at_utc"))
+            .put("finalised_at_utc", drive.optNullable("finalised_at_utc"))
+            .put("completion_status", completionStatus(
+                if (drive.isNull("stop_reason")) null else drive.getString("stop_reason"),
+                drive.getString("status"),
+            ))
+            .put("interruption_reason", drive.optNullable("interruption_reason"))
             .put("duration_s", duration)
             .put("distance_km", if (distanceIntervals > 0) distance else JSONObject.NULL)
             .put("average_speed_kmh", if (speedCount > 0) speedSum / speedCount else JSONObject.NULL)
@@ -381,19 +432,85 @@ class BundleExporter(
             val manifest = zip.getInputStream(zip.getEntry("manifest.json")).bufferedReader().use {
                 JSONObject(it.readText())
             }
+            val manifestFields = manifest.keys().asSequence().toSet()
+            check(manifestFields == LEGACY_MANIFEST_FIELDS || manifestFields == HARDENED_MANIFEST_FIELDS) {
+                "manifest fields do not match an exact supported v1 shape"
+            }
+            val hardened = manifestFields == HARDENED_MANIFEST_FIELDS
             check(manifest.getInt("schema_version") == 1)
             check(manifest.getString("drive_id") == expectedDriveId)
             check(manifest.getString("bundle_format") == "dashcam-obd")
+            val included = manifest.getJSONArray("included_filenames")
+            check(included.length() == members.size)
+            check((0 until included.length()).map(included::getString).toSet() == members.toSet())
             val manifestUnits = manifest.getJSONObject("units")
             check(manifestUnits.length() == units.size)
             check(units.all { (key, value) -> manifestUnits.optString(key) == value })
             val files = manifest.getJSONObject("files")
+            check(files.keys().asSequence().toSet() == members.drop(1).toSet())
             for (name in members.drop(1)) {
                 val entry = zip.getEntry(name)
                 val expected = files.getJSONObject(name)
+                check(
+                    expected.keys().asSequence().toSet() ==
+                        setOf("size_bytes", "sha256", "record_count"),
+                )
                 check(expected.getLong("size_bytes") == entry.size)
+                check(expected.getLong("record_count") >= 0)
                 val digest = zip.getInputStream(entry).use { hashStream(it) }
                 check(expected.getString("sha256") == digest)
+            }
+            val summary = zip.getInputStream(zip.getEntry("summary.json")).bufferedReader().use {
+                JSONObject(it.readText())
+            }
+            check(
+                summary.keys().asSequence().toSet() ==
+                    if (hardened) HARDENED_SUMMARY_FIELDS else LEGACY_SUMMARY_FIELDS,
+            ) { "summary fields do not match the manifest's exact v1 shape" }
+            check(summary.getInt("schema_version") == 1)
+            check(summary.getString("drive_id") == expectedDriveId)
+            check(summary.getString("start_time_utc") == manifest.getString("start_time_utc"))
+            check(summary.getString("finish_time_utc") == manifest.getString("finish_time_utc"))
+            check(summary.getLong("sample_count") == manifest.getLong("sample_count"))
+            check(summary.getBoolean("clean_end") == manifest.getBoolean("clean_end"))
+            validateLifecycleShape(manifest, summary, hardened)
+        }
+    }
+
+    private fun validateLifecycleShape(
+        manifest: JSONObject,
+        summary: JSONObject,
+        hardened: Boolean,
+    ) {
+        val start = Instant.parse(manifest.getString("start_time_utc"))
+        val finish = Instant.parse(manifest.getString("finish_time_utc"))
+        check(!finish.isBefore(start)) { "manifest drive time range is reversed" }
+        if (!hardened) return
+        check(manifest.get("poll_plan_version") is Number && manifest.getInt("poll_plan_version") == 2)
+        val lastSample = manifest.instantOrNull("last_sample_at_utc")
+        val lastResponse = manifest.instantOrNull("last_successful_obd_response_at_utc")
+        val noticed = manifest.instantOrNull("termination_noticed_at_utc")
+        val finalised = manifest.instantOrNull("finalised_at_utc")
+        if (lastSample != null) check(!lastSample.isBefore(start) && !lastSample.isAfter(finish))
+        val responseUpper = noticed ?: finalised ?: Instant.parse(manifest.getString("created_at_utc"))
+        if (lastResponse != null) {
+            check(!lastResponse.isBefore(start) && !lastResponse.isAfter(responseUpper))
+        }
+        if (noticed != null) check(!noticed.isBefore(finish))
+        if (finalised != null && noticed != null) check(!finalised.isBefore(noticed))
+        val created = Instant.parse(manifest.getString("created_at_utc"))
+        if (finalised != null) check(!created.isBefore(finalised))
+        val completion = manifest.getString("completion_status")
+        check(completion in setOf("complete", "interrupted", "recovered"))
+        val interruption = manifest.stringOrNull("interruption_reason")
+        if (manifest.getBoolean("clean_end")) {
+            check(completion == "complete" && interruption == null)
+        } else {
+            check(completion != "complete" && !interruption.isNullOrBlank())
+        }
+        for (key in HARDENED_SUMMARY_FIELDS - LEGACY_SUMMARY_FIELDS) {
+            check(summary.get(key).toString() == manifest.get(key).toString()) {
+                "summary $key does not match manifest"
             }
         }
     }
@@ -404,6 +521,16 @@ class BundleExporter(
             it.fd.sync()
         }
     }
+
+    private fun exportCreatedAtUtc(drive: JSONObject): String = listOfNotNull(
+        Instant.now(),
+        Instant.parse(drive.getString("start_time_utc")),
+        drive.stringOrNull("finish_time_utc")?.let(Instant::parse),
+        drive.stringOrNull("last_sample_at_utc")?.let(Instant::parse),
+        drive.stringOrNull("last_successful_response_at_utc")?.let(Instant::parse),
+        drive.stringOrNull("termination_noticed_at_utc")?.let(Instant::parse),
+        drive.stringOrNull("finalised_at_utc")?.let(Instant::parse),
+    ).maxOrNull()!!.toString()
 
     private fun hashFile(file: File): String = file.inputStream().use(::hashStream)
     private fun hashStream(stream: java.io.InputStream): String {
@@ -520,8 +647,12 @@ private val safeDriveId = Regex("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 internal fun isSafeDriveId(value: String): Boolean = safeDriveId.matches(value)
 
-internal fun completionStatus(stopReason: String?): String =
-    if (stopReason == "device_restart") "recovered" else "complete"
+internal fun completionStatus(stopReason: String?, persistedStatus: String? = null): String = when {
+    persistedStatus == "failed" -> "interrupted"
+    persistedStatus in TERMINAL_DRIVE_STATUSES -> checkNotNull(persistedStatus)
+    stopReason == null -> "complete"
+    else -> driveTerminalPolicy(stopReason).status
+}
 
 internal fun writeStoredZip(target: File, members: List<Pair<String, File>>) {
     FileOutputStream(target).use { raw ->
@@ -563,6 +694,11 @@ private fun addStored(zip: ZipOutputStream, source: File, name: String) {
 
 private fun JSONObject.optNullable(key: String): Any =
     if (has(key) && !isNull(key)) get(key) else JSONObject.NULL
+
+private fun JSONObject.stringOrNull(key: String): String? =
+    if (has(key) && !isNull(key)) getString(key) else null
+
+private fun JSONObject.instantOrNull(key: String): Instant? = stringOrNull(key)?.let(Instant::parse)
 
 private fun JSONObject.number(key: String): Double? =
     if (has(key) && !isNull(key)) optDouble(key).takeUnless(Double::isNaN) else null

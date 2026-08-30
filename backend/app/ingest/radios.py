@@ -60,9 +60,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
@@ -84,6 +86,17 @@ QUIET_AFTER_ONLINE_S = 10.0
 #: unrooted unit. It survives a reboot, which is harmless: the flag does nothing on its
 #: own, and every watchdog that reads it was armed by a run in the current boot.
 FLAG_PATH = "/data/local/tmp/.dashcam_analyser_radios"
+WATCHDOG_READY_PATH = f"{FLAG_PATH}.watchdog_ready"
+
+# Hotspot credentials are needed only to undo a process that dies after stopping the
+# AP. They never belong in the server database or its backups. A short-lived mode-0600
+# capsule stays inside the already-authorised Android shell boundary instead, alongside
+# the watchdog flag, and is removed as soon as restoration is verified.
+HOTSPOT_CAPSULE_PREFIX = "/data/local/tmp/.dashcam_analyser_hotspot_"
+MAX_HOTSPOT_CAPSULE_BYTES = 512
+_SAFE_TRANSITION_ID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+_BOOT_ID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+_DEVICE_SERIAL = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 
 #: Where "something is still turned off" is persisted on this side.
 #:
@@ -150,10 +163,52 @@ def _accepted(reply: str) -> bool:
 #: What may be carried back into ``cmd wifi start-softap`` inside single quotes.
 #:
 #: The SSID and passphrase come out of ``dumpsys`` output, which makes them scraped text
-#: rather than trusted configuration, and they end up as argv on the unit's shell. Same
-#: policy as the card filenames: validated against a conservative shape and refused
-#: otherwise, never escaped.
+#: rather than trusted configuration, and they enter a script delivered to the unit over
+#: stdin. Same policy as the card filenames: validated against a conservative shape and
+#: refused otherwise, never escaped.
 _SAFE_AP_TEXT = re.compile(r"^[A-Za-z0-9 ._@#%+=-]{1,63}$")
+
+
+async def read_device_boot_id(address: str) -> str | None:
+    """Return a privacy-safe stable-device fingerprint plus this boot's UUID.
+
+    The stable half makes a DHCP move safe to follow and rejects IP reuse by another
+    unit. The boot half records whether recovery crossed a reboot; it is intentionally
+    not the sole identity because a kernel boot UUID changes at every restart.
+    """
+
+    try:
+        reply = await adb.shell(
+            address,
+            'serial="$(getprop ro.serialno)"; '
+            '[ -n "$serial" ] && [ "$serial" != unknown ] || '
+            'serial="$(getprop ro.boot.serialno)"; '
+            "printf '%s\\n' \"$serial\"; cat /proc/sys/kernel/random/boot_id",
+            timeout=RADIO_TIMEOUT_S,
+        )
+    except adb.AdbError:
+        return None
+    lines = [line.strip() for line in reply.splitlines() if line.strip()]
+    if len(lines) != 2:
+        return None
+    serial, boot_id = lines[0], lines[1].lower()
+    if not _DEVICE_SERIAL.fullmatch(serial) or not _BOOT_ID.fullmatch(boot_id):
+        return None
+    fingerprint = hashlib.sha256(serial.encode("utf-8")).hexdigest()[:32]
+    return f"{fingerprint}@{boot_id}"
+
+
+def same_device_identity(stored: str, current: str | None) -> bool:
+    """Whether two stored identity tokens name the same physical unit."""
+
+    if current is None:
+        return False
+    stored_device, separator, _stored_boot = stored.partition("@")
+    current_device, current_separator, _current_boot = current.partition("@")
+    if separator and current_separator:
+        return stored_device == current_device
+    # Compatibility for a transition written by the short-lived boot-UUID-only format.
+    return stored == current
 
 
 def _parse_softap_config(dump: str) -> tuple[str, str] | None:
@@ -211,6 +266,17 @@ async def _bluetooth_is_on(address: str) -> bool | None:
     return None
 
 
+async def _confirm_bluetooth_off(address: str) -> bool:
+    """Whether Bluetooth is positively off after a disable request."""
+    deadline = time.monotonic() + CONFIRM_TIMEOUT_S
+    while True:
+        if await _bluetooth_is_on(address) is False:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(CONFIRM_INTERVAL_S)
+
+
 #: How long to keep asking whether Bluetooth actually came back, and how often.
 #:
 #: ``cmd bluetooth_manager enable`` returns "Success" the moment it is accepted, but
@@ -222,6 +288,14 @@ async def _bluetooth_is_on(address: str) -> bool | None:
 #: until the next arrival repaired it.
 CONFIRM_TIMEOUT_S = 8.0
 CONFIRM_INTERVAL_S = 0.5
+
+#: Bluetooth enable is vendor-coupled to hotspot enable on the production unit, but the
+#: AP interface appears several seconds after Bluetooth itself reports ON.  OFF cannot be
+#: certified inside that gap: doing so disarms the watchdog and retires the durable row
+#: just before the vendor brings the AP back.  Keep observing slightly beyond the measured
+#: ~5-second re-arm, with a short poll so an unexpected AP can be stopped promptly.
+HOTSPOT_REARM_SETTLE_S = 6.0
+HOTSPOT_REARM_POLL_S = 0.25
 
 
 async def _confirm_bluetooth_on(address: str) -> bool:
@@ -260,8 +334,8 @@ async def _set_bluetooth(address: str, *, enable: bool) -> bool:
     return False
 
 
-async def _serving_ap(address: str) -> str:
-    """The interface of a soft AP that is actually serving, or "" when none is.
+async def _serving_ap(address: str) -> str | None:
+    """Serving AP interface, ``""`` for proven absence, or ``None`` if unreadable.
 
     Three questions get conflated here and only one of them is the right one.
 
@@ -286,16 +360,48 @@ async def _serving_ap(address: str) -> str:
     try:
         reply = await adb.shell(address, "ip -o addr show; exit 0", timeout=RADIO_TIMEOUT_S)
     except adb.AdbError:
-        return ""
+        return None
+    parsed_inventory = False
     for line in reply.splitlines():
         match = _IP_LINE.match(line.strip())
         if not match:
             continue
+        parsed_inventory = True
         iface, addr = match.group(1), match.group(2)
         if addr == host or not _AP_NAME.match(iface):
             continue
         return iface
-    return ""
+    return "" if parsed_inventory else None
+
+
+async def _ap_interfaces(address: str) -> tuple[str, str] | None:
+    """Return ``(separate_ap, transport_ap)`` or ``None`` when state is unreadable.
+
+    A matching interface that owns the ADB target address is conservatively classified
+    as transport.  It may be a client interface on an unusually named vendor build, but
+    that ambiguity must resolve to "do not stop it", never to severing the transfer.
+    """
+    host = address.partition(":")[0].strip()
+    try:
+        reply = await adb.shell(address, "ip -o addr show; exit 0", timeout=RADIO_TIMEOUT_S)
+    except adb.AdbError:
+        return None
+    separate = ""
+    transport = ""
+    parsed_inventory = False
+    for line in reply.splitlines():
+        match = _IP_LINE.match(line.strip())
+        if not match:
+            continue
+        parsed_inventory = True
+        iface, addr = match.group(1), match.group(2)
+        if not _AP_NAME.match(iface):
+            continue
+        if addr == host:
+            transport = iface
+        elif not separate:
+            separate = iface
+    return (separate, transport) if parsed_inventory else None
 
 
 #: How a soft AP is asked to stop from an unrooted shell — the lever that actually works.
@@ -352,7 +458,8 @@ async def _stop_took_effect(address: str) -> bool:
     """Whether the AP is really gone, allowing for the teardown not being instant."""
     deadline = asyncio.get_running_loop().time() + STOP_SETTLE_BUDGET_S
     while True:
-        if not await _serving_ap(address):
+        observed = await _serving_ap(address)
+        if observed == "":
             return True
         if asyncio.get_running_loop().time() >= deadline:
             return False
@@ -425,11 +532,71 @@ async def _persist_refusal(value: str) -> None:
 
 async def _remove_flag(address: str) -> None:
     with contextlib.suppress(adb.AdbError):
-        await adb.shell(address, f"rm -f '{FLAG_PATH}'", timeout=RADIO_TIMEOUT_S)
+        await adb.shell(
+            address,
+            f"rm -f '{FLAG_PATH}' '{WATCHDOG_READY_PATH}'",
+            timeout=RADIO_TIMEOUT_S,
+        )
 
 
-async def _arm_watchdog(address: str, deadline_s: int) -> asyncio.subprocess.Process | None:
-    """Leave a Bluetooth re-enabler running on the unit, gated on the flag file.
+async def _shell_script(address: str, script: str, *, timeout: float) -> str:
+    """Run a shell script over stdin so credentials never appear in local process argv."""
+
+    process = await asyncio.create_subprocess_exec(
+        adb.adb_path(),
+        "-s",
+        address,
+        "shell",
+        "sh",
+        "-s",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, _stderr = await asyncio.wait_for(
+            process.communicate(script.encode("utf-8")),
+            timeout=timeout,
+        )
+    except TimeoutError:
+        process.kill()
+        with contextlib.suppress(TimeoutError, Exception):
+            await asyncio.wait_for(process.wait(), timeout=3.0)
+        raise adb.AdbError(f"adb shell script timed out after {timeout:.0f}s") from None
+    except asyncio.CancelledError:
+        process.kill()
+        raise
+    if process.returncode:
+        # Do not include stderr: a shell parser can echo the input line containing the
+        # passphrase, defeating the purpose of keeping it out of argv.
+        raise adb.AdbError(f"adb shell script failed ({process.returncode})")
+    return stdout.decode("utf-8", "replace").replace("\r", "").strip()
+
+
+def _valid_hotspot_capsule_path(path: str) -> bool:
+    if not path.startswith(HOTSPOT_CAPSULE_PREFIX) or not path.endswith(".json"):
+        return False
+    transition_id = path[len(HOTSPOT_CAPSULE_PREFIX) : -len(".json")]
+    return bool(_SAFE_TRANSITION_ID.fullmatch(transition_id))
+
+
+def hotspot_capsule_path(transition_id: str) -> str | None:
+    """Return the deterministic recovery path for a validated transition UUID."""
+
+    if not _SAFE_TRANSITION_ID.fullmatch(transition_id):
+        return None
+    return f"{HOTSPOT_CAPSULE_PREFIX}{transition_id}.json"
+
+
+async def _arm_watchdog(
+    address: str,
+    deadline_s: int,
+    *,
+    restore_bluetooth: bool = True,
+    hotspot_baseline: str = "unknown",
+    hotspot_capsule_path: str | None = None,
+) -> asyncio.subprocess.Process | None:
+    """Leave an exact radio-restoration watchdog running on the unit.
 
     The same shape as the transfer's listener: nothing is backgrounded remotely (this
     unit's ``adb shell`` never returns for a backgrounded command), so the adb child is
@@ -438,12 +605,53 @@ async def _arm_watchdog(address: str, deadline_s: int) -> asyncio.subprocess.Pro
     the watchdog exists for. If the run restores first it removes the flag, and a fired
     watchdog that finds no flag exits without touching anything.
     """
+    if hotspot_baseline not in {"on", "off", "transport", "unknown"}:
+        return None
+    if hotspot_capsule_path is not None and not _valid_hotspot_capsule_path(hotspot_capsule_path):
+        return None
+    if hotspot_baseline == "unknown" and hotspot_capsule_path is not None:
+        # Compatibility for the legacy RadioQuiet caller: a capsule only exists after it
+        # positively observed and stopped a serving AP.
+        hotspot_baseline = "on"
+    if hotspot_baseline == "on" and hotspot_capsule_path is None:
+        return None
+    restore_commands: list[str] = []
+    if restore_bluetooth:
+        restore_commands.append("cmd bluetooth_manager enable || svc bluetooth enable")
+    if restore_bluetooth and hotspot_baseline in {"on", "off"}:
+        # This vendor stack re-arms its AP a few seconds after Bluetooth is enabled. The
+        # final AP action therefore follows that settle period, rather than racing the
+        # re-arm and leaving the opposite of the captured baseline behind.
+        restore_commands.append("sleep 5")
+    if hotspot_baseline == "off":
+        # OFF is distinct from TRANSPORT. stopTethering is safe only because capture
+        # classified an AP carrying the ADB target address as transport, and that state
+        # never reaches this branch. Run both supported stop paths: the binder works on
+        # the field unit; the cmd fallback covers rooted/debuggable Android builds.
+        restore_commands.append(f"({_STOP_VIA_TETHERING})")
+        restore_commands.append("cmd wifi stop-softap >/dev/null 2>&1 || true")
+    elif hotspot_baseline == "on" and hotspot_capsule_path is not None:
+        # The compact JSON capsule was generated from a strict allowlist and read back
+        # byte-for-byte before this point. Values are expanded only as quoted argv, so a
+        # damaged file cannot become shell syntax. The capsule and recovery flag remain
+        # until a later server-side readback positively verifies the exact baseline.
+        restore_commands.append(
+            f"capsule='{hotspot_capsule_path}'; "
+            'ssid="$(sed -n \'s/.*"ssid":"\\([^"]*\\)".*/\\1/p\' "$capsule" | head -n 1)"; '
+            'passphrase="$(sed -n \'s/.*"passphrase":"\\([^"]*\\)".*/\\1/p\' "$capsule" | head -n 1)"; '
+            'if [ -n "$ssid" ] && [ -n "$passphrase" ]; then '
+            'cmd wifi start-softap "$ssid" wpa2 "$passphrase" >/dev/null 2>&1 || true; '
+            "fi"
+        )
+    if not restore_commands:
+        return None
     command = (
-        f"sleep {int(deadline_s)}; [ -f '{FLAG_PATH}' ] || exit 0; "
-        f"rm -f '{FLAG_PATH}'; cmd bluetooth_manager enable || svc bluetooth enable"
+        f"umask 077; printf armed > '{WATCHDOG_READY_PATH}'; sleep {int(deadline_s)}; "
+        f"[ -f '{FLAG_PATH}' ] || {{ rm -f '{WATCHDOG_READY_PATH}'; exit 0; }}; "
+        f"rm -f '{WATCHDOG_READY_PATH}'; " + "; ".join(restore_commands)
     )
     try:
-        return await asyncio.create_subprocess_exec(
+        process = await asyncio.create_subprocess_exec(
             adb.adb_path(),
             "-s",
             address,
@@ -453,9 +661,441 @@ async def _arm_watchdog(address: str, deadline_s: int) -> asyncio.subprocess.Pro
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if process.returncode is not None:
+                return None
+            reply = await adb.shell(
+                address,
+                f"[ \"$(cat '{WATCHDOG_READY_PATH}' 2>/dev/null)\" = armed ] && "
+                "printf armed; exit 0",
+                timeout=RADIO_TIMEOUT_S,
+            )
+            if reply.strip() == "armed":
+                return process
+            await asyncio.sleep(0.1)
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        with contextlib.suppress(TimeoutError, Exception):
+            await asyncio.wait_for(process.wait(), timeout=1.0)
+        return None
     except Exception as exc:
         log.warning("could not arm the Bluetooth watchdog on the unit", error=str(exc))
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class RadioSnapshot:
+    """The exact observable baseline captured before any radio side effect."""
+
+    bluetooth: str
+    hotspot: str
+    hotspot_interface: str | None = None
+    transport_interface: str | None = None
+    hotspot_config: tuple[str, str] | None = field(default=None, repr=False)
+
+
+class RadioController:
+    """Awaited radio primitives for the durable ingest coordinator.
+
+    Database ownership lives in :mod:`app.ingest.radio_coordinator`; this object owns the
+    process-local exclusion and the on-unit Bluetooth watchdog.  Methods deliberately do
+    one observable effect at a time so the coordinator can checkpoint intent before the
+    command and verification after it.
+    """
+
+    def __init__(self, address: str, *, watchdog_deadline_s: int) -> None:
+        self.address = address
+        self.watchdog_deadline_s = watchdog_deadline_s
+        self._watchdog: asyncio.subprocess.Process | None = None
+        self._bluetooth_baseline = "unknown"
+        self._hotspot_baseline = "unknown"
+        self._hotspot_rearm_deadline: float | None = None
+        self._transport_interface: str | None = None
+        self._hotspot_capsule_path: str | None = None
+        self._owns = False
+
+    def claim(self) -> None:
+        global _active
+        if not self._owns:
+            _active += 1
+            self._owns = True
+
+    async def capture(self) -> RadioSnapshot:
+        """Capture all baseline state under the process radio lock."""
+        async with _lock:
+            bluetooth_value = await _bluetooth_is_on(self.address)
+            bluetooth = (
+                "on"
+                if bluetooth_value is True
+                else "off"
+                if bluetooth_value is False
+                else "unknown"
+            )
+            self._bluetooth_baseline = bluetooth
+            interfaces = await _ap_interfaces(self.address)
+            if interfaces is None:
+                self._hotspot_baseline = "unknown"
+                self._transport_interface = None
+                return RadioSnapshot(bluetooth=bluetooth, hotspot="unknown")
+            iface, transport_iface = interfaces
+            self._transport_interface = transport_iface or None
+            if not iface:
+                if transport_iface:
+                    self._hotspot_baseline = "transport"
+                    return RadioSnapshot(
+                        bluetooth=bluetooth,
+                        hotspot="transport",
+                        hotspot_interface=transport_iface,
+                        transport_interface=transport_iface,
+                    )
+                self._hotspot_baseline = "off"
+                return RadioSnapshot(bluetooth=bluetooth, hotspot="off")
+
+            config: tuple[str, str] | None = None
+            try:
+                dump = await adb.shell(self.address, "dumpsys wifi", timeout=15.0)
+                config = _parse_softap_config(dump)
+            except adb.AdbError as exc:
+                log.debug("could not read the hotspot configuration", error=str(exc))
+            self._hotspot_baseline = "on"
+            return RadioSnapshot(
+                bluetooth=bluetooth,
+                hotspot="on",
+                hotspot_interface=iface,
+                transport_interface=transport_iface or None,
+                hotspot_config=config,
+            )
+
+    async def persist_hotspot_capsule(
+        self,
+        transition_id: str,
+        config: tuple[str, str],
+    ) -> str | None:
+        """Persist restore-only credentials inside the device's shell boundary."""
+        if not _SAFE_TRANSITION_ID.fullmatch(transition_id):
+            return None
+        ssid, passphrase = config
+        if not _SAFE_AP_TEXT.fullmatch(ssid) or not _SAFE_AP_TEXT.fullmatch(passphrase):
+            return None
+        body = json.dumps(
+            {"schema_version": 1, "ssid": ssid, "passphrase": passphrase},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        body_size = len(body.encode("utf-8"))
+        if "'" in body or body_size > MAX_HOTSPOT_CAPSULE_BYTES:
+            return None
+        target = hotspot_capsule_path(transition_id)
+        if target is None:
+            return None
+        partial = f"{target}.partial"
+        command = (
+            f"rm -f '{partial}' && umask 077 && printf '%s' '{body}' > '{partial}' && "
+            f"chmod 600 '{partial}' && [ -f '{partial}' ] && [ ! -L '{partial}' ] && "
+            f"[ \"$(wc -c < '{partial}')\" -eq {body_size} ] && "
+            f"[ \"$(cat '{partial}')\" = '{body}' ] && "
+            f"(sync '{partial}' 2>/dev/null || sync) && mv -f '{partial}' '{target}' && "
+            f"chmod 600 '{target}'"
+        )
+        try:
+            async with _lock:
+                await _shell_script(self.address, command, timeout=10.0)
+                readback = await adb.shell(
+                    self.address,
+                    f"[ -f '{target}' ] && [ ! -L '{target}' ] && cat '{target}'",
+                    timeout=6.0,
+                )
+        except adb.AdbError:
+            return None
+        if readback == body:
+            self._hotspot_capsule_path = target
+            return target
+        return None
+
+    async def read_hotspot_capsule(self, path: str) -> tuple[str, str] | None:
+        if not self._valid_capsule_path(path):
+            return None
+        try:
+            async with _lock:
+                raw = await adb.shell(
+                    self.address,
+                    f"[ -f '{path}' ] && [ ! -L '{path}' ] && "
+                    f"head -c {MAX_HOTSPOT_CAPSULE_BYTES + 1} '{path}'; exit 0",
+                    timeout=6.0,
+                )
+        except adb.AdbError:
+            return None
+        if not raw or len(raw.encode("utf-8")) > MAX_HOTSPOT_CAPSULE_BYTES:
+            return None
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(value, dict) or set(value) != {"schema_version", "ssid", "passphrase"}:
+            return None
+        ssid = value.get("ssid")
+        passphrase = value.get("passphrase")
+        if (
+            value.get("schema_version") != 1
+            or not isinstance(ssid, str)
+            or not isinstance(passphrase, str)
+            or not _SAFE_AP_TEXT.fullmatch(ssid)
+            or not _SAFE_AP_TEXT.fullmatch(passphrase)
+            or len(passphrase) < 8
+        ):
+            return None
+        return ssid, passphrase
+
+    async def remove_hotspot_capsule(self, path: str) -> bool:
+        if not self._valid_capsule_path(path):
+            return False
+        try:
+            async with _lock:
+                reply = await adb.shell(
+                    self.address,
+                    f"rm -f '{path}'; [ ! -e '{path}' ] && printf removed; exit 0",
+                    timeout=6.0,
+                )
+        except adb.AdbError:
+            return False
+        removed = reply.strip() == "removed"
+        if removed and self._hotspot_capsule_path == path:
+            self._hotspot_capsule_path = None
+        return removed
+
+    @staticmethod
+    def _valid_capsule_path(path: str) -> bool:
+        return _valid_hotspot_capsule_path(path)
+
+    async def _ensure_watchdog_locked(self, *, marker: str) -> bool:
+        if self._watchdog is not None and self._watchdog.returncode is None:
+            return True
+        await _persist_marker(marker)
+        try:
+            await _remove_flag(self.address)
+            await adb.shell(self.address, f"touch '{FLAG_PATH}'", timeout=RADIO_TIMEOUT_S)
+        except adb.AdbError:
+            log.warning("could not create the radio watchdog flag; leaving radios on")
+            return False
+        self._watchdog = await _arm_watchdog(
+            self.address,
+            self.watchdog_deadline_s,
+            restore_bluetooth=self._bluetooth_baseline != "off",
+            hotspot_baseline=self._hotspot_baseline,
+            hotspot_capsule_path=self._hotspot_capsule_path,
+        )
+        if self._watchdog is None:
+            await _remove_flag(self.address)
+            await _persist_marker("")
+            log.warning("could not prove the radio watchdog was armed; leaving radios on")
+            return False
+        return True
+
+    async def disable_bluetooth(self) -> bool:
+        """Disable and positively verify Bluetooth, with all legacy recovery guards."""
+        async with _lock:
+            # The remote process must acknowledge that it is alive before Bluetooth is
+            # touched. Merely creating a local ``adb`` child is not proof that its shell
+            # reached the unit; an immediate transport failure would otherwise leave no
+            # independent restoration path after the disable.
+            if not await self._ensure_watchdog_locked(marker="bluetooth"):
+                return False
+            accepted = await _set_bluetooth(self.address, enable=False)
+            verified = accepted and await _confirm_bluetooth_off(self.address)
+            if verified:
+                log.info("turned the unit's Bluetooth off for the transfer")
+                return True
+            log.warning("could not confirm the unit's Bluetooth is off; aborting radio quiet")
+            return False
+
+    async def disable_hotspot(self) -> bool:
+        """Stop a separate serving AP and verify its interface disappeared."""
+        async with _lock:
+            if self._hotspot_capsule_path is None:
+                log.warning("hotspot recovery capsule is unavailable; leaving the hotspot on")
+                return False
+            if not await self._ensure_watchdog_locked(marker="hotspot"):
+                return False
+            stopped, why = await _stop_hotspot(self.address)
+            if stopped:
+                await _persist_refusal("")
+                log.info("stopped the unit's hotspot for the transfer")
+                return True
+            await _persist_refusal(why or "the unit refused without saying why")
+            log.warning("could not stop the unit's hotspot", reply=why)
+            return False
+
+    async def restore_bluetooth(self, baseline: str) -> bool:
+        """Restore/verify the baseline Bluetooth state, including an original OFF."""
+        async with _lock:
+            if baseline == "unknown":
+                return False
+            if baseline == "on":
+                restored = await _set_bluetooth(self.address, enable=True)
+                if restored:
+                    # Start the settle clock at the accepted enable, not after the
+                    # Bluetooth confirmation: that command is what triggers the vendor's
+                    # delayed hotspot re-arm. Issuing the idempotent enable even when a
+                    # watchdog may already have restored Bluetooth also covers a re-arm
+                    # that was in flight just before this process observed the unit.
+                    self._hotspot_rearm_deadline = time.monotonic() + HOTSPOT_REARM_SETTLE_S
+                restored = restored and await _confirm_bluetooth_on(self.address)
+            else:
+                self._hotspot_rearm_deadline = None
+                current = await _bluetooth_is_on(self.address)
+                restored = current is False
+                if current is True:
+                    restored = await _set_bluetooth(self.address, enable=False)
+                    restored = restored and await _confirm_bluetooth_off(self.address)
+            if restored:
+                # The hotspot is restored afterwards. Standing the shared watchdog down
+                # here would strand an originally-on AP if that later operation failed.
+                pass
+            return restored
+
+    async def _restore_hotspot_off(self) -> bool:
+        """Keep the original OFF baseline true through any delayed Bluetooth re-arm."""
+        while True:
+            serving = await _serving_ap(self.address)
+            if serving is None:
+                return False
+            if serving:
+                stopped, why = await _stop_hotspot(self.address)
+                if not stopped:
+                    log.warning("could not restore the originally-off hotspot", reply=why)
+                    return False
+
+            deadline = self._hotspot_rearm_deadline
+            if deadline is None:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._hotspot_rearm_deadline = None
+                return True
+            await asyncio.sleep(min(HOTSPOT_REARM_POLL_S, remaining))
+
+    async def _wait_for_hotspot_rearm(self) -> str | None:
+        """Let an originally-ON AP reappear before explicitly starting a duplicate."""
+        while True:
+            serving = await _serving_ap(self.address)
+            if serving is None or serving:
+                if serving:
+                    self._hotspot_rearm_deadline = None
+                return serving
+            deadline = self._hotspot_rearm_deadline
+            if deadline is None:
+                return ""
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._hotspot_rearm_deadline = None
+                return ""
+            await asyncio.sleep(min(HOTSPOT_REARM_POLL_S, remaining))
+
+    async def restore_hotspot(
+        self,
+        baseline: str,
+        config: tuple[str, str] | None,
+    ) -> bool:
+        """Restore the observed AP state and verify the effect.
+
+        This intentionally runs *after* Bluetooth restoration.  Enabling Bluetooth on
+        the target vendor unit may re-arm a soft AP; an originally-off hotspot therefore
+        needs a final stop to return to the true baseline.
+        """
+        async with _lock:
+            if baseline == "transport":
+                return True  # never touched; it is the active data/control path
+            if baseline == "unknown":
+                return False
+            if baseline == "off":
+                return await self._restore_hotspot_off()
+
+            serving = await self._wait_for_hotspot_rearm()
+            if serving is None:
+                # A lost ADB reply and a proven-empty interface inventory are different
+                # safety facts.  In particular, Bluetooth restoration may have re-armed
+                # this vendor's AP: an unreadable inventory cannot certify the original
+                # OFF baseline and must leave durable recovery armed for the next arrival.
+                return False
+            if not config:
+                return False
+            ssid, passphrase = config
+            if serving:
+                try:
+                    current = _parse_softap_config(
+                        await adb.shell(self.address, "dumpsys wifi", timeout=15.0)
+                    )
+                except adb.AdbError:
+                    current = None
+                if current == config:
+                    return True
+                # A serving AP is not necessarily the captured AP. Replace it only because
+                # the exact prior configuration is protected in the recovery capsule.
+                stopped, why = await _stop_hotspot(self.address)
+                if not stopped:
+                    log.warning("could not replace a mismatched restored hotspot", reply=why)
+                    return False
+            try:
+                reply = await _shell_script(
+                    self.address,
+                    f"cmd wifi start-softap '{ssid}' wpa2 '{passphrase}'",
+                    timeout=RADIO_TIMEOUT_S,
+                )
+            except adb.AdbError:
+                return False
+            if not _accepted(reply):
+                return False
+            deadline = time.monotonic() + CONFIRM_TIMEOUT_S
+            while True:
+                serving = await _serving_ap(self.address)
+                if serving is None:
+                    return False
+                if serving:
+                    try:
+                        current = _parse_softap_config(
+                            await adb.shell(self.address, "dumpsys wifi", timeout=15.0)
+                        )
+                    except adb.AdbError:
+                        current = None
+                    if current == config:
+                        return True
+                if time.monotonic() >= deadline:
+                    return False
+                await asyncio.sleep(CONFIRM_INTERVAL_S)
+
+    async def _stop_watchdog(self) -> None:
+        watchdog = self._watchdog
+        if watchdog is not None and watchdog.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                watchdog.kill()
+            with contextlib.suppress(TimeoutError, Exception):
+                await asyncio.wait_for(watchdog.wait(), timeout=3.0)
+
+    async def stand_down_watchdog(self) -> bool:
+        """Disarm only after every changed radio has regained its exact baseline."""
+        async with _lock:
+            try:
+                reply = await adb.shell(
+                    self.address,
+                    f"rm -f '{FLAG_PATH}' '{WATCHDOG_READY_PATH}'; "
+                    f"[ ! -e '{FLAG_PATH}' ] && [ ! -e '{WATCHDOG_READY_PATH}' ] && "
+                    "printf cleared; exit 0",
+                    timeout=RADIO_TIMEOUT_S,
+                )
+            except adb.AdbError:
+                return False
+            if reply.strip() != "cleared":
+                return False
+            await self._stop_watchdog()
+            await _persist_marker("")
+            return True
+
+    async def release(self) -> None:
+        global _active
+        if self._owns:
+            _active -= 1
+            self._owns = False
 
 
 @dataclass
@@ -469,7 +1109,7 @@ class RadioQuiet:
     #: asymmetry is deliberate: enabling a radio that is already on is a no-op, while
     #: failing to enable one that was turned off is a silent phone in the morning.
     bluetooth_off: bool = False
-    hotspot_restore: tuple[str, str] | None = None
+    hotspot_restore: tuple[str, str] | None = field(default=None, repr=False)
     _task: asyncio.Task | None = None
     _watchdog: asyncio.subprocess.Process | None = None
     #: Whether this run has claimed the radios, so `finish` releases exactly once however
@@ -534,7 +1174,10 @@ class RadioQuiet:
 
     async def _quiet_hotspot(self) -> None:
         iface = await _serving_ap(self.address)
-        if not iface:
+        if iface is None:
+            log.warning("could not read the unit's hotspot state; leaving it alone")
+            return
+        if iface == "":
             # Nothing is serving, which is already the state that was asked for. The
             # previous version fired a `stop-softap` here every window regardless, which
             # on a unit that cannot run it produced no effect and no log line either --
@@ -631,7 +1274,7 @@ class RadioQuiet:
     async def _restore_hotspot(self) -> None:
         ssid, passphrase = self.hotspot_restore or ("", "")
         try:
-            await adb.shell(
+            await _shell_script(
                 self.address,
                 f"cmd wifi start-softap '{ssid}' wpa2 '{passphrase}'",
                 timeout=RADIO_TIMEOUT_S,

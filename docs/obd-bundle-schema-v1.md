@@ -10,8 +10,8 @@ all timestamps are RFC 3339/ISO 8601 strings with an explicit zero UTC offset.
 The final filename is `<drive_id>.obd2.zip`; the in-progress sibling is
 `<drive_id>.obd2.zip.partial` and is never discovered. `drive_id` matches
 `[A-Za-z0-9][A-Za-z0-9_-]{0,63}` and `vehicle_id` matches
-`[a-z0-9][a-z0-9_-]{0,63}`. The archive is `ZIP_STORED` and has exactly four regular,
-unencrypted root members, with no directories, links or duplicate names:
+`[a-z0-9][a-z0-9_-]{0,63}`. The canonical producer archive is `ZIP_STORED` and has four
+regular, unencrypted root members, with no directories, links or duplicate names:
 
 ```text
 manifest.json
@@ -20,7 +20,7 @@ diagnostics.json
 summary.json
 ```
 
-`manifest.json` contains exactly these keys:
+Legacy `manifest.json` contains exactly these keys:
 
 | Key | V1 type/rule |
 | --- | --- |
@@ -35,7 +35,7 @@ summary.json
 | `start_reason` | non-empty string up to 128 characters |
 | `stop_reason` | non-empty string up to 128 characters, or `null` |
 | `obd_protocol` | non-empty string up to 256 characters, or `null` |
-| `completion_status` | `complete` or `recovered` |
+| `completion_status` | `complete`, `interrupted`, or `recovered` |
 | `clean_end` | boolean |
 | `sample_count`, `diagnostic_count`, `error_count` | non-negative integers; counts equal payload records |
 | `included_filenames` | the four member names above, exactly once each |
@@ -45,6 +45,16 @@ summary.json
 The manifest hashes the stored bytes of `samples.ndjson.gz`, `diagnostics.json` and
 `summary.json`; it cannot hash itself. The whole archive SHA-256 is computed after the final
 atomic rename and becomes the server/receipt/HA idempotency identity.
+
+Hardened v1 uses one other exact manifest shape: all legacy keys plus
+`poll_plan_version: 2`, `last_sample_at_utc`,
+`last_successful_obd_response_at_utc`, `termination_noticed_at_utc`,
+`finalised_at_utc`, and `interruption_reason`. Lifecycle timestamps are UTC or `null` and
+ordered; an unclean hardened drive cannot claim `complete`, while a clean drive has no
+interruption reason. No partial subset or additional key is accepted. The explicit poll
+plan version identifies the distributed medium phases (`index % 3`) and slow phases
+(`0`, `4`, `8`) used for cadence analysis; legacy manifests retain the grouped phase-zero
+plan.
 
 ## Units and samples
 
@@ -130,7 +140,7 @@ observation timestamp without repeating full payloads.
 
 ## Summary and implementation limits
 
-`summary.json` has exactly these keys: `schema_version`, `drive_id`, `start_time_utc`,
+Legacy `summary.json` has exactly these keys: `schema_version`, `drive_id`, `start_time_utc`,
 `finish_time_utc`, `duration_s`, `distance_km`, `average_speed_kmh`, `maximum_speed_kmh`,
 `average_rpm`, `maximum_rpm`, `idle_duration_s`, `estimated_fuel_used_l`,
 `average_fuel_consumption_l_per_100km`, `maximum_coolant_temperature_c`,
@@ -140,6 +150,15 @@ count and clean-end match the manifest. `duration_s`, `missing_data_duration_s` 
 `received_sample_percentage` are non-null; other aggregate metrics are numeric or `null` so
 missing never becomes zero. Expected count is at least sample count, missing duration is at
 most duration, percentages are 0..100, and DTCs are bounded canonical codes.
+
+A hardened summary has the same base plus exactly `last_sample_at_utc`,
+`termination_noticed_at_utc`, `finalised_at_utc`, `completion_status`, and
+`interruption_reason`; those values must equal the manifest. Because a summary contains
+only derived arithmetic, a missing, corrupt, hash-mismatched, or semantically invalid
+summary does not hide otherwise valid primary history. The server still strictly validates
+the manifest, sample stream and diagnostics, derives a replacement summary from those
+validated records, records `summary_source=derived` and a warning, and retains the original
+archive unchanged for forensic download.
 
 JSON members are capped at 2 MiB and a decompressed NDJSON line at 64 KiB. The deployment
 also enforces configured archive size, total expansion, compression-ratio and sample-count

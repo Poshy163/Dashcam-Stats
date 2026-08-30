@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import inspect, select
 
 from app.db import models
-from app.db.models import Base, Camera, CameraRole, OsdProfile
+from app.db.models import Base, Camera, CameraRole, OBDBundle, OBDDrive, OsdProfile
 from app.db.session import current_revision, dispose_engine, get_engine, init_db, session_scope
 
 
@@ -86,15 +86,20 @@ class TestMigrations:
         import sqlite3
 
         from alembic import command
+        from alembic.script import ScriptDirectory
 
         from app.db.session import alembic_config
 
         await init_db(seed=False)
         await dispose_engine()
-        await asyncio.to_thread(command.downgrade, alembic_config(), "0013")
+        config = alembic_config()
+        head = ScriptDirectory.from_config(config).get_current_head()
+        await asyncio.to_thread(command.downgrade, config, "0013")
 
         await init_db(seed=False)
-        backups = sorted((app_config.data_dir / "backups").glob("pre-migration-0013-to-0014-*.db"))
+        backups = sorted(
+            (app_config.data_dir / "backups").glob(f"pre-migration-0013-to-{head}-*.db")
+        )
         assert len(backups) == 1
         with sqlite3.connect(backups[0]) as connection:
             assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
@@ -141,6 +146,75 @@ class TestMigrations:
         async with engine.connect() as conn:
             result = await conn.exec_driver_sql("PRAGMA foreign_keys")
             assert bool(result.scalar())
+
+    async def test_0015_backfills_legacy_unclean_completion_without_rewriting_manifest(
+        self, app_config
+    ):
+        import asyncio
+        from datetime import UTC, datetime, timedelta
+
+        from alembic import command
+
+        from app.db.session import alembic_config
+
+        await init_db(seed=False)
+        started = datetime(2026, 8, 30, 4, 36, tzinfo=UTC)
+        observed = started + timedelta(minutes=27)
+        raw_manifest = {
+            "completion_status": "complete",
+            "clean_end": False,
+            "stop_reason": "connection_lost",
+        }
+        async with session_scope() as session:
+            bundle = OBDBundle(
+                drive_id="drive_migration_interrupted",
+                bundle_hash="a" * 64,
+                schema_version=1,
+                filename="drive_migration_interrupted.obd2.zip",
+                size_bytes=1,
+                vehicle_id="tiida_c11",
+                logger_id="dashcam_head_unit",
+                logger_version="0.1.1",
+                drive_started_at=started,
+                drive_finished_at=observed,
+                sample_count=0,
+                diagnostic_count=0,
+                metadata_trusted=True,
+            )
+            session.add(bundle)
+            await session.flush()
+            session.add(
+                OBDDrive(
+                    bundle_id=bundle.id,
+                    drive_id=bundle.drive_id,
+                    vehicle_id=bundle.vehicle_id,
+                    started_at=started,
+                    finished_at=observed,
+                    stop_reason="connection_lost",
+                    completion_status="complete",
+                    clean_end=False,
+                    units={},
+                    manifest_json=raw_manifest,
+                    summary_json={},
+                )
+            )
+
+        await dispose_engine()
+        config = alembic_config()
+        await asyncio.to_thread(command.downgrade, config, "0014")
+        await asyncio.to_thread(command.upgrade, config, "head")
+
+        async with session_scope() as session:
+            drive = (
+                await session.execute(
+                    select(OBDDrive).where(OBDDrive.drive_id == "drive_migration_interrupted")
+                )
+            ).scalar_one()
+            assert drive.lifecycle_status == "interrupted"
+            assert drive.interruption_reason == "connection_lost"
+            assert drive.finalization_observed_at == observed
+            assert drive.processing_status == "pending"
+            assert drive.manifest_json == raw_manifest
 
 
 class TestSeeding:

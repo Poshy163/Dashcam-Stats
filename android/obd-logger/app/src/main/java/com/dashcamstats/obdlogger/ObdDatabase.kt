@@ -9,14 +9,15 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.time.Instant
 import java.util.UUID
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.RandomAccessFile
 
 data class DriveRecord(
     val driveId: String,
@@ -53,7 +54,36 @@ object ExportRecoveryPlanner {
     }
 }
 
-data class LastCompletedDrive(val driveId: String, val finishedAtUtc: String)
+data class LastCompletedDrive(
+    val driveId: String,
+    val finishedAtUtc: String,
+    val lastSampleAtUtc: String?,
+)
+
+data class DriveFinalization(
+    val driveId: String,
+    val status: String,
+    val finishTimeUtc: String,
+    val lastSampleAtUtc: String?,
+    val lastSuccessfulResponseAtUtc: String?,
+    val terminationNoticedAtUtc: String,
+    val finalisedAtUtc: String,
+    val stopReason: String,
+    val sampleCount: Long,
+    val changed: Boolean,
+)
+
+private data class ExistingDriveLifecycle(
+    val status: String,
+    val startTimeUtc: String,
+    val finishTimeUtc: String?,
+    val lastSampleAtUtc: String?,
+    val lastSuccessfulResponseAtUtc: String?,
+    val terminationNoticedAtUtc: String?,
+    val finalisedAtUtc: String?,
+    val stopReason: String?,
+    val sampleCount: Long,
+)
 
 data class ExportedDriveRetentionCandidate(
     val driveId: String,
@@ -63,12 +93,15 @@ data class ExportedDriveRetentionCandidate(
 
 data class VerifiedExportedDrive(val driveId: String, val bundleSha256: String)
 
+internal val TERMINAL_DRIVE_STATUSES = setOf("complete", "interrupted", "recovered", "failed")
+
 class ObdDatabase(
     context: Context,
+    private val migrationFileFailureForTest: ((String) -> Unit)? = null,
     private val upgradeFailureForTest: (() -> Unit)? = null,
 ) : SQLiteOpenHelper(context, DATABASE_NAME, null, DATABASE_VERSION) {
     private val databaseFile = context.getDatabasePath(DATABASE_NAME)
-    private val migrationBackup = prepareMigrationBackup(databaseFile)
+    private val migrationBackup = prepareMigrationBackup(databaseFile, migrationFileFailureForTest)
 
     init {
         setWriteAheadLoggingEnabled(true)
@@ -94,14 +127,18 @@ class ObdDatabase(
                 check(database.version == DATABASE_VERSION && integrity) {
                     "upgraded OBD database failed its integrity check"
                 }
-                migrationBackup.deleteRecursively()
+                retireMigrationBackup(databaseFile, migrationBackup)
             }
             return database
         } catch (error: Throwable) {
             if (migrationBackup != null) {
                 runCatching { super.close() }
                 try {
-                    restoreMigrationBackup(databaseFile, migrationBackup)
+                    restoreMigrationBackup(
+                        databaseFile,
+                        migrationBackup,
+                        migrationFileFailureForTest,
+                    )
                 } catch (restoreError: Throwable) {
                     error.addSuppressed(restoreError)
                 }
@@ -137,7 +174,10 @@ class ObdDatabase(
               start_reason TEXT NOT NULL, stop_reason TEXT, obd_protocol TEXT,
               status TEXT NOT NULL, export_status TEXT NOT NULL DEFAULT 'waiting_for_backup',
               bundle_sha256 TEXT, sample_count INTEGER NOT NULL DEFAULT 0,
-              error_count INTEGER NOT NULL DEFAULT 0, clean_end INTEGER NOT NULL DEFAULT 0
+              error_count INTEGER NOT NULL DEFAULT 0, clean_end INTEGER NOT NULL DEFAULT 0,
+              last_sample_at_utc TEXT, last_successful_response_at_utc TEXT,
+              termination_noticed_at_utc TEXT, finalised_at_utc TEXT,
+              interruption_reason TEXT, last_processing_error TEXT
             )
             """.trimIndent(),
         )
@@ -175,93 +215,415 @@ class ObdDatabase(
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        if (oldVersion == 1 && newVersion >= 2) {
+        if (oldVersion < 2 && newVersion >= 2) {
             db.execSQL("ALTER TABLE samples ADD COLUMN oxygen_sensors_present TEXT")
             db.execSQL("ALTER TABLE samples ADD COLUMN obd_standard TEXT")
             db.execSQL("ALTER TABLE samples ADD COLUMN distance_with_mil REAL")
-            upgradeFailureForTest?.invoke()
-            return
         }
-        throw IllegalStateException("unsupported OBD database upgrade $oldVersion -> $newVersion")
+        if (oldVersion < 3 && newVersion >= 3) {
+            db.execSQL("ALTER TABLE drives ADD COLUMN last_sample_at_utc TEXT")
+            db.execSQL("ALTER TABLE drives ADD COLUMN last_successful_response_at_utc TEXT")
+            db.execSQL("ALTER TABLE drives ADD COLUMN termination_noticed_at_utc TEXT")
+            db.execSQL("ALTER TABLE drives ADD COLUMN finalised_at_utc TEXT")
+            db.execSQL("ALTER TABLE drives ADD COLUMN interruption_reason TEXT")
+            db.execSQL("ALTER TABLE drives ADD COLUMN last_processing_error TEXT")
+            if (tableHasColumn(db, "samples", "timestamp_utc")) {
+                db.execSQL(
+                    """
+                    UPDATE drives SET
+                      last_sample_at_utc=(
+                        SELECT timestamp_utc FROM samples WHERE samples.drive_id=drives.drive_id
+                        ORDER BY sequence DESC LIMIT 1
+                      ),
+                      last_successful_response_at_utc=(
+                        SELECT timestamp_utc FROM samples WHERE samples.drive_id=drives.drive_id
+                          AND quality_json NOT LIKE '%"transport":"failed_after_partial"%'
+                        ORDER BY sequence DESC LIMIT 1
+                      )
+                    """.trimIndent(),
+                )
+            }
+            if (tableHasColumn(db, "drives", "finish_time_utc")) {
+                db.execSQL(
+                    "UPDATE drives SET termination_noticed_at_utc=finish_time_utc," +
+                        "finalised_at_utc=finish_time_utc",
+                )
+            }
+        }
+        upgradeFailureForTest?.invoke()
+        if (oldVersion !in 1 until newVersion || newVersion > DATABASE_VERSION) {
+            throw IllegalStateException("unsupported OBD database upgrade $oldVersion -> $newVersion")
+        }
     }
 
     companion object {
         private const val DATABASE_NAME = "obd_drives.db"
-        private const val DATABASE_VERSION = 2
-        private const val SQLITE_USER_VERSION_OFFSET = 60L
-        private val sidecars = listOf("" to "main", "-wal" to "wal", "-shm" to "shm")
+        private const val DATABASE_VERSION = 3
+        private const val BACKUP_READY_NAME = "READY.json"
+        private const val BACKUP_STAGING_NAME = ".obd-migration-v3.partial"
+        private const val RESTORE_MARKER_SUFFIX = ".migration-restore.pending"
+        private const val RESTORE_STAGING_SUFFIX = ".migration-restore.partial"
+        private val volatileSidecarSuffixes = listOf("-wal", "-shm", "-journal")
+        private val backupMetadataKeys = setOf(
+            "schema_version",
+            "source_database_version",
+            "main_size_bytes",
+            "main_sha256",
+        )
 
-        private fun prepareMigrationBackup(databaseFile: File): File? {
-            if (!databaseFile.isFile || sqliteHeaderVersion(databaseFile) != 1) return null
-            val backup = File(
-                databaseFile.parentFile,
-                "${databaseFile.name}.migration-backup-v1-to-v$DATABASE_VERSION",
+        private data class DatabaseInspection(val version: Int)
+
+        private data class ValidatedMigrationBackup(
+            val main: File,
+            val sourceVersion: Int,
+            val sizeBytes: Long,
+            val sha256: String,
+        )
+
+        /**
+         * Resolve every interrupted restore before SQLiteOpenHelper can open the live path. A
+         * validated old-version backup wins only when the live set is absent/corrupt or a durable
+         * restore marker exists; a healthy current database wins and retires stale artifacts.
+         */
+        private fun prepareMigrationBackup(
+            databaseFile: File,
+            failureForTest: ((String) -> Unit)?,
+        ): File? {
+            databaseFile.parentFile?.mkdirs()
+            val backup = migrationBackupDirectory(databaseFile)
+            val marker = restoreMarker(databaseFile)
+            var restoredFromBackup = false
+            if (marker.isFile) {
+                check(validateMigrationBackup(backup) != null) {
+                    "OBD migration restore is pending but its validated backup is missing"
+                }
+                restoreMigrationBackup(databaseFile, backup, failureForTest)
+                restoredFromBackup = true
+            } else {
+                Files.deleteIfExists(restoreStaging(databaseFile).toPath())
+                Files.deleteIfExists(File(marker.parentFile, "${marker.name}.partial").toPath())
+            }
+
+            var live = inspectDatabase(databaseFile, readWrite = false)
+            val existingBackup = validateMigrationBackup(backup)
+            if (live == null && existingBackup != null) {
+                restoreMigrationBackup(databaseFile, backup, failureForTest)
+                restoredFromBackup = true
+                live = inspectDatabase(databaseFile, readWrite = false)
+            }
+            if (live?.version == DATABASE_VERSION) {
+                retireMigrationBackup(databaseFile, backup)
+                return null
+            }
+            if (live == null || live.version !in 1 until DATABASE_VERSION) return null
+            if (existingBackup != null) {
+                check(existingBackup.sourceVersion == live.version) {
+                    "existing OBD migration backup is for a different database version"
+                }
+                // A retained backup means a prior upgrade never reached its validated commit
+                // point. Normalize the live set from that authoritative snapshot before retrying;
+                // the old-schema app cannot have continued writing after the failed open.
+                if (!restoredFromBackup) {
+                    restoreMigrationBackup(databaseFile, backup, failureForTest)
+                }
+                return backup
+            }
+            val checkpointed = checkpointAndInspect(databaseFile)
+            check(checkpointed.version == live.version) {
+                "OBD database version changed while preparing its migration backup"
+            }
+            return createMigrationBackup(databaseFile, backup, checkpointed.version)
+        }
+
+        /**
+         * Restore uses one checkpointed main database; WAL is never copied and SHM is never
+         * treated as durable. The marker remains until main replacement, sidecar cleanup and a
+         * final integrity check all complete, so any power loss is safely replayed on startup.
+         */
+        private fun restoreMigrationBackup(
+            databaseFile: File,
+            backup: File,
+            failureForTest: ((String) -> Unit)? = null,
+        ) {
+            val validated = checkNotNull(validateMigrationBackup(backup)) {
+                "OBD migration backup is missing or invalid"
+            }
+            val staging = restoreStaging(databaseFile)
+            Files.deleteIfExists(staging.toPath())
+            copySynced(validated.main, staging)
+            check(staging.length() == validated.sizeBytes && hashFile(staging) == validated.sha256) {
+                "staged OBD migration restore does not match its backup"
+            }
+            check(inspectDatabase(staging, readWrite = false)?.version == validated.sourceVersion) {
+                "staged OBD migration restore failed validation"
+            }
+            failureForTest?.invoke("after_restore_stage_copy")
+
+            val marker = restoreMarker(databaseFile)
+            writeSyncedAtomic(
+                marker,
+                JSONObject()
+                    .put("schema_version", 1)
+                    .put("source_database_version", validated.sourceVersion)
+                    .put("main_size_bytes", validated.sizeBytes)
+                    .put("main_sha256", validated.sha256)
+                    .toString()
+                    .toByteArray(Charsets.UTF_8),
             )
-            if (backup.isDirectory && File(backup, "main").isFile) return backup
-            val staging = File(backup.parentFile, "${backup.name}.partial")
+            failureForTest?.invoke("after_restore_marker")
+
+            // Never unlink the only live main database. The fully synced and validated staged
+            // file replaces it in one same-directory atomic operation.
+            Files.move(
+                staging.toPath(),
+                databaseFile.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+            syncDirectory(checkNotNull(databaseFile.parentFile))
+            failureForTest?.invoke("after_restore_main_replace")
+
+            for (suffix in volatileSidecarSuffixes) {
+                Files.deleteIfExists(File(databaseFile.path + suffix).toPath())
+            }
+            syncDirectory(checkNotNull(databaseFile.parentFile))
+            failureForTest?.invoke("after_restore_sidecar_cleanup")
+
+            check(databaseFile.length() == validated.sizeBytes && hashFile(databaseFile) == validated.sha256) {
+                "restored OBD database does not match its validated backup"
+            }
+            check(inspectDatabase(databaseFile, readWrite = false)?.version == validated.sourceVersion) {
+                "restored OBD database failed its integrity check"
+            }
+            Files.deleteIfExists(marker.toPath())
+            Files.deleteIfExists(File(marker.parentFile, "${marker.name}.partial").toPath())
+            syncDirectory(checkNotNull(databaseFile.parentFile))
+        }
+
+        private fun createMigrationBackup(
+            databaseFile: File,
+            backup: File,
+            sourceVersion: Int,
+        ): File {
+            val staging = backupStaging(databaseFile)
             staging.deleteRecursively()
             check(staging.mkdir()) { "could not create OBD migration backup staging directory" }
             try {
-                for ((suffix, name) in sidecars) {
-                    val source = File(databaseFile.path + suffix)
-                    if (source.isFile) copySynced(source, File(staging, name))
+                val stagedMain = File(staging, "main")
+                copySynced(databaseFile, stagedMain)
+                val size = stagedMain.length()
+                val digest = hashFile(stagedMain)
+                check(inspectDatabaseOrThrow(stagedMain, readWrite = false).version == sourceVersion) {
+                    "staged OBD migration backup failed its integrity check"
                 }
-                check(File(staging, "main").isFile) { "OBD migration backup has no main database" }
+                writeSyncedFile(
+                    File(staging, BACKUP_READY_NAME),
+                    JSONObject()
+                        .put("schema_version", 1)
+                        .put("source_database_version", sourceVersion)
+                        .put("main_size_bytes", size)
+                        .put("main_sha256", digest)
+                        .toString()
+                        .toByteArray(Charsets.UTF_8),
+                )
+                syncDirectory(staging)
+                if (backup.exists()) backup.deleteRecursively()
                 Files.move(staging.toPath(), backup.toPath(), StandardCopyOption.ATOMIC_MOVE)
+                syncDirectory(checkNotNull(backup.parentFile))
+                check(validateMigrationBackup(backup) != null) {
+                    "published OBD migration backup failed validation"
+                }
+                return backup
             } catch (error: Throwable) {
                 staging.deleteRecursively()
                 throw IllegalStateException("could not create OBD database migration backup", error)
             }
-            return backup
         }
 
-        private fun restoreMigrationBackup(databaseFile: File, backup: File) {
-            check(backup.isDirectory && File(backup, "main").isFile) {
-                "OBD migration backup is missing"
+        private fun validateMigrationBackup(backup: File): ValidatedMigrationBackup? = runCatching {
+            check(backup.isDirectory && !Files.isSymbolicLink(backup.toPath()))
+            check(backup.listFiles()?.map(File::getName)?.toSet() == setOf("main", BACKUP_READY_NAME))
+            val main = File(backup, "main")
+            val ready = File(backup, BACKUP_READY_NAME)
+            check(Files.isRegularFile(main.toPath(), LinkOption.NOFOLLOW_LINKS))
+            check(Files.isRegularFile(ready.toPath(), LinkOption.NOFOLLOW_LINKS))
+            check(ready.length() in 1..4_096)
+            val metadata = JSONObject(ready.readText(Charsets.UTF_8))
+            check(metadata.keys().asSequence().toSet() == backupMetadataKeys)
+            check(metadata.getInt("schema_version") == 1)
+            val sourceVersion = metadata.getInt("source_database_version")
+            check(sourceVersion in 1 until DATABASE_VERSION)
+            val size = metadata.getLong("main_size_bytes")
+            val digest = metadata.getString("main_sha256")
+            check(size > 0 && main.length() == size)
+            check(sha256Pattern.matches(digest) && hashFile(main) == digest)
+            check(inspectDatabase(main, readWrite = false)?.version == sourceVersion)
+            ValidatedMigrationBackup(main, sourceVersion, size, digest)
+        }.getOrNull()
+
+        private fun checkpointAndInspect(databaseFile: File): DatabaseInspection {
+            val database = SQLiteDatabase.openDatabase(
+                databaseFile.path,
+                null,
+                SQLiteDatabase.OPEN_READWRITE,
+            )
+            return database.use { db ->
+                check(databaseIntegrityIsOk(db)) { "source OBD database failed quick_check" }
+                db.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null).use { cursor ->
+                    check(cursor.moveToFirst() && cursor.getInt(0) == 0) {
+                        "source OBD WAL could not be checkpointed for migration"
+                    }
+                    if (cursor.columnCount >= 3) {
+                        val logFrames = cursor.getInt(1)
+                        val checkpointedFrames = cursor.getInt(2)
+                        check(logFrames < 0 || logFrames == checkpointedFrames) {
+                            "source OBD WAL checkpoint was incomplete"
+                        }
+                    }
+                }
+                check(databaseIntegrityIsOk(db)) { "checkpointed OBD database failed quick_check" }
+                DatabaseInspection(db.version)
             }
-            for ((suffix, name) in sidecars) {
-                val target = File(databaseFile.path + suffix)
-                val saved = File(backup, name)
-                Files.deleteIfExists(target.toPath())
-                if (!saved.isFile) continue
-                val partial = File(target.parentFile, "${target.name}.restore.partial")
-                Files.deleteIfExists(partial.toPath())
-                copySynced(saved, partial)
-                Files.move(
-                    partial.toPath(),
-                    target.toPath(),
-                    StandardCopyOption.ATOMIC_MOVE,
-                    StandardCopyOption.REPLACE_EXISTING,
-                )
+        }
+
+        private fun inspectDatabase(databaseFile: File, readWrite: Boolean): DatabaseInspection? {
+            if (!Files.isRegularFile(databaseFile.toPath(), LinkOption.NOFOLLOW_LINKS)) return null
+            return runCatching { inspectDatabaseOrThrow(databaseFile, readWrite) }.getOrNull()
+        }
+
+        private fun inspectDatabaseOrThrow(
+            databaseFile: File,
+            readWrite: Boolean,
+        ): DatabaseInspection = SQLiteDatabase.openDatabase(
+            databaseFile.path,
+            null,
+            if (readWrite) SQLiteDatabase.OPEN_READWRITE else SQLiteDatabase.OPEN_READONLY,
+        ).use { database ->
+            check(databaseIntegrityIsOk(database)) { "SQLite quick_check failed for ${databaseFile.name}" }
+            DatabaseInspection(database.version)
+        }
+
+        private fun databaseIntegrityIsOk(database: SQLiteDatabase): Boolean =
+            database.rawQuery("PRAGMA quick_check", null).use { cursor ->
+                cursor.count == 1 && cursor.moveToFirst() && cursor.getString(0) == "ok"
             }
+
+        private fun retireMigrationBackup(databaseFile: File, backup: File) {
+            backup.deleteRecursively()
+            backupStaging(databaseFile).deleteRecursively()
+            Files.deleteIfExists(restoreStaging(databaseFile).toPath())
+            val marker = restoreMarker(databaseFile)
+            Files.deleteIfExists(marker.toPath())
+            Files.deleteIfExists(File(marker.parentFile, "${marker.name}.partial").toPath())
+            syncDirectory(checkNotNull(databaseFile.parentFile))
         }
 
         private fun copySynced(source: File, target: File) {
             FileInputStream(source).use { input ->
                 FileOutputStream(target).use { output ->
-                    input.channel.transferTo(0, input.channel.size(), output.channel)
-                    output.fd.sync()
+                    val size = input.channel.size()
+                    var position = 0L
+                    while (position < size) {
+                        val copied = input.channel.transferTo(position, size - position, output.channel)
+                        check(copied > 0) { "OBD migration copy made no progress" }
+                        position += copied
+                    }
+                    output.channel.force(true)
                 }
             }
             check(source.length() == target.length()) { "OBD migration backup copy is incomplete" }
         }
 
-        private fun sqliteHeaderVersion(databaseFile: File): Int? = runCatching {
-            RandomAccessFile(databaseFile, "r").use { source ->
-                if (source.length() < SQLITE_USER_VERSION_OFFSET + 4) return@use null
-                val magic = ByteArray(16)
-                source.readFully(magic)
-                if (!magic.contentEquals("SQLite format 3\u0000".toByteArray())) return@use null
-                source.seek(SQLITE_USER_VERSION_OFFSET)
-                source.readInt()
+        private fun writeSyncedFile(target: File, bytes: ByteArray) {
+            FileOutputStream(target).use { output ->
+                output.write(bytes)
+                output.channel.force(true)
             }
-        }.getOrNull()
+        }
 
-        internal fun migrationBackupDirectory(context: Context): File = File(
-            context.getDatabasePath(DATABASE_NAME).parentFile,
-            "$DATABASE_NAME.migration-backup-v1-to-v$DATABASE_VERSION",
+        private fun writeSyncedAtomic(target: File, bytes: ByteArray) {
+            val partial = File(target.parentFile, "${target.name}.partial")
+            Files.deleteIfExists(partial.toPath())
+            writeSyncedFile(partial, bytes)
+            Files.move(
+                partial.toPath(),
+                target.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+            syncDirectory(checkNotNull(target.parentFile))
+        }
+
+        private fun hashFile(file: File): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            FileInputStream(file).use { input ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    digest.update(buffer, 0, count)
+                }
+            }
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        }
+
+        private fun syncDirectory(directory: File) {
+            // Android/Linux requires the containing directory metadata to be durable after each
+            // marker or replacement rename. Host-side Robolectric runs on Windows and cannot open
+            // a directory descriptor, so it validates the protocol without this platform syscall.
+            if (!System.getProperty("java.runtime.name", "")
+                    .orEmpty()
+                    .contains("Android", ignoreCase = true)
+            ) {
+                return
+            }
+            val descriptor = android.system.Os.open(
+                directory.path,
+                android.system.OsConstants.O_RDONLY,
+                0,
+            )
+            try {
+                android.system.Os.fsync(descriptor)
+            } finally {
+                android.system.Os.close(descriptor)
+            }
+        }
+
+        private fun migrationBackupDirectory(databaseFile: File): File = File(
+            databaseFile.parentFile,
+            "${databaseFile.name}.migration-backup-v1-to-v$DATABASE_VERSION",
         )
+
+        private fun backupStaging(databaseFile: File): File =
+            File(databaseFile.parentFile, BACKUP_STAGING_NAME)
+
+        private fun restoreMarker(databaseFile: File): File =
+            File(databaseFile.parentFile, databaseFile.name + RESTORE_MARKER_SUFFIX)
+
+        private fun restoreStaging(databaseFile: File): File =
+            File(databaseFile.parentFile, databaseFile.name + RESTORE_STAGING_SUFFIX)
+
+        internal fun migrationBackupDirectory(context: Context): File =
+            migrationBackupDirectory(context.getDatabasePath(DATABASE_NAME))
+
+        internal fun migrationRestoreMarker(context: Context): File =
+            restoreMarker(context.getDatabasePath(DATABASE_NAME))
+
+        internal fun migrationRestoreStaging(context: Context): File =
+            restoreStaging(context.getDatabasePath(DATABASE_NAME))
+
+        internal fun migrationBackupStaging(context: Context): File =
+            backupStaging(context.getDatabasePath(DATABASE_NAME))
     }
+
+    private fun tableHasColumn(db: SQLiteDatabase, table: String, column: String): Boolean =
+        db.rawQuery("PRAGMA table_info($table)", null).use { cursor ->
+            val nameIndex = cursor.getColumnIndexOrThrow("name")
+            while (cursor.moveToNext()) {
+                if (cursor.getString(nameIndex) == column) return@use true
+            }
+            false
+        }
 
     fun startDrive(record: DriveRecord) {
         val values = ContentValues().apply {
@@ -311,8 +673,27 @@ class ObdDatabase(
             )
             if (inserted == -1L) return false
             db.execSQL(
-                "UPDATE drives SET sample_count=sample_count+1 WHERE drive_id=? AND status='recording'",
-                arrayOf(sample.driveId),
+                """
+                UPDATE drives SET sample_count=sample_count+1,
+                  last_sample_at_utc=(
+                    SELECT timestamp_utc FROM samples WHERE drive_id=?
+                    ORDER BY sequence DESC LIMIT 1
+                  ),
+                  last_successful_response_at_utc=CASE
+                    WHEN ?='failed_after_partial' THEN last_successful_response_at_utc
+                    ELSE (
+                      SELECT timestamp_utc FROM samples WHERE drive_id=?
+                      ORDER BY sequence DESC LIMIT 1
+                    )
+                  END
+                WHERE drive_id=? AND status='recording'
+                """.trimIndent(),
+                arrayOf(
+                    sample.driveId,
+                    sample.transportQuality,
+                    sample.driveId,
+                    sample.driveId,
+                ),
             )
             db.setTransactionSuccessful()
             return true
@@ -374,40 +755,232 @@ class ObdDatabase(
         )
     }
 
+    fun recordProcessingError(driveId: String, message: String) {
+        writableDatabase.execSQL(
+            "UPDATE drives SET last_processing_error=? WHERE drive_id=?",
+            arrayOf(message.take(240), driveId),
+        )
+    }
+
+    fun markFinalising(
+        driveId: String,
+        stopReason: String,
+        noticedAtUtc: String = Instant.now().toString(),
+        lastSuccessfulResponseAtUtc: String? = null,
+    ): Boolean {
+        val noticed = Instant.parse(noticedAtUtc).toString()
+        val lastResponse = lastSuccessfulResponseAtUtc?.let { Instant.parse(it).toString() }
+        check(lastResponse == null || !Instant.parse(lastResponse).isAfter(Instant.parse(noticed))) {
+            "last successful response follows termination notice"
+        }
+        return writableDatabase.update(
+            "drives",
+            ContentValues().apply {
+                put("status", "finalising")
+                put("stop_reason", stopReason)
+                put("termination_noticed_at_utc", noticed)
+                if (lastResponse != null) put("last_successful_response_at_utc", lastResponse)
+                if (driveTerminalPolicy(stopReason).status != "complete") {
+                    put("interruption_reason", stopReason)
+                }
+            },
+            "drive_id=? AND status='recording'",
+            arrayOf(driveId),
+        ) == 1
+    }
+
     fun finishDrive(
         driveId: String,
         stopReason: String,
         cleanEnd: Boolean,
         finishedAtUtc: String = Instant.now().toString(),
-    ): String {
-        writableDatabase.execSQL(
-            """
-            UPDATE drives SET finish_time_utc=?,stop_reason=?,status='complete',clean_end=?
-            WHERE drive_id=? AND status='recording'
-            """.trimIndent(),
-            arrayOf(finishedAtUtc, stopReason, if (cleanEnd) 1 else 0, driveId),
-        )
-        return finishedAtUtc
+    ): String = finalizeDrive(
+        driveId = driveId,
+        stopReason = stopReason,
+        noticedAtUtc = finishedAtUtc,
+        requestedFinishAtUtc = if (cleanEnd) finishedAtUtc else null,
+    ).finishTimeUtc
+
+    /**
+     * Atomically and idempotently moves recording/finalising to one explicit terminal state.
+     * Interrupted/recovered end time is evidence-based; the later notice/finalisation clocks are
+     * retained separately and repeated calls return the original immutable result.
+     */
+    fun finalizeDrive(
+        driveId: String,
+        stopReason: String,
+        noticedAtUtc: String = Instant.now().toString(),
+        requestedFinishAtUtc: String? = null,
+        lastSuccessfulResponseAtUtc: String? = null,
+        finalisedAtUtc: String? = null,
+    ): DriveFinalization {
+        val noticed = Instant.parse(noticedAtUtc).toString()
+        val requestedFinish = requestedFinishAtUtc?.let { Instant.parse(it).toString() }
+        val suppliedLastResponse = lastSuccessfulResponseAtUtc?.let { Instant.parse(it).toString() }
+        val suppliedFinalised = finalisedAtUtc?.let(Instant::parse)
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val existing = db.rawQuery(
+                """
+                SELECT status,start_time_utc,finish_time_utc,last_sample_at_utc,
+                  last_successful_response_at_utc,
+                  termination_noticed_at_utc,finalised_at_utc,stop_reason,sample_count
+                FROM drives WHERE drive_id=?
+                """.trimIndent(),
+                arrayOf(driveId),
+            ).use { cursor ->
+                check(cursor.moveToFirst()) { "drive not found" }
+                val status = cursor.getString(0)
+                val start = cursor.getString(1)
+                val finish = if (cursor.isNull(2)) null else cursor.getString(2)
+                val persistedLast = if (cursor.isNull(3)) null else cursor.getString(3)
+                val persistedLastResponse = if (cursor.isNull(4)) null else cursor.getString(4)
+                val existingNoticed = if (cursor.isNull(5)) null else cursor.getString(5)
+                val finalised = if (cursor.isNull(6)) null else cursor.getString(6)
+                val existingReason = if (cursor.isNull(7)) null else cursor.getString(7)
+                val count = cursor.getLong(8)
+                ExistingDriveLifecycle(
+                    status = status,
+                    startTimeUtc = start,
+                    finishTimeUtc = finish,
+                    lastSampleAtUtc = persistedLast,
+                    lastSuccessfulResponseAtUtc = persistedLastResponse,
+                    terminationNoticedAtUtc = existingNoticed,
+                    finalisedAtUtc = finalised,
+                    stopReason = existingReason,
+                    sampleCount = count,
+                )
+            }
+            val existingStatus = existing.status
+            val terminal = existingStatus in TERMINAL_DRIVE_STATUSES
+            if (terminal) {
+                val result = DriveFinalization(
+                    driveId = driveId,
+                    status = existingStatus,
+                    finishTimeUtc = checkNotNull(existing.finishTimeUtc),
+                    lastSampleAtUtc = existing.lastSampleAtUtc,
+                    lastSuccessfulResponseAtUtc = existing.lastSuccessfulResponseAtUtc,
+                    terminationNoticedAtUtc = checkNotNull(existing.terminationNoticedAtUtc),
+                    finalisedAtUtc = checkNotNull(existing.finalisedAtUtc),
+                    stopReason = checkNotNull(existing.stopReason),
+                    sampleCount = existing.sampleCount,
+                    changed = false,
+                )
+                db.setTransactionSuccessful()
+                return result
+            }
+            check(existingStatus == "recording" || existingStatus == "finalising") {
+                "drive has unsupported lifecycle state $existingStatus"
+            }
+            val queriedLast = db.rawQuery(
+                "SELECT timestamp_utc FROM samples WHERE drive_id=? ORDER BY sequence DESC LIMIT 1",
+                arrayOf(driveId),
+            ).use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            }
+            val queriedResponseFallback = db.rawQuery(
+                """
+                SELECT timestamp_utc,quality_json FROM samples
+                WHERE drive_id=? ORDER BY sequence DESC
+                """.trimIndent(),
+                arrayOf(driveId),
+            ).use { cursor ->
+                var responseTimestamp: String? = null
+                while (cursor.moveToNext() && responseTimestamp == null) {
+                    val transport = JSONObject(cursor.getString(1)).optString("transport", "ok")
+                    if (transport != "failed_after_partial") responseTimestamp = cursor.getString(0)
+                }
+                responseTimestamp
+            }
+            val lastSample = queriedLast ?: existing.lastSampleAtUtc
+            val start = existing.startTimeUtc
+            val startInstant = Instant.parse(start)
+            val effectiveReason = existing.stopReason
+                ?.takeIf { existingStatus == "finalising" }
+                ?: stopReason
+            val effectivePolicy = driveTerminalPolicy(effectiveReason)
+            val rawFinish = if (effectivePolicy.useLastValidSampleAsEnd) {
+                lastSample ?: start
+            } else {
+                requestedFinish ?: noticed
+            }
+            val finishInstant = maxInstant(startInstant, Instant.parse(rawFinish))
+            val finish = finishInstant.toString()
+            val effectiveLastResponse = listOfNotNull(
+                suppliedLastResponse,
+                existing.lastSuccessfulResponseAtUtc,
+                queriedResponseFallback,
+            ).firstOrNull { !Instant.parse(it).isBefore(startInstant) }
+            val effectiveNoticedInstant = maxInstant(
+                startInstant,
+                finishInstant,
+                Instant.parse(existing.terminationNoticedAtUtc ?: noticed),
+                effectiveLastResponse?.let(Instant::parse),
+            )
+            val effectiveNoticed = effectiveNoticedInstant.toString()
+            val finalisedAt = maxInstant(
+                suppliedFinalised ?: Instant.now(),
+                effectiveNoticedInstant,
+            ).toString()
+            val values = ContentValues().apply {
+                put("finish_time_utc", finish)
+                put("last_sample_at_utc", lastSample)
+                put("last_successful_response_at_utc", effectiveLastResponse)
+                put("termination_noticed_at_utc", effectiveNoticed)
+                put("finalised_at_utc", finalisedAt)
+                put("stop_reason", effectiveReason)
+                put("status", effectivePolicy.status)
+                put("clean_end", if (effectivePolicy.cleanEnd) 1 else 0)
+                if (effectivePolicy.status == "complete") putNull("interruption_reason")
+                else put("interruption_reason", effectiveReason)
+            }
+            val updated = db.update(
+                "drives",
+                values,
+                "drive_id=? AND status IN ('recording','finalising')",
+                arrayOf(driveId),
+            )
+            check(updated == 1) { "drive finalisation lost its lifecycle race" }
+            val result = DriveFinalization(
+                driveId = driveId,
+                status = effectivePolicy.status,
+                finishTimeUtc = finish,
+                lastSampleAtUtc = lastSample,
+                lastSuccessfulResponseAtUtc = effectiveLastResponse,
+                terminationNoticedAtUtc = effectiveNoticed,
+                finalisedAtUtc = finalisedAt,
+                stopReason = effectiveReason,
+                sampleCount = existing.sampleCount,
+                changed = true,
+            )
+            db.setTransactionSuccessful()
+            return result
+        } finally {
+            db.endTransaction()
+        }
     }
 
-    fun recoverInterrupted(): List<String> {
-        val ids = mutableListOf<String>()
+    fun recoverInterrupted(recordingReason: String = "device_restart"): List<DriveFinalization> {
+        require(recordingReason == "device_restart" || driveTerminalPolicy(recordingReason).status == "interrupted")
+        val pending = mutableListOf<Pair<String, String>>()
         readableDatabase.rawQuery(
-            "SELECT drive_id FROM drives WHERE status='recording' ORDER BY start_time_utc",
+            """
+            SELECT drive_id,stop_reason FROM drives
+            WHERE status IN ('recording','finalising') ORDER BY start_time_utc,drive_id
+            """.trimIndent(),
             null,
-        ).use { cursor -> while (cursor.moveToNext()) ids += cursor.getString(0) }
-        if (ids.isNotEmpty()) {
-            writableDatabase.execSQL(
-                """
-                UPDATE drives SET finish_time_utc=COALESCE(
-                    (SELECT MAX(timestamp_utc) FROM samples WHERE samples.drive_id=drives.drive_id),
-                    start_time_utc
-                ),stop_reason='device_restart',status='complete',clean_end=0
-                WHERE status='recording'
-                """.trimIndent(),
-            )
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                pending += cursor.getString(0) to if (cursor.isNull(1)) {
+                    recordingReason
+                } else {
+                    cursor.getString(1)
+                }
+            }
         }
-        return ids
+        val now = Instant.now().toString()
+        return pending.map { (driveId, reason) -> finalizeDrive(driveId, reason, now) }
     }
 
     fun completedDriveIds(): List<String> {
@@ -415,7 +988,8 @@ class ObdDatabase(
         readableDatabase.rawQuery(
             """
             SELECT drive_id FROM drives
-            WHERE status='complete' AND export_status='waiting_for_backup' AND sample_count>0
+            WHERE status IN ('complete','interrupted','recovered','failed')
+              AND export_status='waiting_for_backup' AND sample_count>0
             ORDER BY start_time_utc,drive_id
             """.trimIndent(),
             null,
@@ -430,7 +1004,8 @@ class ObdDatabase(
             db.rawQuery(
                 """
                 SELECT drive_id,sample_count,export_status FROM drives
-                WHERE status='complete' AND export_status!='exported'
+                WHERE status IN ('complete','interrupted','recovered','failed')
+                  AND export_status!='exported'
                 ORDER BY start_time_utc,drive_id
                 """.trimIndent(),
                 null,
@@ -456,13 +1031,20 @@ class ObdDatabase(
 
     fun lastCompletedDrive(): LastCompletedDrive? = readableDatabase.rawQuery(
         """
-        SELECT drive_id,finish_time_utc FROM drives
-        WHERE status='complete' AND finish_time_utc IS NOT NULL
+        SELECT drive_id,finish_time_utc,last_sample_at_utc FROM drives
+        WHERE status IN ('complete','interrupted','recovered','failed')
+          AND finish_time_utc IS NOT NULL
         ORDER BY julianday(finish_time_utc) DESC,drive_id DESC LIMIT 1
         """.trimIndent(),
         null,
     ).use { cursor ->
-        if (cursor.moveToFirst()) LastCompletedDrive(cursor.getString(0), cursor.getString(1))
+        if (cursor.moveToFirst()) {
+            LastCompletedDrive(
+                cursor.getString(0),
+                cursor.getString(1),
+                if (cursor.isNull(2)) null else cursor.getString(2),
+            )
+        }
         else null
     }
 
@@ -475,7 +1057,7 @@ class ObdDatabase(
                 put("export_status", "exported")
                 put("bundle_sha256", bundleSha256)
             },
-            "drive_id=? AND status='complete' AND sample_count>0",
+            "drive_id=? AND status IN ('complete','interrupted','recovered','failed') AND sample_count>0",
             arrayOf(driveId),
         )
         check(updated == 1) { "only a completed non-empty drive can be marked exported" }
@@ -508,7 +1090,7 @@ class ObdDatabase(
         readableDatabase.rawQuery(
             """
             SELECT drive_id,finish_time_utc,bundle_sha256 FROM drives
-            WHERE status='complete' AND export_status='exported'
+            WHERE status IN ('complete','interrupted','recovered','failed') AND export_status='exported'
               AND finish_time_utc IS NOT NULL AND bundle_sha256 IS NOT NULL
             $pageClause
             ORDER BY julianday(finish_time_utc),drive_id LIMIT ?
@@ -535,7 +1117,8 @@ class ObdDatabase(
                 put("export_status", "waiting_for_backup")
                 putNull("bundle_sha256")
             },
-            "drive_id=? AND status='complete' AND export_status='exported' AND bundle_sha256=?",
+            "drive_id=? AND status IN ('complete','interrupted','recovered','failed') " +
+                "AND export_status='exported' AND bundle_sha256=?",
             arrayOf(driveId, bundleSha256),
         ) == 1
 
@@ -548,7 +1131,7 @@ class ObdDatabase(
         val eligibleCount = readableDatabase.rawQuery(
             """
             SELECT COUNT(*) FROM drives
-            WHERE status='complete' AND export_status='exported'
+            WHERE status IN ('complete','interrupted','recovered','failed') AND export_status='exported'
               AND finish_time_utc IS NOT NULL AND bundle_sha256 IS NOT NULL
             """.trimIndent(),
             null,
@@ -562,7 +1145,7 @@ class ObdDatabase(
         readableDatabase.rawQuery(
             """
             SELECT drive_id,finish_time_utc,bundle_sha256 FROM drives
-            WHERE status='complete' AND export_status='exported'
+            WHERE status IN ('complete','interrupted','recovered','failed') AND export_status='exported'
               AND finish_time_utc IS NOT NULL AND bundle_sha256 IS NOT NULL
             ORDER BY julianday(finish_time_utc) ASC,drive_id ASC LIMIT ?
             """.trimIndent(),
@@ -602,7 +1185,8 @@ class ObdDatabase(
                 val eligibleCount = db.rawQuery(
                     """
                     SELECT COUNT(*) FROM drives
-                    WHERE status='complete' AND export_status='exported'
+                    WHERE status IN ('complete','interrupted','recovered','failed')
+                      AND export_status='exported'
                       AND finish_time_utc IS NOT NULL AND bundle_sha256 IS NOT NULL
                     """.trimIndent(),
                     null,
@@ -614,7 +1198,8 @@ class ObdDatabase(
                 val stillVerified = db.rawQuery(
                     """
                     SELECT 1 FROM drives
-                    WHERE drive_id=? AND status='complete' AND export_status='exported'
+                    WHERE drive_id=? AND status IN ('complete','interrupted','recovered','failed')
+                      AND export_status='exported'
                       AND finish_time_utc IS NOT NULL AND bundle_sha256=? LIMIT 1
                     """.trimIndent(),
                     arrayOf(candidate.driveId, candidate.bundleSha256),
@@ -624,7 +1209,8 @@ class ObdDatabase(
                 db.delete("samples", "drive_id=?", arrayOf(candidate.driveId))
                 val removed = db.delete(
                     "drives",
-                    "drive_id=? AND status='complete' AND export_status='exported' AND bundle_sha256=?",
+                    "drive_id=? AND status IN ('complete','interrupted','recovered','failed') " +
+                        "AND export_status='exported' AND bundle_sha256=?",
                     arrayOf(candidate.driveId, candidate.bundleSha256),
                 )
                 if (removed == 1) deleted += candidate
@@ -676,6 +1262,14 @@ class ObdDatabase(
             .put("payload", JSONObject(row.getString("payload_json")))
     }
 
+    /** A bounded FULL checkpoint used before the ingestion controller is allowed to cut radios. */
+    fun checkpointForIngestion() {
+        writableDatabase.rawQuery("PRAGMA wal_checkpoint(FULL)", null).use { cursor ->
+            check(cursor.moveToFirst())
+            check(cursor.getInt(0) == 0) { "OBD WAL checkpoint remained busy" }
+        }
+    }
+
     private fun rows(sql: String, argument: String): List<JSONObject> {
         val result = mutableListOf<JSONObject>()
         readableDatabase.rawQuery(sql, arrayOf(argument)).use { cursor ->
@@ -701,6 +1295,9 @@ private fun Cursor.toJson(): JSONObject {
 
 private val random = SecureRandom()
 private val sha256Pattern = Regex("^[0-9a-f]{64}$")
+
+private fun maxInstant(vararg values: Instant?): Instant =
+    checkNotNull(values.filterNotNull().maxOrNull())
 
 private fun reclaimDeletedPagesIfConfigured(db: SQLiteDatabase) {
     // WAL checkpointing and page reclamation are separate. Keep both bounded and best-effort:

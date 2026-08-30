@@ -30,6 +30,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import TypeDecorator
@@ -771,6 +772,79 @@ class IngestRun(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class IngestRadioTransition(Base):
+    """Durable ownership and recovery state for one device-radio ingest window.
+
+    The high-rate byte progress for an ingest run still belongs in
+    :mod:`app.ingest.status`.  This row is deliberately different: every field here is
+    needed to decide whether a process that starts after an unclean exit may touch the
+    radios, and exactly which state it must restore.
+    """
+
+    __tablename__ = "ingest_radio_transitions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    transition_id: Mapped[str] = mapped_column(String(36), unique=True)
+    trigger: Mapped[str] = mapped_column(String(32), default="auto")
+    phase: Mapped[str] = mapped_column(String(32), default="preparing", index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    heartbeat_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    lease_owner: Mapped[str] = mapped_column(String(64))
+    lease_expires_at: Mapped[datetime] = mapped_column(UtcDateTime, index=True)
+
+    device_address: Mapped[str] = mapped_column(String(255))
+    device_boot_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    transport_host: Mapped[str] = mapped_column(String(255))
+    transport_interface: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    capabilities_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    logger_status_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    logger_request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    logger_quiesce_capable: Mapped[bool] = mapped_column(Boolean, default=False)
+    logger_quiesce_requested_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    logger_quiesce_acked_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    logger_resume_attempted: Mapped[bool] = mapped_column(Boolean, default=False)
+    logger_resume_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # ``unknown`` is kept distinct from ``off``.  An unreadable state is never an
+    # invitation to toggle a radio whose operator baseline cannot be recovered.
+    bluetooth_before: Mapped[str] = mapped_column(String(16), default="unknown")
+    hotspot_before: Mapped[str] = mapped_column(String(16), default="unknown")
+    hotspot_interface: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Opaque on-device mode-0600 capsule path. The SSID/passphrase itself never enters
+    # this database, its backups, an ORM representation or an API response.
+    hotspot_restore_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    bluetooth_disable_attempted: Mapped[bool] = mapped_column(Boolean, default=False)
+    bluetooth_disable_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    hotspot_disable_attempted: Mapped[bool] = mapped_column(Boolean, default=False)
+    hotspot_disable_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    bluetooth_restore_attempted: Mapped[bool] = mapped_column(Boolean, default=False)
+    bluetooth_restore_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    hotspot_restore_attempted: Mapped[bool] = mapped_column(Boolean, default=False)
+    hotspot_restore_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    obd_transfer_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    recovery_required: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # SQLite is the production database.  A partial unique index lets history remain in
+    # this table while making the only unsafe state -- two live radio owners --
+    # impossible across processes.
+    __table_args__ = (
+        Index(
+            "uq_ingest_radio_transition_active",
+            "active",
+            unique=True,
+            sqlite_where=text("active = 1"),
+        ),
+    )
+
+
 class OBDBundle(Base):
     """One immutable logger export and its independent Home Assistant queue state."""
 
@@ -851,6 +925,29 @@ class OBDDrive(Base):
     obd_protocol: Mapped[str | None] = mapped_column(String(256), nullable=True)
     completion_status: Mapped[str] = mapped_column(String(32))
     clean_end: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # ``completion_status`` is the literal producer value retained for compatibility
+    # with immutable v1 manifests. ``lifecycle_status`` is the server projection used
+    # by the API: legacy loggers labelled every non-restart termination ``complete``,
+    # even when clean_end=false and stop_reason=connection_lost.
+    lifecycle_status: Mapped[str] = mapped_column(String(32), default="complete", index=True)
+    interruption_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    first_sample_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    last_sample_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    last_successful_response_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    # The producer's finish timestamp records when finalisation was observed. For an
+    # interrupted drive, ``finished_at`` can therefore be projected to the last valid
+    # sample without losing the later failure-detection time.
+    finalization_observed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    connection_loss_count: Mapped[int] = mapped_column(Integer, default=0)
+    gap_count: Mapped[int] = mapped_column(Integer, default=0)
+    longest_gap_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    data_completeness_percentage: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gap_analysis_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    processing_status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    last_processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary_source: Mapped[str] = mapped_column(String(32), default="producer")
+    summary_generated_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
     duration_s: Mapped[float | None] = mapped_column(Float, nullable=True)
     distance_km: Mapped[float | None] = mapped_column(Float, nullable=True)

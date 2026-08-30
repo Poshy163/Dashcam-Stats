@@ -6,7 +6,7 @@ import type { PointerEvent as ReactPointerEvent } from 'react'
 import Spinner from '@/components/Spinner'
 import { EmptyState, ErrorState, PageHeader, StatTile } from '@/components/ui'
 import { api, type OBDSeriesSample } from '@/lib/api'
-import { formatDateTime, formatDuration, formatSpeed, formatTime } from '@/lib/format'
+import { formatDateTime, formatDuration, formatRelative, formatSpeed, formatTime } from '@/lib/format'
 
 /** One metric drawn against elapsed drive time. */
 interface Series {
@@ -14,6 +14,10 @@ interface Series {
   /** Tailwind text colour; the SVG strokes with currentColor so the theme decides. */
   colorClass: string
   values: (number | null)[]
+  unit?: string
+  /** Logger poll-plan cadence, never inferred from a sparse or interrupted trace. */
+  expectedCadenceS?: number
+  provenance?: 'measured' | 'derived'
 }
 
 const CHART_W = 720
@@ -23,8 +27,8 @@ const PAD_R = 10
 const PAD_T = 10
 const PAD_B = 22
 
-/** Consecutive samples further apart than this are a gap, not a long interval. */
-const GAP_S = 15
+/** Fast samples beyond the documented 5 s cadence plus 50% tolerance are a gap. */
+const FAST_GAP_THRESHOLD_S = 7.5
 
 function formatTick(value: number, span?: number): string {
   // Decimals follow the axis range, not the value's size: a 12.1–12.9 V axis labelled
@@ -37,8 +41,9 @@ function formatTick(value: number, span?: number): string {
 }
 
 function formatElapsed(seconds: number): string {
-  const m = Math.floor(seconds / 60)
-  const s = Math.round(seconds % 60)
+  const total = Math.max(0, Math.round(seconds))
+  const m = Math.floor(total / 60)
+  const s = total % 60
   return `${m}:${String(s).padStart(2, '0')}`
 }
 
@@ -92,26 +97,18 @@ function TimeChart({
   const gridValues = [0, 1, 2, 3].map((i) => min + ((max - min) * i) / 3)
   const tickTimes = [0, 0.25, 0.5, 0.75, 1].map((f) => tFirst + domain * f)
 
-  // Not every metric arrives every cycle: the poll plan reads coolant, trims and the O2
-  // sensors on a slower tier, so their series are mostly nulls with a value every few
-  // samples. Splitting on every null therefore produced only single-point "lines" and the
-  // chart drew nothing while its own legend quoted a range. Instead, each series bridges
-  // separations up to 2.5x its own median observation cadence — a slow tier joins up, a
-  // fast series still breaks where the link actually dropped — and anything left isolated
-  // is drawn as a dot rather than discarded.
-  const segments = (values: (number | null)[]): { lines: string[]; dots: [number, number][] } => {
+  // Not every metric arrives every cycle. Connect only across the explicit logger-plan
+  // cadence plus its fixed tolerance: sparse traces cannot teach the UI that a long outage
+  // was normal. Anything left isolated is drawn as a measured dot.
+  const segments = (item: Series): { lines: string[]; dots: [number, number][] } => {
+    const values = item.values
     const observed: { t: number; v: number }[] = []
     values.forEach((v, i) => {
       const t = elapsedS[i]
       if (v != null && t != null) observed.push({ t, v })
     })
     if (observed.length === 0) return { lines: [], dots: [] }
-    const separations = observed
-      .slice(1)
-      .map((o, i) => o.t - (observed[i]?.t ?? o.t))
-      .sort((a, b) => a - b)
-    const median = separations[Math.floor(separations.length / 2)] ?? 0
-    const bridge = Math.max(GAP_S, median * 2.5)
+    const bridge = (item.expectedCadenceS ?? 5) * 1.5
 
     const lines: string[] = []
     const dots: [number, number][] = []
@@ -134,11 +131,15 @@ function TimeChart({
   }
 
   const stats = (values: (number | null)[]) => {
-    const present = values.filter((v): v is number => v != null)
+    const present = values
+      .map((value, index) => ({ value, index }))
+      .filter((item): item is { value: number; index: number } => item.value != null)
+    const last = present[present.length - 1]
     return {
-      min: Math.min(...present),
-      max: Math.max(...present),
-      last: present[present.length - 1] ?? 0,
+      min: Math.min(...present.map((item) => item.value)),
+      max: Math.max(...present.map((item) => item.value)),
+      last: last?.value ?? 0,
+      lastAt: last ? elapsedS[last.index] : null,
     }
   }
 
@@ -165,31 +166,18 @@ function TimeChart({
   const hoverT = hover != null ? elapsedS[hover] : null
   const hoverClock = hover != null ? formatDateTime(timesIso[hover]) : null
   const tooltipTitle = hoverT != null ? `${formatElapsed(hoverT)} · ${hoverClock}` : ''
-  // A slow-tier metric usually has no reading at the exact hovered sample; the nearest
-  // observation within 30 s is what the bridged line is claiming there anyway.
-  const valueNear = (values: (number | null)[]): number | null => {
-    if (hover == null || hoverT == null) return null
-    const direct = values[hover]
-    if (direct != null) return direct
-    let best: number | null = null
-    let bestDistance = 30
-    values.forEach((v, i) => {
-      const t = elapsedS[i]
-      if (v == null || t == null) return
-      const distance = Math.abs(t - hoverT)
-      if (distance <= bestDistance) {
-        bestDistance = distance
-        best = v
-      }
-    })
-    return best
-  }
+  // Never silently substitute a nearby reading. A null is a null at this sample; the
+  // cadence-aware line is presentation only and carries no invented point value.
+  const valueAt = (values: (number | null)[]): number | null =>
+    hover == null ? null : (values[hover] ?? null)
   const tooltipRows =
     hover != null
       ? drawn.map((s) => ({
           label: s.label,
           colorClass: s.colorClass,
-          value: valueNear(s.values),
+          value: valueAt(s.values),
+          provenance: s.provenance ?? 'measured',
+          unit: s.unit ?? unit,
         }))
       : []
   const tooltipW =
@@ -199,7 +187,9 @@ function TimeChart({
         8,
         tooltipTitle.length,
         ...tooltipRows.map(
-          (row) => `${row.label} ${row.value != null ? formatTick(row.value) : '—'} ${unit}`.length,
+          (row) =>
+            `${row.label} ${row.value != null ? formatTick(row.value) : '—'} ${row.unit} ${row.provenance}`
+              .length,
         ),
       )
   const tooltipH = 16 + tooltipRows.length * 13
@@ -212,13 +202,18 @@ function TimeChart({
         <h2 className="section-title">{title}</h2>
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-content-muted">
           {drawn.map((s) => {
-            const { min: lo, max: hi, last } = stats(s.values)
+            const { min: lo, max: hi, last, lastAt } = stats(s.values)
+            const stale =
+              lastAt != null && tLast - lastAt > (s.expectedCadenceS ?? 5) * 1.5
+            const seriesUnit = s.unit ?? unit
             return (
               <span key={s.label} className="flex items-center gap-1.5">
                 <span className={`h-0.5 w-4 rounded-full bg-current ${s.colorClass}`} />
                 {s.label}
                 <span className="tabular text-content-faint">
-                  {formatTick(lo)}–{formatTick(hi)}, last {formatTick(last)} {unit}
+                  {formatTick(lo)}–{formatTick(hi)}, last {formatTick(last)} {seriesUnit} at{' '}
+                  {lastAt != null ? formatElapsed(lastAt) : '—'}
+                  {stale && <span className="ml-1 text-state-warn">stale</span>}
                 </span>
               </span>
             )
@@ -271,7 +266,7 @@ function TimeChart({
           </text>
         ))}
         {drawn.map((s) => {
-          const { lines, dots } = segments(s.values)
+          const { lines, dots } = segments(s)
           return (
             <g key={s.label} className={s.colorClass}>
               {lines.map((points, i) => (
@@ -343,7 +338,8 @@ function TimeChart({
                 fill="currentColor"
                 className={row.colorClass}
               >
-                {row.label} {row.value != null ? `${formatTick(row.value)} ${unit}` : '—'}
+                {row.label} {row.value != null ? `${formatTick(row.value)} ${row.unit}` : '—'} ·{' '}
+                {row.provenance}
               </text>
             ))}
           </g>
@@ -399,8 +395,8 @@ interface DerivedStats {
 /**
  * Everything here is derived from the raw samples rather than sent by the server, so the
  * page and the stored data can never disagree. Interval time is charged to the sample
- * ending it and capped at GAP_S, so a dropout is not billed to whichever band the car
- * happened to be in when the link died.
+ * ending it only inside the fast-tier cadence tolerance; a dropout contributes no
+ * inferred time to either endpoint's band.
  */
 function deriveStats(samples: OBDSeriesSample[], elapsedS: number[]): DerivedStats {
   const speedBandEdges = [
@@ -434,8 +430,9 @@ function deriveStats(samples: OBDSeriesSample[], elapsedS: number[]): DerivedSta
     if (!sample || t == null) continue
 
     const prevT = i > 0 ? elapsedS[i - 1] : null
-    const dt = prevT != null ? Math.min(Math.max(t - prevT, 0), GAP_S) : 0
-    const gap = prevT != null && t - prevT > GAP_S
+    const interval = prevT != null ? Math.max(t - prevT, 0) : 0
+    const gap = prevT != null && interval > FAST_GAP_THRESHOLD_S
+    const dt = gap ? 0 : interval
 
     const speed = sample.vehicleSpeedKmh
     if (speed != null && dt > 0) {
@@ -525,7 +522,11 @@ export default function ObdDriveDetail() {
         subtitle={
           <>
             {formatTime(drive.startedAt)} – {formatTime(drive.finishedAt)} · {drive.vehicleId}
-            {!drive.cleanEnd && <span className="ml-2 text-state-warn">interrupted end</span>}
+            {drive.lifecycleStatus !== 'complete' && (
+              <span className="ml-2 text-state-warn">
+                {drive.lifecycleStatus.replace(/_/g, ' ')} end
+              </span>
+            )}
           </>
         }
         actions={
@@ -535,12 +536,114 @@ export default function ObdDriveDetail() {
                 {journey.title ? `Journey: ${journey.title}` : 'View journey footage'}
               </Link>
             )}
+            {drive.bundleDownloadUrl && (
+              <a className="btn" href={drive.bundleDownloadUrl} download={drive.bundleFilename}>
+                Download verified bundle
+              </a>
+            )}
             <Link to="/obd" className="btn">
               All drives
             </Link>
           </>
         }
       />
+
+      <section className="card p-4 sm:p-5">
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+              drive.lifecycleStatus === 'complete'
+                ? 'bg-state-ok/15 text-state-ok'
+                : drive.lifecycleStatus === 'recovered'
+                  ? 'bg-accent-muted text-accent'
+                  : 'bg-state-warn/15 text-state-warn'
+            }`}
+          >
+            {drive.lifecycleStatus.replace(/_/g, ' ')}
+          </span>
+          {drive.interruptionReason && (
+            <span className="text-sm text-content-muted">
+              {drive.interruptionReason.replace(/_/g, ' ')}
+            </span>
+          )}
+          <span className="ml-auto text-xs text-content-faint">
+            projection {drive.processingStatus} · summary {drive.summarySource}
+          </span>
+        </div>
+        <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+          <div>
+            <dt className="text-xs text-content-faint">Drive started</dt>
+            <dd className="mt-0.5 tabular">{formatDateTime(drive.startedAt)}</dd>
+          </div>
+          <div>
+            <dt className="text-xs text-content-faint">Effective end</dt>
+            <dd className="mt-0.5 tabular">{formatDateTime(drive.finishedAt)}</dd>
+          </div>
+          <div>
+            <dt className="text-xs text-content-faint">First OBD sample</dt>
+            <dd className="mt-0.5 tabular">
+              {drive.firstSampleAt ? formatDateTime(drive.firstSampleAt) : 'No valid sample'}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs text-content-faint">Last valid sample</dt>
+            <dd className="mt-0.5 tabular">
+              {drive.lastSampleAt ? formatDateTime(drive.lastSampleAt) : 'No valid sample'}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs text-content-faint">Last successful OBD response</dt>
+            <dd className="mt-0.5 tabular">
+              {drive.lastSuccessfulResponseAt
+                ? formatDateTime(drive.lastSuccessfulResponseAt)
+                : 'Not recorded'}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs text-content-faint">Termination observed</dt>
+            <dd className="mt-0.5 tabular">
+              {drive.finalizationObservedAt
+                ? formatDateTime(drive.finalizationObservedAt)
+                : 'Not recorded'}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs text-content-faint">Bluetooth disconnects</dt>
+            <dd className="mt-0.5 tabular">{drive.connectionLossCount.toLocaleString()}</dd>
+          </div>
+          <div>
+            <dt className="text-xs text-content-faint">Transport gap duration</dt>
+            <dd className="mt-0.5 tabular">
+              {formatDuration(
+                drive.gapAnalysis?.transport.totalGapDurationS ?? drive.missingDataDurationS,
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs text-content-faint">Export / backup</dt>
+            <dd className="mt-0.5">
+              {drive.exportStatus} · {drive.backupStatus}
+              {drive.verifiedAt ? ` ${formatRelative(drive.verifiedAt)}` : ''}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs text-content-faint">Home Assistant</dt>
+            <dd className="mt-0.5">
+              {drive.importState.replace(/_/g, ' ')}
+              {drive.importedAt ? ` ${formatRelative(drive.importedAt)}` : ''}
+            </dd>
+          </div>
+        </dl>
+        {(drive.bundleError || drive.lastProcessingError || drive.validationWarnings.length > 0) && (
+          <div className="mt-4 space-y-1 rounded-md bg-state-warn/10 p-3 text-xs text-state-warn">
+            {drive.bundleError && <p>{drive.bundleError}</p>}
+            {drive.lastProcessingError && <p>{drive.lastProcessingError}</p>}
+            {drive.validationWarnings.map((warning) => (
+              <p key={warning}>{warning}</p>
+            ))}
+          </div>
+        )}
+      </section>
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-6">
         <StatTile label="Duration" value={formatDuration(drive.durationS)} />
@@ -627,17 +730,82 @@ export default function ObdDriveDetail() {
         <StatTile
           label="Data gaps"
           value={
-            drive.missingDataDurationS != null && drive.missingDataDurationS > 0
-              ? formatDuration(drive.missingDataDurationS)
-              : 'none'
+            drive.gapCount > 0 ? drive.gapCount.toLocaleString() : 'none'
+          }
+          hint={
+            drive.longestGapS != null
+              ? `longest ${formatDuration(drive.longestGapS)} · ${
+                  drive.dataCompletenessPercentage != null
+                    ? `${drive.dataCompletenessPercentage.toFixed(1)}% signal coverage`
+                    : 'coverage unavailable'
+                }`
+              : undefined
           }
           tone={
-            drive.missingDataDurationS != null && drive.missingDataDurationS > 30
-              ? 'warn'
-              : 'default'
+            drive.gapCount > 0 ? 'warn' : 'default'
           }
         />
       </div>
+
+      {drive.gapAnalysis && (
+        <section className="card overflow-x-auto">
+          <div className="border-b border-border p-3">
+            <h2 className="section-title">Signal cadence and gaps</h2>
+            <p className="mt-1 text-xs text-content-muted">
+              Expected cadence comes from logger poll plan v{drive.gapAnalysis.pollPlanVersion};
+              tier spacing is not counted as missing data.
+            </p>
+          </div>
+          <table className="w-full min-w-[52rem] text-sm">
+            <thead className="border-b border-border text-left text-xs text-content-muted">
+              <tr>
+                <th className="p-2 font-medium">Signal</th>
+                <th className="p-2 font-medium">Source</th>
+                <th className="p-2 font-medium">Cadence</th>
+                <th className="p-2 font-medium">Observed / expected</th>
+                <th className="p-2 font-medium">Coverage</th>
+                <th className="p-2 font-medium">p95 / max</th>
+                <th className="p-2 font-medium">Gaps</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {drive.gapAnalysis.signals
+                .filter((signal) => signal.supported || signal.observationCount > 0)
+                .map((signal) => (
+                  <tr key={signal.name}>
+                    <td className="p-2">
+                      {signal.label}
+                      {signal.pid && <span className="ml-1 text-xs text-content-faint">PID {signal.pid}</span>}
+                    </td>
+                    <td className="p-2 text-content-muted">
+                      {signal.provenance} · {signal.tier}
+                    </td>
+                    <td className="tabular p-2">{formatDuration(signal.expectedCadenceS)}</td>
+                    <td className="tabular p-2">
+                      {signal.receivedObservationCount.toLocaleString()} /{' '}
+                      {signal.expectedObservationCount.toLocaleString()}
+                    </td>
+                    <td className="tabular p-2">
+                      {signal.coveragePercentage != null
+                        ? `${signal.coveragePercentage.toFixed(1)}%`
+                        : '—'}
+                    </td>
+                    <td className="tabular p-2">
+                      {signal.p95CadenceS != null ? signal.p95CadenceS.toFixed(1) : '—'} /{' '}
+                      {signal.maximumCadenceS != null ? signal.maximumCadenceS.toFixed(1) : '—'} s
+                    </td>
+                    <td className="tabular p-2">
+                      {signal.gapCount}
+                      {signal.missingObservationCount > 0
+                        ? ` · ${signal.missingObservationCount} missing reads`
+                        : ''}
+                    </td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </section>
+      )}
 
       {samples.length < 2 ? (
         <EmptyState
@@ -683,11 +851,13 @@ export default function ObdDriveDetail() {
                   label: 'Coolant',
                   colorClass: 'text-state-error',
                   values: metric(samples, (s) => s.coolantTemperatureC),
+                  expectedCadenceS: 15,
                 },
                 {
                   label: 'Intake air',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.intakeAirTemperatureC),
+                  expectedCadenceS: 15,
                 },
               ]}
             />
@@ -732,11 +902,13 @@ export default function ObdDriveDetail() {
                   label: 'Short term',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.shortTermFuelTrimPct),
+                  expectedCadenceS: 15,
                 },
                 {
                   label: 'Long term',
                   colorClass: 'text-state-warn',
                   values: metric(samples, (s) => s.longTermFuelTrimPct),
+                  expectedCadenceS: 15,
                 },
               ]}
             />
@@ -750,6 +922,7 @@ export default function ObdDriveDetail() {
                   label: 'Estimated fuel rate',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.estimatedFuelRateLH),
+                  provenance: 'derived',
                 },
               ]}
             />
@@ -763,6 +936,7 @@ export default function ObdDriveDetail() {
                   label: 'Est. consumption (5+ km/h)',
                   colorClass: 'text-accent',
                   values: movingConsumption,
+                  provenance: 'derived',
                 },
               ]}
             />
@@ -776,11 +950,13 @@ export default function ObdDriveDetail() {
                   label: 'Sensor 1',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.oxygenSensor1VoltageV),
+                  expectedCadenceS: 15,
                 },
                 {
                   label: 'Sensor 2',
                   colorClass: 'text-state-warn',
                   values: metric(samples, (s) => s.oxygenSensor2VoltageV),
+                  expectedCadenceS: 15,
                 },
               ]}
             />
@@ -794,11 +970,13 @@ export default function ObdDriveDetail() {
                   label: 'MAF',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.massAirFlowGS),
+                  unit: 'g/s',
                 },
                 {
                   label: 'Timing advance',
                   colorClass: 'text-state-warn',
                   values: metric(samples, (s) => s.timingAdvanceDeg),
+                  unit: '°',
                 },
               ]}
             />

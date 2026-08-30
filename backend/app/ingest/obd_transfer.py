@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import os
 import re
 import shutil
@@ -21,6 +22,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.config import AppConfig, get_config
 from app.core.logging import get_logger
+from app.core.process_lock import ProcessFileLock, try_acquire
 from app.db.models import OBDBundle, OBDBundleState, utcnow
 from app.db.session import session_scope
 from app.ingest import adb, transport
@@ -61,12 +63,19 @@ MAX_REMOTE_STATUS_BYTES = 64 * 1024
 MAX_RECEIPT_BYTES = 512
 
 
+def _sync_lock_path(config: AppConfig) -> Path:
+    """A stable per-data-directory fence shared by every server process."""
+    return config.obd_dir / ".transfer-sync.lock"
+
+
 @dataclass(slots=True)
 class OBDTransferResult:
     discovered: int = 0
     copied: int = 0
     duplicates: int = 0
     failed: int = 0
+    missing: int = 0
+    complete: bool = True
     removed_from_unit: int = 0
     bytes: int = 0
     seconds: float = 0.0
@@ -190,40 +199,137 @@ _LOGGER_KEYS = frozenset(
         "current_drive_id",
         "last_drive_id",
         "last_drive_finished_at_utc",
+        "last_sample_at_utc",
+        "ingestion_request_id",
         "pending_bundle_count",
         "sample_count",
+        "capabilities",
+        "metrics",
         "last_error",
         "last_error_at_utc",
         "updated_at_utc",
     }
 )
 
+_LOGGER_CAPABILITY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_LOGGER_METRIC_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+MAX_LOGGER_CAPABILITIES = 32
+MAX_LOGGER_METRICS = 64
+LOGGER_PACKAGE = "com.dashcamstats.obdlogger"
+_STATUS_FILE_PREFIX = "__DASHCAM_LOGGER_STATUS_FILE__\n"
+_STATUS_NOT_INSTALLED = "__DASHCAM_LOGGER_NOT_INSTALLED__"
+_STATUS_INSTALLED_MISSING = "__DASHCAM_LOGGER_INSTALLED_STATUS_MISSING__"
+_STATUS_PACKAGE_CHECK_FAILED = "__DASHCAM_LOGGER_PACKAGE_CHECK_FAILED__"
+
+
+def _clean_logger_capabilities(value: object) -> list[str] | None:
+    """Return a small allowlisted capability vector, never attacker-sized input."""
+    if not isinstance(value, list) or len(value) > MAX_LOGGER_CAPABILITIES:
+        return None
+    clean: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not _LOGGER_CAPABILITY_RE.fullmatch(item):
+            return None
+        if item not in clean:
+            clean.append(item)
+    return clean
+
+
+def _clean_logger_metrics(value: object) -> dict[str, int | float] | None:
+    """Keep only bounded finite scalar counters from the public logger status."""
+    if not isinstance(value, dict) or len(value) > MAX_LOGGER_METRICS:
+        return None
+    clean: dict[str, int | float] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not _LOGGER_METRIC_RE.fullmatch(key):
+            return None
+        # bool is an int in Python, but it is not a useful counter and accepting it makes
+        # schema mistakes look healthy.
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        if isinstance(item, float) and not math.isfinite(item):
+            return None
+        if item < 0 or item > 1_000_000_000_000:
+            return None
+        clean[key] = item
+    return clean
+
 
 async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
-    """Read a bounded, redacted status file; absence is the healthy pre-install case."""
+    """Read a bounded status file and prove when no logger package is installed.
+
+    A missing file alone is not authoritative: it also describes an installed app before
+    first publication, an unavailable storage mount, or a deleted/corrupt status file.
+    Only a successful package-manager lookup that positively reports the package absent
+    permits callers to treat Bluetooth as unowned.
+    """
     path = _safe_remote_path(path)
+    # The marker separates package-manager evidence from an empty/missing status file.
+    # Every interpolated value is a fixed constant or has passed the remote-path allowlist.
+    command = (
+        f"if [ -f '{path}' ] && [ ! -L '{path}' ]; then "
+        f"printf '{_STATUS_FILE_PREFIX}'; head -c {MAX_REMOTE_STATUS_BYTES + 1} '{path}'; "
+        f"else package_path=\"$(pm path '{LOGGER_PACKAGE}' 2>/dev/null)\"; "
+        "package_rc=$?; "
+        f"if [ \"$package_rc\" -ne 0 ]; then printf '{_STATUS_PACKAGE_CHECK_FAILED}'; "
+        f"elif [ -n \"$package_path\" ]; then printf '{_STATUS_INSTALLED_MISSING}'; "
+        f"else printf '{_STATUS_NOT_INSTALLED}'; fi; fi; exit 0"
+    )
     try:
         raw = await adb.shell(
             address,
-            f"[ -f '{path}' ] && head -c {MAX_REMOTE_STATUS_BYTES + 1} '{path}'; exit 0",
+            command,
             timeout=5.0,
         )
     except adb.AdbError:
+        # ``None`` is reserved for a positively observed absent file.  Conflating a
+        # failed control-channel read with "no logger installed" lets the caller disable
+        # Bluetooth while an unobserved logger may still own it.
+        return {
+            "state": "status_unavailable",
+            "last_error": "logger status could not be read",
+        }
+    if raw == _STATUS_NOT_INSTALLED:
         return None
+    if raw == _STATUS_INSTALLED_MISSING:
+        return {
+            "state": "status_unavailable",
+            "last_error": "logger is installed but its status file is missing",
+        }
+    if raw == _STATUS_PACKAGE_CHECK_FAILED or not raw:
+        return {
+            "state": "status_unavailable",
+            "last_error": "logger installation state could not be verified",
+        }
+    if raw.startswith(_STATUS_FILE_PREFIX):
+        raw = raw[len(_STATUS_FILE_PREFIX) :]
+    # Raw JSON remains accepted for unit fakes and older remote helpers. It is still an
+    # affirmative file body, never evidence that a missing file means no owner.
     encoded = raw.encode("utf-8")
-    if not raw or len(encoded) > MAX_REMOTE_STATUS_BYTES:
-        return None
+    if len(encoded) > MAX_REMOTE_STATUS_BYTES:
+        return {
+            "state": "invalid_status",
+            "last_error": "logger status exceeds its size limit",
+        }
     try:
         value = json.loads(raw)
     except json.JSONDecodeError:
         return {"state": "invalid_status", "last_error": "logger status JSON is invalid"}
     if not isinstance(value, dict):
-        return None
+        return {"state": "invalid_status", "last_error": "logger status is not an object"}
     clean: dict[str, Any] = {}
     for key, item in value.items():
         if key not in _LOGGER_KEYS:
             continue
-        if isinstance(item, str):
+        if key == "capabilities":
+            capabilities = _clean_logger_capabilities(item)
+            if capabilities is not None:
+                clean[key] = capabilities
+        elif key == "metrics":
+            metrics = _clean_logger_metrics(item)
+            if metrics is not None:
+                clean[key] = metrics
+        elif isinstance(item, str):
             clean[key] = redact(item)[:256]
         elif isinstance(item, (bool, int, float)) or item is None:
             clean[key] = item
@@ -528,6 +634,87 @@ async def _register(validated: ValidatedBundle) -> OBDBundle:
         return await store_validated_bundle(session, validated)
 
 
+async def _registered_winner(validated: ValidatedBundle, config: AppConfig) -> OBDBundle | None:
+    """Prove that a uniqueness loser is the same durable immutable bundle.
+
+    An ``IntegrityError`` alone says only that *some* unique key won.  It is not
+    authority to discard anything from ``verified/``: the conflict may instead be a
+    colliding sample id, drive id, or filename.  Accept the operation as idempotent only
+    when both independent durability boundaries agree -- a trusted database identity and
+    the exact canonical file bytes.
+    """
+    async with session_scope() as session:
+        row = await session.scalar(
+            select(OBDBundle).where(
+                OBDBundle.filename == validated.filename,
+                OBDBundle.drive_id == validated.drive_id,
+                OBDBundle.bundle_hash == validated.bundle_sha256,
+                OBDBundle.schema_version == validated.schema_version,
+                OBDBundle.size_bytes == validated.size_bytes,
+                OBDBundle.metadata_trusted.is_(True),
+                OBDBundle.verified_at.is_not(None),
+            )
+        )
+    if row is None:
+        return None
+
+    target = config.obd_verified_dir / validated.filename
+    if (
+        target.is_symlink()
+        or not target.is_file()
+        or target.resolve().parent != config.obd_verified_dir.resolve()
+        or target.stat().st_size != validated.size_bytes
+    ):
+        return None
+    try:
+        digest, size = await asyncio.to_thread(
+            file_sha256,
+            target,
+            maximum=config.obd_max_bundle_bytes,
+        )
+    except (BundleError, OSError):
+        return None
+    if size != validated.size_bytes or digest != validated.bundle_sha256:
+        return None
+    return row
+
+
+async def verified_bundle_matches(filename: str, bundle_sha256: str) -> bool:
+    """Whether an acknowledged immutable export has both trusted metadata and bytes."""
+    if not is_bundle_name(filename) or not SHA256_RE.fullmatch(bundle_sha256):
+        return False
+    config = get_config()
+    async with session_scope() as session:
+        row = await session.scalar(
+            select(OBDBundle).where(
+                OBDBundle.filename == filename,
+                OBDBundle.bundle_hash == bundle_sha256,
+                OBDBundle.metadata_trusted.is_(True),
+                OBDBundle.verified_at.is_not(None),
+            )
+        )
+    if row is None:
+        return False
+
+    target = config.obd_verified_dir / filename
+    if (
+        target.is_symlink()
+        or not target.is_file()
+        or target.resolve().parent != config.obd_verified_dir.resolve()
+        or target.stat().st_size != row.size_bytes
+    ):
+        return False
+    try:
+        digest, size = await asyncio.to_thread(
+            file_sha256,
+            target,
+            maximum=config.obd_max_bundle_bytes,
+        )
+    except (BundleError, OSError):
+        return False
+    return size == row.size_bytes and digest == row.bundle_hash
+
+
 async def sync_remote_bundles(
     info: UnitInfo,
     *,
@@ -540,8 +727,37 @@ async def sync_remote_bundles(
     started = time.monotonic()
     result = OBDTransferResult()
     state = get_obd_transfer_status()
-    source = _safe_remote_path(cfg.obd_remote_ready_dir)
+    transfer_dir: Path | None = None
+    process_lock: ProcessFileLock | None = None
+
     try:
+        # ``try_acquire`` is a single non-blocking OS call. Keeping it on this task also
+        # prevents cancellation from abandoning an acquired descriptor in a worker
+        # future whose result nobody will collect.
+        process_lock = try_acquire(_sync_lock_path(cfg))
+    except OSError as exc:
+        result.error = f"could not acquire the OBD transfer lock: {redact(exc)}"
+        result.failed = 1
+        result.complete = False
+        result.seconds = time.monotonic() - started
+        log.warning("OBD backup stage could not establish its process fence", error=result.error)
+        return result
+    if process_lock is None:
+        # Do not touch the process-wide status snapshot: an in-process winner may be the
+        # run currently represented there.  The caller still receives an explicit
+        # incomplete result and therefore cannot treat the OBD durability gate as passed.
+        result.error = "another OBD transfer is already active"
+        result.failed = 1
+        result.complete = False
+        result.seconds = time.monotonic() - started
+        log.warning("skipped a concurrent OBD backup stage")
+        return result
+
+    try:
+        source = _safe_remote_path(cfg.obd_remote_ready_dir)
+        # A process-lifetime file lock is now held. Any matching directory is therefore
+        # known to be an orphan from a dead process rather than another live transfer.
+        await asyncio.to_thread(_clean_staging, cfg)
         logger_task = asyncio.create_task(
             read_logger_status(info.address, cfg.obd_remote_status_file)
         )
@@ -552,8 +768,6 @@ async def sync_remote_bundles(
         state.set_inventory(len(remote))
         if not remote:
             return result
-
-        await asyncio.to_thread(_clean_staging, cfg)
 
         pending: list[RemoteFile] = []
         for item in remote:
@@ -649,6 +863,9 @@ async def sync_remote_bundles(
                 break
         if not pending:
             return result
+        # False until every item in the authoritative pending inventory has crossed the
+        # hash/validation/database durability boundary below.
+        result.complete = False
 
         transfer_dir = cfg.obd_staging_dir / f".transfer-{uuid.uuid4().hex}.partial"
         transfer_dir.mkdir()
@@ -695,10 +912,13 @@ async def sync_remote_bundles(
         await adb.stop_listener(proc)
 
         expected = {item.name: item for item in pending}
+        durable_names: set[str] = set()
         for name in received.files:
             item = expected.get(name)
             staged = transfer_dir / name
             target: Path | None = None
+            target_owned_by_run = False
+            validated: ValidatedBundle | None = None
             if item is None or not staged.is_file():
                 continue
             try:
@@ -731,10 +951,12 @@ async def sync_remote_bundles(
                         # before atomically restoring the verified path.
                         await asyncio.to_thread(_quarantine, target, target_hash, cfg)
                         await asyncio.to_thread(_durable_move, staged, target)
+                        target_owned_by_run = True
                     else:
                         staged.unlink()
                 else:
                     await asyncio.to_thread(_durable_move, staged, target)
+                    target_owned_by_run = True
                 # The move preserves the inode but the dataclass path is immutable.
                 validated = ValidatedBundle(
                     path=target,
@@ -747,6 +969,7 @@ async def sync_remote_bundles(
                     latest_sample=validated.latest_sample,
                     latest_values=validated.latest_values,
                     statistics=validated.statistics,
+                    summary_source=validated.summary_source,
                     warnings=validated.warnings,
                 )
                 row = await _register(validated)
@@ -763,58 +986,81 @@ async def sync_remote_bundles(
                             error=redact(cleanup_error),
                         )
             except (BundleError, OSError, IntegrityError) as exc:
-                result.failed += 1
-                error_text = (
-                    "database uniqueness conflict while storing validated OBD history"
-                    if isinstance(exc, IntegrityError)
-                    else redact(exc)
+                winner = (
+                    await _registered_winner(validated, cfg)
+                    if isinstance(exc, IntegrityError) and validated is not None
+                    else None
                 )
-                result.error = error_text
-                quarantine_path: Path | None = None
-                digest: str | None = None
-                rejected_size = 0
-                rejected_source = staged
-                if (
-                    not rejected_source.is_file()
-                    and target is not None
-                    and target.is_file()
-                    and not target.is_symlink()
-                    and target.resolve().parent == cfg.obd_verified_dir.resolve()
-                ):
-                    rejected_source = target
-                if rejected_source.is_file():
-                    with contextlib.suppress(BundleError, OSError):
-                        digest, rejected_size = await asyncio.to_thread(
-                            file_sha256, rejected_source, maximum=cfg.obd_max_bundle_bytes
-                        )
-                        quarantine_path = await asyncio.to_thread(
-                            _quarantine, rejected_source, digest, cfg
-                        )
-                if digest is not None:
-                    try:
-                        async with session_scope() as session:
-                            await store_rejected_bundle(
-                                session,
-                                filename=name,
-                                bundle_hash=digest,
-                                size_bytes=rejected_size,
-                                error=error_text,
-                                quarantined=quarantine_path is not None,
+                if winner is not None:
+                    # Another transaction crossed both the trusted-row and canonical-file
+                    # durability boundaries first. This run is an idempotent observer, not
+                    # the owner of bytes it may quarantine.
+                    row = winner
+                    log.info(
+                        "accepted a concurrently registered OBD bundle",
+                        bundle=name,
+                    )
+                else:
+                    result.failed += 1
+                    error_text = (
+                        "database uniqueness conflict while storing validated OBD history"
+                        if isinstance(exc, IntegrityError)
+                        else redact(exc)
+                    )
+                    result.error = error_text
+                    quarantine_path: Path | None = None
+                    digest: str | None = None
+                    rejected_size = 0
+                    rejected_source: Path | None = staged if staged.is_file() else None
+                    if (
+                        rejected_source is None
+                        and target_owned_by_run
+                        and target is not None
+                        and target.is_file()
+                        and not target.is_symlink()
+                        and target.resolve().parent == cfg.obd_verified_dir.resolve()
+                    ):
+                        # Only a path installed by this run is eligible. A pre-existing
+                        # canonical target may belong to the winning transaction that
+                        # produced the IntegrityError and must never be moved on inference.
+                        rejected_source = target
+                    if rejected_source is not None:
+                        with contextlib.suppress(BundleError, OSError):
+                            digest, rejected_size = await asyncio.to_thread(
+                                file_sha256,
+                                rejected_source,
+                                maximum=cfg.obd_max_bundle_bytes,
                             )
-                    except Exception as record_error:
-                        log.exception(
-                            "could not persist an OBD quarantine record",
-                            bundle=name,
-                            error=redact(record_error),
-                        )
-                log.warning(
-                    "an OBD bundle failed validation and was quarantined",
-                    bundle=name,
-                    error=error_text,
-                )
-                continue
+                            quarantine_path = await asyncio.to_thread(
+                                _quarantine, rejected_source, digest, cfg
+                            )
+                    if digest is not None:
+                        try:
+                            async with session_scope() as session:
+                                await store_rejected_bundle(
+                                    session,
+                                    filename=name,
+                                    bundle_hash=digest,
+                                    size_bytes=rejected_size,
+                                    error=error_text,
+                                    quarantined=quarantine_path is not None,
+                                )
+                        except Exception as record_error:
+                            log.exception(
+                                "could not persist an OBD quarantine record",
+                                bundle=name,
+                                error=redact(record_error),
+                            )
+                    log.warning(
+                        "an OBD bundle failed validation",
+                        bundle=name,
+                        quarantined=quarantine_path is not None,
+                        error=error_text,
+                    )
+                    continue
 
             result.copied += 1
+            durable_names.add(name)
             result.bytes += item.size
             if not _receipt_eligible(row):
                 log.warning(
@@ -859,20 +1105,42 @@ async def sync_remote_bundles(
                 result.removed_from_unit += 1
             get_import_worker().wake()
 
+        missing_names = set(expected) - durable_names
+        result.missing = len(missing_names)
+        result.complete = not missing_names
+        if missing_names:
+            # Validation failures were counted in their own branch. Add only the pending
+            # files the transport never delivered so each missing bundle is represented.
+            result.failed += sum(1 for name in missing_names if name not in received.files)
         if not received.complete and received.error:
             result.error = redact(received.error)
     except (BundleError, adb.AdbError, OSError) as exc:
         result.error = redact(exc)
         result.failed += 1
+        result.complete = False
         log.warning("OBD backup stage failed without affecting footage", error=result.error)
     finally:
-        result.seconds = time.monotonic() - started
-        state.finish(result)
-        # Only this run's random temporary directory; never recurse over the OBD root.
-        for path in cfg.obd_staging_dir.glob(".transfer-*.partial"):
-            if path.is_dir() and path.resolve().parent == cfg.obd_staging_dir.resolve():
-                with contextlib.suppress(OSError):
-                    await asyncio.to_thread(shutil.rmtree, path)
+        try:
+            result.seconds = time.monotonic() - started
+            state.finish(result)
+            # Orphan sweeping happens once at entry under the process fence. At exit,
+            # remove only the UUID directory allocated by this invocation; a broad glob
+            # here could erase a successor's live transfer after this lock is released.
+            with contextlib.suppress(OSError):
+                if (
+                    transfer_dir is not None
+                    and transfer_dir.is_dir()
+                    and transfer_dir.resolve().parent == cfg.obd_staging_dir.resolve()
+                ):
+                    await asyncio.to_thread(shutil.rmtree, transfer_dir)
+        finally:
+            try:
+                process_lock.release()
+            except OSError as exc:
+                # ``release`` closes the descriptor even when the explicit unlock fails,
+                # so the operating system still drops ownership. Do not turn a completed
+                # best-effort telemetry stage into a footage failure while reporting it.
+                log.warning("could not explicitly release the OBD transfer lock", error=redact(exc))
     return result
 
 
@@ -882,5 +1150,6 @@ __all__ = [
     "inventory_remote_bundles",
     "read_logger_status",
     "sync_remote_bundles",
+    "verified_bundle_matches",
     "write_verification_receipt",
 ]

@@ -17,7 +17,7 @@ import re
 import stat
 import zipfile
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,6 +40,7 @@ SCHEMA_VERSION = 1
 BUNDLE_SUFFIX = ".obd2.zip"
 PARTIAL_SUFFIX = ".partial"
 MEMBERS = frozenset({"manifest.json", "samples.ndjson.gz", "diagnostics.json", "summary.json"})
+CORE_MEMBERS = frozenset({"manifest.json", "samples.ndjson.gz", "diagnostics.json"})
 PAYLOAD_MEMBERS = frozenset({"samples.ndjson.gz", "diagnostics.json", "summary.json"})
 SAFE_DRIVE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 SAFE_VEHICLE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -47,10 +48,67 @@ SAFE_SAMPLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$")
 DTC_RE = re.compile(r"^[PCBU][0-9A-F]{4}$")
 PID_HEX_RE = re.compile(r"^[0-9A-F]{2}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SAFE_REASON_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+PIPELINE_METRIC_FIELDS = frozenset(
+    {
+        "commands_requested",
+        "commands_completed",
+        "command_timeouts",
+        "notifications_received",
+        "notification_fragments_received",
+        "frames_assembled",
+        "checksum_failures",
+        "parse_failures",
+        "samples_created",
+        "samples_queued",
+        "samples_persisted",
+        "samples_dropped",
+        "database_write_failures",
+        "ble_disconnects",
+        "reconnect_attempts",
+        "radio_shutdowns",
+        "queue_depth",
+        "maximum_queue_depth",
+    }
+)
 MAX_JSON_MEMBER_BYTES = 2 * 1024 * 1024
 MAX_SAMPLE_LINE_BYTES = 64 * 1024
 MAX_DIAGNOSTIC_EVENTS = 4096
 MAX_DRIVE_SPAN = timedelta(days=31)
+HARDENED_SUMMARY_FIELDS = frozenset(
+    {
+        "last_sample_at_utc",
+        "termination_noticed_at_utc",
+        "finalised_at_utc",
+        "completion_status",
+        "interruption_reason",
+    }
+)
+SUMMARY_FIELDS_V1 = frozenset(
+    {
+        "schema_version",
+        "drive_id",
+        "start_time_utc",
+        "finish_time_utc",
+        "duration_s",
+        "distance_km",
+        "average_speed_kmh",
+        "maximum_speed_kmh",
+        "average_rpm",
+        "maximum_rpm",
+        "idle_duration_s",
+        "estimated_fuel_used_l",
+        "average_fuel_consumption_l_per_100km",
+        "maximum_coolant_temperature_c",
+        "maximum_engine_load_pct",
+        "dtcs_observed",
+        "sample_count",
+        "missing_data_duration_s",
+        "expected_sample_count",
+        "received_sample_percentage",
+        "clean_end",
+    }
+)
 
 # Byte-for-byte shared with the logger and the Home Assistant endpoint.  Keeping this in
 # one place makes a unit spelling change a schema version change rather than a silent data
@@ -112,6 +170,10 @@ class BundleError(ValueError):
     """A permanent integrity/schema failure.  The copy belongs in quarantine."""
 
 
+class HAPayloadError(ValueError):
+    """A server projection cannot be represented safely; raw bundle bytes are valid."""
+
+
 class BundleConflict(BundleError):
     """A drive id was already stored from different immutable bytes."""
 
@@ -128,6 +190,7 @@ class ValidatedBundle:
     latest_sample: dict[str, Any]
     latest_values: dict[str, dict[str, Any]]
     statistics: list[dict[str, Any]]
+    summary_source: str = "producer"
     warnings: tuple[str, ...] = ()
 
     @property
@@ -142,21 +205,80 @@ class ValidatedBundle:
     def vehicle_id(self) -> str:
         return str(self.manifest["vehicle_id"])
 
-    def ha_payload(self) -> dict[str, Any]:
+    def ha_payload(
+        self,
+        *,
+        lifecycle: Mapping[str, Any] | None = None,
+        canonical_summary: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """The bounded v1 body.  Raw samples and filesystem metadata never leave here."""
+        # HA imports historical state. Keeping the strict v1 shape while changing the
+        # already-enumerated status value prevents an interrupted drive's final sample
+        # from claiming that the ECU is currently connected.
+        latest_sample = {
+            key: value
+            for key, value in self.latest_sample.items()
+            if key in SAMPLE_IDENTITY_FIELDS or key in SAMPLE_TELEMETRY_FIELDS
+        }
+        latest_sample["ecu_data_status"] = "last_known"
+        summary = {
+            key: value
+            for key, value in (canonical_summary or self.summary).items()
+            if key not in HARDENED_SUMMARY_FIELDS
+        }
+        _validate_ha_summary(summary, drive_id=self.drive_id)
+        if lifecycle is not None:
+            expected = {
+                "lifecycle_status",
+                "interruption_reason",
+                "gap_count",
+                "longest_gap_s",
+            }
+            if set(lifecycle) != expected:
+                raise HAPayloadError("Home Assistant lifecycle projection fields are incomplete")
+            lifecycle_status = lifecycle["lifecycle_status"]
+            reason = lifecycle["interruption_reason"]
+            gap_count = lifecycle["gap_count"]
+            longest_gap = lifecycle["longest_gap_s"]
+            if lifecycle_status not in {"complete", "interrupted", "recovered"}:
+                raise HAPayloadError("Home Assistant lifecycle status is invalid")
+            if reason is not None and (
+                not isinstance(reason, str) or not SAFE_REASON_RE.fullmatch(reason)
+            ):
+                raise HAPayloadError("Home Assistant interruption reason is not a safe code")
+            if lifecycle_status == "complete" and reason is not None:
+                raise HAPayloadError("a complete Home Assistant lifecycle cannot have a reason")
+            if (lifecycle_status == "complete") != bool(summary["clean_end"]):
+                raise HAPayloadError("Home Assistant lifecycle conflicts with clean_end")
+            if isinstance(gap_count, bool) or not isinstance(gap_count, int) or gap_count < 0:
+                raise HAPayloadError("Home Assistant gap count is invalid")
+            if (
+                isinstance(longest_gap, bool)
+                or not isinstance(longest_gap, (int, float))
+                or not math.isfinite(float(longest_gap))
+                or float(longest_gap) < 0
+                or float(longest_gap) > float(summary["duration_s"])
+            ):
+                raise HAPayloadError("Home Assistant longest gap is invalid")
+            if (gap_count == 0) != (float(longest_gap) == 0):
+                raise HAPayloadError("Home Assistant gap count and longest gap disagree")
+            summary.update(
+                {
+                    "lifecycle_status": lifecycle_status,
+                    "interruption_reason": reason,
+                    "gap_count": gap_count,
+                    "longest_gap_s": float(longest_gap),
+                }
+            )
         return {
             "schema_version": self.schema_version,
             "drive_id": self.drive_id,
             "bundle_sha256": self.bundle_sha256,
             "vehicle_id": self.vehicle_id,
             "units": dict(self.manifest["units"]),
-            "latest_sample": {
-                key: value
-                for key, value in self.latest_sample.items()
-                if key in SAMPLE_IDENTITY_FIELDS or key in SAMPLE_TELEMETRY_FIELDS
-            },
+            "latest_sample": latest_sample,
             "latest_values": self.latest_values,
-            "summary": self.summary,
+            "summary": summary,
             "statistics": self.statistics,
             "diagnostics": diagnostics_for_ha(self.diagnostics_document),
         }
@@ -277,11 +399,14 @@ def _zip_infos(archive: zipfile.ZipFile, config: AppConfig) -> dict[str, zipfile
     names = [item.filename for item in infos]
     if len(names) != len(set(names)):
         raise BundleError("ZIP contains duplicate member names")
-    if set(names) != MEMBERS:
-        missing = sorted(MEMBERS - set(names))
-        unexpected = sorted(set(names) - MEMBERS)
+    names_set = set(names)
+    # summary.json is derived and is not allowed to make otherwise valid raw history
+    # disappear. Unknown members and a missing manifest/sample/diagnostic remain fatal.
+    if not CORE_MEMBERS.issubset(names_set) or not names_set.issubset(MEMBERS):
+        missing = sorted(CORE_MEMBERS - names_set)
+        unexpected = sorted(names_set - MEMBERS)
         raise BundleError(
-            f"ZIP members do not match v1 (missing={missing}, unexpected={unexpected})"
+            f"ZIP core members do not match v1 (missing={missing}, unexpected={unexpected})"
         )
 
     expanded = 0
@@ -325,7 +450,7 @@ def _validate_manifest(
     archive: zipfile.ZipFile,
     infos: dict[str, zipfile.ZipInfo],
     config: AppConfig,
-) -> tuple[datetime, datetime]:
+) -> tuple[datetime, datetime, str | None]:
     if not isinstance(manifest, dict):
         raise BundleError("manifest.json must contain an object")
     manifest_fields = {
@@ -352,11 +477,26 @@ def _validate_manifest(
         "units",
         "files",
     }
-    if set(manifest) != manifest_fields:
+    hardened_fields = {
+        "last_sample_at_utc",
+        "last_successful_obd_response_at_utc",
+        "termination_noticed_at_utc",
+        "finalised_at_utc",
+        "interruption_reason",
+        "poll_plan_version",
+    }
+    actual_fields = set(manifest)
+    actual_shape = frozenset(actual_fields)
+    if actual_shape not in {
+        frozenset(manifest_fields),
+        frozenset(manifest_fields | hardened_fields),
+    }:
+        expected = manifest_fields | (hardened_fields if actual_fields & hardened_fields else set())
         raise BundleError(
-            f"manifest fields do not match v1 (missing={sorted(manifest_fields - manifest.keys())}, "
-            f"extras={sorted(manifest.keys() - manifest_fields)})"
+            f"manifest fields do not match a supported v1 shape "
+            f"(missing={sorted(expected - actual_fields)}, extras={sorted(actual_fields - expected)})"
         )
+    hardened = hardened_fields.issubset(actual_fields)
     if _integer(manifest["schema_version"], field_name="manifest.schema_version") != SCHEMA_VERSION:
         raise BundleError(f"unsupported bundle schema version {manifest['schema_version']!r}")
     if manifest["bundle_format"] != "dashcam-obd":
@@ -384,9 +524,9 @@ def _validate_manifest(
         maximum=256,
         nullable=True,
     )
-    _utc(manifest["created_at_utc"], field_name="manifest.created_at_utc")
-    if manifest["completion_status"] not in {"complete", "recovered"}:
-        raise BundleError("completion_status must be complete or recovered")
+    created = _utc(manifest["created_at_utc"], field_name="manifest.created_at_utc")
+    if manifest["completion_status"] not in {"complete", "interrupted", "recovered"}:
+        raise BundleError("completion_status must be complete, interrupted or recovered")
     if not isinstance(manifest["clean_end"], bool):
         raise BundleError("manifest.clean_end must be boolean")
     _integer(
@@ -410,10 +550,50 @@ def _validate_manifest(
     finished = _utc(manifest["finish_time_utc"], field_name="manifest.finish_time_utc")
     if finished < started or finished - started > MAX_DRIVE_SPAN:
         raise BundleError("manifest drive time range is reversed or exceeds 31 days")
+    if hardened:
+        if _integer(manifest["poll_plan_version"], field_name="manifest.poll_plan_version") != 2:
+            raise BundleError("manifest.poll_plan_version is not supported")
+
+        def lifecycle_time(name: str) -> datetime | None:
+            value = manifest[name]
+            if value is None:
+                return None
+            return _utc(value, field_name=f"manifest.{name}")
+
+        last_sample = lifecycle_time("last_sample_at_utc")
+        last_response = lifecycle_time("last_successful_obd_response_at_utc")
+        noticed = lifecycle_time("termination_noticed_at_utc")
+        finalised = lifecycle_time("finalised_at_utc")
+        interruption_reason = _text(
+            manifest["interruption_reason"],
+            field_name="manifest.interruption_reason",
+            maximum=128,
+            nullable=True,
+        )
+        if last_sample is not None and not started <= last_sample <= finished:
+            raise BundleError("manifest.last_sample_at_utc lies outside the drive window")
+        response_upper = noticed or finalised or created
+        if last_response is not None and not started <= last_response <= response_upper:
+            raise BundleError(
+                "manifest.last_successful_obd_response_at_utc lies outside the observed session"
+            )
+        if noticed is not None and noticed < finished:
+            raise BundleError("manifest.termination_noticed_at_utc precedes the effective end")
+        if finalised is not None and noticed is not None and finalised < noticed:
+            raise BundleError("manifest.finalised_at_utc precedes termination observation")
+        completion = manifest["completion_status"]
+        if manifest["clean_end"]:
+            if completion != "complete" or interruption_reason is not None:
+                raise BundleError("a clean manifest must be complete without interruption_reason")
+        elif completion == "complete":
+            raise BundleError("a hardened unclean manifest cannot claim complete")
+        elif not interruption_reason:
+            raise BundleError("a hardened unclean manifest requires interruption_reason")
 
     files = manifest["files"]
     if not isinstance(files, dict) or set(files) != PAYLOAD_MEMBERS:
         raise BundleError("manifest.files must map the three payload members exactly")
+    summary_problem: str | None = None
     for name in sorted(PAYLOAD_MEMBERS):
         expected = files[name]
         if not isinstance(expected, dict):
@@ -433,13 +613,25 @@ def _validate_manifest(
             field_name=f"manifest.files.{name}.record_count",
             maximum=max(config.obd_max_samples, MAX_DIAGNOSTIC_EVENTS),
         )
-        with archive.open(infos[name], "r") as source:
+        info = infos.get(name)
+        if info is None:
+            if name == "summary.json":
+                summary_problem = "summary.json is missing"
+                continue
+            raise BundleError(f"required payload member {name} is missing")
+        with archive.open(info, "r") as source:
             actual_hash, actual_size = _sha256_stream(source)
-        if actual_size != expected_size or actual_size != infos[name].file_size:
+        if actual_size != expected_size or actual_size != info.file_size:
+            if name == "summary.json":
+                summary_problem = "summary.json size does not match its manifest"
+                continue
             raise BundleError(f"{name} size does not match its manifest")
         if actual_hash != expected_hash:
+            if name == "summary.json":
+                summary_problem = "summary.json SHA-256 does not match its manifest"
+                continue
             raise BundleError(f"{name} SHA-256 does not match its manifest")
-    return started, finished
+    return started, finished, summary_problem
 
 
 def _validate_sample(
@@ -804,6 +996,7 @@ def _validate_diagnostics(
         "protocol_change",
         "connection_failure",
         "parser_failure",
+        "pipeline_metrics",
     }
     previous_at: datetime | None = None
     dtc_scan_statuses: dict[int, str] = {}
@@ -823,7 +1016,7 @@ def _validate_diagnostics(
             raise BundleError("diagnostic drive_id does not match manifest")
         observed_at = _utc(event["timestamp_utc"], field_name="diagnostic.timestamp_utc")
         if observed_at < started or observed_at > finished:
-            raise BundleError("diagnostic timestamp lies outside the manifest drive window")
+            raise BundleError("diagnostic timestamp lies outside the observed drive window")
         if previous_at is not None and observed_at < previous_at:
             raise BundleError("diagnostic events must be ordered by timestamp")
         previous_at = observed_at
@@ -1059,6 +1252,25 @@ def _validate_diagnostics(
                 raise BundleError(f"diagnostic {kind} payload fields do not match v1")
             _text(payload["category"], field_name=f"diagnostic.{kind}.category", maximum=128)
             _text(payload["message"], field_name=f"diagnostic.{kind}.message", maximum=1024)
+        elif kind == "pipeline_metrics":
+            if set(payload) != PIPELINE_METRIC_FIELDS:
+                raise BundleError("diagnostic pipeline_metrics fields do not match v1")
+            for field_name in PIPELINE_METRIC_FIELDS:
+                maximum = 1 if field_name in {"queue_depth", "maximum_queue_depth"} else 2**31 - 1
+                _integer(
+                    payload[field_name],
+                    field_name=f"diagnostic.pipeline_metrics.{field_name}",
+                    maximum=maximum,
+                )
+            if payload["queue_depth"] > payload["maximum_queue_depth"]:
+                raise BundleError("diagnostic pipeline_metrics queue depth is inconsistent")
+            if payload["commands_completed"] > payload["commands_requested"]:
+                raise BundleError("diagnostic pipeline_metrics command counts are inconsistent")
+            if (
+                payload["samples_persisted"] + payload["samples_dropped"]
+                > payload["samples_queued"]
+            ):
+                raise BundleError("diagnostic pipeline_metrics sample counts are inconsistent")
     return value
 
 
@@ -1070,36 +1282,17 @@ def _validate_summary(
     started: datetime,
     finished: datetime,
     clean_end: bool,
+    manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise BundleError("summary.json must be an object")
-    required = {
-        "schema_version",
-        "drive_id",
-        "start_time_utc",
-        "finish_time_utc",
-        "duration_s",
-        "distance_km",
-        "average_speed_kmh",
-        "maximum_speed_kmh",
-        "average_rpm",
-        "maximum_rpm",
-        "idle_duration_s",
-        "estimated_fuel_used_l",
-        "average_fuel_consumption_l_per_100km",
-        "maximum_coolant_temperature_c",
-        "maximum_engine_load_pct",
-        "dtcs_observed",
-        "sample_count",
-        "missing_data_duration_s",
-        "expected_sample_count",
-        "received_sample_percentage",
-        "clean_end",
-    }
-    if set(value) != required:
+    required = SUMMARY_FIELDS_V1
+    hardened = HARDENED_SUMMARY_FIELDS
+    expected = required | (hardened if manifest and "poll_plan_version" in manifest else set())
+    if set(value) != expected:
         raise BundleError(
-            f"summary fields do not match v1 (missing={sorted(required - value.keys())}, "
-            f"extras={sorted(value.keys() - required)})"
+            f"summary fields do not match the manifest's v1 shape "
+            f"(missing={sorted(expected - value.keys())}, extras={sorted(value.keys() - expected)})"
         )
     if value.get("schema_version") != SCHEMA_VERSION:
         raise BundleError("summary schema_version is unsupported")
@@ -1111,6 +1304,14 @@ def _validate_summary(
         raise BundleError("summary finish_time_utc does not match manifest")
     if value["clean_end"] is not clean_end:
         raise BundleError("summary clean_end does not match manifest")
+    if hardened.issubset(value):
+        assert manifest is not None
+        for key in hardened:
+            if value[key] != manifest[key]:
+                raise BundleError(f"summary {key} does not match manifest")
+        for key in ("last_sample_at_utc", "termination_noticed_at_utc", "finalised_at_utc"):
+            if value[key] is not None:
+                _utc(value[key], field_name=f"summary.{key}")
     if _integer(value.get("sample_count"), field_name="summary.sample_count") != sample_count:
         raise BundleError("summary sample_count does not match manifest")
     numeric_ranges = {
@@ -1155,6 +1356,65 @@ def _validate_summary(
     return value
 
 
+def _validate_ha_summary(value: Mapping[str, Any], *, drive_id: str) -> None:
+    """Validate the canonical mutable projection without re-binding it to raw clocks."""
+    try:
+        if set(value) != SUMMARY_FIELDS_V1:
+            raise HAPayloadError("Home Assistant summary projection fields are incomplete")
+        if value.get("schema_version") != SCHEMA_VERSION or value.get("drive_id") != drive_id:
+            raise HAPayloadError("Home Assistant summary projection identity is invalid")
+        started = _utc(value["start_time_utc"], field_name="summary.start_time_utc")
+        finished = _utc(value["finish_time_utc"], field_name="summary.finish_time_utc")
+        if finished < started:
+            raise HAPayloadError("Home Assistant summary finish precedes its start")
+        if not isinstance(value["clean_end"], bool):
+            raise HAPayloadError("Home Assistant summary clean_end is invalid")
+        sample_count = _integer(value["sample_count"], field_name="summary.sample_count")
+        expected = _integer(
+            value["expected_sample_count"], field_name="summary.expected_sample_count"
+        )
+        if expected < sample_count:
+            raise HAPayloadError("Home Assistant expected sample count is too small")
+        numeric_ranges = {
+            "duration_s": (0, 2_678_400),
+            "distance_km": (0, 300_000),
+            "average_speed_kmh": (0, 400),
+            "maximum_speed_kmh": (0, 400),
+            "average_rpm": (0, 20_000),
+            "maximum_rpm": (0, 20_000),
+            "idle_duration_s": (0, 2_678_400),
+            "estimated_fuel_used_l": (0, 750_000),
+            "average_fuel_consumption_l_per_100km": (0, 10_000),
+            "maximum_coolant_temperature_c": (-80, 250),
+            "maximum_engine_load_pct": (0, 100),
+            "missing_data_duration_s": (0, 2_678_400),
+            "received_sample_percentage": (0, 100),
+        }
+        non_nullable = {"duration_s", "missing_data_duration_s", "received_sample_percentage"}
+        for key, (minimum, maximum) in numeric_ranges.items():
+            _number(
+                value[key],
+                field_name=f"summary.{key}",
+                minimum=minimum,
+                maximum=maximum,
+                nullable=key not in non_nullable,
+            )
+        duration = float(value["duration_s"])
+        if abs(duration - (finished - started).total_seconds()) > 0.01:
+            raise HAPayloadError("Home Assistant summary duration conflicts with its clocks")
+        if float(value["missing_data_duration_s"]) > duration:
+            raise HAPayloadError("Home Assistant missing duration exceeds drive duration")
+        if not isinstance(value["dtcs_observed"], list) or len(value["dtcs_observed"]) > 128:
+            raise HAPayloadError("Home Assistant DTC projection is invalid")
+        if len(set(value["dtcs_observed"])) != len(value["dtcs_observed"]) or any(
+            not isinstance(code, str) or not DTC_RE.fullmatch(code)
+            for code in value["dtcs_observed"]
+        ):
+            raise HAPayloadError("Home Assistant DTC projection is invalid")
+    except BundleError as exc:
+        raise HAPayloadError(str(exc)) from None
+
+
 def validate_bundle(path: Path, *, config: AppConfig | None = None) -> ValidatedBundle:
     """Validate one immutable ZIP without extracting it or trusting member paths."""
     cfg = config or get_config()
@@ -1179,13 +1439,25 @@ def validate_bundle(path: Path, *, config: AppConfig | None = None) -> Validated
                 _read_member(archive, infos["manifest.json"], maximum=MAX_JSON_MEMBER_BYTES),
                 name="manifest.json",
             )
-            started, finished = _validate_manifest(
+            started, finished, summary_problem = _validate_manifest(
                 manifest,
                 filename_drive_id=filename_drive_id,
                 archive=archive,
                 infos=infos,
                 config=cfg,
             )
+            # Samples end at the effective drive finish. Hardened interruption diagnostics
+            # can truthfully be observed a moment later, up to the producer's separately
+            # retained termination/finalisation clock. Legacy bundles keep the old bound.
+            diagnostic_finished = finished
+            if "poll_plan_version" in manifest:
+                for field_name in ("termination_noticed_at_utc", "finalised_at_utc"):
+                    raw_time = manifest.get(field_name)
+                    if raw_time is not None:
+                        diagnostic_finished = max(
+                            diagnostic_finished,
+                            _utc(raw_time, field_name=f"manifest.{field_name}"),
+                        )
             diagnostics = _validate_diagnostics(
                 _json_bytes(
                     _read_member(archive, infos["diagnostics.json"], maximum=MAX_JSON_MEMBER_BYTES),
@@ -1194,19 +1466,29 @@ def validate_bundle(path: Path, *, config: AppConfig | None = None) -> Validated
                 drive_id=filename_drive_id,
                 manifest_count=int(manifest["diagnostic_count"]),
                 started=started,
-                finished=finished,
+                finished=diagnostic_finished,
             )
-            summary = _validate_summary(
-                _json_bytes(
-                    _read_member(archive, infos["summary.json"], maximum=MAX_JSON_MEMBER_BYTES),
-                    name="summary.json",
-                ),
-                drive_id=filename_drive_id,
-                sample_count=int(manifest["sample_count"]),
-                started=started,
-                finished=finished,
-                clean_end=manifest["clean_end"],
-            )
+            summary: dict[str, Any] | None = None
+            if summary_problem is None:
+                try:
+                    summary = _validate_summary(
+                        _json_bytes(
+                            _read_member(
+                                archive,
+                                infos["summary.json"],
+                                maximum=MAX_JSON_MEMBER_BYTES,
+                            ),
+                            name="summary.json",
+                        ),
+                        drive_id=filename_drive_id,
+                        sample_count=int(manifest["sample_count"]),
+                        started=started,
+                        finished=finished,
+                        clean_end=manifest["clean_end"],
+                        manifest=manifest,
+                    )
+                except BundleError as exc:
+                    summary_problem = str(exc)
     except (zipfile.BadZipFile, OSError, EOFError) as exc:
         raise BundleError(f"bundle ZIP is corrupt: {type(exc).__name__}: {exc}") from None
 
@@ -1240,9 +1522,55 @@ def validate_bundle(path: Path, *, config: AppConfig | None = None) -> Validated
     if manifest["files"]["diagnostics.json"]["record_count"] != len(diagnostics["events"]):
         raise BundleError("diagnostics member record_count does not match its contents")
     if manifest["files"]["summary.json"]["record_count"] != 1:
-        raise BundleError("summary member record_count must be one")
+        summary_problem = "summary member record_count is not one"
 
     warnings: list[str] = []
+    summary_source = "producer"
+    if summary is None or summary_problem is not None:
+        # The summary contains no primary observations. Deriving it from the already
+        # checksum-verified, schema-validated sample stream is safer than hiding the drive
+        # or trusting corrupt producer arithmetic. The original ZIP remains byte-for-byte
+        # available for forensic download.
+        from app.obd.summary import calculate_summary
+
+        summary = calculate_summary(
+            manifest,
+            iter_samples(
+                resolved,
+                drive_id=filename_drive_id,
+                started=started,
+                finished=finished,
+                config=cfg,
+            ),
+            diagnostics["events"],
+        )
+        if "poll_plan_version" in manifest:
+            summary.update(
+                {
+                    key: manifest[key]
+                    for key in (
+                        "last_sample_at_utc",
+                        "termination_noticed_at_utc",
+                        "finalised_at_utc",
+                        "completion_status",
+                        "interruption_reason",
+                    )
+                }
+            )
+        summary = _validate_summary(
+            summary,
+            drive_id=filename_drive_id,
+            sample_count=int(manifest["sample_count"]),
+            started=started,
+            finished=finished,
+            clean_end=manifest["clean_end"],
+            manifest=manifest,
+        )
+        summary_source = "derived"
+        warnings.append(
+            "summary.json was missing or invalid; the server derived summary fields "
+            "from validated raw samples"
+        )
     now = datetime.now(UTC)
     if started > now + timedelta(days=1):
         warnings.append("drive timestamps are more than 24 hours ahead of the server clock")
@@ -1257,6 +1585,7 @@ def validate_bundle(path: Path, *, config: AppConfig | None = None) -> Validated
         latest_sample=latest,
         latest_values=latest_values,
         statistics=statistics.finish(),
+        summary_source=summary_source,
         warnings=tuple(warnings),
     )
 
@@ -1468,6 +1797,17 @@ async def store_validated_bundle(session: AsyncSession, bundle: ValidatedBundle)
             existing.last_http_status = None
             existing.updated_at = now
             await session.flush()
+        drive = (
+            await session.execute(select(OBDDrive).where(OBDDrive.bundle_id == existing.id))
+        ).scalar_one_or_none()
+        if drive is not None:
+            from app.ingest.obd_reconciliation import reconcile_drive_projection
+
+            await reconcile_drive_projection(
+                session,
+                drive,
+                summary_source=bundle.summary_source,
+            )
         return existing
     rejected = (
         await session.execute(
@@ -1546,6 +1886,18 @@ async def store_validated_bundle(session: AsyncSession, bundle: ValidatedBundle)
         obd_protocol=manifest.get("obd_protocol"),
         completion_status=manifest["completion_status"],
         clean_end=manifest["clean_end"],
+        lifecycle_status=(
+            "complete"
+            if manifest["clean_end"]
+            else "recovered"
+            if manifest.get("stop_reason") == "device_restart"
+            or manifest["completion_status"] == "recovered"
+            else "interrupted"
+        ),
+        interruption_reason=(manifest.get("stop_reason") if not manifest["clean_end"] else None),
+        finalization_observed_at=row.drive_finished_at,
+        processing_status="pending",
+        summary_source=bundle.summary_source,
         duration_s=summary.get("duration_s"),
         distance_km=summary.get("distance_km"),
         average_speed_kmh=summary.get("average_speed_kmh"),
@@ -1598,6 +1950,14 @@ async def store_validated_bundle(session: AsyncSession, bundle: ValidatedBundle)
         )
     if diagnostic_rows:
         await session.execute(insert(OBDDiagnostic), diagnostic_rows)
+    await session.flush()
+    from app.ingest.obd_reconciliation import reconcile_drive_projection
+
+    await reconcile_drive_projection(
+        session,
+        drive,
+        summary_source=bundle.summary_source,
+    )
     return row
 
 

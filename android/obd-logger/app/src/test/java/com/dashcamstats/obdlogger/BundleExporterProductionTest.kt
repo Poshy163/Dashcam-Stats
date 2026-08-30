@@ -73,6 +73,8 @@ class BundleExporterProductionTest {
             }
             assertEquals(1, manifest.getInt("sample_count"))
             assertEquals(1, manifest.getInt("diagnostic_count"))
+            assertEquals(2, manifest.getInt("poll_plan_version"))
+            assertEquals("complete", manifest.getString("completion_status"))
             for (name in listOf("samples.ndjson.gz", "diagnostics.json", "summary.json")) {
                 val entry = zip.getEntry(name)
                 val expected = manifest.getJSONObject("files").getJSONObject(name)
@@ -93,6 +95,92 @@ class BundleExporterProductionTest {
         val recovered = exporter.export(driveId)
         assertEquals(exported.sha256, recovered.sha256)
         assertArrayEquals(firstBytes, recovered.file.readBytes())
+    }
+
+    @Test
+    fun interruptedOneSampleDriveExportsWithEvidenceBasedEndAndLifecycleMetadata() {
+        val driveId = "interrupted-one"
+        val start = Instant.parse("2025-03-02T00:00:00Z")
+        database.startDrive(
+            DriveRecord(
+                driveId, "test-car", "test-adapter", "test-logger", "0.2.0", 1,
+                start.toString(), "UTC", "test", "test",
+            ),
+        )
+        database.addSample(
+            SampleRecord(
+                driveId, 0, start.plusSeconds(5).toString(),
+                mapOf("engine_rpm" to 900.0),
+            ),
+        )
+        database.markFinalising(
+            driveId,
+            "connection_lost",
+            start.plusSeconds(30).toString(),
+            start.plusSeconds(20).toString(),
+        )
+        database.finalizeDrive(
+            driveId,
+            "connection_lost",
+            start.plusSeconds(31).toString(),
+            lastSuccessfulResponseAtUtc = start.plusSeconds(20).toString(),
+        )
+
+        val exported = exporter.export(driveId)
+        ZipFile(exported.file).use { zip ->
+            val manifest = zip.getInputStream(zip.getEntry("manifest.json")).bufferedReader().use {
+                JSONObject(it.readText())
+            }
+            assertEquals("interrupted", manifest.getString("completion_status"))
+            assertEquals("connection_lost", manifest.getString("interruption_reason"))
+            assertEquals(start.plusSeconds(5).toString(), manifest.getString("finish_time_utc"))
+            assertEquals(start.plusSeconds(5).toString(), manifest.getString("last_sample_at_utc"))
+            assertEquals(
+                start.plusSeconds(20).toString(),
+                manifest.getString("last_successful_obd_response_at_utc"),
+            )
+            assertEquals(start.plusSeconds(30).toString(), manifest.getString("termination_noticed_at_utc"))
+            assertEquals(2, manifest.getInt("poll_plan_version"))
+        }
+    }
+
+    @Test
+    fun backwardWallJumpStillProducesOrderedExportLifecycleTimestamps() {
+        val driveId = "clock-jump-export"
+        val start = Instant.parse("2099-01-01T00:00:00Z")
+        database.startDrive(
+            DriveRecord(
+                driveId, "test-car", "test-adapter", "test-logger", "0.2.0", 1,
+                start.toString(), "UTC", "test", "test",
+            ),
+        )
+        database.addSample(
+            SampleRecord(
+                driveId,
+                0,
+                start.plusSeconds(5).toString(),
+                mapOf("engine_rpm" to 900.0),
+            ),
+        )
+        database.finalizeDrive(
+            driveId,
+            "process_terminated",
+            noticedAtUtc = "2020-01-01T00:00:00Z",
+        )
+
+        val exported = exporter.export(driveId)
+        ZipFile(exported.file).use { zip ->
+            val manifest = zip.getInputStream(zip.getEntry("manifest.json")).bufferedReader().use {
+                JSONObject(it.readText())
+            }
+            val finish = Instant.parse(manifest.getString("finish_time_utc"))
+            val noticed = Instant.parse(manifest.getString("termination_noticed_at_utc"))
+            val finalised = Instant.parse(manifest.getString("finalised_at_utc"))
+            val created = Instant.parse(manifest.getString("created_at_utc"))
+            assertFalse(noticed.isBefore(finish))
+            assertFalse(finalised.isBefore(noticed))
+            assertFalse(created.isBefore(finalised))
+        }
     }
 
     @Test

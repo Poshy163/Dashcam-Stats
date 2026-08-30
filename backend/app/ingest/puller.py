@@ -18,7 +18,7 @@ from pathlib import Path
 from app.config import get_config
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
-from app.ingest import adb, band, elevate, origin, radios, transport
+from app.ingest import adb, band, elevate, obd_control, origin, radio_coordinator, radios, transport
 from app.ingest.models import (
     DeltaPlan,
     Phase,
@@ -36,6 +36,7 @@ from app.ingest.obd_transfer import (
     inventory_remote_bundles,
     read_logger_status,
     sync_remote_bundles,
+    verified_bundle_matches,
 )
 from app.ingest.status import get_status
 
@@ -84,6 +85,18 @@ def _obd_logger_owns_bluetooth(logger_status: object) -> bool:
     only costs transfer throughput; disabling Bluetooth on an active owner loses telemetry.
     """
     return isinstance(logger_status, dict) and logger_status.get("ownership_enabled") is True
+
+
+def _obd_logger_status_is_authoritative(logger_status: object) -> bool:
+    """Whether radio ownership was positively observed rather than guessed.
+
+    ``None`` is emitted only when the status file was positively absent. Installed
+    logger versions publish a real boolean ownership flag. Error sentinels, malformed
+    documents and future partial schemas fail closed and keep Bluetooth untouched.
+    """
+    return logger_status is None or (
+        isinstance(logger_status, dict) and isinstance(logger_status.get("ownership_enabled"), bool)
+    )
 
 
 async def widen_sleep_window(address: str) -> None:
@@ -135,7 +148,12 @@ async def close_sleep_window(address: str, *, drained: bool) -> None:
         log.info("card drained and the engine is off; sending the head unit to sleep")
 
 
-async def _reclaim(info: UnitInfo, items: list[RemoteFile]) -> int:
+async def _reclaim(
+    info: UnitInfo,
+    items: list[RemoteFile],
+    *,
+    lease: radio_coordinator.RadioTransition | None = None,
+) -> int:
     """Remove recordings the library already holds from the card. Returns how many went.
 
     Logged rather than silent, at info level, which is the other half of this fix. The
@@ -146,6 +164,8 @@ async def _reclaim(info: UnitInfo, items: list[RemoteFile]) -> int:
     where = {item.name: item.directory or (info.source or "") for item in items}
     removed = 0
     for directory, names in _group_names([item.name for item in items], where).items():
+        if lease is not None:
+            lease.raise_if_lease_lost()
         try:
             removed += await adb.delete(info.address, directory, names)
         except adb.AdbError as exc:
@@ -157,6 +177,8 @@ async def _reclaim(info: UnitInfo, items: list[RemoteFile]) -> int:
                 files=len(names),
                 error=str(exc),
             )
+        if lease is not None:
+            lease.raise_if_lease_lost()
     if removed:
         log.info(
             "reclaimed card space for recordings already in the library",
@@ -205,6 +227,7 @@ async def _move(
     host: str,
     port: int,
     timeout_s: int,
+    lease: radio_coordinator.RadioTransition | None = None,
 ) -> transport.TransferResult:
     """Stream *files* off the unit into *staging*, one listener per directory.
 
@@ -224,6 +247,8 @@ async def _move(
     # Seeded complete; `_absorb` ANDs each batch onto it.
     transferred = transport.TransferResult(complete=True)
     for directory, batch in _by_directory(files, info.source):
+        if lease is not None:
+            lease.raise_if_lease_lost()
         # Anything still listening is serving a *previous* batch's file list, so clear it
         # before starting ours rather than connecting to the wrong stream.
         await adb.clear_listener(info.address)
@@ -260,6 +285,8 @@ async def _move(
         if part.error and not part.complete and not was_serving:
             part.error = f"{part.error} (the head unit stopped serving first)"
         _absorb(transferred, part)
+        if lease is not None:
+            lease.raise_if_lease_lost()
         if not part.complete:
             # The window shut, or the operator cancelled. Standing up another listener into
             # a link that has already gone would spend what is left of the window on a
@@ -727,8 +754,11 @@ async def run_pull(
     footage = Path(str(await get_settings_service().footage_dir()))
     staging = footage / STAGING_DIRNAME
     preflight: list[asyncio.Task] = []
-    quiet: radios.RadioQuiet | None = None
+    radio_transition: radio_coordinator.RadioTransition | None = None
     obd_result = None
+    obd_ack: obd_control.LoggerAck | None = None
+    obd_inventory_ok = True
+    obd_transfer_error: Exception | None = None
 
     try:
         # Only if nobody has already looked. The presence poll describes the unit
@@ -753,6 +783,16 @@ async def run_pull(
             result = RunResult(
                 state=RunState.ERROR,
                 error=info.card_error or "the head unit's memory card could not be found",
+            )
+            return result
+
+        # Reconcile before every run, including a same-visit re-drain. A failed restore
+        # can otherwise remain active while the unit stays online: each later run merely
+        # collides with its row and no path ever adopts the now-expired lease.
+        if not await radio_coordinator.reconcile_pending(address=info.address):
+            result = RunResult(
+                state=RunState.IDLE,
+                error="an earlier ingest radio transition still requires recovery",
             )
             return result
 
@@ -835,12 +875,16 @@ async def run_pull(
             remote_obd = await obd_inventory
         except Exception as exc:
             remote_obd = []
+            obd_inventory_ok = False
             log.warning("could not inventory OBD exports; footage will continue", error=str(exc))
         previous_logger = get_obd_transfer_status().snapshot()["logger"]
         try:
             observed_logger = await obd_logger
         except Exception as exc:
-            observed_logger = None
+            observed_logger = {
+                "state": "status_unavailable",
+                "last_error": "logger status read failed",
+            }
             log.warning("could not read OBD logger status; footage will continue", error=str(exc))
         if observed_logger is not None:
             get_obd_transfer_status().set_logger(observed_logger)
@@ -910,6 +954,84 @@ async def run_pull(
             result = RunResult(state=RunState.IDLE)
             return result
 
+        quiet_requested = bool(_get("quiet_radios", False)) and bool(plan.files)
+        logger_owns_bluetooth = _obd_logger_owns_bluetooth(observed_logger)
+        logger_can_quiesce = obd_control.supports_quiesce(observed_logger)
+        logger_status_authoritative = _obd_logger_status_is_authoritative(observed_logger)
+
+        # A logger that exposes the v1 quiesce capability can prove that its active
+        # command/sample/drive/export are durable before Bluetooth is touched.  An older
+        # logger retains the established ownership-yield behaviour: no control file is
+        # invented for it and both radios stay up.
+        if quiet_requested and not logger_status_authoritative:
+            log.warning(
+                "leaving the unit's radios on because OBD logger ownership could not be read",
+                logger_state=(observed_logger or {}).get("state"),
+            )
+        elif quiet_requested and logger_owns_bluetooth and not logger_can_quiesce:
+            log.info(
+                "leaving the unit's radios on because the OBD logger owns Bluetooth "
+                "and does not support ingestion quiescence",
+                logger_state=(observed_logger or {}).get("state"),
+            )
+        elif quiet_requested:
+            delay = max(0.0, radios.QUIET_AFTER_ONLINE_S - status.online_for())
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                radio_transition = await radio_coordinator.begin(
+                    trigger=trigger,
+                    address=info.address,
+                    logger_status=observed_logger,
+                    logger_status_path=get_config().obd_remote_status_file,
+                    watchdog_deadline_s=int(_get("listen_timeout_s", 180)) * 2 + 120,
+                    lease_loss_callback=status.cancel,
+                )
+            except radio_coordinator.TransitionBusy as exc:
+                # A second process must not inventory/copy/delete the same card while the
+                # first owns radio state. IDLE keeps this visit retryable after recovery.
+                log.warning("another ingest owns the device radios; postponing this pull")
+                result = RunResult(state=RunState.IDLE, error=str(exc))
+                return result
+            except radio_coordinator.RadioTransitionError as exc:
+                log.warning(
+                    "could not establish crash-safe radio ownership; leaving radios on",
+                    error=str(exc),
+                )
+
+            if radio_transition is not None and logger_owns_bluetooth:
+                try:
+                    obd_ack = await radio_transition.prepare_logger()
+                    # Finalisation may have atomically published a new bundle after the
+                    # first inventory. This authoritative second listing is the one that
+                    # must be copied before Bluetooth disappears.
+                    remote_obd = await inventory_remote_bundles(
+                        info.address, get_config().obd_remote_ready_dir
+                    )
+                    obd_inventory_ok = True
+                    if obd_ack.bundle_filename is not None and obd_ack.bundle_filename not in {
+                        item.name for item in remote_obd
+                    }:
+                        raise radio_coordinator.RadioTransitionError(
+                            "logger acknowledgement bundle is not visible in ready storage"
+                        )
+                except Exception as exc:
+                    log.warning(
+                        "OBD logger could not be quiesced; leaving radios on",
+                        error=str(exc),
+                    )
+                    restored = await radio_transition.restore(error=exc)
+                    radio_transition = None
+                    if not restored:
+                        # A failed restore can mean the logger is still paused even when
+                        # no radio command was attempted.  Do not start a large transfer
+                        # while the durable transition is explicitly awaiting recovery.
+                        result = RunResult(
+                            state=RunState.IDLE,
+                            error="OBD logger/radio recovery could not be verified",
+                        )
+                        return result
+
         # Small immutable OBD archives go first so the drive survives even if the unit's
         # short post-ignition window closes partway through the much larger footage set.
         # The stage owns its own temp directory, hashes, validation and DB transaction;
@@ -918,11 +1040,61 @@ async def run_pull(
         if remote_obd:
             status.set_phase(Phase.TRANSFERRING)
             try:
+                if radio_transition is not None:
+                    radio_transition.raise_if_lease_lost()
                 obd_result = await sync_remote_bundles(
                     info, ingest_status=status, remote=remote_obd
                 )
+                if radio_transition is not None:
+                    radio_transition.raise_if_lease_lost()
             except Exception as exc:
+                obd_transfer_error = exc
                 log.exception("OBD backup failed without affecting footage", error=str(exc))
+
+        if radio_transition is not None:
+            try:
+                if not obd_inventory_ok:
+                    raise radio_coordinator.RadioTransitionError(
+                        "OBD export inventory could not be verified"
+                    )
+                if obd_transfer_error is not None:
+                    raise radio_coordinator.RadioTransitionError(
+                        "OBD export transfer did not complete"
+                    ) from obd_transfer_error
+                if obd_result is not None and obd_result.failed:
+                    raise radio_coordinator.RadioTransitionError(
+                        "one or more OBD exports did not complete durable backup"
+                    )
+                if obd_result is not None and not obd_result.complete:
+                    raise radio_coordinator.RadioTransitionError(
+                        "one or more pending OBD exports are still missing from durable backup"
+                    )
+                if (
+                    obd_ack is not None
+                    and obd_ack.bundle_filename is not None
+                    and not await verified_bundle_matches(
+                        obd_ack.bundle_filename,
+                        obd_ack.bundle_sha256 or "",
+                    )
+                ):
+                    raise radio_coordinator.RadioTransitionError(
+                        "logger acknowledgement bundle is not durably verified on the server"
+                    )
+                radio_transition.raise_if_lease_lost()
+                await radio_transition.mark_obd_transfer_complete()
+            except Exception as exc:
+                log.warning(
+                    "OBD backup did not complete before radio shutdown; leaving radios on",
+                    error=str(exc),
+                )
+                restored = await radio_transition.restore(error=exc)
+                radio_transition = None
+                if not restored:
+                    result = RunResult(
+                        state=RunState.IDLE,
+                        error="OBD backup recovery could not be verified",
+                    )
+                    return result
 
         if not plan.files:
             if obd_result is not None and (obd_result.copied or obd_result.duplicates):
@@ -996,32 +1168,46 @@ async def run_pull(
         timeout_s = int(_get("listen_timeout_s", 180))
         status.set_phase(Phase.TRANSFERRING)
 
-        # The unit's Bluetooth and hotspot share the transfer's single-stream radio, and
-        # the transfer runs at that radio's measured ceiling — so both go quiet while
-        # bytes move, once the unit has been here long enough to be parked rather than
-        # passing. Started here, after the idle return, so a window with nothing to copy
-        # never touches them; the run's `finally` puts back whatever was taken. The
-        # deadline covers one listener timeout per directory the plan can have, plus
-        # slack, so the on-unit watchdog cannot fire mid-run.
-        if bool(_get("quiet_radios", False)) and _obd_logger_owns_bluetooth(observed_logger):
-            log.info(
-                "leaving the unit's radios on because the OBD logger owns Bluetooth",
-                logger_state=observed_logger.get("state"),
-            )
-        elif bool(_get("quiet_radios", False)):
-            quiet = radios.begin_quiet(
-                info.address,
-                online_for=status.online_for(),
-                watchdog_deadline_s=timeout_s * 2 + 120,
-            )
+        # Awaited, and only after logger finalisation plus OBD bundle backup.  The previous
+        # background task raced this first bulk read and could still be in its ten-second
+        # guard while the transfer was already moving bytes.
+        if radio_transition is not None:
+            try:
+                radio_transition.raise_if_lease_lost()
+                await radio_transition.capture_and_quiet()
+                radio_transition.raise_if_lease_lost()
+            except Exception as exc:
+                log.warning(
+                    "could not safely quiet radios; restoring before transfer", error=str(exc)
+                )
+                restored = await radio_transition.restore(error=exc)
+                radio_transition = None
+                if not restored:
+                    result = RunResult(
+                        state=RunState.IDLE,
+                        error="radio recovery could not be verified before transfer",
+                    )
+                    return result
 
         transferred = await _move(
-            info, plan.files, staging=staging, host=host, port=port, timeout_s=timeout_s
+            info,
+            plan.files,
+            staging=staging,
+            host=host,
+            port=port,
+            timeout_s=timeout_s,
+            lease=radio_transition,
         )
+        if radio_transition is not None:
+            radio_transition.raise_if_lease_lost()
 
         status.set_phase(Phase.VERIFYING)
         expected = {item.name: item.size for item in plan.files}
+        if radio_transition is not None:
+            radio_transition.raise_if_lease_lost()
         committed = await asyncio.to_thread(commit, staging, footage, expected)
+        if radio_transition is not None:
+            radio_transition.raise_if_lease_lost()
         wanted = list(plan.files)
 
         if bool(_get("delete_after_verify", False)) and committed:
@@ -1031,7 +1217,11 @@ async def run_pull(
             # share its name. `_reclaim` does that grouping and, unlike the bare
             # `suppress(AdbError)` this replaced, says so in the log either way.
             by_name = {item.name: item for item in plan.files}
-            await _reclaim(info, [by_name[name] for name in committed if name in by_name])
+            await _reclaim(
+                info,
+                [by_name[name] for name in committed if name in by_name],
+                lease=radio_transition,
+            )
 
         # The sweeps: re-check the card before calling the run done. The plan was drawn
         # when the car arrived, and the recording the camera was writing at that moment --
@@ -1070,18 +1260,32 @@ async def run_pull(
             status.extend_plan(more)
             status.set_phase(Phase.TRANSFERRING)
             part = await _move(
-                info, more.files, staging=staging, host=host, port=port, timeout_s=timeout_s
+                info,
+                more.files,
+                staging=staging,
+                host=host,
+                port=port,
+                timeout_s=timeout_s,
+                lease=radio_transition,
             )
             _absorb(transferred, part)
+            if radio_transition is not None:
+                radio_transition.raise_if_lease_lost()
             status.set_phase(Phase.VERIFYING)
             more_expected = {item.name: item.size for item in more.files}
             more_committed = await asyncio.to_thread(commit, staging, footage, more_expected)
+            if radio_transition is not None:
+                radio_transition.raise_if_lease_lost()
             expected.update(more_expected)
             committed = [*committed, *more_committed]
             wanted.extend(more.files)
             if bool(_get("delete_after_verify", False)) and more_committed:
                 by_name = {item.name: item for item in more.files}
-                await _reclaim(info, [by_name[name] for name in more_committed if name in by_name])
+                await _reclaim(
+                    info,
+                    [by_name[name] for name in more_committed if name in by_name],
+                    lease=radio_transition,
+                )
 
         # The rescue: cut-short recordings stranded outside Video by a power cut. After
         # the sweeps, while the link is still proven good, and only on a run that has not
@@ -1093,6 +1297,8 @@ async def run_pull(
             and not status.cancel_event.is_set()
         ):
             try:
+                if radio_transition is not None:
+                    radio_transition.raise_if_lease_lost()
                 rescued, rescued_names, rescued_sizes = await _rescue_partials(
                     info,
                     staging=staging,
@@ -1103,6 +1309,10 @@ async def run_pull(
                     unit_now=int(time.time() + skew),
                     already_seen=await removed,
                 )
+                if radio_transition is not None:
+                    radio_transition.raise_if_lease_lost()
+            except radio_coordinator.RadioTransitionError:
+                raise
             except Exception as exc:
                 log.warning("could not rescue cut-short recordings", error=str(exc))
             else:
@@ -1153,9 +1363,21 @@ async def run_pull(
         # failure follows somebody into the car. Bounded, because the usual reason a
         # restore struggles is that the unit has driven away and every call is a timeout
         # — the marker and the on-unit watchdog carry the cases this cannot reach.
-        if quiet is not None:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await asyncio.wait_for(quiet.finish(), timeout=30.0)
+        if radio_transition is not None:
+            restored = False
+            try:
+                restored = await asyncio.wait_for(radio_transition.restore(), timeout=30.0)
+            except (asyncio.CancelledError, Exception) as exc:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(radio_transition.require_recovery(exc))
+            if not restored and result.state is RunState.OK:
+                result = RunResult(
+                    state=RunState.PARTIAL,
+                    files=result.files,
+                    bytes=result.bytes,
+                    seconds=result.seconds,
+                    error="radio restoration remains pending and will be retried",
+                )
 
         # Any preflight nobody got as far as needing -- an idle window, a share that failed
         # its checks. Collected rather than abandoned, so a short run cannot leave a task

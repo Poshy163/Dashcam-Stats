@@ -18,30 +18,45 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import java.time.Instant
 import java.util.UUID
 
 open class ElmException(message: String) : RuntimeException(message)
+class ElmCommandTimeoutException(message: String) : ElmException(message)
+class ElmQuiesceRequestedException : ElmException("ingestion quiesce requested")
 class ElmCommandRejectedException(message: String) : ElmException(message)
 data class DtcQueryResult(val codes: List<String>, val status: String)
 
 @SuppressLint("MissingPermission")
-class ElmBleClient(private val context: Context, private val address: String) {
+class ElmBleClient(
+    private val context: Context,
+    private val address: String,
+    private val metrics: PipelineMetrics = PipelineMetrics(),
+    private val utcNow: () -> String = { Instant.now().toString() },
+) {
     private val serviceUuid = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb")
     private val characteristicUuid = UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb")
     private val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     private val commandMutex = Mutex()
     private val commandSession = ElmCommandSession()
+    private val responseClock = SuccessfulResponseClock()
     private var gatt: BluetoothGatt? = null
     private var characteristic: BluetoothGattCharacteristic? = null
     private var connection: CompletableDeferred<Unit>? = null
     private var response: CompletableDeferred<String>? = null
     private var lastCommandAt = 0L
+    private var disconnectRecorded = false
     var ecuSource: Int? = null
         private set
+    val lastSuccessfulResponseAtUtc: String?
+        get() = responseClock.lastSuccessfulResponseAtUtc
+
+    fun beginDriveEvidence() = responseClock.beginDriveEvidence()
 
     private val callback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS || newState == BluetoothProfile.STATE_DISCONNECTED) {
+                recordDisconnectOnce()
                 commandSession.taint()
                 val error = ElmException("BLE disconnected (status $status); adapter may have another owner")
                 connection?.completeExceptionally(error)
@@ -103,12 +118,31 @@ class ElmBleClient(private val context: Context, private val address: String) {
     }
 
     private fun accept(fragment: ByteArray) {
-        val pending = response ?: return
+        metrics.notificationReceived()
+        val pending = response
         when (val assembled = commandSession.accept(fragment)) {
-            is ElmResponseAssembly.Complete -> pending.complete(assembled.response)
-            ElmResponseAssembly.Overflow -> pending.completeExceptionally(
-                ElmException("ELM response exceeded 8192 bytes"),
-            )
+            is ElmResponseAssembly.Complete -> {
+                metrics.frameAssembled()
+                pending?.complete(assembled.response)
+            }
+            ElmResponseAssembly.Overflow -> {
+                metrics.parserFailure(checksumFailure = false)
+                pending?.completeExceptionally(
+                    ElmException("ELM response exceeded the bounded byte limit"),
+                )
+            }
+            ElmResponseAssembly.TrailingData -> {
+                metrics.parserFailure(checksumFailure = false)
+                pending?.completeExceptionally(
+                    ElmException("ELM response contained data after its prompt"),
+                )
+            }
+            ElmResponseAssembly.UnexpectedData -> {
+                metrics.parserFailure(checksumFailure = false)
+                pending?.completeExceptionally(
+                    ElmException("ELM notification arrived without an owning command"),
+                )
+            }
             ElmResponseAssembly.Ignored,
             ElmResponseAssembly.Pending,
             -> Unit
@@ -126,6 +160,8 @@ class ElmBleClient(private val context: Context, private val address: String) {
             throw ElmException("configured adapter address is invalid")
         }
         connection = CompletableDeferred()
+        responseClock.freshConnection()
+        disconnectRecorded = false
         gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
         try {
             withTimeout(20_000) { connection!!.await() }
@@ -149,6 +185,7 @@ class ElmBleClient(private val context: Context, private val address: String) {
         val target = characteristic ?: throw ElmException("FFF1 is unresolved")
         val since = SystemClock.elapsedRealtime() - lastCommandAt
         if (since < 100) delay(100 - since)
+        metrics.commandRequested()
         commandSession.beginCommand()
         response = CompletableDeferred()
         target.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
@@ -158,24 +195,38 @@ class ElmBleClient(private val context: Context, private val address: String) {
                 commandSession.taint()
                 throw ElmException("FFF1 write was rejected")
             }
-            commandSession.awaitResponse(response!!, command, timeoutMillis)
+            try {
+                commandSession.awaitResponse(response!!, command, timeoutMillis).also {
+                    metrics.commandCompleted()
+                    responseClock.responseCompleted(utcNow())
+                }
+            } catch (error: ElmCommandTimeoutException) {
+                metrics.commandTimedOut()
+                throw error
+            }
         } finally {
             lastCommandAt = SystemClock.elapsedRealtime()
             response = null
         }
     }
 
-    suspend fun initialize(): Double? {
+    suspend fun initialize(quiesceRequested: () -> Boolean = { false }): Double? {
         val commands = listOf(
             "ATZ", "ATI", "ATD", "ATD0", "ATE0", "ATL0", "ATH1", "ATSP0", "ATE0",
             "ATH1", "ATM0", "ATS0", "ATAT1", "ATAL", "ATST64",
         )
-        for (command in commands) command(command, if (command == "ATZ") 12_000 else 6_000)
+        for (command in commands) {
+            if (quiesceRequested()) throw ElmQuiesceRequestedException()
+            command(command, if (command == "ATZ") 12_000 else 6_000)
+        }
+        if (quiesceRequested()) throw ElmQuiesceRequestedException()
         return ElmProtocol.voltage(command("ATRV"))
     }
 
-    suspend fun proveEcu(): Set<Int> {
+    suspend fun proveEcu(quiesceRequested: () -> Boolean = { false }): Set<Int> {
+        if (quiesceRequested()) throw ElmQuiesceRequestedException()
         command("ATSP0")
+        if (quiesceRequested()) throw ElmQuiesceRequestedException()
         val reply = command("0100", 35_000)
         if (reply.uppercase().contains("NO DATA") || ElmProtocol.hasTransportError(reply)) {
             commandSession.taint()
@@ -190,6 +241,7 @@ class ElmBleClient(private val context: Context, private val address: String) {
         val mask = payload.fold(0L) { value, byte -> (value shl 8) or (byte.toLong() and 0xFF) }
         val supported = (1..32).filter { mask and (1L shl (32 - it)) != 0L }.toMutableSet()
         if (0x20 in supported) {
+            if (quiesceRequested()) throw ElmQuiesceRequestedException()
             val extensionReply = command("0120")
             if (extensionReply.uppercase().contains("NO DATA")) {
                 throw ElmException("ECU advertised 0120 but returned NO DATA")
@@ -353,18 +405,29 @@ class ElmBleClient(private val context: Context, private val address: String) {
         }
         gatt?.disconnect()
         gatt?.close()
+        if (gatt != null) recordDisconnectOnce()
         gatt = null
         characteristic = null
         ecuSource = null
+        responseClock.disconnected()
         commandSession.disconnected()
     }
 
     fun closeNow() {
         gatt?.disconnect()
         gatt?.close()
+        if (gatt != null) recordDisconnectOnce()
         gatt = null
         characteristic = null
         ecuSource = null
+        responseClock.disconnected()
         commandSession.disconnected()
+    }
+
+    @Synchronized
+    private fun recordDisconnectOnce() {
+        if (disconnectRecorded) return
+        disconnectRecorded = true
+        metrics.bleDisconnected()
     }
 }

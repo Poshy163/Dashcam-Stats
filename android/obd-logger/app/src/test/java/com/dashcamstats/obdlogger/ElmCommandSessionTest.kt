@@ -10,6 +10,20 @@ import org.junit.Test
 
 class ElmCommandSessionTest {
     @Test
+    fun successfulResponseClockSurvivesDisconnectUntilFreshConnection() {
+        val clock = SuccessfulResponseClock()
+        clock.freshConnection()
+        clock.responseCompleted("2026-08-30T01:02:03Z")
+        clock.disconnected()
+        assertEquals("2026-08-30T01:02:03Z", clock.lastSuccessfulResponseAtUtc)
+        clock.beginDriveEvidence()
+        assertEquals(null, clock.lastSuccessfulResponseAtUtc)
+        clock.responseCompleted("2026-08-30T01:02:04Z")
+        clock.freshConnection()
+        assertEquals(null, clock.lastSuccessfulResponseAtUtc)
+    }
+
+    @Test
     fun fragmentedNotificationsUseTheProductionPromptAssembler() {
         val session = ElmCommandSession()
         session.freshConnection()
@@ -42,6 +56,47 @@ class ElmCommandSessionTest {
             session.accept(notification.toByteArray()),
         )
         assertFalse(session.isTainted)
+    }
+
+    @Test
+    fun multiplePromptsOrTrailingBytesTaintWithoutCrossCommandReuse() {
+        val multiple = ElmCommandSession()
+        multiple.freshConnection()
+        multiple.beginCommand()
+        assertEquals(
+            ElmResponseAssembly.TrailingData,
+            multiple.accept("OK\r>STALE\r>".toByteArray()),
+        )
+        assertTrue(multiple.isTainted)
+        assertThrows(ElmException::class.java) { multiple.beginCommand() }
+
+        val splitTrailing = ElmCommandSession()
+        splitTrailing.freshConnection()
+        splitTrailing.beginCommand()
+        assertEquals(
+            ElmResponseAssembly.Complete("OK\r>"),
+            splitTrailing.accept("OK\r>".toByteArray()),
+        )
+        assertEquals(
+            ElmResponseAssembly.UnexpectedData,
+            splitTrailing.accept("STALE\r>".toByteArray()),
+        )
+        assertTrue(splitTrailing.isTainted)
+        assertThrows(ElmException::class.java) { splitTrailing.beginCommand() }
+    }
+
+    @Test
+    fun harmlessWhitespaceAfterPromptIsDiscardedBeforeNextCommand() {
+        val session = ElmCommandSession()
+        session.freshConnection()
+        session.beginCommand()
+        assertEquals(
+            ElmResponseAssembly.Complete("OK\r>"),
+            session.accept("OK\r>\r\n\u0000".toByteArray()),
+        )
+        assertFalse(session.isTainted)
+        session.beginCommand()
+        assertEquals(ElmResponseAssembly.Pending, session.accept("NEXT\r".toByteArray()))
     }
 
     @Test

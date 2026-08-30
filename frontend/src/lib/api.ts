@@ -273,8 +273,26 @@ export interface OBDDriveSummary {
   startedAt: string
   finishedAt: string
   originalTimezone: string | null
+  startReason: string | null
+  stopReason: string | null
+  obdProtocol: string | null
   completionStatus: string
+  producerCompletionStatus: string
+  lifecycleStatus: 'complete' | 'interrupted' | 'recovered' | string
   cleanEnd: boolean
+  interruptionReason: string | null
+  firstSampleAt: string | null
+  lastSampleAt: string | null
+  lastSuccessfulResponseAt: string | null
+  finalizationObservedAt: string | null
+  connectionLossCount: number
+  gapCount: number
+  longestGapS: number | null
+  dataCompletenessPercentage: number | null
+  processingStatus: string
+  lastProcessingError: string | null
+  summarySource: 'producer' | 'derived' | string
+  summaryGeneratedAt: string | null
   durationS: number | null
   distanceKm: number | null
   averageSpeedKmh: number | null
@@ -292,7 +310,72 @@ export interface OBDDriveSummary {
   sampleCount: number
   errorCount: number
   dtcsObserved: string[]
+  bundleId: number
+  bundleFilename: string
+  bundleSha256: string
+  bundleAvailable: boolean
+  bundleDownloadUrl: string | null
+  exportStatus: string
+  backupStatus: string
+  copiedAt: string | null
+  verifiedAt: string | null
+  importedAt: string | null
   importState: string
+  bundleError: string | null
+  validationWarnings: string[]
+  gapAnalysis?: OBDGapAnalysis | null
+}
+
+export interface OBDCadenceQuality {
+  observationCount: number
+  firstObservedAt: string | null
+  lastObservedAt: string | null
+  expectedCadenceS: number
+  gapThresholdS: number
+  medianCadenceS: number | null
+  p95CadenceS: number | null
+  p99CadenceS: number | null
+  maximumCadenceS: number | null
+  cadenceIsSampled: boolean
+  gapCount: number
+  totalGapDurationS: number
+  longestGapS: number | null
+  outOfOrderCount: number
+  gaps: { startAt: string; endAt: string; durationS: number; excessS: number }[]
+  gapsTruncated: boolean
+}
+
+export interface OBDSignalQuality extends OBDCadenceQuality {
+  name: string
+  label: string
+  pid: string | null
+  tier: 'fast' | 'medium' | 'slow' | string
+  provenance: 'measured' | 'derived' | string
+  discrete: boolean
+  supported: boolean
+  expectedObservationCount: number
+  receivedObservationCount: number
+  missingObservationCount: number
+  missingRunCount: number
+  longestMissingRun: number
+  coveragePercentage: number | null
+}
+
+export interface OBDGapAnalysis {
+  schemaVersion: number
+  pollPlanVersion: number
+  nominalCycleS: number
+  gapTolerance: number
+  supportedPidSource: string
+  supportedPids: string[]
+  transport: OBDCadenceQuality & {
+    expectedObservationCount: number
+    receivedObservationCount: number
+    sequenceGapCount: number
+    coveragePercentage: number | null
+  }
+  signals: OBDSignalQuality[]
+  aggregateSignalCompletenessPercentage: number | null
 }
 
 export interface OBDDrivesTotals {
@@ -311,8 +394,12 @@ export interface OBDDrivesTotals {
 }
 
 export interface OBDSeriesSample {
+  sampleId: string
   t: string
   sequence: number
+  ecuDataStatus: 'live' | 'last_known' | string
+  quality: { transport?: string; parser?: string; missingPids?: number[] } | null
+  provenance: Record<string, 'measured' | 'derived' | string>
   engineRpm: number | null
   vehicleSpeedKmh: number | null
   coolantTemperatureC: number | null
@@ -330,10 +417,21 @@ export interface OBDSeriesSample {
   estimatedFuelConsumptionL100km: number | null
 }
 
+export interface OBDSignalMetadata {
+  name: string
+  label: string
+  pid: string | null
+  tier: string
+  expectedCadenceS: number
+  provenance: 'measured' | 'derived' | string
+  discrete: boolean
+}
+
 export interface OBDDriveSeries {
   drive: OBDDriveSummary
   journey: { id: number; title: string | null; overlapS: number } | null
   units: Record<string, string>
+  signalMetadata: OBDSignalMetadata[]
   samples: OBDSeriesSample[]
   diagnostics: { observedAt: string | null; kind: string; payload: Record<string, unknown> }[]
 }
@@ -499,6 +597,10 @@ export const api = {
     driveForJourney: (journeyId: number) =>
       request<{ drive: OBDDriveSummary | null; overlapS: number | null }>(
         `/obd/drives/for-journey/${journeyId}`,
+      ),
+    reprocessDrive: (driveId: string) =>
+      post<{ result: Record<string, unknown>; drive: OBDDriveSummary }>(
+        `/obd/drives/${encodeURIComponent(driveId)}/reprocess`,
       ),
     validate: (id: number) =>
       post<{ valid: boolean; bundle: OBDBundle }>(`/obd/bundles/${id}/validate`),

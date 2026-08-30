@@ -43,7 +43,9 @@ from app.hardware.detect import detect_hardware_async
 from app.hardware.ffmpeg import media_health
 from app.ingest import origin
 from app.ingest.ha_import_queue import get_import_worker
+from app.ingest.obd_reconciliation import reconcile_all_drives
 from app.ingest.poller import get_poller
+from app.ingest.radio_coordinator import reconcile_startup
 from app.pipeline.stages import warm_models
 from app.workers import queue
 from app.workers.scheduler import get_scheduler
@@ -161,10 +163,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Its own durable queue: an HA outage never occupies a footage worker or changes a
     # backup run's result.  Startup reconciles any import interrupted by the last process.
     await get_import_worker().start()
+    # Radio recovery is a safety invariant, not an ingest feature toggle.  Reconcile a
+    # process that died between disable and restore before the poller can start another
+    # visit, even when ingest.enabled is currently false.  An offline unit leaves the
+    # durable row active; the poller retries it before the next pull when the unit returns.
+    if not await reconcile_startup():
+        log.warning("an interrupted ingest radio transition remains pending")
     # Its own ticker rather than a scheduler task: the shared scheduler floors every
     # interval at thirty seconds, and the head unit is only on the network for a minute or
     # two while the engine runs.
     await get_poller().start()
+
+    # Derived OBD lifecycle and gap projections are rebuildable. Reconcile old bundles
+    # after the API becomes startable rather than making health wait on full-resolution
+    # history; every newly stored bundle is reconciled synchronously as well.
+    obd_reconcile = asyncio.create_task(reconcile_all_drives(), name="obd-reconciliation")
 
     # Deliberately not awaited: compiling the models takes about a minute on the iGPU, and
     # blocking here would delay the health check and the UI for no benefit. The first job
@@ -181,6 +194,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         warm.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await warm
+        obd_reconcile.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await obd_reconcile
         await get_poller().stop()
         await get_import_worker().stop()
         await scheduler.stop()

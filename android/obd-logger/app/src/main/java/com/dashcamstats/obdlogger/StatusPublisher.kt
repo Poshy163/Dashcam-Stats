@@ -5,6 +5,8 @@ import android.os.Environment
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.time.Instant
 
 class RemovableStorageUnavailableException : IllegalStateException(
@@ -40,8 +42,12 @@ object DeviceFiles {
 data class PublicStatus(
     val state: String,
     val ownershipEnabled: Boolean,
+    val currentDriveId: String? = null,
     val lastDriveId: String? = null,
     val lastDriveFinishedAtUtc: String? = null,
+    val ingestionRequestId: String? = null,
+    val lastSampleAtUtc: String? = null,
+    val metrics: PipelineMetricsSnapshot = PipelineMetricsSnapshot.EMPTY,
     val lastError: String? = null,
     val lastErrorAtUtc: String? = null,
 )
@@ -60,30 +66,42 @@ object StatusPublisher {
     private fun publishAt(root: File, status: PublicStatus, pendingCount: Int?) {
         root.mkdirs()
         val ready = if (pendingCount == null) File(root, "ready").apply { mkdirs() } else null
-        val body = JSONObject()
-            .put("state", status.state)
-            .put("ownership_enabled", status.ownershipEnabled)
-            .put("last_drive_id", status.lastDriveId ?: JSONObject.NULL)
-            .put("last_drive_finished_at_utc", status.lastDriveFinishedAtUtc ?: JSONObject.NULL)
-            .put(
-                "pending_bundle_count",
-                pendingCount ?: ready?.listFiles()?.count {
-                    it.isFile && it.name.endsWith(".obd2.zip") && !it.name.endsWith(".partial")
-                } ?: 0,
-            )
-            .put("last_error", status.lastError ?: JSONObject.NULL)
-            .put("last_error_at_utc", status.lastErrorAtUtc ?: JSONObject.NULL)
+        val body = buildStatusJson(status, pendingCount ?: ready?.listFiles()?.count {
+            it.isFile && it.name.endsWith(".obd2.zip") && !it.name.endsWith(".partial")
+        } ?: 0)
         val partial = File(root, "status.json.partial")
         FileOutputStream(partial).use {
             it.write(body.toString().toByteArray(Charsets.UTF_8))
             it.fd.sync()
         }
         val target = File(root, "status.json")
-        if (!partial.renameTo(target)) {
+        try {
+            Files.move(
+                partial.toPath(),
+                target.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        } catch (error: Exception) {
             partial.delete()
-            throw IllegalStateException("could not atomically publish logger status")
+            throw IllegalStateException("could not atomically publish logger status", error)
         }
     }
+
+    internal fun buildStatusJson(status: PublicStatus, pendingCount: Int): JSONObject = JSONObject()
+            .put("schema_version", 2)
+            .put("capabilities", org.json.JSONArray(listOf("ingestion_quiesce_v1")))
+            .put("state", status.state)
+            .put("ownership_enabled", status.ownershipEnabled)
+            .put("current_drive_id", status.currentDriveId ?: JSONObject.NULL)
+            .put("last_drive_id", status.lastDriveId ?: JSONObject.NULL)
+            .put("last_drive_finished_at_utc", status.lastDriveFinishedAtUtc ?: JSONObject.NULL)
+            .put("pending_bundle_count", pendingCount.coerceAtLeast(0))
+            .put("ingestion_request_id", status.ingestionRequestId ?: JSONObject.NULL)
+            .put("last_sample_at_utc", status.lastSampleAtUtc ?: JSONObject.NULL)
+            .put("metrics", status.metrics.toJson())
+            .put("last_error", status.lastError ?: JSONObject.NULL)
+            .put("last_error_at_utc", status.lastErrorAtUtc ?: JSONObject.NULL)
 
     fun error(context: Context, ownership: Boolean, state: String, message: String) {
         publish(

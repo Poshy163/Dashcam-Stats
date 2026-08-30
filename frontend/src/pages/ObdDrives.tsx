@@ -28,6 +28,24 @@ function ImportBadge({ state }: { state: string }) {
   )
 }
 
+const LIFECYCLE_STYLE: Record<string, { label: string; className: string }> = {
+  complete: { label: 'Complete', className: 'bg-state-ok/15 text-state-ok' },
+  interrupted: { label: 'Interrupted', className: 'bg-state-warn/15 text-state-warn' },
+  recovered: { label: 'Recovered', className: 'bg-accent-muted text-accent' },
+}
+
+function LifecycleBadge({ status }: { status: string }) {
+  const style = LIFECYCLE_STYLE[status] ?? {
+    label: status.replace(/_/g, ' '),
+    className: 'bg-surface-sunken text-content-muted',
+  }
+  return (
+    <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${style.className}`}>
+      {style.label}
+    </span>
+  )
+}
+
 export default function ObdDrives() {
   const [page, setPage] = useState(1)
   const query = useQuery({
@@ -105,6 +123,7 @@ export default function ObdDrives() {
             <thead className="border-b border-border text-left text-xs text-content-muted">
               <tr>
                 <th className="p-2 font-medium">Started</th>
+                <th className="p-2 font-medium">Status</th>
                 <th className="p-2 font-medium">Duration</th>
                 <th className="p-2 font-medium">Distance</th>
                 <th className="p-2 font-medium">Avg / max speed</th>
@@ -122,8 +141,13 @@ export default function ObdDrives() {
                     <Link className="font-medium hover:text-accent" to={`/obd/${drive.driveId}`}>
                       {formatDateTime(drive.startedAt)}
                     </Link>
-                    {!drive.cleanEnd && (
-                      <span className="ml-2 text-xs text-state-warn">interrupted</span>
+                  </td>
+                  <td className="p-2">
+                    <LifecycleBadge status={drive.lifecycleStatus} />
+                    {drive.interruptionReason && (
+                      <div className="mt-1 text-xs text-content-faint">
+                        {drive.interruptionReason.replace(/_/g, ' ')}
+                      </div>
                     )}
                   </td>
                   <td className="tabular p-2">{formatDuration(drive.durationS)}</td>
@@ -145,6 +169,12 @@ export default function ObdDrives() {
                       <span className="ml-1 text-xs text-content-faint">
                         ({Math.round(drive.receivedSamplePercentage)}%)
                       </span>
+                    )}
+                    {drive.dataCompletenessPercentage != null && (
+                      <div className="text-xs text-content-faint">
+                        {Math.round(drive.dataCompletenessPercentage)}% signal coverage ·{' '}
+                        {drive.gapCount} cadence gaps
+                      </div>
                     )}
                   </td>
                   <td className="p-2">

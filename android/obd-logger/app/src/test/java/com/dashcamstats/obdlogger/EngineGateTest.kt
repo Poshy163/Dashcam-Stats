@@ -8,6 +8,7 @@ import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.file.Files
+import java.time.Instant
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
@@ -49,7 +50,7 @@ class EngineGateTest {
     fun pollPlanNeverQueriesOrCountsUnsupportedPidsAsFailures() {
         val supported = setOf(0x0C, 0x03, 0x15, 0x13, 0x1C, 0x21, 0x99)
         val requested = ObdPollPlan.requestedPids(sequence = 0, supported = supported)
-        assertEquals(listOf(0x0C, 0x03, 0x15, 0x13, 0x1C, 0x21), requested)
+        assertEquals(listOf(0x0C, 0x03, 0x15, 0x13), requested)
 
         val queried = mutableListOf<Int>()
         val missing = mutableListOf<Int>()
@@ -58,7 +59,7 @@ class EngineGateTest {
             val reply = if (pid in supported) mapOf("value" to 1.0) else emptyMap()
             if (reply.isEmpty()) missing += pid
         }
-        assertEquals(listOf(0x0C, 0x03, 0x15, 0x13, 0x1C, 0x21), queried)
+        assertEquals(listOf(0x0C, 0x03, 0x15, 0x13), queried)
         assertTrue(missing.isEmpty())
         assertEquals(listOf(0x0C), ObdPollPlan.requestedPids(sequence = 1, supported = supported))
     }
@@ -96,13 +97,47 @@ class EngineGateTest {
     }
 
     @Test
-    fun malformedLivePidIsSuppressedForTheRestOfTheConnection() {
+    fun transientMalformedPidRetriesAndPermanentFailureUsesBoundedCircuitBreaker() {
         val tracker = LivePidMalformedTracker()
-        assertFalse(tracker.isMalformed(0x15))
-        assertTrue(tracker.markMalformed(0x15))
-        assertTrue(tracker.isMalformed(0x15))
-        assertFalse(tracker.markMalformed(0x15))
-        assertFalse(tracker.isMalformed(0x0C))
+        assertTrue(tracker.shouldPoll(0x10, 0))
+        assertEquals(2, tracker.recordMalformed(0x10, 0).retryAtCycle)
+        assertFalse(tracker.shouldPoll(0x10, 1))
+        assertTrue(tracker.shouldPoll(0x10, 2))
+        tracker.recordValid(0x10)
+        assertTrue(tracker.shouldPoll(0x10, 3))
+
+        val permanent = LivePidMalformedTracker(baseCooldownCycles = 2, maximumCooldownCycles = 12)
+        assertEquals(2, permanent.recordMalformed(0x15, 0).retryAtCycle)
+        assertEquals(6, permanent.recordMalformed(0x15, 2).retryAtCycle)
+        assertEquals(14, permanent.recordMalformed(0x15, 6).retryAtCycle)
+        assertEquals(26, permanent.recordMalformed(0x15, 14).retryAtCycle)
+        assertFalse(permanent.shouldPoll(0x15, 25))
+        assertTrue(permanent.shouldPoll(0x15, 26))
+    }
+
+    @Test
+    fun mediumAndSlowCommandsAreDistributedWithoutChangingPerPidCadence() {
+        val supported = setOf(
+            0x03, 0x05, 0x06, 0x07, 0x0F, 0x14, 0x15,
+            0x13, 0x1C, 0x21,
+        )
+        val cycles = (0L until 24L).associateWith { ObdPollPlan.requestedPids(it, supported) }
+        val optionalCountsPerCycle = cycles.values.map(List<Int>::size)
+        assertTrue(optionalCountsPerCycle.all { it in 2..4 })
+        for (pid in listOf(0x03, 0x05, 0x06, 0x07, 0x0F, 0x14, 0x15)) {
+            val observed = cycles.filterValues { pid in it }.keys.toList()
+            assertEquals(8, observed.size)
+            assertTrue(observed.zipWithNext().all { (first, second) -> second - first == 3L })
+            assertEquals("medium", ObdPollPlan.tier(pid))
+            assertEquals(3, ObdPollPlan.expectedIntervalCycles(pid))
+        }
+        for (pid in listOf(0x13, 0x1C, 0x21)) {
+            val observed = cycles.filterValues { pid in it }.keys.toList()
+            assertEquals(2, observed.size)
+            assertEquals(12L, observed[1] - observed[0])
+            assertEquals("slow", ObdPollPlan.tier(pid))
+            assertEquals(12, ObdPollPlan.expectedIntervalCycles(pid))
+        }
     }
 
     @Test
@@ -208,6 +243,41 @@ class EngineGateTest {
         assertTrue(gate.shouldWrite("backoff", 65_001))
         gate.writeFailed("backoff")
         assertTrue(gate.shouldWrite("backoff", 65_002))
+    }
+
+    @Test
+    fun sampleAndMetricChurnDoesNotWriteStatusEveryCycle() {
+        val gate = StatusWriteGate(heartbeatMillis = 60_000)
+        val metrics = PipelineMetrics()
+        var writes = 0
+        repeat(12) { cycle ->
+            metrics.commandRequested()
+            metrics.sampleCreated()
+            val status = PublicStatus(
+                state = "ecu_online",
+                ownershipEnabled = true,
+                currentDriveId = "drive-1",
+                lastSampleAtUtc = "2026-08-30T00:00:${cycle.toString().padStart(2, '0')}Z",
+                metrics = metrics.snapshot(),
+            )
+            if (gate.shouldWrite(durableStatusSignature(status), cycle * 5_000L)) writes += 1
+        }
+        assertEquals(1, writes)
+
+        val heartbeatStatus = PublicStatus(
+            state = "ecu_online",
+            ownershipEnabled = true,
+            currentDriveId = "drive-1",
+            lastSampleAtUtc = "2026-08-30T00:01:00Z",
+            metrics = metrics.snapshot(),
+        )
+        assertTrue(gate.shouldWrite(durableStatusSignature(heartbeatStatus), 60_000L))
+
+        val quiescing = heartbeatStatus.copy(
+            state = "ingestion_ready",
+            ingestionRequestId = "request-1",
+        )
+        assertTrue(gate.shouldWrite(durableStatusSignature(quiescing), 60_001L))
     }
 
     @Test
@@ -330,6 +400,37 @@ class EngineGateTest {
     fun recoveredDrivePreservesVersionedCompletionStatus() {
         assertEquals("recovered", completionStatus("device_restart"))
         assertEquals("complete", completionStatus("engine_stopped"))
+        assertEquals("interrupted", completionStatus("connection_lost"))
+        assertEquals("interrupted", completionStatus("ingestion_requested"))
+        assertEquals("interrupted", completionStatus("administratively_disabled"))
+        assertEquals("interrupted", completionStatus("process_terminated"))
         assertEquals("complete", completionStatus(null))
+    }
+
+    @Test
+    fun onlyBootCompletedClassifiesAnOrphanAsDeviceRestart() {
+        assertEquals("device_restart", startupRecoveryReason("device_restart"))
+        assertEquals("process_terminated", startupRecoveryReason("process_terminated"))
+        assertEquals("process_terminated", startupRecoveryReason(null))
+        assertEquals("process_terminated", startupRecoveryReason("untrusted"))
+    }
+
+    @Test
+    fun perDriveUtcClockIgnoresWallClockChangesAndNeverRegresses() {
+        var elapsed = 10_000L
+        val clock = MonotonicUtcClock(
+            anchorUtc = Instant.parse("2026-08-30T00:00:00Z"),
+            anchorElapsedMillis = elapsed,
+            elapsedRealtimeMillis = { elapsed },
+        )
+        assertEquals("2026-08-30T00:00:00Z", clock.nowUtc())
+
+        // A wall-clock update is deliberately absent from the timestamp source; only uptime moves.
+        elapsed = 15_250L
+        assertEquals("2026-08-30T00:00:05.250Z", clock.nowUtc())
+
+        // Defensive clamping also prevents a faulty/regressed monotonic reading from going back.
+        elapsed = 12_000L
+        assertEquals("2026-08-30T00:00:05.250Z", clock.nowUtc())
     }
 }

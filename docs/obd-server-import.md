@@ -71,8 +71,10 @@ offline/online edge, so one receive timeout cannot strand a ready bundle for a w
 1. Inventory accepts only `<safe-drive-id>.obd2.zip`, ignores sibling `.partial` files and
    copies oldest first into a unique `/data/obd/staging/.transfer-*.partial` directory.
 2. The server refuses links, unexpected/path-like/duplicate/encrypted/compressed ZIP
-   members, excessive sizes or compression ratios, invalid hashes, unsafe IDs and malformed
-   JSON. It independently streams and bounds `samples.ndjson.gz`.
+   members, excessive sizes or compression ratios, invalid primary-payload hashes, unsafe
+   IDs and malformed primary JSON. It independently streams and bounds
+   `samples.ndjson.gz`. A missing or invalid derived `summary.json` is rebuilt from the
+   validated samples with an explicit warning; it cannot make primary history disappear.
 3. A valid archive is flushed and atomically renamed into `/data/obd/verified`. In one
    database transaction the server adds its immutable identity, summary, diagnostics and
    every high-resolution sample. Unique drive, sample ID and drive-sequence constraints make
@@ -99,12 +101,15 @@ offline/online edge, so one receive timeout cannot strand a ready bundle for a w
    response), 5xx and transport failures use capped exponential retry and `Retry-After`;
    other 4xx responses stop for operator action.
 
-The HA body keeps the literal final sample for drive/session identity and adds a strict
+The HA body keeps the literal final sample for drive/session identity, marks its existing
+v1 `ecu_data_status` field `last_known` (never a live ECU claim), and adds a strict
 `latest_values` map derived while streaming validation. Each present telemetry field carries
 its newest non-null value plus its original UTC timestamp, so tiered polling cannot hide a
 fresh coolant/trim/O2 value just because the final fast cycle omitted it. Diagnostics use the
 same rule: DTC, MIL, readiness, calibration, protocol, CVN and freeze-frame continuity values
 carry their original event timestamps, and older drives never regress newer retained state.
+Hardened lifecycle fields stay in the server API; the HA request strips them from its
+strict legacy summary shape and uses the existing `clean_end` field for compatibility.
 
 Each hourly row carries total `sample_count` plus `speed_sample_count` and
 `rpm_sample_count`. The latter two count only non-null readings, so Home Assistant can merge
@@ -131,6 +136,8 @@ GET  /api/obd/status
 GET  /api/obd/bundles?state=retry_wait
 GET  /api/obd/drives
 GET  /api/obd/drives/{drive_id}/series
+GET  /api/obd/drives/{drive_id}/bundle
+POST /api/obd/drives/{drive_id}/reprocess
 POST /api/obd/bundles/{id}/validate
 POST /api/obd/bundles/{id}/retry
 POST /api/obd/queue/rebuild
@@ -139,8 +146,11 @@ POST /api/obd/queue/rebuild
 The two `drives` endpoints back the **OBD drives** page. Home Assistant's long-term
 statistics are hourly and its state machine cannot be backdated, so the full 5-second
 sample resolution is only reachable here: the list returns each drive's stored rollups,
-and `series` returns every retained sample (ordered by sequence, original UTC timestamps)
-plus the drive's sparse diagnostic events for charting.
+and `series` returns every retained sample (ordered by sequence, original UTC timestamps),
+the explicit measured/derived provenance, tier-aware cadence/gap analysis, and sparse
+diagnostic events. `reprocess` idempotently rebuilds only this derived lifecycle/quality
+projection. `bundle` rechecks size and SHA-256 before returning the authenticated immutable
+archive.
 
 - Use **Validate** after investigating a retained copy. A failed revalidation moves the
   bytes to quarantine and disables HA retry. Pre-registration rejection rows are explicitly

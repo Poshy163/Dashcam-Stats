@@ -24,7 +24,7 @@ class ObdDatabaseRetentionTest {
     fun setUp() {
         context = ApplicationProvider.getApplicationContext()
         context.deleteDatabase("obd_drives.db")
-        ObdDatabase.migrationBackupDirectory(context).deleteRecursively()
+        clearMigrationArtifacts()
         database = ObdDatabase(context)
     }
 
@@ -32,7 +32,7 @@ class ObdDatabaseRetentionTest {
     fun tearDown() {
         database.close()
         context.deleteDatabase("obd_drives.db")
-        ObdDatabase.migrationBackupDirectory(context).deleteRecursively()
+        clearMigrationArtifacts()
     }
 
     @Test
@@ -133,11 +133,14 @@ class ObdDatabaseRetentionTest {
         database.close()
 
         database = ObdDatabase(context)
-        assertEquals(listOf("restart-drive"), database.recoverInterrupted())
+        assertEquals(listOf("restart-drive"), database.recoverInterrupted().map { it.driveId })
         val recovered = database.drive("restart-drive")
         assertEquals("2025-02-01T10:00:10Z", recovered.getString("finish_time_utc"))
         assertEquals("device_restart", recovered.getString("stop_reason"))
-        assertEquals("complete", recovered.getString("status"))
+        assertEquals("recovered", recovered.getString("status"))
+        assertEquals("2025-02-01T10:00:10Z", recovered.getString("last_sample_at_utc"))
+        assertFalse(recovered.isNull("termination_noticed_at_utc"))
+        assertFalse(recovered.isNull("finalised_at_utc"))
         assertEquals(0, recovered.getInt("clean_end"))
         assertEquals(2, database.samples("restart-drive").size)
         assertEquals(1, database.diagnostics("restart-drive").size)
@@ -161,7 +164,187 @@ class ObdDatabaseRetentionTest {
     }
 
     @Test
-    fun versionOneUpgradePreservesDriveAndSamplesWhileAddingSlowPidColumns() {
+    fun lifecycleMappingAndDuplicateFinalisationKeepOriginalEvidenceClocks() {
+        createRecordingDrive(70)
+        assertTrue(
+            database.markFinalising(
+                "drive-70",
+                "connection_lost",
+                "2025-01-01T00:02:00Z",
+                "2025-01-01T00:01:30Z",
+            ),
+        )
+        val first = database.finalizeDrive(
+            "drive-70",
+            "connection_lost",
+            "2025-01-01T00:02:01Z",
+        )
+        assertEquals("interrupted", first.status)
+        assertEquals("2025-01-01T00:01:10Z", first.finishTimeUtc)
+        assertEquals("2025-01-01T00:01:30Z", first.lastSuccessfulResponseAtUtc)
+        assertEquals("2025-01-01T00:02:00Z", first.terminationNoticedAtUtc)
+        assertTrue(first.changed)
+
+        val duplicate = database.finalizeDrive(
+            "drive-70",
+            "engine_stopped",
+            "2025-01-02T00:00:00Z",
+            "2025-01-02T00:00:00Z",
+        )
+        assertFalse(duplicate.changed)
+        assertEquals(first.finishTimeUtc, duplicate.finishTimeUtc)
+        assertEquals(first.terminationNoticedAtUtc, duplicate.terminationNoticedAtUtc)
+        assertEquals(first.finalisedAtUtc, duplicate.finalisedAtUtc)
+        assertEquals(first.lastSuccessfulResponseAtUtc, duplicate.lastSuccessfulResponseAtUtc)
+        assertEquals("connection_lost", duplicate.stopReason)
+        assertEquals("interrupted", database.drive("drive-70").getString("status"))
+
+        createRecordingDrive(71)
+        val clean = database.finalizeDrive(
+            "drive-71",
+            "engine_stopped",
+            "2025-01-01T00:03:00Z",
+            "2025-01-01T00:03:00Z",
+        )
+        assertEquals("complete", clean.status)
+        assertEquals("2025-01-01T00:03:00Z", clean.finishTimeUtc)
+    }
+
+    @Test
+    fun repeatedStartupRecoveryHandlesFinalisingOneSampleAndRetainsZeroSampleEvidence() {
+        val start = "2025-04-01T00:00:00Z"
+        database.startDrive(
+            DriveRecord(
+                "one-sample", "car", "adapter", "logger", "test", 1, start, "UTC", "test", "test",
+            ),
+        )
+        database.addSample(
+            SampleRecord("one-sample", 0, "2025-04-01T00:00:05Z", mapOf("engine_rpm" to 800.0)),
+        )
+        database.markFinalising("one-sample", "ingestion_requested", "2025-04-01T00:00:06Z")
+
+        database.startDrive(
+            DriveRecord(
+                "zero-sample", "car", "adapter", "logger", "test", 1,
+                "2025-04-01T01:00:00Z", "UTC", "test", "test",
+            ),
+        )
+
+        val recovered = database.recoverInterrupted().associateBy { it.driveId }
+        assertEquals("interrupted", recovered.getValue("one-sample").status)
+        assertEquals("ingestion_requested", recovered.getValue("one-sample").stopReason)
+        assertEquals("2025-04-01T00:00:05Z", recovered.getValue("one-sample").finishTimeUtc)
+        assertEquals("recovered", recovered.getValue("zero-sample").status)
+        assertEquals("2025-04-01T01:00:00Z", recovered.getValue("zero-sample").finishTimeUtc)
+        assertTrue(database.recoverInterrupted().isEmpty())
+
+        assertEquals(listOf("one-sample"), database.prepareCompletedExports())
+        assertEquals(
+            "not_exportable_zero_samples",
+            database.drive("zero-sample").getString("export_status"),
+        )
+        assertEquals(0, database.drive("zero-sample").getLong("sample_count"))
+    }
+
+    @Test
+    fun nonBootStartupRecoversRecordingAsInterruptedProcessTermination() {
+        createRecordingDrive(72)
+
+        val recovered = database.recoverInterrupted("process_terminated").single()
+
+        assertEquals("interrupted", recovered.status)
+        assertEquals("process_terminated", recovered.stopReason)
+        assertEquals("process_terminated", database.drive("drive-72").getString("interruption_reason"))
+        assertTrue(database.recoverInterrupted("process_terminated").isEmpty())
+    }
+
+    @Test
+    fun finalizationClampsNoticeAndFinalizedClocksAfterBackwardWallJump() {
+        val start = "2099-01-01T00:00:00Z"
+        database.startDrive(
+            DriveRecord(
+                "clock-jump", "car", "adapter", "logger", "test", 1,
+                start, "UTC", "test", "test",
+            ),
+        )
+        database.addSample(
+            SampleRecord(
+                "clock-jump",
+                0,
+                "2099-01-01T00:00:05Z",
+                mapOf("engine_rpm" to 800.0),
+            ),
+        )
+
+        val finalised = database.finalizeDrive(
+            "clock-jump",
+            "process_terminated",
+            // Simulate wall UTC being corrected backward after the sample was committed.
+            noticedAtUtc = "2020-01-01T00:00:00Z",
+        )
+
+        assertEquals("2099-01-01T00:00:05Z", finalised.finishTimeUtc)
+        assertEquals("2099-01-01T00:00:05Z", finalised.terminationNoticedAtUtc)
+        assertFalse(
+            Instant.parse(finalised.finalisedAtUtc)
+                .isBefore(Instant.parse(finalised.terminationNoticedAtUtc)),
+        )
+    }
+
+    @Test
+    fun failedAfterPartialSampleDoesNotOverstateSuccessfulResponseEvidence() {
+        val start = "2026-08-30T02:00:00Z"
+        database.startDrive(
+            DriveRecord(
+                "partial-response", "car", "adapter", "logger", "test", 1,
+                start, "UTC", "test", "test",
+            ),
+        )
+        database.addSample(
+            SampleRecord(
+                "partial-response", 0, "2026-08-30T02:00:05Z",
+                mapOf("engine_rpm" to 800.0),
+            ),
+        )
+        database.addSample(
+            SampleRecord(
+                "partial-response", 1, "2026-08-30T02:00:10Z",
+                mapOf("engine_rpm" to 810.0),
+                transportQuality = "failed_after_partial",
+            ),
+        )
+
+        val drive = database.drive("partial-response")
+        assertEquals("2026-08-30T02:00:10Z", drive.getString("last_sample_at_utc"))
+        assertEquals(
+            "2026-08-30T02:00:05Z",
+            drive.getString("last_successful_response_at_utc"),
+        )
+
+        database.startDrive(
+            DriveRecord(
+                "partial-only", "car", "adapter", "logger", "test", 1,
+                start, "UTC", "test", "test",
+            ),
+        )
+        database.addSample(
+            SampleRecord(
+                "partial-only", 0, "2026-08-30T02:00:07Z",
+                mapOf("engine_rpm" to 700.0),
+                transportQuality = "failed_after_partial",
+            ),
+        )
+        assertTrue(database.drive("partial-only").isNull("last_successful_response_at_utc"))
+        val recovered = database.finalizeDrive(
+            "partial-only",
+            "process_terminated",
+            "2026-08-30T02:00:08Z",
+        )
+        assertEquals(null, recovered.lastSuccessfulResponseAtUtc)
+    }
+
+    @Test
+    fun versionOneUpgradePreservesDriveAndSamplesWhileAddingLifecycleAndSlowPidColumns() {
         database.close()
         context.deleteDatabase("obd_drives.db")
         SQLiteDatabase.openOrCreateDatabase(context.getDatabasePath("obd_drives.db"), null).use {
@@ -213,7 +396,7 @@ class ObdDatabaseRetentionTest {
                   drive_id,vehicle_id,logger_id,logger_version,start_time_utc,start_reason,
                   status,sample_count
                 ) VALUES('legacy-drive','test-car','logger','v1','2025-01-01T00:00:00Z',
-                  'engine_started','complete',1)
+                  'engine_started','complete',2)
                 """.trimIndent(),
             )
             legacy.execSQL(
@@ -224,19 +407,33 @@ class ObdDatabaseRetentionTest {
                   '{"transport":"ok","parser":"ok","missing_pids":[]}')
                 """.trimIndent(),
             )
+            legacy.execSQL(
+                """
+                INSERT INTO samples(
+                  sample_id,drive_id,timestamp_utc,sequence,ecu_data_status,engine_rpm,quality_json
+                ) VALUES('legacy-partial','legacy-drive','2025-01-01T00:00:10Z',1,'live',860.0,
+                  '{"transport":"failed_after_partial","parser":"partial","missing_pids":[]}')
+                """.trimIndent(),
+            )
             legacy.execSQL("PRAGMA user_version=1")
         }
 
         database = ObdDatabase(context)
 
         assertEquals("test-car", database.drive("legacy-drive").getString("vehicle_id"))
-        val sample = database.samples("legacy-drive").single()
+        val migratedDrive = database.drive("legacy-drive")
+        assertEquals("2025-01-01T00:00:10Z", migratedDrive.getString("last_sample_at_utc"))
+        assertEquals(
+            "2025-01-01T00:00:05Z",
+            migratedDrive.getString("last_successful_response_at_utc"),
+        )
+        val sample = database.samples("legacy-drive").first { it.getLong("sequence") == 0L }
         assertEquals(850.0, sample.getDouble("engine_rpm"), 0.0)
         assertTrue(sample.isNull("oxygen_sensors_present"))
         assertTrue(sample.isNull("obd_standard"))
         assertTrue(sample.isNull("distance_with_mil"))
         assertEquals(
-            2,
+            3,
             database.readableDatabase.rawQuery("PRAGMA user_version", null).use { cursor ->
                 cursor.moveToFirst()
                 cursor.getInt(0)
@@ -275,6 +472,128 @@ class ObdDatabaseRetentionTest {
         assertEquals(850.0, sample.getDouble("engine_rpm"), 0.0)
         assertTrue(sample.isNull("distance_with_mil"))
         assertFalse(backup.exists())
+    }
+
+    @Test
+    fun failedVersionTwoUpgradeAlsoRestoresExactDatabaseBeforeRetry() {
+        database.close()
+        context.deleteDatabase("obd_drives.db")
+        createMinimalVersionTwoDatabase()
+        database = ObdDatabase(context) { error("simulated v2 migration failure") }
+
+        assertThrows(IllegalStateException::class.java) { database.writableDatabase }
+
+        SQLiteDatabase.openDatabase(
+            context.getDatabasePath("obd_drives.db").path,
+            null,
+            SQLiteDatabase.OPEN_READONLY,
+        ).use { restored -> assertEquals(2, restored.version) }
+        val backup = ObdDatabase.migrationBackupDirectory(context)
+        assertTrue(backup.resolve("main").isFile)
+
+        database = ObdDatabase(context)
+        assertEquals(850.0, database.samples("legacy-drive").single().getDouble("engine_rpm"), 0.0)
+        assertTrue(database.drive("legacy-drive").isNull("last_sample_at_utc").not())
+        assertFalse(backup.exists())
+    }
+
+    @Test
+    fun stagedRestoreCopyFailureNeverRemovesLiveMainAndRetrySucceeds() {
+        database.close()
+        context.deleteDatabase("obd_drives.db")
+        clearMigrationArtifacts()
+        createMinimalVersionOneDatabase()
+        val main = context.getDatabasePath("obd_drives.db")
+        database = ObdDatabase(
+            context,
+            migrationFileFailureForTest = { phase ->
+                if (phase == "after_restore_stage_copy") error("simulated staged copy failure")
+            },
+            upgradeFailureForTest = { error("simulated migration failure") },
+        )
+
+        assertThrows(IllegalStateException::class.java) { database.writableDatabase }
+        assertTrue(main.isFile)
+        assertFalse(ObdDatabase.migrationRestoreMarker(context).exists())
+        SQLiteDatabase.openDatabase(main.path, null, SQLiteDatabase.OPEN_READONLY).use { live ->
+            assertEquals(1, live.version)
+            assertEquals(
+                1,
+                live.rawQuery("SELECT COUNT(*) FROM samples", null).use { cursor ->
+                    cursor.moveToFirst()
+                    cursor.getInt(0)
+                },
+            )
+        }
+
+        database.close()
+        database = ObdDatabase(context)
+        assertEquals(850.0, database.samples("legacy-drive").single().getDouble("engine_rpm"), 0.0)
+        assertFalse(ObdDatabase.migrationRestoreStaging(context).exists())
+    }
+
+    @Test
+    fun powerLossAfterMainReplaceReplaysMarkerAndDiscardsWalAndShmOnRestart() {
+        database.close()
+        context.deleteDatabase("obd_drives.db")
+        clearMigrationArtifacts()
+        createMinimalVersionOneDatabase()
+        val main = context.getDatabasePath("obd_drives.db")
+        database = ObdDatabase(
+            context,
+            migrationFileFailureForTest = { phase ->
+                if (phase == "after_restore_main_replace") error("simulated power loss")
+            },
+            upgradeFailureForTest = { error("simulated migration failure") },
+        )
+
+        assertThrows(IllegalStateException::class.java) { database.writableDatabase }
+        val marker = ObdDatabase.migrationRestoreMarker(context)
+        assertTrue(marker.isFile)
+        database.close()
+        File(main.path + "-wal").writeBytes(byteArrayOf(1, 2, 3, 4))
+        File(main.path + "-shm").writeBytes(byteArrayOf(5, 6, 7, 8))
+
+        var observedCleanRestoreSet = false
+        database = ObdDatabase(
+            context,
+            migrationFileFailureForTest = { phase ->
+                if (phase == "after_restore_sidecar_cleanup") {
+                    observedCleanRestoreSet = true
+                    assertFalse(File(main.path + "-wal").exists())
+                    assertFalse(File(main.path + "-shm").exists())
+                }
+            },
+        )
+        assertEquals(850.0, database.samples("legacy-drive").single().getDouble("engine_rpm"), 0.0)
+        assertTrue(observedCleanRestoreSet)
+        assertFalse(marker.exists())
+    }
+
+    @Test
+    fun validBackupWinsWhenLiveMainIsMissingOrCorrupt() {
+        for (damage in listOf("missing", "corrupt")) {
+            database.close()
+            context.deleteDatabase("obd_drives.db")
+            clearMigrationArtifacts()
+            createMinimalVersionOneDatabase()
+            database = ObdDatabase(context) { error("simulated migration failure") }
+            assertThrows(IllegalStateException::class.java) { database.writableDatabase }
+            database.close()
+
+            val main = context.getDatabasePath("obd_drives.db")
+            if (damage == "missing") {
+                assertTrue(main.delete())
+            } else {
+                main.writeBytes("not a sqlite database".toByteArray())
+            }
+            database = ObdDatabase(context)
+            assertEquals(
+                850.0,
+                database.samples("legacy-drive").single().getDouble("engine_rpm"),
+                0.0,
+            )
+        }
     }
 
     @Test
@@ -425,6 +744,20 @@ class ObdDatabaseRetentionTest {
         }
     }
 
+    private fun createMinimalVersionTwoDatabase() {
+        createMinimalVersionOneDatabase()
+        SQLiteDatabase.openDatabase(
+            context.getDatabasePath("obd_drives.db").path,
+            null,
+            SQLiteDatabase.OPEN_READWRITE,
+        ).use { legacy ->
+            legacy.execSQL("ALTER TABLE samples ADD COLUMN oxygen_sensors_present TEXT")
+            legacy.execSQL("ALTER TABLE samples ADD COLUMN obd_standard TEXT")
+            legacy.execSQL("ALTER TABLE samples ADD COLUMN distance_with_mil REAL")
+            legacy.version = 2
+        }
+    }
+
     private fun createRecordingDrive(index: Int) {
         val id = "drive-%02d".format(index)
         val started = Instant.parse("2025-01-01T00:00:00Z").plusSeconds(index.toLong()).toString()
@@ -453,4 +786,14 @@ class ObdDatabaseRetentionTest {
     }
 
     private fun digest(value: Int): String = value.toString(16).padStart(64, '0')
+
+    private fun clearMigrationArtifacts() {
+        val backup = ObdDatabase.migrationBackupDirectory(context)
+        backup.deleteRecursively()
+        ObdDatabase.migrationBackupStaging(context).deleteRecursively()
+        val marker = ObdDatabase.migrationRestoreMarker(context)
+        marker.delete()
+        File(marker.parentFile, "${marker.name}.partial").delete()
+        ObdDatabase.migrationRestoreStaging(context).delete()
+    }
 }
