@@ -67,6 +67,7 @@ import json
 import math
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from app.core.logging import get_logger
@@ -1016,7 +1017,11 @@ class RadioController:
             return False
         return True
 
-    async def disable_bluetooth(self) -> bool:
+    async def disable_bluetooth(
+        self,
+        *,
+        before_change: Callable[[], Awaitable[None]] | None = None,
+    ) -> bool:
         """Disable and positively verify Bluetooth, with all legacy recovery guards."""
         async with _lock:
             # The remote process must acknowledge that it is alive before Bluetooth is
@@ -1025,6 +1030,12 @@ class RadioController:
             # independent restoration path after the disable.
             if not await self._ensure_watchdog_locked(marker="bluetooth"):
                 return False
+            # This hook is intentionally inside the radio lock and after the remote
+            # watchdog handshake. The OBD coordinator uses it to re-read the exact live
+            # quiesce lease after every potentially-blocking database checkpoint, leaving
+            # no unbounded work between that proof and the first radio side effect.
+            if before_change is not None:
+                await before_change()
             accepted = await _set_bluetooth(self.address, enable=False)
             verified = accepted and await _confirm_bluetooth_off(self.address)
             if verified:
@@ -1033,7 +1044,11 @@ class RadioController:
             log.warning("could not confirm the unit's Bluetooth is off; aborting radio quiet")
             return False
 
-    async def disable_hotspot(self) -> bool:
+    async def disable_hotspot(
+        self,
+        *,
+        before_change: Callable[[], Awaitable[None]] | None = None,
+    ) -> bool:
         """Stop a separate serving AP and verify its interface disappeared."""
         async with _lock:
             if self._hotspot_capsule_path is None:
@@ -1041,6 +1056,8 @@ class RadioController:
                 return False
             if not await self._ensure_watchdog_locked(marker="hotspot"):
                 return False
+            if before_change is not None:
+                await before_change()
             stopped, why = await _stop_hotspot(self.address)
             if stopped:
                 await _persist_refusal("")

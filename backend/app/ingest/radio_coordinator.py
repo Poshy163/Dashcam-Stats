@@ -286,37 +286,44 @@ class RadioTransition:
                     "available; radios were left on"
                 )
 
-        # The immutable OBD export being safe on the server is necessary but not enough:
-        # the Android logger's bounded pause must also remain live until the independent
-        # watchdog can restore Bluetooth. Re-read the exact request/ACK generation as late
-        # as possible before the first radio side effect, with recovery headroom included.
-        if row.logger_request_id:
-            if not self.logger_status_path:
-                raise RadioTransitionError(
-                    "OBD quiesce lease could not be revalidated; radios were left on"
-                )
-            try:
-                await obd_control.verify_quiesce(
-                    self.address,
-                    self.logger_status_path,
-                    row.logger_request_id,
-                    minimum_remaining_s=(self.watchdog_deadline_s + LOGGER_RADIO_RECOVERY_MARGIN_S),
-                )
-            except Exception as exc:
-                raise RadioTransitionError(
-                    "OBD quiesce lease no longer covers radio recovery; radios were left on"
-                ) from exc
+        async def final_radio_guard() -> None:
+            """Re-prove logger and boot safety after the watchdog is actually armed."""
 
-        current_boot_id = await radios.read_device_boot_id(self.address)
-        if current_boot_id is None or current_boot_id != row.device_boot_id:
-            raise RadioTransitionError(
-                "head unit restarted during OBD preparation; radios were left on"
-            )
+            # The immutable OBD export being safe on the server is necessary but not
+            # enough: the Android logger's bounded pause must remain live until the
+            # independent watchdog restores Bluetooth. This callback runs inside the
+            # controller's radio lock, after its remote watchdog handshake and immediately
+            # before the first radio side effect. In particular, every SQLite checkpoint
+            # below has already completed and cannot consume this recovery margin.
+            if row.logger_request_id:
+                if not self.logger_status_path:
+                    raise RadioTransitionError(
+                        "OBD quiesce lease could not be revalidated; radios were left on"
+                    )
+                try:
+                    await obd_control.verify_quiesce(
+                        self.address,
+                        self.logger_status_path,
+                        row.logger_request_id,
+                        minimum_remaining_s=(
+                            self.watchdog_deadline_s + LOGGER_RADIO_RECOVERY_MARGIN_S
+                        ),
+                    )
+                except Exception as exc:
+                    raise RadioTransitionError(
+                        "OBD quiesce lease no longer covers radio recovery; radios were left on"
+                    ) from exc
+
+            current_boot_id = await radios.read_device_boot_id(self.address)
+            if current_boot_id is None or current_boot_id != row.device_boot_id:
+                raise RadioTransitionError(
+                    "head unit restarted during OBD preparation; radios were left on"
+                )
 
         await self.checkpoint(TransitionPhase.DISABLING_RADIOS)
         if snapshot.bluetooth == "on":
             await self.checkpoint(bluetooth_disable_attempted=True)
-            if not await self.controller.disable_bluetooth():
+            if not await self.controller.disable_bluetooth(before_change=final_radio_guard):
                 raise RadioTransitionError("Bluetooth disable could not be verified")
             await self.checkpoint(bluetooth_disable_verified=True)
         else:
@@ -324,7 +331,8 @@ class RadioTransition:
 
         if snapshot.hotspot == "on":
             await self.checkpoint(hotspot_disable_attempted=True)
-            if not await self.controller.disable_hotspot():
+            hotspot_guard = final_radio_guard if snapshot.bluetooth != "on" else None
+            if not await self.controller.disable_hotspot(before_change=hotspot_guard):
                 raise RadioTransitionError("hotspot disable could not be verified")
             await self.checkpoint(hotspot_disable_verified=True)
         else:

@@ -271,6 +271,20 @@ class FakeController:
         self.calls.append("stand-down")
         return True
 
+    async def disable_bluetooth(self, *, before_change=None) -> bool:
+        self.calls.append("watchdog-bluetooth")
+        if before_change is not None:
+            await before_change()
+        self.calls.append("disable-bluetooth")
+        return True
+
+    async def disable_hotspot(self, *, before_change=None) -> bool:
+        self.calls.append("watchdog-hotspot")
+        if before_change is not None:
+            await before_change()
+        self.calls.append("disable-hotspot")
+        return True
+
     async def release(self) -> None:
         self.released = True
 
@@ -843,7 +857,7 @@ async def test_radio_quieting_refuses_to_run_before_obd_durability_checkpoint(
     assert await transition.restore(error="quieting refused")
 
 
-async def test_radio_quieting_revalidates_obd_lease_after_a_delayed_bundle_copy(
+async def test_radio_quieting_revalidates_obd_lease_after_watchdog_and_checkpoints(
     db_session, fake_controller, monkeypatch
 ):
     transition = await radio_coordinator.begin(
@@ -870,23 +884,21 @@ async def test_radio_quieting_revalidates_obd_lease_after_a_delayed_bundle_copy(
             row = await session.get(IngestRadioTransition, transition.id)
             assert row is not None and row.obd_transfer_complete
             assert row.bluetooth_before == "on" and row.hotspot_before == "off"
-            assert not row.bluetooth_disable_attempted and not row.hotspot_disable_attempted
+            assert row.phase == radio_coordinator.TransitionPhase.DISABLING_RADIOS.value
+            assert row.bluetooth_disable_attempted and not row.hotspot_disable_attempted
+        assert transition.controller.calls[-1] == "watchdog-bluetooth"
         raise obd_control.LoggerControlError("lease expired during the delayed OBD copy")
-
-    async def unexpected_disable():
-        raise AssertionError("an expired OBD lease must block every radio command")
 
     async def resume(_address, _path):
         return True
 
     transition.controller.capture = capture
-    transition.controller.disable_bluetooth = unexpected_disable
-    transition.controller.disable_hotspot = unexpected_disable
     monkeypatch.setattr(obd_control, "verify_quiesce", expired)
     monkeypatch.setattr(obd_control, "resume_logger", resume)
 
     with pytest.raises(radio_coordinator.RadioTransitionError, match="no longer covers"):
         await transition.capture_and_quiet()
+    assert "disable-bluetooth" not in transition.controller.calls
     assert await transition.restore(error="quieting refused")
 
     async with session_scope() as session:
@@ -913,15 +925,13 @@ async def test_radio_quieting_refuses_a_head_unit_reboot_during_obd_preparation(
             hotspot="off",
         )
 
-    async def unexpected_disable():
-        raise AssertionError("a rebooted logger must block every radio command")
-
     transition.controller.capture = capture
-    transition.controller.disable_bluetooth = unexpected_disable
     FakeController.boot_id = "a" * 32 + "@fedcba98-7654-3210-fedc-ba9876543210"
 
     with pytest.raises(radio_coordinator.RadioTransitionError, match="restarted"):
         await transition.capture_and_quiet()
+    assert transition.controller.calls[-1] == "watchdog-bluetooth"
+    assert "disable-bluetooth" not in transition.controller.calls
     assert await transition.restore(error="quieting refused")
 
 
@@ -1150,7 +1160,7 @@ async def test_opted_in_zlink_rearm_is_durable_before_both_radios_are_forced_off
         transition.controller.calls.append("persist-rearm")
         return restore_ref
 
-    async def disable_bluetooth():
+    async def disable_bluetooth(*, before_change=None):
         async with session_scope() as session:
             row = await session.get(IngestRadioTransition, transition.id)
             assert row is not None
@@ -1159,10 +1169,13 @@ async def test_opted_in_zlink_rearm_is_durable_before_both_radios_are_forced_off
             assert row.hotspot_restore_ref == restore_ref
             assert row.bluetooth_disable_attempted
             assert not row.hotspot_disable_attempted
+        assert before_change is not None
+        await before_change()
         transition.controller.calls.append("disable-bluetooth")
         return True
 
-    async def disable_hotspot():
+    async def disable_hotspot(*, before_change=None):
+        assert before_change is None
         async with session_scope() as session:
             row = await session.get(IngestRadioTransition, transition.id)
             assert row is not None

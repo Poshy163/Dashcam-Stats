@@ -63,12 +63,13 @@ still protect OBD data in that case. The server retains the transition and retri
 verification and logger resume when the same unit becomes reachable; it never treats a
 reboot as proof that either radio recovered.
 
-Immediately before the first radio command, the server re-reads the exact correlated OBD
-request and acknowledgement and requires its remaining Android lease to cover the whole
-watchdog window plus recovery headroom. Quieting is capped at eight minutes and the request
-is issued with 90 seconds of extra lease. If OBD copying or any preceding probe consumes
-that headroom, both radios stay on and the logger is explicitly resumed instead of risking
-a BLE reconnect during shutdown.
+After every durable pre-change checkpoint, the server proves the on-unit watchdog is armed.
+Then, from inside the radio lock and immediately before the first radio command, it re-reads
+the exact correlated OBD request and acknowledgement and requires the remaining Android
+lease to cover the whole watchdog window plus recovery headroom. Quieting is capped at eight
+minutes and the request is issued with 90 seconds of extra lease. If OBD copying, a database
+wait or any preceding probe consumes that headroom, both radios stay on and the logger is
+explicitly resumed instead of risking a BLE reconnect during shutdown.
 
 Older logger builds do not understand the file handshake. Their existing explicit
 `ownership_enabled=true` contract remains authoritative: ingestion continues with both

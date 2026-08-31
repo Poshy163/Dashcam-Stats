@@ -606,6 +606,33 @@ class TestTheWatchdog:
 
         assert observed["hotspot_baseline"] == expected_baseline
 
+    async def test_final_safety_guard_runs_after_watchdog_before_bluetooth(
+        self, unit_shell, monkeypatch
+    ):
+        order = []
+
+        async def armed(_address, _deadline_s, **_kwargs):
+            order.append("watchdog")
+            return FakeProcess()
+
+        async def guard():
+            order.append("guard")
+            assert not _issued(unit_shell.commands, "bluetooth_manager disable")
+
+        monkeypatch.setattr(radios, "_arm_watchdog", armed)
+        unit_shell.replies["bluetooth_on"] = ["1", "0"]
+        unit_shell.replies["ip -o addr"] = _IP_NO_AP
+        controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
+        controller.claim()
+        try:
+            await controller.capture()
+            assert await controller.disable_bluetooth(before_change=guard)
+        finally:
+            await controller.release()
+
+        assert order == ["watchdog", "guard"]
+        assert _issued(unit_shell.commands, "bluetooth_manager disable")
+
 
 class TestTheHotspot:
     """Stopping a soft AP from an unrooted shell rides the tethering binder, not the wifi
