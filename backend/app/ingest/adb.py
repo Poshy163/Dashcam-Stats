@@ -145,8 +145,13 @@ async def _adb(*args: str, timeout: float = CONTROL_TIMEOUT_S) -> AdbResult:
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
-        proc.kill()
-        await asyncio.wait_for(proc.wait(), timeout=5.0)
+        # The adb client can exit in the instant between wait_for timing out and
+        # kill(). uvloop reports that ordinary race as ProcessLookupError; never let it
+        # replace the bounded AdbError (or, during application startup, abort lifespan).
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(TimeoutError, ProcessLookupError):
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
         raise AdbError(f"adb {' '.join(args[:2])} timed out after {timeout:.0f}s") from None
     except asyncio.CancelledError:
         # Cancelling only stops this side *waiting*. The adb client keeps running and the
@@ -156,7 +161,8 @@ async def _adb(*args: str, timeout: float = CONTROL_TIMEOUT_S) -> AdbResult:
         # restored. Killing the client hangs up the remote shell with it, so a command
         # that has not run yet never does -- and one that already ran necessarily ran
         # before whatever is issued next.
-        proc.kill()
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
         raise
     return AdbResult(
         proc.returncode or 0,
