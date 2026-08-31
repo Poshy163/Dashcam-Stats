@@ -33,8 +33,8 @@ so unattended backup recovery does not call them.
 ## Current bounded radio quieting
 
 The experimental server-side option **Let Bluetooth re-arm the Zlink hotspot after
-copying** addresses the narrower case where the approved production package path and
-version are already on the home network. It does not perform the CarPlay-to-home handoff
+copying** addresses the narrower case where the cryptographically approved production
+system APK is already on the home network. It does not perform the CarPlay-to-home handoff
 described below.
 
 The OBD logger first finalises its current sample and drive, exports and verifies the

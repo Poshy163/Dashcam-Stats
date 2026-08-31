@@ -1175,7 +1175,7 @@ SETTINGS: tuple[SettingDef, ...] = (
         "bool",
         False,
         "ingest",
-        "Experimental, for the approved production Zlink package path and version only. "
+        "Experimental, for the cryptographically approved production Zlink system APK only. "
         "It lets a backup "
         "force the separate hotspot off when Android hides its password, using the observed "
         "Bluetooth-to-AP return behavior. Before either radio changes, the app protects "

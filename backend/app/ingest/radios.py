@@ -104,7 +104,7 @@ _DEVICE_SERIAL = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 # On the production head unit, enabling Bluetooth was observed to be followed by its
 # separate soft AP returning a few seconds later. AP ownership was not independently
 # attributed to Zlink, so this exceptional path is explicit opt-in and restricted to the
-# approved system-package path and version. Generic units retain the exact-credentials rule.
+# exact approved system APK. Generic units retain the exact-credentials rule.
 HOTSPOT_RESTORE_EXACT = "exact_config"
 HOTSPOT_RESTORE_BLUETOOTH_REARM = "bluetooth_rearm"
 _HOTSPOT_RESTORE_MODES = {
@@ -113,7 +113,11 @@ _HOTSPOT_RESTORE_MODES = {
 }
 ZLINK_PACKAGE = "com.zjinnova.zlink"
 ZLINK_SUPPORTED_VERSION = "6.1.02"
+ZLINK_SUPPORTED_VERSION_CODE = "600102"
 ZLINK_SYSTEM_APK_PATH = "package:/system/app/CarZhiJian/CarZhiJian.apk"
+ZLINK_SYSTEM_APK_SHA256 = (
+    "c8f43e1a2dbd957220194f59ded0eb64581a571fde59d55386e6c5b4d49967d3"
+)
 _BLUETOOTH_REARM_CAPSULE = {
     "schema_version": 2,
     "restore_mode": HOTSPOT_RESTORE_BLUETOOTH_REARM,
@@ -190,7 +194,7 @@ class HotspotRecoveryPlan:
 
 
 async def supports_zlink_bluetooth_rearm(address: str) -> bool:
-    """Whether the approved Zlink path and version are installed as a system app.
+    """Whether the exact approved Zlink system APK is installed.
 
     Presence alone is insufficient: the observed Bluetooth/AP coupling may change in a
     vendor update. The server setting remains the operator's separate opt-in.
@@ -202,16 +206,26 @@ async def supports_zlink_bluetooth_rearm(address: str) -> bool:
             f'path="$(pm path {ZLINK_PACKAGE} 2>/dev/null | head -n 1)"; '
             f'version="$(dumpsys package {ZLINK_PACKAGE} 2>/dev/null | '
             "sed -n 's/^[[:space:]]*versionName=//p' | head -n 1)" + '"; '
-            'printf \'%s\\n%s\' "$path" "$version"; exit 0',
+            f'version_code="$(dumpsys package {ZLINK_PACKAGE} 2>/dev/null | '
+            "sed -n 's/^[[:space:]]*versionCode=\\([0-9]*\\).*$/\\1/p' | "
+            "head -n 1)" + '"; '
+            'digest=""; '
+            f"if [ \"$path\" = '{ZLINK_SYSTEM_APK_PATH}' ]; then "
+            "digest=\"$(sha256sum '/system/app/CarZhiJian/CarZhiJian.apk' "
+            "2>/dev/null | cut -d' ' -f1)\"; fi; "
+            'printf \'%s\\n%s\\n%s\\n%s\' "$path" "$version" "$version_code" '
+            '"$digest"; exit 0',
             timeout=15.0,
         )
     except adb.AdbError:
         return False
     lines = [line.strip() for line in reply.splitlines()]
     return (
-        len(lines) == 2
+        len(lines) == 4
         and lines[0] == ZLINK_SYSTEM_APK_PATH
         and lines[1] == ZLINK_SUPPORTED_VERSION
+        and lines[2] == ZLINK_SUPPORTED_VERSION_CODE
+        and lines[3] == ZLINK_SYSTEM_APK_SHA256
     )
 
 

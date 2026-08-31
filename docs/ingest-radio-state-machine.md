@@ -45,11 +45,11 @@ Generic units use schema 1, which contains the exact SSID and passphrase needed 
 the AP. Those values never enter the server database, database backup, API, status output,
 diagnostics or logs.
 
-The approved production Zlink package path and version may instead use the separately
+The cryptographically approved production Zlink system APK may instead use the separately
 enabled schema-2
 `bluetooth_rearm` strategy. It contains no network name or password. This path is accepted
 only when Bluetooth and a separate AP were both positively observed on, the exact approved
-system-package path and version are present, and the operator enabled **Let Bluetooth
+system-package path, version code and APK SHA-256 are present, and the operator enabled **Let Bluetooth
 re-arm the Zlink hotspot after copying**. The on-unit watchdog restores Bluetooth; on this
 head unit that was observed to be followed by the AP returning, though Zlink ownership of
 the AP has not been independently proven. Normal recovery requires the same captured AP

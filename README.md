@@ -196,7 +196,8 @@ What that means in practice:
     hotspot after copying** option can use the observed Bluetooth-to-AP return behavior
     instead: Bluetooth comes back first, and recovery remains pending until the same AP
     interface stays continuously visible through the final stability window. This experimental
-    credential-free path is off by default and package-path/version-gated.
+    credential-free path is off by default and gated by the exact system path, version
+    code and APK SHA-256.
   - **Let the app restart the dashcam's ADB as root** closes that gap on a unit that
     allows it. `adb root` is run once per transfer, before any copying starts, and only
     works on a debuggable build (`ro.debuggable=1`) — most units are production builds,

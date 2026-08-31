@@ -181,7 +181,10 @@ async def test_device_identity_is_stable_across_reboots_without_storing_serial(m
 
 async def test_zlink_package_gate_is_positive_and_bounded(unit_shell):
     unit_shell.replies["pm path com.zjinnova.zlink"] = (
-        "package:/system/app/CarZhiJian/CarZhiJian.apk\n6.1.02"
+        "package:/system/app/CarZhiJian/CarZhiJian.apk\n"
+        "6.1.02\n"
+        "600102\n"
+        "c8f43e1a2dbd957220194f59ded0eb64581a571fde59d55386e6c5b4d49967d3"
     )
     assert await radios.supports_zlink_bluetooth_rearm("unit:5555")
     assert len(_issued(unit_shell.commands, "pm path com.zjinnova.zlink")) == 1
@@ -190,10 +193,15 @@ async def test_zlink_package_gate_is_positive_and_bounded(unit_shell):
 @pytest.mark.parametrize(
     "reply",
     [
-        "package:/data/app/~~random/com.zjinnova.zlink/base.apk\n6.1.02",
-        "package:/system/app/CarZhiJian/renamed.apk\n6.1.02",
-        "package:/system/app/CarZhiJian/CarZhiJian.apk\n6.1.03",
-        "package:/system/app/CarZhiJian/CarZhiJian.apk\n",
+        "package:/data/app/~~random/com.zjinnova.zlink/base.apk\n6.1.02\n600102\n",
+        "package:/system/app/CarZhiJian/renamed.apk\n6.1.02\n600102\n",
+        "package:/system/app/CarZhiJian/CarZhiJian.apk\n6.1.03\n600102\n"
+        "c8f43e1a2dbd957220194f59ded0eb64581a571fde59d55386e6c5b4d49967d3",
+        "package:/system/app/CarZhiJian/CarZhiJian.apk\n6.1.02\n600103\n"
+        "c8f43e1a2dbd957220194f59ded0eb64581a571fde59d55386e6c5b4d49967d3",
+        "package:/system/app/CarZhiJian/CarZhiJian.apk\n6.1.02\n600102\n"
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "package:/system/app/CarZhiJian/CarZhiJian.apk\n6.1.02\n600102\n",
         "",
     ],
 )
