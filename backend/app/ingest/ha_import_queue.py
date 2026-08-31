@@ -28,7 +28,6 @@ from app.ingest.obd_bundle import (
     BundleError,
     HAPayloadError,
     bundle_path_for,
-    diagnostics_for_ha,
     file_sha256,
     is_bundle_name,
     store_rejected_bundle,
@@ -424,16 +423,16 @@ async def post_bundle(
             # HA accepts a one-way projection amendment only after proving that the body it
             # already stored is exactly one of the two predecessor contracts.  A lost HA
             # acknowledgement can leave the server unable to know whether v1 or v2 landed,
-            # so both bounded candidates are self-contained.  V1 used the producer summary
-            # and legacy unwindowed aggregate; v2 used this canonical summary and the
-            # current windowed aggregate.  Raw diagnostic events never leave the validated
-            # bundle or get rewritten.
-            producer_summary = bundle.ha_payload()["summary"]
-            legacy_diagnostics = diagnostics_for_ha(bundle.diagnostics_document)
+            # so both bounded candidates are self-contained. V1 used the producer summary,
+            # whose own strict window also bounds its diagnostics; v2 used this canonical
+            # summary and its narrower aggregate. Any v1 body HA actually accepted already
+            # satisfied that window, while later finalisation events remain only in the
+            # server's immutable raw history.
+            producer_payload = bundle.ha_payload()
             payload["supersedes_projections"] = {
                 "1": {
-                    "summary": producer_summary,
-                    "diagnostics": legacy_diagnostics,
+                    "summary": producer_payload["summary"],
+                    "diagnostics": producer_payload["diagnostics"],
                 },
                 "2": {
                     "summary": payload["summary"],

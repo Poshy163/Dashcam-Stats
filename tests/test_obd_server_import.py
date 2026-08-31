@@ -1833,6 +1833,8 @@ class TestHAClient:
         drive_id = "drive_projection_v3"
         producer_finish = BASE + timedelta(seconds=10)
         canonical_finish = BASE + timedelta(seconds=5)
+        termination_noticed = BASE + timedelta(seconds=11)
+        finalised = BASE + timedelta(seconds=12)
         diagnostics = [
             {
                 "diagnostic_id": "inside",
@@ -1854,19 +1856,43 @@ class TestHAClient:
                     "message": "finalisation evidence stays in the raw bundle",
                 },
             },
+            {
+                "diagnostic_id": "after_producer_finish",
+                "drive_id": drive_id,
+                "timestamp_utc": termination_noticed.isoformat(),
+                "kind": "connection_failure",
+                "payload": {
+                    "category": "finalisation",
+                    "message": "late lifecycle evidence remains raw server history",
+                },
+            },
         ]
+        lifecycle = {
+            "last_sample_at_utc": canonical_finish.isoformat(),
+            "termination_noticed_at_utc": termination_noticed.isoformat(),
+            "finalised_at_utc": finalised.isoformat(),
+            "completion_status": "interrupted",
+            "interruption_reason": "connection_lost",
+        }
         checked = validate_bundle(
             make_bundle(
                 tmp_path,
                 drive_id,
                 diagnostics=diagnostics,
                 summary_patch={
+                    **lifecycle,
                     "finish_time_utc": producer_finish.isoformat(),
                     "duration_s": 10.0,
+                    "clean_end": False,
                 },
                 manifest_patch={
+                    **lifecycle,
                     "finish_time_utc": producer_finish.isoformat(),
-                    "created_at_utc": producer_finish.isoformat(),
+                    "last_successful_obd_response_at_utc": producer_finish.isoformat(),
+                    "poll_plan_version": 2,
+                    "stop_reason": "connection_lost",
+                    "clean_end": False,
+                    "created_at_utc": finalised.isoformat(),
                 },
             ),
             config=ha_config,
@@ -1920,6 +1946,8 @@ class TestHAClient:
             "diagnostics": body["diagnostics"],
         }
         assert "private transport detail" not in json.dumps(body["supersedes_projections"])
+        assert "late lifecycle evidence" not in json.dumps(body["supersedes_projections"])
+        assert len(checked.diagnostics_document["events"]) == 3
         assert (
             json.dumps(
                 checked.diagnostics_document,
