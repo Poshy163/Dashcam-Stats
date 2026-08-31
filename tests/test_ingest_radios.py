@@ -190,6 +190,33 @@ async def test_zlink_package_gate_is_positive_and_bounded(unit_shell):
     assert len(_issued(unit_shell.commands, "pm path com.zjinnova.zlink")) == 1
 
 
+async def test_zlink_package_gate_retries_a_transient_attestation_failure(monkeypatch):
+    replies = iter(
+        [
+            adb.AdbError("adb transport temporarily unavailable"),
+            (
+                "package:/system/app/CarZhiJian/CarZhiJian.apk\n"
+                "6.1.02\n"
+                "600102\n"
+                "c8f43e1a2dbd957220194f59ded0eb64581a571fde59d55386e6c5b4d49967d3"
+            ),
+        ]
+    )
+
+    async def shell(_address, _command, **_kwargs):
+        reply = next(replies)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    async def no_wait(_delay):
+        return None
+
+    monkeypatch.setattr(adb, "shell", shell)
+    monkeypatch.setattr(radios.asyncio, "sleep", no_wait)
+    assert await radios.supports_zlink_bluetooth_rearm("unit:5555")
+
+
 @pytest.mark.parametrize(
     "reply",
     [

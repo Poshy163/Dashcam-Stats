@@ -117,6 +117,8 @@ ZLINK_SUPPORTED_VERSION = "6.1.02"
 ZLINK_SUPPORTED_VERSION_CODE = "600102"
 ZLINK_SYSTEM_APK_PATH = "package:/system/app/CarZhiJian/CarZhiJian.apk"
 ZLINK_SYSTEM_APK_SHA256 = "c8f43e1a2dbd957220194f59ded0eb64581a571fde59d55386e6c5b4d49967d3"
+_ZLINK_ATTESTATION_ATTEMPTS = 3
+_ZLINK_ATTESTATION_RETRY_S = 0.25
 _BLUETOOTH_REARM_CAPSULE = {
     "schema_version": 2,
     "restore_mode": HOTSPOT_RESTORE_BLUETOOTH_REARM,
@@ -199,33 +201,44 @@ async def supports_zlink_bluetooth_rearm(address: str) -> bool:
     vendor update. The server setting remains the operator's separate opt-in.
     """
 
-    try:
-        reply = await adb.shell(
-            address,
-            f'path="$(pm path {ZLINK_PACKAGE} 2>/dev/null | head -n 1)"; '
-            f'version="$(dumpsys package {ZLINK_PACKAGE} 2>/dev/null | '
-            "sed -n 's/^[[:space:]]*versionName=//p' | head -n 1)" + '"; '
-            f'version_code="$(dumpsys package {ZLINK_PACKAGE} 2>/dev/null | '
-            "sed -n 's/^[[:space:]]*versionCode=\\([0-9]*\\).*$/\\1/p' | "
-            "head -n 1)" + '"; '
-            'digest=""; '
-            f"if [ \"$path\" = '{ZLINK_SYSTEM_APK_PATH}' ]; then "
-            "digest=\"$(sha256sum '/system/app/CarZhiJian/CarZhiJian.apk' "
-            "2>/dev/null | cut -d' ' -f1)\"; fi; "
-            'printf \'%s\\n%s\\n%s\\n%s\' "$path" "$version" "$version_code" '
-            '"$digest"; exit 0',
-            timeout=15.0,
-        )
-    except adb.AdbError:
-        return False
-    lines = [line.strip() for line in reply.splitlines()]
-    return (
-        len(lines) == 4
-        and lines[0] == ZLINK_SYSTEM_APK_PATH
-        and lines[1] == ZLINK_SUPPORTED_VERSION
-        and lines[2] == ZLINK_SUPPORTED_VERSION_CODE
-        and lines[3] == ZLINK_SYSTEM_APK_SHA256
+    command = (
+        f'path="$(pm path {ZLINK_PACKAGE} 2>/dev/null | head -n 1)"; '
+        f'version="$(dumpsys package {ZLINK_PACKAGE} 2>/dev/null | '
+        "sed -n 's/^[[:space:]]*versionName=//p' | head -n 1)" + '"; '
+        f'version_code="$(dumpsys package {ZLINK_PACKAGE} 2>/dev/null | '
+        "sed -n 's/^[[:space:]]*versionCode=\\([0-9]*\\).*$/\\1/p' | "
+        "head -n 1)" + '"; '
+        'digest=""; '
+        f"if [ \"$path\" = '{ZLINK_SYSTEM_APK_PATH}' ]; then "
+        "digest=\"$(sha256sum '/system/app/CarZhiJian/CarZhiJian.apk' "
+        "2>/dev/null | cut -d' ' -f1)\"; fi; "
+        'printf \'%s\\n%s\\n%s\\n%s\' "$path" "$version" "$version_code" '
+        '"$digest"; exit 0'
     )
+    for attempt in range(1, _ZLINK_ATTESTATION_ATTEMPTS + 1):
+        try:
+            reply = await adb.shell(address, command, timeout=15.0)
+        except adb.AdbError:
+            # The AP connection can briefly stall while Android is associating. A failed
+            # read is not evidence that the exact build changed, but neither is it safe
+            # enough to quiet radios on its own. Confirm twice more before declining.
+            if attempt < _ZLINK_ATTESTATION_ATTEMPTS:
+                await asyncio.sleep(_ZLINK_ATTESTATION_RETRY_S)
+                continue
+            return False
+        lines = [line.strip() for line in reply.splitlines()]
+        if len(lines) != 4:
+            if attempt < _ZLINK_ATTESTATION_ATTEMPTS:
+                await asyncio.sleep(_ZLINK_ATTESTATION_RETRY_S)
+                continue
+            return False
+        return (
+            lines[0] == ZLINK_SYSTEM_APK_PATH
+            and lines[1] == ZLINK_SUPPORTED_VERSION
+            and lines[2] == ZLINK_SUPPORTED_VERSION_CODE
+            and lines[3] == ZLINK_SYSTEM_APK_SHA256
+        )
+    return False
 
 
 #: What may be carried back into ``cmd wifi start-softap`` inside single quotes.
