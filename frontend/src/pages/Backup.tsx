@@ -60,6 +60,14 @@ function radioSummary(status: IngestRadioStatus): {
       tone: 'error',
     }
   }
+  const changed =
+    transition?.bluetooth.disableAttempted || transition?.hotspot.disableAttempted || false
+  const restored =
+    !!transition &&
+    (!transition.bluetooth.disableAttempted || transition.bluetooth.restoreVerified) &&
+    (!transition.hotspot.disableAttempted || transition.hotspot.restoreVerified)
+  const quietVerified =
+    !!transition && transition.bluetooth.disableVerified && transition.hotspot.disableVerified
   if (transition?.active) {
     if (['restoring_radios', 'resuming_obd'].includes(transition.phase)) {
       return {
@@ -69,6 +77,21 @@ function radioSummary(status: IngestRadioStatus): {
       }
     }
     if (transition.phase === 'ingesting') {
+      if (changed && restored) {
+        return {
+          title: 'Backup continuing with radios restored',
+          detail:
+            'The safety deadline restored the radios while the remaining files finish copying.',
+          tone: 'warn',
+        }
+      }
+      if (!changed && quietVerified) {
+        return {
+          title: 'Backup transfer active',
+          detail: 'The radios were already in a safe state, so no change was needed.',
+          tone: 'busy',
+        }
+      }
       return {
         title: 'Backup radio window active',
         detail: 'Any radio changed by the app will be returned to its captured starting state.',
@@ -96,15 +119,38 @@ function radioSummary(status: IngestRadioStatus): {
     }
   }
 
-  const changed =
-    transition.bluetooth.disableAttempted || transition.hotspot.disableAttempted
-  const restored =
-    (!transition.bluetooth.disableAttempted || transition.bluetooth.restoreVerified) &&
-    (!transition.hotspot.disableAttempted || transition.hotspot.restoreVerified)
+  if (transition.phase === 'failed') {
+    if (changed && restored) {
+      return {
+        title: 'Radios restored after an interrupted transition',
+        detail: 'Every attempted radio change was restored, but the transition ended early.',
+        tone: 'warn',
+      }
+    }
+    if (!changed && quietVerified) {
+      return {
+        title: 'No radio change was needed',
+        detail: 'The captured radio state was already safe, but the transition ended early.',
+        tone: 'warn',
+      }
+    }
+    if (!changed) {
+      return {
+        title: 'Radio quieting could not start',
+        detail: 'The safety checks stopped the latest transition before either radio was changed.',
+        tone: 'warn',
+      }
+    }
+    return {
+      title: 'Radio restore was not verified',
+      detail: 'The latest transition failed and its recorded restore evidence is incomplete.',
+      tone: 'error',
+    }
+  }
   if (changed && restored) {
     return {
-      title: 'Original radio state restored',
-      detail: 'The latest backup verified every radio it needed to put back.',
+      title: 'Radio recovery checks passed',
+      detail: 'The latest backup passed every required Bluetooth and hotspot recovery check.',
       tone: 'ok',
     }
   }

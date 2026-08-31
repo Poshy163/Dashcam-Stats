@@ -1170,6 +1170,22 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.zlink_hotspot_rearm",
+        "Let Bluetooth re-arm the Zlink hotspot after copying",
+        "bool",
+        False,
+        "ingest",
+        "Experimental, for the approved production Zlink package path and version only. "
+        "It lets a backup "
+        "force the separate hotspot off when Android hides its password, using the observed "
+        "Bluetooth-to-AP return behavior. Before either radio changes, the app protects "
+        "this recovery choice on the unit and arms an independent Bluetooth deadline "
+        "watchdog. Recovery stays pending until the same hotspot interface remains "
+        "continuously visible through the final stability window. Other builds leave an "
+        "unreadable hotspot on.",
+        requires="ingest.quiet_radios",
+    ),
+    SettingDef(
         "ingest.unit_health_watch",
         "Watch the recorder while the car is away",
         "bool",

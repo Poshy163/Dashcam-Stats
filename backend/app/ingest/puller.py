@@ -985,6 +985,7 @@ async def run_pull(
                     logger_status=observed_logger,
                     logger_status_path=get_config().obd_remote_status_file,
                     watchdog_deadline_s=int(_get("listen_timeout_s", 180)) * 2 + 120,
+                    allow_zlink_rearm=bool(_get("zlink_hotspot_rearm", False)),
                     lease_loss_callback=status.cancel,
                 )
             except radio_coordinator.TransitionBusy as exc:

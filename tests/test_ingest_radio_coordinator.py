@@ -93,6 +93,69 @@ async def test_quiesce_timeout_is_bounded_and_never_accepts_a_missing_ack(monkey
     assert (deadline - requested).total_seconds() == 10
 
 
+async def test_quiesce_revalidation_requires_a_live_correlated_lease(monkeypatch):
+    requested = datetime.now(UTC) - timedelta(seconds=1)
+    deadline = requested + timedelta(seconds=570)
+    request = json.dumps(
+        {
+            "schema_version": 1,
+            "request_id": "request-1",
+            "action": obd_control.REQUEST_ACTION,
+            "requested_at_utc": requested.isoformat().replace("+00:00", "Z"),
+            "deadline_at_utc": deadline.isoformat().replace("+00:00", "Z"),
+        },
+        separators=(",", ":"),
+    )
+    acknowledgement = json.dumps(_ack(), separators=(",", ":"))
+
+    async def shell(_address, command, **_kwargs):
+        if "ingestion-request.json" in command:
+            return request
+        if "ingestion-ack.json" in command:
+            return acknowledgement
+        return ""
+
+    monkeypatch.setattr(obd_control.adb, "shell", shell)
+    ack = await obd_control.verify_quiesce(
+        "unit:5555",
+        "/storage/card/app/obd/status.json",
+        "request-1",
+        minimum_remaining_s=510,
+    )
+    assert ack.ready and ack.request_id == "request-1"
+
+
+async def test_quiesce_revalidation_rejects_a_lease_near_expiry(monkeypatch):
+    requested = datetime.now(UTC) - timedelta(seconds=500)
+    deadline = requested + timedelta(seconds=510)
+    request = json.dumps(
+        {
+            "schema_version": 1,
+            "request_id": "request-1",
+            "action": obd_control.REQUEST_ACTION,
+            "requested_at_utc": requested.isoformat().replace("+00:00", "Z"),
+            "deadline_at_utc": deadline.isoformat().replace("+00:00", "Z"),
+        },
+        separators=(",", ":"),
+    )
+
+    async def shell(_address, command, **_kwargs):
+        if "ingestion-request.json" in command:
+            return request
+        if "ingestion-ack.json" in command:
+            return json.dumps(_ack(), separators=(",", ":"))
+        return ""
+
+    monkeypatch.setattr(obd_control.adb, "shell", shell)
+    with pytest.raises(obd_control.LoggerControlError, match="does not cover radio recovery"):
+        await obd_control.verify_quiesce(
+            "unit:5555",
+            "/storage/card/app/obd/status.json",
+            "request-1",
+            minimum_remaining_s=30,
+        )
+
+
 async def test_logger_status_keeps_only_bounded_capabilities_and_metrics(monkeypatch):
     body = json.dumps(
         {
@@ -153,6 +216,10 @@ class FakeController:
     boot_id = "a" * 32 + "@01234567-89ab-cdef-0123-456789abcdef"
     remove_ok = True
     on_remove = None
+    recovery_plan = radio_coordinator.radios.HotspotRecoveryPlan(
+        radio_coordinator.radios.HOTSPOT_RESTORE_EXACT,
+        ("CarSpot", "roadtrip99"),
+    )
 
     def __init__(self, address: str, *, watchdog_deadline_s: int) -> None:
         self.address = address
@@ -168,11 +235,27 @@ class FakeController:
         self.calls.append(f"bluetooth:{baseline}")
         return type(self).bluetooth_ok
 
-    async def restore_hotspot(self, baseline: str, config) -> bool:
+    async def restore_hotspot(
+        self,
+        baseline: str,
+        config,
+        restore_mode=None,
+        *,
+        expected_interface=None,
+    ) -> bool:
         self.calls.append(f"hotspot:{baseline}")
         if baseline == "on":
-            assert config == ("CarSpot", "roadtrip99")
+            if restore_mode == radio_coordinator.radios.HOTSPOT_RESTORE_BLUETOOTH_REARM:
+                assert config is None
+                assert expected_interface == "ap0"
+            else:
+                assert config == ("CarSpot", "roadtrip99")
+                assert restore_mode == radio_coordinator.radios.HOTSPOT_RESTORE_EXACT
         return type(self).hotspot_ok
+
+    async def read_hotspot_recovery_plan(self, _path: str):
+        self.calls.append("read-capsule")
+        return type(self).recovery_plan
 
     async def read_hotspot_capsule(self, _path: str):
         self.calls.append("read-capsule")
@@ -200,6 +283,10 @@ def fake_controller(monkeypatch):
     FakeController.boot_id = "a" * 32 + "@01234567-89ab-cdef-0123-456789abcdef"
     FakeController.remove_ok = True
     FakeController.on_remove = None
+    FakeController.recovery_plan = radio_coordinator.radios.HotspotRecoveryPlan(
+        radio_coordinator.radios.HOTSPOT_RESTORE_EXACT,
+        ("CarSpot", "roadtrip99"),
+    )
     monkeypatch.setattr(radio_coordinator.radios, "RadioController", FakeController)
 
     async def boot_id(_address):
@@ -207,6 +294,41 @@ def fake_controller(monkeypatch):
 
     monkeypatch.setattr(radio_coordinator.radios, "read_device_boot_id", boot_id)
     return FakeController
+
+
+async def test_logger_lease_keeps_bounded_radio_recovery_headroom(
+    db_session, fake_controller, monkeypatch
+):
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=9999,
+    )
+    assert transition.watchdog_deadline_s == radio_coordinator.MAX_WATCHDOG_DEADLINE_S == 480
+
+    async def request(_address, _path, **kwargs):
+        assert kwargs["timeout_s"] == obd_control.DEFAULT_TIMEOUT_S
+        assert kwargs["hold_s"] == 570
+        return obd_control.LoggerAck(
+            request_id=kwargs["request_id"],
+            state="ready",
+            ready_at_utc="2026-08-30T01:02:03Z",
+            drive_id=None,
+            last_sample_at_utc=None,
+            bundle_filename=None,
+            bundle_sha256=None,
+            error=None,
+        )
+
+    async def resume(_address, _path):
+        return True
+
+    monkeypatch.setattr(obd_control, "request_quiesce", request)
+    monkeypatch.setattr(obd_control, "resume_logger", resume)
+    assert (await transition.prepare_logger()).ready
+    assert await transition.restore()
 
 
 @pytest.mark.parametrize(
@@ -474,6 +596,64 @@ async def test_expired_transition_is_reconciled_after_process_restart(db_session
         assert row.phase == radio_coordinator.TransitionPhase.FAILED.value
 
 
+async def test_expired_zlink_rearm_transition_recovers_from_credential_free_capsule(
+    db_session, fake_controller, monkeypatch
+):
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+    )
+    restore_ref = (
+        f"{radio_coordinator.radios.HOTSPOT_CAPSULE_PREFIX}{transition.transition_id}.json"
+    )
+    await transition.checkpoint(
+        bluetooth_before="on",
+        hotspot_before="on",
+        hotspot_interface="ap0",
+        bluetooth_disable_attempted=True,
+        bluetooth_disable_verified=True,
+        hotspot_disable_attempted=True,
+        hotspot_disable_verified=True,
+        hotspot_restore_ref=restore_ref,
+        logger_request_id="request-1",
+    )
+    transition_id = transition.id
+    await transition.close()
+    async with session_scope() as session:
+        await session.execute(
+            update(IngestRadioTransition)
+            .where(IngestRadioTransition.id == transition_id)
+            .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+
+    FakeController.recovery_plan = radio_coordinator.radios.HotspotRecoveryPlan(
+        radio_coordinator.radios.HOTSPOT_RESTORE_BLUETOOTH_REARM
+    )
+
+    async def resume_logger(_address, _path):
+        FakeController.instances[-1].calls.append("resume-logger")
+        return True
+
+    monkeypatch.setattr(radio_coordinator.obd_control, "resume_logger", resume_logger)
+    assert await radio_coordinator.reconcile_pending(address="unit:5555")
+    recovered = FakeController.instances[-1]
+    assert recovered.calls[1:7] == [
+        "bluetooth:on",
+        "read-capsule",
+        "hotspot:on",
+        "stand-down",
+        "resume-logger",
+        "remove-capsule",
+    ]
+    async with session_scope() as session:
+        row = await session.get(IngestRadioTransition, transition_id)
+        assert row is not None and not row.active and not row.recovery_required
+        assert row.logger_resume_verified and row.hotspot_restore_ref is None
+
+
 async def test_expired_transition_follows_dhcp_change_only_with_same_stable_device_identity(
     db_session, fake_controller, monkeypatch
 ):
@@ -637,6 +817,114 @@ async def test_cancelled_restore_releases_local_owner_and_expires_for_recovery(
         assert row.lease_expires_at <= datetime.now(UTC)
 
 
+async def test_radio_quieting_refuses_to_run_before_obd_durability_checkpoint(
+    db_session, fake_controller
+):
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+    )
+
+    async def unexpected_capture():
+        raise AssertionError("radio state must not be read before the OBD checkpoint")
+
+    transition.controller.capture = unexpected_capture
+    with pytest.raises(radio_coordinator.RadioTransitionError, match="OBD transfer durability"):
+        await transition.capture_and_quiet()
+
+    async with session_scope() as session:
+        row = await session.get(IngestRadioTransition, transition.id)
+        assert row is not None
+        assert not row.obd_transfer_complete
+        assert not row.bluetooth_disable_attempted and not row.hotspot_disable_attempted
+    assert await transition.restore(error="quieting refused")
+
+
+async def test_radio_quieting_revalidates_obd_lease_after_a_delayed_bundle_copy(
+    db_session, fake_controller, monkeypatch
+):
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+    )
+    await transition.checkpoint(
+        logger_request_id="request-1",
+        obd_transfer_complete=True,
+    )
+
+    async def capture():
+        return radio_coordinator.radios.RadioSnapshot(
+            bluetooth="on",
+            hotspot="off",
+        )
+
+    async def expired(_address, _path, _request_id, *, minimum_remaining_s):
+        assert minimum_remaining_s == 150
+        async with session_scope() as session:
+            row = await session.get(IngestRadioTransition, transition.id)
+            assert row is not None and row.obd_transfer_complete
+            assert row.bluetooth_before == "on" and row.hotspot_before == "off"
+            assert not row.bluetooth_disable_attempted and not row.hotspot_disable_attempted
+        raise obd_control.LoggerControlError("lease expired during the delayed OBD copy")
+
+    async def unexpected_disable():
+        raise AssertionError("an expired OBD lease must block every radio command")
+
+    async def resume(_address, _path):
+        return True
+
+    transition.controller.capture = capture
+    transition.controller.disable_bluetooth = unexpected_disable
+    transition.controller.disable_hotspot = unexpected_disable
+    monkeypatch.setattr(obd_control, "verify_quiesce", expired)
+    monkeypatch.setattr(obd_control, "resume_logger", resume)
+
+    with pytest.raises(radio_coordinator.RadioTransitionError, match="no longer covers"):
+        await transition.capture_and_quiet()
+    assert await transition.restore(error="quieting refused")
+
+    async with session_scope() as session:
+        row = await session.get(IngestRadioTransition, transition.id)
+        assert row is not None and not row.active
+        assert row.logger_resume_verified
+
+
+async def test_radio_quieting_refuses_a_head_unit_reboot_during_obd_preparation(
+    db_session, fake_controller
+):
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+    )
+    await transition.mark_obd_transfer_complete()
+
+    async def capture():
+        return radio_coordinator.radios.RadioSnapshot(
+            bluetooth="on",
+            hotspot="off",
+        )
+
+    async def unexpected_disable():
+        raise AssertionError("a rebooted logger must block every radio command")
+
+    transition.controller.capture = capture
+    transition.controller.disable_bluetooth = unexpected_disable
+    FakeController.boot_id = "a" * 32 + "@fedcba98-7654-3210-fedc-ba9876543210"
+
+    with pytest.raises(radio_coordinator.RadioTransitionError, match="restarted"):
+        await transition.capture_and_quiet()
+    assert await transition.restore(error="quieting refused")
+
+
 async def test_capsule_is_erased_when_its_durable_checkpoint_fails(
     db_session, fake_controller, monkeypatch
 ):
@@ -664,6 +952,7 @@ async def test_capsule_is_erased_when_its_durable_checkpoint_fails(
 
     transition.controller.capture = capture
     transition.controller.persist_hotspot_capsule = persist
+    await transition.mark_obd_transfer_complete()
     original_checkpoint = radio_coordinator.RadioTransition.checkpoint
     snapshot_failed = False
 
@@ -788,6 +1077,120 @@ async def test_transition_deactivates_before_capsule_cleanup_and_retries_cleanup
     async with session_scope() as session:
         row = await session.get(IngestRadioTransition, second.id)
         assert row is not None and row.hotspot_restore_ref is None
+
+
+async def test_unreadable_hotspot_still_fails_closed_without_zlink_opt_in(
+    db_session, fake_controller, monkeypatch
+):
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+    )
+
+    async def capture():
+        return radio_coordinator.radios.RadioSnapshot(
+            bluetooth="on",
+            hotspot="on",
+            hotspot_interface="ap0",
+            transport_interface="wlan0",
+        )
+
+    async def unexpected_support(_address):
+        raise AssertionError("Zlink must not be probed without explicit opt-in")
+
+    transition.controller.capture = capture
+    monkeypatch.setattr(
+        radio_coordinator.radios,
+        "supports_zlink_bluetooth_rearm",
+        unexpected_support,
+    )
+
+    await transition.mark_obd_transfer_complete()
+    with pytest.raises(radio_coordinator.RadioTransitionError, match="Zlink re-arm"):
+        await transition.capture_and_quiet()
+
+    async with session_scope() as session:
+        row = await session.get(IngestRadioTransition, transition.id)
+        assert row is not None
+        assert row.bluetooth_before == "on" and row.hotspot_before == "on"
+        assert not row.bluetooth_disable_attempted and not row.hotspot_disable_attempted
+    assert await transition.restore(error="quieting refused")
+
+
+async def test_opted_in_zlink_rearm_is_durable_before_both_radios_are_forced_off(
+    db_session, fake_controller, monkeypatch
+):
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+        allow_zlink_rearm=True,
+    )
+    restore_ref = (
+        f"{radio_coordinator.radios.HOTSPOT_CAPSULE_PREFIX}{transition.transition_id}.json"
+    )
+
+    async def capture():
+        return radio_coordinator.radios.RadioSnapshot(
+            bluetooth="on",
+            hotspot="on",
+            hotspot_interface="ap0",
+            transport_interface="wlan0",
+        )
+
+    async def supported(_address):
+        return True
+
+    async def persist(_transition_id):
+        transition.controller.calls.append("persist-rearm")
+        return restore_ref
+
+    async def disable_bluetooth():
+        async with session_scope() as session:
+            row = await session.get(IngestRadioTransition, transition.id)
+            assert row is not None
+            assert row.obd_transfer_complete
+            assert row.bluetooth_before == "on" and row.hotspot_before == "on"
+            assert row.hotspot_restore_ref == restore_ref
+            assert row.bluetooth_disable_attempted
+            assert not row.hotspot_disable_attempted
+        transition.controller.calls.append("disable-bluetooth")
+        return True
+
+    async def disable_hotspot():
+        async with session_scope() as session:
+            row = await session.get(IngestRadioTransition, transition.id)
+            assert row is not None
+            assert row.obd_transfer_complete
+            assert row.hotspot_restore_ref == restore_ref
+            assert row.bluetooth_disable_verified
+            assert row.hotspot_disable_attempted
+        transition.controller.calls.append("disable-hotspot")
+        return True
+
+    transition.controller.capture = capture
+    transition.controller.persist_bluetooth_rearm_capsule = persist
+    transition.controller.disable_bluetooth = disable_bluetooth
+    transition.controller.disable_hotspot = disable_hotspot
+    monkeypatch.setattr(radio_coordinator.radios, "supports_zlink_bluetooth_rearm", supported)
+
+    await transition.mark_obd_transfer_complete()
+    await transition.capture_and_quiet()
+
+    calls = transition.controller.calls
+    assert calls.index("persist-rearm") < calls.index("disable-bluetooth")
+    assert calls.index("disable-bluetooth") < calls.index("disable-hotspot")
+    async with session_scope() as session:
+        row = await session.get(IngestRadioTransition, transition.id)
+        assert row is not None
+        assert row.hotspot_restore_ref == restore_ref
+        assert row.bluetooth_disable_verified and row.hotspot_disable_verified
+    assert await transition.restore()
 
 
 def test_hotspot_secret_is_not_part_of_the_persisted_schema():

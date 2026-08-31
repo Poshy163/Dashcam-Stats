@@ -36,7 +36,9 @@ log = get_logger(__name__)
 LEASE_TTL_S = 45.0
 HEARTBEAT_INTERVAL_S = 10.0
 QUIET_RESTORE_MARGIN_S = 30.0
-MAX_WATCHDOG_DEADLINE_S = 540
+LOGGER_QUIESCE_HEADROOM_S = 90.0
+LOGGER_RADIO_RECOVERY_MARGIN_S = 30.0
+MAX_WATCHDOG_DEADLINE_S = 480
 PROCESS_FENCE_NAME = ".ingest-radio-transition.lock"
 
 
@@ -89,6 +91,7 @@ class RadioTransition:
     controller: radios.RadioController
     watchdog_deadline_s: int
     process_fence: ProcessFileLock = field(repr=False)
+    allow_zlink_rearm: bool = False
     lease_loss_callback: Callable[[], object] | None = field(default=None, repr=False)
     _heartbeat_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _deadline_task: asyncio.Task[None] | None = field(default=None, repr=False)
@@ -98,6 +101,7 @@ class RadioTransition:
     _baseline_error: object | None = field(default=None, repr=False)
     _closed: bool = False
     _hotspot_config: tuple[str, str] | None = field(default=None, repr=False)
+    _hotspot_restore_mode: str | None = field(default=None, repr=False)
     _untracked_capsule_ref: str | None = field(default=None, repr=False)
     _lease_lost_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     _lease_loss_error: RadioTransitionError | None = field(default=None, repr=False)
@@ -202,7 +206,7 @@ class RadioTransition:
                 self.address,
                 self.logger_status_path,
                 timeout_s=timeout_s,
-                hold_s=self.watchdog_deadline_s + timeout_s,
+                hold_s=self.watchdog_deadline_s + max(timeout_s, LOGGER_QUIESCE_HEADROOM_S),
                 request_id=request_id,
             )
         except Exception as exc:
@@ -218,6 +222,14 @@ class RadioTransition:
         )
 
     async def capture_and_quiet(self) -> None:
+        # This method is deliberately self-defending rather than relying on the puller's
+        # call order.  A future caller must not be able to take BLE away from the logger
+        # until its immutable export has been transferred, verified and checkpointed.
+        row = await self._row()
+        if not row.obd_transfer_complete:
+            raise RadioTransitionError(
+                "OBD transfer durability was not checkpointed; radios were left on"
+            )
         await self.checkpoint(TransitionPhase.CAPTURING_RADIO_STATE)
         snapshot = await self.controller.capture()
         restore_ref = None
@@ -230,6 +242,19 @@ class RadioTransition:
                     "hotspot recovery state could not be protected; radios were left on"
                 )
             self._hotspot_config = snapshot.hotspot_config
+            self._hotspot_restore_mode = radios.HOTSPOT_RESTORE_EXACT
+        elif (
+            snapshot.hotspot == "on"
+            and snapshot.bluetooth == "on"
+            and self.allow_zlink_rearm
+            and await radios.supports_zlink_bluetooth_rearm(self.address)
+        ):
+            restore_ref = await self.controller.persist_bluetooth_rearm_capsule(self.transition_id)
+            if restore_ref is None:
+                raise RadioTransitionError(
+                    "Zlink hotspot recovery state could not be protected; radios were left on"
+                )
+            self._hotspot_restore_mode = radios.HOTSPOT_RESTORE_BLUETOOTH_REARM
         try:
             await self.checkpoint(
                 bluetooth_before=snapshot.bluetooth,
@@ -255,8 +280,37 @@ class RadioTransition:
         if snapshot.bluetooth == "unknown" or snapshot.hotspot == "unknown":
             raise RadioTransitionError("radio baseline could not be read; radios were left on")
         if snapshot.hotspot == "on" and snapshot.hotspot_config is None:
+            if restore_ref is None:
+                raise RadioTransitionError(
+                    "hotspot configuration could not be recovered and Zlink re-arm was not "
+                    "available; radios were left on"
+                )
+
+        # The immutable OBD export being safe on the server is necessary but not enough:
+        # the Android logger's bounded pause must also remain live until the independent
+        # watchdog can restore Bluetooth. Re-read the exact request/ACK generation as late
+        # as possible before the first radio side effect, with recovery headroom included.
+        if row.logger_request_id:
+            if not self.logger_status_path:
+                raise RadioTransitionError(
+                    "OBD quiesce lease could not be revalidated; radios were left on"
+                )
+            try:
+                await obd_control.verify_quiesce(
+                    self.address,
+                    self.logger_status_path,
+                    row.logger_request_id,
+                    minimum_remaining_s=(self.watchdog_deadline_s + LOGGER_RADIO_RECOVERY_MARGIN_S),
+                )
+            except Exception as exc:
+                raise RadioTransitionError(
+                    "OBD quiesce lease no longer covers radio recovery; radios were left on"
+                ) from exc
+
+        current_boot_id = await radios.read_device_boot_id(self.address)
+        if current_boot_id is None or current_boot_id != row.device_boot_id:
             raise RadioTransitionError(
-                "hotspot configuration could not be recovered; radios were left on"
+                "head unit restarted during OBD preparation; radios were left on"
             )
 
         await self.checkpoint(TransitionPhase.DISABLING_RADIOS)
@@ -414,11 +468,17 @@ class RadioTransition:
         if row.bluetooth_disable_attempted or row.hotspot_disable_attempted:
             await self.checkpoint(hotspot_restore_attempted=True)
             hotspot_config = self._hotspot_config
-            if hotspot_config is None and row.hotspot_restore_ref:
-                hotspot_config = await self.controller.read_hotspot_capsule(row.hotspot_restore_ref)
+            hotspot_restore_mode = self._hotspot_restore_mode
+            if row.hotspot_restore_ref and hotspot_restore_mode is None:
+                plan = await self.controller.read_hotspot_recovery_plan(row.hotspot_restore_ref)
+                if plan is not None:
+                    hotspot_restore_mode = plan.mode
+                    hotspot_config = plan.config
             hotspot_ok = await self.controller.restore_hotspot(
                 row.hotspot_before,
                 hotspot_config,
+                hotspot_restore_mode,
+                expected_interface=row.hotspot_interface,
             )
             await self.checkpoint(hotspot_restore_verified=hotspot_ok)
             if not hotspot_ok:
@@ -595,6 +655,7 @@ async def begin(
     logger_status: dict[str, Any] | None,
     logger_status_path: str | None,
     watchdog_deadline_s: int,
+    allow_zlink_rearm: bool = False,
     lease_loss_callback: Callable[[], object] | None = None,
 ) -> RadioTransition:
     """Atomically claim the only active transition across all server processes."""
@@ -657,6 +718,7 @@ async def begin(
         controller=controller,
         watchdog_deadline_s=watchdog_deadline_s,
         process_fence=process_fence,
+        allow_zlink_rearm=allow_zlink_rearm,
         lease_loss_callback=lease_loss_callback,
     )
     transition.start_heartbeat()

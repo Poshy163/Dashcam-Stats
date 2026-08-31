@@ -187,14 +187,16 @@ What that means in practice:
   seconds, so a car that is only turning around on the driveway keeps its phone
   connection, and it puts back what it turned off when the run ends. If the engine stops
   mid-transfer — the ordinary way a window ends — a watchdog left running on the unit
-  turns Bluetooth back on by itself, and anything still off is restored the moment the
-  car is next seen. Off by default.
-  - **Bluetooth works on any unit. The hotspot needs one whose ADB runs as root**, which
-    most do not: Android only lets uid 0 stop a soft AP, so an ordinary unit answers
-    `SecurityException` and keeps beaconing. The app checks whether the hotspot is
-    genuinely still serving rather than trusting the exit status, and records the unit's
-    own refusal in Settings instead of quietly claiming success. If it matters, turn the
-    hotspot off on the unit itself.
+  restores Bluetooth on its deadline, and anything still unverified is reconciled the
+  moment the car is next seen. Off by default.
+  - **An originally-on hotspot is stopped only with a protected recovery path.** The app
+    uses Android's unrooted tethering binder and verifies that the serving AP actually
+    disappears. Generic units require the exact configuration to be recoverable first.
+    On the approved production Zlink build, the separate **Let Bluetooth re-arm the Zlink
+    hotspot after copying** option can use the observed Bluetooth-to-AP return behavior
+    instead: Bluetooth comes back first, and recovery remains pending until the same AP
+    interface stays continuously visible through the final stability window. This experimental
+    credential-free path is off by default and package-path/version-gated.
   - **Let the app restart the dashcam's ADB as root** closes that gap on a unit that
     allows it. `adb root` is run once per transfer, before any copying starts, and only
     works on a debuggable build (`ro.debuggable=1`) — most units are production builds,

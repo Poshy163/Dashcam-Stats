@@ -99,6 +99,7 @@ def unit_shell(monkeypatch):
     # keep the "the stop never took" tests off the wall clock.
     monkeypatch.setattr(radios, "STOP_SETTLE_BUDGET_S", 0.05)
     monkeypatch.setattr(radios, "STOP_SETTLE_POLL_S", 0.01)
+    monkeypatch.setattr(radios, "HOTSPOT_REARM_STABILITY_S", 0.005)
     stub = StubSettings()
     monkeypatch.setattr(radios, "get_settings_service", lambda: stub)
     # The arrival restore is debounced per address across the process, so one test's
@@ -176,6 +177,62 @@ async def test_device_identity_is_stable_across_reboots_without_storing_serial(m
     fingerprint = first.partition("@")[0]
     assert radios.same_device_identity(first, f"{fingerprint}@{boot_two}")
     assert not radios.same_device_identity(first, f"{'f' * 32}@{boot_two}")
+
+
+async def test_zlink_package_gate_is_positive_and_bounded(unit_shell):
+    unit_shell.replies["pm path com.zjinnova.zlink"] = (
+        "package:/system/app/CarZhiJian/CarZhiJian.apk\n6.1.02"
+    )
+    assert await radios.supports_zlink_bluetooth_rearm("unit:5555")
+    assert len(_issued(unit_shell.commands, "pm path com.zjinnova.zlink")) == 1
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "package:/data/app/~~random/com.zjinnova.zlink/base.apk\n6.1.02",
+        "package:/system/app/CarZhiJian/renamed.apk\n6.1.02",
+        "package:/system/app/CarZhiJian/CarZhiJian.apk\n6.1.03",
+        "package:/system/app/CarZhiJian/CarZhiJian.apk\n",
+        "",
+    ],
+)
+async def test_zlink_package_gate_rejects_unapproved_install_or_build(unit_shell, reply):
+    unit_shell.replies["pm path com.zjinnova.zlink"] = reply
+    assert not await radios.supports_zlink_bluetooth_rearm("unit:5555")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"schema_version":2,"restore_mode":"other"}',
+        '{"schema_version":2,"restore_mode":"bluetooth_rearm","extra":true}',
+        '{"schema_version":3,"restore_mode":"bluetooth_rearm"}',
+    ],
+)
+async def test_bluetooth_rearm_capsule_parser_rejects_schema_drift(body):
+    controller = radios.RadioController("unit:5555", watchdog_deadline_s=300)
+
+    async def read(_path):
+        return body
+
+    controller._read_hotspot_capsule = read
+    path = f"{radios.HOTSPOT_CAPSULE_PREFIX}01234567-89ab-cdef-0123-456789abcdef.json"
+    assert await controller.read_hotspot_recovery_plan(path) is None
+
+
+async def test_bluetooth_rearm_capsule_is_credential_free_and_versioned():
+    controller = radios.RadioController("unit:5555", watchdog_deadline_s=300)
+    body = '{"schema_version":2,"restore_mode":"bluetooth_rearm"}'
+
+    async def read(_path):
+        return body
+
+    controller._read_hotspot_capsule = read
+    path = f"{radios.HOTSPOT_CAPSULE_PREFIX}01234567-89ab-cdef-0123-456789abcdef.json"
+    plan = await controller.read_hotspot_recovery_plan(path)
+    assert plan == radios.HotspotRecoveryPlan(radios.HOTSPOT_RESTORE_BLUETOOTH_REARM)
+    assert "ssid" not in body and "passphrase" not in body
 
 
 @pytest.fixture(autouse=True)
@@ -369,20 +426,20 @@ class TestTheWatchdog:
             (
                 "off",
                 False,
-                ("bluetooth_manager enable", "sleep 5", "service call tethering"),
+                ("bluetooth_manager enable", "sleep 6", "service call tethering"),
                 ("start-softap",),
             ),
             (
                 "on",
                 True,
-                ("bluetooth_manager enable", "sleep 5", "start-softap"),
+                ("bluetooth_manager enable", "sleep 6", "start-softap"),
                 ("service call tethering",),
             ),
             (
                 "transport",
                 False,
                 ("bluetooth_manager enable",),
-                ("sleep 5", "service call tethering", "start-softap"),
+                ("sleep 6", "service call tethering", "start-softap"),
             ),
         ],
     )
@@ -449,6 +506,48 @@ class TestTheWatchdog:
         assert "start-softap" in command and capsule in command
         assert 'rm -f "$capsule"' not in command
         assert f"rm -f '{radios.FLAG_PATH}'" not in command
+
+    async def test_bluetooth_rearm_watchdog_never_invents_credentials_or_vendor_actions(
+        self, monkeypatch
+    ):
+        captured: dict[str, tuple] = {}
+        capsule = f"{radios.HOTSPOT_CAPSULE_PREFIX}01234567-89ab-cdef-0123-456789abcdef.json"
+
+        async def fake_spawn(*args, **kwargs):
+            captured["args"] = args
+            return FakeProcess()
+
+        async def fake_shell(_address, command, **_kwargs):
+            return "armed" if radios.WATCHDOG_READY_PATH in command else ""
+
+        monkeypatch.setattr(radios.asyncio, "create_subprocess_exec", fake_spawn)
+        monkeypatch.setattr(adb, "adb_path", lambda: "adb")
+        monkeypatch.setattr(adb, "shell", fake_shell)
+
+        assert await radios._arm_watchdog(
+            "u:5555",
+            300,
+            restore_bluetooth=True,
+            hotspot_baseline="on",
+            hotspot_capsule_path=capsule,
+            hotspot_restore_mode=radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
+        )
+        command = captured["args"][-1]
+        # The strategy was validated before arming. Capsule loss after the radios go down
+        # must not prevent recovery of the independently captured Bluetooth baseline.
+        assert capsule not in command
+        assert command.index("bluetooth_manager enable") < command.index("sleep 6")
+        assert "start-softap" not in command
+        assert "com.zjinnova.zlink.action" not in command
+
+        assert not await radios._arm_watchdog(
+            "u:5555",
+            300,
+            restore_bluetooth=False,
+            hotspot_baseline="on",
+            hotspot_capsule_path=capsule,
+            hotspot_restore_mode=radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
+        )
 
     async def test_bluetooth_is_not_touched_without_a_proven_remote_watchdog(self, unit_shell):
         unit_shell.replies["bluetooth_on"] = "1"
@@ -650,6 +749,93 @@ class TestTheHotspot:
         assert await controller.restore_bluetooth("on")
         assert await controller.restore_hotspot("on", ("CarSpot", "roadtrip99"))
         assert not _issued(unit_shell.commands, "cmd wifi start-softap")
+
+    async def test_opted_in_zlink_restore_requires_the_vendor_ap_to_reappear(
+        self, unit_shell, monkeypatch
+    ):
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_SETTLE_S", 0.04)
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_POLL_S", 0.005)
+        unit_shell.replies["bluetooth_on"] = "1"
+        unit_shell.replies["ip -o addr"] = [_IP_NO_AP, _IP_WITH_AP]
+        controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
+
+        assert await controller.restore_bluetooth("on")
+        assert await controller.restore_hotspot(
+            "on",
+            None,
+            radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
+            expected_interface="ap0",
+        )
+        assert not _issued(unit_shell.commands, "start-softap")
+
+    async def test_opted_in_zlink_restore_stays_pending_when_the_ap_does_not_return(
+        self, unit_shell, monkeypatch
+    ):
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_SETTLE_S", 0.02)
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_POLL_S", 0.005)
+        unit_shell.replies["bluetooth_on"] = "1"
+        unit_shell.replies["ip -o addr"] = _IP_NO_AP
+        controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
+
+        assert await controller.restore_bluetooth("on")
+        assert not await controller.restore_hotspot(
+            "on",
+            None,
+            radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
+            expected_interface="ap0",
+        )
+
+    async def test_opted_in_zlink_restore_rejects_a_different_serving_ap(
+        self, unit_shell, monkeypatch
+    ):
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_SETTLE_S", 0.02)
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_POLL_S", 0.005)
+        unit_shell.replies["bluetooth_on"] = "1"
+        unit_shell.replies["ip -o addr"] = _IP_WITH_AP.replace("ap0", "wlan1")
+        controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
+
+        assert await controller.restore_bluetooth("on")
+        assert not await controller.restore_hotspot(
+            "on",
+            None,
+            radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
+            expected_interface="ap0",
+        )
+
+    async def test_opted_in_zlink_restore_rejects_an_ap_that_disappears_during_settle(
+        self, unit_shell, monkeypatch
+    ):
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_SETTLE_S", 0.02)
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_POLL_S", 0.005)
+        unit_shell.replies["bluetooth_on"] = "1"
+        unit_shell.replies["ip -o addr"] = [_IP_WITH_AP, _IP_NO_AP]
+        controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
+
+        assert await controller.restore_bluetooth("on")
+        assert not await controller.restore_hotspot(
+            "on",
+            None,
+            radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
+            expected_interface="ap0",
+        )
+
+    async def test_opted_in_zlink_restore_restarts_stability_after_an_ap_flap(
+        self, unit_shell, monkeypatch
+    ):
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_SETTLE_S", 0.02)
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_POLL_S", 0.002)
+        unit_shell.replies["bluetooth_on"] = "1"
+        unit_shell.replies["ip -o addr"] = [_IP_WITH_AP, _IP_NO_AP, _IP_WITH_AP]
+        controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
+
+        assert await controller.restore_bluetooth("on")
+        assert await controller.restore_hotspot(
+            "on",
+            None,
+            radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
+            expected_interface="ap0",
+        )
+        assert len(_issued(unit_shell.commands, "ip -o addr")) >= 3
 
     async def test_empty_or_unparseable_inventory_is_unknown_not_proven_off(self, unit_shell):
         unit_shell.replies["ip -o addr"] = "diagnostic noise without an address"

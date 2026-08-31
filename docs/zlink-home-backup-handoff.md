@@ -26,6 +26,28 @@ identifiers and credentials are deliberately omitted.
   This proves hardware/framework concurrency, not which path Zlink chooses or whether it
   allows Android to autojoin the home network promptly during a session.
 
+The package actions above are discovery evidence only. Their active-session value
+contract, receiver permissions and restoration effect have not been physically validated,
+so unattended backup recovery does not call them.
+
+## Current bounded radio quieting
+
+The experimental server-side option **Let Bluetooth re-arm the Zlink hotspot after
+copying** addresses the narrower case where the approved production package path and
+version are already on the home network. It does not perform the CarPlay-to-home handoff
+described below.
+
+The OBD logger first finalises its current sample and drive, exports and verifies the
+immutable bundle, checkpoints its database and closes BLE. The server then persists a
+credential-free recovery capsule, arms an on-unit deadline watchdog, forces Bluetooth and
+the separate hotspot off, and verifies both effects. Restoration enables Bluetooth and
+requires the same captured AP interface to remain continuously present through a final stability window before
+clearing either recovery state or the logger request. This relies only on the observed
+Bluetooth-to-AP return behavior; it does not claim Zlink AP ownership, send `DISCONNECT`,
+`POWER_ON`, `POWER_OFF`, toggle STA WiFi or invent a hotspot password. A unit reboot can
+end the shell watchdog, but it cannot discard the Android logger's durable quiesce lease or
+the server's recovery row; reconciliation resumes when the same unit is reachable.
+
 ## Current home-network facts
 
 The unit already autojoins a saved, non-ephemeral 5 GHz network and negotiates the radio's
@@ -56,8 +78,8 @@ durable radio transition.
 
 1. Require the logger's stable engine-stopped verdict. ACC-off may be an early hint only
    after it is physically re-correlated on the normal vehicle supply.
-2. Record whether Zlink reported an active connection and arm a durable local restoration
-   marker.
+2. Finalise/export the OBD drive, checkpoint it, close BLE, then record whether Zlink
+   reported an active connection and arm a durable local restoration marker.
 3. Send the package-scoped `com.zjinnova.zlink.action.DISCONNECT` broadcast. Do not spoof
    the vendor's global `acc_disconnect` event and do not force-stop Zlink.
 4. For at most five seconds, verify the Zlink connection state becomes disconnected and

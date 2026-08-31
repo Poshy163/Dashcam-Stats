@@ -1690,6 +1690,7 @@ class TestARunEndToEnd:
                 return True
 
         async def begin(**_kwargs):
+            assert _kwargs["allow_zlink_rearm"] is True
             events.append("transition-claimed")
             return Transition()
 
@@ -1706,7 +1707,12 @@ class TestARunEndToEnd:
         monkeypatch.setattr(puller, "verified_bundle_matches", verified)
         monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
         monkeypatch.setattr(puller, "_move", move)
-        await self._enable(**{"ingest.quiet_radios": True})
+        await self._enable(
+            **{
+                "ingest.quiet_radios": True,
+                "ingest.zlink_hotspot_rearm": True,
+            }
+        )
 
         result = await puller.run_pull(trigger="manual")
 

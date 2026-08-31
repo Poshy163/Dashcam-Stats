@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import time
 import uuid
@@ -30,9 +31,19 @@ REQUEST_ACTION = "prepare_for_ingest"
 DEFAULT_TIMEOUT_S = 30.0
 POLL_INTERVAL_S = 0.25
 MAX_CONTROL_BYTES = 4096
+MAX_HOLD_S = 600.0
 
 _SAFE_REMOTE_PATH = re.compile(r"^/[A-Za-z0-9._/-]{1,511}$")
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_REQUEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "request_id",
+        "action",
+        "requested_at_utc",
+        "deadline_at_utc",
+    }
+)
 _ACK_KEYS = frozenset(
     {
         "schema_version",
@@ -190,6 +201,74 @@ def parse_ack(raw: str, request_id: str) -> LoggerAck:
     )
 
 
+def _parse_request_deadline(raw: str, request_id: str) -> datetime:
+    if not raw or len(raw.encode("utf-8")) > MAX_CONTROL_BYTES:
+        raise LoggerControlError("logger request is empty or too large")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise LoggerControlError("logger request is invalid JSON") from exc
+    if not isinstance(value, dict) or set(value) != _REQUEST_KEYS:
+        raise LoggerControlError("logger request does not match schema v1")
+    if (
+        value.get("schema_version") != 1
+        or value.get("request_id") != request_id
+        or value.get("action") != REQUEST_ACTION
+    ):
+        raise LoggerControlError("logger request does not match the active request")
+    requested_text = _parse_utc(value.get("requested_at_utc")) or ""
+    deadline_text = _parse_utc(value.get("deadline_at_utc")) or ""
+    requested = datetime.fromisoformat(requested_text.replace("Z", "+00:00"))
+    deadline = datetime.fromisoformat(deadline_text.replace("Z", "+00:00"))
+    duration_s = (deadline - requested).total_seconds()
+    if duration_s < 1.0 or duration_s > MAX_HOLD_S:
+        raise LoggerControlError("logger request lease duration is outside the bounded range")
+    return deadline
+
+
+async def verify_quiesce(
+    address: str,
+    status_path: str,
+    request_id: str,
+    *,
+    minimum_remaining_s: float,
+) -> LoggerAck:
+    """Prove the exact request/ack pair still covers the coming radio-off window."""
+
+    if not _SAFE_REQUEST_ID.fullmatch(request_id):
+        raise LoggerControlError("logger request id is unsafe")
+    minimum_remaining_s = float(minimum_remaining_s)
+    if (
+        not math.isfinite(minimum_remaining_s)
+        or minimum_remaining_s < 0
+        or minimum_remaining_s > MAX_HOLD_S
+    ):
+        raise LoggerControlError("required logger lease coverage is outside the bounded range")
+    paths = control_paths(status_path)
+
+    async def read(path: str) -> str:
+        return await adb.shell(
+            address,
+            f"[ -f '{path}' ] && [ ! -L '{path}' ] && "
+            f"head -c {MAX_CONTROL_BYTES + 1} '{path}'; exit 0",
+            timeout=6.0,
+        )
+
+    request_raw = await read(paths.request)
+    deadline = _parse_request_deadline(request_raw, request_id)
+    ack = parse_ack(await read(paths.ack), request_id)
+    if not ack.ready:
+        raise LoggerControlError("logger is no longer ready for ingestion")
+    # Re-read the request after the ACK so expiry/removal/replacement during the check
+    # cannot leave a stale acknowledgement looking authoritative.
+    if await read(paths.request) != request_raw:
+        raise LoggerControlError("logger request changed while its lease was verified")
+    remaining_s = (deadline - datetime.now(UTC)).total_seconds()
+    if remaining_s < minimum_remaining_s:
+        raise LoggerControlError("logger quiesce lease does not cover radio recovery")
+    return ack
+
+
 async def _remove_files(address: str, paths: ControlPaths) -> bool:
     await adb.shell(
         address,
@@ -228,7 +307,7 @@ async def request_quiesce(
     deadline instead of remaining paused indefinitely.
     """
     timeout_s = max(1.0, min(float(timeout_s), 120.0))
-    hold_s = timeout_s if hold_s is None else max(timeout_s, min(float(hold_s), 600.0))
+    hold_s = timeout_s if hold_s is None else max(timeout_s, min(float(hold_s), MAX_HOLD_S))
     request_id = request_id or str(uuid.uuid4())
     if not _SAFE_REQUEST_ID.fullmatch(request_id):
         raise LoggerControlError("logger request id is unsafe")
@@ -301,4 +380,5 @@ __all__ = [
     "request_quiesce",
     "resume_logger",
     "supports_quiesce",
+    "verify_quiesce",
 ]

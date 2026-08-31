@@ -22,10 +22,12 @@ whose run already restored does nothing.
 
 **Only turn off what can be turned back on.** Bluetooth's state is readable
 (``settings get global bluetooth_on``), so it is toggled freely and only when it was
-actually on. The hotspot is restarted only when it was positively seen serving *and* its
-SSID and passphrase were recovered from ``dumpsys wifi``, because a shell has nowhere
-else to get them and restarting the wrong network — or an open one — is worse than
-leaving it for the next engine start to re-arm.
+actually on. A generic hotspot is restarted only when its exact SSID and passphrase were
+recovered from ``dumpsys wifi``. The production head unit has one narrower opt-in path:
+enabling Bluetooth was observed to be followed by the separate AP returning, so an
+approved Zlink system-package build may use a credential-free recovery capsule. Either
+path has to keep the captured AP interface visible through a final stability window before
+recovery is called complete.
 
 **Believe the effect, never the exit status.** This is the rule the first version of this
 module did not have, and the field found it inside a day: Bluetooth went off and the
@@ -62,6 +64,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -97,6 +100,24 @@ MAX_HOTSPOT_CAPSULE_BYTES = 512
 _SAFE_TRANSITION_ID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 _BOOT_ID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 _DEVICE_SERIAL = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
+
+# On the production head unit, enabling Bluetooth was observed to be followed by its
+# separate soft AP returning a few seconds later. AP ownership was not independently
+# attributed to Zlink, so this exceptional path is explicit opt-in and restricted to the
+# approved system-package path and version. Generic units retain the exact-credentials rule.
+HOTSPOT_RESTORE_EXACT = "exact_config"
+HOTSPOT_RESTORE_BLUETOOTH_REARM = "bluetooth_rearm"
+_HOTSPOT_RESTORE_MODES = {
+    HOTSPOT_RESTORE_EXACT,
+    HOTSPOT_RESTORE_BLUETOOTH_REARM,
+}
+ZLINK_PACKAGE = "com.zjinnova.zlink"
+ZLINK_SUPPORTED_VERSION = "6.1.02"
+ZLINK_SYSTEM_APK_PATH = "package:/system/app/CarZhiJian/CarZhiJian.apk"
+_BLUETOOTH_REARM_CAPSULE = {
+    "schema_version": 2,
+    "restore_mode": HOTSPOT_RESTORE_BLUETOOTH_REARM,
+}
 
 #: Where "something is still turned off" is persisted on this side.
 #:
@@ -160,6 +181,40 @@ def _accepted(reply: str) -> bool:
     return not any(refusal in lowered for refusal in _REFUSALS)
 
 
+@dataclass(frozen=True, slots=True)
+class HotspotRecoveryPlan:
+    """Strict restore material recovered from the on-unit transition capsule."""
+
+    mode: str
+    config: tuple[str, str] | None = field(default=None, repr=False)
+
+
+async def supports_zlink_bluetooth_rearm(address: str) -> bool:
+    """Whether the approved Zlink path and version are installed as a system app.
+
+    Presence alone is insufficient: the observed Bluetooth/AP coupling may change in a
+    vendor update. The server setting remains the operator's separate opt-in.
+    """
+
+    try:
+        reply = await adb.shell(
+            address,
+            f'path="$(pm path {ZLINK_PACKAGE} 2>/dev/null | head -n 1)"; '
+            f'version="$(dumpsys package {ZLINK_PACKAGE} 2>/dev/null | '
+            "sed -n 's/^[[:space:]]*versionName=//p' | head -n 1)" + '"; '
+            'printf \'%s\\n%s\' "$path" "$version"; exit 0',
+            timeout=15.0,
+        )
+    except adb.AdbError:
+        return False
+    lines = [line.strip() for line in reply.splitlines()]
+    return (
+        len(lines) == 2
+        and lines[0] == ZLINK_SYSTEM_APK_PATH
+        and lines[1] == ZLINK_SUPPORTED_VERSION
+    )
+
+
 #: What may be carried back into ``cmd wifi start-softap`` inside single quotes.
 #:
 #: The SSID and passphrase come out of ``dumpsys`` output, which makes them scraped text
@@ -217,9 +272,9 @@ def _parse_softap_config(dump: str) -> tuple[str, str] | None:
     The dump is full of SSIDs — every network the client side has ever seen — so nothing
     is read outside a window anchored on the softap configuration's own markers. Newer
     builds render the SSID as ``WifiSsid{"name"}``, older ones bare; both are accepted.
-    A redacted or oddly-shaped value returns None, which downstream means "stop it but
-    do not promise to start it": restarting the wrong network, or an open one, is worse
-    than leaving the hotspot for the next engine start to re-arm.
+    A redacted or oddly-shaped value returns None. The durable coordinator then leaves a
+    generic AP alone unless the operator explicitly enabled the package-gated Zlink
+    Bluetooth re-arm strategy.
     """
     marker = re.search(r"WifiApConfigStore|mPersistentWifiApConfig|SoftApConfiguration", dump)
     if not marker:
@@ -296,6 +351,7 @@ CONFIRM_INTERVAL_S = 0.5
 #: ~5-second re-arm, with a short poll so an unexpected AP can be stopped promptly.
 HOTSPOT_REARM_SETTLE_S = 6.0
 HOTSPOT_REARM_POLL_S = 0.25
+HOTSPOT_REARM_STABILITY_S = 1.0
 
 
 async def _confirm_bluetooth_on(address: str) -> bool:
@@ -595,6 +651,7 @@ async def _arm_watchdog(
     restore_bluetooth: bool = True,
     hotspot_baseline: str = "unknown",
     hotspot_capsule_path: str | None = None,
+    hotspot_restore_mode: str | None = None,
 ) -> asyncio.subprocess.Process | None:
     """Leave an exact radio-restoration watchdog running on the unit.
 
@@ -613,16 +670,25 @@ async def _arm_watchdog(
         # Compatibility for the legacy RadioQuiet caller: a capsule only exists after it
         # positively observed and stopped a serving AP.
         hotspot_baseline = "on"
-    if hotspot_baseline == "on" and hotspot_capsule_path is None:
+    if hotspot_restore_mode is None and hotspot_capsule_path is not None:
+        hotspot_restore_mode = HOTSPOT_RESTORE_EXACT
+    if hotspot_restore_mode is not None and hotspot_restore_mode not in _HOTSPOT_RESTORE_MODES:
         return None
+    if hotspot_baseline == "on":
+        if hotspot_capsule_path is None or hotspot_restore_mode is None:
+            return None
+        if hotspot_restore_mode == HOTSPOT_RESTORE_BLUETOOTH_REARM and not restore_bluetooth:
+            return None
     restore_commands: list[str] = []
     if restore_bluetooth:
+        # Bluetooth's baseline is captured independently in the durable server row.  A
+        # later-damaged hotspot capsule must not suppress this last-resort recovery.
         restore_commands.append("cmd bluetooth_manager enable || svc bluetooth enable")
     if restore_bluetooth and hotspot_baseline in {"on", "off"}:
         # This vendor stack re-arms its AP a few seconds after Bluetooth is enabled. The
         # final AP action therefore follows that settle period, rather than racing the
         # re-arm and leaving the opposite of the captured baseline behind.
-        restore_commands.append("sleep 5")
+        restore_commands.append(f"sleep {math.ceil(HOTSPOT_REARM_SETTLE_S)}")
     if hotspot_baseline == "off":
         # OFF is distinct from TRANSPORT. stopTethering is safe only because capture
         # classified an AP carrying the ADB target address as transport, and that state
@@ -630,7 +696,11 @@ async def _arm_watchdog(
         # the field unit; the cmd fallback covers rooted/debuggable Android builds.
         restore_commands.append(f"({_STOP_VIA_TETHERING})")
         restore_commands.append("cmd wifi stop-softap >/dev/null 2>&1 || true")
-    elif hotspot_baseline == "on" and hotspot_capsule_path is not None:
+    elif (
+        hotspot_baseline == "on"
+        and hotspot_capsule_path is not None
+        and hotspot_restore_mode == HOTSPOT_RESTORE_EXACT
+    ):
         # The compact JSON capsule was generated from a strict allowlist and read back
         # byte-for-byte before this point. Values are expanded only as quoted argv, so a
         # damaged file cannot become shell syntax. The capsule and recovery flag remain
@@ -713,6 +783,7 @@ class RadioController:
         self._hotspot_rearm_deadline: float | None = None
         self._transport_interface: str | None = None
         self._hotspot_capsule_path: str | None = None
+        self._hotspot_restore_mode: str | None = None
         self._owns = False
 
     def claim(self) -> None:
@@ -773,8 +844,6 @@ class RadioController:
         config: tuple[str, str],
     ) -> str | None:
         """Persist restore-only credentials inside the device's shell boundary."""
-        if not _SAFE_TRANSITION_ID.fullmatch(transition_id):
-            return None
         ssid, passphrase = config
         if not _SAFE_AP_TEXT.fullmatch(ssid) or not _SAFE_AP_TEXT.fullmatch(passphrase):
             return None
@@ -783,6 +852,27 @@ class RadioController:
             ensure_ascii=True,
             separators=(",", ":"),
         )
+        target = await self._persist_hotspot_capsule_body(transition_id, body)
+        if target is not None:
+            self._hotspot_restore_mode = HOTSPOT_RESTORE_EXACT
+        return target
+
+    async def persist_bluetooth_rearm_capsule(self, transition_id: str) -> str | None:
+        """Freeze the opt-in vendor recovery method without storing AP credentials."""
+
+        body = json.dumps(_BLUETOOTH_REARM_CAPSULE, separators=(",", ":"))
+        target = await self._persist_hotspot_capsule_body(transition_id, body)
+        if target is not None:
+            self._hotspot_restore_mode = HOTSPOT_RESTORE_BLUETOOTH_REARM
+        return target
+
+    async def _persist_hotspot_capsule_body(
+        self,
+        transition_id: str,
+        body: str,
+    ) -> str | None:
+        if not _SAFE_TRANSITION_ID.fullmatch(transition_id):
+            return None
         body_size = len(body.encode("utf-8"))
         if "'" in body or body_size > MAX_HOTSPOT_CAPSULE_BYTES:
             return None
@@ -813,7 +903,44 @@ class RadioController:
             return target
         return None
 
+    async def read_hotspot_recovery_plan(self, path: str) -> HotspotRecoveryPlan | None:
+        """Read one strict, versioned recovery capsule without exposing its contents."""
+
+        raw = await self._read_hotspot_capsule(path)
+        if raw is None:
+            return None
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(value, dict):
+            return None
+        if set(value) == {"schema_version", "restore_mode"}:
+            if value == _BLUETOOTH_REARM_CAPSULE:
+                return HotspotRecoveryPlan(HOTSPOT_RESTORE_BLUETOOTH_REARM)
+            return None
+        if set(value) != {"schema_version", "ssid", "passphrase"}:
+            return None
+        ssid = value.get("ssid")
+        passphrase = value.get("passphrase")
+        if (
+            value.get("schema_version") != 1
+            or not isinstance(ssid, str)
+            or not isinstance(passphrase, str)
+            or not _SAFE_AP_TEXT.fullmatch(ssid)
+            or not _SAFE_AP_TEXT.fullmatch(passphrase)
+            or len(passphrase) < 8
+        ):
+            return None
+        return HotspotRecoveryPlan(HOTSPOT_RESTORE_EXACT, (ssid, passphrase))
+
     async def read_hotspot_capsule(self, path: str) -> tuple[str, str] | None:
+        """Compatibility wrapper for callers that understand credential capsules."""
+
+        plan = await self.read_hotspot_recovery_plan(path)
+        return plan.config if plan is not None and plan.mode == HOTSPOT_RESTORE_EXACT else None
+
+    async def _read_hotspot_capsule(self, path: str) -> str | None:
         if not self._valid_capsule_path(path):
             return None
         try:
@@ -828,24 +955,7 @@ class RadioController:
             return None
         if not raw or len(raw.encode("utf-8")) > MAX_HOTSPOT_CAPSULE_BYTES:
             return None
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(value, dict) or set(value) != {"schema_version", "ssid", "passphrase"}:
-            return None
-        ssid = value.get("ssid")
-        passphrase = value.get("passphrase")
-        if (
-            value.get("schema_version") != 1
-            or not isinstance(ssid, str)
-            or not isinstance(passphrase, str)
-            or not _SAFE_AP_TEXT.fullmatch(ssid)
-            or not _SAFE_AP_TEXT.fullmatch(passphrase)
-            or len(passphrase) < 8
-        ):
-            return None
-        return ssid, passphrase
+        return raw
 
     async def remove_hotspot_capsule(self, path: str) -> bool:
         if not self._valid_capsule_path(path):
@@ -862,6 +972,7 @@ class RadioController:
         removed = reply.strip() == "removed"
         if removed and self._hotspot_capsule_path == path:
             self._hotspot_capsule_path = None
+            self._hotspot_restore_mode = None
         return removed
 
     @staticmethod
@@ -884,6 +995,7 @@ class RadioController:
             restore_bluetooth=self._bluetooth_baseline != "off",
             hotspot_baseline=self._hotspot_baseline,
             hotspot_capsule_path=self._hotspot_capsule_path,
+            hotspot_restore_mode=self._hotspot_restore_mode,
         )
         if self._watchdog is None:
             await _remove_flag(self.address)
@@ -975,27 +1087,52 @@ class RadioController:
                 return True
             await asyncio.sleep(min(HOTSPOT_REARM_POLL_S, remaining))
 
-    async def _wait_for_hotspot_rearm(self) -> str | None:
-        """Let an originally-ON AP reappear before explicitly starting a duplicate."""
+    async def _wait_for_hotspot_rearm(
+        self,
+        *,
+        expected_interface: str | None = None,
+    ) -> str | None:
+        """Observe the AP through settle, plus a stable tail for heuristic recovery."""
+
+        stable_since: float | None = None
         while True:
             serving = await _serving_ap(self.address)
-            if serving is None or serving:
-                if serving:
-                    self._hotspot_rearm_deadline = None
-                return serving
+            if serving is None:
+                return None
+            observed_at = time.monotonic()
+            if expected_interface is not None:
+                if serving == expected_interface:
+                    if stable_since is None:
+                        stable_since = observed_at
+                else:
+                    stable_since = None
             deadline = self._hotspot_rearm_deadline
             if deadline is None:
-                return ""
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+                if expected_interface is None or stable_since is None:
+                    return serving
+                deadline = observed_at
+            settle_complete = observed_at >= deadline
+            stability_complete = expected_interface is None or (
+                stable_since is not None and observed_at - stable_since >= HOTSPOT_REARM_STABILITY_S
+            )
+            if settle_complete and stability_complete:
                 self._hotspot_rearm_deadline = None
-                return ""
-            await asyncio.sleep(min(HOTSPOT_REARM_POLL_S, remaining))
+                return serving
+            if settle_complete and expected_interface is not None and stable_since is None:
+                self._hotspot_rearm_deadline = None
+                return serving
+            verify_until = deadline
+            if stable_since is not None:
+                verify_until = max(verify_until, stable_since + HOTSPOT_REARM_STABILITY_S)
+            await asyncio.sleep(min(HOTSPOT_REARM_POLL_S, max(0.0, verify_until - observed_at)))
 
     async def restore_hotspot(
         self,
         baseline: str,
         config: tuple[str, str] | None,
+        restore_mode: str | None = None,
+        *,
+        expected_interface: str | None = None,
     ) -> bool:
         """Restore the observed AP state and verify the effect.
 
@@ -1011,12 +1148,23 @@ class RadioController:
             if baseline == "off":
                 return await self._restore_hotspot_off()
 
-            serving = await self._wait_for_hotspot_rearm()
+            serving = await self._wait_for_hotspot_rearm(
+                expected_interface=(
+                    expected_interface if restore_mode == HOTSPOT_RESTORE_BLUETOOTH_REARM else None
+                )
+            )
             if serving is None:
                 # A lost ADB reply and a proven-empty interface inventory are different
                 # safety facts.  In particular, Bluetooth restoration may have re-armed
                 # this vendor's AP: an unreadable inventory cannot certify the original
                 # OFF baseline and must leave durable recovery armed for the next arrival.
+                return False
+            if restore_mode == HOTSPOT_RESTORE_BLUETOOTH_REARM:
+                # A serving AP alone is insufficient: it could be an unrelated interface
+                # or the old AP briefly observed before a delayed stop completes. Require
+                # the captured interface to remain present through a final stability window.
+                return bool(expected_interface) and serving == expected_interface
+            if restore_mode not in {None, HOTSPOT_RESTORE_EXACT}:
                 return False
             if not config:
                 return False

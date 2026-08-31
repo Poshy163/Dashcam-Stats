@@ -170,10 +170,12 @@ drained) and removed — see "do not repeat these" below.
   Leave it empty.
 - Sleep itself **drops the radio completely** — no ping, no ADB. Extending
   `persist.sys.time.system_sleep` gains nothing for backups; only the *countdown* does.
-- **The hotspot can be stopped but not restored.** `cmd wifi stop-softap` works from the
-  shell user; reading the SSID and passphrase back does not — `is-softap-enabled` answers
-  uid 2000 with a `SecurityException`. Measured before the guard existed: fifteen stops,
-  zero starts. It is now only stopped when its configuration could be read first.
+- **Do not stop the hotspot without a protected recovery strategy.** The unrooted
+  tethering binder can stop it, while the ordinary WiFi command and configuration reads
+  are restricted. Measured before the guard existed: fifteen stops, zero explicit starts.
+  The durable path now requires either an exact configuration capsule or the separately
+  enabled Zlink Bluetooth-rearm capsule, and it must observe the serving AP return before
+  declaring recovery complete.
 - **Suspending early only works once per visit.** `svc power forcesuspend` works, but
   the camera keeps recording after ignition-off and closes a segment about every minute,
   which wakes the unit straight back up. The result is a suspend/resume loop — measured
