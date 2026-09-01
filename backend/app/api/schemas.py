@@ -291,6 +291,19 @@ class LogEntryOut(ApiModel):
     job_id: int | None = None
 
 
+class UnitLogEntryOut(ApiModel):
+    """One filtered line of the head unit's own system log."""
+
+    id: int
+    occurred_at: datetime
+    received_at: datetime
+    pid: int
+    tid: int
+    level: str
+    tag: str
+    message: str
+
+
 class SettingOut(BaseModel):
     key: str
     label: str

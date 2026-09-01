@@ -26,7 +26,7 @@ import contextlib
 import time
 
 from app.core.logging import get_logger
-from app.ingest import adb, health, puller, radio_coordinator, radios
+from app.ingest import adb, health, puller, radio_coordinator, radios, unit_logs
 from app.ingest.models import RunState, UnitInfo, UnitState, ingest_setting
 from app.ingest.status import get_status
 
@@ -93,6 +93,7 @@ class IngestPoller:
         # Local watcher sessions only; the script on the unit keeps running, by design --
         # the app going down is exactly the kind of absence it exists to cover.
         await health.shutdown()
+        await unit_logs.shutdown()
         log.info("ingest poller stopped")
 
     @property
@@ -326,6 +327,7 @@ class IngestPoller:
                     # Cheap and non-destructive, and throttled inside: this is what keeps
                     # the recorder-health card current on a unit that stays present.
                     health.on_unit_present(self._address())
+                    unit_logs.on_unit_present(self._address())
                     await asyncio.sleep(self._interval())
                     continue
 
@@ -372,6 +374,9 @@ class IngestPoller:
                         # the drive the watcher exists to cover. Debounced inside, because
                         # this branch re-runs every tick while the gate holds.
                         health.on_unit_seen(info.address, info.source)
+                        # Same arrival moment, same reason: drain the vendor log the
+                        # unit wrote while it was away, then start a fresh capture.
+                        unit_logs.on_unit_seen(info.address)
                         # The arrival gate: hold the first pull until the unit has been
                         # running long enough to be arriving rather than leaving. A hold
                         # leaves `_was_online` False so the next tick re-checks, and a real
@@ -445,6 +450,7 @@ class IngestPoller:
                     # and then -- what makes the card mean something on a unit parked at
                     # home, where the arrival collect above fires only once.
                     health.on_unit_present(info.address)
+                    unit_logs.on_unit_present(info.address)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

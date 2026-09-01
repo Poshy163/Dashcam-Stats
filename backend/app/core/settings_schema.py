@@ -1240,6 +1240,47 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.unit_health_watch",
     ),
     SettingDef(
+        "ingest.unit_logs",
+        "Collect the head unit's own system log",
+        "bool",
+        True,
+        "ingest",
+        "The unit ships with Android logging switched off entirely, which is why the "
+        "built-in recorder can fail without leaving anything to read. This turns it back "
+        "on and carries home a filtered slice: the recorder's own per-camera frame rate, "
+        "the watchdog, thermal warnings, and card errors from the kernel. The noisy "
+        "camera-tuning tags are silenced on the unit before a line is written, so this "
+        "costs about a megabyte an hour rather than the eighty an unfiltered capture "
+        "would. Nothing is installed — deleting the log files from the unit's temp "
+        "directory removes every trace.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.unit_log_silenced_tags",
+        "Log tags to silence on the unit",
+        "string",
+        "",
+        "ingest",
+        "Comma-separated tags dropped on the unit before they are written, so noise "
+        "never crosses the link. Leave empty for the measured defaults, which silence "
+        "the camera ISP tuning spam (ParamSet, isp_alg_fw) that is otherwise about "
+        "four fifths of everything the unit logs. Add a tag here if your firmware is "
+        "chatty somewhere else; entries with shell metacharacters are ignored.",
+        requires="ingest.unit_logs",
+    ),
+    SettingDef(
+        "ingest.unit_log_status",
+        "What the last unit log collection read",
+        "string",
+        "",
+        "ingest",
+        "How many lines came back from the unit the last time its log was read, and how "
+        "many of those were new. Repeated reads while the car is parked are expected to "
+        "be mostly duplicates — the capture is only cleared when the car arrives.",
+        read_only=True,
+        requires="ingest.unit_logs",
+    ),
+    SettingDef(
         "ingest.radios_pending_restore",
         "Radios awaiting restore",
         "string",

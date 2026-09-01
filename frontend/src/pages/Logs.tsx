@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
 
 import Spinner from '@/components/Spinner'
+import UnitLogView from '@/components/UnitLogView'
 import { EmptyState, ErrorState, PageHeader, Pagination } from '@/components/ui'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
@@ -23,6 +24,7 @@ export default function Logs() {
   const [live, setLive] = useState(false)
   const [expanded, setExpanded] = useState<number | null>(null)
 
+  const source = params.get('source') === 'unit' ? 'unit' : 'server'
   const page = Number(params.get('page') ?? 1)
   const level = params.get('level') ?? ''
   const search = params.get('search') ?? ''
@@ -35,6 +37,18 @@ export default function Logs() {
     setDraft(search)
   }
 
+  const setSource = (value: string) => {
+    const next = new URLSearchParams(params)
+    if (value === 'unit') next.set('source', 'unit')
+    else next.delete('source')
+    // Level and tag vocabularies differ between the two sources (WARNING vs W, logger
+    // vs tag), so carrying a filter across would silently return nothing.
+    next.delete('page')
+    next.delete('level')
+    next.delete('tag')
+    setParams(next)
+  }
+
   const query = useQuery({
     queryKey: ['logs', page, level, search],
     queryFn: () =>
@@ -44,7 +58,9 @@ export default function Logs() {
         level: level || undefined,
         search: search || undefined,
       }),
-    refetchInterval: live ? 5_000 : false,
+    // Don't fetch the server log while the unit log is on screen.
+    enabled: source === 'server',
+    refetchInterval: live && source === 'server' ? 5_000 : false,
   })
 
   /**
@@ -71,15 +87,44 @@ export default function Logs() {
     <div className="space-y-4">
       <PageHeader
         title="Logs"
-        subtitle="Application and processing events. Frame-level detail is deliberately not logged."
+        subtitle={
+          source === 'unit'
+            ? "The head unit's own system log: the built-in recorder, the platform and the kernel."
+            : 'Application and processing events. Frame-level detail is deliberately not logged.'
+        }
         actions={
-          <label className="flex items-center gap-2 text-sm">
-            <input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} />
-            Auto-refresh
-          </label>
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-1 rounded-md bg-surface-sunken p-0.5 text-sm">
+              {[
+                { value: 'server', label: 'Server' },
+                { value: 'unit', label: 'Head unit' },
+              ].map((option) => (
+                <button
+                  key={option.value}
+                  onClick={() => setSource(option.value)}
+                  className={cn(
+                    'rounded px-2 py-1',
+                    source === option.value
+                      ? 'bg-surface text-content shadow-sm'
+                      : 'text-content-muted hover:text-content',
+                  )}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <label className="flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} />
+              Auto-refresh
+            </label>
+          </div>
         }
       />
 
+      {source === 'unit' && <UnitLogView live={live} />}
+
+      {source === 'server' && (
+        <>
       <div className="card flex flex-wrap items-end gap-3 p-3">
         <label>
           <span className="label mb-1 block text-xs">Level</span>
@@ -149,6 +194,8 @@ export default function Logs() {
           total={query.data.total}
           onChange={setPage}
         />
+      )}
+        </>
       )}
     </div>
   )

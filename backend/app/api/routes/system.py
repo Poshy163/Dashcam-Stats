@@ -27,6 +27,7 @@ from app.api.schemas import (
     StatusProcessing,
     StatusStorage,
     StatusTotals,
+    UnitLogEntryOut,
 )
 from app.api.visibility import visible_journey_ids, visible_revision
 from app.auth.service import ensure_credential_loaded
@@ -51,6 +52,7 @@ from app.db.models import (
     RetentionRun,
     TelemetryPoint,
     TrackedObject,
+    UnitLogEntry,
 )
 from app.db.session import current_revision
 from app.hardware.detect import detect_hardware_async
@@ -617,6 +619,67 @@ async def list_logs(
         page_size=page.page_size,
         pages=page.pages(total),
     )
+
+
+@router.get("/unit-logs", response_model=Paginated[UnitLogEntryOut])
+async def list_unit_logs(
+    session: SessionDep,
+    page: PaginationDep,
+    level: str | None = None,
+    tag: str | None = None,
+    search: str | None = Query(None),
+):
+    """The head unit's own system log: the built-in recorder, the platform, the kernel.
+
+    Separate from ``/api/logs`` (this server's log) and from ``/api/obd/events`` (our
+    companion app's structured stream). This is the vendor side, which the firmware ships
+    with logging disabled -- see ``app/ingest/unit_logs.py``.
+    """
+    stmt = select(UnitLogEntry)
+    count_stmt = select(func.count(UnitLogEntry.id))
+    for condition in (
+        (UnitLogEntry.level == level.upper()[:1]) if level else None,
+        (UnitLogEntry.tag == tag) if tag else None,
+        UnitLogEntry.message.ilike(f"%{search}%") if search else None,
+    ):
+        if condition is not None:
+            stmt = stmt.where(condition)
+            count_stmt = count_stmt.where(condition)
+
+    total = int((await session.execute(count_stmt)).scalar() or 0)
+    rows = (
+        (
+            await session.execute(
+                stmt.order_by(UnitLogEntry.occurred_at.desc())
+                .offset(page.offset)
+                .limit(page.page_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return Paginated[UnitLogEntryOut](
+        items=[UnitLogEntryOut.model_validate(r) for r in rows],
+        total=total,
+        page=page.page,
+        page_size=page.page_size,
+        pages=page.pages(total),
+    )
+
+
+@router.get("/unit-logs/tags", summary="Tags present in the collected unit log")
+async def unit_log_tags(session: SessionDep) -> list[dict[str, object]]:
+    """Tag counts, so the UI can offer a filter without scanning every row client-side."""
+    rows = (
+        await session.execute(
+            select(UnitLogEntry.tag, func.count(UnitLogEntry.id))
+            .group_by(UnitLogEntry.tag)
+            .order_by(func.count(UnitLogEntry.id).desc())
+            .limit(50)
+        )
+    ).all()
+    return [{"tag": tag, "count": int(count)} for tag, count in rows]
 
 
 @router.get("/system/hardware")

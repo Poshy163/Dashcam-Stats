@@ -215,6 +215,78 @@ Both cameras are ordinary Camera2 devices (`Number of camera devices: 2`, back +
 are held open by the persistent recorder, so no third-party app can take them. The device
 advertises no concurrent multi-camera support.
 
+## 7a. Logging (disabled in firmware)
+
+**The unit ships with Android logging switched off entirely**, which is the single biggest
+reason the recorder can fail without leaving anything to read:
+
+| Property / service | Shipped value | Meaning |
+| --- | --- | --- |
+| `persist.log.tag` | `S` | Silent. Global suppression of every tag. **Persists across reboot.** |
+| `init.svc.logd` | `stopped` | The log daemon is not running; `logcat` returns `Logcat read failure: No such file or directory` |
+
+Both are reversible from the `shell` user, but by *different* mechanisms and with different
+lifetimes:
+
+```sh
+setprop persist.log.tag ""      # clears suppression; survives reboot
+setprop ctl.start logd          # starts the daemon; does NOT survive reboot
+```
+
+`start logd` proper is refused (`Must be root`); setting `ctl.start` works because the shell
+user holds that permission for this service. Because the `ctl.start` half is not persistent,
+**`logd` has to be restarted after every ignition cycle** — which is why
+`app/ingest/unit_logs.py` re-runs both on every arming rather than once.
+
+### Volume, and why the capture is filtered
+
+Measured live. The buffers are small (256 KiB each, `main` permanently full and wrapping),
+so a poll-the-ring-buffer approach loses almost everything; the capture has to be continuous.
+
+| Filter | Rate | Per hour |
+| --- | --- | --- |
+| `*:W` (warning and above) | ~22 KiB/s | **~80 MB** |
+| Noise tags silenced, `*:E` elsewhere | ~0.34 KiB/s | **~1.2 MB** |
+
+79% of warn-level output is two tags — `ParamSet` and `isp_alg_fw` — the camera ISP printing
+tuning parameters frame by frame. Silencing them **on the unit** (a `TAG:S` filter spec, so
+the line is never written) is what makes collection affordable.
+
+### What is worth keeping
+
+| Tag | Why |
+| --- | --- |
+| `ZQC-CamSubStream0` / `1` | The recorder's real per-camera frame rate (`ObtainYuvRate:16/s.cameraId 0`). A **direct** liveness signal per camera, unlike the newest-file-age heuristic in §4. |
+| `UnisocWatchdog` | Watchdog firing |
+| kernel `mmc` / `FAT-fs` / `blk_update_request` | The card developing errors — what `errors=remount-ro` turns into a silent stop |
+| `ThermalManagerService` | 64-68°C on a desk; worse in a sunlit car |
+| `BatteryService` | Prints `mIsAccCable=true`, a second opinion on ACC state. Silenced by default (~1 line/s) but useful to re-enable when chasing a power-window question. |
+
+### Filterspec gotcha: long tags are silently ignored
+
+**A `TAG:S` entry longer than about 25 characters is accepted on the command line and then
+does nothing.** Measured on this unit: every deny entry of 25 characters or fewer was
+honoured, while both 32-character entries (`SprdActivityDebugConfigsUtilImpl`,
+`vendor.sprd.modules.thm@2.0-impl`) kept appearing at 126 lines per capture despite being
+in the running `logcat` command line.
+
+Two consequences:
+
+- Every **privacy** tag must be kept short enough to be honoured, because those have to be
+  stopped *on the unit* — dropping them after transfer is too late. All six networking tags
+  are 18 characters or fewer, and a test asserts that.
+- The deny list is therefore enforced a **second** time on the server
+  (`unit_logs.drop_silenced`), so a long entry still means what it says.
+
+Do not try to verify this with `log -p e -t "<32-char tag>"`: the `log` command truncates
+the tag it emits, so the probe silently tests a shorter tag than you typed and the filter
+appears to work.
+
+Format note: use `-v threadtime -v year -v UTC`. Plain `threadtime` omits the year and uses
+the unit's local clock, so a parser would have to guess both; the modifiers make every line
+absolute. `logcat` also does its own bounded rotation (`-f FILE -r KIB -n COUNT`), so no
+shell script is needed to cap the file.
+
 ## 8. Update / telemetry endpoints
 
 `com.abfota.systemUpdate` is a rebadged **Redstone FOTA SDK** (`com.redstone.ota.sdk`,

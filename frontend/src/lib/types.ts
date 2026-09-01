@@ -400,6 +400,27 @@ export interface LogEntry {
   jobId: number | null
 }
 
+/**
+ * One filtered line of the head unit's OWN system log (the built-in recorder, the
+ * platform, the kernel) -- distinct from `LogEntry`, which is this server's log, and
+ * from the OBD app's structured event stream.
+ */
+export interface UnitLogEntry {
+  id: number
+  occurredAt: string
+  receivedAt: string
+  pid: number
+  tid: number
+  level: string
+  tag: string
+  message: string
+}
+
+export interface UnitLogTag {
+  tag: string
+  count: number
+}
+
 export type SettingType = 'bool' | 'int' | 'float' | 'string' | 'select' | 'path' | 'bytes'
 
 export interface SettingDef {

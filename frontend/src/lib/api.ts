@@ -10,14 +10,12 @@ import type {
   AuthSession,
   AuthState,
   Heatmap,
-  OsdDebug,
   HeatmapFilters,
-  RouteFilters,
-  Routes,
   Job,
   Journey,
   JourneyDetail,
   LogEntry,
+  OsdDebug,
   Paginated,
   Plate,
   PlateObservation,
@@ -25,6 +23,8 @@ import type {
   Recording,
   ReprocessResult,
   RetentionPlan,
+  RouteFilters,
+  Routes,
   SafetyReport,
   SearchResults,
   SettingCategory,
@@ -32,6 +32,8 @@ import type {
   TelemetryPoint,
   TelemetryQuality,
   TrackedObject,
+  UnitLogEntry,
+  UnitLogTag,
   Vehicle,
 } from './types'
 
@@ -765,8 +767,13 @@ export const api = {
     history: (query?: Query) => request<Paginated<unknown>>('/retention/history', { query }),
   },
 
-  logs: {
-    list: (query?: Query) => request<Paginated<LogEntry>>('/logs', { query }),
+  logs: {
+    list: (query?: Query) => request<Paginated<LogEntry>>('/logs', { query }),
+  },
+
+  unitLogs: {
+    list: (query?: Query) => request<Paginated<UnitLogEntry>>('/unit-logs', { query }),
+    tags: () => request<UnitLogTag[]>('/unit-logs/tags'),
   },
 
   search: (q: string) => request<SearchResults>('/search', { query: { q } }),

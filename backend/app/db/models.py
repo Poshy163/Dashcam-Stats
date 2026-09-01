@@ -1090,6 +1090,34 @@ class OBDLoggerEvent(Base):
     )
 
 
+class UnitLogEntry(Base):
+    """A filtered line of the head unit's own system log.
+
+    Distinct from :class:`OBDLoggerEvent`, which is our companion app's structured
+    lifecycle stream.  This is the *vendor* side: the built-in recorder, the kernel and
+    the platform services, whose logging the firmware ships switched off entirely
+    (``persist.log.tag=S``, no ``logd``).  See :mod:`app.ingest.unit_logs` for why the
+    capture is aggressively filtered rather than wholesale.
+
+    ``line_hash`` is unique because the parked refresh re-reads the same tail every
+    minute; letting the index absorb that keeps the repeated read free.
+    """
+
+    __tablename__ = "unit_log_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    occurred_at: Mapped[datetime] = mapped_column(UtcDateTime, index=True)
+    received_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, index=True)
+    pid: Mapped[int] = mapped_column(Integer)
+    tid: Mapped[int] = mapped_column(Integer)
+    level: Mapped[str] = mapped_column(String(1), index=True)
+    tag: Mapped[str] = mapped_column(String(64), index=True)
+    message: Mapped[str] = mapped_column(Text)
+    line_hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+    __table_args__ = (Index("ix_unit_log_entries_tag_time", "tag", "occurred_at"),)
+
+
 class AppSetting(Base):
     """UI-editable configuration. Values are JSON so types survive round-tripping."""
 
