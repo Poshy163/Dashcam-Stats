@@ -294,6 +294,16 @@ export interface OBDLoggerStatus {
     | string
   headUnitState?: 'awake' | 'sleep_requested' | 'asleep' | 'unknown' | string
   voltageOnlyMode?: boolean
+  wifiConnected?: boolean
+  accStateKnown?: boolean
+  accOn?: boolean
+  ingestionSleepHoldKnown?: boolean
+  ingestionSleepHold?: boolean
+  sleepWindowPolicy?: string
+  sleepWindowTargetS?: number | null
+  sleepWindowObservedS?: number | null
+  sleepWindowVerified?: boolean
+  sleepWindowError?: string | null
   currentDriveId?: string | null
   lastDriveId?: string | null
   lastDriveFinishedAtUtc?: string | null
@@ -501,6 +511,15 @@ export interface OBDDriveSeries {
 export interface OBDStatus {
   logger: OBDLoggerStatus | null
   loggerCheckedAt: string | null
+  eventStream: {
+    available: boolean
+    checkedAt: string | null
+    lastReceivedAt: string | null
+    accepted: number
+    duplicates: number
+    sequenceGap: number
+    lastError: string | null
+  }
   waitingOnUnit: number
   currentBundleCopy: string | null
   lastCopyAt: string | null
@@ -519,6 +538,35 @@ export interface OBDStatus {
   lastImportError: string | null
   importsLastHour: number
   workerRunning: boolean
+}
+
+export interface OBDLoggerEvent {
+  sequence: number
+  occurredAt: string
+  receivedAt: string
+  kind:
+    | 'app.boot'
+    | 'app.service'
+    | 'network.wifi'
+    | 'power.sleep_window'
+    | 'obd.ble_connection'
+    | 'obd.elm_session'
+    | 'obd.ecu_session'
+    | 'obd.poll_health'
+    | 'drive.lifecycle'
+    | 'ingest.handoff'
+    | 'radio.observation'
+    | 'bundle.export'
+    | 'receipt.verification'
+    | string
+  level: 'info' | 'warning' | 'error'
+  outcome: string
+  reasonCode: string | null
+  driveId: string | null
+  metrics: Record<string, number>
+  appVersionName: string
+  appVersionCode: number
+  buildGitSha: string
 }
 
 export interface RecordingFilters extends Query {
@@ -652,6 +700,7 @@ export const api = {
 
   obd: {
     status: () => request<OBDStatus>('/obd/status'),
+    events: (query?: Query) => request<Paginated<OBDLoggerEvent>>('/obd/events', { query }),
     bundles: (query?: Query) => request<Paginated<OBDBundle>>('/obd/bundles', { query }),
     drives: (query?: Query) => request<Paginated<OBDDriveSummary>>('/obd/drives', { query }),
     drivesSummary: () => request<OBDDrivesTotals>('/obd/drives/summary'),

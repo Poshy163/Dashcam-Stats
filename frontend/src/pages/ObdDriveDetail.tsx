@@ -1,9 +1,10 @@
 import { useMemo, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router-dom'
 import type { PointerEvent as ReactPointerEvent } from 'react'
 
 import Spinner from '@/components/Spinner'
+import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
 import { EmptyState, ErrorState, PageHeader, StatTile } from '@/components/ui'
 import { api, type OBDSeriesSample } from '@/lib/api'
 import { formatDateTime, formatDuration, formatRelative, formatSpeed, formatTime } from '@/lib/format'
@@ -489,6 +490,16 @@ export default function ObdDriveDetail() {
     queryFn: () => api.obd.driveSeries(driveId ?? ''),
     enabled: Boolean(driveId),
   })
+  const appEvents = useInfiniteQuery({
+    queryKey: ['obd-app-events', driveId],
+    queryFn: ({ pageParam }) => api.obd.events({ driveId, page: pageParam, pageSize: 100 }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) =>
+      lastPage.page < lastPage.pages ? lastPage.page + 1 : undefined,
+    enabled: Boolean(driveId),
+  })
+  const appEventItems = appEvents.data?.pages.flatMap((page) => page.items) ?? []
+  const appEventTotal = appEvents.data?.pages[0]?.total ?? 0
 
   const elapsedS = useMemo(() => {
     const samples = query.data?.samples ?? []
@@ -1017,6 +1028,47 @@ export default function ObdDriveDetail() {
             </tbody>
           </table>
         </div>
+      )}
+
+      {(appEvents.isPending || appEvents.isError || appEventItems.length > 0) && (
+        <section className="card overflow-hidden" aria-label="App-owned drive activity">
+          <div className="border-b border-border p-4">
+            <h2 className="section-title">Logger lifecycle</h2>
+            <p className="mt-1 text-xs text-content-muted">
+              First-sample, handoff, export, and receipt timings recorded by the head-unit app
+              for this drive.
+            </p>
+          </div>
+          <div className="p-4">
+            {appEvents.isPending ? (
+              <Spinner label="Loading logger lifecycle" className="py-8" />
+            ) : appEvents.isError ? (
+              <ErrorState error={appEvents.error} retry={() => appEvents.refetch()} />
+            ) : (
+              <>
+                <ObdAppEventTimeline events={appEventItems} linkDrives />
+                {appEventTotal > 0 && (
+                  <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4 text-xs text-content-faint">
+                    <span>
+                      Showing {appEventItems.length.toLocaleString()} of{' '}
+                      {appEventTotal.toLocaleString()} retained drive events
+                    </span>
+                    {appEvents.hasNextPage && (
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={appEvents.isFetchingNextPage}
+                        onClick={() => appEvents.fetchNextPage()}
+                      >
+                        {appEvents.isFetchingNextPage ? 'Loading…' : 'Load earlier activity'}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </section>
       )}
     </div>
   )

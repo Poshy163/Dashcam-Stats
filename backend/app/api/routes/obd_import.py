@@ -17,6 +17,7 @@ from app.db.models import (
     OBDBundleState,
     OBDDiagnostic,
     OBDDrive,
+    OBDLoggerEvent,
     OBDSample,
     utcnow,
 )
@@ -30,11 +31,17 @@ from app.ingest.ha_import_queue import (
     restore_from_quarantine,
 )
 from app.ingest.obd_bundle import (
+    SAFE_DRIVE_ID,
     BundleError,
     bundle_path_for,
     file_sha256,
     store_validated_bundle,
     validate_bundle,
+)
+from app.ingest.obd_events import (
+    EVENT_KINDS,
+    EVENT_LEVELS,
+    get_logger_event_status,
 )
 from app.ingest.obd_reconciliation import (
     SIGNALS,
@@ -94,6 +101,24 @@ def _bundle(row: OBDBundle) -> dict[str, object]:
         "imported_at": row.imported_at.isoformat() if row.imported_at else None,
         "duplicate": row.duplicate,
         "warnings": row.validation_warnings or [],
+    }
+
+
+def _logger_event(row: OBDLoggerEvent) -> dict[str, object]:
+    """Public app evidence; hashed producer/session identities stay server-side."""
+    return {
+        "sequence": row.sequence,
+        "occurred_at": row.occurred_at.isoformat(),
+        "received_at": row.received_at.isoformat(),
+        "kind": row.kind,
+        "level": row.level,
+        "outcome": row.outcome,
+        "reason_code": row.reason_code,
+        "drive_id": row.drive_id,
+        "metrics": row.metrics_json or {},
+        "app_version_name": row.app_version_name,
+        "app_version_code": row.app_version_code,
+        "build_git_sha": row.build_git_sha,
     }
 
 
@@ -582,6 +607,7 @@ async def obd_status(session: SessionDep) -> dict[str, object]:
     transfer = get_obd_transfer_status().snapshot()
     return {
         **transfer,
+        "event_stream": get_logger_event_status().snapshot(),
         "home_assistant_authentication": auth,
         "home_assistant_configuration_error": auth_error,
         "counts": counts,
@@ -607,6 +633,73 @@ async def obd_status(session: SessionDep) -> dict[str, object]:
         "last_import_error": last_error.last_error if last_error else None,
         "imports_last_hour": imported_last_hour,
         "worker_running": get_import_worker().running,
+    }
+
+
+@router.get("/events", summary="List privacy-safe lifecycle events mirrored from the OBD app")
+async def list_logger_events(
+    session: SessionDep,
+    page: PaginationDep,
+    drive_id: str | None = Query(None, min_length=1, max_length=64),
+    kind: str | None = Query(None, min_length=1, max_length=32),
+    level: str | None = Query(None, min_length=1, max_length=8),
+    since: datetime | None = Query(None),
+) -> dict[str, object]:
+    if drive_id is not None and not SAFE_DRIVE_ID.fullmatch(drive_id):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid OBD drive id")
+    if kind is not None and kind not in EVENT_KINDS:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unknown app event kind")
+    if level is not None and level not in EVENT_LEVELS:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unknown app event level")
+    if since is not None:
+        if since.tzinfo is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Event time filter must include a timezone",
+            )
+        try:
+            since = since.astimezone(UTC)
+        except (OverflowError, ValueError) as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Event time filter is outside the supported range",
+            ) from exc
+        if since < datetime(2020, 1, 1, tzinfo=UTC) or since > utcnow() + timedelta(days=1):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Event time filter is outside the supported range",
+            )
+
+    filters = [
+        OBDLoggerEvent.drive_id == drive_id if drive_id is not None else None,
+        OBDLoggerEvent.kind == kind if kind is not None else None,
+        OBDLoggerEvent.level == level if level is not None else None,
+        OBDLoggerEvent.occurred_at >= since if since is not None else None,
+    ]
+    predicates = [item for item in filters if item is not None]
+    query = select(OBDLoggerEvent)
+    count_query = select(func.count(OBDLoggerEvent.id))
+    if predicates:
+        query = query.where(*predicates)
+        count_query = count_query.where(*predicates)
+    total = int((await session.execute(count_query)).scalar() or 0)
+    rows = (
+        (
+            await session.execute(
+                query.order_by(OBDLoggerEvent.occurred_at.desc(), OBDLoggerEvent.id.desc())
+                .offset(page.offset)
+                .limit(page.page_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "items": [_logger_event(row) for row in rows],
+        "total": total,
+        "page": page.page,
+        "page_size": page.page_size,
+        "pages": page.pages(total),
     }
 
 

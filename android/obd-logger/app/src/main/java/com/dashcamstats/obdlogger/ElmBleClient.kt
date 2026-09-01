@@ -22,6 +22,7 @@ import java.time.Instant
 import java.util.UUID
 
 open class ElmException(message: String) : RuntimeException(message)
+class ElmConnectionTimeoutException(message: String) : ElmException(message)
 class ElmCommandTimeoutException(message: String) : ElmException(message)
 class ElmQuiesceRequestedException : ElmException("ingestion quiesce requested")
 class ElmCommandRejectedException(message: String) : ElmException(message)
@@ -98,6 +99,12 @@ class ElmBleClient(
                 connection?.completeExceptionally(ElmException("could not start GATT discovery"))
             } else if (newState == BluetoothProfile.STATE_CONNECTED) {
                 gattConnected = true
+                // Advisory only: the cheap UART bridge still owns the real serial throughput,
+                // but a shorter BLE connection interval reduces avoidable fragment/write delay.
+                // Failure is harmless and must not invalidate an otherwise usable GATT link.
+                runCatching {
+                    gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                }
                 metrics.gattConnectionEstablished()
             }
         }
@@ -213,7 +220,9 @@ class ElmBleClient(
         } catch (_: TimeoutCancellationException) {
             metrics.connectionFailed()
             disconnect(false)
-            throw ElmException("BLE connection timed out; adapter may have another owner")
+            throw ElmConnectionTimeoutException(
+                "BLE connection timed out; adapter may have another owner",
+            )
         } catch (cancelled: CancellationException) {
             disconnect(false)
             throw cancelled

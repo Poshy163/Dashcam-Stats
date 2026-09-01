@@ -157,10 +157,12 @@ constant 12 V, with ACC as a *signal* rather than the power source. On ignition-
 
 The production OBD companion carries the same fixed 900/300-second policy as a
 device-side fallback: Wi-Fi arrival or a valid ingestion request selects 900, while a
-definite Wi-Fi loss with no request selects 300. The server remains authoritative while
+definite Wi-Fi loss with no request selects 300. The policy cannot be disabled. The server
+displays it and both values read-only, coerces older false/override rows back to the fixed
+contract, ignores stale cached toggle values in the puller, and remains authoritative while
 the unit is home and narrows the window only after footage, OBD and radio recovery are
-all proven complete. Keep the two Backup settings aligned with those companion values;
-turning off server-side management does not reconfigure an already-installed APK.
+all proven complete. The three Backup entries are read-only evidence of that contract, not
+controls; there is no independent server-side off switch or duration override.
 
 This is the **only** lever that changes how much footage a park is worth. At 32 MB/s, fifteen
 minutes is ~29 GB. Before it was found the working window was ~40 s, and the conclusion

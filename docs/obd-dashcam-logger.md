@@ -4,7 +4,8 @@ The on-device logger is the Android companion under `android/obd-logger`. It is 
 separate from the server container while using the same version-one bundle contract and the
 existing ADB arrival backup.
 
-The exact producer/validator contract is [obd-bundle-schema-v1.md](obd-bundle-schema-v1.md).
+The exact producer/validator contracts are [obd-bundle-schema-v1.md](obd-bundle-schema-v1.md)
+and [obd-app-event-schema-v1.md](obd-app-event-schema-v1.md).
 
 ## Why it is an APK
 
@@ -28,15 +29,17 @@ Default host-readable paths (verify the removable-volume alias on the physical u
 
 ```text
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/status.json
+/storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/events.json
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/control/ingestion-request.json
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/control/ingestion-ack.json
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/ready/<drive_id>.obd2.zip
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/receipts/<drive_id>.verified.json
 ```
 
-The backup server's `DASHCAM_OBD_REMOTE_READY_DIR`, `DASHCAM_OBD_REMOTE_STATUS_FILE`, and
-`DASHCAM_OBD_REMOTE_RECEIPTS_DIR` settings are overrides for a unit whose app-specific path
-resolves differently. Status schema v5 publishes `ingestion_quiesce_v1`,
+The backup server's `DASHCAM_OBD_REMOTE_READY_DIR`, `DASHCAM_OBD_REMOTE_STATUS_FILE`,
+`DASHCAM_OBD_REMOTE_EVENTS_FILE`, and `DASHCAM_OBD_REMOTE_RECEIPTS_DIR` settings are overrides
+for a unit whose app-specific path resolves differently. Status schema v6 publishes
+`ingestion_quiesce_v1`,
 `voltage_only_audit_v1`, `controlled_voltage_only_mode_v1` and
 `adaptive_sleep_window_v1`, current/last drive identity,
 last sample, pending bundle count, the correlated ingestion request ID and fixed-schema
@@ -53,12 +56,38 @@ These fields are passed through under `logger` by `GET /api/obd/status`. Status 
 address, VIN, credentials, arbitrary command/response payload or ECU telemetry. The only retained
 response text is the validated numeric ATRV token, such as `12.7 V`.
 
-The companion's device-side fallback writes and reads back a 900-second countdown when Wi-Fi
-arrives or a valid ingestion lease is active, and 300 seconds after Wi-Fi is definitely lost with
-no lease. Managed writes use a small bounded retry schedule and never stop OBD collection when the
-vendor property is unavailable. Once an ingestion lease ends while Wi-Fi remains connected, the
-companion observes only: the server owns the final 300-second transition after it has verified
-footage, OBD and radio recovery.
+The `app_event_stream_v1` capability means the app also owns a transition-only event ring. It
+keeps at most 2,048 rows or seven days in its private store and atomically publishes the latest
+512 in `events.json`. The exact document has schema/source/generated time/sequence bounds,
+bounded producer build identity, and an ascending `events` array. Every event contains only a
+persistent sequence, timestamp, random session UUID, an allowlisted kind/level/outcome/reason,
+an optional safe drive ID, and allowlisted finite numeric timing/counter metrics. It has no
+free-form message, hardware/network identifier, raw adapter response or exception text. The
+source UUID is random and app-scoped, not an Android/hardware identity; the server hashes both it
+and the session UUID, deduplicates by source hash plus sequence, and never returns either hash.
+Missing or malformed event telemetry cannot block footage, OBD bundle, receipt or radio recovery.
+The vendor ACC state is sampled every five seconds as a fallback wake edge, in addition to Android
+Bluetooth, screen, user-present and power broadcasts, so a head unit that emits none of those
+broadcasts does not sit through the parked retry interval after ignition-on. The normal
+service-stop record is reserved outside the bounded producer queue and the event worker
+gets a bounded drain window. An abrupt process or power loss can still prevent that final notice;
+the next boot/recovery transition is the durable evidence for that boundary.
+The server retains the validated mirror for 90 days up to 50,000 rows and exposes it through
+`GET /api/obd/events`, the Backup activity timeline and each matching OBD drive page.
+
+The companion writes and reads back a fixed 900-second countdown while Wi-Fi is connected or a
+valid ingestion lease is active, and a fixed 300 seconds otherwise. Known ACC-on state prevents
+the post-ingestion handoff from narrowing an active Wi-Fi window; it does not select 900 seconds
+by itself. This policy is always on: the server exposes it and both values read-only in Settings,
+coerces any older disabled toggle or duration override back to the fixed contract, and never lets
+the puller branch on a stale cached toggle. The two controllers therefore cannot fight over the
+persistent property. Managed writes use a small bounded retry schedule and never stop OBD
+collection when the vendor property is unavailable. A fresh status advertising
+`adaptive_sleep_window_v2` makes request removal the app's safe completion trigger, so the server
+does not race the final 300-second write. Before accepting that evidence, the server directly
+reads the current property; stale status falls through to its verified 300-second fallback write.
+The server still widens to 900 before arrival recovery and uses the same fallback for v1, missing
+or invalid app status.
 
 ## Build, sign and install
 
@@ -173,7 +202,12 @@ out-of-range replies are invalid rather than clamped.
 The single FFF1 command stream is prompt-delimited and bounded. A missing prompt, failed protocol
 search, write uncertainty, overflow, multiple prompts, non-whitespace trailing bytes or an idle
 notification taints the session without carrying bytes into the next command; the service closes GATT and starts again
-with a fresh `ATZ` only after bounded exponential backoff with jitter, capped at five minutes.
+with a fresh `ATZ` only after bounded exponential backoff with jitter, capped at 30 seconds. A
+checksum-valid ECU proof resets that escalation immediately, even though the active drive remains
+inside the same service call. Bluetooth-on, screen-on, user-present and power-connected broadcasts
+interrupt a pending retry or parked-probe wait, while a new ingestion lease preempts either wait
+within 250 ms. This prevents failures from earlier in a long-running service process delaying the
+next post-sleep connection by minutes.
 Sparse diagnostic scans read Modes
 03/07/0A, Mode 01 readiness/MIL, supported Mode 09 calibration evidence, and correctly framed
 Mode 02 freeze-frame number 0 (including explicit empty/no-data evidence). Strict parsing requires
@@ -193,9 +227,12 @@ for historical drives.
 Only transport-level faults (missing prompt, overflow, failed write, disconnect) still taint and
 reconnect, and a fatal fault mid-cycle first persists the partial sample already gathered, marked
 `failed_after_partial`/`partial`, so observed values survive the reconnect.
-The scan is interleaved at one diagnostic command after each committed fast sample, so a slow
-optional ECU response cannot pause the sample loop for an entire multi-command scan. They never
-send Mode 04/08 or clear DTCs.
+The scan is interleaved at no more than one diagnostic command after each committed fast sample.
+It starts only when at least two seconds remain in that cycle's five-second budget; otherwise the
+step stays queued for a later cycle instead of making an existing cadence gap worse. The serial
+adapter can still take longer than that reserve, but an in-flight ELM command is never cancelled
+because doing so would taint prompt ownership and require a reconnect. The scans never send Mode
+04/08 or clear DTCs.
 
 ## Local data and bundle v1
 
@@ -210,8 +247,10 @@ wall clock was corrected backward, and bundle creation is likewise ordered after
 Diagnostics deduplicate only an unchanged consecutive value of the same kind; a real
 `A → B → A` transition keeps all three observations and timestamps. Startup recovery closes an
 orphaned `recording` or `finalising` drive at its final persisted sample timestamp (not at the
-later notice time) and drains every terminal unexported drive before starting another drive. Only
-an actual `BOOT_COMPLETED` launch labels a stale recording `recovered` with `device_restart`;
+later notice time). It then prioritizes the first adapter voltage/ECU check over background ZIP
+repair; terminal unexported drives are drained once the unit is confirmed parked, at the next
+drive terminal, or synchronously before an ingestion acknowledgement. Only an actual
+`BOOT_COMPLETED` launch labels a stale recording `recovered` with `device_restart`;
 ordinary service/process recreation labels it `interrupted` with `process_terminated`, while a
 pre-existing `finalising` marker keeps its original reason. Live connection, command, parser, ingestion, administrative and process
 faults end as `interrupted`; only the engine-off gate produces clean `complete`. Finalisation first

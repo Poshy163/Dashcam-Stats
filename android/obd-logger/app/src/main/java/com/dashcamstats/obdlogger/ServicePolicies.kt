@@ -1,5 +1,7 @@
 package com.dashcamstats.obdlogger
 
+import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.coroutines.withTimeoutOrNull
 import java.time.Instant
 
 enum class ServiceStartupDecision { START, STOP_DISABLED, STOP_PERMISSION_REQUIRED }
@@ -124,10 +126,39 @@ internal class ReconnectAttemptTracker {
     }
 }
 
+internal enum class ParkedObservationBand { BELOW_START, ENGINE_CANDIDATE }
+
+/** Thousands of identical parked probes collapse to one transition event. */
+internal class ParkedObservationEventGate {
+    private var previous: ParkedObservationBand? = null
+
+    fun changed(next: ParkedObservationBand): Boolean {
+        if (next == previous) return false
+        previous = next
+        return true
+    }
+}
+
+internal fun bleConnectionFailureReason(error: Exception): String =
+    if (error is ElmConnectionTimeoutException) "gatt_timeout" else "gatt_error"
+
+internal fun firstSampleTimingMetrics(
+    connectionStartedAtMillis: Long?,
+    driveStartedAtMillis: Long?,
+    observedAtMillis: Long,
+): Map<String, Long> = buildMap {
+    connectionStartedAtMillis?.let {
+        put("first_sample_ms", (observedAtMillis - it).coerceIn(0L, 3_600_000L))
+    }
+    driveStartedAtMillis?.let {
+        put("elapsed_ms", (observedAtMillis - it).coerceIn(0L, 3_600_000L))
+    }
+}
+
 /** Bounded retry delay with jitter so two clients do not remain phase-locked after a conflict. */
 internal class BoundedExponentialBackoff(
     private val baseDelayMillis: Long = 2_000,
-    private val maximumDelayMillis: Long = 300_000,
+    private val maximumDelayMillis: Long = 30_000,
     private val jitterFraction: Double = 0.2,
     private val randomUnit: () -> Double = { kotlin.random.Random.nextDouble() },
 ) {
@@ -151,6 +182,90 @@ internal class BoundedExponentialBackoff(
         val unit = randomUnit().coerceIn(0.0, 1.0)
         val factor = (1.0 - jitterFraction) + (2.0 * jitterFraction * unit)
         return (delay * factor).toLong().coerceIn(1L, maximumDelayMillis)
+    }
+}
+
+/**
+ * One service-lifetime retry policy whose escalation ends as soon as the adapter/ECU path proves
+ * useful again. A live drive can span several reconnects, so waiting for runOneConnection() to
+ * return before resetting would incorrectly carry old failures forward for the rest of the drive.
+ */
+internal class ConnectionRetryController(
+    private val backoff: BoundedExponentialBackoff = BoundedExponentialBackoff(),
+) {
+    private var consecutiveFailures = 0
+
+    fun failed(): ConnectionFailureDecision {
+        consecutiveFailures = (consecutiveFailures + 1).coerceAtMost(1_000_000)
+        return ConnectionFailureDecision(
+            delayMillis = backoff.nextDelayMillis(),
+            consecutiveFailures = consecutiveFailures,
+        )
+    }
+
+    fun progressConfirmed() {
+        backoff.reset()
+        consecutiveFailures = 0
+    }
+
+    fun externalWakeObserved() = backoff.reset()
+}
+
+internal data class ConnectionFailureDecision(
+    val delayMillis: Long,
+    val consecutiveFailures: Int,
+)
+
+internal enum class LoggerWakeReason {
+    BLUETOOTH_ON,
+    SCREEN_ON,
+    USER_PRESENT,
+    POWER_CONNECTED,
+    ACC_ON,
+}
+
+internal fun LoggerWakeReason.eventReasonCode(): String = when (this) {
+    LoggerWakeReason.BLUETOOTH_ON -> "bluetooth_on"
+    LoggerWakeReason.SCREEN_ON -> "screen_on"
+    LoggerWakeReason.USER_PRESENT -> "user_present"
+    LoggerWakeReason.POWER_CONNECTED -> "power_connected"
+    LoggerWakeReason.ACC_ON -> "acc_on"
+}
+
+internal sealed interface InterruptibleWaitResult {
+    data object Elapsed : InterruptibleWaitResult
+    data object Preempted : InterruptibleWaitResult
+    data class Woken(val reason: LoggerWakeReason) : InterruptibleWaitResult
+}
+
+/**
+ * Wait without hiding a newly-created ingestion lease or a head-unit/radio wake transition behind
+ * a retry delay. The monotonic clock keeps suspend time in the deadline on Android and makes the
+ * policy deterministic in JVM tests.
+ */
+internal suspend fun awaitInterruptibleDelay(
+    durationMillis: Long,
+    wakeSignals: ReceiveChannel<LoggerWakeReason>,
+    preempted: () -> Boolean,
+    monotonicMillis: () -> Long,
+    preemptionPollMillis: Long = 250,
+): InterruptibleWaitResult {
+    require(durationMillis >= 0)
+    require(preemptionPollMillis >= 1)
+    val startedAt = monotonicMillis()
+    while (true) {
+        if (preempted()) return InterruptibleWaitResult.Preempted
+        val elapsed = (monotonicMillis() - startedAt).coerceAtLeast(0)
+        val remaining = durationMillis - elapsed
+        if (remaining <= 0) return InterruptibleWaitResult.Elapsed
+        val waitMillis = minOf(preemptionPollMillis, remaining)
+        val received = withTimeoutOrNull(waitMillis) {
+            wakeSignals.receiveCatching()
+        }
+        if (received != null) {
+            val wakeReason = received.getOrNull() ?: return InterruptibleWaitResult.Elapsed
+            return InterruptibleWaitResult.Woken(wakeReason)
+        }
     }
 }
 
@@ -216,6 +331,8 @@ internal fun durableStatusSignature(status: PublicStatus): String = listOf(
     status.headUnitState,
     status.voltageOnlyMode.toString(),
     status.wifiConnected.toString(),
+    status.accStateKnown.toString(),
+    status.accOn.toString(),
     status.ingestionSleepHoldKnown.toString(),
     status.ingestionSleepHold.toString(),
     status.sleepWindowPolicy,
@@ -377,6 +494,7 @@ object RemovableStoragePolicy {
 
 object ObdPollPlan {
     const val VERSION = 3
+    const val TARGET_CYCLE_MILLIS = 5_000L
 
     // ISO 9141 has to serialize every request.  Six fast PIDs plus the rotating work
     // consistently overran the five-second target on the real adapter, producing
@@ -407,5 +525,53 @@ object ObdPollPlan {
         in medium -> 3
         in slow -> 12
         else -> null
+    }
+
+    /**
+     * Optional diagnostic work may only consume the command budget learned from this live ELM
+     * session. This is deliberately not a fixed guess: ISO 9141 response time changes between
+     * adapters and a slow command disables sparse work for the rest of the drive.
+     */
+    fun mayRunSparseDiagnostic(
+        liveCycleElapsedMillis: Long,
+        requiredCommandBudgetMillis: Long,
+    ): Boolean =
+        requiredCommandBudgetMillis in 1..TARGET_CYCLE_MILLIS &&
+            liveCycleElapsedMillis <= TARGET_CYCLE_MILLIS - requiredCommandBudgetMillis
+}
+
+/**
+ * Conservative, connection-local budget for one optional ELM command. Live and diagnostic
+ * command timings feed the same high-water mark. A two-times multiplier plus a fixed margin
+ * accounts for larger multi-frame diagnostic replies without cancelling an in-flight command.
+ * Once a command is slow enough, optional work remains deferred until reconnect.
+ */
+internal class SparseDiagnosticBudgetTracker(
+    private val minimumBudgetMillis: Long = 2_000L,
+    private val maximumBudgetMillis: Long = 6_000L,
+    private val multiplier: Long = 2L,
+    private val marginMillis: Long = 250L,
+) {
+    private var observedWorstMillis = 0L
+
+    init {
+        require(minimumBudgetMillis >= 1)
+        require(maximumBudgetMillis >= minimumBudgetMillis)
+        require(multiplier >= 1)
+        require(marginMillis >= 0)
+    }
+
+    fun observeCommand(durationMillis: Long) {
+        observedWorstMillis = maxOf(observedWorstMillis, durationMillis.coerceAtLeast(1L))
+    }
+
+    fun requiredBudgetMillis(): Long {
+        if (observedWorstMillis == 0L) return maximumBudgetMillis
+        val scaled = if (observedWorstMillis > (Long.MAX_VALUE - marginMillis) / multiplier) {
+            Long.MAX_VALUE
+        } else {
+            observedWorstMillis * multiplier + marginMillis
+        }
+        return scaled.coerceIn(minimumBudgetMillis, maximumBudgetMillis)
     }
 }

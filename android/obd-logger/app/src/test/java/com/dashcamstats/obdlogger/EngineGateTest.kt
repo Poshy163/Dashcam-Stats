@@ -1,5 +1,10 @@
 package com.dashcamstats.obdlogger
 
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -13,6 +18,7 @@ import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class EngineGateTest {
     @Test
     fun recentRpmVetoesDipButSustainedLowVoltageStops() {
@@ -264,6 +270,138 @@ class EngineGateTest {
         assertEquals(2_400L, highJitter.nextDelayMillis())
         repeat(30) { highJitter.nextDelayMillis() }
         assertTrue(highJitter.nextDelayMillis() <= 300_000L)
+    }
+
+    @Test
+    fun liveReconnectProgressAndWakeSignalsResetTheShortRetryBudget() {
+        val controller = ConnectionRetryController(
+            BoundedExponentialBackoff(
+                baseDelayMillis = 2_000,
+                maximumDelayMillis = 30_000,
+                jitterFraction = 0.0,
+            ),
+        )
+        assertEquals(ConnectionFailureDecision(2_000L, 1), controller.failed())
+        assertEquals(ConnectionFailureDecision(4_000L, 2), controller.failed())
+        assertEquals(ConnectionFailureDecision(8_000L, 3), controller.failed())
+
+        // A checksum-valid ECU proof occurs while runOneConnection is still active. It must
+        // reset escalation immediately rather than waiting until the whole drive ends.
+        controller.progressConfirmed()
+        assertEquals(ConnectionFailureDecision(2_000L, 1), controller.failed())
+        repeat(20) { controller.failed() }
+        assertEquals(30_000L, controller.failed().delayMillis)
+
+        controller.externalWakeObserved()
+        val afterWake = controller.failed()
+        assertEquals(2_000L, afterWake.delayMillis)
+        assertTrue(afterWake.consecutiveFailures > 1)
+
+        controller.progressConfirmed()
+        assertEquals(ConnectionFailureDecision(2_000L, 1), controller.failed())
+
+        assertEquals("bluetooth_on", LoggerWakeReason.BLUETOOTH_ON.eventReasonCode())
+        assertEquals("screen_on", LoggerWakeReason.SCREEN_ON.eventReasonCode())
+        assertEquals("user_present", LoggerWakeReason.USER_PRESENT.eventReasonCode())
+        assertEquals("power_connected", LoggerWakeReason.POWER_CONNECTED.eventReasonCode())
+        assertEquals("acc_on", LoggerWakeReason.ACC_ON.eventReasonCode())
+    }
+
+    @Test
+    fun headUnitWakeInterruptsALongReconnectDelay() = runTest {
+        val signals = Channel<LoggerWakeReason>(Channel.CONFLATED)
+        val waiting = async {
+            awaitInterruptibleDelay(
+                durationMillis = 300_000,
+                wakeSignals = signals,
+                preempted = { false },
+                monotonicMillis = { testScheduler.currentTime },
+            )
+        }
+        runCurrent()
+        advanceTimeBy(900)
+        signals.trySend(LoggerWakeReason.BLUETOOTH_ON)
+        runCurrent()
+
+        assertEquals(
+            InterruptibleWaitResult.Woken(LoggerWakeReason.BLUETOOTH_ON),
+            waiting.await(),
+        )
+        assertEquals(900L, testScheduler.currentTime)
+    }
+
+    @Test
+    fun wakeQueuedDuringAFailedAttemptSurvivesIntoTheRetryWait() = runTest {
+        val signals = Channel<LoggerWakeReason>(Channel.CONFLATED)
+        signals.trySend(LoggerWakeReason.ACC_ON)
+
+        val waiting = async {
+            awaitInterruptibleDelay(
+                durationMillis = 30_000,
+                wakeSignals = signals,
+                preempted = { false },
+                monotonicMillis = { testScheduler.currentTime },
+            )
+        }
+        runCurrent()
+
+        assertEquals(InterruptibleWaitResult.Woken(LoggerWakeReason.ACC_ON), waiting.await())
+        assertEquals(0L, testScheduler.currentTime)
+    }
+
+    @Test
+    fun ingestionRequestPreemptsReconnectWaitWithinTheBoundedPollInterval() = runTest {
+        val signals = Channel<LoggerWakeReason>(Channel.CONFLATED)
+        var ingestionRequested = false
+        val waiting = async {
+            awaitInterruptibleDelay(
+                durationMillis = 30_000,
+                wakeSignals = signals,
+                preempted = { ingestionRequested },
+                monotonicMillis = { testScheduler.currentTime },
+                preemptionPollMillis = 250,
+            )
+        }
+        runCurrent()
+        advanceTimeBy(750)
+        ingestionRequested = true
+        advanceTimeBy(250)
+        runCurrent()
+
+        assertEquals(InterruptibleWaitResult.Preempted, waiting.await())
+        assertEquals(1_000L, testScheduler.currentTime)
+
+        assertEquals(
+            InterruptibleWaitResult.Preempted,
+            awaitInterruptibleDelay(
+                durationMillis = 30_000,
+                wakeSignals = signals,
+                preempted = { true },
+                monotonicMillis = { testScheduler.currentTime },
+            ),
+        )
+        assertEquals(1_000L, testScheduler.currentTime)
+    }
+
+    @Test
+    fun exhaustedLiveCycleBudgetDefersSparseDiagnosticWithoutDequeuingIt() {
+        val budget = SparseDiagnosticBudgetTracker()
+        assertEquals(6_000L, budget.requiredBudgetMillis())
+        assertFalse(ObdPollPlan.mayRunSparseDiagnostic(0, budget.requiredBudgetMillis()))
+
+        budget.observeCommand(700)
+        assertEquals(2_000L, budget.requiredBudgetMillis())
+        assertTrue(ObdPollPlan.mayRunSparseDiagnostic(3_000, budget.requiredBudgetMillis()))
+        assertFalse(ObdPollPlan.mayRunSparseDiagnostic(3_001, budget.requiredBudgetMillis()))
+
+        budget.observeCommand(2_900)
+        assertEquals(6_000L, budget.requiredBudgetMillis())
+        assertFalse(ObdPollPlan.mayRunSparseDiagnostic(0, budget.requiredBudgetMillis()))
+
+        val queue = OneStepPerCycleQueue<String>()
+        queue.add("readiness")
+        if (ObdPollPlan.mayRunSparseDiagnostic(0, budget.requiredBudgetMillis())) queue.take(0)
+        assertEquals("readiness", queue.take(1))
     }
 
     @Test
@@ -643,5 +781,45 @@ class EngineGateTest {
         // Defensive clamping also prevents a faulty/regressed monotonic reading from going back.
         elapsed = 12_000L
         assertEquals("2026-08-30T00:00:05.250Z", clock.nowUtc())
+    }
+
+    @Test
+    fun identicalThirtySecondParkedProbesProduceOneTransitionPerBand() {
+        val gate = ParkedObservationEventGate()
+        var events = 0
+
+        // A full day at the default 30-second interval is one event, not 2,880 disk writes.
+        repeat(2_880) {
+            if (gate.changed(ParkedObservationBand.BELOW_START)) events += 1
+        }
+        assertEquals(1, events)
+        if (gate.changed(ParkedObservationBand.ENGINE_CANDIDATE)) events += 1
+        if (gate.changed(ParkedObservationBand.BELOW_START)) events += 1
+        assertEquals(3, events)
+    }
+
+    @Test
+    fun connectionTimeoutReasonRequiresTheStructuredTimeoutType() {
+        assertEquals(
+            "gatt_timeout",
+            bleConnectionFailureReason(ElmConnectionTimeoutException("bounded timeout")),
+        )
+        assertEquals("gatt_error", bleConnectionFailureReason(ElmException("other failure")))
+    }
+
+    @Test
+    fun firstSampleTimingCoversConnectPathAndShorterDriveStartSegment() {
+        assertEquals(
+            mapOf("first_sample_ms" to 2_500L, "elapsed_ms" to 400L),
+            firstSampleTimingMetrics(
+                connectionStartedAtMillis = 1_000L,
+                driveStartedAtMillis = 3_100L,
+                observedAtMillis = 3_500L,
+            ),
+        )
+        assertEquals(
+            3_600_000L,
+            firstSampleTimingMetrics(0L, null, 4_000_000L).getValue("first_sample_ms"),
+        )
     }
 }

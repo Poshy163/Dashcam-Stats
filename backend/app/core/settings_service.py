@@ -37,6 +37,7 @@ from app.config import get_config
 from app.core.logging import get_logger
 from app.core.settings_schema import (
     CATEGORIES,
+    FIXED_SETTING_VALUES,
     SETTINGS,
     SETTINGS_BY_KEY,
     SettingDef,
@@ -364,7 +365,12 @@ def coerce_setting(defn: SettingDef, raw: Any) -> Any:
     coercer = _COERCERS.get(defn.type)
     if coercer is None:  # pragma: no cover - guards a schema typo
         raise SettingValidationError(defn.key, f"unsupported setting type {defn.type!r}")
-    return coercer(defn, raw)
+    value = coercer(defn, raw)
+    # These are compatibility rows for a policy that is now jointly owned by the server
+    # and Android app. Validate the input's type, then collapse every historic or internal
+    # spelling to the one effective value so an old database row cannot re-enable a retired
+    # behavioural branch.
+    return FIXED_SETTING_VALUES.get(defn.key, value)
 
 
 def _as_python_type(key: str, value: Any, type_: type[T]) -> T:

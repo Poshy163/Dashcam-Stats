@@ -17,6 +17,10 @@ from pathlib import Path
 
 from app.config import get_config
 from app.core.logging import get_logger
+from app.core.settings_schema import (
+    INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,
+    INGEST_SLEEP_WINDOW_IDLE_SECONDS,
+)
 from app.core.settings_service import get_settings_service
 from app.ingest import adb, band, elevate, obd_control, origin, radio_coordinator, radios, transport
 from app.ingest.models import (
@@ -30,6 +34,11 @@ from app.ingest.models import (
 )
 from app.ingest.models import (
     ingest_setting as _get,
+)
+from app.ingest.obd_events import (
+    EVENT_SYNC_TIMEOUT_SECONDS,
+    EventSyncResult,
+    sync_remote_events,
 )
 from app.ingest.obd_transfer import (
     get_obd_transfer_status,
@@ -50,6 +59,10 @@ STAGING_DIRNAME = ".ingest_staging"
 # drive.  These retries are deliberately few and remain a background courtesy: no transfer byte
 # waits for them, and the task is cancelled as soon as the transfer ends.
 DISPLAY_RETRY_DELAYS_S = (0.0, 3.0, 10.0)
+APP_OWNED_SLEEP_WINDOW_CAPABILITY = "adaptive_sleep_window_v2"
+APP_OWNED_SLEEP_STATUS_READ_TIMEOUT_S = 6.0
+APP_OWNED_SLEEP_STATUS_MAX_AGE_S = 30.0
+_EVENT_SYNC_AWAIT_GRACE_SECONDS = 0.25
 
 
 async def _show_backup_page_during_transfer(address: str, url: str) -> None:
@@ -119,9 +132,10 @@ async def widen_sleep_window(address: str) -> bool:
     device-side recovery unless the configured value was already present or its write was
     read back successfully.
     """
-    if not bool(_get("manage_sleep_window", False)):
-        return True
-    wanted = int(_get("sleep_window_s", 900))
+    # Fixed contract shared with the Android app. Do not read the live settings cache here:
+    # an upgraded process can briefly retain an old false toggle or explicit duration, and the
+    # persistent vendor property must never leave the app-owned policy or oscillate.
+    wanted = INGEST_SLEEP_WINDOW_ACTIVE_SECONDS
     if await adb.sleep_countdown(address) == wanted:
         return True
     if await adb.set_sleep_countdown(address, wanted):
@@ -142,7 +156,7 @@ async def reconcile_pending_in_awake_window(address: str) -> bool:
         log.warning(
             "radio recovery deferred because the managed awake window could not be verified",
             address=address,
-            seconds=int(_get("sleep_window_s", 900)),
+            seconds=INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,
         )
         return False
     return await radio_coordinator.reconcile_pending(address=address)
@@ -166,16 +180,77 @@ async def close_sleep_window(address: str, *, drained: bool) -> None:
     segment, creating a wake/suspend loop that could land inside an active recording.  A
     verified five-minute countdown saves the battery without forcing that unsafe edge.
     """
-    if not bool(_get("manage_sleep_window", False)) or not address:
+    if not address:
         return
     if not drained:
         return
+    # See widen_sleep_window(): this is a protocol value, not a runtime tuning value.
+    idle = INGEST_SLEEP_WINDOW_IDLE_SECONDS
+
+    # v2 moves the final transition to the component that observes Wi-Fi, ACC and the
+    # ingestion-request file together. Only pay for another bounded ADB read when the
+    # status captured earlier in this visit advertised that contract. Capability alone is
+    # never permission to skip the server fallback: the newly read status must be current,
+    # know ACC, and contain positive property readback evidence from this completion edge.
+    cached_logger = get_obd_transfer_status().snapshot().get("logger")
+    cached_capabilities = (
+        cached_logger.get("capabilities") if isinstance(cached_logger, dict) else None
+    )
+    if (
+        isinstance(cached_capabilities, list)
+        and APP_OWNED_SLEEP_WINDOW_CAPABILITY in cached_capabilities
+    ):
+        try:
+            logger_status = await asyncio.wait_for(
+                read_logger_status(address, get_config().obd_remote_status_file),
+                timeout=APP_OWNED_SLEEP_STATUS_READ_TIMEOUT_S,
+            )
+        except Exception:
+            logger_status = None
+
+        status_is_current = False
+        if isinstance(logger_status, dict):
+            updated_at = logger_status.get("updated_at_utc")
+            if isinstance(updated_at, str):
+                with contextlib.suppress(ValueError, OverflowError):
+                    updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                    if updated.tzinfo is not None:
+                        age_s = (datetime.now(UTC) - updated.astimezone(UTC)).total_seconds()
+                        status_is_current = -5.0 <= age_s <= APP_OWNED_SLEEP_STATUS_MAX_AGE_S
+
+        fresh_capabilities = (
+            logger_status.get("capabilities") if isinstance(logger_status, dict) else None
+        )
+        fresh_v2 = (
+            status_is_current
+            and isinstance(logger_status, dict)
+            and isinstance(logger_status.get("schema_version"), int)
+            and logger_status["schema_version"] >= 6
+            and isinstance(fresh_capabilities, list)
+            and APP_OWNED_SLEEP_WINDOW_CAPABILITY in fresh_capabilities
+        )
+        if fresh_v2 and logger_status.get("acc_state_known") is True:
+            if logger_status.get("acc_on") is True:
+                log.info("left the active sleep window to the OBD app because ACC is on")
+                return
+            if (
+                logger_status.get("acc_on") is False
+                and logger_status.get("sleep_window_target_s") == idle
+                and logger_status.get("sleep_window_observed_s") == idle
+                and logger_status.get("sleep_window_verified") is True
+            ):
+                # status.json may have been republished with an old verified evidence object.
+                # Accept app ownership only when the vendor property agrees *now*; otherwise
+                # continue through the parked server fallback, which writes and verifies it.
+                if await adb.sleep_countdown(address) == idle:
+                    log.info("accepted the OBD app's verified idle sleep window", seconds=idle)
+                    return
+
     if not await adb.is_parked(address):
         # Still being driven. Narrowing the window now would strand the next ignition-off
         # with the short value before anything had a chance to widen it.
         return
 
-    idle = int(_get("sleep_window_idle_s", 300))
     if await adb.sleep_countdown(address) != idle:
         if await adb.set_sleep_countdown(address, idle):
             log.info("restored the head unit's idle sleep window", seconds=idle)
@@ -731,6 +806,27 @@ def _preflight(tracked: list[asyncio.Task], coro) -> asyncio.Task:
     return task
 
 
+async def _await_event_mirror(task: asyncio.Task[EventSyncResult], *, deadline: float) -> None:
+    """Collect event mirroring without allowing observability to gate a backup."""
+    try:
+        # The deadline is captured when the preflight starts, rather than granting a
+        # fresh timeout here after card inventory and logger status have completed.
+        async with asyncio.timeout_at(deadline):
+            await task
+    except TimeoutError:
+        log.warning(
+            "could not mirror OBD app events; backup will continue",
+            error="event mirror deadline exceeded",
+        )
+    except Exception:
+        # The consumer handles expected ADB, validation and storage failures itself.
+        # This final fence keeps a future unexpected regression fail-soft as well.
+        log.warning(
+            "could not mirror OBD app events; backup will continue",
+            error="unexpected event mirror failure",
+        )
+
+
 def start_run(
     *, trigger: str, info: UnitInfo | None = None, continuation: bool = False
 ) -> asyncio.Task[RunResult]:
@@ -887,6 +983,18 @@ async def run_pull(
             preflight,
             read_logger_status(info.address, get_config().obd_remote_status_file),
         )
+        # The Android app owns a transition-only event ring. Mirror its bounded public
+        # projection on every visit, including an otherwise idle one, so boot/reconnect
+        # evidence does not depend on footage or a completed drive being present.
+        obd_events = _preflight(
+            preflight,
+            sync_remote_events(info.address, get_config().obd_remote_events_file),
+        )
+        obd_events_deadline = (
+            asyncio.get_running_loop().time()
+            + EVENT_SYNC_TIMEOUT_SECONDS
+            + _EVENT_SYNC_AWAIT_GRACE_SECONDS
+        )
 
         status.set_phase(Phase.SCANNING)
         sources = [info.source]
@@ -953,6 +1061,7 @@ async def run_pull(
             observed_logger = previous_logger
         else:
             get_obd_transfer_status().set_logger(None)
+        await _await_event_mirror(obd_events, deadline=obd_events_deadline)
 
         # Before the idle return, not after it. A card whose whole contents the library
         # already holds produces exactly that idle run, every window, forever -- so leaving

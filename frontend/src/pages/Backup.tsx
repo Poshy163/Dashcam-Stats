@@ -1,7 +1,9 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 
 import { ObdLoggerCard } from '@/components/ObdLoggerCard'
+import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
+import Spinner from '@/components/Spinner'
 import { EmptyState, ErrorState, PageHeader, ProgressBar, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
 import type {
@@ -236,6 +238,16 @@ export default function Backup() {
     queryFn: () => api.obd.bundles({ pageSize: 10 }),
     refetchInterval: 15_000,
   })
+  const obdEvents = useInfiniteQuery({
+    queryKey: ['obd-app-events'],
+    queryFn: ({ pageParam }) => api.obd.events({ page: pageParam, pageSize: 40 }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) =>
+      lastPage.page < lastPage.pages ? lastPage.page + 1 : undefined,
+    refetchInterval: 10_000,
+  })
+  const obdEventItems = obdEvents.data?.pages.flatMap((page) => page.items) ?? []
+  const obdEventTotal = obdEvents.data?.pages[0]?.total ?? 0
 
   const invalidate = () => {
     client.invalidateQueries({ queryKey: ['ingest-status'] })
@@ -243,6 +255,7 @@ export default function Backup() {
     client.invalidateQueries({ queryKey: ['ingest-radio-status'] })
     client.invalidateQueries({ queryKey: ['obd-status'] })
     client.invalidateQueries({ queryKey: ['obd-bundles'] })
+    client.invalidateQueries({ queryKey: ['obd-app-events'] })
   }
   const pullNow = useMutation({ mutationFn: api.ingest.run, onSuccess: invalidate })
   const cancel = useMutation({ mutationFn: api.ingest.cancel, onSuccess: invalidate })
@@ -259,6 +272,7 @@ export default function Backup() {
   if (status.isError) return <ErrorState error={status.error} retry={() => status.refetch()} />
 
   const data = status.data
+  const eventSequenceGap = obdStatus.data?.eventStream?.sequenceGap ?? 0
   const running = data?.state === 'running'
   const transition = radioStatus.data?.transition
   const recoveryBlocked = !running && transition?.recoveryRequired === true
@@ -660,6 +674,68 @@ export default function Backup() {
             logger={obdStatus.data?.logger}
             checkedAt={obdStatus.data?.loggerCheckedAt}
           />
+
+          <section className="card mb-6 overflow-hidden" aria-label="Head-unit OBD app activity">
+            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border px-5 py-4">
+              <div>
+                <h3 className="font-semibold">Head-unit activity</h3>
+                <p className="mt-0.5 text-sm text-content-muted">
+                  App-owned boot, connection, drive, handoff, and receipt evidence mirrored when
+                  the car reaches home Wi-Fi.
+                </p>
+              </div>
+              <span className="text-xs text-content-faint">
+                {obdStatus.data?.eventStream?.lastReceivedAt
+                  ? `synced ${formatRelative(obdStatus.data.eventStream.lastReceivedAt)}`
+                  : obdEventItems.length > 0
+                    ? 'waiting for the next device sync'
+                  : obdStatus.data?.eventStream?.available
+                    ? 'stream is empty'
+                    : 'waiting for a compatible app'}
+              </span>
+            </div>
+            <div className="p-5">
+              {obdStatus.data?.eventStream?.lastError && (
+                <div className="mb-3 rounded-lg bg-state-warn/10 px-3 py-2 text-sm text-state-warn">
+                  The latest app event snapshot could not be mirrored. Backup and OBD data remain
+                  independent and will retry next visit.
+                </div>
+              )}
+              {eventSequenceGap > 0 && (
+                <div className="mb-3 rounded-lg bg-state-warn/10 px-3 py-2 text-sm text-state-warn">
+                  {eventSequenceGap.toLocaleString()} older app event(s) were no longer in the
+                  device ring before the server could mirror them.
+                </div>
+              )}
+              {obdEvents.isPending ? (
+                <Spinner label="Loading head-unit activity" className="py-8" />
+              ) : obdEvents.isError ? (
+                <ErrorState error={obdEvents.error} retry={() => obdEvents.refetch()} />
+              ) : (
+                <>
+                  <ObdAppEventTimeline events={obdEventItems} />
+                  {obdEventTotal > 0 && (
+                    <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4 text-xs text-content-faint">
+                      <span>
+                        Showing {obdEventItems.length.toLocaleString()} of{' '}
+                        {obdEventTotal.toLocaleString()} retained events
+                      </span>
+                      {obdEvents.hasNextPage && (
+                        <button
+                          type="button"
+                          className="btn"
+                          disabled={obdEvents.isFetchingNextPage}
+                          onClick={() => obdEvents.fetchNextPage()}
+                        >
+                          {obdEvents.isFetchingNextPage ? 'Loading…' : 'Load earlier activity'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </section>
 
           {obdStatus.data?.homeAssistantAuthentication !== 'configured' && (
             <div className="card mb-6 border-state-warn/40 px-5 py-4 text-sm">

@@ -50,12 +50,19 @@ The default device paths are:
 ```text
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/ready
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/status.json
+/storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/events.json
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/receipts
 ```
 
-Confirm all three through ADB on the physical unit before relying on an arrival window. Missing
+Confirm all four through ADB on the physical unit before relying on an arrival window. Missing
 or malformed `status.json` is best-effort status only and never fails bundle or footage
 backup.
+
+`events.json` is a separate optional, atomic and size-bounded app-owned lifecycle snapshot. The
+server starts its read beside the card, bundle and status inventories on every visit, including
+an otherwise idle visit. Missing/invalid files fail soft; valid rows are code-and-number only,
+hashed, deduplicated by app-scoped random source plus sequence and retained independently of
+drive bundles. `DASHCAM_OBD_REMOTE_EVENTS_FILE` overrides the default path.
 
 `status.json` is also read at the start of every footage pull, whether or not a bundle is
 waiting. Schema v3 build identity (`app_version_name`, `app_version_code`,
@@ -167,6 +174,7 @@ The same controls are available over the authenticated API:
 
 ```text
 GET  /api/obd/status
+GET  /api/obd/events?drive_id={drive_id}&kind={kind}&level={level}&since={ISO8601}
 GET  /api/obd/bundles?state=retry_wait
 GET  /api/obd/drives
 GET  /api/obd/drives/{drive_id}/series

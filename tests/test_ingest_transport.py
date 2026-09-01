@@ -21,6 +21,7 @@ import socket
 import tarfile
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1290,10 +1291,28 @@ class TestARunEndToEnd:
             deleted.extend(names)
             return len(names)
 
+        sleep_window = {"seconds": 300}
+
+        async def current_sleep_window(address):
+            assert address == "127.0.0.1:5555"
+            return sleep_window["seconds"]
+
+        async def set_sleep_window(address, seconds):
+            assert address == "127.0.0.1:5555"
+            sleep_window["seconds"] = seconds
+            return True
+
+        async def parked(address):
+            assert address == "127.0.0.1:5555"
+            return True
+
         monkeypatch.setattr(adb, "describe", describe)
         monkeypatch.setattr(adb, "inventory", inventory)
         monkeypatch.setattr(adb, "launch_listener", launch_listener)
         monkeypatch.setattr(adb, "delete", delete)
+        monkeypatch.setattr(adb, "sleep_countdown", current_sleep_window)
+        monkeypatch.setattr(adb, "set_sleep_countdown", set_sleep_window)
+        monkeypatch.setattr(adb, "is_parked", parked)
 
         # The listener chooses its own ephemeral port, so the receiver must be told it.
         real_receive = transport.receive
@@ -1382,13 +1401,7 @@ class TestARunEndToEnd:
         async def forbidden_sleep(_address):
             raise AssertionError("unknown backlog and pending recovery must never sleep the unit")
 
-        await self._enable(
-            **{
-                "ingest.manage_sleep_window": True,
-                "ingest.sleep_window_s": 900,
-                "ingest.sleep_window_idle_s": 300,
-            }
-        )
+        await self._enable()
         monkeypatch.setattr(adb, "sleep_countdown", current_window)
         monkeypatch.setattr(adb, "set_sleep_countdown", set_window)
         monkeypatch.setattr(adb, "sleep_unit", forbidden_sleep)
@@ -3280,12 +3293,95 @@ class TestTheSleepWindowIsManagedNotLeftWide:
     battery pays for it anyway."""
 
     def test_the_policy_defaults_are_fifteen_minutes_active_and_five_minutes_idle(self):
-        from app.core.settings_schema import SETTINGS_BY_KEY
+        from app.core.settings_schema import (
+            INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,
+            INGEST_SLEEP_WINDOW_IDLE_SECONDS,
+            SETTINGS_BY_KEY,
+        )
 
-        assert SETTINGS_BY_KEY["ingest.sleep_window_s"].default == 900
-        assert SETTINGS_BY_KEY["ingest.sleep_window_idle_s"].default == 300
+        active = SETTINGS_BY_KEY["ingest.sleep_window_s"]
+        idle = SETTINGS_BY_KEY["ingest.sleep_window_idle_s"]
+        managed = SETTINGS_BY_KEY["ingest.manage_sleep_window"]
+        assert managed.default is True
+        assert managed.read_only is True
+        assert (active.default, active.minimum, active.maximum) == (
+            INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,
+        ) * 3
+        assert (idle.default, idle.minimum, idle.maximum) == (INGEST_SLEEP_WINDOW_IDLE_SECONDS,) * 3
+        assert active.read_only is True
+        assert idle.read_only is True
 
-    async def test_it_is_widened_only_when_asked_for(self, db_session, monkeypatch):
+    async def test_non_default_internal_input_is_coerced_in_the_current_cache(self, db_session):
+        from app.core.settings_service import get_settings_service
+
+        settings = get_settings_service()
+        stored = await settings.set_many(
+            {
+                "ingest.manage_sleep_window": False,
+                "ingest.sleep_window_s": 42,
+                "ingest.sleep_window_idle_s": 599,
+            },
+            internal=True,
+        )
+
+        assert stored == {
+            "ingest.manage_sleep_window": True,
+            "ingest.sleep_window_s": 900,
+            "ingest.sleep_window_idle_s": 300,
+        }
+        assert settings.get_nowait("ingest.manage_sleep_window") is True
+        assert settings.get_nowait("ingest.sleep_window_s") == 900
+        assert settings.get_nowait("ingest.sleep_window_idle_s") == 300
+
+    async def test_existing_non_default_rows_are_coerced_when_the_cache_reloads(self, db_session):
+        from app.core.settings_service import get_settings_service
+        from app.db.models import AppSetting
+
+        for key, value in {
+            "ingest.manage_sleep_window": False,
+            "ingest.sleep_window_s": 1_800,
+            "ingest.sleep_window_idle_s": 60,
+        }.items():
+            row = await db_session.get(AppSetting, key)
+            if row is None:
+                db_session.add(AppSetting(key=key, value=value))
+            else:
+                row.value = value
+        await db_session.commit()
+
+        settings = get_settings_service()
+        await settings.reload()
+
+        assert settings.get_nowait("ingest.manage_sleep_window") is True
+        assert settings.get_nowait("ingest.sleep_window_s") == 900
+        assert settings.get_nowait("ingest.sleep_window_idle_s") == 300
+
+    async def test_webui_reports_the_policy_as_fixed_and_rejects_edits(self, client):
+        categories = (await client.get("/api/settings")).json()
+        settings = {
+            setting["key"]: setting for category in categories for setting in category["settings"]
+        }
+
+        assert settings["ingest.manage_sleep_window"]["value"] is True
+        assert settings["ingest.manage_sleep_window"]["read_only"] is True
+        assert settings["ingest.sleep_window_s"]["value"] == 900
+        assert settings["ingest.sleep_window_s"]["read_only"] is True
+        assert settings["ingest.sleep_window_idle_s"]["value"] == 300
+        assert settings["ingest.sleep_window_idle_s"]["read_only"] is True
+        response = await client.put(
+            "/api/settings",
+            json={"values": {"ingest.sleep_window_s": 1_800}},
+        )
+        assert response.status_code == 400
+        assert "read-only" in response.text
+        response = await client.put(
+            "/api/settings",
+            json={"values": {"ingest.manage_sleep_window": False}},
+        )
+        assert response.status_code == 400
+        assert "read-only" in response.text
+
+    async def test_the_active_window_is_always_managed(self, db_session, monkeypatch):
         from app.core.settings_service import get_settings_service
         from app.ingest import adb, puller
 
@@ -3303,13 +3399,43 @@ class TestTheSleepWindowIsManagedNotLeftWide:
 
         await get_settings_service().set_many({"ingest.enabled": True})
         assert await puller.widen_sleep_window("u:5555")
-        assert set_to == [], "off by default"
-
-        await get_settings_service().set_many(
-            {"ingest.manage_sleep_window": True, "ingest.sleep_window_s": 900}
-        )
-        assert await puller.widen_sleep_window("u:5555")
         assert set_to == [900]
+
+    async def test_puller_ignores_drifted_values_in_the_live_settings_cache(self, monkeypatch):
+        from app.ingest import adb, puller
+
+        current_window = 300
+        set_to: list[int] = []
+
+        def drifted_setting(key, default=None):
+            return {
+                "manage_sleep_window": False,
+                "sleep_window_s": 1_800,
+                "sleep_window_idle_s": 60,
+            }.get(key, default)
+
+        async def current(_address):
+            return current_window
+
+        async def setter(_address, seconds):
+            nonlocal current_window
+            set_to.append(seconds)
+            current_window = seconds
+            return True
+
+        async def parked(_address):
+            return True
+
+        monkeypatch.setattr(puller, "_get", drifted_setting)
+        monkeypatch.setattr(adb, "sleep_countdown", current)
+        monkeypatch.setattr(adb, "set_sleep_countdown", setter)
+        monkeypatch.setattr(adb, "is_parked", parked)
+        puller.get_obd_transfer_status().set_logger({"capabilities": ["adaptive_sleep_window_v1"]})
+
+        assert await puller.widen_sleep_window("u:5555")
+        await puller.close_sleep_window("u:5555", drained=True)
+
+        assert set_to == [900, 300]
 
     async def test_pending_recovery_waits_for_a_verified_active_window(
         self, db_session, monkeypatch
@@ -3334,9 +3460,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         monkeypatch.setattr(adb, "sleep_countdown", current)
         monkeypatch.setattr(adb, "set_sleep_countdown", setter)
         monkeypatch.setattr(puller.radio_coordinator, "reconcile_pending", reconcile)
-        await get_settings_service().set_many(
-            {"ingest.manage_sleep_window": True, "ingest.sleep_window_s": 900}
-        )
+        await get_settings_service().set_many({"ingest.enabled": True})
 
         assert await puller.reconcile_pending_in_awake_window("u:5555")
         assert events == [
@@ -3373,9 +3497,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         monkeypatch.setattr(adb, "set_sleep_countdown", refused_set)
         monkeypatch.setattr(puller.radio_coordinator, "reconcile_pending", forbidden_reconcile)
         monkeypatch.setattr(puller, "log", CapturingLog())
-        await get_settings_service().set_many(
-            {"ingest.manage_sleep_window": True, "ingest.sleep_window_s": 900}
-        )
+        await get_settings_service().set_many({"ingest.enabled": True})
 
         assert not await puller.reconcile_pending_in_awake_window("u:5555")
         assert events == ["read:u:5555", "set:u:5555:900"]
@@ -3475,6 +3597,9 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         async def parked(address):
             return True
 
+        async def v1_logger_status(address, path):
+            return {"capabilities": ["adaptive_sleep_window_v1"]}
+
         async def forbidden_sleep(address):
             raise AssertionError("the server must let Android's countdown suspend the unit")
 
@@ -3482,13 +3607,13 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         monkeypatch.setattr(adb, "set_sleep_countdown", setter)
         monkeypatch.setattr(adb, "is_parked", parked)
         monkeypatch.setattr(adb, "sleep_unit", forbidden_sleep)
+        monkeypatch.setattr(puller, "read_logger_status", v1_logger_status)
         await get_settings_service().set_many(
             {
                 "ingest.enabled": True,
-                "ingest.manage_sleep_window": True,
-                "ingest.sleep_window_idle_s": 300,
             }
         )
+        puller.get_obd_transfer_status().set_logger({"capabilities": ["adaptive_sleep_window_v1"]})
         await puller.close_sleep_window("u:5555", drained=True)
         assert set_to == [300], "the verified five-minute idle countdown is restored"
 
@@ -3515,6 +3640,9 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         async def parked(address):
             return True
 
+        async def v1_logger_status(address, path):
+            return {"capabilities": ["adaptive_sleep_window_v1"]}
+
         async def forbidden_sleep(address):
             raise AssertionError("a failed idle readback must never trigger forced suspend")
 
@@ -3527,13 +3655,13 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         monkeypatch.setattr(adb, "is_parked", parked)
         monkeypatch.setattr(adb, "sleep_unit", forbidden_sleep)
         monkeypatch.setattr(puller, "log", CapturingLog())
+        monkeypatch.setattr(puller, "read_logger_status", v1_logger_status)
         await get_settings_service().set_many(
             {
                 "ingest.enabled": True,
-                "ingest.manage_sleep_window": True,
-                "ingest.sleep_window_idle_s": 300,
             }
         )
+        puller.get_obd_transfer_status().set_logger({"capabilities": ["adaptive_sleep_window_v1"]})
 
         await puller.close_sleep_window("u:5555", drained=True)
         assert set_to == [300]
@@ -3543,6 +3671,158 @@ class TestTheSleepWindowIsManagedNotLeftWide:
                 {"address": "u:5555", "seconds": 300},
             )
         ]
+
+    async def test_v2_logger_owns_the_final_idle_window(self, db_session, monkeypatch):
+        from app.core.settings_service import get_settings_service
+        from app.ingest import adb, puller
+
+        async def v2_logger_status(address, path):
+            return {
+                "schema_version": 6,
+                "capabilities": ["adaptive_sleep_window_v1", "adaptive_sleep_window_v2"],
+                "acc_state_known": True,
+                "acc_on": False,
+                "sleep_window_target_s": 300,
+                "sleep_window_observed_s": 300,
+                "sleep_window_verified": True,
+                "updated_at_utc": datetime.now(UTC).isoformat(),
+            }
+
+        async def forbidden_parked(address):
+            raise AssertionError("verified v2 evidence must skip the legacy parked probe")
+
+        reads: list[str] = []
+
+        async def current(address):
+            reads.append(address)
+            return 300
+
+        async def forbidden_set(address, seconds):
+            raise AssertionError("v2 app ownership must skip the server countdown write")
+
+        monkeypatch.setattr(adb, "is_parked", forbidden_parked)
+        monkeypatch.setattr(adb, "sleep_countdown", current)
+        monkeypatch.setattr(adb, "set_sleep_countdown", forbidden_set)
+        monkeypatch.setattr(puller, "read_logger_status", v2_logger_status)
+        await get_settings_service().set_many({"ingest.enabled": True})
+        puller.get_obd_transfer_status().set_logger({"capabilities": ["adaptive_sleep_window_v2"]})
+
+        await puller.close_sleep_window("u:5555", drained=True)
+        assert reads == ["u:5555"]
+
+    async def test_v2_stale_idle_evidence_falls_through_to_verified_server_write(
+        self, db_session, monkeypatch
+    ):
+        from app.core.settings_service import get_settings_service
+        from app.ingest import adb, puller
+
+        async def stale_v2_logger_status(address, path):
+            return {
+                "schema_version": 6,
+                "capabilities": ["adaptive_sleep_window_v2"],
+                "acc_state_known": True,
+                "acc_on": False,
+                "sleep_window_target_s": 300,
+                "sleep_window_observed_s": 300,
+                "sleep_window_verified": True,
+                "updated_at_utc": datetime.now(UTC).isoformat(),
+            }
+
+        reads: list[str] = []
+        set_to: list[int] = []
+
+        async def current(address):
+            reads.append(address)
+            return 900
+
+        async def parked(address):
+            return True
+
+        async def setter(address, seconds):
+            set_to.append(seconds)
+            return True
+
+        monkeypatch.setattr(adb, "sleep_countdown", current)
+        monkeypatch.setattr(adb, "is_parked", parked)
+        monkeypatch.setattr(adb, "set_sleep_countdown", setter)
+        monkeypatch.setattr(puller, "read_logger_status", stale_v2_logger_status)
+        await get_settings_service().set_many({"ingest.enabled": True})
+        puller.get_obd_transfer_status().set_logger({"capabilities": ["adaptive_sleep_window_v2"]})
+
+        await puller.close_sleep_window("u:5555", drained=True)
+
+        assert reads == ["u:5555", "u:5555"]
+        assert set_to == [300]
+
+    async def test_v2_logger_keeps_the_active_window_when_acc_is_on(self, db_session, monkeypatch):
+        from app.core.settings_service import get_settings_service
+        from app.ingest import adb, puller
+
+        async def v2_logger_status(address, path):
+            return {
+                "schema_version": 6,
+                "capabilities": ["adaptive_sleep_window_v2"],
+                "acc_state_known": True,
+                "acc_on": True,
+                "sleep_window_target_s": 900,
+                "sleep_window_observed_s": 900,
+                "sleep_window_verified": True,
+                "updated_at_utc": datetime.now(UTC).isoformat(),
+            }
+
+        async def forbidden_parked(address):
+            raise AssertionError("known ACC-on state must keep the app's active window")
+
+        async def forbidden_read(address):
+            raise AssertionError("known ACC-on state must skip the server countdown read")
+
+        async def forbidden_set(address, seconds):
+            raise AssertionError("known ACC-on state must skip the server countdown write")
+
+        monkeypatch.setattr(adb, "is_parked", forbidden_parked)
+        monkeypatch.setattr(adb, "sleep_countdown", forbidden_read)
+        monkeypatch.setattr(adb, "set_sleep_countdown", forbidden_set)
+        monkeypatch.setattr(puller, "read_logger_status", v2_logger_status)
+        await get_settings_service().set_many({"ingest.enabled": True})
+        puller.get_obd_transfer_status().set_logger({"capabilities": ["adaptive_sleep_window_v2"]})
+
+        await puller.close_sleep_window("u:5555", drained=True)
+
+    async def test_unknown_logger_status_uses_verified_fallback_without_forced_suspend(
+        self, db_session, monkeypatch
+    ):
+        from app.core.settings_service import get_settings_service
+        from app.ingest import adb, puller
+
+        set_to: list[int] = []
+
+        async def parked(address):
+            return True
+
+        async def unknown_status(address, path):
+            return {"state": "status_unavailable", "last_error": "canonical"}
+
+        async def current(address):
+            return 900
+
+        async def refused_set(address, seconds):
+            set_to.append(seconds)
+            return False
+
+        async def forbidden_sleep(address):
+            raise AssertionError("unknown app state must never trigger forced suspend")
+
+        monkeypatch.setattr(adb, "is_parked", parked)
+        monkeypatch.setattr(adb, "sleep_countdown", current)
+        monkeypatch.setattr(adb, "set_sleep_countdown", refused_set)
+        monkeypatch.setattr(adb, "sleep_unit", forbidden_sleep)
+        monkeypatch.setattr(puller, "read_logger_status", unknown_status)
+        await get_settings_service().set_many({"ingest.enabled": True})
+        puller.get_obd_transfer_status().set_logger({"capabilities": ["adaptive_sleep_window_v2"]})
+
+        await puller.close_sleep_window("u:5555", drained=True)
+
+        assert set_to == [300]
 
     async def test_it_never_narrows_a_car_being_driven(self, db_session, monkeypatch):
         from app.core.settings_service import get_settings_service
@@ -3567,9 +3847,8 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         monkeypatch.setattr(adb, "sleep_unit", forbidden_sleep)
         monkeypatch.setattr(adb, "sleep_countdown", current)
         monkeypatch.setattr(adb, "set_sleep_countdown", setter)
-        await get_settings_service().set_many(
-            {"ingest.enabled": True, "ingest.manage_sleep_window": True}
-        )
+        await get_settings_service().set_many({"ingest.enabled": True})
+        puller.get_obd_transfer_status().set_logger({"capabilities": ["adaptive_sleep_window_v1"]})
         await puller.close_sleep_window("u:5555", drained=True)
         assert set_to == []
 
@@ -3588,9 +3867,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
 
         monkeypatch.setattr(adb, "set_sleep_countdown", setter)
         monkeypatch.setattr(adb, "sleep_unit", forbidden_sleep)
-        await get_settings_service().set_many(
-            {"ingest.enabled": True, "ingest.manage_sleep_window": True}
-        )
+        await get_settings_service().set_many({"ingest.enabled": True})
 
         await puller.close_sleep_window("u:5555", drained=False)
         assert set_to == []

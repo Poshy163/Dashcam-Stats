@@ -27,6 +27,17 @@ class SleepWindowControllerTest {
             ).targetSeconds,
         )
         assertEquals(
+            IDLE_SLEEP_WINDOW_SECONDS,
+            sleepWindowCommand(
+                SleepWindowEvent.ACC_BECAME_ON,
+                wifiConnected = false,
+                ingestionStateKnown = true,
+                ingestionRequestActive = false,
+                accStateKnown = true,
+                accOn = true,
+            ).targetSeconds,
+        )
+        assertEquals(
             ACTIVE_SLEEP_WINDOW_SECONDS,
             sleepWindowCommand(
                 SleepWindowEvent.WIFI_BECAME_PRESENT,
@@ -44,14 +55,29 @@ class SleepWindowControllerTest {
                 ingestionRequestActive = true,
             ).targetSeconds,
         )
-        val serverOwned = sleepWindowCommand(
+        val completedWithAccOff = sleepWindowCommand(
             SleepWindowEvent.INGESTION_ENDED,
             wifiConnected = true,
             ingestionStateKnown = true,
             ingestionRequestActive = false,
+            ingestionCompleted = true,
+            accStateKnown = true,
+            accOn = false,
         )
-        assertEquals("server_owned", serverOwned.policy)
-        assertNull(serverOwned.targetSeconds)
+        assertEquals("managed_idle", completedWithAccOff.policy)
+        assertEquals(IDLE_SLEEP_WINDOW_SECONDS, completedWithAccOff.targetSeconds)
+        assertEquals(
+            ACTIVE_SLEEP_WINDOW_SECONDS,
+            sleepWindowCommand(
+                SleepWindowEvent.INGESTION_ENDED,
+                wifiConnected = true,
+                ingestionStateKnown = true,
+                ingestionRequestActive = false,
+                ingestionCompleted = true,
+                accStateKnown = true,
+                accOn = true,
+            ).targetSeconds,
+        )
         assertEquals(
             IDLE_SLEEP_WINDOW_SECONDS,
             sleepWindowCommand(
@@ -177,6 +203,14 @@ class SleepWindowControllerTest {
     }
 
     @Test
+    fun accParserKeepsUnknownDistinctFromOff() {
+        assertEquals(true, parseAccState("1\n"))
+        assertEquals(false, parseAccState("off"))
+        assertNull(parseAccState("null"))
+        assertNull(parseAccState("permission denied"))
+    }
+
+    @Test
     fun wifiStartupAppliesActiveWindowBeforeKnownAbsentBecomesServerOwned() {
         val property = FakeProperty(IDLE_SLEEP_WINDOW_SECONDS)
         val reconciler = SleepWindowReconciler(property)
@@ -208,8 +242,8 @@ class SleepWindowControllerTest {
 
         assertTrue(startupEvidence.verified)
         assertEquals(listOf(ACTIVE_SLEEP_WINDOW_SECONDS), property.writes)
-        assertEquals("server_owned", absenceEvidence.policy)
-        assertNull(absenceEvidence.targetSeconds)
+        assertEquals("managed_active", absenceEvidence.policy)
+        assertEquals(ACTIVE_SLEEP_WINDOW_SECONDS, absenceEvidence.targetSeconds)
         assertEquals(ACTIVE_SLEEP_WINDOW_SECONDS, absenceEvidence.observedSeconds)
     }
 
@@ -259,7 +293,7 @@ class SleepWindowControllerTest {
                 delays += it
                 true
             },
-            publish = { published += it },
+            publish = { next, _, _ -> published += next },
         )
 
         assertFalse(evidence.verified)

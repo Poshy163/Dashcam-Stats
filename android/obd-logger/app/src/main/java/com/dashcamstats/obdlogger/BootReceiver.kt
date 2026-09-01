@@ -4,11 +4,37 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import java.util.UUID
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action !in setOf(Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED)) {
             return
+        }
+        val pendingResult = goAsync()
+        val eventScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        eventScope.launch {
+            try {
+                AppEventJournal(context.applicationContext).append(
+                    sessionId = UUID.randomUUID().toString(),
+                    kind = "app.boot",
+                    level = "info",
+                    outcome = "started",
+                    reasonCode = if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
+                        "boot_completed"
+                    } else {
+                        "package_replaced"
+                    },
+                )
+            } finally {
+                pendingResult.finish()
+                eventScope.cancel()
+            }
         }
         val config = LoggerPreferences.load(context)
         if (!config.canRun) {

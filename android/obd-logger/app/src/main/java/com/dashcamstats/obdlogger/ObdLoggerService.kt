@@ -5,7 +5,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
@@ -17,17 +21,22 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.time.Instant
 import java.time.ZoneId
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 class ObdLoggerService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val eventScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var database: ObdDatabase
     private lateinit var exporter: BundleExporter
     private var worker: Job? = null
@@ -47,6 +56,47 @@ class ObdLoggerService : Service() {
     private var collaboratorsInitialized = false
     private val statusWriteGate = StatusWriteGate()
     private var sleepWindowController: AdaptiveSleepWindowController? = null
+    private lateinit var eventJournal: AppEventJournal
+    private lateinit var eventEmitter: AppEventEmitter
+    private val eventProjectionRetryQueued = AtomicBoolean(false)
+    private var lastEventProjectionRetryAtMillis = 0L
+    private val eventSessionId = UUID.randomUUID().toString()
+    private var lastIngestionEventRequestId: String? = null
+    private var lastAcknowledgedEventRequestId: String? = null
+    private var ingestionEventStateKnown = false
+    private var connectionAttempt = 0
+    private var connectionStartedElapsedMillis: Long? = null
+    private var driveStartedElapsedMillis: Long? = null
+    private val parkedEventGate = ParkedObservationEventGate()
+    @Volatile
+    private var lastStatusState = "starting"
+    @Volatile
+    private var lastStatusError: String? = null
+    private var sleepStatusPublishJob: Job? = null
+    private val retryWakeSignals = Channel<LoggerWakeReason>(Channel.CONFLATED)
+    private var retryWakeReceiverRegistered = false
+
+    private val retryWakeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val reason = when (intent.action) {
+                BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                    if (
+                        intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR) ==
+                        BluetoothAdapter.STATE_ON
+                    ) {
+                        LoggerWakeReason.BLUETOOTH_ON
+                    } else {
+                        null
+                    }
+                }
+                Intent.ACTION_SCREEN_ON -> LoggerWakeReason.SCREEN_ON
+                Intent.ACTION_USER_PRESENT -> LoggerWakeReason.USER_PRESENT
+                Intent.ACTION_POWER_CONNECTED -> LoggerWakeReason.POWER_CONNECTED
+                else -> null
+            }
+            if (reason != null) retryWakeSignals.trySend(reason)
+        }
+    }
 
     private sealed interface RecordingExit {
         data object EngineStopped : RecordingExit
@@ -55,6 +105,9 @@ class ObdLoggerService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        eventJournal = AppEventJournal(applicationContext)
+        eventEmitter = AppEventEmitter(eventJournal, eventSessionId, eventScope)
+        emitEvent("app.service", "info", "started", "service_started")
         val config = LoggerPreferences.load(this)
         when (ServiceStartupGate.decide(config.canRun, hasLoggerPermissions(this))) {
             ServiceStartupDecision.STOP_PERMISSION_REQUIRED -> {
@@ -87,14 +140,20 @@ class ObdLoggerService : Service() {
                 startConnectedDeviceForeground("Starting safely")
                 foregroundFirstStartupGate.markForegroundStarted()
                 startupAllowed = true
+                runCatching { registerRetryWakeReceiver() }
                 sleepWindowController = runCatching {
-                    AdaptiveSleepWindowController(applicationContext, scope).also { it.start() }
+                    AdaptiveSleepWindowController(
+                        applicationContext,
+                        scope,
+                        observation = ::recordSleepWindowObservation,
+                    ).also { it.start() }
                 }.getOrNull()
             }
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        emitEvent("app.service", "info", "observed", "start_command")
         if (!startupAllowed) {
             stopSelfResult(startId)
             return START_NOT_STICKY
@@ -129,8 +188,27 @@ class ObdLoggerService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        if (::eventEmitter.isInitialized) {
+            eventEmitter.closeWithTerminal(
+                "app.service",
+                "info",
+                "completed",
+                "service_stopped",
+            )
+            eventScope.launch {
+                withTimeoutOrNull(2_000L) { eventEmitter.workerJob().join() }
+                eventScope.cancel()
+            }
+        } else {
+            eventScope.cancel()
+        }
         worker?.cancel()
         client?.closeNow()
+        if (retryWakeReceiverRegistered) {
+            runCatching { unregisterReceiver(retryWakeReceiver) }
+            retryWakeReceiverRegistered = false
+        }
+        retryWakeSignals.close()
         sleepWindowController?.close()
         sleepWindowController = null
         scope.cancel()
@@ -139,6 +217,22 @@ class ObdLoggerService : Service() {
         // Closing underneath it creates the very partial-write race WAL is meant to avoid.
         // Process teardown closes the handle; a normal next service instance opens it again.
         super.onDestroy()
+    }
+
+    private fun registerRetryWakeReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+            addAction(Intent.ACTION_POWER_CONNECTED)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(retryWakeReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(retryWakeReceiver, filter)
+        }
+        retryWakeReceiverRegistered = true
     }
 
     /**
@@ -179,11 +273,13 @@ class ObdLoggerService : Service() {
         var recovered = false
         var recoveryReason = pendingStartupRecoveryReason
         var clearLeaseAfterBoot = recoveryReason == "device_restart"
-        val failureBackoff = BoundedExponentialBackoff()
+        val connectionRetry = ConnectionRetryController()
         val reconnectAttempts = ReconnectAttemptTracker()
         while (scope.isActive) {
             var config: LoggerConfig? = null
             var retryDelayMillis: Long? = null
+            var retryDeviceRoot: File? = null
+            var retryMayBePreemptedByIngestion = false
             try {
                 if (!recovered) {
                     val recoveredDrives = database.recoverInterrupted(recoveryReason)
@@ -193,6 +289,18 @@ class ObdLoggerService : Service() {
                             "pipeline_metrics",
                             pipelineMetrics.snapshot().toJson(),
                             drive.finalisedAtUtc,
+                        )
+                        emitEvent(
+                            kind = "drive.lifecycle",
+                            level = "warning",
+                            outcome = "recovered",
+                            reasonCode = if (recoveryReason == "device_restart") {
+                                "device_restart"
+                            } else {
+                                "uncaught_restart"
+                            },
+                            driveId = drive.driveId,
+                            metrics = mapOf("sample_count" to drive.sampleCount),
                         )
                     }
                     startupRecoveredDrive = recoveredDrives.lastOrNull()
@@ -240,21 +348,29 @@ class ObdLoggerService : Service() {
                         IngestionRequestRead.Absent -> {
                             val resumed = IngestionQuiesceFiles.clearAcknowledgement(deviceRoot)
                             ingestionRequestId = null
-                            if (resumed) publish("parked", loadedConfig)
-                            // A process death after finalisation, or a prior filesystem failure,
-                            // leaves the terminal drive waiting for this safe export attempt.
-                            drainPendingExports()
-                            startupRecoveredDrive = null
+                            if (resumed) {
+                                emitEvent("ingest.handoff", "info", "resumed", "resume_completed")
+                                publish("parked", loadedConfig)
+                            }
                             val reconnecting = reconnectAttempts.nextAttemptIsReconnect()
                             try {
-                                runOneConnection(loadedConfig, deviceRoot, reconnecting)
+                                runOneConnection(
+                                    loadedConfig,
+                                    deviceRoot,
+                                    reconnecting,
+                                    onEcuProof = {
+                                        connectionRetry.progressConfirmed()
+                                        clearRetryWakeSignals()
+                                    },
+                                )
                             } catch (error: Exception) {
                                 if (error !is CancellationException) {
                                     reconnectAttempts.connectionFailed()
                                 }
                                 throw error
                             }
-                            failureBackoff.reset()
+                            startupRecoveredDrive = null
+                            connectionRetry.progressConfirmed()
                         }
                         is IngestionRequestRead.Invalid -> {
                             ingestionRequestId = null
@@ -266,7 +382,7 @@ class ObdLoggerService : Service() {
                             ingestionRequestId = requestRead.request.requestId
                             prepareParkedForIngestion(deviceRoot, loadedConfig, requestRead.request)
                             retryDelayMillis = 500
-                            failureBackoff.reset()
+                            connectionRetry.progressConfirmed()
                         }
                     }
                 }
@@ -280,6 +396,8 @@ class ObdLoggerService : Service() {
                 val statusConfig = config ?: runCatching { LoggerPreferences.load(this) }.getOrNull()
                 val root = DeviceFiles.removableRootOrNull(this)
                 val request = root?.let(::readIngestionRequest)
+                retryDeviceRoot = root
+                retryMayBePreemptedByIngestion = root != null
                 if (root != null && request is IngestionRequestRead.Valid) {
                     runCatching {
                         IngestionQuiesceFiles.publishFailed(root, request.request, message)
@@ -287,7 +405,19 @@ class ObdLoggerService : Service() {
                 }
                 if (statusConfig != null) publish("backoff", statusConfig, message)
                 runCatching { updateNotification("Waiting after logger failure") }
-                retryDelayMillis = failureBackoff.nextDelayMillis()
+                val failure = connectionRetry.failed()
+                retryDelayMillis = failure.delayMillis
+                emitEvent(
+                    kind = "obd.ble_connection",
+                    level = "warning",
+                    outcome = "retrying",
+                    reasonCode = "backoff_scheduled",
+                    metrics = mapOf(
+                        "attempt" to connectionAttempt,
+                        "consecutive_failures" to failure.consecutiveFailures,
+                        "retry_delay_ms" to failure.delayMillis,
+                    ),
+                )
             } finally {
                 try {
                     client?.disconnect(false)
@@ -295,8 +425,31 @@ class ObdLoggerService : Service() {
                     // A tainted or vanished link is closed by BluetoothGatt itself.
                 }
                 client = null
+                connectionStartedElapsedMillis = null
             }
-            retryDelayMillis?.let { delay(it) }
+            retryDelayMillis?.let { delayMillis ->
+                val result = awaitInterruptibleDelay(
+                    durationMillis = delayMillis,
+                    wakeSignals = retryWakeSignals,
+                    preempted = {
+                        retryMayBePreemptedByIngestion && retryDeviceRoot?.let { root ->
+                            runCatching {
+                                readIngestionRequest(root) !is IngestionRequestRead.Absent
+                            }.getOrDefault(true)
+                        } == true
+                    },
+                    monotonicMillis = SystemClock::elapsedRealtime,
+                )
+                if (result is InterruptibleWaitResult.Woken) {
+                    connectionRetry.externalWakeObserved()
+                    emitEvent(
+                        "app.service",
+                        "info",
+                        "resumed",
+                        result.reason.eventReasonCode(),
+                    )
+                }
+            }
         }
     }
 
@@ -304,6 +457,7 @@ class ObdLoggerService : Service() {
         config: LoggerConfig,
         deviceRoot: File,
         reconnecting: Boolean,
+        onEcuProof: () -> Unit,
     ) {
         updateNotification("Checking adapter voltage")
         publish("parked", config)
@@ -325,7 +479,45 @@ class ObdLoggerService : Service() {
             },
         )
         client = elm
-        elm.connect()
+        connectionAttempt = (connectionAttempt + 1).coerceAtMost(10_000)
+        val connectStarted = SystemClock.elapsedRealtime()
+        connectionStartedElapsedMillis = connectStarted
+        if (reconnecting) {
+            emitEvent(
+                "obd.ble_connection",
+                "info",
+                "started",
+                "scheduled_connect",
+                metrics = mapOf("attempt" to connectionAttempt),
+            )
+        }
+        try {
+            elm.connect()
+        } catch (error: Exception) {
+            emitEvent(
+                "obd.ble_connection",
+                "error",
+                "failed",
+                bleConnectionFailureReason(error),
+                metrics = mapOf(
+                    "attempt" to connectionAttempt,
+                    "connect_ms" to boundedElapsedMillis(connectStarted),
+                ),
+            )
+            throw error
+        }
+        if (reconnecting) {
+            emitEvent(
+                "obd.ble_connection",
+                "info",
+                "succeeded",
+                "notifications_ready",
+                metrics = mapOf(
+                    "attempt" to connectionAttempt,
+                    "connect_ms" to boundedElapsedMillis(connectStarted),
+                ),
+            )
+        }
         val lifecycle = EngineLifecycle(
             voltageOn = config.voltageOn,
             voltageOff = config.voltageOff,
@@ -340,6 +532,29 @@ class ObdLoggerService : Service() {
             elm.disconnect(false)
             client = null
             return
+        } catch (error: Exception) {
+            emitEvent(
+                "obd.elm_session",
+                "error",
+                "failed",
+                if (error is ElmCommandTimeoutException) "elm_timeout" else "connection_failed",
+            )
+            throw error
+        }
+        val engineCandidate = parkedProbeMayInitialize(
+            config.voltageOnlyMode || BuildConfig.VOLTAGE_ONLY_AUDIT,
+            parkedVoltage,
+            config.voltageOn,
+        )
+        val parkedTransition = parkedEventGate.changed(
+            if (engineCandidate) {
+                ParkedObservationBand.ENGINE_CANDIDATE
+            } else {
+                ParkedObservationBand.BELOW_START
+            },
+        )
+        if (parkedVoltage != null && parkedTransition) {
+            emitEvent("obd.elm_session", "info", "verified", "adapter_voltage_valid")
         }
         if (controlPresent()) {
             elm.disconnect(false)
@@ -347,12 +562,18 @@ class ObdLoggerService : Service() {
             return
         }
         val voltageOnlyMode = config.voltageOnlyMode || BuildConfig.VOLTAGE_ONLY_AUDIT
-        if (!parkedProbeMayInitialize(voltageOnlyMode, parkedVoltage, config.voltageOn)) {
+        if (!engineCandidate) {
+            if (parkedTransition) {
+                emitEvent("obd.ecu_session", "info", "skipped", "voltage_below_start")
+            }
             // No protocol was opened and no ECU command was sent, so a local GATT close is the
             // complete parked teardown. In particular, do not turn a cheap voltage probe into an
             // ATZ/configuration/ATPC cycle while the engine remains off.
             elm.disconnect(false)
             client = null
+            // Startup/export repair is intentionally below the first safe voltage observation.
+            // Slow removable-storage work must not delay discovering that the engine is running.
+            drainPendingExports()
             updateNotification(
                 "Parked; next safe voltage check in ${config.parkedIntervalSeconds} s",
             )
@@ -360,12 +581,43 @@ class ObdLoggerService : Service() {
             waitForNextParkedProbe(deviceRoot, config.parkedIntervalSeconds * 1_000)
             return
         }
+        if (!reconnecting) {
+            emitEvent(
+                "obd.ble_connection",
+                "info",
+                "succeeded",
+                "notifications_ready",
+                metrics = mapOf(
+                    "attempt" to connectionAttempt,
+                    "connect_ms" to boundedElapsedMillis(connectStarted),
+                ),
+            )
+        }
+        val elmStarted = SystemClock.elapsedRealtime()
+        emitEvent("obd.elm_session", "info", "started", "adapter_voltage_valid")
         val voltage = try {
-            elm.initialize(controlPresent)
+            elm.initialize(controlPresent).also {
+                emitEvent(
+                    "obd.elm_session",
+                    "info",
+                    "succeeded",
+                    "elm_ready",
+                    metrics = mapOf("elm_init_ms" to boundedElapsedMillis(elmStarted)),
+                )
+            }
         } catch (_: ElmQuiesceRequestedException) {
             elm.disconnect(false)
             client = null
             return
+        } catch (error: Exception) {
+            emitEvent(
+                "obd.elm_session",
+                "error",
+                "failed",
+                if (error is ElmCommandTimeoutException) "elm_timeout" else "protocol_search_failed",
+                metrics = mapOf("elm_init_ms" to boundedElapsedMillis(elmStarted)),
+            )
+            throw error
         }
         if (controlPresent()) {
             elm.disconnect(false)
@@ -373,7 +625,10 @@ class ObdLoggerService : Service() {
             return
         }
         if (!lifecycle.observeParkedVoltage(voltage)) {
+            emitEvent("obd.ecu_session", "info", "skipped", "voltage_below_stop")
             elm.disconnect(closeProtocol = !controlPresent())
+            client = null
+            drainPendingExports()
             updateNotification(
                 "Parked; next safe voltage check in ${config.parkedIntervalSeconds} s",
             )
@@ -383,12 +638,31 @@ class ObdLoggerService : Service() {
         }
         publish("probing", config)
         updateNotification("Proving ECU response")
+        val ecuProbeStarted = SystemClock.elapsedRealtime()
+        emitEvent("obd.ecu_session", "info", "started", "engine_detected")
         val supported = try {
-            elm.proveEcu(controlPresent)
+            elm.proveEcu(controlPresent).also {
+                emitEvent(
+                    "obd.ecu_session",
+                    "info",
+                    "succeeded",
+                    "ecu_proof_valid",
+                    metrics = mapOf("ecu_probe_ms" to boundedElapsedMillis(ecuProbeStarted)),
+                )
+            }
         } catch (_: ElmQuiesceRequestedException) {
             elm.disconnect(false)
             client = null
             return
+        } catch (error: Exception) {
+            emitEvent(
+                "obd.ecu_session",
+                "error",
+                "failed",
+                if (error is ElmCommandTimeoutException) "poll_timeout" else "ecu_offline",
+                metrics = mapOf("ecu_probe_ms" to boundedElapsedMillis(ecuProbeStarted)),
+            )
+            throw error
         }
         if (controlPresent()) {
             elm.disconnect(false)
@@ -402,6 +676,10 @@ class ObdLoggerService : Service() {
             return
         }
         check(lifecycle.acceptChecksumValidEcuProof(true))
+        // A checksum-valid ECU response is meaningful recovery even though this connection may
+        // remain inside runOneConnection for the rest of the drive. Do not let old failures keep
+        // escalating the next reconnect delay toward its cap.
+        onEcuProof()
         val startedAt = driveClock.nowUtc()
         val driveId = uuid7(Instant.parse(startedAt).toEpochMilli())
         elm.beginDriveEvidence()
@@ -419,6 +697,8 @@ class ObdLoggerService : Service() {
             ),
         )
         currentDriveId = driveId
+        driveStartedElapsedMillis = SystemClock.elapsedRealtime()
+        emitEvent("drive.lifecycle", "info", "started", "engine_detected", driveId)
         try {
             database.addDiagnostic(
                 driveId,
@@ -456,6 +736,13 @@ class ObdLoggerService : Service() {
                     check(finalised.status == "complete")
                 }
                 is RecordingExit.Quiesce -> {
+                    emitEvent(
+                        "ingest.handoff",
+                        "info",
+                        "changed",
+                        "quiesce_entered",
+                        driveId,
+                    )
                     val request = (exit.requestRead as? IngestionRequestRead.Valid)?.request
                     val finalised = finalizeActiveDrive(
                         driveId,
@@ -482,6 +769,7 @@ class ObdLoggerService : Service() {
                             request,
                             acknowledgementMetadata(finalised, exported),
                         )
+                        emitAcknowledgementOnce(request.requestId, finalised.driveId)
                         publish("ingestion_ready", config)
                         updateNotification("OBD persisted; ready for ingestion")
                     } else {
@@ -544,7 +832,9 @@ class ObdLoggerService : Service() {
     ): RecordingExit {
         val diagnosticScan = DiagnosticScan(elm, driveId)
         val malformedLivePids = LivePidMalformedTracker()
+        val sparseDiagnosticBudget = SparseDiagnosticBudgetTracker()
         var sequence = 0L
+        var cadenceOverrun = false
         while (scope.isActive) {
             currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
             val cycleStarted = SystemClock.elapsedRealtime()
@@ -566,6 +856,7 @@ class ObdLoggerService : Service() {
                     missing += pid
                     continue
                 }
+                val commandStarted = SystemClock.elapsedRealtime()
                 val result = try {
                     pollLivePid(pid, elm::query)
                 } catch (cancelled: CancellationException) {
@@ -579,6 +870,8 @@ class ObdLoggerService : Service() {
                         driveClock.nowUtc(),
                     )
                     throw error
+                } finally {
+                    sparseDiagnosticBudget.observeCommand(boundedElapsedMillis(commandStarted))
                 }
                 when (result) {
                     LivePidPollResult.Missing -> {
@@ -620,6 +913,7 @@ class ObdLoggerService : Service() {
                 persistPartialSample(driveId, sequence, values, missing, driveClock.nowUtc())
                 return RecordingExit.Quiesce(it)
             }
+            val voltageStarted = SystemClock.elapsedRealtime()
             try {
                 elm.readVoltage()?.let { values["adapter_voltage"] = it }
             } catch (cancelled: CancellationException) {
@@ -627,6 +921,8 @@ class ObdLoggerService : Service() {
             } catch (error: Exception) {
                 persistPartialSample(driveId, sequence, values, missing, driveClock.nowUtc())
                 throw error
+            } finally {
+                sparseDiagnosticBudget.observeCommand(boundedElapsedMillis(voltageStarted))
             }
             values.putAll(ElmProtocol.estimates(values))
             val sampleTimestamp = driveClock.nowUtc()
@@ -641,10 +937,22 @@ class ObdLoggerService : Service() {
                 ),
             )
             currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
-            // At most one sparse diagnostic command is allowed after a committed sample.
-            // Even a 6-second prompt timeout therefore cannot turn a scan into a minute-long
-            // hole in the fast stream. ElmBleClient's mutex still serializes the FFF1 channel.
-            diagnosticScan.runOne(sequence, sampleTimestamp)
+            val liveCycleElapsed = SystemClock.elapsedRealtime() - cycleStarted
+            // At most one sparse diagnostic command is allowed after a committed sample. Its
+            // reserve comes from the worst command observed on this exact connection rather than
+            // a fixed guess. A slow response therefore defers later diagnostic work without ever
+            // cancelling an in-flight ELM command or deliberately delaying the critical PIDs.
+            val diagnosticBudgetMillis = sparseDiagnosticBudget.requiredBudgetMillis()
+            if (ObdPollPlan.mayRunSparseDiagnostic(liveCycleElapsed, diagnosticBudgetMillis)) {
+                val diagnosticStarted = SystemClock.elapsedRealtime()
+                try {
+                    diagnosticScan.runOne(sequence, sampleTimestamp)
+                } finally {
+                    sparseDiagnosticBudget.observeCommand(
+                        boundedElapsedMillis(diagnosticStarted),
+                    )
+                }
+            }
             currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
             val running = lifecycle.remainsRecording(
                 SystemClock.elapsedRealtime(),
@@ -652,9 +960,35 @@ class ObdLoggerService : Service() {
                 values["engine_rpm"] as? Double,
             )
             if (!running) return RecordingExit.EngineStopped
+            val pollCycleMillis = boundedElapsedMillis(cycleStarted)
+            val overrun = pollCycleMillis > ObdPollPlan.TARGET_CYCLE_MILLIS
+            if (overrun != cadenceOverrun) {
+                cadenceOverrun = overrun
+                emitEvent(
+                    kind = "obd.poll_health",
+                    level = if (overrun) "warning" else "info",
+                    outcome = if (overrun) "observed" else "recovered",
+                    reasonCode = if (overrun) "cadence_gap" else "drive_summary",
+                    driveId = driveId,
+                    metrics = mapOf(
+                        "poll_cycle_ms" to pollCycleMillis,
+                        "polling_duty_cycle_percent" to (
+                            pollCycleMillis.toDouble() /
+                                ObdPollPlan.TARGET_CYCLE_MILLIS.toDouble() * 100.0
+                            ).coerceIn(0.0, 100.0),
+                        "gap_count" to if (overrun) 1 else 0,
+                        "command_count" to requested.size,
+                    ),
+                )
+            }
             sequence += 1
             publish("ecu_online", config)
-            delay((5_000 - (SystemClock.elapsedRealtime() - cycleStarted)).coerceAtLeast(0))
+            delay(
+                (
+                    ObdPollPlan.TARGET_CYCLE_MILLIS -
+                        (SystemClock.elapsedRealtime() - cycleStarted)
+                    ).coerceAtLeast(0),
+            )
         }
         throw CancellationException("logger scope stopped")
     }
@@ -686,6 +1020,25 @@ class ObdLoggerService : Service() {
             if (inserted) {
                 pipelineMetrics.samplePersisted()
                 lastSampleAt = sample.timestampUtc
+                if (sample.sequence == 0L) {
+                    val metrics = linkedMapOf<String, Number>("sample_count" to 1)
+                    metrics.putAll(
+                        firstSampleTimingMetrics(
+                            connectionStartedElapsedMillis,
+                            driveStartedElapsedMillis,
+                            SystemClock.elapsedRealtime(),
+                        ),
+                    )
+                    emitEvent(
+                        "obd.poll_health",
+                        "info",
+                        "succeeded",
+                        "first_sample_persisted",
+                        sample.driveId,
+                        metrics,
+                    )
+                    connectionStartedElapsedMillis = null
+                }
             } else {
                 pipelineMetrics.sampleDropped()
             }
@@ -704,6 +1057,7 @@ class ObdLoggerService : Service() {
     private fun readIngestionRequest(deviceRoot: File): IngestionRequestRead =
         IngestionQuiesceFiles.readRequest(deviceRoot).also { request ->
             sleepWindowController?.setIngestionRequestActive(request is IngestionRequestRead.Valid)
+            observeIngestionRequest(request)
         }
 
     private fun recordParserFailure(error: ElmProtocolException) {
@@ -744,6 +1098,31 @@ class ObdLoggerService : Service() {
         lastDriveId = driveId
         lastDriveFinished = finalised.finishTimeUtc
         lastSampleAt = finalised.lastSampleAtUtc
+        val eventMetrics = linkedMapOf<String, Number>("sample_count" to finalised.sampleCount)
+        driveStartedElapsedMillis?.let {
+            eventMetrics["elapsed_ms"] = boundedElapsedMillis(it, 604_800_000L)
+        }
+        emitEvent(
+            kind = "drive.lifecycle",
+            level = if (finalised.status == "complete") "info" else "warning",
+            outcome = when (finalised.status) {
+                "complete" -> "completed"
+                "recovered" -> "recovered"
+                else -> "interrupted"
+            },
+            reasonCode = when (stopReason) {
+                "engine_stopped" -> "engine_stopped"
+                "ingestion_requested" -> "ingestion_requested"
+                "device_restart" -> "device_restart"
+                "command_timeout" -> "poll_timeout"
+                "connection_lost" -> "connection_lost"
+                "process_terminated" -> "uncaught_restart"
+                else -> "unknown"
+            },
+            driveId = driveId,
+            metrics = eventMetrics,
+        )
+        driveStartedElapsedMillis = null
         return finalised
     }
 
@@ -752,7 +1131,7 @@ class ObdLoggerService : Service() {
             database.prepareCompletedExports()
             return null
         }
-        return exporter.export(finalised.driveId)
+        return exportWithEvent(finalised.driveId)
     }
 
     private fun acknowledgementMetadata(
@@ -773,6 +1152,7 @@ class ObdLoggerService : Service() {
         if (!requestStillActive(deviceRoot, request)) return
         if (IngestionQuiesceFiles.isReadyFor(deviceRoot, request.requestId)) {
             startupRecoveredDrive = null
+            emitAcknowledgementOnce(request.requestId, null)
             publish("ingestion_ready", config)
             updateNotification("OBD persisted; ready for ingestion")
             return
@@ -784,24 +1164,34 @@ class ObdLoggerService : Service() {
             val actualBundle = if (recoveredDrive.sampleCount > 0) {
                 // Revalidate/recreate the local immutable file even when a prior server receipt
                 // allowed retention to prune it. An ACK must never name a file that is absent.
-                exporter.export(recoveredDrive.driveId)
+                exportWithEvent(recoveredDrive.driveId)
             } else {
                 null
             }
             acknowledgementMetadata(recoveredDrive, actualBundle)
         } ?: IngestionAckMetadata()
         IngestionQuiesceFiles.publishReady(deviceRoot, request, metadata)
+        emitAcknowledgementOnce(request.requestId, metadata.driveId)
         startupRecoveredDrive = null
         publish("ingestion_ready", config)
         updateNotification("OBD persisted; ready for ingestion")
     }
 
     private suspend fun waitForNextParkedProbe(deviceRoot: File, durationMillis: Long) {
-        val started = SystemClock.elapsedRealtime()
-        while (scope.isActive && SystemClock.elapsedRealtime() - started < durationMillis) {
-            if (readIngestionRequest(deviceRoot) !is IngestionRequestRead.Absent) return
-            val remaining = durationMillis - (SystemClock.elapsedRealtime() - started)
-            delay(minOf(250L, remaining.coerceAtLeast(1L)))
+        awaitInterruptibleDelay(
+            durationMillis = durationMillis,
+            wakeSignals = retryWakeSignals,
+            preempted = {
+                !scope.isActive ||
+                    readIngestionRequest(deviceRoot) !is IngestionRequestRead.Absent
+            },
+            monotonicMillis = SystemClock::elapsedRealtime,
+        )
+    }
+
+    private fun clearRetryWakeSignals() {
+        while (retryWakeSignals.tryReceive().isSuccess) {
+            // Wake broadcasts observed during a proven live session must not zero a later retry.
         }
     }
 
@@ -1141,7 +1531,7 @@ class ObdLoggerService : Service() {
         exporter.reconcileMissingExports()
         for (driveId in database.prepareCompletedExports()) exportSafely(driveId)
         try {
-            exporter.enforceRetention()
+            recordRetentionPrune(exporter.enforceRetention())
         } catch (error: Exception) {
             val config = runCatching { LoggerPreferences.load(this) }.getOrNull()
             if (config != null) {
@@ -1160,13 +1550,13 @@ class ObdLoggerService : Service() {
     /** Unlike background draining, quiesce cannot acknowledge success after an export failure. */
     private fun drainPendingExportsStrict() {
         exporter.reconcileMissingExports()
-        for (driveId in database.prepareCompletedExports()) exporter.export(driveId)
-        runCatching { exporter.enforceRetention() }
+        for (driveId in database.prepareCompletedExports()) exportWithEvent(driveId)
+        runCatching { recordRetentionPrune(exporter.enforceRetention()) }
     }
 
     private fun exportSafely(driveId: String) {
         try {
-            exporter.export(driveId)
+            exportWithEvent(driveId)
         } catch (error: Exception) {
             val config = runCatching { LoggerPreferences.load(this) }.getOrNull()
             if (error is RemovableStorageUnavailableException && config != null) {
@@ -1184,7 +1574,39 @@ class ObdLoggerService : Service() {
         }
     }
 
+    private fun exportWithEvent(driveId: String): ExportedBundle {
+        emitEvent("bundle.export", "info", "started", "export_started", driveId)
+        return try {
+            exporter.export(driveId).also { exported ->
+                emitEvent(
+                    "bundle.export",
+                    "info",
+                    "completed",
+                    "export_completed",
+                    driveId,
+                    mapOf("bundle_bytes" to exported.file.length().coerceAtMost(536_870_912L)),
+                )
+            }
+        } catch (error: Exception) {
+            emitEvent("bundle.export", "error", "failed", "export_failed", driveId)
+            throw error
+        }
+    }
+
+    private fun recordRetentionPrune(count: Int) {
+        if (count <= 0) return
+        emitEvent(
+            "receipt.verification",
+            "info",
+            "pruned",
+            "retention_pruned",
+            metrics = mapOf("receipt_count" to count.coerceAtMost(1_000_000)),
+        )
+    }
+
     private fun publish(state: String, config: LoggerConfig, error: String? = null) {
+        lastStatusState = state
+        lastStatusError = error
         val metrics = pipelineMetrics.snapshot()
         val voltageProbe = metrics.lastVoltageProbe
         val voltageState = voltagePublicState(
@@ -1225,6 +1647,8 @@ class ObdLoggerService : Service() {
             bleOwner = bleOwner,
             voltageOnlyMode = controlledVoltageOnly,
             wifiConnected = sleepWindow.wifiConnected,
+            accStateKnown = sleepWindow.accStateKnown,
+            accOn = sleepWindow.accOn,
             ingestionSleepHoldKnown = sleepWindow.ingestionStateKnown,
             ingestionSleepHold = sleepWindow.ingestionRequestActive,
             sleepWindowPolicy = sleepWindow.policy,
@@ -1235,6 +1659,7 @@ class ObdLoggerService : Service() {
             lastError = error,
             lastErrorAtUtc = error?.let { Instant.now().toString() },
         )
+        scheduleEventProjectionRetry()
         val signature = durableStatusSignature(status)
         if (!statusWriteGate.shouldWrite(signature, SystemClock.elapsedRealtime())) return
         runCatching {
@@ -1243,6 +1668,151 @@ class ObdLoggerService : Service() {
             statusWriteGate.writeFailed(signature)
         }
     }
+
+    /**
+     * Signal a fail-soft projection retry without putting TF-card IO on the OBD poll worker.
+     * Persistent failures remain single-flight and rate-limited; the private ring stays durable.
+     */
+    private fun scheduleEventProjectionRetry() {
+        if (
+            !::eventJournal.isInitialized ||
+            !eventJournal.hasPendingProjection() ||
+            !eventProjectionRetryQueued.compareAndSet(false, true)
+        ) {
+            return
+        }
+        eventScope.launch {
+            try {
+                val nowMillis = SystemClock.elapsedRealtime()
+                if (lastEventProjectionRetryAtMillis > 0L) {
+                    val elapsedMillis =
+                        (nowMillis - lastEventProjectionRetryAtMillis).coerceAtLeast(0L)
+                    delay((EVENT_PROJECTION_RETRY_INTERVAL_MILLIS - elapsedMillis).coerceAtLeast(0L))
+                }
+                if (eventJournal.hasPendingProjection()) eventJournal.publishSnapshot()
+                lastEventProjectionRetryAtMillis = SystemClock.elapsedRealtime()
+            } finally {
+                eventProjectionRetryQueued.set(false)
+            }
+        }
+    }
+
+    private fun emitEvent(
+        kind: String,
+        level: String,
+        outcome: String,
+        reasonCode: String? = null,
+        driveId: String? = null,
+        metrics: Map<String, Number> = emptyMap(),
+    ) {
+        if (!::eventEmitter.isInitialized) return
+        eventEmitter.emit(
+            kind = kind,
+            level = level,
+            outcome = outcome,
+            reasonCode = reasonCode,
+            driveId = driveId,
+            metrics = metrics,
+        )
+    }
+
+    private fun observeIngestionRequest(request: IngestionRequestRead) {
+        when (request) {
+            is IngestionRequestRead.Valid -> if (
+                !ingestionEventStateKnown || lastIngestionEventRequestId != request.request.requestId
+            ) {
+                ingestionEventStateKnown = true
+                lastIngestionEventRequestId = request.request.requestId
+                emitEvent("ingest.handoff", "info", "requested", "request_observed")
+            }
+            IngestionRequestRead.Absent -> {
+                if (ingestionEventStateKnown && lastIngestionEventRequestId != null) {
+                    emitEvent("ingest.handoff", "info", "resumed", "resume_observed")
+                }
+                ingestionEventStateKnown = true
+                lastIngestionEventRequestId = null
+                lastAcknowledgedEventRequestId = null
+            }
+            is IngestionRequestRead.Invalid -> Unit
+        }
+    }
+
+    private fun emitAcknowledgementOnce(requestId: String, driveId: String?) {
+        if (lastAcknowledgedEventRequestId == requestId) return
+        lastAcknowledgedEventRequestId = requestId
+        emitEvent(
+            "ingest.handoff",
+            "info",
+            "acknowledged",
+            "quiesce_acknowledged",
+            driveId,
+        )
+    }
+
+    private fun recordSleepWindowObservation(value: SleepWindowControllerObservation) {
+        when (value) {
+            is SleepWindowControllerObservation.Wifi -> emitEvent(
+                kind = "network.wifi",
+                level = "info",
+                outcome = if (value.connected) "available" else "lost",
+                reasonCode = if (value.connected) "wifi_available" else "wifi_lost",
+            )
+            is SleepWindowControllerObservation.Acc -> {
+                if (value.on) retryWakeSignals.trySend(LoggerWakeReason.ACC_ON)
+                emitEvent(
+                    kind = "app.service",
+                    level = "info",
+                    outcome = "observed",
+                    reasonCode = if (value.on) "acc_on" else "acc_off",
+                )
+            }
+            is SleepWindowControllerObservation.Attempt -> {
+                val evidence = value.evidence
+                val reason = when (evidence.error) {
+                    "sleep countdown update was refused" -> "property_refused"
+                    "sleep countdown readback was unavailable" -> "readback_unavailable"
+                    "sleep countdown readback did not match the requested value" ->
+                        "readback_mismatch"
+                    else -> when {
+                        evidence.targetSeconds == null -> "ingestion_state_unknown"
+                        evidence.ingestionRequestActive -> "backup_active"
+                        evidence.wifiConnected -> "wifi_connected"
+                        else -> "wifi_disconnected"
+                    }
+                }
+                val metrics = linkedMapOf<String, Number>("attempt" to value.attempt)
+                evidence.targetSeconds?.let { metrics["sleep_target_s"] = it }
+                evidence.observedSeconds?.let { metrics["sleep_observed_s"] = it }
+                value.retryDelayMillis?.let { metrics["retry_delay_ms"] = it }
+                emitEvent(
+                    kind = "power.sleep_window",
+                    level = if (evidence.error == null) "info" else "warning",
+                    outcome = when {
+                        evidence.error != null && value.retryDelayMillis != null -> "retrying"
+                        evidence.error != null -> "failed"
+                        evidence.verified -> "verified"
+                        else -> "skipped"
+                    },
+                    reasonCode = reason,
+                    metrics = metrics,
+                )
+                scheduleSleepStatusPublish()
+            }
+        }
+    }
+
+    private fun scheduleSleepStatusPublish() {
+        if (sleepStatusPublishJob?.isActive == true || !startupAllowed) return
+        sleepStatusPublishJob = scope.launch {
+            delay(250)
+            val config = runCatching { LoggerPreferences.load(this@ObdLoggerService) }.getOrNull()
+                ?: return@launch
+            publish(lastStatusState, config, lastStatusError)
+        }
+    }
+
+    private fun boundedElapsedMillis(startedAt: Long, maximum: Long = 3_600_000L): Long =
+        (SystemClock.elapsedRealtime() - startedAt).coerceIn(0L, maximum)
 
     private fun safeError(error: Exception): String {
         return boundedRedactedError(error.message, fallback = error.javaClass.simpleName)
@@ -1302,6 +1872,7 @@ class ObdLoggerService : Service() {
     }
 
     companion object {
+        private const val EVENT_PROJECTION_RETRY_INTERVAL_MILLIS = 30_000L
         private const val CHANNEL = "obd_logger"
         private const val NOTIFICATION_ID = 1107
         private const val VOLTAGE_FRESHNESS_SECONDS = 75L

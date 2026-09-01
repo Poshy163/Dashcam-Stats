@@ -302,6 +302,8 @@ class IngestionQuiesceTest {
                 bleOwner = "dashcam_voltage_only",
                 voltageOnlyMode = true,
                 wifiConnected = true,
+                accStateKnown = true,
+                accOn = false,
                 ingestionSleepHoldKnown = true,
                 ingestionSleepHold = true,
                 sleepWindowPolicy = "managed_active",
@@ -315,6 +317,8 @@ class IngestionQuiesceTest {
         assertEquals("ingestion_quiesce_v1", status.getJSONArray("capabilities").getString(0))
         assertEquals("voltage_only_audit_v1", status.getJSONArray("capabilities").getString(1))
         assertEquals("adaptive_sleep_window_v1", status.getJSONArray("capabilities").getString(3))
+        assertEquals("adaptive_sleep_window_v2", status.getJSONArray("capabilities").getString(4))
+        assertEquals("app_event_stream_v1", status.getJSONArray("capabilities").getString(5))
         assertEquals("drive-current", status.getString("current_drive_id"))
         assertEquals(3, status.getInt("pending_bundle_count"))
         assertEquals(1L, status.getJSONObject("metrics").getLong("maximum_queue_depth"))
@@ -325,6 +329,8 @@ class IngestionQuiesceTest {
         assertNotNull(Instant.parse(status.getString("updated_at_utc")))
         assertTrue(status.getBoolean("voltage_only_mode"))
         assertTrue(status.getBoolean("wifi_connected"))
+        assertTrue(status.getBoolean("acc_state_known"))
+        assertFalse(status.getBoolean("acc_on"))
         assertTrue(status.getBoolean("ingestion_sleep_hold_known"))
         assertTrue(status.getBoolean("ingestion_sleep_hold"))
         assertEquals("managed_active", status.getString("sleep_window_policy"))

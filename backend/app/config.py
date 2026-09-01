@@ -63,6 +63,10 @@ class AppConfig(BaseSettings):
         default="/storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/status.json",
         validation_alias=AliasChoices("DASHCAM_OBD_STATUS_PATH", "DASHCAM_OBD_REMOTE_STATUS_FILE"),
     )
+    obd_remote_events_file: str = Field(
+        default="/storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/events.json",
+        validation_alias=AliasChoices("DASHCAM_OBD_EVENTS_PATH", "DASHCAM_OBD_REMOTE_EVENTS_FILE"),
+    )
     obd_remote_receipts_dir: str = Field(
         default=("/storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/receipts"),
         validation_alias=AliasChoices(

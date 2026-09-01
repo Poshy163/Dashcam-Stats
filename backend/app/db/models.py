@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -1048,6 +1049,44 @@ class OBDDiagnostic(Base):
 
     __table_args__ = (
         UniqueConstraint("drive_db_id", "event_hash", name="uq_obd_diagnostic_event"),
+    )
+
+
+class OBDLoggerEvent(Base):
+    """Bounded, privacy-safe lifecycle evidence mirrored from the Android logger.
+
+    The app owns the event stream and its sequence.  The server stores a hash of the
+    app-scoped random source id rather than a hardware identifier, then deduplicates the
+    rolling snapshot by ``(source_id_hash, sequence)``.  ``drive_id`` deliberately has no
+    foreign key: boot/connection evidence can arrive before its immutable drive bundle.
+    """
+
+    __tablename__ = "obd_logger_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_id_hash: Mapped[str] = mapped_column(String(64))
+    sequence: Mapped[int] = mapped_column(BigInteger)
+    occurred_at: Mapped[datetime] = mapped_column(UtcDateTime, index=True)
+    received_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, index=True)
+    session_id_hash: Mapped[str] = mapped_column(String(64))
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    level: Mapped[str] = mapped_column(String(8), index=True)
+    outcome: Mapped[str] = mapped_column(String(32))
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    drive_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    metrics_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    app_version_name: Mapped[str] = mapped_column(String(64))
+    app_version_code: Mapped[int] = mapped_column(Integer)
+    build_git_sha: Mapped[str] = mapped_column(String(12))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_id_hash",
+            "sequence",
+            name="uq_obd_logger_event_source_sequence",
+        ),
+        Index("ix_obd_logger_events_kind_time", "kind", "occurred_at"),
+        Index("ix_obd_logger_events_drive_time", "drive_id", "occurred_at"),
     )
 
 

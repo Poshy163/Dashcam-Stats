@@ -18,6 +18,15 @@ from zoneinfo import ZoneInfo
 
 SettingType = Literal["bool", "int", "float", "string", "select", "path", "bytes"]
 
+# The Android OBD companion and the server jointly own one sleep policy. These values are
+# evidence-contract constants, not tuning knobs: accepting a different WebUI value would let
+# the puller fight the app over the persistent vendor property during radio recovery.
+INGEST_SLEEP_WINDOW_ACTIVE_SECONDS = 900
+INGEST_SLEEP_WINDOW_IDLE_SECONDS = 300
+FIXED_SETTING_VALUES: dict[str, object] = {
+    "ingest.manage_sleep_window": True,
+}
+
 #: The zone the deployment says it is in, if it says anything.
 #:
 #: ``TZ`` is shipped in docker-compose.yml and documented in the README as the timezone
@@ -1315,47 +1324,45 @@ SETTINGS: tuple[SettingDef, ...] = (
     ),
     SettingDef(
         "ingest.manage_sleep_window",
-        "Hold the dashcam awake while it still has footage to give",
+        "Adaptive sleep policy (always on)",
         "bool",
-        False,
+        True,
         "ingest",
         "The head unit stays awake for a fixed countdown after the ignition goes off, and "
         "the WiFi stays up for all of it — so that countdown is the whole backup window. "
-        "With this on, the app widens it while the car is here and narrows it again the "
-        "moment the card is empty. Android's normal countdown remains the only path into "
-        "sleep, so recording is never interrupted by a forced suspend. A unit the app never "
-        "reaches — parked away from home — keeps the short value and sleeps promptly.",
-        requires="ingest.enabled",
+        "The OBD companion always widens it during backup or recovery and narrows it after "
+        "completion. This safety contract cannot be disabled: Android's normal countdown "
+        "remains the only path into sleep, so recording is never interrupted by a forced "
+        "suspend. A unit parked away from home keeps the short value and sleeps promptly.",
+        read_only=True,
     ),
     SettingDef(
         "ingest.sleep_window_s",
-        "Awake time while there is footage to copy",
+        "Backup awake time (fixed)",
         "int",
-        900,
+        INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,
         "ingest",
-        "How long the head unit stays awake after the ignition goes off while the app is "
-        "in touch with it. At the measured transfer rate this is far more than a day of "
-        "footage; the app cuts it short as soon as the card is drained, so the full value "
-        "is only ever spent on a genuinely large backlog.",
-        minimum=30,
-        maximum=3600,
+        "Fixed at 900 seconds (15 minutes) while WiFi backup or recovery is active. This "
+        "must match the OBD companion's app-owned policy, so it is shown for audit but "
+        "cannot be edited.",
+        minimum=INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,
+        maximum=INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,
         unit="seconds",
-        requires="ingest.manage_sleep_window",
+        read_only=True,
     ),
     SettingDef(
         "ingest.sleep_window_idle_s",
-        "Awake time otherwise",
+        "Idle awake time (fixed)",
         "int",
-        300,
+        INGEST_SLEEP_WINDOW_IDLE_SECONDS,
         "ingest",
-        "What the countdown is set back to once the card is empty, and what a unit the app "
-        "cannot reach keeps. This is the value that applies when the car is parked away "
-        "from home, so it is the one that decides how much of the car's battery a park "
-        "costs when no backup is possible.",
-        minimum=5,
-        maximum=600,
+        "Fixed at 300 seconds (5 minutes) after backup and radio recovery complete, or "
+        "when the unit is away from home. This must match the OBD companion's app-owned "
+        "policy, so it is shown for audit but cannot be edited.",
+        minimum=INGEST_SLEEP_WINDOW_IDLE_SECONDS,
+        maximum=INGEST_SLEEP_WINDOW_IDLE_SECONDS,
         unit="seconds",
-        requires="ingest.manage_sleep_window",
+        read_only=True,
     ),
     SettingDef(
         "ingest.delete_after_verify",
