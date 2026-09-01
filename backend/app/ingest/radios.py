@@ -13,21 +13,21 @@ Three rules shape everything here, in order of importance.
 **Never leave the car worse than it was found.** Bluetooth is the driver's hands-free,
 and the ordinary way a window ends is the engine stopping mid-transfer, after which this
 app cannot reach the unit again that day. So restoring is not one ``finally``: it is the
-run's own restore, plus a watchdog left running on the unit that re-enables Bluetooth on
-a deadline whether or not this app still exists — the same trick the transfer's listener
-already plays with ``timeout`` — plus a marker persisted on this side so that anything
-still off is turned back on the moment the unit is next seen, before a single byte is
-asked for. The watchdog gates on a flag file the restore removes, so a stale watchdog
-whose run already restored does nothing.
+run's own restore, plus a watchdog left running on the unit that re-enables Bluetooth when
+its renewable lease expires whether or not this app still exists, plus a marker persisted
+on this side so that anything still off is turned back on the moment the unit is next seen,
+before a single byte is asked for. The watchdog gates on a flag file the restore removes,
+so a stale watchdog whose run already restored does nothing.
 
 **Only turn off what can be turned back on.** Bluetooth's state is readable
 (``settings get global bluetooth_on``), so it is toggled freely and only when it was
 actually on. A generic hotspot is restarted only when its exact SSID and passphrase were
 recovered from ``dumpsys wifi``. The production head unit has one narrower opt-in path:
-enabling Bluetooth was observed to be followed by the separate AP returning, so an
-approved Zlink system-package build may use a credential-free recovery capsule. Either
-path has to keep the captured AP interface visible through a final stability window before
-recovery is called complete.
+its approved system controller exposes a package-scoped action that asks Android to start
+Wi-Fi tethering from the already-saved configuration. The exact Zlink and controller
+builds are attested before either radio changes, and the recovery capsule contains only a
+mode name. Either path has to keep the captured AP interface visible through a final
+stability window before recovery is called complete.
 
 **Believe the effect, never the exit status.** This is the rule the first version of this
 module did not have, and the field found it inside a day: Bluetooth went off and the
@@ -44,12 +44,11 @@ raised *after* the teardown has already happened. So a stop is believed only whe
 it genuinely cannot be done, that is a warning naming the unit's own words, not silence.
 
 **Bluetooth comes down before the hotspot, and the order is load-bearing.** This unit
-couples the two: while its Bluetooth is on, it re-arms the soft AP within seconds of any
-stop (``cmd bluetooth_manager enable`` is observed to drive the hotspot back up — a vendor
-car-kit behaviour). A hotspot stopped while Bluetooth is still on therefore never sticks;
-taking Bluetooth down first removes the thing that turns it back on, which is why
-:func:`_quiet` disables Bluetooth and only then stops the AP. It also means the restore is
-half-automatic: re-enabling Bluetooth brings the operator's hotspot back on its own.
+couples the two: while its Bluetooth is on, it can re-arm the soft AP within seconds of any
+stop. A hotspot stopped while Bluetooth is still on therefore may not stick; taking
+Bluetooth down first removes that race. Restoration never relies on that coupling,
+however: after Bluetooth returns, the attested controller explicitly starts the saved
+tethering profile and the captured AP interface is verified.
 
 **Never delay the transfer.** Every call here rides the control channel, which is idle
 while the bulk socket moves bytes. The quieting itself waits until the unit has been on
@@ -66,6 +65,7 @@ import hashlib
 import json
 import math
 import re
+import secrets
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -91,6 +91,24 @@ QUIET_AFTER_ONLINE_S = 10.0
 #: own, and every watchdog that reads it was armed by a run in the current boot.
 FLAG_PATH = "/data/local/tmp/.dashcam_analyser_radios"
 WATCHDOG_READY_PATH = f"{FLAG_PATH}.watchdog_ready"
+WATCHDOG_LEASE_PATH = f"{FLAG_PATH}.watchdog_lease"
+WATCHDOG_LEASE_PARTIAL_PATH = f"{WATCHDOG_LEASE_PATH}.partial"
+WATCHDOG_EXPIRY_CLAIM_PATH = f"{WATCHDOG_READY_PATH}.expired"
+WATCHDOG_PID_PATH = f"{FLAG_PATH}.watchdog_pid"
+WATCHDOG_PID_PARTIAL_PATH = f"{WATCHDOG_PID_PATH}.partial"
+WATCHDOG_SCRIPT_PATH = f"{FLAG_PATH}.watchdog.sh"
+WATCHDOG_SCRIPT_PARTIAL_PATH = f"{WATCHDOG_SCRIPT_PATH}.partial"
+WATCHDOG_ACTIVE_PATH = f"{FLAG_PATH}.watchdog_active"
+WATCHDOG_ACTIVE_PARTIAL_PATH = f"{WATCHDOG_ACTIVE_PATH}.partial"
+WATCHDOG_SCRIPT_PREFIX = f"{FLAG_PATH}.watchdog_"
+_WATCHDOG_TOKEN = re.compile(r"^[0-9a-f]{32}$")
+
+# The lease is an Android monotonic-uptime second, not wall-clock time. The watchdog polls
+# locally on the unit, while the server renews with enough headroom to survive several
+# transient ADB failures without either restoring mid-transfer or weakening crash recovery.
+WATCHDOG_LEASE_POLL_S = 2
+WATCHDOG_MAX_RENEW_INTERVAL_S = 30.0
+WATCHDOG_RENEW_RETRY_S = 1.0
 
 # Hotspot credentials are needed only to undo a process that dies after stopping the
 # AP. They never belong in the server database or its backups. A short-lived mode-0600
@@ -102,10 +120,11 @@ _SAFE_TRANSITION_ID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$
 _BOOT_ID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 _DEVICE_SERIAL = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 
-# On the production head unit, enabling Bluetooth was observed to be followed by its
-# separate soft AP returning a few seconds later. AP ownership was not independently
-# attributed to Zlink, so this exceptional path is explicit opt-in and restricted to the
-# exact approved system APK. Generic units retain the exact-credentials rule.
+# ``bluetooth_rearm`` is retained as the schema-v2 capsule name for compatibility with
+# transitions already on disk. The original passive Bluetooth edge was not reliable. On
+# the approved production image, restoration now uses the exact FunctionCore system
+# package's credential-free tethering action and then verifies the captured AP interface.
+# Generic units retain the exact-credentials rule.
 HOTSPOT_RESTORE_EXACT = "exact_config"
 HOTSPOT_RESTORE_BLUETOOTH_REARM = "bluetooth_rearm"
 _HOTSPOT_RESTORE_MODES = {
@@ -117,6 +136,12 @@ ZLINK_SUPPORTED_VERSION = "6.1.02"
 ZLINK_SUPPORTED_VERSION_CODE = "600102"
 ZLINK_SYSTEM_APK_PATH = "package:/system/app/CarZhiJian/CarZhiJian.apk"
 ZLINK_SYSTEM_APK_SHA256 = "c8f43e1a2dbd957220194f59ded0eb64581a571fde59d55386e6c5b4d49967d3"
+HOTSPOT_CONTROLLER_PACKAGE = "com.zqc.functioncore"
+HOTSPOT_CONTROLLER_VERSION = "1.0.5"
+HOTSPOT_CONTROLLER_VERSION_CODE = "5"
+HOTSPOT_CONTROLLER_APK_PATH = "package:/system/app/FunctionCore/FunctionCore.apk"
+HOTSPOT_CONTROLLER_APK_SHA256 = "5335519733cd7c361715f8a8c96e0062b58fb8a50292a30a78b33db63ff1917a"
+HOTSPOT_START_ACTION = "action.start.tethering"
 _ZLINK_ATTESTATION_ATTEMPTS = 3
 _ZLINK_ATTESTATION_RETRY_S = 0.25
 _BLUETOOTH_REARM_CAPSULE = {
@@ -195,10 +220,11 @@ class HotspotRecoveryPlan:
 
 
 async def supports_zlink_bluetooth_rearm(address: str) -> bool:
-    """Whether the exact approved Zlink system APK is installed.
+    """Whether the exact approved Zlink and hotspot-controller builds are installed.
 
-    Presence alone is insufficient: the observed Bluetooth/AP coupling may change in a
-    vendor update. The server setting remains the operator's separate opt-in.
+    Presence alone is insufficient: a vendor update may change the unprotected action's
+    meaning. The historical function name is retained for callers and persisted v2
+    recovery capsules; restoration no longer depends on a Bluetooth edge.
     """
 
     command = (
@@ -212,8 +238,20 @@ async def supports_zlink_bluetooth_rearm(address: str) -> bool:
         f"if [ \"$path\" = '{ZLINK_SYSTEM_APK_PATH}' ]; then "
         "digest=\"$(sha256sum '/system/app/CarZhiJian/CarZhiJian.apk' "
         "2>/dev/null | cut -d' ' -f1)\"; fi; "
-        'printf \'%s\\n%s\\n%s\\n%s\' "$path" "$version" "$version_code" '
-        '"$digest"; exit 0'
+        f'controller_path="$(pm path {HOTSPOT_CONTROLLER_PACKAGE} 2>/dev/null | '
+        'head -n 1)"; '
+        f'controller_version="$(dumpsys package {HOTSPOT_CONTROLLER_PACKAGE} 2>/dev/null | '
+        "sed -n 's/^[[:space:]]*versionName=//p' | head -n 1)" + '"; '
+        f'controller_version_code="$(dumpsys package {HOTSPOT_CONTROLLER_PACKAGE} '
+        "2>/dev/null | sed -n 's/^[[:space:]]*versionCode=\\([0-9]*\\).*$/\\1/p' | "
+        "head -n 1)" + '"; '
+        'controller_digest=""; '
+        f"if [ \"$controller_path\" = '{HOTSPOT_CONTROLLER_APK_PATH}' ]; then "
+        "controller_digest=\"$(sha256sum '/system/app/FunctionCore/FunctionCore.apk' "
+        "2>/dev/null | cut -d' ' -f1)\"; fi; "
+        "printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s' "
+        '"$path" "$version" "$version_code" "$digest" "$controller_path" '
+        '"$controller_version" "$controller_version_code" "$controller_digest"; exit 0'
     )
     for attempt in range(1, _ZLINK_ATTESTATION_ATTEMPTS + 1):
         try:
@@ -227,7 +265,7 @@ async def supports_zlink_bluetooth_rearm(address: str) -> bool:
                 continue
             return False
         lines = [line.strip() for line in reply.splitlines()]
-        if len(lines) != 4:
+        if len(lines) != 8:
             if attempt < _ZLINK_ATTESTATION_ATTEMPTS:
                 await asyncio.sleep(_ZLINK_ATTESTATION_RETRY_S)
                 continue
@@ -237,6 +275,10 @@ async def supports_zlink_bluetooth_rearm(address: str) -> bool:
             and lines[1] == ZLINK_SUPPORTED_VERSION
             and lines[2] == ZLINK_SUPPORTED_VERSION_CODE
             and lines[3] == ZLINK_SYSTEM_APK_SHA256
+            and lines[4] == HOTSPOT_CONTROLLER_APK_PATH
+            and lines[5] == HOTSPOT_CONTROLLER_VERSION
+            and lines[6] == HOTSPOT_CONTROLLER_VERSION_CODE
+            and lines[7] == HOTSPOT_CONTROLLER_APK_SHA256
         )
     return False
 
@@ -517,6 +559,17 @@ _STOP_VIA_TETHERING = (
     "service call tethering 5 i32 0 s16 com.android.shell s16 com.android.shell null; exit 0"
 )
 
+#: The exact production controller's registered receiver calls Android's privileged
+#: ``startTethering(TETHERING_WIFI, ...)`` API without accepting or emitting credentials.
+#: Android therefore reuses the saved system hotspot profile. The package and action are
+#: fixed literals and the package build is attested before either radio changes. The
+#: broadcast result is not success evidence; only the captured AP interface becoming
+#: stable is.
+_START_VIA_HOTSPOT_CONTROLLER = (
+    f"am broadcast --user 0 -p {HOTSPOT_CONTROLLER_PACKAGE} "
+    f"-a {HOTSPOT_START_ACTION} >/dev/null 2>&1 || true"
+)
+
 #: The fallback, for a unit whose adbd runs as root (a debuggable build) where
 #: ``WifiManager.stopSoftAp`` is reachable directly. Never reached on an unrooted unit: the
 #: binder above has by then taken the AP down and :func:`_stop_hotspot` has returned.
@@ -585,6 +638,16 @@ async def _stop_hotspot(address: str) -> tuple[bool, str]:
     return False, "; ".join(replies)[:400]
 
 
+async def _request_saved_hotspot_start(address: str) -> bool:
+    """Ask the attested controller to start Android's saved Wi-Fi tethering profile."""
+
+    try:
+        await adb.shell(address, _START_VIA_HOTSPOT_CONTROLLER, timeout=RADIO_TIMEOUT_S)
+    except adb.AdbError:
+        return False
+    return True
+
+
 async def _persist_marker(value: str) -> None:
     try:
         await get_settings_service().set(MARKER_KEY, value, internal=True)
@@ -612,11 +675,167 @@ async def _persist_refusal(value: str) -> None:
         log.debug("could not persist the hotspot refusal", error=str(exc))
 
 
+@dataclass(frozen=True, slots=True)
+class WatchdogHandle:
+    """Identity of one detached on-unit recovery process and its private artifacts."""
+
+    token: str
+    pid: int
+
+    def __post_init__(self) -> None:
+        if not _WATCHDOG_TOKEN.fullmatch(self.token) or self.pid < 0:
+            raise ValueError("invalid detached watchdog identity")
+
+    @property
+    def script_path(self) -> str:
+        return f"{WATCHDOG_SCRIPT_PREFIX}{self.token}.sh"
+
+    @property
+    def script_partial_path(self) -> str:
+        return f"{self.script_path}.partial"
+
+    @property
+    def ready_path(self) -> str:
+        return f"{self.script_path}.ready"
+
+    @property
+    def lease_path(self) -> str:
+        return f"{self.script_path}.lease"
+
+    @property
+    def lease_partial_path(self) -> str:
+        return f"{self.lease_path}.partial"
+
+    @property
+    def expiry_claim_path(self) -> str:
+        return f"{self.ready_path}.expired"
+
+
+def _new_watchdog_handle(*, pid: int = 0) -> WatchdogHandle:
+    return WatchdogHandle(token=secrets.token_hex(16), pid=pid)
+
+
+def _watchdog_owner_cleanup_command(
+    handle: WatchdogHandle,
+    *,
+    allow_unpublished: bool = False,
+    prove: bool = False,
+) -> str:
+    """Clean only the exact generation named by ``handle``.
+
+    A late generation must never disarm the active successor. The active record is
+    therefore re-read immediately before shared state is removed; a mismatch is a
+    fail-closed result with no FLAG or active-record mutation.
+    """
+
+    expected = f"{handle.token} {handle.pid}" if handle.pid > 0 else ""
+    candidate_artifacts = " ".join(
+        f"'{path}'"
+        for path in (
+            handle.script_path,
+            handle.script_partial_path,
+            handle.ready_path,
+            handle.lease_path,
+            handle.lease_partial_path,
+            handle.expiry_claim_path,
+        )
+    )
+    command = (
+        f"state=\"$(cat '{WATCHDOG_ACTIVE_PATH}' 2>/dev/null)\"; "
+        'token="${state%% *}"; pid="${state#* }"; owned=0; '
+    )
+    if expected:
+        command += f'[ "$state" = "{expected}" ] && owned=1; '
+    else:
+        command += (
+            f'[ "$token" = "{handle.token}" ] && case "$pid" in ""|*[!0-9]*) ;; *) owned=1;; esac; '
+        )
+    command += (
+        'if [ "$owned" -eq 1 ]; then '
+        f'script="{handle.script_path}"; '
+        "tries=0; while :; do cmdline=\"$(tr '\\000' ' ' < \"/proc/$pid/cmdline\" "
+        '2>/dev/null)"; case "$cmdline" in *"$script"*) ;; *) break;; esac; '
+        '[ "$tries" -ge 3 ] && { printf busy; exit 0; }; '
+        'kill "$pid" 2>/dev/null || true; sleep 1; tries="$((tries + 1))"; done; '
+        f'[ "$(cat \'{WATCHDOG_ACTIVE_PATH}\' 2>/dev/null)" = "$state" ] || '
+        "{ printf mismatch; exit 0; }; "
+        f"rm -f '{FLAG_PATH}' '{WATCHDOG_ACTIVE_PATH}' '{WATCHDOG_ACTIVE_PARTIAL_PATH}' "
+        f"{candidate_artifacts}; "
+        "printf cleared; exit 0; fi; "
+    )
+    if allow_unpublished:
+        cleanup_state = f"cleanup:{handle.token}"
+        command += (
+            f'if [ -z "$state" ]; then cleanup_state="{cleanup_state}"; '
+            f"if (set -C; printf '%s\\n' \"$cleanup_state\" > "
+            f"'{WATCHDOG_ACTIVE_PATH}') 2>/dev/null; then "
+            f'trap \'current="$(cat "{WATCHDOG_ACTIVE_PATH}" 2>/dev/null)"; '
+            f'[ "$current" = "$cleanup_state" ] && rm -f "{WATCHDOG_ACTIVE_PATH}"\' '
+            "EXIT; trap 'exit 1' HUP INT TERM; "
+            f'[ "$(cat \'{WATCHDOG_ACTIVE_PATH}\' 2>/dev/null)" = "$cleanup_state" ] '
+            "|| exit 1; "
+            f"rm -f '{FLAG_PATH}' {candidate_artifacts}; "
+            "printf cleared; exit 0; fi; fi; "
+        )
+    command += f"rm -f {candidate_artifacts}; "
+    command += "printf mismatch; exit 0" if prove else "exit 0"
+    return command
+
+
+def _watchdog_cleanup_command(*, prove: bool = False) -> str:
+    """Return an exact, PID-checked cleanup for this module's detached watchdog."""
+
+    legacy_artifacts = " ".join(
+        f"'{path}'"
+        for path in (
+            WATCHDOG_READY_PATH,
+            WATCHDOG_LEASE_PATH,
+            WATCHDOG_LEASE_PARTIAL_PATH,
+            WATCHDOG_EXPIRY_CLAIM_PATH,
+            WATCHDOG_PID_PATH,
+            WATCHDOG_PID_PARTIAL_PATH,
+            WATCHDOG_SCRIPT_PATH,
+            WATCHDOG_SCRIPT_PARTIAL_PATH,
+        )
+    )
+    command = (
+        f"state=\"$(cat '{WATCHDOG_ACTIVE_PATH}' 2>/dev/null)\"; "
+        'token="${state%% *}"; pid="${state#* }"; '
+        f'script="{WATCHDOG_SCRIPT_PREFIX}${{token}}.sh"; '
+        'valid=1; [ "${#token}" -eq 32 ] 2>/dev/null || valid=0; '
+        'case "$token" in ""|*[!0-9a-f]*) valid=0;; esac; '
+        'case "$pid" in ""|*[!0-9]*) valid=0;; esac; '
+        'if [ "$valid" -eq 1 ]; then '
+        "cmdline=\"$(tr '\\000' ' ' < \"/proc/$pid/cmdline\" 2>/dev/null)\"; "
+        'case "$cmdline" in *"$script"*) kill "$pid" 2>/dev/null || true;; esac; '
+        "fi; "
+        f"rm -f '{FLAG_PATH}' '{WATCHDOG_ACTIVE_PATH}' '{WATCHDOG_ACTIVE_PARTIAL_PATH}'; "
+        'if [ "$valid" -eq 1 ]; then '
+        'rm -f "$script" "$script.partial" "$script.ready" "$script.lease" '
+        '"$script.lease.partial" "$script.ready.expired"; fi; '
+        f"rm -f {legacy_artifacts}"
+    )
+    if prove:
+        command += f"; if [ ! -e '{FLAG_PATH}' ] && [ ! -e '{WATCHDOG_READY_PATH}' ]"
+        command += f" && [ ! -e '{WATCHDOG_ACTIVE_PATH}' ]"
+        command += f" && [ ! -e '{WATCHDOG_LEASE_PATH}' ] && [ ! -e '{WATCHDOG_PID_PATH}' ]"
+        command += f" && [ ! -e '{WATCHDOG_SCRIPT_PATH}' ]"
+        command += '; then if [ "$valid" -eq 0 ] || [ ! -e "$script" ]; then printf cleared; fi; fi; exit 0'
+    return command
+
+
 async def _remove_flag(address: str) -> None:
+    with contextlib.suppress(adb.AdbError):
+        await adb.shell(address, _watchdog_cleanup_command(), timeout=RADIO_TIMEOUT_S)
+
+
+async def _discard_watchdog_candidate(address: str, handle: WatchdogHandle) -> None:
+    """Remove a launch that failed before it could publish a complete active record."""
+
     with contextlib.suppress(adb.AdbError):
         await adb.shell(
             address,
-            f"rm -f '{FLAG_PATH}' '{WATCHDOG_READY_PATH}'",
+            _watchdog_owner_cleanup_command(handle, allow_unpublished=True),
             timeout=RADIO_TIMEOUT_S,
         )
 
@@ -678,15 +897,17 @@ async def _arm_watchdog(
     hotspot_baseline: str = "unknown",
     hotspot_capsule_path: str | None = None,
     hotspot_restore_mode: str | None = None,
-) -> asyncio.subprocess.Process | None:
+) -> WatchdogHandle | None:
     """Leave an exact radio-restoration watchdog running on the unit.
 
-    The same shape as the transfer's listener: nothing is backgrounded remotely (this
-    unit's ``adb shell`` never returns for a backgrounded command), so the adb child is
-    simply never awaited, and the remote command outlives a dropped session — which is
-    the one property that matters, because "the session dropped" is exactly the failure
-    the watchdog exists for. If the run restores first it removes the flag, and a fired
-    watchdog that finds no flag exits without touching anything.
+    The recovery loop is written to a mode-0700 script and launched with the head unit's
+    proven Toybox ``setsid -d`` + ``nohup`` path, with every stdio descriptor detached.
+    Its numeric PID, command line, readiness gate and monotonic lease are all read back
+    through a second ADB session before any radio can be touched. The loop therefore
+    survives loss of the launching ADB client and of this server process. If the healthy
+    run restores first it removes the flag and kills only the PID whose command line still
+    names this exact script; a fired watchdog that finds no flag exits without touching
+    either radio.
     """
     if hotspot_baseline not in {"on", "off", "transport", "unknown"}:
         return None
@@ -739,45 +960,219 @@ async def _arm_watchdog(
             'cmd wifi start-softap "$ssid" wpa2 "$passphrase" >/dev/null 2>&1 || true; '
             "fi"
         )
+    elif (
+        hotspot_baseline == "on"
+        and hotspot_capsule_path is not None
+        and hotspot_restore_mode == HOTSPOT_RESTORE_BLUETOOTH_REARM
+    ):
+        # The mode name is capsule compatibility. The attested controller action is the
+        # deterministic recovery path; it starts the saved profile without credentials.
+        restore_commands.append(_START_VIA_HOTSPOT_CONTROLLER)
     if not restore_commands:
         return None
-    command = (
-        f"umask 077; printf armed > '{WATCHDOG_READY_PATH}'; sleep {int(deadline_s)}; "
-        f"[ -f '{FLAG_PATH}' ] || {{ rm -f '{WATCHDOG_READY_PATH}'; exit 0; }}; "
-        f"rm -f '{WATCHDOG_READY_PATH}'; " + "; ".join(restore_commands)
+    lease_ttl_s = max(1, int(deadline_s))
+    candidate = _new_watchdog_handle()
+    script_path = candidate.script_path
+    script_partial_path = candidate.script_partial_path
+    ready_path = candidate.ready_path
+    lease_path = candidate.lease_path
+    lease_partial_path = candidate.lease_partial_path
+    expiry_claim_path = candidate.expiry_claim_path
+    owned_state = f"{candidate.token} $$"
+    cleanup_owned = (
+        "cleanup_owned() { "
+        f"current=\"$(cat '{WATCHDOG_ACTIVE_PATH}' 2>/dev/null)\"; "
+        f'if [ "$current" = "{owned_state}" ]; then '
+        f"rm -f '{WATCHDOG_ACTIVE_PATH}' '{WATCHDOG_ACTIVE_PARTIAL_PATH}' "
+        f"'{ready_path}' '{lease_path}' '{lease_partial_path}' "
+        f"'{expiry_claim_path}' '{script_path}' '{script_partial_path}'; fi; }}; "
+    )
+    watchdog_script = (
+        f"umask 077; token='{candidate.token}'; {cleanup_owned}"
+        f"rm -f '{lease_partial_path}' '{expiry_claim_path}'; "
+        f"(set -C; printf '%s %s\\n' \"$token\" \"$$\" > '{WATCHDOG_ACTIVE_PATH}') "
+        "2>/dev/null || exit 1; "
+        f"chmod 600 '{WATCHDOG_ACTIVE_PATH}' || {{ cleanup_owned; exit 1; }}; "
+        'now="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; '
+        'case "$now" in ""|*[!0-9]*) cleanup_owned; exit 1;; esac; '
+        f'expiry="$((now + {lease_ttl_s}))"; '
+        f"printf '%s\\n' \"$expiry\" > '{lease_partial_path}' && "
+        f"chmod 600 '{lease_partial_path}' && "
+        f"mv -f '{lease_partial_path}' '{lease_path}' && "
+        f"printf armed > '{ready_path}' || {{ cleanup_owned; exit 1; }}; "
+        "while :; do "
+        f'[ "$(cat \'{WATCHDOG_ACTIVE_PATH}\' 2>/dev/null)" = "{owned_state}" ] '
+        "|| exit 0; "
+        f"[ -f '{FLAG_PATH}' ] && [ \"$(cat '{ready_path}' 2>/dev/null)\" = armed ] "
+        "|| { cleanup_owned; exit 0; }; "
+        'now="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; '
+        f"expiry=\"$(cat '{lease_path}' 2>/dev/null)\"; "
+        'case "$now:$expiry" in "":*|*:""|*[!0-9:]*) remaining=0;; '
+        '*) remaining="$((expiry - now))";; esac; '
+        'if [ "$remaining" -gt 0 ]; then '
+        f"delay={WATCHDOG_LEASE_POLL_S}; "
+        '[ "$remaining" -le "$delay" ] && delay="$remaining"; '
+        'sleep "$delay"; continue; fi; '
+        f"mv -f '{ready_path}' '{expiry_claim_path}' 2>/dev/null || exit 0; "
+        f'[ "$(cat \'{WATCHDOG_ACTIVE_PATH}\' 2>/dev/null)" = "{owned_state}" ] '
+        "|| exit 0; "
+        f"[ -f '{FLAG_PATH}' ] || {{ cleanup_owned; exit 0; }}; "
+        'now="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; '
+        f"expiry=\"$(cat '{lease_path}' 2>/dev/null)\"; "
+        'case "$now:$expiry" in "":*|*:""|*[!0-9:]*) remaining=0;; '
+        '*) remaining="$((expiry - now))";; esac; '
+        'if [ "$remaining" -gt 0 ]; then '
+        f"mv -f '{expiry_claim_path}' '{ready_path}' "
+        "2>/dev/null || exit 0; continue; fi; "
+        f"rm -f '{ready_path}' '{lease_path}' '{lease_partial_path}' "
+        f"'{expiry_claim_path}'; break; done; "
+        f"if [ -f '{FLAG_PATH}' ] && "
+        f'[ "$(cat \'{WATCHDOG_ACTIVE_PATH}\' 2>/dev/null)" = "{owned_state}" ]; then '
+        + "; ".join(restore_commands)
+        + "; fi; cleanup_owned"
+    )
+    launcher = (
+        f"umask 077; rm -f '{script_partial_path}'; "
+        f"cat > '{script_partial_path}' <<'DASHCAM_RADIO_WATCHDOG'\n"
+        f"{watchdog_script}\n"
+        "DASHCAM_RADIO_WATCHDOG\n"
+        f"chmod 700 '{script_partial_path}' && "
+        f"mv -f '{script_partial_path}' '{script_path}' || exit 1; "
+        f"setsid -d nohup sh '{script_path}' </dev/null >/dev/null 2>&1 &"
     )
     try:
-        process = await asyncio.create_subprocess_exec(
-            adb.adb_path(),
-            "-s",
-            address,
-            "shell",
-            command,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+        await _shell_script(address, launcher, timeout=10.0)
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
-            if process.returncode is not None:
-                return None
             reply = await adb.shell(
                 address,
-                f"[ \"$(cat '{WATCHDOG_READY_PATH}' 2>/dev/null)\" = armed ] && "
-                "printf armed; exit 0",
+                _watchdog_probe_command(candidate),
                 timeout=RADIO_TIMEOUT_S,
             )
-            if reply.strip() == "armed":
-                return process
+            if reply.strip().isdigit():
+                return WatchdogHandle(candidate.token, int(reply.strip()))
             await asyncio.sleep(0.1)
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
-        with contextlib.suppress(TimeoutError, Exception):
-            await asyncio.wait_for(process.wait(), timeout=1.0)
+        await _discard_watchdog_candidate(address, candidate)
         return None
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await asyncio.shield(_discard_watchdog_candidate(address, candidate))
+        raise
     except Exception as exc:
         log.warning("could not arm the Bluetooth watchdog on the unit", error=str(exc))
+        await _discard_watchdog_candidate(address, candidate)
         return None
+
+
+def _watchdog_probe_command(handle: WatchdogHandle) -> str:
+    """Prove that the detached PID still owns the armed, unexpired lease."""
+
+    expected_pid = f'[ "$pid" = "{handle.pid}" ] || exit 0; ' if handle.pid > 0 else ""
+    return (
+        f"state=\"$(cat '{WATCHDOG_ACTIVE_PATH}' 2>/dev/null)\"; "
+        'token="${state%% *}"; pid="${state#* }"; '
+        f'[ "$token" = "{handle.token}" ] || exit 0; '
+        'case "$pid" in ""|*[!0-9]*) exit 0;; esac; ' + expected_pid + f"[ -f '{FLAG_PATH}' ] && "
+        f"[ \"$(cat '{handle.ready_path}' 2>/dev/null)\" = armed ] && "
+        f"[ -s '{handle.lease_path}' ] && kill -0 \"$pid\" 2>/dev/null || exit 0; "
+        "cmdline=\"$(tr '\\000' ' ' < \"/proc/$pid/cmdline\" 2>/dev/null)\"; "
+        f'case "$cmdline" in *"{handle.script_path}"*) ;; *) exit 0;; esac; '
+        'now="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; '
+        f"expiry=\"$(cat '{handle.lease_path}' 2>/dev/null)\"; "
+        'case "$now:$expiry" in "":*|*:""|*[!0-9:]*) exit 0;; esac; '
+        '[ "$expiry" -gt "$now" ] || exit 0; printf "%s" "$pid"; exit 0'
+    )
+
+
+async def _watchdog_is_armed(address: str, handle: WatchdogHandle) -> bool:
+    try:
+        reply = await adb.shell(
+            address,
+            _watchdog_probe_command(handle),
+            timeout=RADIO_TIMEOUT_S,
+        )
+    except adb.AdbError:
+        return False
+    return reply.strip() == str(handle.pid)
+
+
+async def _renew_watchdog_lease(
+    address: str,
+    deadline_s: int,
+    handle: WatchdogHandle,
+) -> bool:
+    """Atomically extend an armed watchdog using only the unit's monotonic uptime."""
+
+    lease_ttl_s = max(1, int(deadline_s))
+    command = (
+        f"state=\"$(cat '{WATCHDOG_ACTIVE_PATH}' 2>/dev/null)\"; "
+        f'[ "$state" = "{handle.token} {handle.pid}" ] || exit 0; '
+        f'pid="{handle.pid}"; '
+        f"[ -f '{FLAG_PATH}' ] && kill -0 \"$pid\" 2>/dev/null && "
+        f"[ \"$(cat '{handle.ready_path}' 2>/dev/null)\" = armed ] || exit 0; "
+        "cmdline=\"$(tr '\\000' ' ' < \"/proc/$pid/cmdline\" 2>/dev/null)\"; "
+        f'case "$cmdline" in *"{handle.script_path}"*) ;; *) exit 0;; esac; '
+        'now="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; '
+        'case "$now" in ""|*[!0-9]*) exit 1;; esac; '
+        f'expiry="$((now + {lease_ttl_s}))"; umask 077; '
+        f"rm -f '{handle.lease_partial_path}'; "
+        f"printf '%s\\n' \"$expiry\" > '{handle.lease_partial_path}' && "
+        f"chmod 600 '{handle.lease_partial_path}' && "
+        f"mv -f '{handle.lease_partial_path}' '{handle.lease_path}' || "
+        f"{{ rm -f '{handle.lease_partial_path}'; exit 1; }}; "
+        f"[ -f '{FLAG_PATH}' ] && kill -0 \"$pid\" 2>/dev/null && "
+        f"[ \"$(cat '{WATCHDOG_ACTIVE_PATH}' 2>/dev/null)\" = "
+        f'"{handle.token} {handle.pid}" ] && '
+        f"[ \"$(cat '{handle.ready_path}' 2>/dev/null)\" = armed ] || "
+        f"{{ rm -f '{handle.lease_path}' '{handle.lease_partial_path}'; exit 0; }}; "
+        "printf renewed; exit 0"
+    )
+    try:
+        reply = await adb.shell(address, command, timeout=RADIO_TIMEOUT_S)
+    except adb.AdbError:
+        return False
+    return reply.strip() == "renewed"
+
+
+def _watchdog_renew_interval(deadline_s: int) -> float:
+    """Renew with two-thirds of the last proven lease still available."""
+
+    return max(1.0, min(WATCHDOG_MAX_RENEW_INTERVAL_S, max(1, int(deadline_s)) / 3))
+
+
+async def _watchdog_renewal_loop(
+    address: str,
+    deadline_s: int,
+    watchdog: WatchdogHandle,
+    lost: asyncio.Event,
+) -> None:
+    """Keep the remote lease alive only while this owner and its watchdog are alive."""
+
+    interval = _watchdog_renew_interval(deadline_s)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            renewed = await _renew_watchdog_lease(address, deadline_s, watchdog)
+        except Exception:
+            renewed = False
+        if renewed:
+            continue
+        # One immediate retry distinguishes a brief control-channel stumble from a lost
+        # detached process without spending a meaningful part of the finite recovery lease.
+        await asyncio.sleep(WATCHDOG_RENEW_RETRY_S)
+        try:
+            renewed = await _renew_watchdog_lease(address, deadline_s, watchdog)
+        except Exception:
+            renewed = False
+        if renewed:
+            continue
+        lost.set()
+        log.error(
+            "the detached on-unit radio watchdog could not be proven; "
+            "the transfer must stop while the last lease can still restore the radios",
+            watchdog_pid=watchdog.pid,
+        )
+        return
 
 
 @dataclass(frozen=True, slots=True)
@@ -803,7 +1198,9 @@ class RadioController:
     def __init__(self, address: str, *, watchdog_deadline_s: int) -> None:
         self.address = address
         self.watchdog_deadline_s = watchdog_deadline_s
-        self._watchdog: asyncio.subprocess.Process | None = None
+        self._watchdog: WatchdogHandle | None = None
+        self._watchdog_renewal_task: asyncio.Task[None] | None = None
+        self._watchdog_lost = asyncio.Event()
         self._bluetooth_baseline = "unknown"
         self._hotspot_baseline = "unknown"
         self._hotspot_rearm_deadline: float | None = None
@@ -1006,8 +1403,27 @@ class RadioController:
         return _valid_hotspot_capsule_path(path)
 
     async def _ensure_watchdog_locked(self, *, marker: str) -> bool:
-        if self._watchdog is not None and self._watchdog.returncode is None:
+        if self._watchdog is not None:
+            if self._watchdog_lost.is_set() or not await _watchdog_is_armed(
+                self.address, self._watchdog
+            ):
+                log.error("the detached radio watchdog is no longer alive")
+                self._watchdog_lost.set()
+                return False
+            renewal = self._watchdog_renewal_task
+            if renewal is None or renewal.done():
+                if not await _renew_watchdog_lease(
+                    self.address, self.watchdog_deadline_s, self._watchdog
+                ):
+                    log.warning(
+                        "could not re-establish radio watchdog lease renewal; "
+                        "leaving the remaining radios on"
+                    )
+                    return False
+                self._start_watchdog_renewal()
             return True
+        await self._stop_watchdog_renewal()
+        self._watchdog_lost.clear()
         await _persist_marker(marker)
         try:
             await _remove_flag(self.address)
@@ -1024,11 +1440,61 @@ class RadioController:
             hotspot_restore_mode=self._hotspot_restore_mode,
         )
         if self._watchdog is None:
-            await _remove_flag(self.address)
-            await _persist_marker("")
-            log.warning("could not prove the radio watchdog was armed; leaving radios on")
+            # Candidate cleanup is generation-scoped. A newer server process may have
+            # published its watchdog while this launch was in flight, so neither the
+            # shared flag nor the conservative recovery marker may be cleared here.
+            log.warning(
+                "could not prove the radio watchdog was armed; "
+                "leaving radios on and recovery state intact"
+            )
             return False
+        self._start_watchdog_renewal()
         return True
+
+    def _start_watchdog_renewal(self) -> None:
+        watchdog = self._watchdog
+        renewal = self._watchdog_renewal_task
+        if watchdog is None or self._watchdog_lost.is_set():
+            return
+        if renewal is not None and not renewal.done():
+            return
+        self._watchdog_renewal_task = asyncio.create_task(
+            _watchdog_renewal_loop(
+                self.address,
+                self.watchdog_deadline_s,
+                watchdog,
+                self._watchdog_lost,
+            ),
+            name="ingest-radio-watchdog-renewal",
+        )
+
+    async def _stop_watchdog_renewal(self) -> None:
+        renewal = self._watchdog_renewal_task
+        self._watchdog_renewal_task = None
+        if renewal is not None and not renewal.done():
+            renewal.cancel()
+        if renewal is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await renewal
+
+    async def watchdog_healthy(self) -> bool:
+        """Positively verify the detached recovery process while ingest is active."""
+
+        async with _lock:
+            watchdog = self._watchdog
+            if watchdog is None:
+                return True
+            if self._watchdog_lost.is_set():
+                return False
+            if await _watchdog_is_armed(self.address, watchdog):
+                return True
+            # A second bounded read prevents one lost ADB reply from cancelling a healthy
+            # bulk transfer, while still detecting a dead PID far inside its finite lease.
+            await asyncio.sleep(WATCHDOG_RENEW_RETRY_S)
+            healthy = await _watchdog_is_armed(self.address, watchdog)
+            if not healthy:
+                self._watchdog_lost.set()
+            return healthy
 
     async def disable_bluetooth(
         self,
@@ -1190,22 +1656,32 @@ class RadioController:
             if baseline == "off":
                 return await self._restore_hotspot_off()
 
-            serving = await self._wait_for_hotspot_rearm(
-                expected_interface=(
-                    expected_interface if restore_mode == HOTSPOT_RESTORE_BLUETOOTH_REARM else None
-                )
-            )
+            if restore_mode == HOTSPOT_RESTORE_BLUETOOTH_REARM:
+                # Schema-v2 named this after the passive Bluetooth edge that first exposed
+                # the vendor coupling. Field evidence showed that edge is not reliable
+                # after a real transfer. The exact package-gated controller now starts the
+                # saved tethering profile explicitly; no SSID or passphrase crosses ADB.
+                if not expected_interface:
+                    return False
+                serving = await _serving_ap(self.address)
+                if serving is None:
+                    return False
+                if serving != expected_interface:
+                    if not await supports_zlink_bluetooth_rearm(self.address):
+                        return False
+                    if not await _request_saved_hotspot_start(self.address):
+                        return False
+                    self._hotspot_rearm_deadline = time.monotonic() + HOTSPOT_REARM_SETTLE_S
+                serving = await self._wait_for_hotspot_rearm(expected_interface=expected_interface)
+                return serving == expected_interface
+
+            serving = await self._wait_for_hotspot_rearm(expected_interface=None)
             if serving is None:
                 # A lost ADB reply and a proven-empty interface inventory are different
                 # safety facts.  In particular, Bluetooth restoration may have re-armed
                 # this vendor's AP: an unreadable inventory cannot certify the original
                 # OFF baseline and must leave durable recovery armed for the next arrival.
                 return False
-            if restore_mode == HOTSPOT_RESTORE_BLUETOOTH_REARM:
-                # A serving AP alone is insufficient: it could be an unrelated interface
-                # or the old AP briefly observed before a delayed stop completes. Require
-                # the captured interface to remain present through a final stability window.
-                return bool(expected_interface) and serving == expected_interface
             if restore_mode not in {None, HOTSPOT_RESTORE_EXACT}:
                 return False
             if not config:
@@ -1254,35 +1730,34 @@ class RadioController:
                     return False
                 await asyncio.sleep(CONFIRM_INTERVAL_S)
 
-    async def _stop_watchdog(self) -> None:
-        watchdog = self._watchdog
-        if watchdog is not None and watchdog.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                watchdog.kill()
-            with contextlib.suppress(TimeoutError, Exception):
-                await asyncio.wait_for(watchdog.wait(), timeout=3.0)
-
     async def stand_down_watchdog(self) -> bool:
         """Disarm only after every changed radio has regained its exact baseline."""
         async with _lock:
+            # Cancel first so a renewal already in flight cannot recreate a lease after
+            # the flag and readiness gate are removed below.
+            await self._stop_watchdog_renewal()
+            watchdog = self._watchdog
+            cleanup = (
+                _watchdog_owner_cleanup_command(watchdog, prove=True)
+                if watchdog is not None
+                else _watchdog_cleanup_command(prove=True)
+            )
             try:
-                reply = await adb.shell(
-                    self.address,
-                    f"rm -f '{FLAG_PATH}' '{WATCHDOG_READY_PATH}'; "
-                    f"[ ! -e '{FLAG_PATH}' ] && [ ! -e '{WATCHDOG_READY_PATH}' ] && "
-                    "printf cleared; exit 0",
-                    timeout=RADIO_TIMEOUT_S,
-                )
+                reply = await adb.shell(self.address, cleanup, timeout=RADIO_TIMEOUT_S)
             except adb.AdbError:
                 return False
             if reply.strip() != "cleared":
                 return False
-            await self._stop_watchdog()
+            self._watchdog = None
+            self._watchdog_lost.clear()
             await _persist_marker("")
             return True
 
     async def release(self) -> None:
         global _active
+        # If baseline restoration did not stand the watchdog down, ceasing renewal is the
+        # hand-off to its last proven on-device expiry. Do not kill the remote process.
+        await self._stop_watchdog_renewal()
         if self._owns:
             _active -= 1
             self._owns = False
@@ -1301,7 +1776,9 @@ class RadioQuiet:
     bluetooth_off: bool = False
     hotspot_restore: tuple[str, str] | None = field(default=None, repr=False)
     _task: asyncio.Task | None = None
-    _watchdog: asyncio.subprocess.Process | None = None
+    _watchdog: WatchdogHandle | None = None
+    _watchdog_renewal_task: asyncio.Task[None] | None = None
+    _watchdog_lost: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     #: Whether this run has claimed the radios, so `finish` releases exactly once however
     #: it is reached -- including for a task cancelled before it ever claimed them.
     _owns: bool = False
@@ -1356,6 +1833,7 @@ class RadioQuiet:
         if await _set_bluetooth(self.address, enable=False):
             log.info("turned the unit's Bluetooth off for the transfer")
             self._watchdog = await _arm_watchdog(self.address, self.watchdog_deadline_s)
+            self._start_watchdog_renewal()
         else:
             # Nothing accepted the toggle, so nothing needs restoring.
             self.bluetooth_off = False
@@ -1426,9 +1904,36 @@ class RadioQuiet:
                 if self.hotspot_restore:
                     await self._restore_hotspot()
         finally:
+            await self._stop_watchdog_renewal()
             if self._owns:
                 _active -= 1
                 self._owns = False
+
+    def _start_watchdog_renewal(self) -> None:
+        watchdog = self._watchdog
+        if watchdog is None or self._watchdog_lost.is_set():
+            return
+        renewal = self._watchdog_renewal_task
+        if renewal is not None and not renewal.done():
+            return
+        self._watchdog_renewal_task = asyncio.create_task(
+            _watchdog_renewal_loop(
+                self.address,
+                self.watchdog_deadline_s,
+                watchdog,
+                self._watchdog_lost,
+            ),
+            name="ingest-radio-watchdog-renewal",
+        )
+
+    async def _stop_watchdog_renewal(self) -> None:
+        renewal = self._watchdog_renewal_task
+        self._watchdog_renewal_task = None
+        if renewal is not None and not renewal.done():
+            renewal.cancel()
+        if renewal is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await renewal
 
     async def _restore_bluetooth(self) -> None:
         restored = False
@@ -1442,8 +1947,24 @@ class RadioQuiet:
             # radio that is already on, which is a no-op.
             restored = await _confirm_bluetooth_on(self.address)
         if restored:
+            watchdog = self._watchdog
+            cleanup_ok = True
+            if watchdog is not None:
+                try:
+                    reply = await adb.shell(
+                        self.address,
+                        _watchdog_owner_cleanup_command(watchdog, prove=True),
+                        timeout=RADIO_TIMEOUT_S,
+                    )
+                    cleanup_ok = reply.strip() == "cleared"
+                except adb.AdbError:
+                    cleanup_ok = False
+            else:
+                await _remove_flag(self.address)
+            if not cleanup_ok:
+                log.warning("a newer radio watchdog replaced this restore generation")
+                return
             log.info("turned the unit's Bluetooth back on")
-            await _remove_flag(self.address)
             await _persist_marker("")
             self.bluetooth_off = False
         else:
@@ -1454,12 +1975,9 @@ class RadioQuiet:
                 "could not confirm the unit's Bluetooth is back on; the watchdog on the "
                 "unit will see to it, or the next arrival"
             )
-        watchdog = self._watchdog
-        if restored and watchdog is not None and watchdog.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                watchdog.kill()
-            with contextlib.suppress(TimeoutError, Exception):
-                await asyncio.wait_for(watchdog.wait(), timeout=3.0)
+        if restored:
+            self._watchdog = None
+            self._watchdog_lost.clear()
 
     async def _restore_hotspot(self) -> None:
         ssid, passphrase = self.hotspot_restore or ("", "")

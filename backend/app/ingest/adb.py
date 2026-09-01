@@ -539,11 +539,13 @@ async def launch_listener(
 
     So nothing is backgrounded remotely and nothing is awaited locally. The adb session
     stays open for the life of the transfer -- which is exactly as long as it is wanted --
-    and the caller kills this process when the stream ends. The remote ``timeout`` is the
-    backstop for the case where this side disappears first.
+    and the caller kills this process when the stream ends. ``nc -w`` bounds only the
+    wait for this side to connect. The old outer ``timeout`` bounded the entire stream,
+    which cut large or temporarily-slow backups off even while bytes were still moving.
+    Once connected, the adb session and TCP connection are the lifetime guards instead.
 
     Nothing is installed on the unit for any of it. It is not rooted and does not need to
-    be: Android's toybox already provides ``tar``, ``nc`` and ``timeout``.
+    be: Android's toybox already provides ``tar`` and ``nc``.
 
     The file list goes as argv. A full card is around 140 names of 30 characters, roughly
     4 KB, far inside ARG_MAX, and the camera's filenames carry no shell metacharacters --
@@ -552,8 +554,7 @@ async def launch_listener(
     if not names:
         return None
     command = (
-        f"cd '{source}' && tar c {_bare_list(names)} | timeout {int(timeout_s)} "
-        f"nc -l -p {int(port)}"
+        f"cd '{source}' && tar c {_bare_list(names)} | nc -l -p {int(port)} -w {int(timeout_s)}"
     )
     return await asyncio.create_subprocess_exec(
         adb_path(),

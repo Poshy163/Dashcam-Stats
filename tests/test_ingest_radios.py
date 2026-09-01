@@ -32,18 +32,22 @@ WifiApConfigStore
   passphrase = roadtrip99
 """
 
+_APPROVED_VENDOR_ATTESTATION = "\n".join(
+    (
+        "package:/system/app/CarZhiJian/CarZhiJian.apk",
+        "6.1.02",
+        "600102",
+        "c8f43e1a2dbd957220194f59ded0eb64581a571fde59d55386e6c5b4d49967d3",
+        "package:/system/app/FunctionCore/FunctionCore.apk",
+        "1.0.5",
+        "5",
+        "5335519733cd7c361715f8a8c96e0062b58fb8a50292a30a78b33db63ff1917a",
+    )
+)
 
-class FakeProcess:
-    def __init__(self) -> None:
-        self.returncode: int | None = None
-        self.killed = False
-
-    def kill(self) -> None:
-        self.killed = True
-        self.returncode = -9
-
-    async def wait(self) -> int:
-        return self.returncode or 0
+_WATCHDOG_TOKEN = "0123456789abcdef0123456789abcdef"
+_WATCHDOG_PID = 4242
+_WATCHDOG_HANDLE = radios.WatchdogHandle(token=_WATCHDOG_TOKEN, pid=_WATCHDOG_PID)
 
 
 class StubSettings:
@@ -120,6 +124,30 @@ def _issued(commands: list[str], fragment: str) -> list[int]:
     return [index for index, command in enumerate(commands) if fragment in command]
 
 
+async def _arm_and_capture_watchdog(monkeypatch, **arm_kwargs):
+    captured: dict[str, object] = {"probes": []}
+    candidate = radios.WatchdogHandle(token=_WATCHDOG_TOKEN, pid=0)
+
+    async def shell_script(address, launcher, *, timeout):
+        assert address == "u:5555"
+        captured["launcher"] = launcher
+        captured["launcher_timeout"] = timeout
+        return ""
+
+    async def shell(address, command, **_kwargs):
+        assert address == "u:5555"
+        captured["probes"].append(command)
+        return str(_WATCHDOG_PID)
+
+    monkeypatch.setattr(radios, "_new_watchdog_handle", lambda **_kwargs: candidate)
+    monkeypatch.setattr(radios, "_shell_script", shell_script)
+    monkeypatch.setattr(adb, "shell", shell)
+
+    handle = await radios._arm_watchdog("u:5555", 300, **arm_kwargs)
+    assert handle == _WATCHDOG_HANDLE
+    return handle, captured
+
+
 def test_hotspot_passphrase_is_excluded_from_radio_object_representations():
     snapshot = radios.RadioSnapshot(
         bluetooth="on",
@@ -180,26 +208,19 @@ async def test_device_identity_is_stable_across_reboots_without_storing_serial(m
 
 
 async def test_zlink_package_gate_is_positive_and_bounded(unit_shell):
-    unit_shell.replies["pm path com.zjinnova.zlink"] = (
-        "package:/system/app/CarZhiJian/CarZhiJian.apk\n"
-        "6.1.02\n"
-        "600102\n"
-        "c8f43e1a2dbd957220194f59ded0eb64581a571fde59d55386e6c5b4d49967d3"
-    )
+    unit_shell.replies["pm path com.zjinnova.zlink"] = _APPROVED_VENDOR_ATTESTATION
     assert await radios.supports_zlink_bluetooth_rearm("unit:5555")
     assert len(_issued(unit_shell.commands, "pm path com.zjinnova.zlink")) == 1
+    command = unit_shell.commands[-1]
+    assert "pm path com.zqc.functioncore" in command
+    assert "sha256sum '/system/app/FunctionCore/FunctionCore.apk'" in command
 
 
 async def test_zlink_package_gate_retries_a_transient_attestation_failure(monkeypatch):
     replies = iter(
         [
             adb.AdbError("adb transport temporarily unavailable"),
-            (
-                "package:/system/app/CarZhiJian/CarZhiJian.apk\n"
-                "6.1.02\n"
-                "600102\n"
-                "c8f43e1a2dbd957220194f59ded0eb64581a571fde59d55386e6c5b4d49967d3"
-            ),
+            _APPROVED_VENDOR_ATTESTATION,
         ]
     )
 
@@ -229,6 +250,10 @@ async def test_zlink_package_gate_retries_a_transient_attestation_failure(monkey
         "package:/system/app/CarZhiJian/CarZhiJian.apk\n6.1.02\n600102\n"
         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         "package:/system/app/CarZhiJian/CarZhiJian.apk\n6.1.02\n600102\n",
+        _APPROVED_VENDOR_ATTESTATION.replace(
+            "5335519733cd7c361715f8a8c96e0062b58fb8a50292a30a78b33db63ff1917a",
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ),
         "",
     ],
 )
@@ -386,19 +411,23 @@ class TestBluetooth:
         assert unit_shell.settings.values[radios.MARKER_KEY] == "bluetooth"
         assert not _issued(unit_shell.commands, f"rm -f '{radios.FLAG_PATH}'")
 
-    async def test_a_successful_restore_stands_down_the_watchdog(self, unit_shell, monkeypatch):
-        watchdog = FakeProcess()
-
+    async def test_a_successful_restore_cleans_up_the_remote_watchdog(
+        self, unit_shell, monkeypatch
+    ):
         async def armed(address, deadline_s, **kwargs):
-            return watchdog
+            return _WATCHDOG_HANDLE
 
         monkeypatch.setattr(radios, "_arm_watchdog", armed)
         unit_shell.replies["bluetooth_on"] = "1"
+        unit_shell.replies["printf cleared"] = "cleared"
         quiet = radios.begin_quiet("u:5555", online_for=60.0, watchdog_deadline_s=300)
         await quiet._task
         await quiet.finish()
 
-        assert watchdog.killed
+        assert quiet._watchdog is None
+        assert unit_shell.commands[-1] == radios._watchdog_owner_cleanup_command(
+            _WATCHDOG_HANDLE, prove=True
+        )
 
     async def test_an_enable_that_does_not_stick_keeps_every_layer_in_place(
         self, unit_shell, monkeypatch
@@ -410,10 +439,9 @@ class TestBluetooth:
         unverified success is what would strand the driver's hands-free with nothing at
         all left to repair it.
         """
-        watchdog = FakeProcess()
 
         async def armed(address, deadline_s, **kwargs):
-            return watchdog
+            return _WATCHDOG_HANDLE
 
         monkeypatch.setattr(radios, "_arm_watchdog", armed)
         # On when asked at the start of the window, still off when asked after the enable.
@@ -425,35 +453,225 @@ class TestBluetooth:
 
         assert unit_shell.settings.values[radios.MARKER_KEY] == "bluetooth"
         assert not _issued(unit_shell.commands, f"rm -f '{radios.FLAG_PATH}'")
-        assert not watchdog.killed, "the watchdog stood down over an unconfirmed restore"
+        assert quiet._watchdog == _WATCHDOG_HANDLE
 
 
 class TestTheWatchdog:
-    async def test_it_is_left_on_the_unit_gated_on_the_flag(self, monkeypatch):
-        """The remote command must be able to act with this app entirely gone."""
-        captured: dict[str, tuple] = {}
+    async def test_arm_launches_a_fully_detached_setsid_nohup_script(self, monkeypatch):
+        handle, captured = await _arm_and_capture_watchdog(monkeypatch)
 
-        async def fake_spawn(*args, **kwargs):
-            captured["args"] = args
-            return FakeProcess()
+        launcher = captured["launcher"]
+        assert captured["launcher_timeout"] == 10.0
+        assert f"cat > '{handle.script_partial_path}' <<'DASHCAM_RADIO_WATCHDOG'" in launcher
+        assert f"chmod 700 '{handle.script_partial_path}'" in launcher
+        assert f"mv -f '{handle.script_partial_path}' '{handle.script_path}'" in launcher
+        assert (
+            f"setsid -d nohup sh '{handle.script_path}' </dev/null >/dev/null 2>&1 &"
+        ) in launcher
+        assert len(captured["probes"]) == 1
 
-        async def fake_shell(address, command, **kwargs):
-            assert address == "u:5555"
-            return "armed" if radios.WATCHDOG_READY_PATH in command else ""
+    async def test_detached_script_publishes_its_own_pid_with_its_token(self, monkeypatch):
+        handle, captured = await _arm_and_capture_watchdog(monkeypatch)
 
-        monkeypatch.setattr(radios.asyncio, "create_subprocess_exec", fake_spawn)
-        monkeypatch.setattr(adb, "adb_path", lambda: "adb")
-        monkeypatch.setattr(adb, "shell", fake_shell)
+        launcher = captured["launcher"]
+        assert f"token='{handle.token}'" in launcher
+        assert (
+            f"(set -C; printf '%s %s\\n' \"$token\" \"$$\" > '{radios.WATCHDOG_ACTIVE_PATH}')"
+        ) in launcher
+        assert f"mv -f '{radios.WATCHDOG_ACTIVE_PARTIAL_PATH}'" not in launcher
+        assert "$!" not in launcher
 
-        await radios._arm_watchdog("u:5555", 300)
+    async def test_watchdog_script_is_flag_gated_and_uses_a_monotonic_lease(self, monkeypatch):
+        handle, captured = await _arm_and_capture_watchdog(monkeypatch)
 
-        command = captured["args"][-1]
-        assert "sleep 300" in command
-        assert radios.FLAG_PATH in command
-        assert "bluetooth_manager enable" in command
-        # The gate: a watchdog whose run already restored must do nothing at all.
-        assert f"[ -f '{radios.FLAG_PATH}' ] ||" in command
-        assert radios.WATCHDOG_READY_PATH in command
+        launcher = captured["launcher"]
+        assert "sleep 300" not in launcher
+        assert "/proc/uptime" in launcher
+        assert "$((now + 300))" in launcher
+        assert 'sleep "$delay"' in launcher
+        assert f"[ -f '{radios.FLAG_PATH}' ]" in launcher
+        assert handle.ready_path in launcher
+        assert handle.lease_path in launcher
+        assert handle.lease_partial_path in launcher
+        assert handle.expiry_claim_path in launcher
+        assert "bluetooth_manager enable" in launcher
+
+    async def test_probe_proves_token_pid_cmdline_and_unexpired_lease(self, unit_shell):
+        unit_shell.replies[_WATCHDOG_HANDLE.script_path] = str(_WATCHDOG_PID)
+
+        assert await radios._watchdog_is_armed("u:5555", _WATCHDOG_HANDLE)
+
+        command = unit_shell.commands[-1]
+        assert f"cat '{radios.WATCHDOG_ACTIVE_PATH}'" in command
+        assert f'[ "$token" = "{_WATCHDOG_TOKEN}" ]' in command
+        assert f'[ "$pid" = "{_WATCHDOG_PID}" ]' in command
+        assert 'kill -0 "$pid"' in command
+        assert '"/proc/$pid/cmdline"' in command
+        assert f'*"{_WATCHDOG_HANDLE.script_path}"*' in command
+        assert _WATCHDOG_HANDLE.ready_path in command
+        assert _WATCHDOG_HANDLE.lease_path in command
+        assert "/proc/uptime" in command
+        assert '[ "$expiry" -gt "$now" ]' in command
+
+    async def test_renewal_atomically_extends_only_an_armed_monotonic_lease(self, unit_shell):
+        unit_shell.replies["printf renewed"] = "renewed"
+
+        assert await radios._renew_watchdog_lease("u:5555", 300, _WATCHDOG_HANDLE)
+
+        command = unit_shell.commands[-1]
+        assert f'[ "$state" = "{_WATCHDOG_TOKEN} {_WATCHDOG_PID}" ]' in command
+        assert f'pid="{_WATCHDOG_PID}"' in command
+        assert '"/proc/$pid/cmdline"' in command
+        assert f'*"{_WATCHDOG_HANDLE.script_path}"*' in command
+        assert "/proc/uptime" in command
+        assert "$((now + 300))" in command
+        assert command.count(f"cat '{_WATCHDOG_HANDLE.ready_path}'") == 2
+        assert f"mv -f '{_WATCHDOG_HANDLE.lease_partial_path}'" in command
+        assert _WATCHDOG_HANDLE.lease_path in command
+        assert "ssid" not in command.lower() and "passphrase" not in command.lower()
+
+    async def test_unpublished_candidate_cleanup_claims_the_empty_slot(self):
+        command = radios._watchdog_owner_cleanup_command(
+            _WATCHDOG_HANDLE,
+            allow_unpublished=True,
+            prove=True,
+        )
+
+        cleanup_state = f"cleanup:{_WATCHDOG_TOKEN}"
+        claim = f"(set -C; printf '%s\\n' \"$cleanup_state\" > '{radios.WATCHDOG_ACTIVE_PATH}')"
+        assert f'cleanup_state="{cleanup_state}"' in command
+        assert claim in command
+        assert f"rm -f '{radios.FLAG_PATH}'" in command[command.index(claim) :]
+        assert f'cat "{radios.WATCHDOG_ACTIVE_PATH}"' in command
+        assert '[ "$current" = "$cleanup_state" ]' in command
+        assert "EXIT; trap 'exit 1' HUP INT TERM" in command
+        assert (
+            f'[ "$(cat \'{radios.WATCHDOG_ACTIVE_PATH}\' 2>/dev/null)" = "$cleanup_state" ] '
+            "|| exit 1"
+        ) in command
+
+    async def test_abnormal_release_stops_renewal_without_cleaning_up_remote_watchdog(
+        self, unit_shell, monkeypatch
+    ):
+        renewed = asyncio.Event()
+        renewal_count = 0
+        renewed_handles = []
+
+        async def armed(_address, _deadline_s, **_kwargs):
+            return _WATCHDOG_HANDLE
+
+        async def renew(_address, _deadline_s, handle):
+            nonlocal renewal_count
+            renewal_count += 1
+            renewed_handles.append(handle)
+            renewed.set()
+            return True
+
+        monkeypatch.setattr(radios, "_arm_watchdog", armed)
+        monkeypatch.setattr(radios, "_renew_watchdog_lease", renew)
+        monkeypatch.setattr(radios, "_watchdog_renew_interval", lambda _deadline_s: 0.001)
+        controller = radios.RadioController("u:5555", watchdog_deadline_s=300)
+        controller.claim()
+
+        assert await controller._ensure_watchdog_locked(marker="bluetooth")
+        renewal_task = controller._watchdog_renewal_task
+        assert renewal_task is not None
+        await asyncio.wait_for(renewed.wait(), timeout=0.2)
+
+        commands_before_release = tuple(unit_shell.commands)
+        await controller.release()
+        stopped_at = renewal_count
+        await asyncio.sleep(0.01)
+        assert renewal_task.done()
+        assert renewal_count == stopped_at
+        assert renewed_handles == [_WATCHDOG_HANDLE]
+        assert tuple(unit_shell.commands) == commands_before_release
+        assert controller._watchdog == _WATCHDOG_HANDLE
+
+    async def test_stand_down_validates_and_cleans_only_the_exact_active_token(
+        self, unit_shell, monkeypatch
+    ):
+        async def armed(_address, _deadline_s, **_kwargs):
+            return _WATCHDOG_HANDLE
+
+        monkeypatch.setattr(radios, "_arm_watchdog", armed)
+        unit_shell.replies["printf cleared"] = "cleared"
+        controller = radios.RadioController("u:5555", watchdog_deadline_s=300)
+        controller.claim()
+        assert await controller._ensure_watchdog_locked(marker="bluetooth")
+        renewal_task = controller._watchdog_renewal_task
+
+        assert await controller.stand_down_watchdog()
+
+        command = unit_shell.commands[-1]
+        assert f"cat '{radios.WATCHDOG_ACTIVE_PATH}'" in command
+        assert f'[ "$state" = "{_WATCHDOG_TOKEN} {_WATCHDOG_PID}" ]' in command
+        assert f'script="{_WATCHDOG_HANDLE.script_path}"' in command
+        assert '"/proc/$pid/cmdline"' in command
+        assert 'case "$cmdline" in *"$script"*) ;; *) break' in command
+        assert 'kill "$pid"' in command
+        assert "printf busy" in command
+        assert _WATCHDOG_HANDLE.script_path in command
+        assert _WATCHDOG_HANDLE.ready_path in command
+        assert _WATCHDOG_HANDLE.lease_path in command
+        assert f'[ "$(cat \'{radios.WATCHDOG_ACTIVE_PATH}\' 2>/dev/null)" = "$state" ]' in command
+        assert f"{radios.WATCHDOG_SCRIPT_PREFIX}*" not in command
+        assert renewal_task is not None and renewal_task.done()
+        assert controller._watchdog is None
+        await controller.release()
+
+    async def test_late_stand_down_cannot_clear_a_newer_watchdog_generation(
+        self, unit_shell, monkeypatch
+    ):
+        async def armed(_address, _deadline_s, **_kwargs):
+            return _WATCHDOG_HANDLE
+
+        monkeypatch.setattr(radios, "_arm_watchdog", armed)
+        unit_shell.replies["printf mismatch"] = "mismatch"
+        controller = radios.RadioController("u:5555", watchdog_deadline_s=300)
+        controller.claim()
+        assert await controller._ensure_watchdog_locked(marker="bluetooth")
+
+        assert not await controller.stand_down_watchdog()
+
+        command = unit_shell.commands[-1]
+        assert f'[ "$state" = "{_WATCHDOG_TOKEN} {_WATCHDOG_PID}" ]' in command
+        assert 'if [ "$owned" -eq 1 ]' in command
+        assert "printf mismatch" in command
+        assert controller._watchdog == _WATCHDOG_HANDLE
+        await controller.release()
+
+    async def test_failed_candidate_cleanup_is_scoped_to_its_token(self, unit_shell):
+        candidate = radios.WatchdogHandle(token=_WATCHDOG_TOKEN, pid=0)
+
+        await radios._discard_watchdog_candidate("u:5555", candidate)
+
+        assert len(unit_shell.commands) == 1
+        command = unit_shell.commands[0]
+        assert f'[ "$token" = "{_WATCHDOG_TOKEN}" ]' in command
+        assert 'if [ -z "$state" ]' in command
+        assert candidate.script_path in command
+        assert f'script="{radios.WATCHDOG_SCRIPT_PREFIX}${{token}}.sh"' not in command
+
+    async def test_two_failed_renewals_set_the_watchdog_loss_event(self, monkeypatch):
+        attempts = []
+        lost = asyncio.Event()
+
+        async def renew(address, deadline_s, handle):
+            attempts.append((address, deadline_s, handle))
+            return False
+
+        monkeypatch.setattr(radios, "_renew_watchdog_lease", renew)
+        monkeypatch.setattr(radios, "_watchdog_renew_interval", lambda _deadline_s: 0)
+        monkeypatch.setattr(radios, "WATCHDOG_RENEW_RETRY_S", 0)
+
+        await radios._watchdog_renewal_loop("u:5555", 300, _WATCHDOG_HANDLE, lost)
+
+        assert lost.is_set()
+        assert attempts == [
+            ("u:5555", 300, _WATCHDOG_HANDLE),
+            ("u:5555", 300, _WATCHDOG_HANDLE),
+        ]
 
     @pytest.mark.parametrize(
         ("hotspot_baseline", "with_capsule", "expected", "forbidden"),
@@ -486,94 +704,55 @@ class TestTheWatchdog:
         expected,
         forbidden,
     ):
-        captured: dict[str, tuple] = {}
         capsule = (
             f"{radios.HOTSPOT_CAPSULE_PREFIX}01234567-89ab-cdef-0123-456789abcdef.json"
             if with_capsule
             else None
         )
 
-        async def fake_spawn(*args, **kwargs):
-            captured["args"] = args
-            return FakeProcess()
-
-        async def fake_shell(_address, command, **_kwargs):
-            return "armed" if radios.WATCHDOG_READY_PATH in command else ""
-
-        monkeypatch.setattr(radios.asyncio, "create_subprocess_exec", fake_spawn)
-        monkeypatch.setattr(adb, "adb_path", lambda: "adb")
-        monkeypatch.setattr(adb, "shell", fake_shell)
-
-        assert await radios._arm_watchdog(
-            "u:5555",
-            300,
+        _handle, captured = await _arm_and_capture_watchdog(
+            monkeypatch,
             restore_bluetooth=True,
             hotspot_baseline=hotspot_baseline,
             hotspot_capsule_path=capsule,
         )
-        command = captured["args"][-1]
+        command = captured["launcher"]
         positions = [command.index(fragment) for fragment in expected]
         assert positions == sorted(positions)
         assert all(fragment not in command for fragment in forbidden)
 
     async def test_hotspot_watchdog_retains_recovery_capsule_until_verified(self, monkeypatch):
-        captured: dict[str, tuple] = {}
         capsule = f"{radios.HOTSPOT_CAPSULE_PREFIX}01234567-89ab-cdef-0123-456789abcdef.json"
 
-        async def fake_spawn(*args, **kwargs):
-            captured["args"] = args
-            return FakeProcess()
-
-        async def fake_shell(_address, command, **_kwargs):
-            return "armed" if radios.WATCHDOG_READY_PATH in command else ""
-
-        monkeypatch.setattr(radios.asyncio, "create_subprocess_exec", fake_spawn)
-        monkeypatch.setattr(adb, "adb_path", lambda: "adb")
-        monkeypatch.setattr(adb, "shell", fake_shell)
-
-        assert await radios._arm_watchdog(
-            "u:5555",
-            300,
+        _handle, captured = await _arm_and_capture_watchdog(
+            monkeypatch,
             restore_bluetooth=False,
             hotspot_capsule_path=capsule,
         )
-        command = captured["args"][-1]
+        command = captured["launcher"]
         assert "start-softap" in command and capsule in command
         assert 'rm -f "$capsule"' not in command
         assert f"rm -f '{radios.FLAG_PATH}'" not in command
 
-    async def test_bluetooth_rearm_watchdog_never_invents_credentials_or_vendor_actions(
-        self, monkeypatch
-    ):
-        captured: dict[str, tuple] = {}
+    async def test_bluetooth_rearm_watchdog_uses_credential_free_vendor_restore(self, monkeypatch):
         capsule = f"{radios.HOTSPOT_CAPSULE_PREFIX}01234567-89ab-cdef-0123-456789abcdef.json"
 
-        async def fake_spawn(*args, **kwargs):
-            captured["args"] = args
-            return FakeProcess()
-
-        async def fake_shell(_address, command, **_kwargs):
-            return "armed" if radios.WATCHDOG_READY_PATH in command else ""
-
-        monkeypatch.setattr(radios.asyncio, "create_subprocess_exec", fake_spawn)
-        monkeypatch.setattr(adb, "adb_path", lambda: "adb")
-        monkeypatch.setattr(adb, "shell", fake_shell)
-
-        assert await radios._arm_watchdog(
-            "u:5555",
-            300,
+        _handle, captured = await _arm_and_capture_watchdog(
+            monkeypatch,
             restore_bluetooth=True,
             hotspot_baseline="on",
             hotspot_capsule_path=capsule,
             hotspot_restore_mode=radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
         )
-        command = captured["args"][-1]
+        command = captured["launcher"]
         # The strategy was validated before arming. Capsule loss after the radios go down
         # must not prevent recovery of the independently captured Bluetooth baseline.
         assert capsule not in command
         assert command.index("bluetooth_manager enable") < command.index("sleep 6")
         assert "start-softap" not in command
-        assert "com.zjinnova.zlink.action" not in command
+        assert "action.start.tethering" in command
+        assert "com.zqc.functioncore" in command
+        assert "ssid" not in command.lower() and "passphrase" not in command.lower()
 
         assert not await radios._arm_watchdog(
             "u:5555",
@@ -592,7 +771,14 @@ class TestTheWatchdog:
         assert not await controller.disable_bluetooth()
 
         assert not _issued(unit_shell.commands, "bluetooth_manager disable")
-        assert unit_shell.settings.values[radios.MARKER_KEY] == ""
+        assert unit_shell.settings.values[radios.MARKER_KEY] == "bluetooth"
+        # A failed candidate launch may mean that a newer process won publication.
+        # The caller must not follow the one exclusive startup cleanup with another
+        # wildcard removal after the scoped candidate has failed.
+        assert (
+            sum(command == radios._watchdog_cleanup_command() for command in unit_shell.commands)
+            == 1
+        )
         await controller.release()
 
     @pytest.mark.parametrize(
@@ -617,7 +803,7 @@ class TestTheWatchdog:
 
         async def armed(_address, _deadline_s, **kwargs):
             observed.update(kwargs)
-            return FakeProcess()
+            return _WATCHDOG_HANDLE
 
         monkeypatch.setattr(radios, "_arm_watchdog", armed)
         unit_shell.replies["bluetooth_on"] = ["1", "0"]
@@ -640,7 +826,7 @@ class TestTheWatchdog:
 
         async def armed(_address, _deadline_s, **_kwargs):
             order.append("watchdog")
-            return FakeProcess()
+            return _WATCHDOG_HANDLE
 
         async def guard():
             order.append("guard")
@@ -819,6 +1005,7 @@ class TestTheHotspot:
         monkeypatch.setattr(radios, "HOTSPOT_REARM_POLL_S", 0.005)
         unit_shell.replies["bluetooth_on"] = "1"
         unit_shell.replies["ip -o addr"] = [_IP_NO_AP, _IP_WITH_AP]
+        unit_shell.replies["pm path com.zjinnova.zlink"] = _APPROVED_VENDOR_ATTESTATION
         controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
 
         assert await controller.restore_bluetooth("on")
@@ -829,6 +1016,7 @@ class TestTheHotspot:
             expected_interface="ap0",
         )
         assert not _issued(unit_shell.commands, "start-softap")
+        assert _issued(unit_shell.commands, "action.start.tethering")
 
     async def test_opted_in_zlink_restore_stays_pending_when_the_ap_does_not_return(
         self, unit_shell, monkeypatch
@@ -837,6 +1025,7 @@ class TestTheHotspot:
         monkeypatch.setattr(radios, "HOTSPOT_REARM_POLL_S", 0.005)
         unit_shell.replies["bluetooth_on"] = "1"
         unit_shell.replies["ip -o addr"] = _IP_NO_AP
+        unit_shell.replies["pm path com.zjinnova.zlink"] = _APPROVED_VENDOR_ATTESTATION
         controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
 
         assert await controller.restore_bluetooth("on")
@@ -846,6 +1035,28 @@ class TestTheHotspot:
             radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
             expected_interface="ap0",
         )
+        assert _issued(unit_shell.commands, "action.start.tethering")
+
+    async def test_opted_in_zlink_restore_does_not_signal_an_unapproved_controller(
+        self, unit_shell, monkeypatch
+    ):
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_SETTLE_S", 0.02)
+        monkeypatch.setattr(radios, "HOTSPOT_REARM_POLL_S", 0.005)
+        unit_shell.replies["bluetooth_on"] = "1"
+        unit_shell.replies["ip -o addr"] = _IP_NO_AP
+        unit_shell.replies["pm path com.zjinnova.zlink"] = _APPROVED_VENDOR_ATTESTATION.replace(
+            "1.0.5", "1.0.6"
+        )
+        controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
+
+        assert await controller.restore_bluetooth("on")
+        assert not await controller.restore_hotspot(
+            "on",
+            None,
+            radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
+            expected_interface="ap0",
+        )
+        assert not _issued(unit_shell.commands, "action.start.tethering")
 
     async def test_opted_in_zlink_restore_rejects_a_different_serving_ap(
         self, unit_shell, monkeypatch
@@ -854,6 +1065,7 @@ class TestTheHotspot:
         monkeypatch.setattr(radios, "HOTSPOT_REARM_POLL_S", 0.005)
         unit_shell.replies["bluetooth_on"] = "1"
         unit_shell.replies["ip -o addr"] = _IP_WITH_AP.replace("ap0", "wlan1")
+        unit_shell.replies["pm path com.zjinnova.zlink"] = _APPROVED_VENDOR_ATTESTATION
         controller = radios.RadioController(UNIT, watchdog_deadline_s=300)
 
         assert await controller.restore_bluetooth("on")
@@ -863,6 +1075,7 @@ class TestTheHotspot:
             radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
             expected_interface="ap0",
         )
+        assert _issued(unit_shell.commands, "action.start.tethering")
 
     async def test_opted_in_zlink_restore_rejects_an_ap_that_disappears_during_settle(
         self, unit_shell, monkeypatch
@@ -898,6 +1111,7 @@ class TestTheHotspot:
             expected_interface="ap0",
         )
         assert len(_issued(unit_shell.commands, "ip -o addr")) >= 3
+        assert not _issued(unit_shell.commands, "action.start.tethering")
 
     async def test_empty_or_unparseable_inventory_is_unknown_not_proven_off(self, unit_shell):
         unit_shell.replies["ip -o addr"] = "diagnostic noise without an address"

@@ -25,7 +25,7 @@ from app.core.logging import get_logger
 from app.core.process_lock import ProcessFileLock, try_acquire
 from app.db.models import IngestRadioTransition
 from app.db.session import session_scope
-from app.ingest import obd_control, radios
+from app.ingest import adb, obd_control, radios
 from app.ingest.ha_import_queue import redact
 
 log = get_logger(__name__)
@@ -35,7 +35,7 @@ log = get_logger(__name__)
 # a device command.
 LEASE_TTL_S = 45.0
 HEARTBEAT_INTERVAL_S = 10.0
-QUIET_RESTORE_MARGIN_S = 30.0
+LOGGER_QUIESCE_RENEW_INTERVAL_S = 20.0
 LOGGER_QUIESCE_HEADROOM_S = 90.0
 LOGGER_RADIO_RECOVERY_MARGIN_S = 30.0
 MAX_WATCHDOG_DEADLINE_S = 480
@@ -94,17 +94,19 @@ class RadioTransition:
     allow_zlink_rearm: bool = False
     lease_loss_callback: Callable[[], object] | None = field(default=None, repr=False)
     _heartbeat_task: asyncio.Task[None] | None = field(default=None, repr=False)
-    _deadline_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _restore_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _logger_control_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _restore_result: bool | None = field(default=None, repr=False)
-    _baseline_restored: bool = field(default=False, repr=False)
-    _baseline_error: object | None = field(default=None, repr=False)
     _closed: bool = False
     _hotspot_config: tuple[str, str] | None = field(default=None, repr=False)
     _hotspot_restore_mode: str | None = field(default=None, repr=False)
     _untracked_capsule_ref: str | None = field(default=None, repr=False)
     _lease_lost_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     _lease_loss_error: RadioTransitionError | None = field(default=None, repr=False)
+    _logger_request_id: str | None = field(default=None, repr=False)
+    _logger_renew_after: float | None = field(default=None, repr=False)
+    _logger_valid_until: float | None = field(default=None, repr=False)
+    _logger_resumed: bool = field(default=False, repr=False)
 
     @property
     def lease_lost(self) -> bool:
@@ -155,8 +157,93 @@ class RadioTransition:
                 # process fence remains held, so a slow commit/ADB call may finish without
                 # an expired-row adopter issuing overlapping side effects.
                 self._signal_lease_loss(exc)
-                log.error("could not renew the ingest radio lease", error=_error_text(exc))
+                log.error("could not renew the durable ingest lease", error=_error_text(exc))
                 return
+            try:
+                watchdog_healthy = await self.controller.watchdog_healthy()
+                if not watchdog_healthy:
+                    raise RadioTransitionError("detached on-unit radio recovery watchdog was lost")
+            except Exception as exc:
+                # A transfer without its independently running restore path is no longer
+                # safe, even if the bulk socket is still moving bytes. Reuse the durable
+                # lease-loss path so the pull is cancelled and normal restoration starts
+                # while the watchdog's last proven monotonic lease still has headroom.
+                self._signal_lease_loss(exc)
+                log.error("radio watchdog health proof failed", error=_error_text(exc))
+                return
+            try:
+                await self._renew_logger_quiesce()
+            except adb.AdbError as exc:
+                # Bulk TCP can remain healthy through one slow ADB control round-trip.
+                # Keep retrying only while the last proven Android deadline still leaves
+                # enough time for the full radio-watchdog recovery window plus another
+                # bounded renewal attempt. Semantic/protocol failures remain fatal below.
+                loop = asyncio.get_running_loop()
+                remaining = (self._logger_valid_until or 0.0) - loop.time()
+                required = (
+                    self.watchdog_deadline_s
+                    + LOGGER_RADIO_RECOVERY_MARGIN_S
+                    + obd_control.RENEWAL_WRITE_MARGIN_S
+                )
+                if remaining > required:
+                    log.warning(
+                        "OBD quiesce lease renewal was temporarily unavailable; retrying",
+                        error=_error_text(exc),
+                        remaining_seconds=round(remaining),
+                    )
+                    continue
+                self._signal_lease_loss(exc)
+                log.error(
+                    "OBD quiesce lease could not be renewed before its safety margin",
+                    error=_error_text(exc),
+                )
+                return
+            except Exception as exc:
+                self._signal_lease_loss(exc)
+                log.error("OBD quiesce lease renewal failed", error=_error_text(exc))
+                return
+
+    def _logger_hold_s(self) -> float:
+        return self.watchdog_deadline_s + max(
+            obd_control.DEFAULT_TIMEOUT_S, LOGGER_QUIESCE_HEADROOM_S
+        )
+
+    async def _renew_logger_quiesce(
+        self,
+        request_id: str | None = None,
+        *,
+        force: bool = False,
+    ) -> obd_control.LoggerAck | None:
+        """Keep the finite Android hold ahead of the independent radio watchdog."""
+
+        request_id = request_id or self._logger_request_id
+        if request_id is None or self._logger_resumed:
+            return None
+        loop = asyncio.get_running_loop()
+        if (
+            not force
+            and self._logger_renew_after is not None
+            and loop.time() < self._logger_renew_after
+        ):
+            return None
+        async with self._logger_control_lock:
+            # Successful resume clears the local id while holding this same lock. Recheck
+            # so a heartbeat queued behind restoration cannot recreate the request.
+            if self._logger_resumed:
+                return None
+            renewal_started = loop.time()
+            ack = await obd_control.renew_quiesce(
+                self.address,
+                self.logger_status_path or "",
+                request_id,
+                hold_s=self._logger_hold_s(),
+                minimum_remaining_s=(self.watchdog_deadline_s + LOGGER_RADIO_RECOVERY_MARGIN_S),
+            )
+            self._logger_request_id = request_id
+            self._logger_renew_after = loop.time() + LOGGER_QUIESCE_RENEW_INTERVAL_S
+            # Conservative: the device creates its new deadline after this timestamp.
+            self._logger_valid_until = renewal_started + self._logger_hold_s()
+            return ack
 
     async def checkpoint(
         self,
@@ -201,6 +288,7 @@ class RadioTransition:
             logger_request_id=request_id,
             logger_quiesce_requested_at=_now(),
         )
+        request_started = asyncio.get_running_loop().time()
         try:
             ack = await obd_control.request_quiesce(
                 self.address,
@@ -213,6 +301,13 @@ class RadioTransition:
             await self.checkpoint(last_error=_error_text(exc))
             raise RadioTransitionError(_error_text(exc)) from exc
         await self.checkpoint(logger_quiesce_acked_at=_now())
+        self._logger_resumed = False
+        self._logger_request_id = request_id
+        self._logger_renew_after = (
+            asyncio.get_running_loop().time() + LOGGER_QUIESCE_RENEW_INTERVAL_S
+        )
+        # Conservative: the device writes the request after this timestamp.
+        self._logger_valid_until = request_started + self._logger_hold_s()
         return ack
 
     async def mark_obd_transfer_complete(self) -> None:
@@ -301,13 +396,9 @@ class RadioTransition:
                         "OBD quiesce lease could not be revalidated; radios were left on"
                     )
                 try:
-                    await obd_control.verify_quiesce(
-                        self.address,
-                        self.logger_status_path,
+                    await self._renew_logger_quiesce(
                         row.logger_request_id,
-                        minimum_remaining_s=(
-                            self.watchdog_deadline_s + LOGGER_RADIO_RECOVERY_MARGIN_S
-                        ),
+                        force=True,
                     )
                 except Exception as exc:
                     raise RadioTransitionError(
@@ -340,48 +431,6 @@ class RadioTransition:
             # it down would destroy the ADB/TCP data path.
             await self.checkpoint(hotspot_disable_verified=True)
         await self.checkpoint(TransitionPhase.INGESTING)
-        self._start_quiet_deadline()
-
-    def _start_quiet_deadline(self) -> None:
-        if self._deadline_task is None:
-            self._deadline_task = asyncio.create_task(
-                self._restore_at_quiet_deadline(),
-                name=f"ingest-radio-deadline-{self.transition_id}",
-            )
-
-    async def _restore_at_quiet_deadline(self) -> None:
-        delay = max(1.0, float(self.watchdog_deadline_s) - QUIET_RESTORE_MARGIN_S)
-        await asyncio.sleep(delay)
-        log.warning(
-            "radio quiet deadline reached; restoring radios while ingest continues",
-            transition_id=self.transition_id,
-            quiet_seconds=round(delay),
-        )
-        await self.restore_radio_baseline(
-            error=RadioTransitionError("radio quiet deadline reached")
-        )
-
-    async def restore_radio_baseline(self, *, error: object | None = None) -> bool:
-        """Restore radios/logger at the safety deadline while retaining ingest ownership."""
-        async with self._restore_lock:
-            if self._baseline_restored:
-                return True
-            try:
-                restored = await self._restore(error=error, finalize=False)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                with contextlib.suppress(Exception):
-                    await self.checkpoint(
-                        TransitionPhase.RECOVERY_REQUIRED,
-                        recovery_required=True,
-                        last_error=_error_text(exc),
-                    )
-                return False
-            if restored:
-                self._baseline_restored = True
-                self._baseline_error = error
-            return restored
 
     async def restore(self, *, error: object | None = None) -> bool:
         """Restore with process-local ownership released even if the caller cancels."""
@@ -395,15 +444,8 @@ class RadioTransition:
                 self._restore_result = False
                 return False
             try:
-                # A deadline checkpoint deliberately retains the protected hotspot
-                # capsule while the ingest fence remains active.  Re-run the idempotent
-                # baseline verification here so finalisation can remove that last-resort
-                # recovery material only after the long-running pull really exits.
-                effective_error = self._baseline_error or error or self._lease_loss_error
-                result = await self._restore(
-                    error=effective_error,
-                    finalize=True,
-                )
+                effective_error = error or self._lease_loss_error
+                result = await self._restore(error=effective_error)
                 self._restore_result = result
                 return result
             except BaseException as exc:
@@ -448,7 +490,7 @@ class RadioTransition:
             if result.rowcount != 1:
                 self._signal_lease_loss("exceptional restore lost durable ownership")
 
-    async def _restore(self, *, error: object | None = None, finalize: bool) -> bool:
+    async def _restore(self, *, error: object | None = None) -> bool:
         """Restore exact baseline, then resume the logger and close the transition."""
         try:
             row = await self._row()
@@ -506,9 +548,15 @@ class RadioTransition:
                     TransitionPhase.RESUMING_OBD,
                     logger_resume_attempted=True,
                 )
-                resume_ok = bool(self.logger_status_path) and await obd_control.resume_logger(
-                    self.address, self.logger_status_path or ""
-                )
+                async with self._logger_control_lock:
+                    resume_ok = bool(self.logger_status_path) and await obd_control.resume_logger(
+                        self.address, self.logger_status_path or ""
+                    )
+                    if resume_ok:
+                        self._logger_resumed = True
+                        self._logger_request_id = None
+                        self._logger_renew_after = None
+                        self._logger_valid_until = None
                 await self.checkpoint(logger_resume_verified=resume_ok)
                 if not resume_ok:
                     errors.append("OBD logger resume could not be verified")
@@ -517,28 +565,20 @@ class RadioTransition:
                 errors.append("OBD logger remains quiesced until radios are restored")
 
         if radio_ok and resume_ok:
-            if finalize:
-                if row.hotspot_restore_ref is None and self._untracked_capsule_ref is not None:
-                    await self.checkpoint(hotspot_restore_ref=self._untracked_capsule_ref)
-                    row.hotspot_restore_ref = self._untracked_capsule_ref
-                # Stop renewal before intentionally deactivating the row. Otherwise a
-                # heartbeat racing the final UPDATE can observe active=False and report
-                # a spurious lease loss during a successful close.
-                await self._stop_heartbeat()
-                clean = await self._finish_transition(error=error, errors=errors)
-                # The active row is the recovery authority. Deactivate it only after the
-                # logger resume is durable, then erase the capsule. A crash on either side
-                # is recoverable: before deactivation startup repeats restore; afterwards
-                # it finds the retained reference and performs idempotent cleanup only.
-                if clean and row.hotspot_restore_ref:
-                    await self._cleanup_capsule_after_finish(row.hotspot_restore_ref)
-            else:
-                await self.checkpoint(
-                    TransitionPhase.INGESTING,
-                    recovery_required=False,
-                    last_error="; ".join(errors)[:2000] or None,
-                )
-                clean = True
+            if row.hotspot_restore_ref is None and self._untracked_capsule_ref is not None:
+                await self.checkpoint(hotspot_restore_ref=self._untracked_capsule_ref)
+                row.hotspot_restore_ref = self._untracked_capsule_ref
+            # Stop renewal before intentionally deactivating the row. Otherwise a
+            # heartbeat racing the final UPDATE can observe active=False and report
+            # a spurious lease loss during a successful close.
+            await self._stop_heartbeat()
+            clean = await self._finish_transition(error=error, errors=errors)
+            # The active row is the recovery authority. Deactivate it only after the
+            # logger resume is durable, then erase the capsule. A crash on either side
+            # is recoverable: before deactivation startup repeats restore; afterwards
+            # it finds the retained reference and performs idempotent cleanup only.
+            if clean and row.hotspot_restore_ref:
+                await self._cleanup_capsule_after_finish(row.hotspot_restore_ref)
         else:
             await self.checkpoint(
                 TransitionPhase.RECOVERY_REQUIRED,
@@ -645,11 +685,6 @@ class RadioTransition:
             return
         self._closed = True
         await self._stop_heartbeat()
-        deadline_task = self._deadline_task
-        if deadline_task is not None and deadline_task is not asyncio.current_task():
-            deadline_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await deadline_task
         try:
             await self.controller.release()
         finally:

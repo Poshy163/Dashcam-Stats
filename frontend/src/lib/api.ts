@@ -188,6 +188,8 @@ export interface IngestStatus {
   currentFile: string | null
   backlogFiles: number
   backlogBytes: number
+  /** False until this process has actually listed the card; zero is not evidence yet. */
+  backlogKnown: boolean
   /** Recordings left alone because the camera is still writing them. */
   activeSkipped: number
   /** The unit's WiFi frequency in MHz as last read by the band gate; null when unknown. */

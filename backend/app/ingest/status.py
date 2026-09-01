@@ -55,6 +55,11 @@ class IngestStatus:
         self.current_file: str | None = None
         self.backlog_files = 0
         self.backlog_bytes = 0
+        #: Whether the backlog counters came from a card inventory in this process. Zero
+        #: is a useful answer only after the card was actually listed; at startup, or when
+        #: radio recovery blocks a run before listing, the same numeric zero means "not
+        #: checked" and must not be presented as an empty card.
+        self.backlog_known = False
         self.active_skipped = 0
         #: The unit's WiFi frequency in MHz as last read by the band gate, whether a
         #: transfer is currently being held for it, and why. Cleared when the unit leaves:
@@ -119,6 +124,7 @@ class IngestStatus:
             self.phase = Phase.CONNECTING
             self.files_total = self.files_done = 0
             self.bytes_total = self.bytes_done = 0
+            self.backlog_known = False
             self.active_skipped = 0
             self.current_file = None
             self.last_error = None
@@ -184,6 +190,7 @@ class IngestStatus:
             self.bytes_total = plan.bytes
             self.backlog_files = plan.backlog_files
             self.backlog_bytes = plan.backlog_bytes
+            self.backlog_known = True
             self.active_skipped = plan.active_skipped
 
     def extend_plan(self, plan: DeltaPlan) -> None:
@@ -203,6 +210,12 @@ class IngestStatus:
         with self._lock:
             self.backlog_files = files
             self.backlog_bytes = size
+            self.backlog_known = True
+
+    def set_last_success(self, observed: datetime | None) -> None:
+        """Seed the durable last-copy time without putting database I/O on snapshots."""
+        with self._lock:
+            self.last_success = observed
 
     def set_unit_online(self, online: bool) -> None:
         with self._lock:
@@ -339,6 +352,7 @@ class IngestStatus:
                 "current_file": self.current_file,
                 "backlog_files": self.backlog_files,
                 "backlog_bytes": self.backlog_bytes,
+                "backlog_known": self.backlog_known,
                 "active_skipped": self.active_skipped,
                 "wifi_frequency_mhz": self.wifi_frequency_mhz,
                 "wifi_band_hold": self.wifi_band_hold,
@@ -366,6 +380,34 @@ def get_status() -> IngestStatus:
     if _status is None:
         _status = IngestStatus()
     return _status
+
+
+async def hydrate_last_success() -> datetime | None:
+    """Load the last completed, non-empty successful run into the live status singleton.
+
+    This is deliberately called once during application startup. The status endpoint stays
+    a lock-protected in-memory snapshot, while the user-visible "Last copied" value survives
+    a container restart by being recovered from ``ingest_runs``.
+    """
+    from sqlalchemy import select
+
+    from app.db.models import IngestRun
+    from app.db.session import session_scope
+
+    async with session_scope() as session:
+        observed = await session.scalar(
+            select(IngestRun.finished_at)
+            .where(
+                IngestRun.state == RunState.OK.value,
+                IngestRun.files_transferred > 0,
+                IngestRun.finished_at.is_not(None),
+            )
+            .order_by(IngestRun.finished_at.desc())
+            .limit(1)
+        )
+
+    get_status().set_last_success(observed)
+    return observed
 
 
 def reset_status_for_tests() -> None:

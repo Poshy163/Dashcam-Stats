@@ -46,6 +46,7 @@ from app.ingest.ha_import_queue import get_import_worker
 from app.ingest.obd_reconciliation import reconcile_all_drives
 from app.ingest.poller import get_poller
 from app.ingest.radio_coordinator import reconcile_startup
+from app.ingest.status import hydrate_last_success
 from app.pipeline.stages import warm_models
 from app.workers import queue
 from app.workers.scheduler import get_scheduler
@@ -85,6 +86,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     await init_db()
     await init_settings_service(get_session_factory())
+    # Live transfer counters stay memory-only, but "Last copied" is historical truth and
+    # must survive a process restart. Hydrate it once here rather than querying the database
+    # on every status poll.
+    try:
+        await hydrate_last_success()
+    except Exception as exc:
+        # Presentation history is not a startup dependency. A later successful copy still
+        # populates this value in memory and the ingest history endpoint remains available.
+        log.warning("could not hydrate the last successful ingest", error=str(exc))
 
     # Whether an account exists is answered from process state on every gated request, so
     # it is read once here rather than faulted in by whoever happens to knock first. The

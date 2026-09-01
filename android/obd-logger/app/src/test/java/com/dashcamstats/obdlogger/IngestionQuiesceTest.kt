@@ -122,6 +122,35 @@ class IngestionQuiesceTest {
     }
 
     @Test
+    fun sameRequestIdDeadlineRenewalKeepsTheReadyAckAndLoggerQuiesced() {
+        val root = Files.createTempDirectory("obd-quiesce-renewal").toFile()
+        try {
+            IngestionQuiesceFiles.controlRoot(root).mkdirs()
+            writeRequest(root, validRequest())
+            val original = (read(root) as IngestionRequestRead.Valid).request
+            IngestionQuiesceFiles.publishReady(
+                root,
+                original,
+                readyAtUtc = "2026-08-30T00:00:30Z",
+            )
+
+            writeRequest(
+                root,
+                requestJson("2026-08-30T00:00:45Z", "2026-08-30T00:10:15Z"),
+                modifiedAtUtc = "2026-08-30T00:00:45Z",
+            )
+            val renewed = read(root, "2026-08-30T00:05:00Z")
+
+            assertTrue(renewed is IngestionRequestRead.Valid)
+            assertEquals(original.requestId, (renewed as IngestionRequestRead.Valid).request.requestId)
+            assertTrue(IngestionQuiesceFiles.isReadyFor(root, original.requestId))
+            assertEquals(IngestionQuiesceDecision.QUIESCE, ingestionQuiesceDecision(renewed))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun parkedReadyHasNoFabricatedDriveAndFailedAckRedactsAndBoundsError() {
         val root = Files.createTempDirectory("obd-quiesce-parked").toFile()
         try {

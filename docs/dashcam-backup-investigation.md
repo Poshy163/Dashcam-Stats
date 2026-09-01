@@ -20,7 +20,7 @@ card, launch a listener, delete verified files. The recordings do not pass throu
 all. The bulk path is:
 
 ```
-adb shell "cd <card> && tar c F1 F2 … | timeout 180 nc -l -p 9000"      (on the unit)
+adb shell "cd <card> && tar c F1 F2 … | nc -l -p 9000 -w 180"          (on the unit)
         ↓  plain TCP, port 9000
 Python tarfile in streaming "r|" mode → <footage>/.ingest_staging/     (in the container)
         ↓  size check + atomic rename
@@ -161,8 +161,10 @@ when several could sit outside it.
   count and removing an inter-process pipe hop**, not eliminating the copy.
 - **Single TCP stream.** On a lossy or high-BDP wireless link a single stream frequently
   cannot fill the pipe. 2–4 parallel streams are the standard remedy and are easy to test.
-- **`timeout 180`** kills the listener at 180 s. Fine for a 90 s window, but if the window ever
-  gets longer (see §4), this becomes a cap.
+- **The former outer `timeout 180` killed an active listener at 180 s.** That became a real
+  data-path fault once large backlogs kept a directory stream open longer than three minutes.
+  The current `nc -w 180` bounds only connection establishment; an accepted stream lives for
+  as long as its tracked ADB session and TCP connection.
 
 ### 2c. Progress and observability
 
@@ -434,9 +436,9 @@ hold: measured gain > 15 %, a clean vendor-supported stop/start exists, and ever
    volume), so an app crash or container restart resumes recording the next time it sees the
    unit, rather than forgetting it ever paused.
 3. **A hard deadline** — resume unconditionally after N minutes regardless of transfer state.
-4. **A remote watchdog** — `timeout <N> sh -c '…; <resume command>'` launched *on the unit*, so
-   recording restarts even if the app disappears entirely. This is the same trick the current
-   listener already uses with `timeout 180 nc`.
+4. **A remote watchdog** — a bounded lease launched *on the unit*, so recording restarts even
+   if the app disappears entirely. This must remain separate from the bulk listener: the
+   listener's `nc -w` timeout intentionally covers connection establishment only.
 5. **Positive verification that recording resumed** — a new `.ts` appears *and grows* between
    two listings, and `dumpsys package <pkg> | grep -i stopped` shows the stopped flag cleared.
    A zero exit code is not evidence.

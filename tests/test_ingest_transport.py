@@ -483,6 +483,7 @@ class TestTheStatusSnapshot:
             "current_file",
             "backlog_files",
             "backlog_bytes",
+            "backlog_known",
             "recorder_health",
             "recorder_health_ok",
             "last_success_ts",
@@ -493,6 +494,87 @@ class TestTheStatusSnapshot:
         assert snapshot["files_done"] == 1
         assert snapshot["bytes_total"] == 3000
         assert snapshot["bytes_done"] == 1000
+        assert snapshot["backlog_known"] is True
+
+    def test_backlog_is_unknown_until_this_run_lists_the_card(self):
+        from app.ingest.models import DeltaPlan, RunResult, RunState
+        from app.ingest.status import IngestStatus
+
+        status = IngestStatus()
+        assert status.snapshot()["backlog_known"] is False
+
+        assert status.try_begin()
+        assert status.snapshot()["backlog_known"] is False
+        status.plan(DeltaPlan(files=[], backlog_files=0, backlog_bytes=0))
+        assert status.snapshot()["backlog_known"] is True
+
+        status.finish(RunResult(state=RunState.IDLE))
+        assert status.try_begin()
+        assert status.snapshot()["backlog_known"] is False
+
+
+class TestStatusStartupHydration:
+    async def test_latest_nonempty_success_survives_a_process_restart(self, db_session):
+        from datetime import UTC, datetime, timedelta
+
+        from app.db.models import IngestRun
+        from app.ingest.status import get_status, hydrate_last_success, reset_status_for_tests
+
+        now = datetime.now(UTC)
+        selected = now - timedelta(hours=2)
+        db_session.add_all(
+            [
+                IngestRun(
+                    started_at=now - timedelta(hours=4),
+                    finished_at=now - timedelta(hours=3),
+                    state="ok",
+                    files_transferred=2,
+                ),
+                IngestRun(
+                    started_at=selected - timedelta(minutes=1),
+                    finished_at=selected,
+                    state="ok",
+                    files_transferred=1,
+                ),
+                # Newer rows that did not copy a file are not a last-copy event.
+                IngestRun(
+                    started_at=now - timedelta(hours=1),
+                    finished_at=now - timedelta(hours=1),
+                    state="ok",
+                    files_transferred=0,
+                ),
+                IngestRun(
+                    started_at=now - timedelta(minutes=30),
+                    finished_at=now - timedelta(minutes=30),
+                    state="error",
+                    files_transferred=3,
+                ),
+                IngestRun(
+                    started_at=now - timedelta(minutes=10),
+                    finished_at=None,
+                    state="ok",
+                    files_transferred=4,
+                ),
+            ]
+        )
+        await db_session.commit()
+        reset_status_for_tests()
+
+        observed = await hydrate_last_success()
+
+        assert observed == selected
+        assert get_status().snapshot()["last_success_ts"] == selected.isoformat()
+
+    async def test_no_durable_success_clears_an_unhydrated_value(self, db_session):
+        from datetime import UTC, datetime
+
+        from app.ingest.status import get_status, hydrate_last_success, reset_status_for_tests
+
+        reset_status_for_tests()
+        get_status().set_last_success(datetime.now(UTC))
+
+        assert await hydrate_last_success() is None
+        assert get_status().snapshot()["last_success_ts"] is None
 
 
 class TestTheAdbControlChannel:
@@ -578,7 +660,8 @@ class TestTheAdbControlChannel:
         assert argv[:4] == ["adb", "-s", "unit:5555", "shell"]
         command = argv[4]
         assert "tar c a.ts b.ts" in command
-        assert "timeout 180 nc -l -p 9000" in command
+        assert "nc -l -p 9000 -w 180" in command
+        assert "timeout 180" not in command
         # Nothing backgrounded remotely: that is exactly what adb would not return from.
         assert not command.rstrip().endswith("&")
         assert "setsid" not in command
@@ -1275,6 +1358,27 @@ class TestARunEndToEnd:
         assert again.files == 0
         assert unit.served["names"] is not None
 
+    async def test_pending_radio_recovery_does_not_publish_a_fake_empty_backlog(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        from app.ingest import puller
+        from app.ingest.models import RunState
+        from app.ingest.status import get_status
+
+        async def recovery_still_pending(*, address):
+            assert address == "127.0.0.1:5555"
+            return False
+
+        await self._enable()
+        monkeypatch.setattr(puller.radio_coordinator, "reconcile_pending", recovery_still_pending)
+
+        result = await puller.run_pull(trigger="manual")
+
+        assert result.state is RunState.IDLE
+        assert result.error == "an earlier ingest radio transition still requires recovery"
+        assert get_status().snapshot()["backlog_known"] is False
+        assert unit.served["names"] is None, "the card was never inventoried"
+
     async def test_a_recording_closed_during_the_transfer_is_swept_up_in_the_same_run(
         self, db_session, unit, app_config, monkeypatch
     ):
@@ -1560,7 +1664,7 @@ class TestARunEndToEnd:
 
         monkeypatch.setattr(adb, "shell", shell)
 
-        watchdog = FakeProcess()
+        watchdog = radios.WatchdogHandle("0123456789abcdef0123456789abcdef", 4321)
 
         async def armed_watchdog(address, deadline_s, **kwargs):
             return watchdog

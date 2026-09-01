@@ -156,6 +156,143 @@ async def test_quiesce_revalidation_rejects_a_lease_near_expiry(monkeypatch):
         )
 
 
+async def test_quiesce_renewal_atomically_replaces_same_request_without_resume_edge(
+    monkeypatch,
+):
+    requested = datetime.now(UTC) - timedelta(seconds=10)
+    deadline = requested + timedelta(seconds=570)
+    request_body = json.dumps(
+        {
+            "schema_version": 1,
+            "request_id": "request-1",
+            "action": obd_control.REQUEST_ACTION,
+            "requested_at_utc": requested.isoformat().replace("+00:00", "Z"),
+            "deadline_at_utc": deadline.isoformat().replace("+00:00", "Z"),
+        },
+        separators=(",", ":"),
+    )
+    acknowledgement = json.dumps(_ack(), separators=(",", ":"))
+    commands: list[str] = []
+
+    async def shell(_address, command, **_kwargs):
+        nonlocal request_body
+        commands.append(command)
+        if "ingestion-request.json.renewal.partial" in command:
+            marker = "printf '%s' '"
+            renewed = command.split(marker, 1)[1].split("' >", 1)[0]
+            assert request_body in command
+            request_body = renewed
+            return renewed
+        if "ingestion-ack.json" in command:
+            return acknowledgement
+        if "ingestion-request.json" in command:
+            return request_body
+        return ""
+
+    monkeypatch.setattr(obd_control.adb, "shell", shell)
+
+    ack = await obd_control.renew_quiesce(
+        "unit:5555",
+        "/storage/card/app/obd/status.json",
+        "request-1",
+        hold_s=570,
+        minimum_remaining_s=510,
+    )
+
+    assert ack.ready and ack.request_id == "request-1"
+    renewed = json.loads(request_body)
+    renewed_requested = datetime.fromisoformat(renewed["requested_at_utc"].replace("Z", "+00:00"))
+    renewed_deadline = datetime.fromisoformat(renewed["deadline_at_utc"].replace("Z", "+00:00"))
+    assert (renewed_deadline - renewed_requested).total_seconds() == 570
+    assert renewed["request_id"] == "request-1"
+    assert not any(
+        "rm -f '/storage/card/app/obd/control/ingestion-request.json'" in command
+        for command in commands
+    )
+
+
+async def test_quiesce_renewal_refuses_to_recreate_a_replaced_request(monkeypatch):
+    requested = datetime.now(UTC) - timedelta(seconds=10)
+    deadline = requested + timedelta(seconds=570)
+
+    def request(request_id: str) -> str:
+        return json.dumps(
+            {
+                "schema_version": 1,
+                "request_id": request_id,
+                "action": obd_control.REQUEST_ACTION,
+                "requested_at_utc": requested.isoformat().replace("+00:00", "Z"),
+                "deadline_at_utc": deadline.isoformat().replace("+00:00", "Z"),
+            },
+            separators=(",", ":"),
+        )
+
+    reads = iter((request("request-1"), request("replacement")))
+    writes = 0
+
+    async def shell(_address, command, **_kwargs):
+        nonlocal writes
+        if "ingestion-request.json.renewal.partial" in command:
+            writes += 1
+            return ""
+        if "ingestion-ack.json" in command:
+            return json.dumps(_ack(), separators=(",", ":"))
+        if "ingestion-request.json" in command:
+            return next(reads)
+        return ""
+
+    monkeypatch.setattr(obd_control.adb, "shell", shell)
+
+    with pytest.raises(obd_control.LoggerControlError, match="changed while"):
+        await obd_control.renew_quiesce(
+            "unit:5555",
+            "/storage/card/app/obd/status.json",
+            "request-1",
+            hold_s=570,
+            minimum_remaining_s=510,
+        )
+    assert writes == 0
+
+
+async def test_quiesce_renewal_refuses_a_request_too_close_to_expiry(monkeypatch):
+    requested = datetime.now(UTC) - timedelta(seconds=560)
+    deadline = requested + timedelta(seconds=570)
+    request = json.dumps(
+        {
+            "schema_version": 1,
+            "request_id": "request-1",
+            "action": obd_control.REQUEST_ACTION,
+            "requested_at_utc": requested.isoformat().replace("+00:00", "Z"),
+            "deadline_at_utc": deadline.isoformat().replace("+00:00", "Z"),
+        },
+        separators=(",", ":"),
+    )
+    writes = 0
+
+    async def shell(_address, command, **_kwargs):
+        nonlocal writes
+        if "ingestion-request.json.renewal.partial" in command:
+            writes += 1
+            return ""
+        if "ingestion-ack.json" in command:
+            return json.dumps(_ack(), separators=(",", ":"))
+        if "ingestion-request.json" in command:
+            return request
+        return ""
+
+    monkeypatch.setattr(obd_control.adb, "shell", shell)
+
+    with pytest.raises(obd_control.LoggerControlError, match="too close to expiry"):
+        await obd_control.renew_quiesce(
+            "unit:5555",
+            "/storage/card/app/obd/status.json",
+            "request-1",
+            hold_s=570,
+            minimum_remaining_s=510,
+        )
+    assert writes == 0
+
+
 async def test_logger_status_keeps_only_bounded_capabilities_and_metrics(monkeypatch):
     body = json.dumps(
         {
@@ -213,6 +350,7 @@ class FakeController:
     instances: ClassVar[list[FakeController]] = []
     bluetooth_ok = True
     hotspot_ok = True
+    watchdog_ok = True
     boot_id = "a" * 32 + "@01234567-89ab-cdef-0123-456789abcdef"
     remove_ok = True
     on_remove = None
@@ -271,6 +409,10 @@ class FakeController:
         self.calls.append("stand-down")
         return True
 
+    async def watchdog_healthy(self) -> bool:
+        self.calls.append("watchdog-health")
+        return type(self).watchdog_ok
+
     async def disable_bluetooth(self, *, before_change=None) -> bool:
         self.calls.append("watchdog-bluetooth")
         if before_change is not None:
@@ -294,6 +436,7 @@ def fake_controller(monkeypatch):
     FakeController.instances = []
     FakeController.bluetooth_ok = True
     FakeController.hotspot_ok = True
+    FakeController.watchdog_ok = True
     FakeController.boot_id = "a" * 32 + "@01234567-89ab-cdef-0123-456789abcdef"
     FakeController.remove_ok = True
     FakeController.on_remove = None
@@ -342,6 +485,123 @@ async def test_logger_lease_keeps_bounded_radio_recovery_headroom(
     monkeypatch.setattr(obd_control, "request_quiesce", request)
     monkeypatch.setattr(obd_control, "resume_logger", resume)
     assert (await transition.prepare_logger()).ready
+    assert await transition.restore()
+
+
+async def test_heartbeat_renews_the_same_logger_hold_until_restoration(
+    db_session, fake_controller, monkeypatch
+):
+    renewed = asyncio.Event()
+    request_ids: list[str] = []
+
+    async def request(_address, _path, **kwargs):
+        request_ids.append(kwargs["request_id"])
+        return obd_control.LoggerAck(
+            request_id=kwargs["request_id"],
+            state="ready",
+            ready_at_utc="2026-08-30T01:02:03Z",
+            drive_id=None,
+            last_sample_at_utc=None,
+            bundle_filename=None,
+            bundle_sha256=None,
+            error=None,
+        )
+
+    async def renew(_address, _path, request_id, *, hold_s, minimum_remaining_s):
+        assert request_id == request_ids[0]
+        assert hold_s == 210
+        assert minimum_remaining_s == 150
+        renewed.set()
+        return obd_control.LoggerAck(
+            request_id=request_id,
+            state="ready",
+            ready_at_utc="2026-08-30T01:02:03Z",
+            drive_id=None,
+            last_sample_at_utc=None,
+            bundle_filename=None,
+            bundle_sha256=None,
+            error=None,
+        )
+
+    async def resume(_address, _path):
+        return True
+
+    monkeypatch.setattr(radio_coordinator, "HEARTBEAT_INTERVAL_S", 0.001)
+    monkeypatch.setattr(radio_coordinator, "LOGGER_QUIESCE_RENEW_INTERVAL_S", 0.0)
+    monkeypatch.setattr(obd_control, "request_quiesce", request)
+    monkeypatch.setattr(obd_control, "renew_quiesce", renew)
+    monkeypatch.setattr(obd_control, "resume_logger", resume)
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+    )
+
+    assert (await transition.prepare_logger()).ready
+    await asyncio.wait_for(renewed.wait(), timeout=1)
+    assert await transition.restore()
+
+
+async def test_transient_adb_logger_renewal_retries_without_cancelling_transfer(
+    db_session, fake_controller, monkeypatch
+):
+    cancelled = asyncio.Event()
+    recovered = asyncio.Event()
+    attempts = 0
+
+    async def request(_address, _path, **kwargs):
+        return obd_control.LoggerAck(
+            request_id=kwargs["request_id"],
+            state="ready",
+            ready_at_utc="2026-08-30T01:02:03Z",
+            drive_id=None,
+            last_sample_at_utc=None,
+            bundle_filename=None,
+            bundle_sha256=None,
+            error=None,
+        )
+
+    async def renew(_address, _path, request_id, *, hold_s, minimum_remaining_s):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise radio_coordinator.adb.AdbError("temporary control-channel timeout")
+        recovered.set()
+        return obd_control.LoggerAck(
+            request_id=request_id,
+            state="ready",
+            ready_at_utc="2026-08-30T01:02:03Z",
+            drive_id=None,
+            last_sample_at_utc=None,
+            bundle_filename=None,
+            bundle_sha256=None,
+            error=None,
+        )
+
+    async def resume(_address, _path):
+        return True
+
+    monkeypatch.setattr(radio_coordinator, "HEARTBEAT_INTERVAL_S", 0.001)
+    monkeypatch.setattr(radio_coordinator, "LOGGER_QUIESCE_RENEW_INTERVAL_S", 0.0)
+    monkeypatch.setattr(obd_control, "request_quiesce", request)
+    monkeypatch.setattr(obd_control, "renew_quiesce", renew)
+    monkeypatch.setattr(obd_control, "resume_logger", resume)
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+        lease_loss_callback=cancelled.set,
+    )
+
+    assert (await transition.prepare_logger()).ready
+    await asyncio.wait_for(recovered.wait(), timeout=1)
+    assert attempts >= 2
+    assert not cancelled.is_set()
+    assert not transition.lease_lost
     assert await transition.restore()
 
 
@@ -401,79 +661,6 @@ async def test_all_four_radio_baselines_restore_exactly(
         row = await session.get(IngestRadioTransition, transition.id)
         assert row is not None and not row.active
         assert row.phase == radio_coordinator.TransitionPhase.COMPLETE.value
-
-
-async def test_safety_deadline_restores_baseline_without_releasing_ingest_fence(
-    db_session, fake_controller
-):
-    transition = await radio_coordinator.begin(
-        trigger="manual",
-        address="unit:5555",
-        logger_status=None,
-        logger_status_path="/safe/status.json",
-        watchdog_deadline_s=120,
-    )
-
-    assert await transition.restore_radio_baseline(error=RuntimeError("quiet deadline"))
-    assert "remove-capsule" not in transition.controller.calls
-    async with session_scope() as session:
-        row = await session.get(IngestRadioTransition, transition.id)
-        assert row is not None and row.active
-        assert row.phase == radio_coordinator.TransitionPhase.INGESTING.value
-    with pytest.raises(radio_coordinator.TransitionBusy):
-        await radio_coordinator.begin(
-            trigger="poller",
-            address="unit:5555",
-            logger_status=None,
-            logger_status_path="/safe/status.json",
-            watchdog_deadline_s=120,
-        )
-
-    assert await transition.restore()
-    async with session_scope() as session:
-        row = await session.get(IngestRadioTransition, transition.id)
-        assert row is not None and not row.active
-        assert row.phase == radio_coordinator.TransitionPhase.FAILED.value
-
-
-async def test_post_deadline_crash_retains_capsule_for_startup_recovery(
-    db_session, fake_controller
-):
-    transition = await radio_coordinator.begin(
-        trigger="manual",
-        address="unit:5555",
-        logger_status=None,
-        logger_status_path="/safe/status.json",
-        watchdog_deadline_s=120,
-    )
-    restore_ref = f"/data/local/tmp/.dashcam_analyser_hotspot_{transition.transition_id}.json"
-    await transition.checkpoint(
-        bluetooth_before="on",
-        hotspot_before="on",
-        bluetooth_disable_attempted=True,
-        hotspot_disable_attempted=True,
-        hotspot_restore_ref=restore_ref,
-    )
-    assert await transition.restore_radio_baseline(error=RuntimeError("quiet deadline"))
-    assert "remove-capsule" not in transition.controller.calls
-
-    transition_id = transition.id
-    await transition.close()  # process dies while the protected capsule still exists
-    async with session_scope() as session:
-        await session.execute(
-            update(IngestRadioTransition)
-            .where(IngestRadioTransition.id == transition_id)
-            .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
-        )
-
-    assert await radio_coordinator.reconcile_pending(address="unit:5555")
-    recovered = FakeController.instances[-1]
-    assert "read-capsule" in recovered.calls
-    assert "remove-capsule" in recovered.calls
-    async with session_scope() as session:
-        row = await session.get(IngestRadioTransition, transition_id)
-        assert row is not None and not row.active and not row.recovery_required
-        assert row.phase == radio_coordinator.TransitionPhase.FAILED.value
 
 
 async def test_database_constraint_prevents_two_radio_owners(db_session, fake_controller):
@@ -576,6 +763,32 @@ async def test_heartbeat_failure_signals_cancellation_and_fences_expired_adoptio
         row = await session.get(IngestRadioTransition, transition.id)
         assert row is not None and not row.active
         assert row.phase == radio_coordinator.TransitionPhase.FAILED.value
+
+
+async def test_watchdog_health_loss_signals_cancellation(db_session, fake_controller, monkeypatch):
+    cancelled = asyncio.Event()
+    fake_controller.watchdog_ok = False
+    monkeypatch.setattr(radio_coordinator, "HEARTBEAT_INTERVAL_S", 0.001)
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+        lease_loss_callback=cancelled.set,
+    )
+
+    error = await asyncio.wait_for(transition.wait_for_lease_loss(), timeout=1)
+    assert cancelled.is_set()
+    assert transition.lease_lost
+    assert "detached on-unit radio recovery watchdog was lost" in str(error)
+    assert "watchdog-health" in transition.controller.calls
+    assert transition.process_fence.held
+
+    # The failed independent recovery proof cancels data movement, but the owner
+    # still holds its fence and must finish the normal safety-restoration path.
+    assert await transition.restore()
+    assert not transition.process_fence.held
 
 
 async def test_expired_transition_is_reconciled_after_process_restart(db_session, fake_controller):
@@ -878,7 +1091,15 @@ async def test_radio_quieting_revalidates_obd_lease_after_watchdog_and_checkpoin
             hotspot="off",
         )
 
-    async def expired(_address, _path, _request_id, *, minimum_remaining_s):
+    async def expired(
+        _address,
+        _path,
+        _request_id,
+        *,
+        hold_s,
+        minimum_remaining_s,
+    ):
+        assert hold_s == 210
         assert minimum_remaining_s == 150
         async with session_scope() as session:
             row = await session.get(IngestRadioTransition, transition.id)
@@ -893,7 +1114,7 @@ async def test_radio_quieting_revalidates_obd_lease_after_watchdog_and_checkpoin
         return True
 
     transition.controller.capture = capture
-    monkeypatch.setattr(obd_control, "verify_quiesce", expired)
+    monkeypatch.setattr(obd_control, "renew_quiesce", expired)
     monkeypatch.setattr(obd_control, "resume_logger", resume)
 
     with pytest.raises(radio_coordinator.RadioTransitionError, match="no longer covers"):

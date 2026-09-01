@@ -260,7 +260,33 @@ export default function Backup() {
 
   const data = status.data
   const running = data?.state === 'running'
-  const descriptor = data ? STATES[data.state] ?? STATES.idle : STATES.idle
+  const transition = radioStatus.data?.transition
+  const recoveryBlocked = !running && transition?.recoveryRequired === true
+  const transitionBusy = !running && transition?.active === true
+  const descriptor = recoveryBlocked
+    ? { label: 'Recovery needed', tone: 'error' as const }
+    : transitionBusy
+      ? ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
+        ? { label: 'Restoring radios', tone: 'busy' as const }
+        : { label: 'Preparing backup', tone: 'busy' as const }
+      : data
+        ? STATES[data.state] ?? STATES.idle
+        : { label: 'Checking', tone: 'busy' as const }
+  const statusHint = running && data
+    ? PHASES[data.phase]
+    : recoveryBlocked
+      ? 'Backup blocked until radios recover'
+      : transitionBusy
+        ? ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
+          ? 'Verifying the original radio state'
+          : 'Making the radio transition safe'
+        : undefined
+  const backlogKnown = data?.backlogKnown === true
+  const backlogHint = backlogKnown && data
+    ? `${data.backlogFiles} file${data.backlogFiles === 1 ? '' : 's'}`
+    : recoveryBlocked
+      ? 'Not checked; waiting for radio recovery'
+      : 'Not checked yet'
   // Clamped: the byte counter meters the socket, so it also carries the tar headers and
   // padding that the file sizes it is measured against do not. That is a few kilobytes on
   // a full card — invisible, until it renders as 100.01% and a bar overshooting its track.
@@ -448,7 +474,7 @@ export default function Backup() {
         <StatTile
           label="Status"
           value={descriptor.label}
-          hint={running && data ? PHASES[data.phase] : undefined}
+          hint={statusHint}
           tone={descriptor.tone}
         />
         <StatTile
@@ -465,9 +491,17 @@ export default function Backup() {
         />
         <StatTile
           label="Still on the camera"
-          value={formatBytes(data?.backlogBytes ?? 0)}
-          hint={`${data?.backlogFiles ?? 0} file${(data?.backlogFiles ?? 0) === 1 ? '' : 's'}`}
-          tone={(data?.backlogFiles ?? 0) > 0 ? 'warn' : 'ok'}
+          value={backlogKnown && data ? formatBytes(data.backlogBytes) : '—'}
+          hint={backlogHint}
+          tone={
+            backlogKnown
+              ? (data?.backlogFiles ?? 0) > 0
+                ? 'warn'
+                : 'ok'
+              : recoveryBlocked
+                ? 'error'
+                : 'default'
+          }
         />
         <StatTile
           label="Last copied"

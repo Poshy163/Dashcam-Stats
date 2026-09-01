@@ -1171,15 +1171,15 @@ SETTINGS: tuple[SettingDef, ...] = (
     ),
     SettingDef(
         "ingest.zlink_hotspot_rearm",
-        "Let Bluetooth re-arm the Zlink hotspot after copying",
+        "Restore the head unit hotspot after copying",
         "bool",
         False,
         "ingest",
-        "Experimental, for the cryptographically approved production Zlink system APK only. "
-        "It lets a backup "
-        "force the separate hotspot off when Android hides its password, using the observed "
-        "Bluetooth-to-AP return behavior. Before either radio changes, the app protects "
-        "this recovery choice on the unit and arms an independent Bluetooth deadline "
+        "For the cryptographically approved production Zlink and head-unit controller "
+        "builds only. It lets a backup force the separate hotspot off when Android hides "
+        "its password, then asks Android to restart the already-saved tethering profile; "
+        "the password is never read, copied or reconstructed. Before either radio changes, "
+        "the app protects this recovery choice on the unit and arms an independent deadline "
         "watchdog. Recovery stays pending until the same hotspot interface remains "
         "continuously visible through the final stability window. Other builds leave an "
         "unreadable hotspot on.",

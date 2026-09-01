@@ -32,6 +32,10 @@ DEFAULT_TIMEOUT_S = 30.0
 POLL_INTERVAL_S = 0.25
 MAX_CONTROL_BYTES = 4096
 MAX_HOLD_S = 600.0
+# A renewal starts with several bounded ADB reads and ends with an atomic rename. Refuse
+# to begin so close to the old deadline that Android could legitimately expire/remove the
+# request while that control round-trip is still in flight.
+RENEWAL_WRITE_MARGIN_S = 15.0
 
 _SAFE_REMOTE_PATH = re.compile(r"^/[A-Za-z0-9._/-]{1,511}$")
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -226,6 +230,14 @@ def _parse_request_deadline(raw: str, request_id: str) -> datetime:
     return deadline
 
 
+async def _read_control_file(address: str, path: str) -> str:
+    return await adb.shell(
+        address,
+        f"[ -f '{path}' ] && [ ! -L '{path}' ] && head -c {MAX_CONTROL_BYTES + 1} '{path}'; exit 0",
+        timeout=6.0,
+    )
+
+
 async def verify_quiesce(
     address: str,
     status_path: str,
@@ -246,26 +258,99 @@ async def verify_quiesce(
         raise LoggerControlError("required logger lease coverage is outside the bounded range")
     paths = control_paths(status_path)
 
-    async def read(path: str) -> str:
-        return await adb.shell(
-            address,
-            f"[ -f '{path}' ] && [ ! -L '{path}' ] && "
-            f"head -c {MAX_CONTROL_BYTES + 1} '{path}'; exit 0",
-            timeout=6.0,
-        )
-
-    request_raw = await read(paths.request)
+    request_raw = await _read_control_file(address, paths.request)
     deadline = _parse_request_deadline(request_raw, request_id)
-    ack = parse_ack(await read(paths.ack), request_id)
+    ack = parse_ack(await _read_control_file(address, paths.ack), request_id)
     if not ack.ready:
         raise LoggerControlError("logger is no longer ready for ingestion")
     # Re-read the request after the ACK so expiry/removal/replacement during the check
     # cannot leave a stale acknowledgement looking authoritative.
-    if await read(paths.request) != request_raw:
+    if await _read_control_file(address, paths.request) != request_raw:
         raise LoggerControlError("logger request changed while its lease was verified")
     remaining_s = (deadline - datetime.now(UTC)).total_seconds()
     if remaining_s < minimum_remaining_s:
         raise LoggerControlError("logger quiesce lease does not cover radio recovery")
+    return ack
+
+
+async def renew_quiesce(
+    address: str,
+    status_path: str,
+    request_id: str,
+    *,
+    hold_s: float,
+    minimum_remaining_s: float,
+) -> LoggerAck:
+    """Atomically extend an already-ready request without exposing a resume edge.
+
+    The request id deliberately remains unchanged, so Android keeps the existing
+    correlated ready acknowledgement and does not finalise/export a drive again.  The
+    live request path is replaced by a same-directory rename; unlike a new handshake it
+    is never removed first.  A compare immediately before the rename prevents a stale
+    controller from recreating a request generation Android already removed or replaced.
+    """
+
+    if not _SAFE_REQUEST_ID.fullmatch(request_id):
+        raise LoggerControlError("logger request id is unsafe")
+    hold_s = float(hold_s)
+    minimum_remaining_s = float(minimum_remaining_s)
+    if not math.isfinite(hold_s) or hold_s < 1.0 or hold_s > MAX_HOLD_S:
+        raise LoggerControlError("logger renewal lease duration is outside the bounded range")
+    if (
+        not math.isfinite(minimum_remaining_s)
+        or minimum_remaining_s < 0
+        or minimum_remaining_s > hold_s
+    ):
+        raise LoggerControlError(
+            "required renewed logger lease coverage is outside the bounded range"
+        )
+
+    paths = control_paths(status_path)
+    request_raw = await _read_control_file(address, paths.request)
+    deadline = _parse_request_deadline(request_raw, request_id)
+    ack = parse_ack(await _read_control_file(address, paths.ack), request_id)
+    if not ack.ready:
+        raise LoggerControlError("logger is no longer ready for ingestion")
+    if await _read_control_file(address, paths.request) != request_raw:
+        raise LoggerControlError("logger request changed while its lease was renewed")
+    if (deadline - datetime.now(UTC)).total_seconds() < RENEWAL_WRITE_MARGIN_S:
+        raise LoggerControlError("logger quiesce lease is too close to expiry to renew safely")
+
+    requested = datetime.now(UTC)
+    renewed_deadline = requested + timedelta(seconds=hold_s)
+    body = json.dumps(
+        {
+            "schema_version": 1,
+            "request_id": request_id,
+            "action": REQUEST_ACTION,
+            "requested_at_utc": _utc_text(requested),
+            "deadline_at_utc": _utc_text(renewed_deadline),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    # Both bodies have passed the fixed schema/token/timestamp parsers. Keep the explicit
+    # quote guard adjacent to their single-quoted shell use.
+    if "'" in request_raw or "'" in body or len(body.encode("utf-8")) > MAX_CONTROL_BYTES:
+        raise LoggerControlError("logger renewal body is unsafe or too large")
+
+    partial = f"{paths.request}.renewal.partial"
+    command = (
+        f"[ -f '{paths.request}' ] && [ ! -L '{paths.request}' ] && "
+        f"[ \"$(head -c {MAX_CONTROL_BYTES + 1} '{paths.request}')\" = '{request_raw}' ] && "
+        f"rm -f '{partial}' && umask 077 && printf '%s' '{body}' > '{partial}' && "
+        f"[ -f '{partial}' ] && [ ! -L '{partial}' ] && "
+        f"(sync '{partial}' 2>/dev/null || sync) && mv -f '{partial}' '{paths.request}' && "
+        f"[ -f '{paths.request}' ] && [ ! -L '{paths.request}' ] && "
+        f"head -c {MAX_CONTROL_BYTES + 1} '{paths.request}'; exit 0"
+    )
+    readback = await adb.shell(address, command, timeout=8.0)
+    if readback != body:
+        raise LoggerControlError("active logger request changed before renewal")
+
+    remaining_s = (renewed_deadline - datetime.now(UTC)).total_seconds()
+    if remaining_s < minimum_remaining_s:
+        raise LoggerControlError("renewed logger quiesce lease does not cover radio recovery")
     return ack
 
 
@@ -377,6 +462,7 @@ __all__ = [
     "LoggerControlError",
     "control_paths",
     "parse_ack",
+    "renew_quiesce",
     "request_quiesce",
     "resume_logger",
     "supports_quiesce",
