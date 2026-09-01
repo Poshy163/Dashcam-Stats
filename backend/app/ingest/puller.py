@@ -46,6 +46,29 @@ log = get_logger(__name__)
 #: skips it -- see `app.scanner.discovery`.
 STAGING_DIRNAME = ".ingest_staging"
 
+# The first display intent can race a head unit whose browser task is still thawing after a
+# drive.  These retries are deliberately few and remain a background courtesy: no transfer byte
+# waits for them, and the task is cancelled as soon as the transfer ends.
+DISPLAY_RETRY_DELAYS_S = (0.0, 3.0, 10.0)
+
+
+async def _show_backup_page_during_transfer(address: str, url: str) -> None:
+    """Open and visibly confirm the car-screen dashboard while a transfer is active."""
+
+    for attempt, delay_s in enumerate(DISPLAY_RETRY_DELAYS_S, start=1):
+        if delay_s:
+            await asyncio.sleep(delay_s)
+        reason = await adb.show_url(address, url)
+        if not reason and await adb.chrome_is_foreground(address):
+            log.info("opened and verified the backup page on the head unit", attempt=attempt)
+            return
+        log.warning(
+            "backup page was not visible on the head unit; will retry while transferring",
+            attempt=attempt,
+            error=reason or "Chrome did not become foreground",
+        )
+    log.warning("could not show the backup page during this transfer")
+
 
 def _by_directory(files: list[RemoteFile], default: str) -> list[tuple[str, list[RemoteFile]]]:
     """Group a plan into one batch per directory, preserving the plan's order.
@@ -754,6 +777,7 @@ async def run_pull(
     footage = Path(str(await get_settings_service().footage_dir()))
     staging = footage / STAGING_DIRNAME
     preflight: list[asyncio.Task] = []
+    display_task: asyncio.Task[None] | None = None
     radio_transition: radio_coordinator.RadioTransition | None = None
     obd_result = None
     obd_ack: obd_control.LoggerAck | None = None
@@ -1137,22 +1161,14 @@ async def run_pull(
         if not continuation:
             _fire_and_forget(report_event("started", plan=plan))
 
-        # The car's own screen, if the operator asked for it. Also fired rather than
-        # awaited: `am start` against a cold browser is not fast, and a courtesy display
-        # must not be able to spend the window it is reporting on.
-        #
-        # Only on the first pull of a visit. Re-firing the same URL reloads the tab
-        # (measured: it is how the page is refreshed at all), so sending it again for every
-        # re-drain while the car sat there was the "screen keeps refreshing" the driver saw.
-        # The page is live on its own, so later passes have nothing to show that it is not
-        # already showing. "First of this visit" is read off the clocks rather than kept as
-        # state: the last run ended before the unit came online this time, or never did.
+        # Only the first pull of a visit may take the screen over.  The actual launch is
+        # deferred until immediately before the transfer starts, after the OBD/radio gates;
+        # that way a safety refusal does not show a misleading copying screen.
         first_of_visit = status.since_finished() > status.online_for()
+        display = ""
         if bool(_get("show_on_unit", False)) and first_of_visit:
             display = display_url()
-            if display:
-                _fire_and_forget(adb.show_url(info.address, display))
-            else:
+            if not display:
                 # Reachable only before this app has ever been opened in a browser, since
                 # the learned address is now kept across restarts. A warning rather than
                 # the debug line this used to be: while it was below the default log level
@@ -1189,6 +1205,12 @@ async def run_pull(
                         error="radio recovery could not be verified before transfer",
                     )
                     return result
+
+        if display:
+            display_task = asyncio.create_task(
+                _show_backup_page_during_transfer(info.address, display),
+                name="ingest-show-backup-page",
+            )
 
         transferred = await _move(
             info,
@@ -1360,6 +1382,12 @@ async def run_pull(
         result = RunResult(state=RunState.ERROR, error=f"{type(exc).__name__}: {exc}")
         log.exception("the ingest run failed", error=str(exc))
     finally:
+        # The dashboard is relevant only while this run owns the transfer.  Do not let a
+        # delayed retry take the screen over after the car has gone or a later run has begun.
+        if display_task is not None:
+            display_task.cancel()
+            await asyncio.gather(display_task, return_exceptions=True)
+
         # Radios first, before any other tidying: this is the one piece of cleanup whose
         # failure follows somebody into the car. Bounded, because the usual reason a
         # restore struggles is that the unit has driven away and every call is a timeout

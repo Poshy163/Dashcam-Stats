@@ -605,6 +605,11 @@ BROWSER_APPLICATION_ID_EXTRA = "com.android.browser.application_id"
 #: this one is a plain identifier so it carries no shell metacharacters into the command.
 APPLICATION_ID = "com.dashcam.analyser"
 
+# The production unit resolves web VIEW intents to Chrome.  The display path is deliberately
+# package-specific at verification time: a successful ``am start`` only means Android accepted
+# the intent, not that the parked car's screen actually changed.
+CHROME_PACKAGE = "com.android.chrome"
+
 
 async def show_url(address: str, url: str) -> str:
     """Open a web page on the unit's own screen. Returns "" on success, or why not.
@@ -645,6 +650,27 @@ async def show_url(address: str, url: str) -> str:
         log.warning("the head unit would not open the backup page", reply=reply[:200])
         return f"The head unit refused to open it: {reply[:200]}"
     return ""
+
+
+async def chrome_is_foreground(address: str) -> bool:
+    """Whether Chrome is the visible activity on the head unit.
+
+    ``am start`` can succeed while a launcher, vendor overlay or stale task remains in front.
+    This uses Android's foreground-window report rather than treating intent acceptance as a
+    visual result.  It is best-effort because the caller must never hold up footage for a
+    courtesy display.
+    """
+
+    try:
+        reply = await shell(
+            address,
+            "dumpsys window windows | sed -n '/mCurrentFocus=/p;/mFocusedApp=/p'",
+            timeout=6.0,
+        )
+    except AdbError as exc:
+        log.warning("could not verify Chrome on the head unit", error=str(exc))
+        return False
+    return CHROME_PACKAGE in reply
 
 
 #: The unit's own ignition line, as ``settings global acc_status`` reports it.

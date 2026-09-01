@@ -837,6 +837,25 @@ class TestTheUnitDisplay:
 
         assert f"--es {adb.BROWSER_APPLICATION_ID_EXTRA} '{adb.APPLICATION_ID}'" in captured[0]
 
+    async def test_chrome_foreground_check_requires_the_visible_activity(self, monkeypatch):
+        from app.ingest import adb
+
+        async def fake_shell(address, command, **kwargs):
+            assert "dumpsys window windows" in command
+            return "mCurrentFocus=Window{123 u0 com.android.chrome/com.google.android.apps.chrome.Main}"
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+        assert await adb.chrome_is_foreground("u:5555")
+
+    async def test_chrome_foreground_check_does_not_trust_a_successful_intent(self, monkeypatch):
+        from app.ingest import adb
+
+        async def fake_shell(address, command, **kwargs):
+            return "mCurrentFocus=Window{123 u0 com.vendor.launcher/.HomeActivity}"
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+        assert not await adb.chrome_is_foreground("u:5555")
+
     def test_the_application_id_carries_nothing_into_the_shell(self):
         """It is interpolated into a command, so it may not contain anything a shell reads."""
         import re
@@ -2119,6 +2138,7 @@ class TestARunEndToEnd:
             shown.append(url)
 
         monkeypatch.setattr(adb, "show_url", record)
+        monkeypatch.setattr(adb, "chrome_is_foreground", _true)
         origin.reset_for_tests()
         await origin.remember("http", "192.168.1.16:8199")
         await self._enable(**{"ingest.show_on_unit": True})
@@ -2145,6 +2165,7 @@ class TestARunEndToEnd:
             shown.append(url)
 
         monkeypatch.setattr(adb, "show_url", record)
+        monkeypatch.setattr(adb, "chrome_is_foreground", _true)
         origin.reset_for_tests()
         await origin.remember("https", "dashcam.example.com")
         await self._enable(
@@ -2265,6 +2286,27 @@ class TestTheShellIsNotCachedIntoABlankScreen:
         assert len(response.content) < 8_000, "the shell has grown enough to be worth caching"
 
 
+async def test_car_screen_retries_until_chrome_is_visible(monkeypatch):
+    from app.ingest import adb, puller
+
+    attempts: list[str] = []
+
+    async def show(address, url):
+        attempts.append(url)
+        return ""
+
+    async def foreground(address):
+        return len(attempts) == 2
+
+    monkeypatch.setattr(adb, "show_url", show)
+    monkeypatch.setattr(adb, "chrome_is_foreground", foreground)
+    monkeypatch.setattr(puller, "DISPLAY_RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+
+    await puller._show_backup_page_during_transfer("u:5555", "http://nas:8199/backup")
+
+    assert len(attempts) == 2
+
+
 class TestTheCarScreenTestButton:
     """Firing the head unit's screen by hand, because the real thing is unobservable.
 
@@ -2288,6 +2330,7 @@ class TestTheCarScreenTestButton:
             return ""
 
         monkeypatch.setattr(adb, "show_url", record)
+        monkeypatch.setattr(adb, "chrome_is_foreground", _true)
         monkeypatch.setattr(adb, "is_listening", lambda address: _true())
         origin.reset_for_tests()
         await self._enable(**{"ingest.unit_adb_address": "10.0.0.5:5555"})
