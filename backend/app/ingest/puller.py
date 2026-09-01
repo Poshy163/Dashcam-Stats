@@ -84,21 +84,6 @@ def _by_directory(files: list[RemoteFile], default: str) -> list[tuple[str, list
     return list(batches.items())
 
 
-#: Visits whose sleep has already been asked for, so it is asked once and not on a loop.
-#:
-#: The unit wakes itself a minute or so after being suspended -- the camera keeps recording
-#: through the ignition-off window and closes a segment about every minute -- and an earlier
-#: version re-suspended it on every one of those wakes. That is a suspend/resume cycle a
-#: minute for the whole countdown, each one landing in the middle of an active recording.
-#: Once per visit, then leave it to the countdown.
-_slept_for: set[str] = set()
-
-
-def forget_sleep_state() -> None:
-    """Let the next visit ask for its own sleep. Called when the unit goes away."""
-    _slept_for.clear()
-
-
 def _obd_logger_owns_bluetooth(logger_status: object) -> bool:
     """Whether the dashcam logger has reserved the unit's Bluetooth radio.
 
@@ -122,7 +107,7 @@ def _obd_logger_status_is_authoritative(logger_status: object) -> bool:
     )
 
 
-async def widen_sleep_window(address: str) -> None:
+async def widen_sleep_window(address: str) -> bool:
     """Give the unit a long ignition-off window, because the app is here to use it.
 
     The countdown is the backup window: the radio stays up for the whole of it, so it is
@@ -130,23 +115,56 @@ async def widen_sleep_window(address: str) -> None:
     than left permanently long because the value persists on the unit, and a unit parked
     somewhere the app cannot reach would otherwise hold the car's battery open for the full
     fifteen minutes for no possible benefit. Narrowed again by :func:`close_sleep_window`.
+    The return value is proof, not merely command success: managed callers must not begin
+    device-side recovery unless the configured value was already present or its write was
+    read back successfully.
     """
     if not bool(_get("manage_sleep_window", False)):
-        return
+        return True
     wanted = int(_get("sleep_window_s", 900))
     if await adb.sleep_countdown(address) == wanted:
-        return
+        return True
     if await adb.set_sleep_countdown(address, wanted):
         log.info("widened the head unit's ignition-off window", seconds=wanted)
+        return True
+    return False
+
+
+async def reconcile_pending_in_awake_window(address: str) -> bool:
+    """Give durable radio recovery the full managed window before attempting it.
+
+    Recovery is the most important work on arrival: until Bluetooth, hotspot and the OBD
+    logger are back at their exact baseline, no new backup may start.  The resting countdown
+    is deliberately short, though, so awaiting the window change first prevents recovery
+    from racing the same sleep boundary it is trying to repair.
+    """
+    if not await widen_sleep_window(address):
+        log.warning(
+            "radio recovery deferred because the managed awake window could not be verified",
+            address=address,
+            seconds=int(_get("sleep_window_s", 900)),
+        )
+        return False
+    return await radio_coordinator.reconcile_pending(address=address)
+
+
+async def reconcile_startup_in_awake_window() -> bool:
+    """Recover startup radio state only after protecting its recorded endpoint from sleep."""
+    address = await radio_coordinator.pending_recovery_address()
+    if address is None:
+        # Preserve the coordinator's no-row startup housekeeping without inventing a device
+        # endpoint or touching the configured unit when there is no durable recovery owner.
+        return await radio_coordinator.reconcile_startup()
+    return await reconcile_pending_in_awake_window(address)
 
 
 async def close_sleep_window(address: str, *, drained: bool) -> None:
-    """Narrow the window and, if there is nothing left to copy, sleep the unit now.
+    """Narrow the window once every device-side obligation is proven complete.
 
-    Two separate things, and the order matters. The countdown is put back to its short
-    value first, so that a unit which drives away before -- or instead of -- sleeping is
-    already carrying the value that costs the least battery. Only then is the sleep asked
-    for, and only with the card drained and the engine off.
+    Android owns the actual transition into sleep.  An earlier implementation called
+    ``svc power forcesuspend`` here; the recorder woke the unit whenever it closed another
+    segment, creating a wake/suspend loop that could land inside an active recording.  A
+    verified five-minute countdown saves the battery without forcing that unsafe edge.
     """
     if not bool(_get("manage_sleep_window", False)) or not address:
         return
@@ -157,18 +175,36 @@ async def close_sleep_window(address: str, *, drained: bool) -> None:
         # with the short value before anything had a chance to widen it.
         return
 
-    idle = int(_get("sleep_window_idle_s", 60))
+    idle = int(_get("sleep_window_idle_s", 300))
     if await adb.sleep_countdown(address) != idle:
-        await adb.set_sleep_countdown(address, idle)
+        if await adb.set_sleep_countdown(address, idle):
+            log.info("restored the head unit's idle sleep window", seconds=idle)
+        else:
+            log.warning(
+                "could not verify the head unit's idle sleep window",
+                address=address,
+                seconds=idle,
+            )
 
-    if address in _slept_for:
-        return
-    _slept_for.add(address)
-    reason = await adb.sleep_unit(address)
-    if reason:
-        log.warning("could not put the head unit to sleep", reason=reason[:200])
-    else:
-        log.info("card drained and the engine is off; sending the head unit to sleep")
+
+async def _sleep_window_may_close(result: RunResult) -> bool:
+    """Prove that no device-side work or recovery depends on the awake window."""
+    status_snapshot = get_status().snapshot()
+    if (
+        result.state not in (RunState.OK, RunState.IDLE)
+        or not status_snapshot["backlog_known"]
+        or bool(status_snapshot["backlog_files"])
+        or bool(get_obd_transfer_status().snapshot()["waiting_on_unit"])
+    ):
+        return False
+    try:
+        return await radio_coordinator.pending_recovery_address() is None
+    except Exception as exc:
+        log.warning(
+            "could not prove radio recovery is clear; leaving the sleep window open",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return False
 
 
 async def _reclaim(
@@ -813,16 +849,14 @@ async def run_pull(
         # Reconcile before every run, including a same-visit re-drain. A failed restore
         # can otherwise remain active while the unit stays online: each later run merely
         # collides with its row and no path ever adopts the now-expired lease.
-        if not await radio_coordinator.reconcile_pending(address=info.address):
+        # Await the longer countdown first.  This path is also used by manual pulls, which
+        # bypass the poller's arrival recovery and must not race the resting sleep window.
+        if not await reconcile_pending_in_awake_window(info.address):
             result = RunResult(
                 state=RunState.IDLE,
                 error="an earlier ingest radio transition still requires recovery",
             )
             return result
-
-        # The window this run gets to use. Fired, not awaited: it is two control calls and
-        # the transfer must not queue behind them.
-        _fire_and_forget(widen_sleep_window(info.address))
 
         # Started before the unit is asked anything, and awaited only where each result is
         # actually needed. Not one of the three depends on the card: two are database reads
@@ -1432,14 +1466,15 @@ async def run_pull(
                     "finished" if result.state is RunState.OK else "error", result=result
                 )
 
-        # Last of all: this can suspend the unit, which takes the control channel down with
-        # it. Everything else that needed the car has had its turn.
+        # Last of all: narrow only after everything that needed the car has had its turn.
+        # Numeric zero is not a drained card until this run actually inventoried it, and a
+        # durable active/recovery row means the radios or logger are still owed an exact
+        # restore. Both conditions fail closed: an unknown state keeps the long window.
+        recovery_clear = await _sleep_window_may_close(result)
         with contextlib.suppress(Exception):
             await close_sleep_window(
                 info.address if info else "",
-                drained=result.state in (RunState.OK, RunState.IDLE)
-                and not get_status().backlog_files
-                and not get_obd_transfer_status().snapshot()["waiting_on_unit"],
+                drained=recovery_clear,
                 # A quarantined/interrupted OBD export is still data on the unit even
                 # when the footage delta is empty.  Leave the visit open for a re-drain.
                 # (Folded into the bool here rather than changing close_sleep_window's

@@ -16,12 +16,13 @@ a boot service, and a release APK cannot be accessed later with `run-as`. A shel
 logger would therefore be test code, not something this unit can run.
 
 The companion uses a `connectedDevice` foreground service, a low-importance persistent
-notification, `BOOT_COMPLETED`, Android's Nearby Devices permissions, app-private SQLite in WAL
-mode, and app-specific removable external storage. Foreground promotion happens before database
-migration or integrity work; database/exporter initialization then runs on the service IO scope so
-a large upgrade cannot consume Android's foreground-start deadline. It holds no indefinite wake lock. If boot
-finds Bluetooth permission missing it disables itself, publishes a redacted error and waits for
-the operator to reopen the setup screen; it does not retry in a tight loop.
+notification, `BOOT_COMPLETED`, Android's Nearby Devices plus network-state permissions,
+app-private SQLite in WAL mode, and app-specific removable external storage. Foreground promotion
+happens before database migration or integrity work; database/exporter initialization then runs on
+the service IO scope so a large upgrade cannot consume Android's foreground-start deadline. It
+holds no indefinite wake lock. If boot finds Bluetooth permission missing it disables itself,
+publishes a redacted error and waits for the operator to reopen the setup screen; it does not retry
+in a tight loop.
 
 Default host-readable paths (verify the removable-volume alias on the physical unit):
 
@@ -35,12 +36,14 @@ Default host-readable paths (verify the removable-volume alias on the physical u
 
 The backup server's `DASHCAM_OBD_REMOTE_READY_DIR`, `DASHCAM_OBD_REMOTE_STATUS_FILE`, and
 `DASHCAM_OBD_REMOTE_RECEIPTS_DIR` settings are overrides for a unit whose app-specific path
-resolves differently. Status schema v4 publishes `ingestion_quiesce_v1`,
-`voltage_only_audit_v1` and `controlled_voltage_only_mode_v1`, current/last drive identity,
+resolves differently. Status schema v5 publishes `ingestion_quiesce_v1`,
+`voltage_only_audit_v1`, `controlled_voltage_only_mode_v1` and
+`adaptive_sleep_window_v1`, current/last drive identity,
 last sample, pending bundle count, the correlated ingestion request ID and fixed-schema
 saturating pipeline counters. It also keeps adapter reachability, transient BLE connection, ECU,
 engine and drive state independent; exposes the last reported BLE owner and producer update time;
-and publishes a bounded ATRV value, source, original sample time, freshness and quality. Every
+publishes bounded sleep-policy target/readback/verification evidence; and publishes a bounded
+ATRV value, source, original sample time, freshness and quality. Every
 ordinary, error and internal-storage fallback payload also
 identifies the installed artifact with `app_version_name`, `app_version_code`,
 `poll_plan_version` and `build_git_sha`. The build revision is a validated 12-character lower-case
@@ -49,6 +52,13 @@ is available. Gradle injects it directly into `BuildConfig` without generating a
 These fields are passed through under `logger` by `GET /api/obd/status`. Status contains no adapter
 address, VIN, credentials, arbitrary command/response payload or ECU telemetry. The only retained
 response text is the validated numeric ATRV token, such as `12.7 V`.
+
+The companion's device-side fallback writes and reads back a 900-second countdown when Wi-Fi
+arrives or a valid ingestion lease is active, and 300 seconds after Wi-Fi is definitely lost with
+no lease. Managed writes use a small bounded retry schedule and never stop OBD collection when the
+vendor property is unavailable. Once an ingestion lease ends while Wi-Fi remains connected, the
+companion observes only: the server owns the final 300-second transition after it has verified
+footage, OBD and radio recovery.
 
 ## Build, sign and install
 

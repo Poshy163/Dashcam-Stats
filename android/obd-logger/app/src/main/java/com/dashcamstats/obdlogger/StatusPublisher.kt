@@ -62,11 +62,19 @@ data class PublicStatus(
     val bleOwner: String = if (ownershipEnabled) "dashcam_full_obd" else "unowned",
     val headUnitState: String = "awake",
     val voltageOnlyMode: Boolean = false,
+    val wifiConnected: Boolean = false,
+    val ingestionSleepHoldKnown: Boolean = false,
+    val ingestionSleepHold: Boolean = false,
+    val sleepWindowPolicy: String = "uninitialized",
+    val sleepWindowTargetSeconds: Int? = null,
+    val sleepWindowObservedSeconds: Int? = null,
+    val sleepWindowVerified: Boolean = false,
+    val sleepWindowError: String? = null,
     val lastError: String? = null,
     val lastErrorAtUtc: String? = null,
 )
 
-internal const val PUBLIC_STATUS_SCHEMA_VERSION = 4
+internal const val PUBLIC_STATUS_SCHEMA_VERSION = 5
 
 object StatusPublisher {
     fun publish(context: Context, status: PublicStatus) {
@@ -117,6 +125,7 @@ object StatusPublisher {
                         "ingestion_quiesce_v1",
                         "voltage_only_audit_v1",
                         "controlled_voltage_only_mode_v1",
+                        "adaptive_sleep_window_v1",
                     ),
                 ),
             )
@@ -143,6 +152,14 @@ object StatusPublisher {
             .put("ble_owner", status.bleOwner)
             .put("head_unit_state", status.headUnitState)
             .put("voltage_only_mode", status.voltageOnlyMode)
+            .put("wifi_connected", status.wifiConnected)
+            .put("ingestion_sleep_hold_known", status.ingestionSleepHoldKnown)
+            .put("ingestion_sleep_hold", status.ingestionSleepHold)
+            .put("sleep_window_policy", status.sleepWindowPolicy)
+            .put("sleep_window_target_s", status.sleepWindowTargetSeconds ?: JSONObject.NULL)
+            .put("sleep_window_observed_s", status.sleepWindowObservedSeconds ?: JSONObject.NULL)
+            .put("sleep_window_verified", status.sleepWindowVerified)
+            .put("sleep_window_error", status.sleepWindowError ?: JSONObject.NULL)
             .put("updated_at_utc", Instant.now().toString())
             .put("last_error", status.lastError ?: JSONObject.NULL)
             .put("last_error_at_utc", status.lastErrorAtUtc ?: JSONObject.NULL)

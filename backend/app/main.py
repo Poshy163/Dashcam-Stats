@@ -45,7 +45,7 @@ from app.ingest import origin
 from app.ingest.ha_import_queue import get_import_worker
 from app.ingest.obd_reconciliation import reconcile_all_drives
 from app.ingest.poller import get_poller
-from app.ingest.radio_coordinator import reconcile_startup
+from app.ingest.puller import reconcile_startup_in_awake_window
 from app.ingest.status import hydrate_last_success
 from app.pipeline.stages import warm_models
 from app.workers import queue
@@ -177,7 +177,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # process that died between disable and restore before the poller can start another
     # visit, even when ingest.enabled is currently false.  An offline unit leaves the
     # durable row active; the poller retries it before the next pull when the unit returns.
-    if not await reconcile_startup():
+    if not await reconcile_startup_in_awake_window():
         log.warning("an interrupted ingest radio transition remains pending")
     # Its own ticker rather than a scheduler task: the shared scheduler floors every
     # interval at thirty seconds, and the head unit is only on the network for a minute or

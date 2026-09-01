@@ -36,8 +36,8 @@ log = get_logger(__name__)
 #:
 #: A tick against an absent car is now one TCP connect that fails in under half a second,
 #: not the three ``adb`` process spawns it used to be, so looking often is affordable in a
-#: way it was not. That matters more than it sounds: the window is sixty to a hundred and
-#: twenty seconds and the transfer runs at ~34 MB/s, so four seconds spent not noticing the
+#: way it was not. That matters more than it sounds: even the five-minute resting window
+#: is finite and the transfer runs at ~34 MB/s, so four seconds spent not noticing the
 #: car has arrived is about 140 MB of footage that waits until tomorrow.
 MIN_POLL_S = 1.0
 
@@ -199,7 +199,7 @@ class IngestPoller:
         for candidate in candidates:
             if not await adb.is_listening(candidate):
                 continue
-            if await radio_coordinator.reconcile_pending(address=candidate):
+            if await puller.reconcile_pending_in_awake_window(candidate):
                 log.info(
                     "reconciled an interrupted radio transition while ingest is disabled",
                     address=candidate,
@@ -288,10 +288,6 @@ class IngestPoller:
                     status.set_state(RunState.OFFLINE)
                     self._was_online = False
                     self._error_retries_started = 0
-                    # The visit is over, so the next one may ask for its own sleep. Kept
-                    # here rather than in the run: a run that ended because the car left
-                    # cannot tell that from one that ended because it had finished.
-                    puller.forget_sleep_state()
                     self._visit_info = None
                     await asyncio.sleep(self._interval())
                     continue
@@ -355,11 +351,11 @@ class IngestPoller:
                         # If a previous window ended with the unit's radios still off --
                         # the engine stopping mid-transfer is the ordinary ending -- put
                         # them right the moment the car is back, before it is asked for
-                        # anything. Fired, not awaited: it rides the control channel,
-                        # which the transfer below does not use for its bytes. Safe to
-                        # re-fire while the arrival gate holds below, because it does
-                        # nothing once the marker it reads is clear.
-                        if not await radio_coordinator.reconcile_pending(address=info.address):
+                        # anything. Awaited because the long sleep window must be proven
+                        # before recovery spends any of the short resting window. Safe to
+                        # repeat while the arrival gate holds below: widening is idempotent,
+                        # and recovery does nothing once its durable marker is clear.
+                        if not await puller.reconcile_pending_in_awake_window(info.address):
                             # A stale durable transition owns the radios until its exact
                             # baseline is restored. Keep this as the arrival transition so
                             # the next tick retries; do not let a second pull manipulate or

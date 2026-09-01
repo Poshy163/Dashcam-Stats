@@ -3016,6 +3016,119 @@ class TestTransferIsolation:
             "adapter_reachable": False,
         }
 
+    async def test_logger_status_accepts_bounded_sleep_window_evidence(self, monkeypatch):
+        fixture = {
+            "schema_version": 5,
+            "state": "parked",
+            "wifi_connected": True,
+            "ingestion_sleep_hold": False,
+            "ingestion_sleep_hold_known": True,
+            "sleep_window_policy": "managed_idle",
+            "sleep_window_target_s": 300,
+            "sleep_window_observed_s": 900,
+            "sleep_window_verified": False,
+            "sleep_window_error": "sleep countdown readback did not match the requested value",
+        }
+        monkeypatch.setattr(
+            obd_transfer.adb,
+            "shell",
+            lambda *_args, **_kwargs: _async_value(json.dumps(fixture)),
+        )
+
+        status = await obd_transfer.read_logger_status("unit", "/safe/status.json")
+
+        assert status is not None
+        assert status["wifi_connected"] is True
+        assert status["ingestion_sleep_hold"] is False
+        assert status["ingestion_sleep_hold_known"] is True
+        assert status["sleep_window_policy"] == "managed_idle"
+        assert status["sleep_window_target_s"] == 300
+        assert status["sleep_window_observed_s"] == 900
+        assert status["sleep_window_verified"] is False
+        assert (
+            status["sleep_window_error"]
+            == "sleep countdown readback did not match the requested value"
+        )
+
+    async def test_logger_status_rejects_invalid_sleep_window_evidence(self, monkeypatch):
+        fixture = {
+            "schema_version": 5,
+            "state": "parked",
+            "wifi_connected": "true",
+            "ingestion_sleep_hold": 1,
+            "ingestion_sleep_hold_known": 0,
+            "sleep_window_policy": ["managed_idle"],
+            "sleep_window_target_s": True,
+            "sleep_window_observed_s": 3_601,
+            "sleep_window_verified": "false",
+            "sleep_window_error": {"message": "sleep countdown readback was unavailable"},
+        }
+        monkeypatch.setattr(
+            obd_transfer.adb,
+            "shell",
+            lambda *_args, **_kwargs: _async_value(json.dumps(fixture)),
+        )
+
+        status = await obd_transfer.read_logger_status("unit", "/safe/status.json")
+
+        assert status == {
+            "schema_version": 5,
+            "state": "parked",
+            "battery_voltage_fresh": False,
+            "adapter_reachable": False,
+        }
+
+    @pytest.mark.parametrize("value", [0, 299, 301, 899, 901, 3_601])
+    async def test_logger_status_rejects_unrecognized_sleep_window_target(
+        self,
+        monkeypatch,
+        value,
+    ):
+        fixture = {
+            "schema_version": 5,
+            "state": "parked",
+            "sleep_window_target_s": value,
+        }
+        monkeypatch.setattr(
+            obd_transfer.adb,
+            "shell",
+            lambda *_args, **_kwargs: _async_value(json.dumps(fixture)),
+        )
+
+        status = await obd_transfer.read_logger_status("unit", "/safe/status.json")
+
+        assert status is not None
+        assert "sleep_window_target_s" not in status
+
+    async def test_logger_status_accepts_safe_sleep_window_startup_state(self, monkeypatch):
+        fixture = {
+            "schema_version": 5,
+            "state": "starting",
+            "wifi_connected": True,
+            "ingestion_sleep_hold": False,
+            "ingestion_sleep_hold_known": False,
+            "sleep_window_policy": "awaiting_ingestion_state",
+            "sleep_window_target_s": None,
+            "sleep_window_observed_s": 900,
+            "sleep_window_verified": False,
+            "sleep_window_error": None,
+        }
+        monkeypatch.setattr(
+            obd_transfer.adb,
+            "shell",
+            lambda *_args, **_kwargs: _async_value(json.dumps(fixture)),
+        )
+
+        status = await obd_transfer.read_logger_status("unit", "/safe/status.json")
+
+        assert status is not None
+        assert status["ingestion_sleep_hold_known"] is False
+        assert status["sleep_window_policy"] == "awaiting_ingestion_state"
+        assert status["sleep_window_target_s"] is None
+        assert status["sleep_window_observed_s"] == 900
+        assert status["sleep_window_verified"] is False
+        assert status["sleep_window_error"] is None
+
     async def test_logger_build_identity_rejects_unbounded_or_mistyped_values(self, monkeypatch):
         fixture = {
             "schema_version": 3,

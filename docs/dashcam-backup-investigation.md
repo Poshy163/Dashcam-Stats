@@ -991,9 +991,8 @@ window needed  =  driving time x (2.16 / 32.5)  =  driving time / 15
 
 | Window | Moves | Covers |
 | ---: | ---: | ---: |
-| 60 s | 1.95 GB | ~15 min of driving |
-| 120 s | 3.90 GB | ~30 min of driving |
-| 600 s | 19.5 GB | ~2.5 h of driving |
+| 300 s resting | 9.75 GB | ~1.25 h of driving |
+| 900 s managed backup | 29.25 GB | ~3.75 h of driving |
 
 The median successful window in the run history moved **1.23 GB** — about 38 seconds of
 transfer, covering **~9.5 minutes of driving**. Drive longer than that between windows and
@@ -1004,7 +1003,7 @@ the backlog grows permanently, which is exactly what the card shows.
 1. **Extend the window. This is the only lever that changes anything.** `dumpsys battery`
    reports `present: false` — there is no backup power of any kind, so the unit dies with
    the ignition. A hardwire kit with an ACC delay, or any small 12 V holdover, converts a
-   ~40-second window into whatever it is set to. Ten minutes of holdover moves 19.5 GB,
+   ~40-second window into whatever it is set to. Fifteen minutes of holdover moves 29.25 GB,
    which is more than the entire card. Nothing in software competes with this.
    (`wifi_sleep_policy=2` is already "never sleep" and `screen_off_timeout` is already
    effectively infinite, so there is nothing to win in settings.)

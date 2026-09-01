@@ -139,7 +139,7 @@ constant 12 V, with ACC as a *signal* rather than the power source. On ignition-
 
 | Property | Value | Meaning |
 | --- | --- | --- |
-| `persist.sys.sleep.countdown.time` | **600** (shipped: 3) | **Seconds awake after ignition-off.** Drives an on-screen countdown. **The radio stays up for all of it.** |
+| `persist.sys.sleep.countdown.time` | **300 resting / 900 during backup** (shipped: 3) | **Seconds awake after ignition-off.** Drives an on-screen countdown. **The radio stays up for all of it.** |
 | `persist.sys.state.system_sleep` | `true` | Sleep enabled |
 | `persist.sys.time.system_sleep` | `24` | How long it stays asleep before full power-off (hours; from `array_system_sleep_time`) |
 | `persist.sys.shutdown.countdown.time` | `3` | Countdown for a real shutdown |
@@ -152,15 +152,27 @@ constant 12 V, with ACC as a *signal* rather than the power source. On ignition-
 | `sleep.countdown.time` | Reachable after ignition-off |
 | ---: | --- |
 | 3 (shipped) | effectively zero — gone before anything can connect |
-| 60 | **60 s**, radio up throughout |
-| 600 (current) | ~10 min |
+| 300 (resting) | **5 min**, radio up throughout |
+| 900 (managed backup/recovery) | **15 min** |
 
-This is the **only** lever that changes how much footage a park is worth. At 32 MB/s, ten
-minutes is ~19 GB. Before it was found the working window was ~40 s, and the conclusion
+The production OBD companion carries the same fixed 900/300-second policy as a
+device-side fallback: Wi-Fi arrival or a valid ingestion request selects 900, while a
+definite Wi-Fi loss with no request selects 300. The server remains authoritative while
+the unit is home and narrows the window only after footage, OBD and radio recovery are
+all proven complete. Keep the two Backup settings aligned with those companion values;
+turning off server-side management does not reconfigure an already-installed APK.
+
+This is the **only** lever that changes how much footage a park is worth. At 32 MB/s, fifteen
+minutes is ~29 GB. Before it was found the working window was ~40 s, and the conclusion
 "sleep is a hard cutoff, nothing left in software" — which was wrong.
 
-There is no early-sleep. It was tried (`svc power forcesuspend` once the card was
-drained) and removed — see "do not repeat these" below.
+The app never forces suspend. Once the card is positively inventoried empty, OBD has
+nothing waiting on the unit, and the durable radio transition proves Bluetooth, hotspot
+and logger recovery complete, it verifies the five-minute resting property and lets
+Android's normal countdown end the window. Unknown inventory or recovery state keeps the
+15-minute window open. Radio reconciliation also fails closed if the 15-minute property
+cannot be read back: it does not start a restore that may be cut off by the resting window.
+A failed five-minute write/readback is logged and never followed by a forced suspend.
 
 ### Do not repeat these
 
@@ -176,12 +188,12 @@ drained) and removed — see "do not repeat these" below.
   The durable path now requires either an exact configuration capsule or the separately
   enabled Zlink Bluetooth-rearm capsule, and it must observe the serving AP return before
   declaring recovery complete.
-- **Suspending early only works once per visit.** `svc power forcesuspend` works, but
+- **Do not suspend early.** `svc power forcesuspend` works, but
   the camera keeps recording after ignition-off and closes a segment about every minute,
   which wakes the unit straight back up. The result is a suspend/resume loop — measured
   at roughly one cycle a minute for the whole countdown — that re-announces itself each
-  time and puts a suspend in the middle of an active recording. The countdown expiring is
-  the only thing that should end the window.
+  time and puts a suspend in the middle of an active recording. Only change the bounded
+  countdown and let Android enter sleep normally.
 - There is no way to keep the unit awake indefinitely, and you would not want one: no
   battery, constant 12 V, and no voltage cutoff available to us, so a stalled sync would
   flatten the car battery. Always leave the countdown as the backstop.

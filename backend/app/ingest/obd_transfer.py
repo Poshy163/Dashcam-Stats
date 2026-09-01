@@ -216,6 +216,14 @@ _LOGGER_KEYS = frozenset(
         "ble_owner",
         "head_unit_state",
         "voltage_only_mode",
+        "wifi_connected",
+        "ingestion_sleep_hold",
+        "ingestion_sleep_hold_known",
+        "sleep_window_policy",
+        "sleep_window_target_s",
+        "sleep_window_observed_s",
+        "sleep_window_verified",
+        "sleep_window_error",
         "current_drive_id",
         "last_drive_id",
         "last_drive_finished_at_utc",
@@ -236,9 +244,27 @@ _LOGGER_METRIC_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _LOGGER_APP_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _LOGGER_BUILD_GIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{12}|unknown)$")
 _LOGGER_STATE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_LOGGER_SLEEP_WINDOW_POLICIES = frozenset(
+    {
+        "uninitialized",
+        "awaiting_ingestion_state",
+        "managed_active",
+        "managed_idle",
+        "server_owned",
+    }
+)
+_LOGGER_SLEEP_WINDOW_TARGETS = frozenset({300, 900})
+_LOGGER_SLEEP_WINDOW_ERRORS = frozenset(
+    {
+        "sleep countdown update was refused",
+        "sleep countdown readback was unavailable",
+        "sleep countdown readback did not match the requested value",
+    }
+)
 MAX_LOGGER_CAPABILITIES = 32
 MAX_LOGGER_METRICS = 64
 LOGGER_VOLTAGE_FRESHNESS_SECONDS = 75
+MAX_LOGGER_SLEEP_WINDOW_SECONDS = 3_600
 LOGGER_PACKAGE = "com.dashcamstats.obdlogger"
 _STATUS_FILE_PREFIX = "__DASHCAM_LOGGER_STATUS_FILE__\n"
 _STATUS_NOT_INSTALLED = "__DASHCAM_LOGGER_NOT_INSTALLED__"
@@ -394,6 +420,10 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
         "engine_running",
         "battery_voltage_fresh",
         "voltage_only_mode",
+        "wifi_connected",
+        "ingestion_sleep_hold",
+        "ingestion_sleep_hold_known",
+        "sleep_window_verified",
     }
     for key, item in value.items():
         if key not in _LOGGER_KEYS:
@@ -459,6 +489,26 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
                 clean[key] = item
         elif key == "head_unit_state":
             if item in {"awake", "sleep_requested", "asleep", "unknown"}:
+                clean[key] = item
+        elif key == "sleep_window_policy":
+            if isinstance(item, str) and item in _LOGGER_SLEEP_WINDOW_POLICIES:
+                clean[key] = item
+        elif key == "sleep_window_target_s":
+            if item is None or (
+                isinstance(item, int)
+                and not isinstance(item, bool)
+                and item in _LOGGER_SLEEP_WINDOW_TARGETS
+            ):
+                clean[key] = item
+        elif key == "sleep_window_observed_s":
+            if item is None or (
+                isinstance(item, int)
+                and not isinstance(item, bool)
+                and 1 <= item <= MAX_LOGGER_SLEEP_WINDOW_SECONDS
+            ):
+                clean[key] = item
+        elif key == "sleep_window_error":
+            if item is None or (isinstance(item, str) and item in _LOGGER_SLEEP_WINDOW_ERRORS):
                 clean[key] = item
         elif key == "updated_at_utc":
             if timestamp := _clean_logger_timestamp(item):

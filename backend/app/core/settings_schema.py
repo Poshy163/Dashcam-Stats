@@ -1322,16 +1322,16 @@ SETTINGS: tuple[SettingDef, ...] = (
         "The head unit stays awake for a fixed countdown after the ignition goes off, and "
         "the WiFi stays up for all of it — so that countdown is the whole backup window. "
         "With this on, the app widens it while the car is here and narrows it again the "
-        "moment the card is empty, then sends the unit to sleep rather than leaving it "
-        "waiting out the rest on the car's battery. A unit the app never reaches — parked "
-        "away from home — keeps the short value and sleeps promptly.",
+        "moment the card is empty. Android's normal countdown remains the only path into "
+        "sleep, so recording is never interrupted by a forced suspend. A unit the app never "
+        "reaches — parked away from home — keeps the short value and sleeps promptly.",
         requires="ingest.enabled",
     ),
     SettingDef(
         "ingest.sleep_window_s",
         "Awake time while there is footage to copy",
         "int",
-        600,
+        900,
         "ingest",
         "How long the head unit stays awake after the ignition goes off while the app is "
         "in touch with it. At the measured transfer rate this is far more than a day of "
@@ -1346,7 +1346,7 @@ SETTINGS: tuple[SettingDef, ...] = (
         "ingest.sleep_window_idle_s",
         "Awake time otherwise",
         "int",
-        60,
+        300,
         "ingest",
         "What the countdown is set back to once the card is empty, and what a unit the app "
         "cannot reach keeps. This is the value that applies when the car is parked away "

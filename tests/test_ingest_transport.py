@@ -1361,21 +1361,44 @@ class TestARunEndToEnd:
     async def test_pending_radio_recovery_does_not_publish_a_fake_empty_backlog(
         self, db_session, unit, app_config, monkeypatch
     ):
-        from app.ingest import puller
+        from app.ingest import adb, puller
         from app.ingest.models import RunState
         from app.ingest.status import get_status
 
+        events: list[str] = []
+
+        async def current_window(_address):
+            return 300
+
+        async def set_window(_address, seconds):
+            events.append(f"window:{seconds}")
+            return True
+
         async def recovery_still_pending(*, address):
             assert address == "127.0.0.1:5555"
+            events.append("reconcile")
             return False
 
-        await self._enable()
+        async def forbidden_sleep(_address):
+            raise AssertionError("unknown backlog and pending recovery must never sleep the unit")
+
+        await self._enable(
+            **{
+                "ingest.manage_sleep_window": True,
+                "ingest.sleep_window_s": 900,
+                "ingest.sleep_window_idle_s": 300,
+            }
+        )
+        monkeypatch.setattr(adb, "sleep_countdown", current_window)
+        monkeypatch.setattr(adb, "set_sleep_countdown", set_window)
+        monkeypatch.setattr(adb, "sleep_unit", forbidden_sleep)
         monkeypatch.setattr(puller.radio_coordinator, "reconcile_pending", recovery_still_pending)
 
         result = await puller.run_pull(trigger="manual")
 
         assert result.state is RunState.IDLE
         assert result.error == "an earlier ingest radio transition still requires recovery"
+        assert events == ["window:900", "reconcile"]
         assert get_status().snapshot()["backlog_known"] is False
         assert unit.served["names"] is None, "the card was never inventoried"
 
@@ -2618,11 +2641,11 @@ class TestDisabledPollerRadioRecovery:
         assert not await IngestPoller()._recover_pending_while_disabled()
 
     async def test_disabled_poller_reconciles_pending_transition_on_next_arrival(self, monkeypatch):
-        from app.ingest import adb, radio_coordinator
+        from app.ingest import adb, puller, radio_coordinator
         from app.ingest.poller import IngestPoller
 
         probes: list[str] = []
-        reconciled: list[str] = []
+        recovery_steps: list[str] = []
 
         async def pending():
             return "last-known:5555"
@@ -2631,8 +2654,12 @@ class TestDisabledPollerRadioRecovery:
             probes.append(address)
             return address == "last-known:5555"
 
+        async def widen(address):
+            recovery_steps.append(f"widen:{address}")
+            return True
+
         async def reconcile(*, address):
-            reconciled.append(address)
+            recovery_steps.append(f"reconcile:{address}")
             return True
 
         poller = IngestPoller()
@@ -2640,10 +2667,14 @@ class TestDisabledPollerRadioRecovery:
         monkeypatch.setattr(radio_coordinator, "pending_recovery_address", pending)
         monkeypatch.setattr(radio_coordinator, "reconcile_pending", reconcile)
         monkeypatch.setattr(adb, "is_listening", listening)
+        monkeypatch.setattr(puller, "widen_sleep_window", widen)
 
         assert await poller._recover_pending_while_disabled()
         assert probes == ["configured:5555", "last-known:5555"]
-        assert reconciled == ["last-known:5555"]
+        assert recovery_steps == [
+            "widen:last-known:5555",
+            "reconcile:last-known:5555",
+        ]
 
     async def test_feature_gate_runs_pending_recovery_ticker_before_sleep(self, monkeypatch):
         from app.ingest.poller import IngestPoller
@@ -3248,6 +3279,12 @@ class TestTheSleepWindowIsManagedNotLeftWide:
     parked somewhere the app will never reach — where the window buys nothing and the
     battery pays for it anyway."""
 
+    def test_the_policy_defaults_are_fifteen_minutes_active_and_five_minutes_idle(self):
+        from app.core.settings_schema import SETTINGS_BY_KEY
+
+        assert SETTINGS_BY_KEY["ingest.sleep_window_s"].default == 900
+        assert SETTINGS_BY_KEY["ingest.sleep_window_idle_s"].default == 300
+
     async def test_it_is_widened_only_when_asked_for(self, db_session, monkeypatch):
         from app.core.settings_service import get_settings_service
         from app.ingest import adb, puller
@@ -3255,7 +3292,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         set_to: list[int] = []
 
         async def current(address):
-            return 60
+            return 300
 
         async def setter(address, seconds):
             set_to.append(seconds)
@@ -3265,21 +3302,259 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         monkeypatch.setattr(adb, "set_sleep_countdown", setter)
 
         await get_settings_service().set_many({"ingest.enabled": True})
-        await puller.widen_sleep_window("u:5555")
+        assert await puller.widen_sleep_window("u:5555")
         assert set_to == [], "off by default"
 
         await get_settings_service().set_many(
             {"ingest.manage_sleep_window": True, "ingest.sleep_window_s": 900}
         )
-        await puller.widen_sleep_window("u:5555")
+        assert await puller.widen_sleep_window("u:5555")
         assert set_to == [900]
 
-    async def test_draining_narrows_it_and_sleeps_once(self, db_session, monkeypatch):
+    async def test_pending_recovery_waits_for_a_verified_active_window(
+        self, db_session, monkeypatch
+    ):
+        from app.core.settings_service import get_settings_service
+        from app.ingest import adb, puller
+
+        events: list[str] = []
+
+        async def current(address):
+            events.append(f"read:{address}")
+            return 300
+
+        async def setter(address, seconds):
+            events.append(f"set:{address}:{seconds}")
+            return True
+
+        async def reconcile(*, address):
+            events.append(f"reconcile:{address}")
+            return True
+
+        monkeypatch.setattr(adb, "sleep_countdown", current)
+        monkeypatch.setattr(adb, "set_sleep_countdown", setter)
+        monkeypatch.setattr(puller.radio_coordinator, "reconcile_pending", reconcile)
+        await get_settings_service().set_many(
+            {"ingest.manage_sleep_window": True, "ingest.sleep_window_s": 900}
+        )
+
+        assert await puller.reconcile_pending_in_awake_window("u:5555")
+        assert events == [
+            "read:u:5555",
+            "set:u:5555:900",
+            "reconcile:u:5555",
+        ]
+
+    async def test_pending_recovery_fails_closed_when_widening_is_not_verified(
+        self, db_session, monkeypatch
+    ):
+        from app.core.settings_service import get_settings_service
+        from app.ingest import adb, puller
+
+        events: list[str] = []
+        warnings: list[tuple[str, dict[str, object]]] = []
+
+        async def current(address):
+            events.append(f"read:{address}")
+            return 300
+
+        async def refused_set(address, seconds):
+            events.append(f"set:{address}:{seconds}")
+            return False
+
+        async def forbidden_reconcile(*, address):
+            raise AssertionError("radio recovery must not race an unverified sleep window")
+
+        class CapturingLog:
+            def warning(self, event, **fields):
+                warnings.append((event, fields))
+
+        monkeypatch.setattr(adb, "sleep_countdown", current)
+        monkeypatch.setattr(adb, "set_sleep_countdown", refused_set)
+        monkeypatch.setattr(puller.radio_coordinator, "reconcile_pending", forbidden_reconcile)
+        monkeypatch.setattr(puller, "log", CapturingLog())
+        await get_settings_service().set_many(
+            {"ingest.manage_sleep_window": True, "ingest.sleep_window_s": 900}
+        )
+
+        assert not await puller.reconcile_pending_in_awake_window("u:5555")
+        assert events == ["read:u:5555", "set:u:5555:900"]
+        assert warnings == [
+            (
+                "radio recovery deferred because the managed awake window could not be verified",
+                {"address": "u:5555", "seconds": 900},
+            )
+        ]
+
+    async def test_startup_routes_a_durable_recovery_address_through_the_awake_guard(
+        self, monkeypatch
+    ):
+        from app.ingest import puller
+
+        events: list[str] = []
+
+        async def pending_address():
+            events.append("pending-address")
+            return "u:5555"
+
+        async def guarded_recovery(address):
+            events.append(f"guarded:{address}")
+            return True
+
+        async def forbidden_unguarded_startup():
+            raise AssertionError("a durable endpoint must use verified awake-window recovery")
+
+        monkeypatch.setattr(
+            puller.radio_coordinator,
+            "pending_recovery_address",
+            pending_address,
+        )
+        monkeypatch.setattr(puller, "reconcile_pending_in_awake_window", guarded_recovery)
+        monkeypatch.setattr(
+            puller.radio_coordinator,
+            "reconcile_startup",
+            forbidden_unguarded_startup,
+        )
+
+        assert await puller.reconcile_startup_in_awake_window()
+        assert events == ["pending-address", "guarded:u:5555"]
+
+    async def test_startup_without_a_durable_address_uses_no_device_endpoint(self, monkeypatch):
+        from app.ingest import puller
+
+        events: list[str] = []
+
+        async def no_pending_address():
+            events.append("pending-address")
+            return None
+
+        async def coordinator_startup():
+            events.append("coordinator-startup")
+            return True
+
+        async def forbidden_guard(address):
+            raise AssertionError("no recovery row means there is no endpoint to widen")
+
+        monkeypatch.setattr(
+            puller.radio_coordinator,
+            "pending_recovery_address",
+            no_pending_address,
+        )
+        monkeypatch.setattr(puller.radio_coordinator, "reconcile_startup", coordinator_startup)
+        monkeypatch.setattr(puller, "reconcile_pending_in_awake_window", forbidden_guard)
+
+        assert await puller.reconcile_startup_in_awake_window()
+        assert events == ["pending-address", "coordinator-startup"]
+
+    def test_application_lifespan_uses_guarded_startup_recovery(self):
+        import inspect
+
+        from app import main
+
+        source = inspect.getsource(main.lifespan)
+        assert "await reconcile_startup_in_awake_window()" in source
+
+    async def test_draining_restores_idle_countdown_without_forced_suspend(
+        self, db_session, monkeypatch
+    ):
         from app.core.settings_service import get_settings_service
         from app.ingest import adb, puller
 
         set_to: list[int] = []
-        slept: list[str] = []
+        current_window = 900
+
+        async def current(address):
+            return current_window
+
+        async def setter(address, seconds):
+            nonlocal current_window
+            set_to.append(seconds)
+            current_window = seconds
+            return True
+
+        async def parked(address):
+            return True
+
+        async def forbidden_sleep(address):
+            raise AssertionError("the server must let Android's countdown suspend the unit")
+
+        monkeypatch.setattr(adb, "sleep_countdown", current)
+        monkeypatch.setattr(adb, "set_sleep_countdown", setter)
+        monkeypatch.setattr(adb, "is_parked", parked)
+        monkeypatch.setattr(adb, "sleep_unit", forbidden_sleep)
+        await get_settings_service().set_many(
+            {
+                "ingest.enabled": True,
+                "ingest.manage_sleep_window": True,
+                "ingest.sleep_window_idle_s": 300,
+            }
+        )
+        await puller.close_sleep_window("u:5555", drained=True)
+        assert set_to == [300], "the verified five-minute idle countdown is restored"
+
+        # A second safe close reads back the desired value and makes no redundant write.
+        await puller.close_sleep_window("u:5555", drained=True)
+        assert set_to == [300]
+
+    async def test_failed_idle_readback_is_warned_without_forced_suspend(
+        self, db_session, monkeypatch
+    ):
+        from app.core.settings_service import get_settings_service
+        from app.ingest import adb, puller
+
+        set_to: list[int] = []
+        warnings: list[tuple[str, dict[str, object]]] = []
+
+        async def current(address):
+            return 900
+
+        async def refused_set(address, seconds):
+            set_to.append(seconds)
+            return False
+
+        async def parked(address):
+            return True
+
+        async def forbidden_sleep(address):
+            raise AssertionError("a failed idle readback must never trigger forced suspend")
+
+        class CapturingLog:
+            def warning(self, event, **fields):
+                warnings.append((event, fields))
+
+        monkeypatch.setattr(adb, "sleep_countdown", current)
+        monkeypatch.setattr(adb, "set_sleep_countdown", refused_set)
+        monkeypatch.setattr(adb, "is_parked", parked)
+        monkeypatch.setattr(adb, "sleep_unit", forbidden_sleep)
+        monkeypatch.setattr(puller, "log", CapturingLog())
+        await get_settings_service().set_many(
+            {
+                "ingest.enabled": True,
+                "ingest.manage_sleep_window": True,
+                "ingest.sleep_window_idle_s": 300,
+            }
+        )
+
+        await puller.close_sleep_window("u:5555", drained=True)
+        assert set_to == [300]
+        assert warnings == [
+            (
+                "could not verify the head unit's idle sleep window",
+                {"address": "u:5555", "seconds": 300},
+            )
+        ]
+
+    async def test_it_never_narrows_a_car_being_driven(self, db_session, monkeypatch):
+        from app.core.settings_service import get_settings_service
+        from app.ingest import adb, puller
+
+        set_to: list[int] = []
+
+        async def driving(address):
+            return False
+
+        async def forbidden_sleep(address):
+            raise AssertionError("the server must not force-suspend the unit")
 
         async def current(address):
             return 900
@@ -3288,85 +3563,135 @@ class TestTheSleepWindowIsManagedNotLeftWide:
             set_to.append(seconds)
             return True
 
-        async def parked(address):
-            return True
-
-        async def sleeper(address):
-            slept.append(address)
-            return ""
-
-        monkeypatch.setattr(adb, "sleep_countdown", current)
-        monkeypatch.setattr(adb, "set_sleep_countdown", setter)
-        monkeypatch.setattr(adb, "is_parked", parked)
-        monkeypatch.setattr(adb, "sleep_unit", sleeper)
-        await get_settings_service().set_many(
-            {
-                "ingest.enabled": True,
-                "ingest.manage_sleep_window": True,
-                "ingest.sleep_window_idle_s": 60,
-            }
-        )
-        puller.forget_sleep_state()
-
-        await puller.close_sleep_window("u:5555", drained=True)
-        assert set_to == [60], "the short value is put back before sleeping"
-        assert slept == ["u:5555"]
-
-        # The unit wakes itself a minute later; it must not be re-suspended on a loop.
-        await puller.close_sleep_window("u:5555", drained=True)
-        assert slept == ["u:5555"], "the unit was suspended twice in one visit"
-
-        # ...until the car has actually left and come back.
-        puller.forget_sleep_state()
-        await puller.close_sleep_window("u:5555", drained=True)
-        assert slept == ["u:5555", "u:5555"]
-
-    async def test_it_never_sleeps_a_car_being_driven(self, db_session, monkeypatch):
-        from app.core.settings_service import get_settings_service
-        from app.ingest import adb, puller
-
-        slept: list[str] = []
-
-        async def driving(address):
-            return False
-
-        async def sleeper(address):
-            slept.append(address)
-            return ""
-
-        async def current(address):
-            return 900
-
-        async def setter(address, seconds):
-            return True
-
         monkeypatch.setattr(adb, "is_parked", driving)
-        monkeypatch.setattr(adb, "sleep_unit", sleeper)
+        monkeypatch.setattr(adb, "sleep_unit", forbidden_sleep)
         monkeypatch.setattr(adb, "sleep_countdown", current)
         monkeypatch.setattr(adb, "set_sleep_countdown", setter)
         await get_settings_service().set_many(
             {"ingest.enabled": True, "ingest.manage_sleep_window": True}
         )
-        puller.forget_sleep_state()
-
         await puller.close_sleep_window("u:5555", drained=True)
-        assert slept == []
+        assert set_to == []
 
     async def test_footage_still_on_the_card_keeps_the_window_open(self, db_session, monkeypatch):
         from app.core.settings_service import get_settings_service
         from app.ingest import adb, puller
 
-        slept: list[str] = []
+        set_to: list[int] = []
 
-        async def sleeper(address):
-            slept.append(address)
-            return ""
+        async def setter(address, seconds):
+            set_to.append(seconds)
+            return True
 
-        monkeypatch.setattr(adb, "sleep_unit", sleeper)
+        async def forbidden_sleep(address):
+            raise AssertionError("the server must not force-suspend the unit")
+
+        monkeypatch.setattr(adb, "set_sleep_countdown", setter)
+        monkeypatch.setattr(adb, "sleep_unit", forbidden_sleep)
         await get_settings_service().set_many(
             {"ingest.enabled": True, "ingest.manage_sleep_window": True}
         )
-        puller.forget_sleep_state()
 
         await puller.close_sleep_window("u:5555", drained=False)
-        assert slept == []
+        assert set_to == []
+
+    async def test_unknown_backlog_cannot_close_the_window(self, monkeypatch):
+        from app.ingest import puller
+        from app.ingest.models import RunResult, RunState
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        assert get_status().try_begin()
+        get_status().finish(RunResult(state=RunState.IDLE))
+
+        async def forbidden_recovery_lookup():
+            raise AssertionError("unknown inventory must fail before the radio lookup")
+
+        monkeypatch.setattr(
+            puller.radio_coordinator,
+            "pending_recovery_address",
+            forbidden_recovery_lookup,
+        )
+        assert not await puller._sleep_window_may_close(RunResult(state=RunState.IDLE))
+
+    @pytest.mark.parametrize("lookup", ["pending", "unknown"])
+    async def test_pending_or_unknown_radio_recovery_cannot_close_the_window(
+        self, monkeypatch, lookup
+    ):
+        from app.ingest import puller
+        from app.ingest.models import DeltaPlan, RunResult, RunState
+        from app.ingest.obd_transfer import get_obd_transfer_status
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        get_obd_transfer_status().set_inventory(0)
+        get_obd_transfer_status().set_logger(None)
+        assert get_status().try_begin()
+        get_status().plan(DeltaPlan(files=[], backlog_files=0, backlog_bytes=0))
+        result = RunResult(state=RunState.IDLE)
+        get_status().finish(result)
+
+        async def recovery_lookup():
+            if lookup == "unknown":
+                raise RuntimeError("database unavailable")
+            return "u:5555"
+
+        monkeypatch.setattr(
+            puller.radio_coordinator,
+            "pending_recovery_address",
+            recovery_lookup,
+        )
+        assert not await puller._sleep_window_may_close(result)
+
+    async def test_obd_work_waiting_on_the_unit_cannot_close_the_window(self, monkeypatch):
+        from app.ingest import puller
+        from app.ingest.models import DeltaPlan, RunResult, RunState
+        from app.ingest.obd_transfer import get_obd_transfer_status
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        get_obd_transfer_status().set_inventory(1)
+        get_obd_transfer_status().set_logger(None)
+        assert get_status().try_begin()
+        get_status().plan(DeltaPlan(files=[], backlog_files=0, backlog_bytes=0))
+        result = RunResult(state=RunState.IDLE)
+        get_status().finish(result)
+
+        async def forbidden_recovery_lookup():
+            raise AssertionError("OBD waiting must fail before the radio lookup")
+
+        monkeypatch.setattr(
+            puller.radio_coordinator,
+            "pending_recovery_address",
+            forbidden_recovery_lookup,
+        )
+        try:
+            assert not await puller._sleep_window_may_close(result)
+        finally:
+            get_obd_transfer_status().set_inventory(0)
+
+    async def test_verified_recovery_and_known_empty_queues_allow_the_window_to_close(
+        self, monkeypatch
+    ):
+        from app.ingest import puller
+        from app.ingest.models import DeltaPlan, RunResult, RunState
+        from app.ingest.obd_transfer import get_obd_transfer_status
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        get_obd_transfer_status().set_inventory(0)
+        get_obd_transfer_status().set_logger(None)
+        assert get_status().try_begin()
+        get_status().plan(DeltaPlan(files=[], backlog_files=0, backlog_bytes=0))
+        result = RunResult(state=RunState.IDLE)
+        get_status().finish(result)
+
+        async def no_pending_recovery():
+            return None
+
+        monkeypatch.setattr(
+            puller.radio_coordinator,
+            "pending_recovery_address",
+            no_pending_recovery,
+        )
+        assert await puller._sleep_window_may_close(result)

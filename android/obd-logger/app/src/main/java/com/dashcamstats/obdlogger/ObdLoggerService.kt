@@ -46,6 +46,7 @@ class ObdLoggerService : Service() {
     @Volatile
     private var collaboratorsInitialized = false
     private val statusWriteGate = StatusWriteGate()
+    private var sleepWindowController: AdaptiveSleepWindowController? = null
 
     private sealed interface RecordingExit {
         data object EngineStopped : RecordingExit
@@ -86,6 +87,9 @@ class ObdLoggerService : Service() {
                 startConnectedDeviceForeground("Starting safely")
                 foregroundFirstStartupGate.markForegroundStarted()
                 startupAllowed = true
+                sleepWindowController = runCatching {
+                    AdaptiveSleepWindowController(applicationContext, scope).also { it.start() }
+                }.getOrNull()
             }
         }
     }
@@ -127,6 +131,8 @@ class ObdLoggerService : Service() {
     override fun onDestroy() {
         worker?.cancel()
         client?.closeNow()
+        sleepWindowController?.close()
+        sleepWindowController = null
         scope.cancel()
         // Do not close SQLite here: the IO coroutine can be between its final DML and
         // setTransactionSuccessful when Android calls onDestroy on the main thread.
@@ -230,7 +236,7 @@ class ObdLoggerService : Service() {
                         ingestionRequestId = null
                         clearLeaseAfterBoot = false
                     }
-                    when (val requestRead = IngestionQuiesceFiles.readRequest(deviceRoot)) {
+                    when (val requestRead = readIngestionRequest(deviceRoot)) {
                         IngestionRequestRead.Absent -> {
                             val resumed = IngestionQuiesceFiles.clearAcknowledgement(deviceRoot)
                             ingestionRequestId = null
@@ -273,7 +279,7 @@ class ObdLoggerService : Service() {
                 val message = safeError(error)
                 val statusConfig = config ?: runCatching { LoggerPreferences.load(this) }.getOrNull()
                 val root = DeviceFiles.removableRootOrNull(this)
-                val request = root?.let(IngestionQuiesceFiles::readRequest)
+                val request = root?.let(::readIngestionRequest)
                 if (root != null && request is IngestionRequestRead.Valid) {
                     runCatching {
                         IngestionQuiesceFiles.publishFailed(root, request.request, message)
@@ -326,7 +332,7 @@ class ObdLoggerService : Service() {
             graceMillis = config.offGraceSeconds * 1000,
         )
         val controlPresent = {
-            IngestionQuiesceFiles.readRequest(deviceRoot) !is IngestionRequestRead.Absent
+            readIngestionRequest(deviceRoot) !is IngestionRequestRead.Absent
         }
         val parkedVoltage = try {
             elm.probeAdapterVoltage(controlPresent)
@@ -691,8 +697,13 @@ class ObdLoggerService : Service() {
     }
 
     private fun currentQuiesceRequest(deviceRoot: File): IngestionRequestRead? =
-        IngestionQuiesceFiles.readRequest(deviceRoot).takeUnless {
+        readIngestionRequest(deviceRoot).takeUnless {
             it is IngestionRequestRead.Absent
+        }
+
+    private fun readIngestionRequest(deviceRoot: File): IngestionRequestRead =
+        IngestionQuiesceFiles.readRequest(deviceRoot).also { request ->
+            sleepWindowController?.setIngestionRequestActive(request is IngestionRequestRead.Valid)
         }
 
     private fun recordParserFailure(error: ElmProtocolException) {
@@ -788,14 +799,14 @@ class ObdLoggerService : Service() {
     private suspend fun waitForNextParkedProbe(deviceRoot: File, durationMillis: Long) {
         val started = SystemClock.elapsedRealtime()
         while (scope.isActive && SystemClock.elapsedRealtime() - started < durationMillis) {
-            if (IngestionQuiesceFiles.readRequest(deviceRoot) !is IngestionRequestRead.Absent) return
+            if (readIngestionRequest(deviceRoot) !is IngestionRequestRead.Absent) return
             val remaining = durationMillis - (SystemClock.elapsedRealtime() - started)
             delay(minOf(250L, remaining.coerceAtLeast(1L)))
         }
     }
 
     private fun requestStillActive(deviceRoot: File, request: IngestionRequest): Boolean =
-        (IngestionQuiesceFiles.readRequest(deviceRoot) as? IngestionRequestRead.Valid)
+        (readIngestionRequest(deviceRoot) as? IngestionRequestRead.Valid)
             ?.request?.requestId == request.requestId
 
     private data class DiagnosticStep(
@@ -1183,6 +1194,7 @@ class ObdLoggerService : Service() {
         )
         val ecuConnected = state == "ecu_online"
         val controlledVoltageOnly = config.voltageOnlyMode || BuildConfig.VOLTAGE_ONLY_AUDIT
+        val sleepWindow = sleepWindowController?.snapshot() ?: SleepWindowEvidence()
         val bleOwner = when {
             !config.ownershipTransferred -> "unowned"
             state == "ingestion_ready" -> "unowned"
@@ -1212,6 +1224,14 @@ class ObdLoggerService : Service() {
             batteryVoltageQuality = voltageState.quality,
             bleOwner = bleOwner,
             voltageOnlyMode = controlledVoltageOnly,
+            wifiConnected = sleepWindow.wifiConnected,
+            ingestionSleepHoldKnown = sleepWindow.ingestionStateKnown,
+            ingestionSleepHold = sleepWindow.ingestionRequestActive,
+            sleepWindowPolicy = sleepWindow.policy,
+            sleepWindowTargetSeconds = sleepWindow.targetSeconds,
+            sleepWindowObservedSeconds = sleepWindow.observedSeconds,
+            sleepWindowVerified = sleepWindow.verified,
+            sleepWindowError = sleepWindow.error,
             lastError = error,
             lastErrorAtUtc = error?.let { Instant.now().toString() },
         )

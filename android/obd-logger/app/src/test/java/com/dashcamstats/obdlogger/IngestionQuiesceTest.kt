@@ -301,12 +301,20 @@ class IngestionQuiesceTest {
                 batteryVoltageQuality = "valid",
                 bleOwner = "dashcam_voltage_only",
                 voltageOnlyMode = true,
+                wifiConnected = true,
+                ingestionSleepHoldKnown = true,
+                ingestionSleepHold = true,
+                sleepWindowPolicy = "managed_active",
+                sleepWindowTargetSeconds = ACTIVE_SLEEP_WINDOW_SECONDS,
+                sleepWindowObservedSeconds = ACTIVE_SLEEP_WINDOW_SECONDS,
+                sleepWindowVerified = true,
             ),
             pendingCount = 3,
         )
         assertLandingIdentity(status)
         assertEquals("ingestion_quiesce_v1", status.getJSONArray("capabilities").getString(0))
         assertEquals("voltage_only_audit_v1", status.getJSONArray("capabilities").getString(1))
+        assertEquals("adaptive_sleep_window_v1", status.getJSONArray("capabilities").getString(3))
         assertEquals("drive-current", status.getString("current_drive_id"))
         assertEquals(3, status.getInt("pending_bundle_count"))
         assertEquals(1L, status.getJSONObject("metrics").getLong("maximum_queue_depth"))
@@ -316,6 +324,14 @@ class IngestionQuiesceTest {
         assertEquals("dashcam_voltage_only", status.getString("ble_owner"))
         assertNotNull(Instant.parse(status.getString("updated_at_utc")))
         assertTrue(status.getBoolean("voltage_only_mode"))
+        assertTrue(status.getBoolean("wifi_connected"))
+        assertTrue(status.getBoolean("ingestion_sleep_hold_known"))
+        assertTrue(status.getBoolean("ingestion_sleep_hold"))
+        assertEquals("managed_active", status.getString("sleep_window_policy"))
+        assertEquals(ACTIVE_SLEEP_WINDOW_SECONDS, status.getInt("sleep_window_target_s"))
+        assertEquals(ACTIVE_SLEEP_WINDOW_SECONDS, status.getInt("sleep_window_observed_s"))
+        assertTrue(status.getBoolean("sleep_window_verified"))
+        assertTrue(status.isNull("sleep_window_error"))
         assertFalse(status.toString().contains("payload"))
         assertFalse(status.toString().contains("ATRV"))
     }
