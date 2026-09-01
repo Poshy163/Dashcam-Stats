@@ -482,7 +482,7 @@ async def _serving_ap(address: str) -> str | None:
     """
     host = address.partition(":")[0].strip()
     try:
-        reply = await adb.shell(address, "ip -o addr show; exit 0", timeout=RADIO_TIMEOUT_S)
+        reply = await adb.shell(address, "ip -o addr show up; exit 0", timeout=RADIO_TIMEOUT_S)
     except adb.AdbError:
         return None
     parsed_inventory = False
@@ -507,7 +507,7 @@ async def _ap_interfaces(address: str) -> tuple[str, str] | None:
     """
     host = address.partition(":")[0].strip()
     try:
-        reply = await adb.shell(address, "ip -o addr show; exit 0", timeout=RADIO_TIMEOUT_S)
+        reply = await adb.shell(address, "ip -o addr show up; exit 0", timeout=RADIO_TIMEOUT_S)
     except adb.AdbError:
         return None
     separate = ""

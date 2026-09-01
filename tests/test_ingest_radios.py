@@ -1118,6 +1118,17 @@ class TestTheHotspot:
 
         assert await radios._serving_ap(UNIT) is None
 
+    async def test_hotspot_inventory_counts_only_interfaces_that_are_up(self, unit_shell):
+        unit_shell.replies["ip -o addr"] = _IP_WITH_AP
+
+        assert await radios._serving_ap(UNIT) == "ap0"
+        assert await radios._ap_interfaces(UNIT) == ("ap0", "wlan0")
+        inventory_commands = _issued(unit_shell.commands, "ip -o addr")
+        assert len(inventory_commands) == 2
+        assert all(
+            "ip -o addr show up" in unit_shell.commands[index] for index in inventory_commands
+        )
+
     async def test_nothing_serving_means_nothing_is_issued(self, unit_shell):
         """A dormant `wlan1` is not a hotspot, and a stop nobody needs is a round trip
         that can only produce a misleading log line."""
