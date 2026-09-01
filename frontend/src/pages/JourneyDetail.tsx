@@ -7,6 +7,7 @@ import JourneyPlayer from '@/components/JourneyPlayer'
 import Spinner from '@/components/Spinner'
 import { DerivedHint, EmptyState, ErrorState, PageHeader, StatTile, StateBadge } from '@/components/ui'
 import { api } from '@/lib/api'
+import { availableFootageDurations } from '@/lib/journeyPlayback'
 import { useMapSettings } from '@/lib/useMapSettings'
 import {
   formatDate,
@@ -24,6 +25,8 @@ const REPROCESS_OPTIONS = [
   ['detection', 'Object detection'],
   ['plates', 'Licence plate detection'],
 ] as const
+
+const CAMERA_ORDER = ['front', 'rear', 'cabin', 'other']
 
 export default function JourneyDetail() {
   const { id } = useParams()
@@ -73,6 +76,11 @@ export default function JourneyDetail() {
   if (!query.data) return null
 
   const journey = query.data
+  const footageDurations = availableFootageDurations(journey.recordings)
+  const footageSummary = Object.entries(footageDurations)
+    .sort(([left], [right]) => CAMERA_ORDER.indexOf(left) - CAMERA_ORDER.indexOf(right))
+    .map(([camera, duration]) => `${camera[0]!.toUpperCase()}${camera.slice(1)} ${formatDuration(duration)}`)
+    .join(' · ')
   const start = journey.startLat != null && journey.startLon != null
     ? ([journey.startLat, journey.startLon] as [number, number])
     : null
@@ -84,7 +92,7 @@ export default function JourneyDetail() {
     <div className="space-y-4">
       <PageHeader
         title={formatDate(journey.startedAt)}
-        subtitle={`${formatTime(journey.startedAt)} → ${formatTime(journey.endedAt)} · ${formatDuration(journey.durationS)}`}
+        subtitle={`${formatTime(journey.startedAt)} → ${formatTime(journey.endedAt)} · Footage available: ${footageSummary || 'none'}`}
         actions={
           <>
             <select className="input w-auto" value={stage} onChange={(e) => setStage(e.target.value)}>

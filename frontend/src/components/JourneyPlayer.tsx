@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
 import { api, type OBDSeriesSample } from '@/lib/api'
-import { formatClock, formatDateTime, formatSpeed } from '@/lib/format'
+import { formatClock, formatDateTime, formatDuration, formatSpeed } from '@/lib/format'
+import { buildPlayableTimeline } from '@/lib/journeyPlayback'
 import type { JourneyDetail, Recording } from '@/lib/types'
 
 function sampleAt(samples: OBDSeriesSample[], timestampMs: number): OBDSeriesSample | null {
@@ -27,28 +28,30 @@ function roleName(recording: Recording): string {
 /** A journey-scale player backed by the original minute clips.
  *
  * Loading one enormous generated file would make first play expensive and duplicate footage
- * on disk. This presents the clips as one wall-clock timeline instead: reaching an edge (or
- * scrubbing anywhere in the journey) selects the right file and offset automatically.
+ * on disk. This presents the surviving clips as one continuous timeline instead: reaching
+ * an edge (or scrubbing anywhere) selects the right file and offset automatically. Original
+ * timestamps are retained separately so the OBD overlay remains synchronized when a deleted
+ * parked interval is skipped.
  */
 export default function JourneyPlayer({ journey, driveId }: { journey: JourneyDetail; driveId?: string }) {
   const video = useRef<HTMLVideoElement>(null)
-  const journeyStart = Date.parse(journey.startedAt)
-  const duration = Math.max(0, (Date.parse(journey.endedAt) - journeyStart) / 1000)
-  const cameras = useMemo(
-    () => Array.from(new Set(journey.recordings.map((r) => r.camera?.role ?? 'other'))),
-    [journey.recordings],
-  )
+  const pendingOffset = useRef(0)
+  const cameras = useMemo(() => {
+    const roles = new Set(journey.recordings.map((recording) => recording.camera?.role ?? 'other'))
+    return Array.from(roles).filter((role) => buildPlayableTimeline(journey.recordings, role).length > 0)
+  }, [journey.recordings])
   const [camera, setCamera] = useState(cameras.includes('front') ? 'front' : cameras[0] ?? 'other')
-  const clips = useMemo(
-    () => journey.recordings
-      .filter((r) => (r.camera?.role ?? 'other') === camera && !r.fileMissing && r.startedAt)
-      .sort((a, b) => Date.parse(a.startedAt!) - Date.parse(b.startedAt!)),
+  const timeline = useMemo(
+    () => buildPlayableTimeline(journey.recordings, camera),
     [camera, journey.recordings],
   )
+  const duration = timeline.at(-1)?.timelineEndS ?? 0
   const [clipIndex, setClipIndex] = useState(0)
   const [elapsed, setElapsed] = useState(0)
+  const [absoluteTimestampMs, setAbsoluteTimestampMs] = useState(timeline[0]?.startedAtMs ?? 0)
   const [continuePlaying, setContinuePlaying] = useState(false)
-  const clip = clips[clipIndex]
+  const segment = timeline[clipIndex]
+  const clip = segment?.recording
 
   const series = useQuery({
     queryKey: ['obd-series', driveId],
@@ -57,48 +60,47 @@ export default function JourneyPlayer({ journey, driveId }: { journey: JourneyDe
     staleTime: 300_000,
   })
   const obd = useMemo(
-    () => sampleAt(series.data?.samples ?? [], journeyStart + elapsed * 1000),
-    [elapsed, journeyStart, series.data?.samples],
+    () => sampleAt(series.data?.samples ?? [], absoluteTimestampMs),
+    [absoluteTimestampMs, series.data?.samples],
   )
 
-  const seekJourney = useCallback((target: number, play = true) => {
-    if (clips.length === 0) return
+  const seekFootage = useCallback((target: number, play = true) => {
+    if (timeline.length === 0) return
     const bounded = Math.max(0, Math.min(duration, target))
-    let next = clips.findIndex((item) => {
-      const start = (Date.parse(item.startedAt!) - journeyStart) / 1000
-      return bounded >= start && bounded < start + (item.durationS ?? 0)
-    })
-    // A camera can miss a segment. Move to the next available clip rather than freezing.
-    if (next < 0) next = clips.findIndex((item) => Date.parse(item.startedAt!) >= journeyStart + bounded * 1000)
-    if (next < 0) next = clips.length - 1
-    const item = clips[next]!
-    const offset = Math.max(0, bounded - (Date.parse(item.startedAt!) - journeyStart) / 1000)
+    let next = timeline.findIndex((item) => bounded >= item.timelineStartS && bounded < item.timelineEndS)
+    if (next < 0) next = timeline.length - 1
+    const item = timeline[next]!
+    const offset = Math.max(0, Math.min(item.durationS, bounded - item.timelineStartS))
+    pendingOffset.current = offset
     setContinuePlaying(play)
     setClipIndex(next)
     setElapsed(bounded)
-    requestAnimationFrame(() => {
-      if (!video.current) return
-      video.current.currentTime = Math.min(offset, item.durationS ?? offset)
+    setAbsoluteTimestampMs(item.startedAtMs + offset * 1000)
+    if (next === clipIndex && video.current) {
+      video.current.currentTime = offset
       if (play) void video.current.play().catch(() => undefined)
-    })
-  }, [clips, duration, journeyStart])
+    }
+  }, [clipIndex, duration, timeline])
 
   useEffect(() => {
     setClipIndex(0)
-    seekJourney(elapsed, false)
-  // The current elapsed time is deliberately retained while switching cameras.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    seekFootage(Math.min(elapsed, duration), false)
+    // Retain the same position in the combined footage while switching camera angles.
+    // Paired front/rear files normally have identical boundaries; clamping handles a
+    // camera that was absent for part of the drive.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [camera])
 
-  if (!clip) return null
-  const clipStart = (Date.parse(clip.startedAt!) - journeyStart) / 1000
+  if (!clip || !segment) return null
 
   return (
     <section className="card overflow-hidden" aria-label="Journey footage">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border p-3">
         <div>
           <h2 className="font-semibold">Journey playback</h2>
-          <p className="text-xs text-content-muted">All clips on one synchronized timeline</p>
+          <p className="text-xs text-content-muted">
+            {formatDuration(duration)} available · deleted gaps skipped · OBD kept in sync
+          </p>
         </div>
         {cameras.length > 1 && (
           <div className="flex rounded-lg bg-surface-sunken p-1" aria-label="Camera angle">
@@ -119,13 +121,26 @@ export default function JourneyPlayer({ journey, driveId }: { journey: JourneyDe
           controls
           preload="metadata"
           playsInline
-          onLoadedMetadata={() => { if (continuePlaying) void video.current?.play().catch(() => undefined) }}
-          onTimeUpdate={(event) => setElapsed(Math.min(duration, clipStart + event.currentTarget.currentTime))}
-          onEnded={() => seekJourney(clipStart + (clip.durationS ?? 0) + 0.05)}
+          onLoadedMetadata={(event) => {
+            event.currentTarget.currentTime = Math.min(pendingOffset.current, event.currentTarget.duration)
+            if (continuePlaying) void event.currentTarget.play().catch(() => undefined)
+          }}
+          onTimeUpdate={(event) => {
+            const offset = Math.min(segment.durationS, event.currentTarget.currentTime)
+            setElapsed(Math.min(duration, segment.timelineStartS + offset))
+            setAbsoluteTimestampMs(segment.startedAtMs + offset * 1000)
+          }}
+          onEnded={() => {
+            if (clipIndex < timeline.length - 1) seekFootage(segment.timelineEndS + 0.001)
+            else {
+              setContinuePlaying(false)
+              setElapsed(duration)
+            }
+          }}
         />
         <div className="pointer-events-none absolute left-3 top-3 flex gap-2">
           <span className="rounded-md bg-black/75 px-2 py-1 text-xs font-semibold text-white">{roleName(clip)}</span>
-          <span className="rounded-md bg-black/75 px-2 py-1 text-xs tabular text-white">clip {clipIndex + 1} / {clips.length}</span>
+          <span className="rounded-md bg-black/75 px-2 py-1 text-xs tabular text-white">clip {clipIndex + 1} / {timeline.length}</span>
         </div>
         {driveId && (
           <div className="absolute bottom-14 right-3 min-w-36 rounded-xl border border-white/20 bg-black/80 p-3 text-white backdrop-blur-sm">
@@ -146,11 +161,11 @@ export default function JourneyPlayer({ journey, driveId }: { journey: JourneyDe
           step={0.1}
           value={elapsed}
           aria-label="Journey timeline"
-          onChange={(event) => seekJourney(Number(event.target.value), false)}
+          onChange={(event) => seekFootage(Number(event.target.value), false)}
         />
         <div className="flex justify-between text-xs text-content-muted">
           <span className="tabular">{formatClock(elapsed)} / {formatClock(duration)}</span>
-          <span>{formatDateTime(new Date(journeyStart + elapsed * 1000).toISOString())}</span>
+          <span>{absoluteTimestampMs ? formatDateTime(new Date(absoluteTimestampMs).toISOString()) : '—'}</span>
         </div>
       </div>
     </section>
