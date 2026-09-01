@@ -73,7 +73,7 @@ class BundleExporterProductionTest {
             }
             assertEquals(1, manifest.getInt("sample_count"))
             assertEquals(1, manifest.getInt("diagnostic_count"))
-            assertEquals(2, manifest.getInt("poll_plan_version"))
+            assertEquals(ObdPollPlan.VERSION, manifest.getInt("poll_plan_version"))
             assertEquals("complete", manifest.getString("completion_status"))
             for (name in listOf("samples.ndjson.gz", "diagnostics.json", "summary.json")) {
                 val entry = zip.getEntry(name)
@@ -140,7 +140,7 @@ class BundleExporterProductionTest {
                 manifest.getString("last_successful_obd_response_at_utc"),
             )
             assertEquals(start.plusSeconds(30).toString(), manifest.getString("termination_noticed_at_utc"))
-            assertEquals(2, manifest.getInt("poll_plan_version"))
+            assertEquals(ObdPollPlan.VERSION, manifest.getInt("poll_plan_version"))
         }
     }
 

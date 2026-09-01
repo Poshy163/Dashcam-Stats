@@ -774,7 +774,10 @@ def _validate_manifest(
     if finished < started or finished - started > MAX_DRIVE_SPAN:
         raise BundleError("manifest drive time range is reversed or exceeds 31 days")
     if hardened:
-        if _integer(manifest["poll_plan_version"], field_name="manifest.poll_plan_version") != 2:
+        if _integer(manifest["poll_plan_version"], field_name="manifest.poll_plan_version") not in {
+            2,
+            3,
+        }:
             raise BundleError("manifest.poll_plan_version is not supported")
 
         def lifecycle_time(name: str) -> datetime | None:
