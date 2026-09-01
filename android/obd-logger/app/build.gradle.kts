@@ -81,8 +81,8 @@ android {
         applicationId = "com.dashcamstats.obdlogger"
         minSdk = 26
         targetSdk = 34
-        versionCode = 8
-        versionName = "0.2.5"
+        versionCode = 9
+        versionName = "0.2.6"
         buildConfigField("String", "BUILD_GIT_SHA", "\"$buildGitSha\"")
         buildConfigField("boolean", "VOLTAGE_ONLY_AUDIT", voltageOnlyAudit.toString())
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

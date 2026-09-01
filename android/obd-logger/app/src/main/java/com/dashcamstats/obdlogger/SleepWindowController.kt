@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.provider.Settings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -17,6 +18,7 @@ import java.util.concurrent.TimeUnit
 internal const val ACTIVE_SLEEP_WINDOW_SECONDS = 900
 internal const val IDLE_SLEEP_WINDOW_SECONDS = 300
 private const val SLEEP_COUNTDOWN_PROPERTY = "persist.sys.sleep.countdown.time"
+private const val ACC_STATUS_SETTING = "acc_status"
 private const val PROPERTY_PROCESS_TIMEOUT_SECONDS = 3L
 private const val ACC_POLL_INTERVAL_MILLIS = 5_000L
 private val SLEEP_WINDOW_RETRY_DELAYS_MILLIS = listOf(1_000L, 5_000L, 15_000L)
@@ -175,31 +177,11 @@ internal class AndroidSleepWindowPropertyAccessor : SleepWindowPropertyAccessor 
 }
 
 /** Read-only vendor ACC evidence. Unknown output never becomes an off decision. */
-internal class AndroidAccStateAccessor : AccStateAccessor {
-    override fun readAccOn(): Boolean? {
-        val result = runProcess(
-            listOf("/system/bin/settings", "get", "global", "acc_status"),
-        )
-        if (result.exitCode != 0) return null
-        return parseAccState(result.output)
-    }
-
-    private fun runProcess(arguments: List<String>): ProcessResult = try {
-        val process = ProcessBuilder(arguments)
-            .redirectErrorStream(true)
-            .start()
-        if (!process.waitFor(PROPERTY_PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-            process.destroyForcibly()
-            process.waitFor(PROPERTY_PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            ProcessResult(null, "")
-        } else {
-            ProcessResult(process.exitValue(), process.inputStream.bufferedReader().readText().take(64))
-        }
-    } catch (_: Exception) {
-        ProcessResult(null, "")
-    }
-
-    private data class ProcessResult(val exitCode: Int?, val output: String)
+internal class AndroidAccStateAccessor(private val context: Context) : AccStateAccessor {
+    override fun readAccOn(): Boolean? = runCatching {
+        Settings.Global.getString(context.contentResolver, ACC_STATUS_SETTING)
+            ?.let(::parseAccState)
+    }.getOrNull()
 }
 
 internal fun parseAccState(value: String): Boolean? = when (value.trim().lowercase()) {
@@ -328,7 +310,7 @@ internal class AdaptiveSleepWindowController(
     context: Context,
     private val scope: CoroutineScope,
     property: SleepWindowPropertyAccessor = AndroidSleepWindowPropertyAccessor(),
-    private val accState: AccStateAccessor = AndroidAccStateAccessor(),
+    private val accState: AccStateAccessor = AndroidAccStateAccessor(context),
     private val observation: (SleepWindowControllerObservation) -> Unit = {},
 ) {
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
