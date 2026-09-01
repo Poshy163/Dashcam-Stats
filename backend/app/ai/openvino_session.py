@@ -217,6 +217,33 @@ def restore_gpu_failure_state() -> str | None:
     return reason
 
 
+def read_gpu_failure_marker() -> dict[str, object] | None:
+    """The durable verdict as recorded on disk, or None when the chip is not condemned.
+
+    Exposed because the marker is the only place that says *how often* the iGPU has
+    aborted, and that is the difference between a one-off worth retrying and a chip that
+    should stay off. Until this existed the answer lived in a file inside the container
+    with no shell, so the honest operator action -- "has this happened once or thirty
+    times?" -- could not be taken at all.
+    """
+    import json as _json
+
+    try:
+        path = _gpu_failure_marker_path()
+        if not path.is_file():
+            return None
+        data = _json.loads(path.read_text("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {
+        "reason": str(data.get("reason") or "")[:500],
+        "failures": int(data.get("failures") or 0),
+        "last_failed_at": data.get("last_failed_at"),
+    }
+
+
 def clear_gpu_failure_state() -> bool:
     """Forget the durable verdict, so the iGPU is tried again after a driver change."""
     global _gpu_disabled_reason, _gpu_failure_persisted

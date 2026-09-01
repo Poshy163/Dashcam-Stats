@@ -10,6 +10,10 @@ from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 
 from app.ai.models import describe_models, is_present
+from app.ai.openvino_session import (
+    clear_gpu_failure_state,
+    read_gpu_failure_marker,
+)
 from app.ai.runtime import describe_media_policy, describe_runtime
 from app.api.deps import PaginationDep, RowIdFilter, SessionDep
 from app.api.schemas import (
@@ -694,6 +698,50 @@ async def system_hardware():
     data["policy"] = describe_media_policy()
     data["models"] = describe_models()
     return data
+
+
+@router.get("/system/gpu")
+async def system_gpu() -> dict[str, object]:
+    """Why the iGPU is or is not being used for inference, including the durable verdict.
+
+    ``/system/hardware`` already reports *that* the GPU is disabled in this process. This
+    reports the part that decides what to do about it: whether the verdict was inherited
+    from a previous run, and how many times the chip has actually aborted. One failure
+    weeks ago and thirty failures today want opposite responses.
+    """
+    marker = read_gpu_failure_marker()
+    return {
+        "disabled_reason": describe_media_policy().get("gpu_inference_disabled"),
+        "durable_failure": marker,
+        "retryable": marker is not None,
+    }
+
+
+@router.post("/system/gpu/retry")
+async def system_gpu_retry() -> dict[str, object]:
+    """Forget the durable verdict so the iGPU is tried again on the next restart.
+
+    Deliberately does not re-arm the chip inside this process. The disable is one-way on
+    purpose: the failure it exists for poisons the OpenCL context, so every later request
+    on the same compiled model fails identically until the process is replaced. Clearing
+    the marker and letting the next start decide is the only honest recovery, and saying
+    so here keeps the button from implying more than it does.
+    """
+    cleared = clear_gpu_failure_state()
+    if not cleared:
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "The durable GPU marker could not be removed.",
+        )
+    log.info("cleared the durable iGPU failure marker on request")
+    return {
+        "cleared": True,
+        "restart_required": True,
+        "detail": (
+            "The iGPU will be tried again after the container restarts. Consider setting "
+            "the decoder to CPU first, so decode and inference are not competing for it."
+        ),
+    }
 
 
 @router.get("/system/info")
