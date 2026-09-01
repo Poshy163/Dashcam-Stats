@@ -256,7 +256,8 @@ analysed like anything else with no further configuration.
 ### OBD-II drive bundles
 
 The optional Android companion can publish an atomic OBD bundle beside its redacted
-`status.json`. The arrival backup validates and stores every five-second sample in the
+`status.json`. The arrival backup validates and stores five-second driving-critical samples
+(RPM, speed and load), with the remaining engine values rotated at a lower cadence, in the
 analytics database before deleting the dashcam copy. Home Assistant delivery uses a
 separate persistent queue, so an unavailable or misconfigured HA instance cannot fail or
 delay footage backup. The Backup page shows logger ownership/state, pending copies,

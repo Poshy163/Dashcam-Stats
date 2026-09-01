@@ -36,7 +36,11 @@ from app.ingest.obd_bundle import (
     store_validated_bundle,
     validate_bundle,
 )
-from app.ingest.obd_reconciliation import SIGNALS, reconcile_drive_projection
+from app.ingest.obd_reconciliation import (
+    SIGNALS,
+    reconcile_drive_projection,
+    specs_for_poll_plan,
+)
 from app.ingest.obd_transfer import get_obd_transfer_status
 
 router = APIRouter(prefix="/api/obd", tags=["obd-import"])
@@ -171,7 +175,7 @@ def _drive(row: OBDDrive, *, include_quality: bool = False) -> dict[str, object]
     return result
 
 
-def _series_sample(row: OBDSample) -> dict[str, object]:
+def _series_sample(row: OBDSample, specs=SIGNALS) -> dict[str, object]:
     result: dict[str, object] = {
         "sample_id": row.sample_id,
         "t": row.captured_at.isoformat(),
@@ -195,7 +199,7 @@ def _series_sample(row: OBDSample) -> dict[str, object]:
         "estimated_fuel_consumption_l_100km": row.estimated_fuel_consumption_l_100km,
     }
     result["provenance"] = {
-        spec.name: spec.provenance for spec in SIGNALS if getattr(row, spec.attribute) is not None
+        spec.name: spec.provenance for spec in specs if getattr(row, spec.attribute) is not None
     }
     return result
 
@@ -365,6 +369,12 @@ async def drive_series(drive_id: str, session: SessionDep) -> dict[str, object]:
     )
     if drive is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "OBD drive was not found")
+    raw_poll_plan = (
+        drive.manifest_json.get("poll_plan_version")
+        if isinstance(drive.manifest_json, dict)
+        else None
+    )
+    _poll_plan_version, specs = specs_for_poll_plan(raw_poll_plan)
     samples = (
         (
             await session.execute(
@@ -401,9 +411,9 @@ async def drive_series(drive_id: str, session: SessionDep) -> dict[str, object]:
                 "provenance": spec.provenance,
                 "discrete": spec.discrete,
             }
-            for spec in SIGNALS
+            for spec in specs
         ],
-        "samples": [_series_sample(row) for row in samples],
+        "samples": [_series_sample(row, specs) for row in samples],
         "diagnostics": [
             {
                 "observed_at": row.observed_at.isoformat() if row.observed_at else None,

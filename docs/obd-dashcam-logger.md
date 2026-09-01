@@ -173,10 +173,13 @@ Because `command()` only returns once the next ELM prompt arrives, a malformed b
 reply to an optional live PID leaves the command stream synchronized. That PID enters a bounded
 per-PID cooldown and is retried; a transient MAF failure can recover, while a repeatedly malformed
 advertised PID backs off to at most one retry per 12 sample cycles. Strict source, length and
-checksum validation is unchanged. Medium PIDs are phase-distributed across three cycles and slow
-PIDs across phases 0/4/8 of each 12-cycle window, preserving each PID's cadence without putting
-every optional command in the same cycle. App `0.2.2` identifies this plan and hardened bundles
-declare `poll_plan_version=2`.
+checksum validation is unchanged. The v3 plan polls engine load, RPM and vehicle speed in every
+five-second cycle. Timing, MAF, throttle and the remaining medium PIDs are phase-distributed
+across three cycles; slow PIDs use phases 0/4/8 of each 12-cycle window. This keeps the
+driving-critical stream inside the target cadence on the serial ISO 9141 adapter instead of
+regularly overrunning it while attempting every optional command. App `0.2.3` identifies this
+plan and hardened bundles declare `poll_plan_version=3`; the server retains the v2 cadence contract
+for historical drives.
 Only transport-level faults (missing prompt, overflow, failed write, disconnect) still taint and
 reconnect, and a fatal fault mid-cycle first persists the partial sample already gathered, marked
 `failed_after_partial`/`partial`, so observed values survive the reconnect.

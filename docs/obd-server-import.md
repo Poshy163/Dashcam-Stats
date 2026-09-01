@@ -3,7 +3,7 @@
 The server treats OBD backup and Home Assistant delivery as two independent durable
 operations. A failed, offline or unauthorised Home Assistant instance never changes the
 result of a footage backup. The server retains the original verified archive plus the full
-five-second sample history; Home Assistant receives a bounded final-sample identity,
+full-resolution sample history (with five-second driving-critical values); Home Assistant receives a bounded final-sample identity,
 the newest non-null value and original UTC timestamp for each telemetry field, and at most
 744 UTC-hour statistics rows.
 

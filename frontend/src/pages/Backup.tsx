@@ -44,7 +44,7 @@ const PHASES: Record<IngestStatus['phase'], string> = {
 
 type RadioTone = 'default' | 'ok' | 'warn' | 'error' | 'busy'
 
-function radioSummary(status: IngestRadioStatus): {
+function radioSummary(status: IngestRadioStatus, backupRunning: boolean): {
   title: string
   detail: string
   tone: RadioTone
@@ -70,6 +70,14 @@ function radioSummary(status: IngestRadioStatus): {
     !!transition && transition.bluetooth.disableVerified && transition.hotspot.disableVerified
   if (transition?.active) {
     if (['restoring_radios', 'resuming_obd'].includes(transition.phase)) {
+      if (backupRunning) {
+        return {
+          title: 'Backup continuing while radios recover',
+          detail:
+            'The quiet-radio safety window ended before the copy did. The remaining files are still transferring while the original radio state is restored and verified.',
+          tone: 'warn',
+        }
+      }
       return {
         title: 'Restoring the original radio state',
         detail: 'The backup has finished using the quiet-radio window and is verifying recovery.',
@@ -258,7 +266,7 @@ export default function Backup() {
   // a full card — invisible, until it renders as 100.01% and a bar overshooting its track.
   const fraction =
     data && data.bytesTotal > 0 ? Math.min(1, data.bytesDone / data.bytesTotal) : 0
-  const radio = radioStatus.data ? radioSummary(radioStatus.data) : null
+  const radio = radioStatus.data ? radioSummary(radioStatus.data, running) : null
   const radioToneClass =
     radio?.tone === 'error'
       ? 'border-state-error/50'

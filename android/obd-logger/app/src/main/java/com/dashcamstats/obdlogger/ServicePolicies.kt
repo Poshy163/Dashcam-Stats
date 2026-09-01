@@ -368,16 +368,21 @@ object RemovableStoragePolicy {
 }
 
 object ObdPollPlan {
-    const val VERSION = 2
+    const val VERSION = 3
 
-    private val fast = listOf(0x04, 0x0C, 0x0D, 0x0E, 0x10, 0x11)
-    private val medium = listOf(0x03, 0x05, 0x06, 0x07, 0x0F, 0x14, 0x15)
+    // ISO 9141 has to serialize every request.  Six fast PIDs plus the rotating work
+    // consistently overran the five-second target on the real adapter, producing
+    // artificial 8-second gaps in speed and RPM.  Keep the driving-critical values in
+    // every cycle and distribute all other live values across the same three-cycle tier.
+    private val fast = listOf(0x04, 0x0C, 0x0D)
+    private val medium = listOf(0x0E, 0x10, 0x11, 0x03, 0x05, 0x06, 0x07, 0x0F, 0x14, 0x15)
     private val slow = listOf(0x13, 0x1C, 0x21)
 
     fun requestedPids(sequence: Long, supported: Set<Int>): List<Int> = buildList {
         addAll(fast)
-        // Preserve the 3-cycle cadence for every medium PID without making one cycle issue all
-        // seven commands. The slow PIDs retain their 12-cycle cadence and use separated phases.
+        // Preserve the 3-cycle cadence for every non-critical live PID without letting one
+        // cycle issue the whole schedule. The slow PIDs retain their 12-cycle cadence and use
+        // separated phases.
         addAll(medium.filterIndexed { index, _ -> index % 3 == (sequence % 3).toInt() })
         addAll(slow.filterIndexed { index, _ -> index * 4 == (sequence % 12).toInt() })
     }.filter(supported::contains)

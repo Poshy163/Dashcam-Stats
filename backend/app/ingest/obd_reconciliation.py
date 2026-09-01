@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -22,7 +22,7 @@ from app.db.session import get_session_factory
 
 log = structlog.get_logger(__name__)
 
-POLL_PLAN_VERSION = 2
+POLL_PLAN_VERSION = 3
 PROJECTION_VERSION = 2
 NOMINAL_CYCLE_S = 5.0
 GAP_TOLERANCE = 1.5
@@ -54,9 +54,9 @@ SIGNALS: tuple[SignalSpec, ...] = (
     SignalSpec("engine_load", "engine_load_pct", "Engine load", 0x04, "fast", 1),
     SignalSpec("engine_rpm", "engine_rpm", "Engine RPM", 0x0C, "fast", 1),
     SignalSpec("vehicle_speed", "vehicle_speed_kmh", "Vehicle speed", 0x0D, "fast", 1),
-    SignalSpec("timing_advance", "timing_advance_deg", "Timing advance", 0x0E, "fast", 1),
-    SignalSpec("mass_air_flow", "mass_air_flow_g_s", "Mass air flow", 0x10, "fast", 1),
-    SignalSpec("throttle_position", "throttle_position_pct", "Throttle", 0x11, "fast", 1),
+    SignalSpec("timing_advance", "timing_advance_deg", "Timing advance", 0x0E, "medium", 3),
+    SignalSpec("mass_air_flow", "mass_air_flow_g_s", "Mass air flow", 0x10, "medium", 3),
+    SignalSpec("throttle_position", "throttle_position_pct", "Throttle", 0x11, "medium", 3),
     SignalSpec(
         "fuel_system_1", "fuel_system_status", "Fuel system", 0x03, "medium", 3, discrete=True
     ),
@@ -129,8 +129,8 @@ SIGNALS: tuple[SignalSpec, ...] = (
         "estimated_fuel_rate_l_h",
         "Estimated fuel rate",
         None,
-        "fast",
-        1,
+        "medium",
+        3,
         provenance="derived",
     ),
     SignalSpec(
@@ -138,8 +138,8 @@ SIGNALS: tuple[SignalSpec, ...] = (
         "estimated_fuel_consumption_l_100km",
         "Estimated fuel consumption",
         None,
-        "fast",
-        1,
+        "medium",
+        3,
         provenance="derived",
     ),
 )
@@ -158,6 +158,53 @@ POLL_PHASES_V2: dict[int, int] = {
     0x1C: 4,
     0x21: 8,
 }
+
+# Poll-plan v3 keeps the three driving-critical PIDs in every cycle.  The remaining
+# live PIDs rotate across three cycles, which lets this ISO 9141 adapter actually finish
+# a cycle inside the five-second target rather than manufacturing regular 8-second gaps.
+POLL_PHASES_V3: dict[int, int] = {
+    # medium.filterIndexed { index % 3 == sequence % 3 }
+    0x0E: 0,
+    0x10: 1,
+    0x11: 2,
+    0x03: 0,
+    0x05: 1,
+    0x06: 2,
+    0x07: 0,
+    0x0F: 1,
+    0x14: 2,
+    0x15: 0,
+    # slow.filterIndexed { index * 4 == sequence % 12 }
+    0x13: 0,
+    0x1C: 4,
+    0x21: 8,
+}
+
+_V2_FAST_NAMES = {
+    "timing_advance",
+    "mass_air_flow",
+    "throttle_position",
+    "estimated_fuel_rate",
+    "estimated_fuel_consumption",
+}
+SIGNALS_V2: tuple[SignalSpec, ...] = tuple(
+    replace(spec, tier="fast", every=1) if spec.name in _V2_FAST_NAMES else spec for spec in SIGNALS
+)
+_POLL_PLAN_SPECS: dict[int, tuple[tuple[SignalSpec, ...], dict[int, int]]] = {
+    2: (SIGNALS_V2, POLL_PHASES_V2),
+    3: (SIGNALS, POLL_PHASES_V3),
+}
+
+
+def specs_for_poll_plan(value: object) -> tuple[int, tuple[SignalSpec, ...]]:
+    """Return the immutable cadence contract for a known logger plan.
+
+    Old, pre-versioned exports retain their conservative legacy interpretation.  This
+    prevents a newer logger from rewriting the expected cadence of existing drives.
+    """
+    if isinstance(value, int) and not isinstance(value, bool) and value in _POLL_PLAN_SPECS:
+        return value, _POLL_PLAN_SPECS[value][0]
+    return 1, SIGNALS_V2
 
 
 def lifecycle_status(*, clean_end: bool, stop_reason: str | None, producer: str | None) -> str:
@@ -450,11 +497,9 @@ def _supported_pids(diagnostics: list[OBDDiagnostic]) -> tuple[bool, set[int]]:
     return bool(scans), supported
 
 
-def _has_successful_measurement(row: OBDSample) -> bool:
+def _has_successful_measurement(row: OBDSample, specs: tuple[SignalSpec, ...]) -> bool:
     return any(
-        getattr(row, spec.attribute) is not None
-        for spec in SIGNALS
-        if spec.provenance == "measured"
+        getattr(row, spec.attribute) is not None for spec in specs if spec.provenance == "measured"
     )
 
 
@@ -521,9 +566,10 @@ async def reconcile_drive_projection(
             if isinstance(drive.manifest_json, dict)
             else None
         )
-        poll_plan_version = raw_poll_plan if raw_poll_plan == POLL_PLAN_VERSION else 1
+        poll_plan_version, specs = specs_for_poll_plan(raw_poll_plan)
+        phases = _POLL_PLAN_SPECS.get(poll_plan_version, ((), {}))[1]
         missing_pids: set[int] = set()
-        signal_states = {spec.name: _SignalState(spec) for spec in SIGNALS}
+        signal_states = {spec.name: _SignalState(spec) for spec in specs}
         transport = _Cadence()
         rollup = _Rollup()
         first_sample: datetime | None = None
@@ -563,7 +609,7 @@ async def reconcile_drive_projection(
                 if maximum_sequence is None
                 else max(maximum_sequence, sample.sequence)
             )
-            if _has_successful_measurement(sample):
+            if _has_successful_measurement(sample, specs):
                 last_success = _latest_time(last_success, sample.captured_at)
             quality = sample.quality_json if isinstance(sample.quality_json, dict) else {}
             raw_missing = quality.get("missing_pids")
@@ -574,11 +620,7 @@ async def reconcile_drive_projection(
                     if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 255
                 )
             for state in signal_states.values():
-                phase = (
-                    POLL_PHASES_V2.get(state.spec.pid, 0)
-                    if poll_plan_version == POLL_PLAN_VERSION
-                    else 0
-                )
+                phase = phases.get(state.spec.pid, 0)
                 state.add(sample, phase=phase)
 
         lifecycle = lifecycle_status(
@@ -629,7 +671,7 @@ async def reconcile_drive_projection(
                 supported = spec.pid in advertised_pids
             else:
                 supported = state.cadence.count > 0 or spec.pid in missing_pids
-            phase = POLL_PHASES_V2.get(spec.pid, 0) if poll_plan_version == POLL_PLAN_VERSION else 0
+            phase = phases.get(spec.pid, 0)
             result = state.finish(
                 supported=supported,
                 expected_cycles=expected_cycles,
@@ -704,7 +746,7 @@ async def reconcile_drive_projection(
             "received_sample_percentage": received_percentage,
             "clean_end": bool(drive.clean_end),
         }
-        if raw_poll_plan == POLL_PLAN_VERSION:
+        if poll_plan_version in _POLL_PLAN_SPECS:
             summary.update(
                 {
                     "last_sample_at_utc": _summary_time(last_sample) if last_sample else None,
