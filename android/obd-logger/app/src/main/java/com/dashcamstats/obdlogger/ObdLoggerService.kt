@@ -821,6 +821,61 @@ class ObdLoggerService : Service() {
         }
     }
 
+    /**
+     * Re-establish the ECU session after the bus has gone silent under a healthy adapter.
+     *
+     * Returns the supported-PID set to poll from here on: the freshly proved one when the
+     * ECU answers again, or the previous one when it does not, so a failed recovery never
+     * narrows the plan and silently drops signals that were working before.
+     *
+     * Deliberately best effort. Every failure mode here -- the ECU still absent, the
+     * adapter dropping mid-probe, a quiesce arriving -- is one where continuing to poll is
+     * strictly better than ending the drive, because the adapter is still answering and
+     * voltage alone still proves the engine is running. The value is that the attempt and
+     * its outcome are now *recorded*, which is exactly what drive 01a05d40 lacked.
+     */
+    private suspend fun recoverSilentBus(
+        elm: ElmBleClient,
+        driveId: String,
+        deviceRoot: File,
+        current: Set<Int>,
+    ): Set<Int> {
+        val startedAt = SystemClock.elapsedRealtime()
+        emitEvent(
+            "obd.ecu_session",
+            "warning",
+            "observed",
+            "bus_silent",
+            driveId = driveId,
+            metrics = mapOf("silent_cycles" to ECU_SILENCE_RECOVERY_CYCLES.toLong()),
+        )
+        return try {
+            val reproved = elm.proveEcu { currentQuiesceRequest(deviceRoot) != null }
+            emitEvent(
+                "obd.ecu_session",
+                "info",
+                "recovered",
+                "ecu_proof_valid",
+                driveId = driveId,
+                metrics = mapOf("ecu_probe_ms" to boundedElapsedMillis(startedAt)),
+            )
+            reproved.ifEmpty { current }
+        } catch (_: ElmQuiesceRequestedException) {
+            // The transfer wants the adapter. The loop's own quiesce check owns that exit.
+            current
+        } catch (error: Exception) {
+            emitEvent(
+                "obd.ecu_session",
+                "error",
+                "failed",
+                if (error is ElmCommandTimeoutException) "poll_timeout" else "ecu_offline",
+                driveId = driveId,
+                metrics = mapOf("ecu_probe_ms" to boundedElapsedMillis(startedAt)),
+            )
+            current
+        }
+    }
+
     private suspend fun recordDrive(
         config: LoggerConfig,
         elm: ElmBleClient,
@@ -835,10 +890,18 @@ class ObdLoggerService : Service() {
         val sparseDiagnosticBudget = SparseDiagnosticBudgetTracker()
         var sequence = 0L
         var cadenceOverrun = false
+        // The vehicle bus can go silent while the adapter stays perfectly healthy: ATRV is
+        // answered by the ELM itself and needs no ECU, so every cycle still "succeeds" and
+        // persists a sample carrying nothing but adapter voltage. Observed on drive
+        // 01a05d40: the ECU proof passed, then 79 consecutive samples arrived with every
+        // bus PID missing and the drive was filed as complete with zero errors. Counting
+        // consecutive fully-missing cycles is what turns that from silence into evidence.
+        var busSilentCycles = 0
+        var activeSupported = supported
         while (scope.isActive) {
             currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
             val cycleStarted = SystemClock.elapsedRealtime()
-            val requested = ObdPollPlan.requestedPids(sequence, supported)
+            val requested = ObdPollPlan.requestedPids(sequence, activeSupported)
             val values = linkedMapOf<String, Any>()
             val missing = mutableListOf<Int>()
             for ((requestedIndex, pid) in requested.withIndex()) {
@@ -936,6 +999,18 @@ class ObdLoggerService : Service() {
                     missingPids = missing,
                 ),
             )
+            // A cycle where every requested PID went unanswered is the bus being silent,
+            // not a slow sample. One such cycle is ordinary -- a single dropped frame, a
+            // reconnect -- so recovery waits for a run of them.
+            busSilentCycles = if (requested.isNotEmpty() && missing.size == requested.size) {
+                busSilentCycles + 1
+            } else {
+                0
+            }
+            if (busSilentCycles == ECU_SILENCE_RECOVERY_CYCLES) {
+                activeSupported = recoverSilentBus(elm, driveId, deviceRoot, activeSupported)
+                busSilentCycles = 0
+            }
             currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
             val liveCycleElapsed = SystemClock.elapsedRealtime() - cycleStarted
             // At most one sparse diagnostic command is allowed after a committed sample. Its

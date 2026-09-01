@@ -32,6 +32,10 @@ const LIFECYCLE_STYLE: Record<string, { label: string; className: string }> = {
   complete: { label: 'Complete', className: 'bg-state-ok/15 text-state-ok' },
   interrupted: { label: 'Interrupted', className: 'bg-state-warn/15 text-state-warn' },
   recovered: { label: 'Recovered', className: 'bg-accent-muted text-accent' },
+  // The bus went silent while the adapter kept answering, so the drive recorded samples
+  // but no vehicle data. Styled as an error rather than a warning: a drive with no
+  // statistics is a drive that was not captured, however cleanly it ended.
+  no_vehicle_data: { label: 'No vehicle data', className: 'bg-state-error/15 text-state-error' },
 }
 
 function LifecycleBadge({ status }: { status: string }) {

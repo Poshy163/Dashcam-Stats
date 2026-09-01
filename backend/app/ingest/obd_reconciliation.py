@@ -207,6 +207,24 @@ def specs_for_poll_plan(value: object) -> tuple[int, tuple[SignalSpec, ...]]:
     return 1, SIGNALS_V2
 
 
+def vehicle_data_present(summary: dict[str, Any]) -> bool:
+    """True when the drive actually captured motion evidence from the vehicle bus.
+
+    The failure this exists for is quiet: ``ATRV`` is answered by the ELM adapter itself
+    and needs no ECU, so a drive whose bus went silent still persists a full-rate stream of
+    samples, still reports ``transport: ok`` on every one, and still ends on a clean
+    ``engine_stopped``. Drive 01a05d40 did exactly that -- 80 samples, zero errors, filed as
+    complete -- and rendered as a page with no statistics on it, because there was nothing
+    to render. Distance, speed and RPM all come off the bus, so their joint absence is the
+    signal; a stationary drive still reports zero speed rather than nothing at all.
+    """
+    for key in ("distance_km", "average_speed_kmh", "maximum_speed_kmh"):
+        if summary.get(key) is not None:
+            return True
+    maximum_rpm = summary.get("maximum_rpm")
+    return isinstance(maximum_rpm, (int, float)) and maximum_rpm > 0
+
+
 def lifecycle_status(*, clean_end: bool, stop_reason: str | None, producer: str | None) -> str:
     """Return the truthful server lifecycle while accepting legacy v1 manifests."""
     if clean_end:
@@ -795,6 +813,18 @@ async def reconcile_drive_projection(
             "summary": summary,
             "gap_analysis": gap_analysis,
         }
+        # A drive that captured no bus data is reported as such whatever its ending was.
+        # It is the fact the operator needs -- "this drive has no statistics" -- and the
+        # ending is not lost, because interruption_reason still carries it.
+        if not vehicle_data_present(summary):
+            lifecycle = "no_vehicle_data"
+            interruption_reason = interruption_reason or "bus_silent"
+            # Both, and before the fingerprint: the projection is hashed to decide whether
+            # a re-import changed anything, so a corrected field left out of the document
+            # would make an empty drive and a healthy one hash alike.
+            projection_document["lifecycle_status"] = lifecycle
+            projection_document["interruption_reason"] = interruption_reason
+
         fingerprint = _projection_fingerprint(projection_document)
         gap_analysis["projection_fingerprint"] = fingerprint
         canonical_values: dict[str, Any] = {

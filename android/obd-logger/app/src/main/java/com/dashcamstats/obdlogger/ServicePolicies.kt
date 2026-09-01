@@ -17,6 +17,16 @@ internal fun serviceWorkerDecision(
     else -> ServiceWorkerDecision.START
 }
 
+/**
+ * Consecutive fully-unanswered poll cycles that mean the vehicle bus has gone silent.
+ *
+ * Not a guess: at [ObdPollPlan.TARGET_CYCLE_MILLIS] this is ~15 seconds of a completely
+ * mute ECU, long enough that a dropped frame, a reconnect or one slow response cannot
+ * reach it, and short enough that a drive loses seconds rather than the six and a half
+ * minutes drive 01a05d40 lost before anyone knew the bus was dead.
+ */
+internal const val ECU_SILENCE_RECOVERY_CYCLES = 3
+
 internal const val EXTRA_STARTUP_RECOVERY_REASON =
     "com.dashcamstats.obdlogger.extra.STARTUP_RECOVERY_REASON"
 
