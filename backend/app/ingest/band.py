@@ -105,12 +105,61 @@ _INFO_SSID = re.compile(r'SSID:\s*"?([^",\r\n]+)"?\s*,')
 #: One scan row: BSSID, frequency, RSSI lead the line in every release's formatting.
 _SCAN_ROW = re.compile(r"^\s*([0-9a-fA-F:]{17})\s+(\d{4,5})\s+(-?\d+)")
 
+#: The one non-privileged lever that actually moves an associated unit toward 5 GHz, short
+#: of storing the network passphrase.
+#:
+#: ``set-network-selection-config <screen-off> <screen-on> -a <override>`` is on AOSP's
+#: ``NON_PRIVILEGED_COMMANDS`` allowlist (probed live on the unit, Android 15, uid 2000,
+#: rc=0). The two flags turn OFF the "sufficiency check" -- the "the network I'm on is good
+#: enough, stop looking for a better one" test that is *exactly* why the unit locks to
+#: 2.4 GHz and never re-evaluates -- for both the screen-off and screen-on cases; ``-a 1``
+#: (``WifiNetworkSelectionConfig.ASSOCIATED_NETWORK_SELECTION_OVERRIDE_ENABLED``) forces
+#: network selection to keep running while associated. Together they let the
+#: ThroughputScorer, which favours 5 GHz through its throughput term, move the link -- and
+#: keep it there -- without ever touching ``WIFI_ON`` (see the long note above on why the
+#: STA-bounce is forbidden on a battery-less unit).
+#:
+#: It is runtime state, not persisted: the unit reboots on every ignition and comes back
+#: with the default sufficiency check on, so this is re-applied every visit rather than set
+#: once. Applying it is idempotent and, verified live, does not disturb an already-good
+#: link.
+_SELECTION_NUDGE = "cmd wifi set-network-selection-config disabled disabled -a 1"
+
 
 def _policy() -> str:
     try:
         return str(get_settings_service().get_nowait("ingest.wifi_band") or "any")
     except Exception:
         return "any"
+
+
+def _nudge_enabled() -> bool:
+    try:
+        return bool(get_settings_service().get_nowait("ingest.wifi_selection_nudge"))
+    except Exception:
+        return False
+
+
+async def apply_selection_nudge(address: str) -> bool:
+    """Ask the unit to stop treating a working 2.4 GHz link as reason not to look for 5 GHz.
+
+    Returns whether the command was issued cleanly. Never raises: this is a best-effort
+    nudge alongside the transfer, and an unreachable unit or a build that words the verb
+    differently must not take a backup down with it -- the band gate still does its own job
+    either way.
+    """
+    try:
+        await adb.shell(address, _SELECTION_NUDGE, timeout=BAND_TIMEOUT_S)
+        return True
+    except adb.AdbError as exc:
+        log.debug("could not apply the 5GHz network-selection nudge", error=str(exc))
+        return False
+
+
+async def _maybe_nudge_selection(address: str) -> None:
+    """Apply the selection nudge if it is switched on. Called only when policy wants 5 GHz."""
+    if _nudge_enabled():
+        await apply_selection_nudge(address)
 
 
 def parse_link(status_reply: str) -> tuple[int | None, str]:
@@ -191,6 +240,13 @@ async def gate(address: str) -> bool:
         # hides genuine failures behind a reassuring explanation.
         _publish(None, held=False, reason=None)
         return True
+
+    # Nudge before reading the band, and on every run, not only when the unit is on 2.4.
+    # Applied on 2.4 it starts a move to 5 GHz; applied on 5 GHz it keeps the unit
+    # re-evaluating so it does not slide back. The move itself takes a scan cycle or two,
+    # so this run may still read 2.4 -- under `require` the thirty-second re-check catches
+    # the result, and under `prefer` the following window does.
+    await _maybe_nudge_selection(address)
 
     frequency, ssid = await read_link(address)
     if frequency is None:

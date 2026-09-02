@@ -1382,16 +1382,32 @@ SETTINGS: tuple[SettingDef, ...] = (
         "off a link that still works. 'Prefer' notes the slow band in the log and copies "
         "anyway; 'Require' holds the transfer while the unit is on 2.4 GHz and re-checks "
         "every half minute for as long as the car is here, telling you on the Backup page "
-        "whether 5 GHz is even in range from where you park. Nothing here can move the "
-        "unit between bands: the only way to do that without root is to switch its WiFi "
-        "off and on, and on a unit with no battery an engine stopping at the wrong "
-        "instant would leave it with WiFi disabled and unreachable for good. Give the "
-        "router a 5 GHz-only SSID and point the car at it — that fixes it properly.",
+        "whether 5 GHz is even in range from where you park. Under either 5 GHz setting the "
+        "app also nudges the unit to re-evaluate its band (see the nudge setting below); it "
+        "never switches WiFi off and on, because on a battery-less unit an engine stopping "
+        "at the wrong instant would leave it disabled and unreachable for good. A 5 GHz-only "
+        "SSID for the car is still the most certain fix.",
         choices=(
             ("any", "Copy on any band"),
             ("prefer_5ghz", "Prefer 5 GHz (warn, but copy)"),
             ("require_5ghz", "Require 5 GHz (hold until it connects on 5 GHz)"),
         ),
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.wifi_selection_nudge",
+        "Nudge the unit toward 5 GHz",
+        "bool",
+        True,
+        "ingest",
+        "While a 5 GHz band setting is active, ask the unit each visit to stop treating a "
+        "working 2.4 GHz link as reason not to look for something better. This turns off "
+        "Android's network-selection 'sufficiency check' and keeps selection running while "
+        "associated, so the throughput scorer can move the link to 5 GHz — and hold it "
+        "there — on its own. It is a non-privileged command that never touches the WiFi "
+        "on/off state, and it is re-applied every visit because the unit forgets it on each "
+        "reboot. Turn it off to leave the unit's roaming behaviour exactly as the firmware "
+        "ships it.",
         requires="ingest.enabled",
     ),
     SettingDef(

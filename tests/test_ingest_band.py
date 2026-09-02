@@ -273,3 +273,63 @@ class TestNothingHereCanDisableTheUnitsWifi:
                 for command in unit_shell.commands:
                     assert "disable" not in command, command
                     assert "set-wifi-enabled" not in command, command
+
+
+class TestTheSelectionNudge:
+    """The one non-privileged lever that moves an associated unit toward 5 GHz.
+
+    Verified live on the unit (Android 15, uid 2000, rc=0) and safe: it disables the
+    network-selection sufficiency check and never touches WIFI_ON. These pin down when it
+    is issued and that a failure to issue it never costs a backup.
+    """
+
+    async def test_the_nudge_is_issued_when_enabled_and_5ghz_is_wanted(self, unit_shell):
+        unit_shell.settings.values["ingest.wifi_band"] = "require_5ghz"
+        unit_shell.settings.values["ingest.wifi_selection_nudge"] = True
+        unit_shell.replies["cmd wifi status"] = _STATUS_5G
+
+        assert await band.gate("u:5555")
+        assert band._SELECTION_NUDGE in unit_shell.commands
+
+    async def test_the_nudge_is_applied_even_while_already_on_5ghz(self, unit_shell):
+        """Applied on 5 GHz it keeps the unit re-evaluating so it does not slide back."""
+        unit_shell.settings.values["ingest.wifi_band"] = "prefer_5ghz"
+        unit_shell.settings.values["ingest.wifi_selection_nudge"] = True
+        unit_shell.replies["cmd wifi status"] = _STATUS_5G
+
+        assert await band.gate("u:5555")
+        assert any("set-network-selection-config" in c for c in unit_shell.commands)
+
+    async def test_the_nudge_runs_but_the_hold_still_happens_on_24(self, unit_shell):
+        unit_shell.settings.values["ingest.wifi_band"] = "require_5ghz"
+        unit_shell.settings.values["ingest.wifi_selection_nudge"] = True
+        unit_shell.replies["cmd wifi status"] = _STATUS_24G
+        unit_shell.replies["list-scan-results"] = _SCAN_WITH_5G
+
+        assert not await band.gate("u:5555")
+        assert band._SELECTION_NUDGE in unit_shell.commands
+        assert get_status().wifi_band_hold
+
+    async def test_no_nudge_under_any_policy(self, unit_shell):
+        unit_shell.settings.values["ingest.wifi_band"] = "any"
+        unit_shell.settings.values["ingest.wifi_selection_nudge"] = True
+        assert await band.gate("u:5555")
+        assert not any("set-network-selection-config" in c for c in unit_shell.commands)
+
+    async def test_the_nudge_can_be_switched_off(self, unit_shell):
+        unit_shell.settings.values["ingest.wifi_band"] = "require_5ghz"
+        unit_shell.settings.values["ingest.wifi_selection_nudge"] = False
+        unit_shell.replies["cmd wifi status"] = _STATUS_5G
+
+        assert await band.gate("u:5555")
+        assert not any("set-network-selection-config" in c for c in unit_shell.commands)
+
+    async def test_a_failed_nudge_never_costs_the_backup(self, unit_shell):
+        unit_shell.settings.values["ingest.wifi_band"] = "require_5ghz"
+        unit_shell.settings.values["ingest.wifi_selection_nudge"] = True
+        unit_shell.replies["set-network-selection-config"] = adb.AdbError("car has left")
+        unit_shell.replies["cmd wifi status"] = _STATUS_5G
+
+        # The nudge raises, apply_selection_nudge swallows it, and the gate proceeds on the
+        # band it can still read.
+        assert await band.gate("u:5555")
