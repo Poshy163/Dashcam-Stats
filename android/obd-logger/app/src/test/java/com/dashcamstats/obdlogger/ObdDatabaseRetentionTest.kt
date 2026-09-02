@@ -486,8 +486,15 @@ class ObdDatabaseRetentionTest {
         assertTrue(sample.isNull("oxygen_sensors_present"))
         assertTrue(sample.isNull("obd_standard"))
         assertTrue(sample.isNull("distance_with_mil"))
+        // Version 4 adds the PID 0x01 columns. `has` proves the column exists on the migrated
+        // row (a missing column would be absent from the row entirely, and isNull alone
+        // would still be true), `isNull` proves the legacy row was not invented a value.
+        for (column in listOf("mil_on", "dtc_count")) {
+            assertTrue(column, sample.has(column))
+            assertTrue(column, sample.isNull(column))
+        }
         assertEquals(
-            3,
+            4,
             database.readableDatabase.rawQuery("PRAGMA user_version", null).use { cursor ->
                 cursor.moveToFirst()
                 cursor.getInt(0)
