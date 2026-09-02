@@ -25,7 +25,7 @@ import numpy as np
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.detector import ObjectDetector
+from app.ai.detector import Detection2D, ObjectDetector
 from app.ai.normalise_au import normalise, patterns_for_region
 from app.ai.plates import (
     PlateDetector,
@@ -1281,10 +1281,63 @@ def _moment(recording: Recording, offset_s: float, located: Located | None) -> d
     return recording.started_at + timedelta(seconds=offset_s)
 
 
+#: Motion gating: the size of the downscaled grayscale fingerprint each frame is reduced
+#: to before it is compared against the last one that was actually inferred.
+_MOTION_W = 64
+_MOTION_H = 64
+
+#: How far one cell of that fingerprint must move, on the 0..255 grey scale, before it is
+#: counted as having changed. Above sensor noise and H.264 quantisation on a still scene,
+#: comfortably below anything a real object entering the frame produces.
+_MOTION_PIXEL_DELTA = 12
+
+
+def _motion_signature(frame: np.ndarray, osd_top: float) -> np.ndarray | None:
+    """A small grayscale fingerprint of the frame *above* the overlay strip, or None.
+
+    The burned-in OSD ticks its clock once a second, so at any sampling rate the bottom
+    band is "motion" in the strict sense and nothing worth spending inference on. It is
+    dropped before the fingerprint is taken; everything above it is what "did the scene
+    change" is actually asked about. Reduced to a fixed 64x64 so the comparison is a few
+    thousand integer subtractions regardless of the source resolution.
+    """
+    height, width = frame.shape[:2]
+    if height < 4 or width < 4:
+        return None
+    cut = int(height * osd_top) if 0.0 < osd_top < 1.0 else height
+    cut = max(2, min(height, cut))
+    upper = frame[:cut]
+    try:
+        import cv2
+
+        gray = cv2.cvtColor(upper, cv2.COLOR_BGR2GRAY) if upper.ndim == 3 else upper
+        small = cv2.resize(gray, (_MOTION_W, _MOTION_H), interpolation=cv2.INTER_AREA)
+        return small.astype(np.int16)
+    except Exception:
+        # Zero-dependency fallback: stride-subsample the green channel, which is the
+        # nearest single plane to luma. Coarser than an area resize but the gate only ever
+        # needs to tell "all but identical" from "something moved".
+        chan = upper[..., 1] if upper.ndim == 3 else upper
+        ys = np.linspace(0, chan.shape[0] - 1, _MOTION_H).astype(int)
+        xs = np.linspace(0, chan.shape[1] - 1, _MOTION_W).astype(int)
+        return chan[np.ix_(ys, xs)].astype(np.int16)
+
+
 async def stage_detect(
     session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
 ) -> StageResult:
-    """Detect and track road objects across sampled frames."""
+    """Detect and track road objects across sampled frames.
+
+    Frames that are all but identical to the last one actually inferred are gated: instead
+    of a second inference pass over an unchanged scene, the previous frame's detections are
+    re-affirmed to the tracker. This is safety-preserving by construction -- anything that
+    *enters* the frame (a pedestrian approaching a parked car) changes the pixels and is
+    inferred normally, and a static clip's one detected car keeps an honest track for the
+    whole duration -- while a dead or parked clip, which is ~30% of the corpus, collapses
+    from hundreds of inferences to a handful. It is not the same as skipping detection on a
+    static clip, which would blind the very footage worth keeping; every gated frame is
+    still checked against the anchor, and any real change re-opens inference.
+    """
     settings = get_settings_service()
     if not bool(settings.get_nowait("processing.detection_enabled")):
         recording.detection_state = StageState.SKIPPED
@@ -1303,10 +1356,25 @@ async def stage_detect(
 
     path = await asyncio.to_thread(resolve_footage_path, recording.rel_path)
     sample_fps = float(settings.get_nowait("processing.frame_sample_fps"))
+    gating_enabled = bool(settings.get_nowait("processing.motion_gating"))
+    min_change = float(settings.get_nowait("advanced.motion_gate_min_change"))
+    # The overlay strip is read from the active profile, the same one telemetry uses, so a
+    # re-registered OSD region moves the motion mask with it rather than leaving a stale
+    # band of ticking clock inside the compared area.
+    osd_top = float((await _active_profile(session)).y)
     tracker = ByteTracker()
     duration = recording.duration_s or 0.0
     frames = 0
+    inferred = 0
+    gated = 0
     decoder_used: str | None = None
+    #: The last frame actually run through the detector, and the detections it produced.
+    #: Gated frames compare against this fixed anchor -- never against the immediately
+    #: preceding frame -- so a scene that drifts a little each frame accumulates against
+    #: one reference and trips the gate open before a slow approach could slip past one
+    #: sub-threshold step at a time.
+    anchor_signature: np.ndarray | None = None
+    last_detections: list[Detection2D] = []
 
     def note_decoder(decoder: str) -> None:
         nonlocal decoder_used
@@ -1314,9 +1382,28 @@ async def stage_detect(
             decoder_used = decoder
 
     async def analyse_frame(offset: float, frame: np.ndarray) -> None:
-        nonlocal frames
-        detections = await detector.detect(frame)
-        tracker.update(detections, offset, frame)
+        nonlocal frames, inferred, gated, anchor_signature, last_detections
+        signature = _motion_signature(frame, osd_top) if gating_enabled else None
+        gate = False
+        if signature is not None and anchor_signature is not None:
+            changed = float((np.abs(signature - anchor_signature) > _MOTION_PIXEL_DELTA).mean())
+            gate = changed < min_change
+        if gate:
+            # Unchanged scene: the same objects are still there, so re-affirm the previous
+            # frame's detections to the tracker instead of paying for a second pass. This
+            # keeps each track alive with an honest duration -- a track merely stopped
+            # being fed would age out and a parked car would read as seen for one second
+            # then gone -- and the crop is taken from this frame, which the gate has just
+            # judged all but identical to the anchor.
+            tracker.update(last_detections, offset, frame)
+            gated += 1
+        else:
+            detections = await detector.detect(frame)
+            tracker.update(detections, offset, frame)
+            last_detections = detections
+            if signature is not None:
+                anchor_signature = signature
+            inferred += 1
         frames += 1
         if progress and duration:
             progress("detection", min(0.95, offset / duration))
@@ -1536,6 +1623,12 @@ async def stage_detect(
         True,
         stats={
             "frames_analysed": frames,
+            # How the decode split between real inference and motion-gated re-affirmation.
+            # `frames_inferred` is what actually cost model time; the gap between it and
+            # `frames_analysed` is the saving. Both surfaced so the queue page can show the
+            # gate working rather than leaving it an invisible behaviour.
+            "frames_inferred": inferred,
+            "frames_gated": gated,
             "tracks": len(tracks),
             # Surfaced rather than inferred from a null: "no location" and "we never
             # looked" are different answers and the recording page shows them differently.

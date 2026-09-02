@@ -342,6 +342,21 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="processing.detection_enabled",
     ),
     SettingDef(
+        "processing.motion_gating",
+        "Skip inference on unchanged frames",
+        "bool",
+        True,
+        "processing",
+        "When a sampled frame is all but identical to the last one actually analysed, "
+        "re-use that frame's detections instead of running the model again. A parked or "
+        "empty clip -- around a third of the footage -- then costs a handful of inferences "
+        "instead of hundreds. Safety is preserved: anything that enters the frame changes "
+        "the picture and is detected normally, and a car already in view keeps its track "
+        "for the whole clip. The overlay clock is excluded from the comparison so its "
+        "once-a-second tick never counts as movement.",
+        requires="processing.detection_enabled",
+    ),
+    SettingDef(
         "processing.detection_classes",
         "Detected classes",
         "string",
@@ -903,6 +918,22 @@ SETTINGS: tuple[SettingDef, ...] = (
         minimum=1,
         maximum=100,
         requires="advanced.keep_sparse_detections",
+    ),
+    SettingDef(
+        "advanced.motion_gate_min_change",
+        "Motion gate sensitivity",
+        "float",
+        0.02,
+        "advanced",
+        "How much of the frame must change before it is re-inferred rather than gated. A "
+        "frame is gated when fewer than this fraction of its (downscaled, overlay-masked) "
+        "cells moved since the last analysed frame. Lower is more cautious -- more frames "
+        "reach the model; 0 disables gating as surely as the switch does. The default of "
+        "0.02 sits well above sensor noise and compression on a still scene and far below "
+        "anything a real object entering the frame produces.",
+        minimum=0.0,
+        maximum=0.5,
+        requires="processing.motion_gating",
     ),
     SettingDef(
         "advanced.ffmpeg_threads",

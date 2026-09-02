@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from sqlalchemy import select
 
+from app.ai.detector import Detection2D
 from app.db.models import Recording, StageState
 from app.pipeline import stages
 
@@ -74,7 +76,13 @@ class TestTheDetectionStageActuallyRuns:
         exactly what got shadowed -- a stage that silently analysed nothing would still
         report success.
         """
+        from app.core.settings_service import get_settings_service
         from app.db.session import session_scope
+
+        # Off, because this asserts the plumbing -- every decoded frame reaches the
+        # detector -- and the eight fixture frames are identical, which the motion gate
+        # would (correctly) collapse to a single inference. Gating has its own tests below.
+        await get_settings_service().set("processing.motion_gating", False)
 
         async with session_scope() as session:
             recording = Recording(
@@ -207,3 +215,174 @@ class TestTheVehicleCropsAreActuallyWritten:
             path = app_config.media_dir / track.crop_path
             assert path.is_file(), f"the row points at {track.crop_path}, which is not on disk"
             assert path.stat().st_size > 0
+
+
+class TestMotionGating:
+    """The inference-skipping gate: unchanged frames re-use the last detections.
+
+    The property that matters is not "it is faster" but "it stays safe while being
+    faster": a scene that does not change is not re-inferred, and anything that *enters*
+    the scene changes it and is inferred. These drive the real stage body over frames whose
+    content is known, so both halves are asserted directly rather than assumed.
+    """
+
+    @staticmethod
+    def _frames(sequence):
+        """An ``iter_frames`` stand-in yielding the given 64x64 frames at 4 fps."""
+
+        async def iter_frames(path, **kwargs):
+            on_decoder = kwargs.get("on_decoder")
+            if on_decoder:
+                on_decoder("software")
+            for index, frame in enumerate(sequence):
+                yield float(index) / 4.0, frame
+
+        return iter_frames
+
+    @staticmethod
+    def _empty():
+        return np.zeros((64, 64, 3), dtype=np.uint8)
+
+    @staticmethod
+    def _bright():
+        return np.full((64, 64, 3), 200, dtype=np.uint8)
+
+    def _install(self, monkeypatch, detector, sequence):
+        async def shared_detector(name, *args, **kwargs):
+            return detector
+
+        async def resolve(rel_path):
+            return rel_path
+
+        monkeypatch.setattr(stages, "_shared_detector", shared_detector)
+        monkeypatch.setattr(stages, "iter_frames", self._frames(sequence))
+        monkeypatch.setattr(
+            stages.asyncio, "to_thread", lambda fn, *a, **k: _immediate(fn, *a, **k)
+        )
+
+    @staticmethod
+    async def _run(width=64, height=64, duration=2.0):
+        from app.db.session import session_scope
+
+        async with session_scope() as session:
+            recording = Recording(
+                rel_path="20260812120000_camera_0.ts",
+                filename="20260812120000_camera_0.ts",
+                width=width,
+                height=height,
+                duration_s=duration,
+                video_codec="h264",
+            )
+            session.add(recording)
+            await session.flush()
+            result = await stages.stage_detect(session, recording)
+            return result, recording
+
+    async def test_identical_frames_are_inferred_once(self, db_session, monkeypatch):
+        detector = FakeDetector()
+        self._install(monkeypatch, detector, [self._bright() for _ in range(8)])
+
+        result, recording = await self._run()
+
+        assert result.ok
+        assert detector.seen == 1, "an unchanged scene was inferred more than once"
+        assert result.stats["frames_analysed"] == 8
+        assert result.stats["frames_inferred"] == 1
+        assert result.stats["frames_gated"] == 7
+        assert recording.detection_state is StageState.DONE
+
+    async def test_a_change_reopens_inference(self, db_session, monkeypatch):
+        detector = FakeDetector()
+        sequence = [self._empty() for _ in range(4)] + [self._bright() for _ in range(4)]
+        self._install(monkeypatch, detector, sequence)
+
+        result, _ = await self._run()
+
+        # First frame, then the first frame of the changed run: two inferences, six gated.
+        assert detector.seen == 2
+        assert result.stats["frames_inferred"] == 2
+        assert result.stats["frames_gated"] == 6
+
+    async def test_an_object_entering_a_static_scene_is_still_detected(
+        self, db_session, monkeypatch
+    ):
+        """The safety guarantee, stated as a test.
+
+        Four empty frames, then four with something in them. The gate must not swallow the
+        arrival: the changed frame is inferred, the object is found, and it ends up tracked
+        with a positive vehicle count -- exactly the parked-car-with-someone-approaching
+        case the gate must never blind.
+        """
+        from app.db.models import TrackedObject
+        from app.db.session import session_scope
+
+        class CarWhenBright:
+            device = "CPU"
+            available = True
+
+            def __init__(self) -> None:
+                self.seen = 0
+
+            async def detect(self, frame, **kwargs):
+                self.seen += 1
+                if int(frame.max()) > 100:
+                    return [
+                        Detection2D(class_label="car", confidence=0.9, x=0.3, y=0.3, w=0.3, h=0.3)
+                    ]
+                return []
+
+        detector = CarWhenBright()
+        sequence = [self._empty() for _ in range(4)] + [self._bright() for _ in range(4)]
+        self._install(monkeypatch, detector, sequence)
+
+        result, recording = await self._run()
+
+        assert result.ok
+        assert detector.seen == 2, "the scene change did not reopen inference"
+        assert recording.vehicle_count == 1, "an object that entered a static scene was lost"
+        async with session_scope() as session:
+            tracks = (await session.execute(select(TrackedObject))).scalars().all()
+        assert len(tracks) == 1
+
+    async def test_a_car_already_in_view_keeps_its_track_across_gated_frames(
+        self, db_session, monkeypatch
+    ):
+        """A car present for the whole clip is inferred once but stays one honest track.
+
+        Re-affirming the last detections on each gated frame is what keeps the track alive
+        with a real duration; without it the track would age out after the buffer and the
+        car would read as seen for a moment and then gone.
+        """
+
+        class OneCar:
+            device = "CPU"
+            available = True
+
+            def __init__(self) -> None:
+                self.seen = 0
+
+            async def detect(self, frame, **kwargs):
+                self.seen += 1
+                return [Detection2D(class_label="car", confidence=0.9, x=0.3, y=0.3, w=0.3, h=0.3)]
+
+        detector = OneCar()
+        self._install(monkeypatch, detector, [self._bright() for _ in range(8)])
+
+        result, recording = await self._run(duration=2.0)
+
+        assert detector.seen == 1
+        assert result.stats["frames_inferred"] == 1
+        assert recording.vehicle_count == 1
+
+    async def test_gating_off_infers_every_frame(self, db_session, monkeypatch):
+        from app.core.settings_service import get_settings_service
+
+        await get_settings_service().set("processing.motion_gating", False)
+        detector = FakeDetector()
+        self._install(monkeypatch, detector, [self._bright() for _ in range(8)])
+
+        result, _ = await self._run()
+
+        assert detector.seen == 8
+        assert result.stats["frames_inferred"] == 8
+        assert result.stats["frames_gated"] == 0
