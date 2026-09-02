@@ -70,6 +70,16 @@ _build_tag: str = ""
 #: Query parameter carrying that fingerprint on the head unit's URL.
 BUILD_PARAM = "v"
 
+#: Marks the one URL the head unit is *sent* (:func:`backup_url`) as the constrained kiosk
+#: view. The dashcam's in-dash browser runs on a weak Mali GPU that recomposites the whole
+#: 1080p surface every frame for as long as any CSS animation is running -- and the shared
+#: layout pulses a "queue busy" dot forever, because the server is essentially always
+#: processing. Measured on the live unit that kept Chrome's GPU process at ~63% of a core
+#: while merely displaying the page, stealing CPU from the recorder and CarPlay. Desktop
+#: clients choose their own URL and never carry this flag, so they keep the full-motion UI;
+#: the unit gets a static one that lets the browser go idle between updates.
+KIOSK_PARAM = "kiosk"
+
 
 def set_build_tag(tag: str) -> None:
     global _build_tag
@@ -158,7 +168,26 @@ def backup_url() -> str:
     url = f"{base}/backup"
     if _build_tag:
         url = f"{url}?{urlencode({BUILD_PARAM: _build_tag})}"
-    return with_api_key(url)
+    # The head unit is the only client sent this URL, so it is the only one flagged as the
+    # kiosk. The key is appended last, after the kiosk marker, so it stays easy to redact.
+    return with_api_key(as_kiosk(url))
+
+
+def as_kiosk(url: str) -> str:
+    """Mark *url* as the head unit's low-power kiosk view, idempotently.
+
+    See :data:`KIOSK_PARAM`. Applied to both the learned :func:`backup_url` and the
+    operator's ``ingest.unit_display_url`` override, so anything the unit is *sent* carries
+    it and nothing a desktop chooses for itself does.
+    """
+    if not url:
+        return url
+    parts = urlsplit(url)
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    if any(key == KIOSK_PARAM for key, _ in pairs):
+        return url
+    pairs.append((KIOSK_PARAM, "1"))
+    return urlunsplit(parts._replace(query=urlencode(pairs)))
 
 
 def redacted(url: str) -> str:

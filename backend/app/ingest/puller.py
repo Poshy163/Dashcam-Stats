@@ -528,7 +528,8 @@ def display_url() -> str:
     own address separately is a test of the test.
     """
     override = str(_get("unit_display_url", "") or "").strip()
-    return origin.with_api_key(override) if override else origin.backup_url()
+    # Both paths reach the same in-dash browser, so both are tagged as the kiosk view.
+    return origin.with_api_key(origin.as_kiosk(override)) if override else origin.backup_url()
 
 
 def delta(

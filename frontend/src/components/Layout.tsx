@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
+import { motion } from '@/lib/kiosk'
 import { invalidateAnalysisQueries, resetForIdentityChange } from '@/lib/queryInvalidation'
 import type { AuthState } from '@/lib/types'
 
@@ -221,7 +222,7 @@ export default function Layout({
           className="mt-4 rounded-xl border border-nav-border bg-nav-raised/70 p-3.5 transition-colors hover:bg-nav-raised"
         >
           <div className="flex items-center gap-2 text-sm font-semibold text-nav-content">
-            <span className={cn('h-2.5 w-2.5 rounded-full', busy ? 'animate-pulse bg-state-ok' : 'bg-nav-muted')} />
+            <span className={cn('h-2.5 w-2.5 rounded-full', busy ? cn('bg-state-ok', motion('animate-pulse')) : 'bg-nav-muted')} />
             {busy ? 'Analysis in progress' : 'Queue is idle'}
           </div>
           <div className="mt-1 pl-[18px] text-xs text-nav-muted">
@@ -281,7 +282,7 @@ export default function Layout({
               className="flex min-h-10 shrink-0 items-center gap-2 rounded-lg px-2.5 text-content-muted hover:bg-surface-sunken"
               title={busy ? 'Processing' : 'Queue idle'}
             >
-              <span className={cn('h-2.5 w-2.5 rounded-full', busy ? 'animate-pulse bg-state-ok' : 'bg-state-idle')} />
+              <span className={cn('h-2.5 w-2.5 rounded-full', busy ? cn('bg-state-ok', motion('animate-pulse')) : 'bg-state-idle')} />
               <span className="tabular text-xs font-semibold">{pending}</span>
             </NavLink>
 

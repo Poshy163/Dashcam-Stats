@@ -969,7 +969,7 @@ class TestTheAppsOwnAddress:
 
         await origin.remember("http", "192.168.1.16:8199")
 
-        assert origin.backup_url() == "http://192.168.1.16:8199/backup"
+        assert origin.backup_url() == "http://192.168.1.16:8199/backup?kiosk=1"
 
     async def test_it_is_a_url_the_control_channel_will_accept(self):
         """Whatever is learned still has to survive the allowlist before it is used."""
@@ -998,7 +998,7 @@ class TestTheAppsOwnAddress:
         await origin.remember("http", "192.168.1.16:8199")
         await origin.remember("http", "192.168.1.20:9000")
 
-        assert origin.backup_url() == "http://192.168.1.20:9000/backup"
+        assert origin.backup_url() == "http://192.168.1.20:9000/backup?kiosk=1"
 
     async def test_nothing_is_known_before_anybody_opens_the_dashboard(self):
         from app.ingest import origin
@@ -1039,7 +1039,7 @@ class TestLearningTheAddressFromTheDashboard:
 
         await client.get("/backup")
 
-        assert origin.backup_url() == "http://test/backup"
+        assert origin.backup_url() == "http://test/backup?kiosk=1"
 
     async def test_it_survives_a_restart(self, client):
         """The reason this feature never once fired on the deployment it was written for.
@@ -1060,7 +1060,7 @@ class TestLearningTheAddressFromTheDashboard:
         # What a restart actually does: process memory goes, the database stays.
         origin.reset_for_tests()
 
-        assert origin.backup_url() == "http://test/backup"
+        assert origin.backup_url() == "http://test/backup?kiosk=1"
 
     async def test_a_later_page_load_overwrites_a_stored_address(self, client):
         """Staleness is what memory-only was protecting against, and it still is."""
@@ -1074,7 +1074,7 @@ class TestLearningTheAddressFromTheDashboard:
         await origin.remember("http", "192.168.1.20:9000")
         origin.reset_for_tests()
 
-        assert origin.backup_url() == "http://192.168.1.20:9000/backup"
+        assert origin.backup_url() == "http://192.168.1.20:9000/backup?kiosk=1"
 
     async def test_the_car_is_sent_the_api_key_when_one_is_set(self, client):
         """The head unit has no other way to present it — no keyboard, and no header on a
@@ -1087,7 +1087,7 @@ class TestLearningTheAddressFromTheDashboard:
         await client.put("/api/settings", json={"values": {"security.api_key": key}})
         await origin.remember("http", "192.168.1.16:8199")
 
-        assert origin.backup_url() == f"http://192.168.1.16:8199/backup?k={key}"
+        assert origin.backup_url() == f"http://192.168.1.16:8199/backup?kiosk=1&k={key}"
 
     async def test_the_url_with_a_key_still_survives_the_control_channel_allowlist(self, client):
         """`show_url` refuses anything that is not a plain web address, key or no key."""
@@ -1110,7 +1110,7 @@ class TestLearningTheAddressFromTheDashboard:
         await client.put("/api/settings", json={"values": {"security.api_key": "short"}})
         await origin.remember("http", "192.168.1.16:8199")
 
-        assert origin.backup_url() == "http://192.168.1.16:8199/backup"
+        assert origin.backup_url() == "http://192.168.1.16:8199/backup?kiosk=1"
 
 
 class TestTheLiveNumbers:
@@ -2285,7 +2285,7 @@ class TestARunEndToEnd:
 
         assert (await puller.run_pull(trigger="manual")).state is RunState.OK
         await _settle()
-        assert shown == ["http://192.168.1.16:8199/backup"]
+        assert shown == ["http://192.168.1.16:8199/backup?kiosk=1"]
 
         shown.clear()
         assert (await puller.run_pull(trigger="manual")).state is RunState.IDLE
@@ -2317,7 +2317,7 @@ class TestARunEndToEnd:
 
         assert (await puller.run_pull(trigger="manual")).state is RunState.OK
         await _settle()
-        assert shown == ["http://192.168.1.16:8199/backup"]
+        assert shown == ["http://192.168.1.16:8199/backup?kiosk=1"]
 
     async def test_a_transfer_still_runs_when_the_address_is_not_known_yet(
         self, db_session, unit, app_config, monkeypatch
@@ -2484,9 +2484,11 @@ class TestTheCarScreenTestButton:
 
         assert response.status_code == 200
         # The unit gets the real key...
-        assert shown == ["http://192.168.1.16:8199/backup?k=iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"]
+        assert shown == [
+            "http://192.168.1.16:8199/backup?kiosk=1&k=iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"
+        ]
         # ...and the screen the operator is looking at does not.
-        assert response.json()["url"] == "http://192.168.1.16:8199/backup?k=<key>"
+        assert response.json()["url"] == "http://192.168.1.16:8199/backup?kiosk=1&k=<key>"
 
     async def test_it_says_so_when_the_address_is_not_known(self, db_session, monkeypatch, client):
         from app.ingest import origin
@@ -2570,7 +2572,7 @@ class TestTheCarsUrlChangesWithTheBuild:
         origin.set_build_tag("bbbbbbbb")
         after = origin.backup_url()
 
-        assert before == "http://192.168.1.16:8199/backup?v=aaaaaaaa"
+        assert before == "http://192.168.1.16:8199/backup?v=aaaaaaaa&kiosk=1"
         assert after != before, "the head unit would have been sent to its cached shell"
 
     async def test_the_key_still_rides_alongside_it(self, client):
@@ -2586,7 +2588,7 @@ class TestTheCarsUrlChangesWithTheBuild:
         url = origin.backup_url()
 
         assert url == (
-            "http://192.168.1.16:8199/backup?v=aaaaaaaa&k=iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"
+            "http://192.168.1.16:8199/backup?v=aaaaaaaa&kiosk=1&k=iL9nQm3xWvB7tR2kZ4pY6hJ8sD5fG1aC"
         )
         from app.ingest.adb import is_safe_url
 
