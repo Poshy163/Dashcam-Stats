@@ -662,16 +662,28 @@ async def chrome_is_foreground(address: str) -> bool:
     courtesy display.
     """
 
+    # The resumed *activity*, not the focused *window*. This used to read
+    # ``dumpsys window windows`` for ``mCurrentFocus``, and that is a window: with CarPlay
+    # connected the vendor app keeps a floating overlay window that holds focus while our
+    # page is plainly the thing on screen, so the check said "not visible" for nearly every
+    # run, the display path re-fired its VIEW intent -- a full reload plus Chrome's tab
+    # strip flashing -- on every retry and every hold tick, and the operator watched the
+    # page refresh itself for the whole backup. ``topResumedActivity`` is what Android
+    # itself considers on top, and overlays do not move it.
     try:
         reply = await shell(
             address,
-            "dumpsys window windows | sed -n '/mCurrentFocus=/p;/mFocusedApp=/p'",
+            "dumpsys activity activities | grep -E 'topResumedActivity=|mResumedActivity=|mFocusedApp='",
             timeout=6.0,
         )
     except AdbError as exc:
         log.warning("could not verify Chrome on the head unit", error=str(exc))
         return False
-    return CHROME_PACKAGE in reply
+    for line in reply.splitlines():
+        if "topResumedActivity=" in line or "mResumedActivity=" in line:
+            return CHROME_PACKAGE in line
+    # An older build that prints neither: fall back to the focused app line.
+    return any("mFocusedApp=" in line and CHROME_PACKAGE in line for line in reply.splitlines())
 
 
 #: The unit's own ignition line, as ``settings global acc_status`` reports it.

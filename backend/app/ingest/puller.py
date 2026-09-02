@@ -70,6 +70,14 @@ _EVENT_SYNC_AWAIT_GRACE_SECONDS = 0.25
 #: observed live, mid-transfer -- and nothing else puts ours back.
 HOLD_FOREGROUND_INTERVAL_S = 8.0
 
+#: The least time between two re-opens of the page, however often the check says it is
+#: covered. Re-opening is a VIEW intent, which reloads the tab and flashes Chrome's tab
+#: strip, so a check that is wrong about the foreground must not be able to turn that into
+#: a reload every tick -- which is exactly what happened when the check read window focus
+#: under a CarPlay overlay. The check is fixed; this is the backstop that makes the next
+#: wrong answer cost one reload a minute rather than one every eight seconds.
+HOLD_REOPEN_MIN_S = 45.0
+
 
 def _hold_page_foreground() -> bool:
     """Whether to keep the page in front for the life of the transfer. Never raises."""
@@ -98,36 +106,52 @@ async def _show_backup_page_during_transfer(address: str, url: str) -> None:
     the transfer ends, which is what makes this safe: it can never compete with the driver,
     because a transfer only ever runs on a parked car.
     """
+    # Look before opening, every time. A VIEW intent to a page that is already on screen
+    # is not a no-op: Chrome reloads the tab and flashes its tab strip. With the engine
+    # idling on the driveway the recorder keeps producing footage, the poller re-runs
+    # about once a minute, and each run used to fire this unconditionally -- so the page
+    # visibly refreshed itself for as long as the car sat there.
     shown = False
     for attempt, delay_s in enumerate(DISPLAY_RETRY_DELAYS_S, start=1):
         if delay_s:
             await asyncio.sleep(delay_s)
-        reason = await adb.show_url(address, url)
-        if not reason and await adb.chrome_is_foreground(address):
-            log.info("opened and verified the backup page on the head unit", attempt=attempt)
+        if await adb.chrome_is_foreground(address):
+            if attempt == 1:
+                log.info("the backup page is already showing on the head unit")
+            else:
+                log.info("opened and verified the backup page on the head unit", attempt=attempt)
             shown = True
             break
-        log.warning(
-            "backup page was not visible on the head unit; will retry while transferring",
-            attempt=attempt,
-            error=reason or "Chrome did not become foreground",
-        )
+        reason = await adb.show_url(address, url)
+        if reason:
+            log.warning(
+                "backup page was not visible on the head unit; will retry while transferring",
+                attempt=attempt,
+                error=reason,
+            )
     if not shown:
-        log.warning("could not show the backup page during this transfer")
+        # One last look: the final open may simply not have settled before the loop ended.
+        shown = await adb.chrome_is_foreground(address)
+        if shown:
+            log.info("opened and verified the backup page on the head unit", attempt=attempt)
+        else:
+            log.warning("could not show the backup page during this transfer")
     if not _hold_page_foreground():
         return
 
-    # Hold it there until the transfer's end cancels this task.
-    reasserts = 0
+    # Hold it there until the transfer's end cancels this task. Every re-open is logged at
+    # info: a demoted repeat is how the reload-every-tick above went unseen.
+    last_reopen: float | None = None
     while True:
         await asyncio.sleep(HOLD_FOREGROUND_INTERVAL_S)
         if await adb.chrome_is_foreground(address):
             continue
-        reasserts += 1
+        now = time.monotonic()
+        if last_reopen is not None and now - last_reopen < HOLD_REOPEN_MIN_S:
+            continue
+        last_reopen = now
         reason = await adb.show_url(address, url)
-        # The first re-assert of a transfer is worth a line; a vendor app that keeps
-        # grabbing the screen every tick would otherwise fill the log for the whole copy.
-        (log.info if reasserts == 1 else log.debug)(
+        log.info(
             "put the backup page back over the head unit's own screen",
             error=reason or None,
         )

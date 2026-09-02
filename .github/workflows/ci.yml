@@ -135,6 +135,47 @@ jobs:
           :app:assembleDebug
           :app:assembleRelease
 
+      # Job logs need a token to read; annotations do not. When Gradle fails, name the
+      # failing tests and lint errors as annotations so the cause is visible from the
+      # run page and the API without opening the log -- two consecutive failures of
+      # this step were opaque from outside for exactly that reason.
+      - name: Surface test and lint failures
+        if: failure()
+        working-directory: android/obd-logger
+        run: |
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          shown = 0
+          def clean(text):
+              return ' '.join((text or '').split())[:600].replace('%', '%25')
+          for path in glob.glob('app/build/test-results/**/*.xml', recursive=True):
+              try:
+                  root = ET.parse(path).getroot()
+              except ET.ParseError:
+                  continue
+              for case in root.iter('testcase'):
+                  for kind in ('failure', 'error'):
+                      node = case.find(kind)
+                      if node is None:
+                          continue
+                      msg = clean(node.get('message') or (node.text or ''))
+                      print('::error title=Unit test ' + kind + '::' + str(case.get('classname')) + '.' + str(case.get('name')) + ': ' + msg)
+                      shown += 1
+          for path in glob.glob('app/build/reports/lint-results-*.xml'):
+              try:
+                  root = ET.parse(path).getroot()
+              except ET.ParseError:
+                  continue
+              for issue in root.iter('issue'):
+                  if issue.get('severity') not in ('Error', 'Fatal'):
+                      continue
+                  loc = issue.find('location')
+                  where = (str(loc.get('file')) + ':' + str(loc.get('line'))) if loc is not None else path
+                  print('::error title=Lint ' + str(issue.get('id')) + '::' + where + ': ' + clean(issue.get('message')))
+                  shown += 1
+          print('surfaced ' + str(shown) + ' failure annotation(s)')
+          PY
+
   docker:
     name: Docker build
     runs-on: ubuntu-latest

@@ -925,8 +925,30 @@ class TestTheUnitDisplay:
         from app.ingest import adb
 
         async def fake_shell(address, command, **kwargs):
-            assert "dumpsys window windows" in command
-            return "mCurrentFocus=Window{123 u0 com.android.chrome/com.google.android.apps.chrome.Main}"
+            assert "dumpsys activity activities" in command
+            return (
+                "    topResumedActivity=ActivityRecord{a174746 u0 "
+                "com.android.chrome/org.chromium.chrome.browser.ChromeTabbedActivity t114 d0}\n"
+                "  mFocusedApp=ActivityRecord{a174746 u0 "
+                "com.android.chrome/org.chromium.chrome.browser.ChromeTabbedActivity t114 d0}"
+            )
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+        assert await adb.chrome_is_foreground("u:5555")
+
+    async def test_chrome_foreground_check_ignores_a_focused_overlay_window(self, monkeypatch):
+        """With CarPlay connected the vendor app keeps a floating window that holds *window*
+        focus while our page is the resumed activity. The old window-focus check said "not
+        visible" and the display path reloaded the page on every tick."""
+        from app.ingest import adb
+
+        async def fake_shell(address, command, **kwargs):
+            return (
+                "    topResumedActivity=ActivityRecord{a174746 u0 "
+                "com.android.chrome/org.chromium.chrome.browser.ChromeTabbedActivity t114 d0}\n"
+                "  mFocusedApp=ActivityRecord{8553841 u0 "
+                "com.zjinnova.zlink/com.zjinnova.android.zlink.features.main.MainActivity t122 d0}"
+            )
 
         monkeypatch.setattr(adb, "shell", fake_shell)
         assert await adb.chrome_is_foreground("u:5555")
@@ -935,7 +957,12 @@ class TestTheUnitDisplay:
         from app.ingest import adb
 
         async def fake_shell(address, command, **kwargs):
-            return "mCurrentFocus=Window{123 u0 com.vendor.launcher/.HomeActivity}"
+            return (
+                "    topResumedActivity=ActivityRecord{8553841 u0 "
+                "com.zjinnova.zlink/com.zjinnova.android.zlink.features.main.MainActivity t122 d0}\n"
+                "  mFocusedApp=ActivityRecord{8553841 u0 "
+                "com.zjinnova.zlink/com.zjinnova.android.zlink.features.main.MainActivity t122 d0}"
+            )
 
         monkeypatch.setattr(adb, "shell", fake_shell)
         assert not await adb.chrome_is_foreground("u:5555")
@@ -2277,8 +2304,13 @@ class TestARunEndToEnd:
         async def record(address, url):
             shown.append(url)
 
+        async def in_front_once_shown(address):
+            # The display path now looks before it opens; a page already showing is never
+            # reloaded. Model a unit that shows nothing until told to.
+            return bool(shown)
+
         monkeypatch.setattr(adb, "show_url", record)
-        monkeypatch.setattr(adb, "chrome_is_foreground", _true)
+        monkeypatch.setattr(adb, "chrome_is_foreground", in_front_once_shown)
         origin.reset_for_tests()
         await origin.remember("http", "192.168.1.16:8199")
         await self._enable(**{"ingest.show_on_unit": True})
@@ -2304,8 +2336,11 @@ class TestARunEndToEnd:
         async def record(address, url):
             shown.append(url)
 
+        async def in_front_once_shown(address):
+            return bool(shown)
+
         monkeypatch.setattr(adb, "show_url", record)
-        monkeypatch.setattr(adb, "chrome_is_foreground", _true)
+        monkeypatch.setattr(adb, "chrome_is_foreground", in_front_once_shown)
         origin.reset_for_tests()
         await origin.remember("https", "dashcam.example.com")
         await self._enable(
@@ -2481,14 +2516,15 @@ async def test_car_screen_is_put_back_when_covered(monkeypatch):
 
     async def foreground(address):
         checks["n"] += 1
-        # Visible after the initial open (check 1); covered by Zlink on the first hold
-        # tick (check 2); visible again once re-opened (check 3 onwards).
-        return checks["n"] != 2
+        # Not showing before the first open (check 1); visible after it (check 2);
+        # covered by Zlink on a hold tick (check 3); visible again once re-opened.
+        return checks["n"] not in (1, 3)
 
     monkeypatch.setattr(adb, "show_url", show)
     monkeypatch.setattr(adb, "chrome_is_foreground", foreground)
-    monkeypatch.setattr(puller, "DISPLAY_RETRY_DELAYS_S", (0.0,))
+    monkeypatch.setattr(puller, "DISPLAY_RETRY_DELAYS_S", (0.0, 0.0))
     monkeypatch.setattr(puller, "HOLD_FOREGROUND_INTERVAL_S", 0.0)
+    monkeypatch.setattr(puller, "HOLD_REOPEN_MIN_S", 0.0)
     monkeypatch.setattr(puller, "_hold_page_foreground", lambda: True)
 
     await _run_hold(puller)
@@ -2496,8 +2532,9 @@ async def test_car_screen_is_put_back_when_covered(monkeypatch):
     assert shows == ["http://nas:8199/backup"] * 2, "initial open plus exactly one re-open"
 
 
-async def test_car_screen_hold_is_off_by_default_without_settings(monkeypatch):
-    """With the hold off the function returns after the initial open, exactly as before."""
+async def test_car_screen_is_not_reopened_when_it_is_already_showing(monkeypatch):
+    """The refresh the operator watched: the poller re-runs about once a minute with the
+    engine idling, and each run fired the open unconditionally -- a reload every time."""
     from app.ingest import adb, puller
 
     shows: list[str] = []
@@ -2511,7 +2548,60 @@ async def test_car_screen_hold_is_off_by_default_without_settings(monkeypatch):
 
     monkeypatch.setattr(adb, "show_url", show)
     monkeypatch.setattr(adb, "chrome_is_foreground", foreground)
-    monkeypatch.setattr(puller, "DISPLAY_RETRY_DELAYS_S", (0.0,))
+    monkeypatch.setattr(puller, "DISPLAY_RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+    monkeypatch.setattr(puller, "HOLD_FOREGROUND_INTERVAL_S", 0.0)
+    monkeypatch.setattr(puller, "_hold_page_foreground", lambda: True)
+
+    await _run_hold(puller)
+
+    assert shows == [], "a page that is already showing must never be reloaded"
+
+
+async def test_car_screen_reopens_are_rate_limited(monkeypatch):
+    """Even if the foreground check is wrong every tick, re-opens are capped: the backstop
+    that turns a bad answer into one reload a minute rather than one every eight seconds."""
+    from app.ingest import adb, puller
+
+    shows: list[str] = []
+    checks = {"n": 0}
+
+    async def show(address, url):
+        shows.append(url)
+        return ""
+
+    async def foreground(address):
+        checks["n"] += 1
+        # Visible right after the initial open, then "covered" forever.
+        return checks["n"] == 2
+
+    monkeypatch.setattr(adb, "show_url", show)
+    monkeypatch.setattr(adb, "chrome_is_foreground", foreground)
+    monkeypatch.setattr(puller, "DISPLAY_RETRY_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr(puller, "HOLD_FOREGROUND_INTERVAL_S", 0.0)
+    monkeypatch.setattr(puller, "HOLD_REOPEN_MIN_S", 1000.0)
+    monkeypatch.setattr(puller, "_hold_page_foreground", lambda: True)
+
+    await _run_hold(puller, ticks=60)
+
+    assert shows == ["http://nas:8199/backup"] * 2, "initial open plus one capped re-open"
+
+
+async def test_car_screen_hold_is_off_by_default_without_settings(monkeypatch):
+    """With the hold off the function returns after the initial open, exactly as before."""
+    from app.ingest import adb, puller
+
+    shows: list[str] = []
+
+    async def show(address, url):
+        shows.append(url)
+        return ""
+
+    async def foreground(address):
+        return bool(shows)
+
+    monkeypatch.setattr(adb, "show_url", show)
+    monkeypatch.setattr(adb, "chrome_is_foreground", foreground)
+    monkeypatch.setattr(puller, "DISPLAY_RETRY_DELAYS_S", (0.0, 0.0))
     monkeypatch.setattr(puller, "_hold_page_foreground", lambda: False)
 
     await puller._show_backup_page_during_transfer("u:5555", "http://nas:8199/backup")
