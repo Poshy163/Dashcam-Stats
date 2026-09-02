@@ -58,7 +58,7 @@ def fixture_dir(ffmpeg_path: str) -> Path:
         "20260804174354_camera_1.ts",  # rear, GPS, no audio, 1s filename offset
         "20260804174359_camera_0.ts",  # contiguous next segment (same journey)
         "20260805150358_camera_0.ts",  # no GPS fix: E:00.0000 N:00.0000
-        "20260805201500_camera_0.ts",  # hours later (separate journey)
+        "20260803091500_camera_0.ts",  # other day (separate journey)
         "20260807214113_camera_0.ts",  # zero bytes
         "20260807214114_camera_0.ts",  # not a transport stream
         "20260807214200_camera_0.ts",  # truncated mid-GOP

@@ -69,6 +69,32 @@ def _escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "’").replace("%", "\\%")
 
 
+#: Fonts to hand drawtext directly, first match wins. With no ``fontfile`` drawtext asks
+#: fontconfig for a default, and on this Windows workstation the winget ffmpeg 9.0 build
+#: has no fontconfig configuration -- it does not fail, it *segfaults* (exit 139, empty
+#: stderr), which the fixture generator reported as a bare "ffmpeg failed" and pytest as
+#: 21 fixture errors. A known file sidesteps fontconfig entirely; where none exists the
+#: default lookup is kept, which is what CI's Linux ffmpeg has always used.
+_FONT_CANDIDATES = (
+    "C:/WINDOWS/Fonts/arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+)
+
+
+def _font_file_option() -> list[str]:
+    """``["fontfile=..."]`` for the first font that exists, else nothing."""
+    for candidate in _FONT_CANDIDATES:
+        if Path(candidate).is_file():
+            # Inside a filter graph a colon separates options, so the drive colon in a
+            # Windows path has to be escaped. Built without a backslash literal on purpose.
+            escaped = candidate.replace(":", chr(92) + ":")
+            return [f"fontfile='{escaped}'"]
+    return []
+
+
 def build_overlay_filters(spec: ClipSpec) -> list[str]:
     """One drawtext per second, gated by `between(t,...)`.
 
@@ -80,6 +106,7 @@ def build_overlay_filters(spec: ClipSpec) -> list[str]:
     # contrast at the edges. Darkening the strip keeps the OCR fixtures representative;
     # over testsrc2's raw colour bars the text would sit on yellow, which never happens.
     filters: list[str] = ["drawbox=x=0:y=ih-56:w=iw:h=56:color=black@0.72:t=fill"]
+    font = _font_file_option()
     for i in range(spec.seconds):
         stamp = spec.start + timedelta(seconds=i)
         if spec.gps:
@@ -100,6 +127,7 @@ def build_overlay_filters(spec: ClipSpec) -> list[str]:
             "drawtext="
             + ":".join(
                 [
+                    *font,
                     f"text='{_escape(text)}'",
                     "fontcolor=white",
                     "fontsize=34",
