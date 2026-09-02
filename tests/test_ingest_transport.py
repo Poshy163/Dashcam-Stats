@@ -2441,10 +2441,82 @@ async def test_car_screen_retries_until_chrome_is_visible(monkeypatch):
     monkeypatch.setattr(adb, "show_url", show)
     monkeypatch.setattr(adb, "chrome_is_foreground", foreground)
     monkeypatch.setattr(puller, "DISPLAY_RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+    # Awaited directly, so the hold -- which only ends when the transfer cancels the task --
+    # must be off for this to return at all.
+    monkeypatch.setattr(puller, "_hold_page_foreground", lambda: False)
 
     await puller._show_backup_page_during_transfer("u:5555", "http://nas:8199/backup")
 
     assert len(attempts) == 2
+
+
+async def _run_hold(puller, ticks: int = 30):
+    """Run the show-and-hold task for a few scheduler turns, then cancel it as the
+    transfer's end would."""
+    import asyncio
+
+    task = asyncio.create_task(
+        puller._show_backup_page_during_transfer("u:5555", "http://nas:8199/backup")
+    )
+    for _ in range(ticks):
+        await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled() or task.done()
+
+
+async def test_car_screen_is_put_back_when_covered(monkeypatch):
+    """Zlink raises its dashboard over the page mid-backup. The hold notices on its next
+    check and opens the page again by URL -- one re-open for the one time it was covered,
+    none while it stays visible -- and the task stops cleanly when the transfer cancels it.
+    """
+    from app.ingest import adb, puller
+
+    shows: list[str] = []
+    checks = {"n": 0}
+
+    async def show(address, url):
+        shows.append(url)
+        return ""
+
+    async def foreground(address):
+        checks["n"] += 1
+        # Visible after the initial open (check 1); covered by Zlink on the first hold
+        # tick (check 2); visible again once re-opened (check 3 onwards).
+        return checks["n"] != 2
+
+    monkeypatch.setattr(adb, "show_url", show)
+    monkeypatch.setattr(adb, "chrome_is_foreground", foreground)
+    monkeypatch.setattr(puller, "DISPLAY_RETRY_DELAYS_S", (0.0,))
+    monkeypatch.setattr(puller, "HOLD_FOREGROUND_INTERVAL_S", 0.0)
+    monkeypatch.setattr(puller, "_hold_page_foreground", lambda: True)
+
+    await _run_hold(puller)
+
+    assert shows == ["http://nas:8199/backup"] * 2, "initial open plus exactly one re-open"
+
+
+async def test_car_screen_hold_is_off_by_default_without_settings(monkeypatch):
+    """With the hold off the function returns after the initial open, exactly as before."""
+    from app.ingest import adb, puller
+
+    shows: list[str] = []
+
+    async def show(address, url):
+        shows.append(url)
+        return ""
+
+    async def foreground(address):
+        return True
+
+    monkeypatch.setattr(adb, "show_url", show)
+    monkeypatch.setattr(adb, "chrome_is_foreground", foreground)
+    monkeypatch.setattr(puller, "DISPLAY_RETRY_DELAYS_S", (0.0,))
+    monkeypatch.setattr(puller, "_hold_page_foreground", lambda: False)
+
+    await puller._show_backup_page_during_transfer("u:5555", "http://nas:8199/backup")
+
+    assert shows == ["http://nas:8199/backup"]
 
 
 class TestTheCarScreenTestButton:

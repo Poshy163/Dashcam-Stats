@@ -65,22 +65,72 @@ APP_OWNED_SLEEP_STATUS_MAX_AGE_S = 30.0
 _EVENT_SYNC_AWAIT_GRACE_SECONDS = 0.25
 
 
-async def _show_backup_page_during_transfer(address: str, url: str) -> None:
-    """Open and visibly confirm the car-screen dashboard while a transfer is active."""
+#: How often, while a transfer runs, the page is checked to still be in front. The vendor's
+#: CarPlay app (Zlink) raises its own dashboard over ours a short way into a backup --
+#: observed live, mid-transfer -- and nothing else puts ours back.
+HOLD_FOREGROUND_INTERVAL_S = 8.0
 
+
+def _hold_page_foreground() -> bool:
+    """Whether to keep the page in front for the life of the transfer. Never raises."""
+    try:
+        return bool(_get("hold_page_foreground", False))
+    except Exception:
+        return False
+
+
+async def _show_backup_page_during_transfer(address: str, url: str) -> None:
+    """Open and visibly confirm the car-screen dashboard while a transfer is active, and,
+    if asked, keep it there.
+
+    The initial open retries a few times because ``am start`` can succeed while a launcher
+    or overlay stays in front. After that the vendor's CarPlay app is free to raise its own
+    dashboard over the page, and on the live unit it does exactly that a short way into a
+    backup, leaving the car showing Zlink's home screen instead of what is being copied.
+
+    So, while this task lives, it periodically checks the page is still in front and, if
+    not, opens it again by URL. By URL deliberately, at the cost of one reload: merely
+    resuming Chrome's existing task (its launcher activity) lands on the *tab grid* whenever
+    more than one tab is open -- seen on the unit, which had two -- and the grid is not the
+    page. A VIEW of the URL shows the tab itself. The reload only happens when something
+    actually covered the page, not every tick, so it is the price of recovery rather than
+    the "screen refresh" that once fired on every visit. The task is cancelled the moment
+    the transfer ends, which is what makes this safe: it can never compete with the driver,
+    because a transfer only ever runs on a parked car.
+    """
+    shown = False
     for attempt, delay_s in enumerate(DISPLAY_RETRY_DELAYS_S, start=1):
         if delay_s:
             await asyncio.sleep(delay_s)
         reason = await adb.show_url(address, url)
         if not reason and await adb.chrome_is_foreground(address):
             log.info("opened and verified the backup page on the head unit", attempt=attempt)
-            return
+            shown = True
+            break
         log.warning(
             "backup page was not visible on the head unit; will retry while transferring",
             attempt=attempt,
             error=reason or "Chrome did not become foreground",
         )
-    log.warning("could not show the backup page during this transfer")
+    if not shown:
+        log.warning("could not show the backup page during this transfer")
+    if not _hold_page_foreground():
+        return
+
+    # Hold it there until the transfer's end cancels this task.
+    reasserts = 0
+    while True:
+        await asyncio.sleep(HOLD_FOREGROUND_INTERVAL_S)
+        if await adb.chrome_is_foreground(address):
+            continue
+        reasserts += 1
+        reason = await adb.show_url(address, url)
+        # The first re-assert of a transfer is worth a line; a vendor app that keeps
+        # grabbing the screen every tick would otherwise fill the log for the whole copy.
+        (log.info if reasserts == 1 else log.debug)(
+            "put the backup page back over the head unit's own screen",
+            error=reason or None,
+        )
 
 
 def _by_directory(files: list[RemoteFile], default: str) -> list[tuple[str, list[RemoteFile]]]:

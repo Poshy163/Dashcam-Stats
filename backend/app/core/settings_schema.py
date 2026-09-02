@@ -1083,6 +1083,19 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.hold_page_foreground",
+        "Keep the backup page in front while copying",
+        "bool",
+        True,
+        "ingest",
+        "The head unit's own CarPlay app raises its dashboard over the backup page part-way "
+        "through a transfer, and nothing else puts ours back — observed live. With this on, "
+        "the page is checked every few seconds for as long as the copy runs and raised back "
+        "in front if something covered it, without reloading it. It stops the instant the "
+        "transfer ends, so it never competes with you while driving.",
+        requires="ingest.show_on_unit",
+    ),
+    SettingDef(
         "ingest.unit_display_url",
         "Dashcam screen address",
         "string",
