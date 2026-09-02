@@ -56,8 +56,9 @@ class EngineGateTest {
     fun pollPlanNeverQueriesOrCountsUnsupportedPidsAsFailures() {
         val supported = setOf(0x0C, 0x03, 0x15, 0x13, 0x1C, 0x21, 0x99)
         val requested = ObdPollPlan.requestedPids(sequence = 0, supported = supported)
-        // 0x13 is static in v4 and never enters the rotation; 0x21 now leads the slow tier.
-        assertEquals(listOf(0x0C, 0x03, 0x15, 0x21), requested)
+        // 0x13 is static and never enters the rotation; the slow tier sits on phases 1 and
+        // 5, so cycle 0 carries no slow PID at all.
+        assertEquals(listOf(0x0C, 0x03, 0x15), requested)
 
         val queried = mutableListOf<Int>()
         val missing = mutableListOf<Int>()
@@ -66,9 +67,9 @@ class EngineGateTest {
             val reply = if (pid in supported) mapOf("value" to 1.0) else emptyMap()
             if (reply.isEmpty()) missing += pid
         }
-        assertEquals(listOf(0x0C, 0x03, 0x15, 0x21), queried)
+        assertEquals(listOf(0x0C, 0x03, 0x15), queried)
         assertTrue(missing.isEmpty())
-        assertEquals(listOf(0x0C), ObdPollPlan.requestedPids(sequence = 1, supported = supported))
+        assertEquals(listOf(0x0C, 0x21), ObdPollPlan.requestedPids(sequence = 1, supported = supported))
     }
 
     @Test
@@ -132,6 +133,9 @@ class EngineGateTest {
             0x13, 0x1C, 0x21,
         )
         val cycles = (0L until 24L).associateWith { ObdPollPlan.requestedPids(it, supported) }
+        // The whole point of the v5 phases: no cycle ever needs an eighth command, so the
+        // four-medium cycles no longer overrun the five-second target.
+        assertTrue(cycles.values.all { requested -> requested.size <= 7 })
         // Static PIDs are read once at drive start and must never consume a cycle.
         for (pid in ObdPollPlan.staticOnce) {
             assertTrue(cycles.values.none { pid in it })

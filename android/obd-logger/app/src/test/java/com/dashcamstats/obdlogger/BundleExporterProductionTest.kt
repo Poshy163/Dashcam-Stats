@@ -18,6 +18,7 @@ import org.robolectric.RobolectricTestRunner
 import java.io.File
 import java.time.Instant
 import java.util.zip.ZipEntry
+import java.util.zip.GZIPInputStream
 import java.util.zip.ZipFile
 
 @RunWith(RobolectricTestRunner::class)
@@ -95,6 +96,49 @@ class BundleExporterProductionTest {
         val recovered = exporter.export(driveId)
         assertEquals(exported.sha256, recovered.sha256)
         assertArrayEquals(firstBytes, recovered.file.readBytes())
+    }
+
+    @Test
+    fun lampAndDtcCountExportWithTheJsonTypesTheServerRequires() {
+        // The server validator wants mil_on as a boolean and dtc_count as an integer; a
+        // 1/0 or a 3.0 would quarantine the whole bundle.
+        val driveId = "lamp-export"
+        val start = Instant.parse("2025-03-02T00:00:00Z")
+        database.startDrive(
+            DriveRecord(
+                driveId, "test-car", "test-adapter", "test-logger", "0.2.9", 1,
+                start.toString(), "UTC", "test", "test",
+            ),
+        )
+        database.addSample(
+            SampleRecord(
+                driveId, 0, start.plusSeconds(5).toString(),
+                mapOf("engine_rpm" to 900.0, "mil_on" to true, "dtc_count" to 3),
+            ),
+        )
+        database.markFinalising(
+            driveId,
+            "engine_stopped",
+            start.plusSeconds(30).toString(),
+            start.plusSeconds(20).toString(),
+        )
+        database.finalizeDrive(
+            driveId,
+            "engine_stopped",
+            start.plusSeconds(31).toString(),
+            lastSuccessfulResponseAtUtc = start.plusSeconds(20).toString(),
+        )
+
+        val exported = exporter.export(driveId)
+        ZipFile(exported.file).use { zip ->
+            val line = GZIPInputStream(zip.getInputStream(zip.getEntry("samples.ndjson.gz")))
+                .bufferedReader().use { it.readText() }.trim()
+            assertTrue(line, line.contains("\"mil_on\":true"))
+            assertTrue(line, line.contains("\"dtc_count\":3,") || line.endsWith("\"dtc_count\":3}"))
+            val sample = JSONObject(line)
+            assertTrue(sample.getBoolean("mil_on"))
+            assertEquals(3, sample.getInt("dtc_count"))
+        }
     }
 
     @Test

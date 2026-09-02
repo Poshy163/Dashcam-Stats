@@ -93,6 +93,52 @@ class ObdDatabaseRetentionTest {
     }
 
     @Test
+    fun lampAndDtcCountPersistAsIntegersInTheirOwnColumns() {
+        // Regression: v4 polled PID 0x01 into values with no matching columns, so the first
+        // 0x01 sample of every drive threw "table samples has no column named dtc_count" and
+        // the drive died as database_fault after four samples.
+        database.startDrive(
+            DriveRecord(
+                driveId = "lamp-drive",
+                vehicleId = "test-car",
+                adapterId = "test-adapter",
+                loggerId = "test-logger",
+                loggerVersion = "test",
+                startedAtUtc = "2025-02-01T10:00:00Z",
+                originalTimezone = "UTC",
+                startReason = "test",
+                obdProtocol = "test",
+            ),
+        )
+        val inserted = database.addSample(
+            SampleRecord(
+                driveId = "lamp-drive",
+                sequence = 0,
+                timestampUtc = "2025-02-01T10:00:05Z",
+                values = mapOf(
+                    "engine_rpm" to 900.0,
+                    "mil_on" to true,
+                    "dtc_count" to 3,
+                    "oxygen_sensors_present" to listOf(1, 2),
+                    "obd_standard" to "OBD-II (CARB)",
+                ),
+            ),
+        )
+        assertTrue(inserted)
+        val row = database.samples("lamp-drive").single()
+        assertEquals(1L, row.getLong("mil_on"))
+        assertEquals(3L, row.getLong("dtc_count"))
+        assertEquals(900.0, row.getDouble("engine_rpm"), 0.0)
+        // Both are INTEGER columns: the cursor reads them back as integers, never as 3.0.
+        database.readableDatabase.rawQuery("PRAGMA table_info(samples)", null).use { cursor ->
+            val types = mutableMapOf<String, String>()
+            while (cursor.moveToNext()) types[cursor.getString(1)] = cursor.getString(2)
+            assertEquals("INTEGER", types["mil_on"])
+            assertEquals("INTEGER", types["dtc_count"])
+        }
+    }
+
+    @Test
     fun processRestartRecoversAtLastPersistedSampleAndKeepsRowsExportable() {
         val started = "2025-02-01T10:00:00Z"
         database.startDrive(

@@ -4730,3 +4730,39 @@ class TestPollPlanV4Bundles:
                 ),
                 config=app_config,
             )
+
+
+class TestPollPlanV5Bundles:
+    """Logger 0.2.9 exports plan v5: accepted, same sample shape as v4."""
+
+    def test_v5_is_accepted(self, tmp_path, app_config):
+        from app.ingest.obd_bundle import validate_bundle
+
+        finish = BASE + timedelta(seconds=5)
+        lifecycle = {
+            "last_sample_at_utc": finish.isoformat(),
+            "termination_noticed_at_utc": finish.isoformat(),
+            "finalised_at_utc": finish.isoformat(),
+            "completion_status": "complete",
+            "interruption_reason": None,
+        }
+        samples = [
+            {**_sample("drive_v5", 0), "mil_on": False, "dtc_count": 0},
+            {**_sample("drive_v5", 1), "mil_on": False, "dtc_count": 0},
+        ]
+        checked = validate_bundle(
+            make_bundle(
+                tmp_path,
+                "drive_v5",
+                samples=samples,
+                summary_patch=lifecycle,
+                manifest_patch={
+                    **lifecycle,
+                    "last_successful_obd_response_at_utc": finish.isoformat(),
+                    "poll_plan_version": 5,
+                },
+            ),
+            config=app_config,
+        )
+        assert checked.manifest["poll_plan_version"] == 5
+        assert checked.latest_sample["dtc_count"] == 0

@@ -503,7 +503,7 @@ object RemovableStoragePolicy {
 }
 
 object ObdPollPlan {
-    const val VERSION = 4
+    const val VERSION = 5
     const val TARGET_CYCLE_MILLIS = 5_000L
 
     // ISO 9141 has to serialize every request.  Six fast PIDs plus the rotating work
@@ -531,7 +531,11 @@ object ObdPollPlan {
         // cycle issue the whole schedule. The slow PIDs retain their 12-cycle cadence and use
         // separated phases.
         addAll(medium.filterIndexed { index, _ -> index % 3 == (sequence % 3).toInt() })
-        addAll(slow.filterIndexed { index, _ -> index * 4 == (sequence % 12).toInt() })
+        // v5: phases 1 and 5 rather than 0 and 4. The medium rotation puts four PIDs on the
+        // sequence%3==0 cycles and three on the others; a slow PID on a four-medium cycle made
+        // an eight-command cycle (~5.4 s, an overrun) every third cycle. On a three-medium
+        // cycle the worst case is seven commands, which fits.
+        addAll(slow.filterIndexed { index, _ -> index * 4 + 1 == (sequence % 12).toInt() })
     }.filter(supported::contains)
 
     fun tier(pid: Int): String? = when (pid) {

@@ -203,6 +203,7 @@ class ObdDatabase(
               oxygen_sensor_1_voltage REAL, oxygen_sensor_1_short_term_fuel_trim REAL,
               oxygen_sensor_2_voltage REAL, oxygen_sensor_2_short_term_fuel_trim REAL,
               oxygen_sensors_present TEXT, obd_standard TEXT, distance_with_mil REAL,
+              mil_on INTEGER, dtc_count INTEGER,
               adapter_voltage REAL, estimated_fuel_rate REAL, estimated_fuel_consumption REAL,
               quality_json TEXT NOT NULL, UNIQUE(drive_id, sequence)
             )
@@ -260,6 +261,15 @@ class ObdDatabase(
                 )
             }
         }
+        if (oldVersion < 4 && newVersion >= 4) {
+            // Poll-plan v4 added PID 0x01 (mil_on, dtc_count) to the sample values without
+            // adding their columns here. The first 0x01 poll of every drive then failed the
+            // insert with "table samples has no column named dtc_count", the drive ended as
+            // database_fault, and a three-minute trip became six twenty-second fragments.
+            // Every sample value is a column; a new value needs its column in the same change.
+            db.execSQL("ALTER TABLE samples ADD COLUMN mil_on INTEGER")
+            db.execSQL("ALTER TABLE samples ADD COLUMN dtc_count INTEGER")
+        }
         upgradeFailureForTest?.invoke()
         if (oldVersion !in 1 until newVersion || newVersion > DATABASE_VERSION) {
             throw IllegalStateException("unsupported OBD database upgrade $oldVersion -> $newVersion")
@@ -268,7 +278,7 @@ class ObdDatabase(
 
     companion object {
         private const val DATABASE_NAME = "obd_drives.db"
-        private const val DATABASE_VERSION = 3
+        private const val DATABASE_VERSION = 4
         private const val BACKUP_READY_NAME = "READY.json"
         private const val BACKUP_STAGING_NAME = ".obd-migration-v3.partial"
         private const val RESTORE_MARKER_SUFFIX = ".migration-restore.pending"
@@ -669,7 +679,12 @@ class ObdDatabase(
                 put("quality_json", quality.toString())
                 for ((key, value) in sample.values) {
                     when (value) {
+                        // Whole numbers bind as integers so an INTEGER column reads back as one
+                        // and exports as a JSON integer; the server refuses 3.0 for a count.
+                        is Int -> put(key, value)
+                        is Long -> put(key, value)
                         is Number -> put(key, value.toDouble())
+                        is Boolean -> put(key, if (value) 1 else 0)
                         is String -> put(key, value)
                         is List<*> -> put(key, JSONArray(value).toString())
                     }

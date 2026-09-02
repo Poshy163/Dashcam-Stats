@@ -1218,6 +1218,7 @@ class ObdLoggerService : Service() {
                 "command_timeout" -> "poll_timeout"
                 "connection_lost" -> "connection_lost"
                 "process_terminated" -> "uncaught_restart"
+                "database_fault" -> "database_fault"
                 else -> "unknown"
             },
             driveId = driveId,

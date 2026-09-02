@@ -786,6 +786,7 @@ def _validate_manifest(
             2,
             3,
             4,
+            5,
         }:
             raise BundleError("manifest.poll_plan_version is not supported")
 

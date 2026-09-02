@@ -80,6 +80,8 @@ class BundleExporter(
         "fuel_system_1",
         "oxygen_sensors_present",
         "obd_standard",
+        "mil_on",
+        "dtc_count",
     )
 
     fun export(driveId: String): ExportedBundle {
@@ -294,10 +296,13 @@ class BundleExporter(
         result.put("quality", JSONObject(row.getString("quality_json")))
         for (key in units.keys + unitlessSampleFields) {
             if (!row.has(key) || row.isNull(key)) continue
-            if (key == "oxygen_sensors_present") {
-                result.put(key, JSONArray(row.getString(key)))
-            } else {
-                result.put(key, row.get(key))
+            when (key) {
+                "oxygen_sensors_present" -> result.put(key, JSONArray(row.getString(key)))
+                // Stored as INTEGER 0/1; the bundle contract (and the server) want a boolean.
+                "mil_on" -> result.put(key, row.getLong(key) != 0L)
+                // getLong also folds a legacy REAL 3.0 back to 3; the server rejects 3.0.
+                "dtc_count" -> result.put(key, row.getLong(key))
+                else -> result.put(key, row.get(key))
             }
         }
         return result

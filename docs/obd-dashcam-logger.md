@@ -240,6 +240,20 @@ provenance and never counts them toward measured completeness. The slow slot the
 `0x01`, the one supported PID this car has that earlier plans never asked for, decoded as
 `mil_on` and `dtc_count`. Driving-critical cadence is deliberately untouched; a tighter medium
 rotation waits for the suffix to prove itself on a real drive.
+
+App `0.2.9` declares plan **v5** and exists because v4 failed in the field. The logger's local
+SQLite `samples` table is fixed-column -- every sample value is a column -- and v4 added the
+`0x01` values without their columns, so the first `0x01` poll of every drive (the fifth cycle)
+failed its insert, the drive ended as `database_fault`, and a three-minute trip became six
+twenty-second fragments. 0.2.9 adds `mil_on INTEGER` and `dtc_count INTEGER` (database version 4),
+binds whole numbers and booleans as integers on write, and exports them with the JSON types the
+server validator requires (boolean, integer). The same drives also settled two open questions:
+the response-count suffix saved essentially nothing on this adapter (its adaptive timing was
+already short), while the 40 ms gap took the six-command cycle from ~4.36 s to ~4.0 s; and the
+eight-command cycle -- a slow PID landing on a four-medium phase -- still overran at ~5.4 s every
+third cycle. v5 therefore moves the slow PIDs to phases 1 and 5, where the medium rotation carries
+three PIDs, so no cycle ever needs an eighth command. v4 keeps its own cadence map on the server
+for the bundles the 0.2.8 logger exported.
 Only transport-level faults (missing prompt, overflow, failed write, disconnect) still taint and
 reconnect, and a fatal fault mid-cycle first persists the partial sample already gathered, marked
 `failed_after_partial`/`partial`, so observed values survive the reconnect.

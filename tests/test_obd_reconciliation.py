@@ -23,7 +23,7 @@ def test_v4_reads_the_constants_once_and_adds_the_lamp() -> None:
     (and out of measured completeness), PID 0x01 in the slot they free. v3 must not move."""
     version4, v4 = specs_for_poll_plan(4)
     assert version4 == 4
-    assert POLL_PLAN_VERSION == 4
+    assert POLL_PLAN_VERSION == 5
     by = {spec.name: spec for spec in v4}
     assert (by["timing_advance"].tier, by["timing_advance"].cadence_s) == ("medium", 15.0)
     assert (by["vehicle_speed"].tier, by["vehicle_speed"].cadence_s) == ("fast", 5.0)
@@ -37,6 +37,27 @@ def test_v4_reads_the_constants_once_and_adds_the_lamp() -> None:
     _, v3 = specs_for_poll_plan(3)
     assert next(spec for spec in v3 if spec.name == "obd_standard").tier == "slow"
     assert not any(spec.name == "mil_on" for spec in v3)
+
+
+def test_v5_moves_the_slow_pids_off_the_four_medium_cycles() -> None:
+    """Same signals as v4; only the slow phases change, and v4 keeps its own map."""
+    from app.ingest.obd_reconciliation import _POLL_PLAN_SPECS
+
+    version5, v5 = specs_for_poll_plan(5)
+    assert version5 == 5
+    _, v4 = specs_for_poll_plan(4)
+    assert [spec.name for spec in v5] == [spec.name for spec in v4]
+    phases4, phases5 = _POLL_PLAN_SPECS[4][1], _POLL_PLAN_SPECS[5][1]
+    assert (phases4[0x21], phases4[0x01]) == (0, 4)
+    assert (phases5[0x21], phases5[0x01]) == (1, 5)
+
+    # A phase-1 or phase-5 cycle carries three medium PIDs; phase 0 carries four.
+    def medium_on(phase: int) -> int:
+        return sum(1 for pid, p in phases5.items() if pid not in (0x21, 0x01) and p == phase % 3)
+
+    assert medium_on(0) == 4
+    assert medium_on(1) == 3
+    assert medium_on(5) == 3
 
 
 def test_unknown_legacy_plan_is_not_mistaken_for_v3() -> None:

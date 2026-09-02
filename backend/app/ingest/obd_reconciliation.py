@@ -22,7 +22,7 @@ from app.db.session import get_session_factory
 
 log = structlog.get_logger(__name__)
 
-POLL_PLAN_VERSION = 4
+POLL_PLAN_VERSION = 5
 PROJECTION_VERSION = 2
 NOMINAL_CYCLE_S = 5.0
 GAP_TOLERANCE = 1.5
@@ -215,10 +215,23 @@ POLL_PHASES_V4: dict[int, int] = {
     0x21: 0,
     0x01: 4,
 }
+# Poll-plan v5 (logger 0.2.9): the same signals as v4, with the two slow PIDs moved from
+# phases 0/4 to 1/5. The medium rotation puts four PIDs on the sequence%3==0 cycles and
+# three on the others, so a slow PID on a four-medium cycle made an eight-command cycle
+# (~5.4 s measured, an overrun) every third cycle; on a three-medium cycle the worst case is
+# seven commands, which fits the five-second target. v4 keeps its own map for the handful of
+# drives the 0.2.8 logger exported.
+POLL_PHASES_V5: dict[int, int] = {
+    **{pid: phase for pid, phase in POLL_PHASES_V4.items() if pid not in (0x21, 0x01)},
+    # slow = listOf(0x21, 0x01); index * 4 + 1 == sequence % 12
+    0x21: 1,
+    0x01: 5,
+}
 _POLL_PLAN_SPECS: dict[int, tuple[tuple[SignalSpec, ...], dict[int, int]]] = {
     2: (SIGNALS_V2, POLL_PHASES_V2),
     3: (SIGNALS, POLL_PHASES_V3),
     4: (SIGNALS_V4, POLL_PHASES_V4),
+    5: (SIGNALS_V4, POLL_PHASES_V5),
 }
 
 
