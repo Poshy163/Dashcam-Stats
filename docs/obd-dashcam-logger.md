@@ -224,6 +224,22 @@ driving-critical stream inside the target cadence on the serial ISO 9141 adapter
 regularly overrunning it while attempting every optional command. App `0.2.3` identifies this
 plan and hardened bundles declare `poll_plan_version=3`; the server retains the v2 cadence contract
 for historical drives.
+
+App `0.2.8` declares plan **v4**. It was designed from a measured drive rather than a guess:
+under v3 the cycle was already at the five-second ceiling (six commands took ~4.36 s, seven
+~5.05 s and an overrun), so nothing could be added to it. v4 changes the cost of a command
+instead of the count. Every live mode-01 request now carries the ELM327 expected-response-count
+suffix (`010C1`), so on this single-ECU K-line car the adapter returns the moment the one reply
+lands instead of sitting out its adaptive timeout; an adapter that answers `?` to the suffix turns
+it off for that session and the request is repeated in the plain form, so the worst case is
+exactly v3. The forced 100 ms inter-command gap drops to 40 ms (the ELM enforces ISO 9141 P3
+itself). The two PIDs that cannot change during a drive -- `0x13` which O2 sensors exist and `0x1C`
+the OBD standard -- leave the rotation, are read once after the ECU proof, and their answers are
+carried into every sample, so downstream shapes are unchanged; the server treats them as `static`
+provenance and never counts them toward measured completeness. The slow slot they free takes
+`0x01`, the one supported PID this car has that earlier plans never asked for, decoded as
+`mil_on` and `dtc_count`. Driving-critical cadence is deliberately untouched; a tighter medium
+rotation waits for the suffix to prove itself on a real drive.
 Only transport-level faults (missing prompt, overflow, failed write, disconnect) still taint and
 reconnect, and a fatal fault mid-cycle first persists the partial sample already gathered, marked
 `failed_after_partial`/`partial`, so observed values survive the reconnect.

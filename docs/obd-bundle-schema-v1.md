@@ -72,6 +72,8 @@ The exact `units` object is:
 | `estimated_fuel_rate` | `L/h` |
 | `estimated_fuel_consumption` | `L/100 km` |
 | `distance_with_mil` | `km` |
+| `mil_on` | boolean (plan v4, PID `0x01` byte A bit 7: check-engine lamp on) |
+| `dtc_count` | count (plan v4, PID `0x01` byte A bits 0-6: stored trouble codes) |
 
 `samples.ndjson.gz` is gzip-compressed NDJSON: one object and one newline per record. Every
 sample requires `sample_id`, `drive_id`, `timestamp_utc`, `sequence`, `ecu_data_status`, and
@@ -97,6 +99,7 @@ explicit `null`; non-null values are finite and within these inclusive ranges:
 | `estimated_fuel_rate` | 0..1000 |
 | `estimated_fuel_consumption` | 0..10000 |
 | `distance_with_mil` | 0..65535 |
+| `dtc_count` | 0..127 |
 
 The optional unitless fields are `fuel_system_1` and `obd_standard` (non-empty strings up
 to 128 characters or `null`) and `oxygen_sensors_present` (unique integer indices 1..8 or

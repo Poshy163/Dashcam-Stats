@@ -4652,3 +4652,81 @@ class TestDriveSeriesApi:
         assert summary["total_distance_km"] == 0.0
         assert summary["average_fuel_consumption_l_100km"] is None
         assert summary["first_drive_at"] is None
+
+
+class TestPollPlanV4Bundles:
+    """Logger 0.2.8 exports plan v4: PID 0x01's lamp and DTC count ride on each sample."""
+
+    def _lifecycle(self):
+        finish = BASE + timedelta(seconds=5)
+        lifecycle = {
+            "last_sample_at_utc": finish.isoformat(),
+            "termination_noticed_at_utc": finish.isoformat(),
+            "finalised_at_utc": finish.isoformat(),
+            "completion_status": "complete",
+            "interruption_reason": None,
+        }
+        manifest = {
+            **lifecycle,
+            "last_successful_obd_response_at_utc": finish.isoformat(),
+            "poll_plan_version": 4,
+        }
+        return lifecycle, manifest
+
+    def test_v4_is_accepted_and_the_lamp_fields_survive(self, tmp_path, app_config):
+        from app.ingest.obd_bundle import validate_bundle
+
+        lifecycle, manifest = self._lifecycle()
+        samples = [
+            {**_sample("drive_v4", 0), "mil_on": False, "dtc_count": 0},
+            {**_sample("drive_v4", 1), "mil_on": True, "dtc_count": 3},
+        ]
+        checked = validate_bundle(
+            make_bundle(
+                tmp_path,
+                "drive_v4",
+                samples=samples,
+                summary_patch=lifecycle,
+                manifest_patch=manifest,
+            ),
+            config=app_config,
+        )
+        assert checked.manifest["poll_plan_version"] == 4
+        # The validated bundle keeps only the newest sample in memory; it must carry the
+        # new fields through untouched.
+        assert checked.latest_sample["mil_on"] is True
+        assert checked.latest_sample["dtc_count"] == 3
+
+    def test_a_lamp_that_is_not_a_boolean_is_rejected(self, tmp_path, app_config):
+        from app.ingest.obd_bundle import BundleError, validate_bundle
+
+        lifecycle, manifest = self._lifecycle()
+        samples = [{**_sample("drive_v4", 0), "mil_on": "yes"}, _sample("drive_v4", 1)]
+        with pytest.raises(BundleError):
+            validate_bundle(
+                make_bundle(
+                    tmp_path,
+                    "drive_v4",
+                    samples=samples,
+                    summary_patch=lifecycle,
+                    manifest_patch=manifest,
+                ),
+                config=app_config,
+            )
+
+    def test_a_dtc_count_beyond_seven_bits_is_rejected(self, tmp_path, app_config):
+        from app.ingest.obd_bundle import BundleError, validate_bundle
+
+        lifecycle, manifest = self._lifecycle()
+        samples = [{**_sample("drive_v4", 0), "dtc_count": 200}, _sample("drive_v4", 1)]
+        with pytest.raises(BundleError):
+            validate_bundle(
+                make_bundle(
+                    tmp_path,
+                    "drive_v4",
+                    samples=samples,
+                    summary_patch=lifecycle,
+                    manifest_patch=manifest,
+                ),
+                config=app_config,
+            )

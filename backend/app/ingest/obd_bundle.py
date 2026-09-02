@@ -212,7 +212,15 @@ SAMPLE_IDENTITY_FIELDS = frozenset(
     {"sample_id", "drive_id", "timestamp_utc", "sequence", "ecu_data_status"}
 )
 SAMPLE_TELEMETRY_FIELDS = frozenset(
-    {*UNITS_V1, "fuel_system_1", "oxygen_sensors_present", "obd_standard"}
+    {
+        *UNITS_V1,
+        "fuel_system_1",
+        "oxygen_sensors_present",
+        "obd_standard",
+        # Poll-plan v4: mode-01 PID 0x01, the check-engine lamp and stored-DTC count.
+        "mil_on",
+        "dtc_count",
+    }
 )
 # Quality remains server-side and is stripped from the HA body.  The names below are the
 # v1 logger contract; accepting only bounded JSON values prevents a future logger bug from
@@ -777,6 +785,7 @@ def _validate_manifest(
         if _integer(manifest["poll_plan_version"], field_name="manifest.poll_plan_version") not in {
             2,
             3,
+            4,
         }:
             raise BundleError("manifest.poll_plan_version is not supported")
 
@@ -900,6 +909,11 @@ def _validate_sample(
         _text(value["fuel_system_1"], field_name="sample.fuel_system_1", maximum=128)
     if "obd_standard" in value and value["obd_standard"] is not None:
         _text(value["obd_standard"], field_name="sample.obd_standard", maximum=128)
+    if "mil_on" in value and value["mil_on"] is not None and not isinstance(value["mil_on"], bool):
+        raise BundleError("sample.mil_on must be a boolean")
+    if "dtc_count" in value and value["dtc_count"] is not None:
+        # Seven bits of PID 0x01 byte A; anything larger is not a decode of that byte.
+        _integer(value["dtc_count"], field_name="sample.dtc_count", minimum=0, maximum=127)
     if "oxygen_sensors_present" in value and value["oxygen_sensors_present"] is not None:
         sensors = value["oxygen_sensors_present"]
         if (
@@ -1981,6 +1995,8 @@ def _sample_row(sample: dict[str, Any], drive_db_id: int) -> dict[str, Any]:
         "oxygen_sensors_present": sample.get("oxygen_sensors_present"),
         "obd_standard": sample.get("obd_standard"),
         "distance_with_mil_km": sample.get("distance_with_mil"),
+        "mil_on": sample.get("mil_on"),
+        "dtc_count": sample.get("dtc_count"),
         "oxygen_sensor_1_voltage_v": sample.get("oxygen_sensor_1_voltage"),
         "oxygen_sensor_1_short_term_fuel_trim_pct": sample.get(
             "oxygen_sensor_1_short_term_fuel_trim"

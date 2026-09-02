@@ -1009,6 +1009,10 @@ class OBDSample(Base):
     oxygen_sensors_present: Mapped[list | None] = mapped_column(JSON, nullable=True)
     obd_standard: Mapped[str | None] = mapped_column(String(128), nullable=True)
     distance_with_mil_km: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Poll-plan v4: mode-01 PID 0x01. Nullable because every drive before logger 0.2.8
+    # never asked for it.
+    mil_on: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    dtc_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     oxygen_sensor_1_voltage_v: Mapped[float | None] = mapped_column(Float, nullable=True)
     oxygen_sensor_1_short_term_fuel_trim_pct: Mapped[float | None] = mapped_column(
         Float, nullable=True

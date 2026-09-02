@@ -699,6 +699,30 @@ class ObdLoggerService : Service() {
         currentDriveId = driveId
         driveStartedElapsedMillis = SystemClock.elapsedRealtime()
         emitEvent("drive.lifecycle", "info", "started", "engine_detected", driveId)
+        elm.onResponseCountSuffixDisabled = {
+            emitEvent(
+                "obd.elm_session",
+                "info",
+                "changed",
+                "response_count_suffix_unsupported",
+                driveId,
+            )
+        }
+        // The two PIDs that cannot change during a drive are read once here, not every
+        // twelve cycles: their answers ride along in every sample so nothing downstream has
+        // to learn a new shape, and the bus time they used to cost goes to live values.
+        val staticValues = linkedMapOf<String, Any>()
+        for (pid in ObdPollPlan.staticOnce.filter(supported::contains)) {
+            if (controlPresent()) break
+            try {
+                staticValues.putAll(elm.query(pid))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: ElmProtocolException) {
+                // A malformed one-off answer is a missing static value, not a lost drive.
+                recordParserFailure(error)
+            }
+        }
         try {
             database.addDiagnostic(
                 driveId,
@@ -718,7 +742,7 @@ class ObdLoggerService : Service() {
             updateNotification("Recording vehicle telemetry")
             when (
                 val exit = recordDrive(
-                    config, elm, driveId, supported, lifecycle, deviceRoot, driveClock,
+                    config, elm, driveId, supported, lifecycle, deviceRoot, driveClock, staticValues,
                 )
             ) {
                 RecordingExit.EngineStopped -> {
@@ -884,6 +908,7 @@ class ObdLoggerService : Service() {
         lifecycle: EngineLifecycle,
         deviceRoot: File,
         driveClock: MonotonicUtcClock,
+        staticValues: Map<String, Any> = emptyMap(),
     ): RecordingExit {
         val diagnosticScan = DiagnosticScan(elm, driveId)
         val malformedLivePids = LivePidMalformedTracker()
@@ -987,6 +1012,7 @@ class ObdLoggerService : Service() {
             } finally {
                 sparseDiagnosticBudget.observeCommand(boundedElapsedMillis(voltageStarted))
             }
+            values.putAll(staticValues)
             values.putAll(ElmProtocol.estimates(values))
             val sampleTimestamp = driveClock.nowUtc()
             persistSample(

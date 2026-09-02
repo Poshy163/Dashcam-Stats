@@ -102,9 +102,16 @@ object ElmProtocol {
         if (value in safeDiagnostics || freezeFrame.matches(value)) {
             return ElmCommandCategory.VEHICLE_BUS
         }
-        if (value.length == 4 && value.startsWith("01")) {
+        // A mode-01 request is `01` + PID, optionally followed by ONE hex digit: the ELM327's
+        // expected-response-count. On this K-line car exactly one ECU answers, so `010C1`
+        // lets the adapter return the moment that reply lands instead of sitting out its
+        // adaptive timeout waiting for a second ECU that does not exist -- the single
+        // biggest lever on per-command latency here. Still exactly one PID per request.
+        if (value.length in 4..5 && value.startsWith("01")) {
+            val pidHex = value.substring(2, 4)
+            val suffixOk = value.length == 4 || value[4] in RESPONSE_COUNT_DIGITS
             return if (
-                value.substring(2).toIntOrNull(16)?.let { it in pidLengths || it == 0 } == true
+                suffixOk && pidHex.toIntOrNull(16)?.let { it in pidLengths || it == 0 } == true
             ) {
                 ElmCommandCategory.VEHICLE_BUS
             } else {
@@ -113,6 +120,13 @@ object ElmProtocol {
         }
         return null
     }
+
+    /** The only characters the ELM327 accepts as an expected-response count. */
+    private val RESPONSE_COUNT_DIGITS = ('1'..'9') + ('A'..'F')
+
+    /** `?` is the ELM327's whole reply to a command it does not understand. */
+    fun isUnrecognised(response: String): Boolean =
+        response.replace(">", "").trim() == "?"
 
     fun isSafe(command: String): Boolean = commandCategory(command) != null
 
@@ -478,6 +492,12 @@ object ElmProtocol {
         fun percentage(value: Int) = value * 100.0 / 255.0
         fun trim(value: Int): Double? = if (value == 0xFF) null else value * 100.0 / 128.0 - 100.0
         return when (pid) {
+            // Monitor status since DTCs cleared: bit 7 of A is the MIL, bits 0-6 the count
+            // of stored codes. The one supported PID this car has that v3 never asked for.
+            0x01 -> mapOf(
+                "mil_on" to (u(0) and 0x80 != 0),
+                "dtc_count" to (u(0) and 0x7F),
+            )
             0x03 -> mapOf("fuel_system_1" to fuelSystem(u(0)))
             0x04 -> mapOf("engine_load" to percentage(u(0)))
             0x05 -> mapOf("coolant_temperature" to (u(0) - 40.0))

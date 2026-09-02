@@ -503,16 +503,27 @@ object RemovableStoragePolicy {
 }
 
 object ObdPollPlan {
-    const val VERSION = 3
+    const val VERSION = 4
     const val TARGET_CYCLE_MILLIS = 5_000L
 
     // ISO 9141 has to serialize every request.  Six fast PIDs plus the rotating work
     // consistently overran the five-second target on the real adapter, producing
     // artificial 8-second gaps in speed and RPM.  Keep the driving-critical values in
     // every cycle and distribute all other live values across the same three-cycle tier.
+    //
+    // v4 (measured on the real car, 2026-09-02): the cycle was already at the ceiling --
+    // six commands took ~4.36 s, seven ~5.05 s (an overrun), so nothing could be ADDED.
+    // Instead two PIDs that never change during a drive (which O2 sensors exist, which OBD
+    // standard the ECU claims) leave the rotation and are read once at drive start; the
+    // slot that frees takes 0x01, the one supported PID this car has that was never asked
+    // for (MIL lamp and stored-DTC count). Per-command latency is cut separately, in the
+    // ELM client, which is what actually buys cadence.
     private val fast = listOf(0x04, 0x0C, 0x0D)
     private val medium = listOf(0x0E, 0x10, 0x11, 0x03, 0x05, 0x06, 0x07, 0x0F, 0x14, 0x15)
-    private val slow = listOf(0x13, 0x1C, 0x21)
+    private val slow = listOf(0x21, 0x01)
+
+    /** Constant for the life of a drive: polled once after the ECU proof, carried into every sample. */
+    val staticOnce = listOf(0x13, 0x1C)
 
     fun requestedPids(sequence: Long, supported: Set<Int>): List<Int> = buildList {
         addAll(fast)
@@ -527,9 +538,11 @@ object ObdPollPlan {
         in fast -> "fast"
         in medium -> "medium"
         in slow -> "slow"
+        in staticOnce -> "static"
         else -> null
     }
 
+    /** Cycles between polls of a rotating PID; null for static PIDs, which are never re-polled. */
     fun expectedIntervalCycles(pid: Int): Int? = when (pid) {
         in fast -> 1
         in medium -> 3

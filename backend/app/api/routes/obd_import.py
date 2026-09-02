@@ -222,6 +222,8 @@ def _series_sample(row: OBDSample, specs=SIGNALS) -> dict[str, object]:
         "adapter_voltage_v": row.adapter_voltage_v,
         "estimated_fuel_rate_l_h": row.estimated_fuel_rate_l_h,
         "estimated_fuel_consumption_l_100km": row.estimated_fuel_consumption_l_100km,
+        "mil_on": row.mil_on,
+        "dtc_count": row.dtc_count,
     }
     result["provenance"] = {
         spec.name: spec.provenance for spec in specs if getattr(row, spec.attribute) is not None

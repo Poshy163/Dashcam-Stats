@@ -35,6 +35,14 @@ data class DtcQueryResult(val codes: List<String>, val status: String)
 internal object ElmAdapterCommandPlan {
     const val parkedVoltageProbe = "ATRV"
 
+    /**
+     * Minimum quiet time between the prompt of one command and the write of the next. The
+     * ELM327 enforces the ISO 9141 inter-message timing (P3) on the K-line itself; this only
+     * needs to let the BLE UART bridge finish delivering the prompt. It was 100 ms, which at
+     * seven commands a cycle was 0.7 s of every 5 s cycle spent deliberately idle.
+     */
+    const val INTER_COMMAND_GAP_MILLIS = 40L
+
     val fullInitialization = listOf(
         "ATZ", "ATI", "ATD", "ATD0", "ATE0", "ATL0", "ATH1", "ATSP0", "ATE0",
         "ATH1", "ATM0", "ATS0", "ATAT1", "ATAL", "ATST64",
@@ -71,6 +79,21 @@ class ElmBleClient(
     private var connection: CompletableDeferred<Unit>? = null
     private var response: CompletableDeferred<String>? = null
     private var lastCommandAt = 0L
+
+    /**
+     * Whether live mode-01 requests carry the ELM327 expected-response-count suffix (`010C1`).
+     * On: the adapter returns as soon as the one ECU reply lands. Some clones do not
+     * implement the suffix and answer `?`; the first such reply turns it off for this
+     * session and the request is repeated in the plain form, so the worst case is exactly
+     * the behaviour before it existed. Reset on every connect so a replaced adapter gets a
+     * fresh chance.
+     */
+    @Volatile
+    var responseCountSuffixActive = true
+        private set
+
+    /** Invoked once per session when the suffix is found unsupported and switched off. */
+    var onResponseCountSuffixDisabled: (() -> Unit)? = null
     @Volatile
     private var gattConnected = false
     @Volatile
@@ -192,6 +215,7 @@ class ElmBleClient(
     }
 
     suspend fun connect() {
+        responseCountSuffixActive = true
         val startedAt = SystemClock.elapsedRealtime()
         metrics.connectionAttempted()
         try {
@@ -245,7 +269,9 @@ class ElmBleClient(
         val activeGatt = gatt ?: throw ElmException("BLE is not connected")
         val target = characteristic ?: throw ElmException("FFF1 is unresolved")
         val since = SystemClock.elapsedRealtime() - lastCommandAt
-        if (since < 100) delay(100 - since)
+        if (since < ElmAdapterCommandPlan.INTER_COMMAND_GAP_MILLIS) {
+            delay(ElmAdapterCommandPlan.INTER_COMMAND_GAP_MILLIS - since)
+        }
         val startedAt = SystemClock.elapsedRealtime()
         metrics.commandRequested(category)
         commandSession.beginCommand()
@@ -343,8 +369,17 @@ class ElmBleClient(
 
     suspend fun queryPayload(pid: Int): ByteArray? {
         val length = ElmProtocol.pidLengths[pid] ?: return null
-        val command = "01%02X".format(pid)
-        val reply = command(command)
+        val plain = "01%02X".format(pid)
+        var command = if (responseCountSuffixActive) plain + "1" else plain
+        var reply = command(command)
+        if (command != plain && ElmProtocol.isUnrecognised(reply)) {
+            // The adapter does not know the suffix. Fall back for the rest of this session
+            // and ask again the old way, so this PID is not lost to the discovery.
+            responseCountSuffixActive = false
+            onResponseCountSuffixDisabled?.invoke()
+            command = plain
+            reply = command(command)
+        }
         if (reply.uppercase().contains("NO DATA")) return null
         if (ElmProtocol.hasTransportError(reply)) throw ElmException("transport error for $command")
         val source = ecuSource ?: throw ElmException("ECU source is not learned")

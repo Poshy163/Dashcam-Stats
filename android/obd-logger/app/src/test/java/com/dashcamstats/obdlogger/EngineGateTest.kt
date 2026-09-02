@@ -56,7 +56,8 @@ class EngineGateTest {
     fun pollPlanNeverQueriesOrCountsUnsupportedPidsAsFailures() {
         val supported = setOf(0x0C, 0x03, 0x15, 0x13, 0x1C, 0x21, 0x99)
         val requested = ObdPollPlan.requestedPids(sequence = 0, supported = supported)
-        assertEquals(listOf(0x0C, 0x03, 0x15, 0x13), requested)
+        // 0x13 is static in v4 and never enters the rotation; 0x21 now leads the slow tier.
+        assertEquals(listOf(0x0C, 0x03, 0x15, 0x21), requested)
 
         val queried = mutableListOf<Int>()
         val missing = mutableListOf<Int>()
@@ -65,7 +66,7 @@ class EngineGateTest {
             val reply = if (pid in supported) mapOf("value" to 1.0) else emptyMap()
             if (reply.isEmpty()) missing += pid
         }
-        assertEquals(listOf(0x0C, 0x03, 0x15, 0x13), queried)
+        assertEquals(listOf(0x0C, 0x03, 0x15, 0x21), queried)
         assertTrue(missing.isEmpty())
         assertEquals(listOf(0x0C), ObdPollPlan.requestedPids(sequence = 1, supported = supported))
     }
@@ -124,12 +125,19 @@ class EngineGateTest {
     @Test
     fun mediumAndSlowCommandsAreDistributedWithoutChangingPerPidCadence() {
         val supported = setOf(
+            0x01,
             0x04, 0x0C, 0x0D,
             0x0E, 0x10, 0x11,
             0x03, 0x05, 0x06, 0x07, 0x0F, 0x14, 0x15,
             0x13, 0x1C, 0x21,
         )
         val cycles = (0L until 24L).associateWith { ObdPollPlan.requestedPids(it, supported) }
+        // Static PIDs are read once at drive start and must never consume a cycle.
+        for (pid in ObdPollPlan.staticOnce) {
+            assertTrue(cycles.values.none { pid in it })
+            assertEquals("static", ObdPollPlan.tier(pid))
+            assertNull(ObdPollPlan.expectedIntervalCycles(pid))
+        }
         assertTrue(cycles.values.all { requested -> requested.containsAll(listOf(0x04, 0x0C, 0x0D)) })
         val rotatingCountsPerCycle = cycles.values.map { requested -> requested.size - 3 }
         assertTrue(rotatingCountsPerCycle.all { it in 3..5 })
@@ -140,7 +148,7 @@ class EngineGateTest {
             assertEquals("medium", ObdPollPlan.tier(pid))
             assertEquals(3, ObdPollPlan.expectedIntervalCycles(pid))
         }
-        for (pid in listOf(0x13, 0x1C, 0x21)) {
+        for (pid in listOf(0x21, 0x01)) {
             val observed = cycles.filterValues { pid in it }.keys.toList()
             assertEquals(2, observed.size)
             assertEquals(12L, observed[1] - observed[0])

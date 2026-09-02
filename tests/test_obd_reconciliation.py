@@ -8,7 +8,7 @@ from app.ingest.obd_reconciliation import (
 def test_v2_and_v3_keep_their_own_cadence_contracts() -> None:
     """New logger builds must not rewrite the historical graph's expected spacing."""
     version2, v2 = specs_for_poll_plan(2)
-    version3, v3 = specs_for_poll_plan(POLL_PLAN_VERSION)
+    version3, v3 = specs_for_poll_plan(3)
 
     assert version2 == 2
     assert version3 == 3
@@ -16,6 +16,27 @@ def test_v2_and_v3_keep_their_own_cadence_contracts() -> None:
     v3_timing = next(spec for spec in v3 if spec.name == "timing_advance")
     assert (v2_timing.tier, v2_timing.cadence_s) == ("fast", 5.0)
     assert (v3_timing.tier, v3_timing.cadence_s) == ("medium", 15.0)
+
+
+def test_v4_reads_the_constants_once_and_adds_the_lamp() -> None:
+    """The current plan: cadence unchanged for live values, constants out of the rotation
+    (and out of measured completeness), PID 0x01 in the slot they free. v3 must not move."""
+    version4, v4 = specs_for_poll_plan(4)
+    assert version4 == 4
+    assert POLL_PLAN_VERSION == 4
+    by = {spec.name: spec for spec in v4}
+    assert (by["timing_advance"].tier, by["timing_advance"].cadence_s) == ("medium", 15.0)
+    assert (by["vehicle_speed"].tier, by["vehicle_speed"].cadence_s) == ("fast", 5.0)
+    for name in ("oxygen_sensors_present", "obd_standard"):
+        assert by[name].tier == "static"
+        assert by[name].provenance == "static"
+    assert (by["mil_on"].pid, by["mil_on"].tier, by["mil_on"].cadence_s) == (0x01, "slow", 60.0)
+    assert by["mil_on"].discrete
+    assert (by["dtc_count"].pid, by["dtc_count"].provenance) == (0x01, "measured")
+
+    _, v3 = specs_for_poll_plan(3)
+    assert next(spec for spec in v3 if spec.name == "obd_standard").tier == "slow"
+    assert not any(spec.name == "mil_on" for spec in v3)
 
 
 def test_unknown_legacy_plan_is_not_mistaken_for_v3() -> None:

@@ -39,12 +39,16 @@ class ElmProtocolTest {
         listOf("ATRV", "ATZ", "ATI", "ATE0", "ATPC").forEach { command ->
             assertEquals(command, ElmCommandCategory.ADAPTER_LOCAL, ElmProtocol.commandCategory(command))
         }
-        listOf("0100", "010C", "020000", "03", "07", "0902").forEach { command ->
+        listOf("0100", "010C", "010C1", "0101F", "020000", "03", "07", "0902").forEach { command ->
             assertEquals(command, ElmCommandCategory.VEHICLE_BUS, ElmProtocol.commandCategory(command))
         }
-        listOf("04", "ATMA", "ATMR", "ATSH7E0", "garbage").forEach { command ->
+        // A response-count suffix is one hex digit 1-F: `0` and a second digit are not it.
+        listOf("04", "ATMA", "ATMR", "ATSH7E0", "garbage", "010C0", "010C10", "010CG").forEach { command ->
             assertNull(command, ElmProtocol.commandCategory(command))
         }
+        assertTrue(ElmProtocol.isUnrecognised("?\r\r>"))
+        assertFalse(ElmProtocol.isUnrecognised("41 0C 1A F0\r\r>"))
+        assertFalse(ElmProtocol.isUnrecognised("NO DATA\r>"))
     }
 
     @Test
@@ -174,6 +178,15 @@ class ElmProtocolTest {
         assertEquals(
             mapOf("distance_with_mil" to 500.0),
             ElmProtocol.decode(0x21, byteArrayOf(0x01, 0xF4.toByte())),
+        )
+        // 0x01: A = 0x83 -> MIL on, three stored codes; A = 0x00 -> lamp off, none.
+        assertEquals(
+            mapOf("mil_on" to true, "dtc_count" to 3),
+            ElmProtocol.decode(0x01, byteArrayOf(0x83.toByte(), 0x07, 0x65, 0x04)),
+        )
+        assertEquals(
+            mapOf("mil_on" to false, "dtc_count" to 0),
+            ElmProtocol.decode(0x01, byteArrayOf(0x00, 0x07, 0x65, 0x04)),
         )
         assertEquals("3", ElmProtocol.protocolNumber("ATDPN\rA3\r>"))
     }

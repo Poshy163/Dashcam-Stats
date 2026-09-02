@@ -22,7 +22,7 @@ from app.db.session import get_session_factory
 
 log = structlog.get_logger(__name__)
 
-POLL_PLAN_VERSION = 3
+POLL_PLAN_VERSION = 4
 PROJECTION_VERSION = 2
 NOMINAL_CYCLE_S = 5.0
 GAP_TOLERANCE = 1.5
@@ -190,9 +190,35 @@ _V2_FAST_NAMES = {
 SIGNALS_V2: tuple[SignalSpec, ...] = tuple(
     replace(spec, tier="fast", every=1) if spec.name in _V2_FAST_NAMES else spec for spec in SIGNALS
 )
+# Poll-plan v4 (logger 0.2.8). Measured on the car: the v3 cycle was already at the five
+# second ceiling -- six commands ~4.36 s, seven ~5.05 s and an overrun -- so nothing could be
+# ADDED. Instead the two PIDs that cannot change during a drive (which O2 sensors exist,
+# which OBD standard the ECU claims) leave the rotation: the logger reads them once at drive
+# start and carries the answers into every sample, so the shape is unchanged and they are
+# simply always present. They are ``static`` provenance so they never count toward measured
+# completeness. The slow slot that frees takes 0x01 -- the one supported PID this car has
+# that v3 never asked for -- decoded as the check-engine lamp and the stored-DTC count.
+_V4_STATIC_NAMES = {"oxygen_sensors_present", "obd_standard"}
+SIGNALS_V4: tuple[SignalSpec, ...] = (
+    *(
+        replace(spec, tier="static", every=1, provenance="static")
+        if spec.name in _V4_STATIC_NAMES
+        else spec
+        for spec in SIGNALS
+    ),
+    SignalSpec("mil_on", "mil_on", "Check-engine lamp", 0x01, "slow", 12, discrete=True),
+    SignalSpec("dtc_count", "dtc_count", "Stored trouble codes", 0x01, "slow", 12),
+)
+POLL_PHASES_V4: dict[int, int] = {
+    **{pid: phase for pid, phase in POLL_PHASES_V3.items() if pid not in (0x13, 0x1C)},
+    # slow = listOf(0x21, 0x01); index * 4 == sequence % 12
+    0x21: 0,
+    0x01: 4,
+}
 _POLL_PLAN_SPECS: dict[int, tuple[tuple[SignalSpec, ...], dict[int, int]]] = {
     2: (SIGNALS_V2, POLL_PHASES_V2),
     3: (SIGNALS, POLL_PHASES_V3),
+    4: (SIGNALS_V4, POLL_PHASES_V4),
 }
 
 
