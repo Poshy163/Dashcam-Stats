@@ -9,7 +9,6 @@ window they describe is over in two minutes.
 
 from __future__ import annotations
 
-import asyncio
 import threading
 import time
 from collections import deque
@@ -516,7 +515,6 @@ class IngestStatus:
 
 
 _status: IngestStatus | None = None
-_status_lock = asyncio.Lock()
 
 
 def get_status() -> IngestStatus:
@@ -526,7 +524,7 @@ def get_status() -> IngestStatus:
     return _status
 
 
-async def hydrate_last_success() -> datetime | None:
+async def hydrate_last_success(session=None) -> datetime | None:
     """Load the last completed, non-empty successful run into the live status singleton.
 
     This is deliberately called once during application startup. The status endpoint stays
@@ -536,19 +534,25 @@ async def hydrate_last_success() -> datetime | None:
     from sqlalchemy import select
 
     from app.db.models import IngestRun
-    from app.db.session import session_scope
 
-    async with session_scope() as session:
-        observed = await session.scalar(
-            select(IngestRun.finished_at)
-            .where(
-                IngestRun.state == RunState.OK.value,
-                IngestRun.files_transferred > 0,
-                IngestRun.finished_at.is_not(None),
-            )
-            .order_by(IngestRun.finished_at.desc())
-            .limit(1)
+    stmt = (
+        select(IngestRun.finished_at)
+        .where(
+            IngestRun.state == RunState.OK.value,
+            IngestRun.files_transferred > 0,
+            IngestRun.finished_at.is_not(None),
         )
+        .order_by(IngestRun.finished_at.desc())
+        .limit(1)
+    )
+
+    if session is not None:
+        observed = await session.scalar(stmt)
+    else:
+        from app.db.session import session_scope
+
+        async with session_scope() as s:
+            observed = await s.scalar(stmt)
 
     get_status().set_last_success(observed)
     return observed

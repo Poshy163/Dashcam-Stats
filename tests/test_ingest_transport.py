@@ -561,7 +561,7 @@ class TestStatusStartupHydration:
         await db_session.commit()
         reset_status_for_tests()
 
-        observed = await hydrate_last_success()
+        observed = await hydrate_last_success(db_session)
 
         assert observed == selected
         assert get_status().snapshot()["last_success_ts"] == selected.isoformat()
@@ -574,7 +574,7 @@ class TestStatusStartupHydration:
         reset_status_for_tests()
         get_status().set_last_success(datetime.now(UTC))
 
-        assert await hydrate_last_success() is None
+        assert await hydrate_last_success(db_session) is None
         assert get_status().snapshot()["last_success_ts"] is None
 
 
