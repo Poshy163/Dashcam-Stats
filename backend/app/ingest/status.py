@@ -38,7 +38,7 @@ class IngestStatus:
     """Mutable progress, guarded because the transport updates it from a worker thread."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._running = False
         self._cancel = threading.Event()
 
