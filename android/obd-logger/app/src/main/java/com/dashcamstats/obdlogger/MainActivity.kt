@@ -26,6 +26,8 @@ class MainActivity : Activity() {
     private lateinit var webhookEnabled: CheckBox
     private lateinit var webhookUrl: EditText
     private lateinit var webhookApiKey: EditText
+    private lateinit var backupAwakeSeconds: EditText
+    private lateinit var idleAwakeSeconds: EditText
     private lateinit var ownership: CheckBox
     private lateinit var enabled: CheckBox
     private lateinit var status: TextView
@@ -82,6 +84,20 @@ class MainActivity : Activity() {
             current.webhookUrl,
         )
         webhookApiKey = field(layout, "Webhook API key (X-API-Key)", current.webhookApiKey)
+        backupAwakeSeconds = field(
+            layout,
+            "Backup awake time (Wi-Fi connected, seconds)",
+            current.backupAwakeSeconds.toString(),
+        ).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        idleAwakeSeconds = field(
+            layout,
+            "Idle awake time (non-Wi-Fi, seconds)",
+            current.idleAwakeSeconds.toString(),
+        ).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
         ownership = CheckBox(this).apply {
             text = "I explicitly transferred adapter ownership from Home Assistant and phones"
             isChecked = current.ownershipTransferred
@@ -133,11 +149,13 @@ class MainActivity : Activity() {
             webhookEnabled = webhookEnabled.isChecked,
             webhookUrl = webhookUrl.text.toString().trim(),
             webhookApiKey = webhookApiKey.text.toString().trim(),
+            backupAwakeSeconds = backupAwakeSeconds.text.toString().toIntOrNull() ?: -1,
+            idleAwakeSeconds = idleAwakeSeconds.text.toString().toIntOrNull() ?: -1,
         )
         if (!config.thresholdConfigurationValid) {
             rejectConfiguration(
                 "Use 10.0–16.0 V, engine-off below engine-on, 0–300 seconds grace, " +
-                    "and a 15–3600 second parked interval",
+                    "15–3600 second parked interval, 30–3600s backup awake, and 15–3600s idle awake",
             )
             return
         }

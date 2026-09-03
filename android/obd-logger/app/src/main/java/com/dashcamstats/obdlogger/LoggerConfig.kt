@@ -17,14 +17,18 @@ data class LoggerConfig(
     val offGraceSeconds: Long = 30,
     val parkedIntervalSeconds: Long = 30,
     val voltageOnlyMode: Boolean = false,
-    val webhookEnabled: Boolean = false,
-    val webhookUrl: String = "",
-    val webhookApiKey: String = "",
+    val webhookEnabled: Boolean = true,
+    val webhookUrl: String = "http://192.168.1.16:8199/api/ingest/webhook",
+    val webhookApiKey: String = "qScVUWaO4qK575RsarARb3cr7zi1Y7RIt_4-mawkRxg",
+    val backupAwakeSeconds: Int = 1200,
+    val idleAwakeSeconds: Int = 300,
 ) {
     val thresholdConfigurationValid: Boolean
         get() = voltageOn in 10.0..16.0 && voltageOff in 10.0..16.0 &&
             voltageOff < voltageOn && offGraceSeconds in 0L..300L &&
-            parkedIntervalSeconds in 15L..3_600L
+            parkedIntervalSeconds in 15L..3_600L &&
+            backupAwakeSeconds in 30..3_600 &&
+            idleAwakeSeconds in 15..3_600
 
     val canRun: Boolean
         get() = enabled && ownershipTransferred && adapterAddress.matches(MAC) &&
@@ -34,6 +38,10 @@ data class LoggerConfig(
         private val MAC = Regex("^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
         private val VEHICLE_ID = Regex("^[a-z0-9][a-z0-9_-]{0,63}$")
         private val ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+        const val DEFAULT_WEBHOOK_URL = "http://192.168.1.16:8199/api/ingest/webhook"
+        const val DEFAULT_WEBHOOK_API_KEY = "qScVUWaO4qK575RsarARb3cr7zi1Y7RIt_4-mawkRxg"
+        const val DEFAULT_BACKUP_AWAKE_SECONDS = 1200
+        const val DEFAULT_IDLE_AWAKE_SECONDS = 300
     }
 }
 
@@ -51,6 +59,8 @@ object LoggerPreferences {
                 }
             }
         }
+        val savedUrl = prefs.getString("webhook_url", LoggerConfig.DEFAULT_WEBHOOK_URL)?.trim().orEmpty()
+        val savedApiKey = prefs.getString("webhook_api_key", LoggerConfig.DEFAULT_WEBHOOK_API_KEY)?.trim().orEmpty()
         return LoggerConfig(
             enabled = prefs.getBoolean("enabled", false),
             ownershipTransferred = prefs.getBoolean("ownership_transferred", false),
@@ -62,9 +72,11 @@ object LoggerPreferences {
             offGraceSeconds = prefs.getLong("off_grace_seconds", 30),
             parkedIntervalSeconds = prefs.getLong("parked_interval_seconds", 30),
             voltageOnlyMode = prefs.getBoolean("voltage_only_mode", false),
-            webhookEnabled = prefs.getBoolean("webhook_enabled", false),
-            webhookUrl = prefs.getString("webhook_url", "")?.trim().orEmpty(),
-            webhookApiKey = prefs.getString("webhook_api_key", "")?.trim().orEmpty(),
+            webhookEnabled = prefs.getBoolean("webhook_enabled", true),
+            webhookUrl = if (savedUrl.isBlank()) LoggerConfig.DEFAULT_WEBHOOK_URL else savedUrl,
+            webhookApiKey = if (savedApiKey.isBlank()) LoggerConfig.DEFAULT_WEBHOOK_API_KEY else savedApiKey,
+            backupAwakeSeconds = prefs.getInt("backup_awake_seconds", LoggerConfig.DEFAULT_BACKUP_AWAKE_SECONDS),
+            idleAwakeSeconds = prefs.getInt("idle_awake_seconds", LoggerConfig.DEFAULT_IDLE_AWAKE_SECONDS),
         )
     }
 
@@ -84,6 +96,8 @@ object LoggerPreferences {
             .putBoolean("webhook_enabled", config.webhookEnabled)
             .putString("webhook_url", config.webhookUrl.trim())
             .putString("webhook_api_key", config.webhookApiKey.trim())
+            .putInt("backup_awake_seconds", config.backupAwakeSeconds)
+            .putInt("idle_awake_seconds", config.idleAwakeSeconds)
             .apply()
     }
 

@@ -15,7 +15,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.TimeUnit
 
-internal const val ACTIVE_SLEEP_WINDOW_SECONDS = 900
+internal const val ACTIVE_SLEEP_WINDOW_SECONDS = 1200
 internal const val IDLE_SLEEP_WINDOW_SECONDS = 300
 private const val SLEEP_COUNTDOWN_PROPERTY = "persist.sys.sleep.countdown.time"
 private const val ACC_STATUS_SETTING = "acc_status"
@@ -52,51 +52,53 @@ internal fun sleepWindowCommand(
     ingestionCompleted: Boolean = false,
     accStateKnown: Boolean = false,
     accOn: Boolean = false,
+    activeSeconds: Int = ACTIVE_SLEEP_WINDOW_SECONDS,
+    idleSeconds: Int = IDLE_SLEEP_WINDOW_SECONDS,
 ): SleepWindowCommand = when (event) {
     SleepWindowEvent.STARTED -> if (wifiConnected || ingestionRequestActive) {
-        SleepWindowCommand("managed_active", ACTIVE_SLEEP_WINDOW_SECONDS)
+        SleepWindowCommand("managed_active", activeSeconds)
     } else if (!ingestionStateKnown) {
         SleepWindowCommand("awaiting_ingestion_state", null)
     } else {
-        SleepWindowCommand("managed_idle", IDLE_SLEEP_WINDOW_SECONDS)
+        SleepWindowCommand("managed_idle", idleSeconds)
     }
     SleepWindowEvent.WIFI_BECAME_PRESENT,
     SleepWindowEvent.INGESTION_STARTED,
-    -> SleepWindowCommand("managed_active", ACTIVE_SLEEP_WINDOW_SECONDS)
+    -> SleepWindowCommand("managed_active", activeSeconds)
     SleepWindowEvent.WIFI_LOST -> if (ingestionRequestActive) {
-        SleepWindowCommand("managed_active", ACTIVE_SLEEP_WINDOW_SECONDS)
+        SleepWindowCommand("managed_active", activeSeconds)
     } else if (!ingestionStateKnown) {
         SleepWindowCommand("awaiting_ingestion_state", null)
     } else {
-        SleepWindowCommand("managed_idle", IDLE_SLEEP_WINDOW_SECONDS)
+        SleepWindowCommand("managed_idle", idleSeconds)
     }
     SleepWindowEvent.INGESTION_ABSENCE_OBSERVED -> if (wifiConnected) {
-        SleepWindowCommand("managed_active", ACTIVE_SLEEP_WINDOW_SECONDS)
+        SleepWindowCommand("managed_active", activeSeconds)
     } else if (!ingestionStateKnown) {
         SleepWindowCommand("awaiting_ingestion_state", null)
     } else {
-        SleepWindowCommand("managed_idle", IDLE_SLEEP_WINDOW_SECONDS)
+        SleepWindowCommand("managed_idle", idleSeconds)
     }
     SleepWindowEvent.INGESTION_ENDED -> when {
-        !wifiConnected -> SleepWindowCommand("managed_idle", IDLE_SLEEP_WINDOW_SECONDS)
-        accStateKnown && !accOn -> SleepWindowCommand("managed_idle", IDLE_SLEEP_WINDOW_SECONDS)
-        else -> SleepWindowCommand("managed_active", ACTIVE_SLEEP_WINDOW_SECONDS)
+        !wifiConnected -> SleepWindowCommand("managed_idle", idleSeconds)
+        accStateKnown && !accOn -> SleepWindowCommand("managed_idle", idleSeconds)
+        else -> SleepWindowCommand("managed_active", activeSeconds)
     }
     SleepWindowEvent.ACC_BECAME_ON -> when {
         wifiConnected || ingestionRequestActive ->
-            SleepWindowCommand("managed_active", ACTIVE_SLEEP_WINDOW_SECONDS)
+            SleepWindowCommand("managed_active", activeSeconds)
         !ingestionStateKnown -> SleepWindowCommand("awaiting_ingestion_state", null)
-        else -> SleepWindowCommand("managed_idle", IDLE_SLEEP_WINDOW_SECONDS)
+        else -> SleepWindowCommand("managed_idle", idleSeconds)
     }
     SleepWindowEvent.ACC_BECAME_OFF -> when {
-        ingestionRequestActive -> SleepWindowCommand("managed_active", ACTIVE_SLEEP_WINDOW_SECONDS)
+        ingestionRequestActive -> SleepWindowCommand("managed_active", activeSeconds)
         !wifiConnected -> if (ingestionStateKnown) {
-            SleepWindowCommand("managed_idle", IDLE_SLEEP_WINDOW_SECONDS)
+            SleepWindowCommand("managed_idle", idleSeconds)
         } else {
             SleepWindowCommand("awaiting_ingestion_state", null)
         }
-        ingestionCompleted -> SleepWindowCommand("managed_idle", IDLE_SLEEP_WINDOW_SECONDS)
-        else -> SleepWindowCommand("managed_active", ACTIVE_SLEEP_WINDOW_SECONDS)
+        ingestionCompleted -> SleepWindowCommand("managed_idle", idleSeconds)
+        else -> SleepWindowCommand("managed_active", activeSeconds)
     }
 }
 
@@ -307,7 +309,7 @@ internal class SleepWindowRetryer(
  * events still cannot launch competing setprop processes or delay the OBD command stream.
  */
 internal class AdaptiveSleepWindowController(
-    context: Context,
+    private val context: Context,
     private val scope: CoroutineScope,
     property: SleepWindowPropertyAccessor = AndroidSleepWindowPropertyAccessor(),
     private val accState: AccStateAccessor = AndroidAccStateAccessor(context),
@@ -410,6 +412,7 @@ internal class AdaptiveSleepWindowController(
                         ingestionCompleted,
                     )
                 }
+                val config = LoggerPreferences.load(context)
                 retryer.reconcile(
                     state.wifiConnected,
                     state.ingestionStateKnown,
@@ -422,6 +425,8 @@ internal class AdaptiveSleepWindowController(
                         state.ingestionCompleted,
                         state.accStateKnown,
                         state.accOn,
+                        activeSeconds = config.backupAwakeSeconds,
+                        idleSeconds = config.idleAwakeSeconds,
                     ),
                     state.accStateKnown,
                     state.accOn,

@@ -501,7 +501,7 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
             if item is None or (
                 isinstance(item, int)
                 and not isinstance(item, bool)
-                and item in _LOGGER_SLEEP_WINDOW_TARGETS
+                and (item in _LOGGER_SLEEP_WINDOW_TARGETS or 1 <= item <= MAX_LOGGER_SLEEP_WINDOW_SECONDS)
             ):
                 clean[key] = item
         elif key == "sleep_window_observed_s":

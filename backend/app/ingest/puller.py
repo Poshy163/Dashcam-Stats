@@ -210,7 +210,7 @@ async def widen_sleep_window(address: str) -> bool:
     # an upgraded process can briefly retain an old false toggle or explicit duration, and the
     # persistent vendor property must never leave the app-owned policy or oscillate.
     wanted = INGEST_SLEEP_WINDOW_ACTIVE_SECONDS
-    if await adb.sleep_countdown(address) == wanted:
+    if await adb.sleep_countdown(address) >= wanted:
         return True
     if await adb.set_sleep_countdown(address, wanted):
         log.info("widened the head unit's ignition-off window", seconds=wanted)
