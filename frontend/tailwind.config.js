@@ -22,6 +22,10 @@ export default {
           DEFAULT: 'rgb(var(--accent) / <alpha-value>)',
           muted: 'rgb(var(--accent-muted) / <alpha-value>)',
         },
+        cyan: {
+          DEFAULT: 'rgb(var(--cyan) / <alpha-value>)',
+          muted: 'rgb(var(--cyan-muted) / <alpha-value>)',
+        },
         nav: {
           DEFAULT: 'rgb(var(--nav) / <alpha-value>)',
           raised: 'rgb(var(--nav-raised) / <alpha-value>)',
@@ -47,8 +51,10 @@ export default {
         '2xs': ['0.6875rem', { lineHeight: '1rem' }],
       },
       boxShadow: {
-        card: '0 1px 2px rgb(15 23 42 / 0.04), 0 8px 24px rgb(15 23 42 / 0.04)',
-        float: '0 16px 48px rgb(15 23 42 / 0.16)',
+        card: '0 1px 3px rgb(0 0 0 / 0.15), 0 8px 24px rgb(0 0 0 / 0.15)',
+        float: '0 16px 48px rgb(0 0 0 / 0.35)',
+        'glow-orange': '0 0 20px -3px rgb(255 107 0 / 0.4)',
+        'glow-cyan': '0 0 20px -3px rgb(0 240 255 / 0.35)',
       },
     },
   },

@@ -50,12 +50,12 @@ function dot(color: string, size = 12) {
 }
 
 const ICONS = {
-  start: dot('#16a34a', 16),
-  end: dot('#dc2626', 16),
-  plate: dot('#2563eb'),
-  vehicle: dot('#8b5cf6'),
-  recording: dot('#f59e0b'),
-  event: dot('#ef4444'),
+  start: dot('#10b981', 16),
+  end: dot('#ef4444', 16),
+  plate: dot('#00f0ff'),
+  vehicle: dot('#a855f7'),
+  recording: dot('#ff6b00'),
+  event: dot('#ff3b30'),
 }
 
 function FitBounds({ points }: { points: [number, number][] }) {
@@ -159,7 +159,7 @@ export default function RouteMap({
           <Polyline
             key={segmentIndex}
             positions={segment}
-            pathOptions={{ color: '#3b82f6', weight: 4, opacity: 0.85 }}
+            pathOptions={{ color: '#ff6b00', weight: 4.5, opacity: 0.95 }}
             eventHandlers={
               onPointClick
                 ? {

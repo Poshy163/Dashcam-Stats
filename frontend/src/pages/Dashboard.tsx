@@ -104,105 +104,119 @@ export default function Dashboard() {
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(19rem,1fr)]">
-        <section className="card p-5 sm:p-6">
+        <section className="card cockpit-panel p-5 sm:p-6">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <h2 className="section-title">Library progress</h2>
-              <p className="mt-1 text-sm text-content-muted">Analysis status across indexed recordings</p>
+              <div className="hud-tag">
+                <span className="h-1.5 w-1.5 rounded-full bg-cyan animate-pulse"></span>
+                CAN-BUS TELEMETRY PIPELINE
+              </div>
+              <h2 className="section-title mt-1">Library Analysis Index</h2>
+              <p className="mt-0.5 text-xs font-mono text-content-muted">Processing status across indexed recordings</p>
             </div>
-            <Link to="/queue" className="text-sm font-semibold text-accent hover:underline">View queue</Link>
+            <Link to="/queue" className="font-mono text-xs font-bold text-accent hover:underline flex items-center gap-1">
+              OPEN QUEUE <ArrowIcon />
+            </Link>
           </div>
 
           <div className="mt-6 grid items-center gap-7 sm:grid-cols-[10rem_minmax(0,1fr)]">
-            <div className="relative mx-auto h-36 w-36 rounded-full p-3" style={{ background: progressRing(analysedPct, activePct) }}>
-              <div className="grid h-full w-full place-items-center rounded-full bg-surface-raised text-center shadow-inner">
+            <div className="relative mx-auto h-36 w-36 rounded-full p-3 shadow-glow-orange" style={{ background: progressRing(analysedPct, activePct) }}>
+              <div className="grid h-full w-full place-items-center rounded-full bg-surface-raised text-center shadow-inner border border-border">
                 <div>
-                  <div className="tabular text-3xl font-bold tracking-tight">{processTotal.toLocaleString()}</div>
-                  <div className="mt-0.5 text-xs font-medium text-content-muted">indexed</div>
+                  <div className="tabular font-mono text-3xl font-black tracking-tight">{processTotal.toLocaleString()}</div>
+                  <div className="mt-0.5 font-mono text-2xs uppercase tracking-wider text-content-muted">CLIPS INDEXED</div>
                 </div>
               </div>
             </div>
 
             <div>
               <div className="grid grid-cols-2 gap-x-5 gap-y-4 sm:grid-cols-3">
-                <ProgressMetric color="bg-state-ok" value={processing.completed} label="Analysed" />
+                <ProgressMetric color="bg-state-ok shadow-[0_0_8px_rgba(16,210,130,0.5)]" value={processing.completed} label="Analysed" />
                 <ProgressMetric color="bg-surface-sunken ring-1 ring-border" value={processing.pending} label="Waiting" />
-                <ProgressMetric color="bg-accent" value={processing.processing} label="Processing" />
+                <ProgressMetric color="bg-cyan shadow-glow-cyan" value={processing.processing} label="Processing" />
                 {processing.failed > 0 && <ProgressMetric color="bg-state-error" value={processing.failed} label="Failed" />}
                 <ProgressMetric color="bg-state-warn" value={processing.invalid} label="Unusable" />
                 {processing.settling > 0 && (
                   <ProgressMetric color="bg-surface-sunken ring-1 ring-border" value={processing.settling} label="Still writing" />
                 )}
-                <ProgressMetric color="bg-accent-muted" value={processing.recordingsToday} label="Added today" />
+                <ProgressMetric color="bg-accent-muted border border-accent/40" value={processing.recordingsToday} label="Added today" />
               </div>
-              <div className="mt-5 rounded-lg bg-surface-sunken px-4 py-3 text-sm text-content-muted">
+              <div className="mt-5 rounded-lg border border-border/80 bg-surface-sunken/80 px-4 py-3 font-mono text-xs text-content-muted flex items-center justify-between">
+                <span>ANALYSIS THROUGHPUT:</span>
                 {processing.throughputPerHour === null ? (
-                  'Analysis rate will appear after more recordings finish.'
+                  <span className="text-content-faint">Calibrating…</span>
                 ) : (
-                  <>Current analysis rate <strong className="tabular font-semibold text-content">{processing.throughputPerHour.toFixed(1)} recordings/hour</strong></>
+                  <strong className="tabular font-bold text-cyan text-sm">{processing.throughputPerHour.toFixed(1)} clips / hr</strong>
                 )}
               </div>
             </div>
           </div>
         </section>
 
-        <section className="card p-5 sm:p-6">
+        <section className="card cockpit-panel p-5 sm:p-6">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <h2 className="section-title">Storage</h2>
-              <p className="mt-1 text-sm text-content-muted">Dashcam footage library</p>
+              <div className="hud-tag">
+                <span className="h-1.5 w-1.5 rounded-full bg-accent"></span>
+                NVME / STORAGE HUD
+              </div>
+              <h2 className="section-title mt-1">Footage Capacity</h2>
+              <p className="mt-0.5 text-xs font-mono text-content-muted">Dashcam footage library</p>
             </div>
-            <span className="grid h-11 w-11 place-items-center rounded-xl bg-accent-muted text-accent"><StorageIcon /></span>
+            <span className="grid h-11 w-11 place-items-center rounded-xl border border-accent/30 bg-accent/10 text-accent shadow-sm"><StorageIcon /></span>
           </div>
-          <div className="mt-8">
+          <div className="mt-7">
             <div className="flex items-end justify-between gap-3">
               <div>
-                <span className="tabular text-3xl font-bold tracking-tight">{formatBytes(storage.usedBytes)}</span>
-                <span className="ml-2 text-sm text-content-muted">used</span>
+                <span className="tabular font-mono text-3xl font-black tracking-tight">{formatBytes(storage.usedBytes)}</span>
+                <span className="ml-2 font-mono text-xs text-content-muted uppercase">used</span>
               </div>
-              <span className="tabular text-sm font-semibold text-content-muted">{Math.round(storagePct * 100)}%</span>
+              <span className="tabular font-mono text-sm font-bold text-accent">{Math.round(storagePct * 100)}%</span>
             </div>
             <ProgressBar value={storagePct} className="mt-4" />
-            <div className="mt-2 text-xs text-content-muted">of {formatBytes(storage.limitBytes)} configured capacity</div>
+            <div className="mt-2 font-mono text-2xs text-content-muted">Capacity limit: {formatBytes(storage.limitBytes)}</div>
           </div>
-          <div className="mt-7 rounded-lg border border-border bg-surface-sunken/60 p-3.5 text-sm leading-relaxed text-content-muted">
+          <div className="mt-6 rounded-lg border border-border bg-surface-sunken/70 p-3 text-xs font-mono leading-relaxed text-content-muted">
             {storage.deletionEnabled ? (
-              storage.footageWritable ? 'Automatic cleanup is enabled.' : 'Cleanup is enabled, but the footage folder is read-only.'
+              storage.footageWritable ? 'Automatic cleanup active.' : 'Cleanup enabled; footage mount is read-only.'
             ) : (
-              <>Retention is in <strong className="font-semibold text-content">report-only mode</strong>. Nothing will be deleted.</>
+              <>Retention policy: <strong className="font-semibold text-content">Report-only mode</strong></>
             )}
           </div>
-          <Link to="/settings" className="mt-4 inline-flex items-center gap-1.5 text-sm font-semibold text-accent hover:underline">
-            Manage storage <ArrowIcon />
+          <Link to="/settings" className="mt-4 inline-flex items-center gap-1.5 font-mono text-xs font-bold text-accent hover:underline">
+            MANAGE STORAGE <ArrowIcon />
           </Link>
         </section>
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(19rem,1fr)]">
         {latestJourney ? (
-          <section className="card overflow-hidden">
+          <section className="card cockpit-panel overflow-hidden">
             <div className="grid min-h-56 sm:grid-cols-[minmax(14rem,0.85fr)_minmax(0,1.4fr)]">
-              <div className="relative grid min-h-44 place-items-center overflow-hidden bg-accent-muted p-6 text-accent">
-                <div className="absolute inset-0 opacity-40 [background-image:radial-gradient(circle_at_center,rgb(var(--accent)/0.22)_1px,transparent_1px)] [background-size:20px_20px]" />
+              <div className="relative grid min-h-44 place-items-center overflow-hidden bg-gradient-to-br from-surface-sunken to-accent-muted p-6 text-accent">
+                <div className="absolute inset-0 opacity-25 [background-image:radial-gradient(circle_at_center,rgb(var(--accent)/0.3)_1px,transparent_1px)] [background-size:16px_16px]" />
                 <RoutePreviewIcon />
               </div>
               <div className="flex flex-col p-5 sm:p-6">
                 <div className="flex items-start justify-between gap-3">
                   <div>
-                    <div className="text-xs font-semibold uppercase tracking-[0.12em] text-content-faint">Latest journey</div>
-                    <h2 className="mt-2 text-xl font-bold tracking-tight">{formatDateTime(latestJourney.startedAt)}</h2>
-                    <p className="mt-1 text-sm text-content-muted">{latestJourney.recordingCount} recordings</p>
+                    <div className="hud-tag">
+                      <span className="h-1.5 w-1.5 rounded-full bg-accent animate-ping"></span>
+                      LATEST RUN TELEMETRY
+                    </div>
+                    <h2 className="mt-1 font-mono text-xl font-black tracking-tight">{formatDateTime(latestJourney.startedAt)}</h2>
+                    <p className="mt-0.5 font-mono text-xs text-content-muted">{latestJourney.recordingCount} recordings · Trip #{latestJourney.id}</p>
                   </div>
-                  <span className="grid h-10 w-10 place-items-center rounded-full bg-state-ok/10 text-state-ok"><JourneyIcon /></span>
+                  <span className="grid h-10 w-10 place-items-center rounded-xl border border-state-ok/30 bg-state-ok/10 text-state-ok"><JourneyIcon /></span>
                 </div>
-                <div className="mt-6 grid grid-cols-2 gap-4 sm:grid-cols-4">
+                <div className="mt-6 grid grid-cols-2 gap-4 sm:grid-cols-4 font-mono">
                   <JourneyMetric label="Duration" value={formatDuration(latestJourney.durationS)} />
                   <JourneyMetric label="Distance" value={formatDistance(latestJourney.distanceM)} />
                   <JourneyMetric label="Average" value={formatSpeed(latestJourney.avgSpeedKmh)} />
-                  <JourneyMetric label="Maximum" value={formatSpeed(latestJourney.maxSpeedKmh)} />
+                  <JourneyMetric label="Max Speed" value={formatSpeed(latestJourney.maxSpeedKmh)} />
                 </div>
                 <Link to={`/journeys/${latestJourney.id}`} className="btn btn-primary mt-6 self-start">
-                  Open journey <ArrowIcon />
+                  Open telemetry run <ArrowIcon />
                 </Link>
               </div>
             </div>
@@ -211,29 +225,45 @@ export default function Dashboard() {
           <EmptyState title="No journeys yet" description="Journeys appear here after your footage has been analysed." />
         )}
 
-        <section className="card p-5 sm:p-6">
+        <section className="card cockpit-panel p-5 sm:p-6">
           <div className="flex items-center justify-between gap-3">
-            <h2 className="section-title">Needs attention</h2>
-            <span className={`h-2.5 w-2.5 rounded-full ${hasAttention ? 'bg-state-warn' : 'bg-state-ok'}`} />
+            <div>
+              <div className="hud-tag">
+                <span className="h-1.5 w-1.5 rounded-full bg-cyan"></span>
+                DIAGNOSTIC STATUS
+              </div>
+              <h2 className="section-title mt-1">System Health</h2>
+            </div>
+            <span className={`h-2.5 w-2.5 rounded-full ${hasAttention ? 'bg-state-warn shadow-glow-orange' : 'bg-state-ok shadow-[0_0_8px_rgba(16,210,130,0.6)]'}`} />
           </div>
           {hasAttention ? (
-            <div className="mt-5 space-y-3">
+            <div className="mt-5 space-y-2.5">
               {processing.invalid > 0 && <AttentionLink to="/recordings?state=invalid" value={processing.invalid} label="unusable files" />}
               {processing.failed > 0 && <AttentionLink to="/queue?state=failed" value={processing.failed} label="failed jobs" error />}
               {blockedFeatures.map((feature) => (
                 <AttentionLink key={feature.key} to="/settings" label={`${feature.label} is unavailable`} />
               ))}
-              {hardware.notes.map((note) => <div key={note} className="rounded-lg bg-state-warn/10 p-3 text-sm text-state-warn">{note}</div>)}
+              {hardware.notes.map((note) => <div key={note} className="rounded-lg bg-state-warn/10 p-3 text-xs font-mono text-state-warn">{note}</div>)}
             </div>
           ) : (
-            <div className="mt-6 flex items-center gap-3 rounded-lg bg-state-ok/10 p-4 text-sm text-state-ok">
+            <div className="mt-5 flex items-center gap-3 rounded-lg border border-state-ok/30 bg-state-ok/10 p-4 text-xs font-mono text-state-ok">
               <CheckIcon />
-              <span><strong className="font-semibold">All clear.</strong> There’s nothing you need to review.</span>
+              <span><strong className="font-bold">ALL SYSTEMS NOMINAL.</strong> No alerts active.</span>
             </div>
           )}
-          <div className="mt-5 border-t border-border pt-4 text-sm text-content-muted">
-            <div className="flex justify-between gap-3"><span>GPU</span><span className="truncate font-medium text-content">{hardware.gpu.name ?? 'Not detected'}</span></div>
-            <div className="mt-2 flex justify-between gap-3"><span>Decoder</span><span className="font-medium text-content">{hardware.decode.hardwareDecode ? 'Hardware accelerated' : 'Software'}</span></div>
+          <div className="mt-5 border-t border-border/80 pt-4 font-mono text-xs text-content-muted space-y-2">
+            <div className="flex justify-between gap-3">
+              <span>ECU / CPU</span>
+              <span className="truncate font-bold text-content">{hardware.cpu.model ?? 'Multi-Core'}</span>
+            </div>
+            <div className="flex justify-between gap-3">
+              <span>VISION ACCELERATOR</span>
+              <span className="truncate font-bold text-cyan">{hardware.gpu.name ?? 'OpenVINO Device'}</span>
+            </div>
+            <div className="flex justify-between gap-3">
+              <span>CODEC ENGINE</span>
+              <span className="font-bold text-content">{hardware.decode.hardwareDecode ? 'VAAPI / QSV Hardware' : 'Software'}</span>
+            </div>
           </div>
         </section>
       </div>
@@ -272,7 +302,7 @@ export default function Dashboard() {
 function progressRing(completed: number, active: number) {
   const completeEnd = Math.max(0, Math.min(100, completed * 100))
   const activeEnd = Math.max(completeEnd, Math.min(100, (completed + active) * 100))
-  return `conic-gradient(rgb(var(--state-ok)) 0 ${completeEnd}%, rgb(var(--accent)) ${completeEnd}% ${activeEnd}%, rgb(var(--surface-sunken)) ${activeEnd}% 100%)`
+  return `conic-gradient(from 220deg, rgb(var(--state-ok)) 0 ${completeEnd}%, rgb(var(--cyan)) ${completeEnd}% ${activeEnd}%, rgb(var(--surface-sunken)) ${activeEnd}% 100%)`
 }
 
 function friendlyStage(stage: string) {
@@ -282,33 +312,34 @@ function friendlyStage(stage: string) {
 function SystemStatus({ active, waiting, failed }: { active: number; waiting: number; failed: number }) {
   const healthy = failed === 0
   return (
-    <section className={`flex flex-wrap items-center gap-4 rounded-xl border p-4 sm:px-5 ${healthy ? 'border-state-ok/35 bg-state-ok/[0.07]' : 'border-state-warn/40 bg-state-warn/[0.08]'}`}>
-      <span className={`grid h-11 w-11 shrink-0 place-items-center rounded-full text-white ${healthy ? 'bg-state-ok' : 'bg-state-warn'}`}>
+    <section className={`relative flex flex-wrap items-center gap-4 rounded-xl border p-4 sm:px-5 overflow-hidden ${healthy ? 'border-state-ok/40 bg-state-ok/[0.06]' : 'border-state-warn/40 bg-state-warn/[0.08]'}`}>
+      <div className={`absolute top-0 left-0 right-0 h-[1px] bg-gradient-to-r from-transparent ${healthy ? 'via-state-ok/60' : 'via-state-warn/60'} to-transparent`} />
+      <span className={`grid h-11 w-11 shrink-0 place-items-center rounded-xl text-white shadow-sm ${healthy ? 'bg-state-ok shadow-[0_0_12px_rgba(16,210,130,0.4)]' : 'bg-state-warn shadow-glow-orange'}`}>
         {healthy ? <CheckIcon /> : <AttentionIcon />}
       </span>
-      <div className="min-w-0 flex-1">
-        <h2 className={`font-semibold ${healthy ? 'text-state-ok' : 'text-state-warn'}`}>
-          {healthy ? (active > 0 ? 'Analysis is running smoothly' : 'Your library is ready') : 'Some jobs need attention'}
+      <div className="min-w-0 flex-1 font-mono">
+        <h2 className={`text-xs sm:text-sm font-bold tracking-wider uppercase ${healthy ? 'text-state-ok' : 'text-state-warn'}`}>
+          {healthy ? (active > 0 ? 'TELEMETRY PIPELINE RUNNING · PROCESSING ACTIVE' : 'INSTRUMENT CLUSTER READY · ALL SYSTEMS NOMINAL') : 'SYSTEM ALERT · ATTENTION REQUIRED'}
         </h2>
-        <p className="mt-0.5 text-sm text-content-muted">
-          {active > 0 ? `${active} recording${active === 1 ? '' : 's'} processing · ${waiting} waiting` : `${waiting} recording${waiting === 1 ? '' : 's'} waiting`}
+        <p className="mt-0.5 text-xs text-content-muted">
+          {active > 0 ? `${active} stream${active === 1 ? '' : 's'} running · ${waiting} clips waiting` : `${waiting} recording${waiting === 1 ? '' : 's'} queued`}
         </p>
       </div>
-      <Link to="/queue" className="btn border-state-ok/30 bg-surface-raised">View queue</Link>
+      <Link to="/queue" className="btn font-mono text-xs font-bold border-state-ok/40 hover:border-state-ok">VIEW QUEUE</Link>
     </section>
   )
 }
 
 function ProgressMetric({ color, value, label }: { color: string; value: number; label: string }) {
-  return <div><div className="flex items-center gap-2"><span className={`h-2.5 w-2.5 rounded-full ${color}`} /><span className="tabular text-xl font-bold">{value.toLocaleString()}</span></div><div className="mt-1 pl-[18px] text-xs text-content-muted">{label}</div></div>
+  return <div><div className="flex items-center gap-2"><span className={`h-2.5 w-2.5 rounded-full ${color}`} /><span className="tabular font-mono text-xl font-black">{value.toLocaleString()}</span></div><div className="mt-1 pl-[18px] font-mono text-2xs uppercase tracking-wider text-content-muted">{label}</div></div>
 }
 
 function JourneyMetric({ label, value }: { label: string; value: string }) {
-  return <div><div className="tabular text-base font-bold sm:text-lg">{value}</div><div className="mt-1 text-xs text-content-muted">{label}</div></div>
+  return <div><div className="tabular font-mono text-base font-black sm:text-lg text-content">{value}</div><div className="mt-1 font-mono text-2xs uppercase tracking-wider text-content-muted">{label}</div></div>
 }
 
 function AttentionLink({ to, value, label, error = false }: { to: string; value?: number; label: string; error?: boolean }) {
-  return <Link to={to} className={`flex items-center gap-3 rounded-lg p-3.5 transition-colors ${error ? 'bg-state-error/10 text-state-error hover:bg-state-error/15' : 'bg-state-warn/10 text-state-warn hover:bg-state-warn/15'}`}><AttentionIcon /><span className="flex-1 text-sm font-semibold">{value !== undefined ? `${value} ${label}` : label}</span><ArrowIcon /></Link>
+  return <Link to={to} className={`flex items-center gap-3 rounded-lg p-3 font-mono text-xs transition-all ${error ? 'bg-state-error/10 text-state-error hover:bg-state-error/20 border border-state-error/30' : 'bg-state-warn/10 text-state-warn hover:bg-state-warn/20 border border-state-warn/30'}`}><AttentionIcon /><span className="flex-1 font-bold">{value !== undefined ? `${value} ${label}` : label}</span><ArrowIcon /></Link>
 }
 
 type IconProps = { className?: string }
@@ -320,7 +351,25 @@ function PlateIcon({ className = iconClass }: IconProps) { return <svg className
 function CheckIcon({ className = iconClass }: IconProps) { return <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="m5 12 4 4L19 6" strokeLinecap="round" strokeLinejoin="round" /></svg> }
 function AttentionIcon({ className = iconClass }: IconProps) { return <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M12 3 2.8 20h18.4z" strokeLinejoin="round" /><path d="M12 9v5m0 3v.1" strokeLinecap="round" /></svg> }
 function ArrowIcon({ className = 'h-4 w-4' }: IconProps) { return <svg className={className} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M4 10h12m-4-4 4 4-4 4" strokeLinecap="round" strokeLinejoin="round" /></svg> }
-function RoutePreviewIcon() { return <svg className="relative h-36 w-full max-w-sm" viewBox="0 0 320 150" fill="none"><path d="M15 95c35-60 70 26 103-22s69 36 101-11 50 24 84-38" stroke="rgb(var(--accent) / .16)" strokeWidth="18" strokeLinecap="round" /><path d="M15 95c35-60 70 26 103-22s69 36 101-11 50 24 84-38" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeDasharray="2 8" /><circle cx="15" cy="95" r="9" fill="rgb(var(--surface-raised))" stroke="rgb(var(--state-ok))" strokeWidth="4" /><circle cx="303" cy="24" r="9" fill="rgb(var(--surface-raised))" stroke="currentColor" strokeWidth="4" /></svg> }
+function RoutePreviewIcon() {
+  return (
+    <svg className="relative h-36 w-full max-w-sm" viewBox="0 0 320 150" fill="none">
+      <defs>
+        <filter id="routeGlow" x="-20%" y="-20%" width="140%" height="140%">
+          <feGaussianBlur stdDeviation="4" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+      </defs>
+      <path d="M15 95c35-60 70 26 103-22s69 36 101-11 50 24 84-38" stroke="rgb(var(--accent) / .25)" strokeWidth="18" strokeLinecap="round" />
+      <path d="M15 95c35-60 70 26 103-22s69 36 101-11 50 24 84-38" stroke="rgb(var(--accent))" strokeWidth="3.5" strokeLinecap="round" filter="url(#routeGlow)" />
+      <circle cx="15" cy="95" r="7" fill="rgb(var(--cyan))" stroke="rgb(var(--surface-raised))" strokeWidth="2.5" />
+      <circle cx="303" cy="24" r="7" fill="rgb(var(--accent))" stroke="rgb(var(--surface-raised))" strokeWidth="2.5" />
+    </svg>
+  )
+}
 function CarIcon({ className = iconClass }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">

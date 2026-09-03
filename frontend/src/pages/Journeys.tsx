@@ -81,41 +81,40 @@ export default function Journeys() {
 
       <div className="space-y-3">
         {query.data?.items.map((journey) => (
-          <div key={journey.id} className="card flex items-start gap-4 p-4 transition-all hover:border-accent/30 hover:shadow-md sm:p-5">
+          <div key={journey.id} className="card cockpit-panel flex items-start gap-4 p-4 transition-all hover:border-accent/60 hover:shadow-card sm:p-5">
             <input
               type="checkbox"
-              className="mt-1"
+              className="mt-1.5 h-4 w-4 rounded border-border bg-surface-sunken text-accent focus:ring-accent"
               checked={selected.includes(journey.id)}
               onChange={() => toggle(journey.id)}
               aria-label={`Select journey ${journey.id}`}
             />
-            <Link to={`/journeys/${journey.id}`} className="min-w-0 flex-1 hover:text-accent">
+            <Link to={`/journeys/${journey.id}`} className="min-w-0 flex-1 group">
               <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                <span className="text-base font-semibold">{formatDate(journey.startedAt)}</span>
-                <span className="tabular text-sm text-content-muted">
+                <span className="font-mono text-base font-black text-white group-hover:text-accent transition-colors">{formatDate(journey.startedAt)}</span>
+                <span className="tabular font-mono text-xs text-content-muted">
                   {formatTime(journey.startedAt)} → {formatTime(journey.endedAt)}
                 </span>
-                <span className="tabular text-sm text-content-muted">
+                <span className="tabular font-mono text-xs text-cyan font-bold bg-cyan/10 border border-cyan/30 px-2 py-0.5 rounded">
                   {formatDuration(journey.durationS)}
                 </span>
                 {journey.manual && (
-                  <span className="badge bg-accent-muted text-accent">edited</span>
+                  <span className="badge border border-accent/40 bg-accent/15 text-accent">manual</span>
                 )}
               </div>
-              <div className="tabular mt-2 flex flex-wrap gap-x-5 gap-y-1 text-sm text-content-muted">
+              <div className="tabular font-mono mt-3 flex flex-wrap gap-x-5 gap-y-1.5 text-xs text-content-muted">
                 {journey.hasGps ? (
                   <>
-                    <DerivedHint>{formatDistance(journey.distanceM)}</DerivedHint>
-                    <DerivedHint>avg {formatSpeed(journey.avgSpeedKmh)}</DerivedHint>
-                    <span>max {formatSpeed(journey.maxSpeedKmh)}</span>
+                    <span className="text-white font-bold"><DerivedHint>{formatDistance(journey.distanceM)}</DerivedHint></span>
+                    <span>avg <span className="text-content font-bold">{formatSpeed(journey.avgSpeedKmh)}</span></span>
+                    <span>max <span className="text-accent font-bold">{formatSpeed(journey.maxSpeedKmh)}</span></span>
                   </>
                 ) : (
                   <span className="text-content-faint">No GPS</span>
                 )}
-                {/* Files and sightings — see the notes on the journey detail tiles. */}
-                <span>{journey.recordingCount} files</span>
-                <span>{journey.vehicleCount} sightings</span>
-                <span>{journey.uniquePlateCount} plates</span>
+                <span>{journey.recordingCount} clips</span>
+                <span>{journey.vehicleCount} vehicles</span>
+                <span className="text-cyan font-bold">{journey.uniquePlateCount} plates</span>
               </div>
             </Link>
           </div>

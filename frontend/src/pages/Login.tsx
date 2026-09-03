@@ -41,24 +41,30 @@ export default function Login({
     : null
 
   return (
-    <div className="grid min-h-full place-items-center bg-surface px-4 py-12">
-      <div className="w-full max-w-sm">
+    <div className="grid min-h-full place-items-center bg-surface px-4 py-12 relative overflow-hidden">
+      {/* Subtle radial glow background */}
+      <div className="absolute inset-0 pointer-events-none [background:radial-gradient(circle_at_50%_40%,rgba(255,107,0,0.06)_0%,transparent_60%)]" />
+
+      <div className="w-full max-w-sm relative z-10">
         <div className="mb-7 flex flex-col items-center text-center">
-          <span className="grid h-14 w-14 place-items-center rounded-2xl bg-nav text-nav-content shadow-card">
-            <LogoIcon />
+          <span className="grid h-16 w-16 place-items-center rounded-2xl border border-accent/40 bg-surface-raised text-accent shadow-glow-orange">
+            <LogoIcon className="h-8 w-8" />
           </span>
-          <h1 className="mt-4 text-2xl font-bold tracking-tight">Dashcam Analyser</h1>
-          <p className="hint mt-1">Sign in to reach your footage.</p>
+          <div className="mt-4 flex items-center gap-2">
+            <h1 className="text-2xl font-black tracking-wider text-white">DASHCAM</h1>
+            <span className="rounded bg-accent/20 px-1.5 py-0.5 text-[10px] font-mono font-bold text-accent">HUD</span>
+          </div>
+          <p className="font-mono text-xs uppercase tracking-wider text-content-muted mt-1">Cockpit Authentication</p>
         </div>
 
-        <form className="card space-y-4 p-6" onSubmit={submit}>
+        <form className="card cockpit-panel space-y-4 p-6 shadow-2xl" onSubmit={submit}>
           <div className="space-y-1.5">
             <label className="label" htmlFor="username">
-              Username
+              Operator Username
             </label>
             <input
               id="username"
-              className="input"
+              className="input font-mono"
               value={username}
               onChange={(event) => setUsername(event.target.value)}
               autoComplete="username"
@@ -69,11 +75,11 @@ export default function Login({
 
           <div className="space-y-1.5">
             <label className="label" htmlFor="password">
-              Password
+              Security Key / Password
             </label>
             <input
               id="password"
-              className="input"
+              className="input font-mono"
               type="password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
@@ -82,9 +88,10 @@ export default function Login({
             />
           </div>
 
-          <label className="flex items-center gap-2 text-sm text-content-muted">
+          <label className="flex items-center gap-2 text-xs font-mono text-content-muted">
             <input
               type="checkbox"
+              className="h-4 w-4 rounded border-border bg-surface-sunken text-accent focus:ring-accent"
               checked={remember}
               onChange={(event) => setRemember(event.target.checked)}
             />
@@ -93,7 +100,7 @@ export default function Login({
 
           {message && (
             <p
-              className="rounded-lg border border-state-error/40 bg-state-error/10 px-3 py-2 text-sm text-state-error"
+              className="rounded-lg border border-state-error/40 bg-state-error/10 px-3 py-2 text-xs font-mono text-state-error"
               role="alert"
             >
               {message}
@@ -101,32 +108,34 @@ export default function Login({
           )}
 
           <button
-            className="btn btn-primary w-full"
+            className="btn btn-primary w-full font-mono uppercase tracking-wider text-xs py-3"
             type="submit"
             disabled={signIn.isPending || !username.trim() || !password}
           >
-            {signIn.isPending ? 'Signing in…' : 'Sign in'}
+            {signIn.isPending ? 'Authenticating…' : 'Initialize Session ⚡'}
           </button>
         </form>
 
-        <p className="hint mt-4 text-center">
-          Forgotten it? Run{' '}
-          <code className="rounded bg-surface-sunken px-1 py-0.5 text-2xs">
+        <p className="hint mt-4 text-center font-mono text-2xs">
+          Forgot password? Run{' '}
+          <code className="rounded bg-surface-sunken px-1.5 py-0.5 text-2xs border border-border">
             docker compose exec dashcam entrypoint.sh recover-login set-password
           </code>{' '}
-          on the host.
+          on host.
         </p>
       </div>
     </div>
   )
 }
 
-function LogoIcon() {
+function LogoIcon({ className = 'h-7 w-7' }: { className?: string }) {
   return (
-    <svg className="h-7 w-7" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <rect x="2.5" y="6.5" width="19" height="11" rx="2.5" />
-      <circle cx="12" cy="12" r="3.2" />
-      <path d="M7 4.5h4" strokeLinecap="round" />
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M4 17.5A9.5 9.5 0 1 1 20 17.5" stroke="currentColor" strokeLinecap="round" opacity="0.85" />
+      <path d="M16 5.2A9.5 9.5 0 0 1 20 17.5" stroke="rgb(var(--accent))" strokeWidth="2.4" strokeLinecap="round" />
+      <path d="M12 13.5l4.8-4.8" stroke="rgb(var(--accent))" strokeWidth="2.2" strokeLinecap="round" />
+      <circle cx="12" cy="13.5" r="2.2" fill="rgb(var(--accent))" />
+      <path d="M6 14.5l1.2-.7M7.5 9.5l1.2.7M12 4.5v1.5M16.5 9.5l-1.2.7" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" opacity="0.6" />
     </svg>
   )
 }

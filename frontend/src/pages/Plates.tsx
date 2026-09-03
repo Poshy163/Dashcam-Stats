@@ -123,7 +123,7 @@ export default function Plates() {
             <Link
               key={plate.id}
               to={`/plates/${plate.id}`}
-              className="card overflow-hidden p-2 transition-colors hover:border-accent/50"
+              className="card cockpit-panel overflow-hidden p-2.5 transition-all hover:border-accent/60 hover:shadow-card hover:-translate-y-0.5"
             >
               {vehicle ? (
                 <img src={vehicle} alt="" loading="lazy" className="aspect-video w-full rounded object-cover" />

@@ -137,7 +137,7 @@ export default function Layout({
 
   const renderNavGroup = (label: string, items: NavItem[]) => (
     <div>
-      <div className="mb-2 px-3 text-2xs font-semibold uppercase tracking-[0.14em] text-nav-muted/70">
+      <div className="mb-2 px-3 font-mono text-2xs font-semibold uppercase tracking-[0.16em] text-nav-muted/60">
         {label}
       </div>
       <ul className="space-y-1">
@@ -149,19 +149,23 @@ export default function Layout({
               onClick={() => setNavOpen(false)}
               className={({ isActive }) =>
                 cn(
-                  'flex min-h-11 items-center gap-3 rounded-lg px-3 text-sm font-medium transition-colors',
+                  'group flex min-h-11 items-center gap-3 rounded-lg px-3 text-sm font-medium transition-all',
                   isActive
-                    ? 'bg-accent text-white shadow-sm'
-                    : 'text-nav-muted hover:bg-nav-raised hover:text-nav-content',
+                    ? 'border-l-2 border-accent bg-gradient-to-r from-accent/20 to-accent/5 text-white font-semibold shadow-sm'
+                    : 'text-nav-muted hover:bg-nav-raised/80 hover:text-nav-content',
                 )
               }
             >
-              <Icon className="h-[18px] w-[18px]" />
-              {itemLabel}
-              {to === '/queue' && pending > 0 && (
-                <span className="tabular ml-auto rounded-full bg-white/10 px-2 py-0.5 text-2xs text-nav-content">
-                  {pending}
-                </span>
+              {({ isActive }) => (
+                <>
+                  <Icon className={cn('h-[18px] w-[18px] transition-colors', isActive ? 'text-accent' : 'text-nav-muted group-hover:text-nav-content')} />
+                  <span>{itemLabel}</span>
+                  {to === '/queue' && pending > 0 && (
+                    <span className="tabular ml-auto rounded-full border border-cyan/40 bg-cyan/15 px-2 py-0.5 text-2xs font-bold text-cyan">
+                      {pending}
+                    </span>
+                  )}
+                </>
               )}
             </NavLink>
           </li>
@@ -179,7 +183,7 @@ export default function Layout({
     <div className="min-h-full bg-surface">
       {navOpen && (
         <button
-          className="fixed inset-0 z-40 bg-slate-950/50 backdrop-blur-sm md:hidden"
+          className="fixed inset-0 z-40 bg-slate-950/70 backdrop-blur-sm md:hidden"
           onClick={() => setNavOpen(false)}
           aria-label="Close navigation"
         />
@@ -188,19 +192,22 @@ export default function Layout({
       <aside
         id="primary-navigation"
         className={cn(
-          'fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-nav-border bg-nav px-3 py-5 shadow-float transition-transform md:translate-x-0 md:shadow-none',
+          'fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-nav-border bg-nav px-3.5 py-5 shadow-float transition-transform md:translate-x-0 md:shadow-none',
           navOpen ? 'translate-x-0' : '-translate-x-full',
         )}
       >
         <div className="flex h-12 items-center justify-between px-2">
-          <NavLink to="/" className="flex items-center gap-3 text-nav-content" onClick={() => setNavOpen(false)}>
-            <span className="grid h-10 w-10 place-items-center rounded-xl bg-white/10">
-              <LogoIcon />
+          <NavLink to="/" className="flex items-center gap-3 text-nav-content group" onClick={() => setNavOpen(false)}>
+            <span className="grid h-10 w-10 place-items-center rounded-xl border border-nav-border bg-nav-raised shadow-inner group-hover:border-accent/50 transition-colors">
+              <LogoIcon className="h-6 w-6" />
             </span>
-            <span>
-              <span className="block text-base font-bold leading-tight tracking-tight">Dashcam</span>
-              <span className="block text-sm font-medium leading-tight text-nav-muted">Analyser</span>
-            </span>
+            <div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-base font-extrabold tracking-tight text-white">DASHCAM</span>
+                <span className="rounded bg-accent/20 px-1 py-0.2 text-[10px] font-mono font-bold text-accent">HUD</span>
+              </div>
+              <span className="block font-mono text-2xs uppercase tracking-wider text-nav-muted/80">Telemetry Suite</span>
+            </div>
           </NavLink>
           <button
             className="grid h-9 w-9 place-items-center rounded-lg text-nav-muted hover:bg-nav-raised hover:text-nav-content md:hidden"
@@ -212,21 +219,28 @@ export default function Layout({
         </div>
 
         <nav className="mt-8 flex-1 space-y-7 overflow-y-auto px-1">
-          {renderNavGroup('Library', LIBRARY_NAV)}
-          {renderNavGroup('System', SYSTEM_NAV)}
+          {renderNavGroup('Cockpit Library', LIBRARY_NAV)}
+          {renderNavGroup('System & Diagnostics', SYSTEM_NAV)}
         </nav>
 
         <NavLink
           to="/queue"
           onClick={() => setNavOpen(false)}
-          className="mt-4 rounded-xl border border-nav-border bg-nav-raised/70 p-3.5 transition-colors hover:bg-nav-raised"
+          className="mt-4 rounded-xl border border-nav-border/90 bg-nav-raised/50 p-3.5 transition-all hover:border-accent/40 hover:bg-nav-raised"
         >
-          <div className="flex items-center gap-2 text-sm font-semibold text-nav-content">
-            <span className={cn('h-2.5 w-2.5 rounded-full', busy ? cn('bg-state-ok', motion('animate-pulse')) : 'bg-nav-muted')} />
-            {busy ? 'Analysis in progress' : 'Queue is idle'}
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-nav-content">
+              <span className={cn('h-2 w-2 rounded-full', busy ? cn('bg-cyan shadow-glow-cyan', motion('animate-pulse')) : 'bg-state-ok')} />
+              {busy ? 'Pipeline Active' : 'Cluster Idle'}
+            </div>
+            {busy && (
+              <span className="font-mono text-2xs font-semibold text-cyan">
+                {stats?.running ?? 0} ACTIVE
+              </span>
+            )}
           </div>
-          <div className="mt-1 pl-[18px] text-xs text-nav-muted">
-            {busy ? `${stats?.running ?? 0} active · ${stats?.queued ?? 0} waiting` : 'No active processing jobs'}
+          <div className="mt-2 font-mono text-2xs text-nav-muted">
+            {busy ? `${stats?.running ?? 0} active · ${stats?.queued ?? 0} queued` : 'No background jobs running'}
           </div>
         </NavLink>
       </aside>
@@ -383,6 +397,18 @@ function SignOutIcon({ className }: IconProps) {
 function MoonIcon({ className }: IconProps) {
   return <svg className={cn(base, className)} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M16 11.5A6.5 6.5 0 0 1 8.5 4a6.5 6.5 0 1 0 7.5 7.5z" strokeLinejoin="round" /></svg>
 }
-function LogoIcon() {
-  return <svg className="h-6 w-6 text-current" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="2.5" y="6.5" width="19" height="11" rx="2.5" /><circle cx="12" cy="12" r="3.2" /><path d="M7 4.5h4" strokeLinecap="round" /></svg>
+function LogoIcon({ className = 'h-6 w-6' }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      {/* Gauge outer arc */}
+      <path d="M4 17.5A9.5 9.5 0 1 1 20 17.5" stroke="currentColor" strokeLinecap="round" opacity="0.85" />
+      {/* Redline segment */}
+      <path d="M16 5.2A9.5 9.5 0 0 1 20 17.5" stroke="rgb(var(--accent))" strokeWidth="2.4" strokeLinecap="round" />
+      {/* Speedometer needle */}
+      <path d="M12 13.5l4.8-4.8" stroke="rgb(var(--accent))" strokeWidth="2.2" strokeLinecap="round" />
+      <circle cx="12" cy="13.5" r="2.2" fill="rgb(var(--accent))" />
+      {/* Tick markings */}
+      <path d="M6 14.5l1.2-.7M7.5 9.5l1.2.7M12 4.5v1.5M16.5 9.5l-1.2.7" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" opacity="0.6" />
+    </svg>
+  )
 }

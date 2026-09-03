@@ -44,68 +44,84 @@ export function StatTile({
     ok: 'text-state-ok',
     warn: 'text-state-warn',
     error: 'text-state-error',
-    busy: 'text-state-busy',
+    busy: 'text-cyan',
   }[tone]
 
   const body = (
-    <div className="flex items-start gap-3">
+    <div className="flex items-start justify-between gap-3">
+      <div className="min-w-0">
+        <div className="font-mono text-xs font-semibold uppercase tracking-wider text-content-muted">
+          {label}
+        </div>
+        <div className={cn('tabular font-mono text-2xl font-black leading-none tracking-tight sm:text-3xl mt-2', toneClass)}>
+          {value}
+        </div>
+        {hint && <div className="mt-2 font-mono text-2xs text-content-faint">{hint}</div>}
+      </div>
       {icon && (
-        <div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-accent-muted text-accent">
+        <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-accent/30 bg-accent/10 text-accent shadow-sm">
           {icon}
         </div>
       )}
-      <div className="min-w-0">
-        <div className={cn('tabular text-2xl font-bold leading-none tracking-tight sm:text-3xl', toneClass)}>
-          {value}
-        </div>
-        <div className="mt-2 text-sm font-medium text-content-muted">{label}</div>
-        {hint && <div className="mt-1 text-xs text-content-faint">{hint}</div>}
-      </div>
     </div>
   )
 
-  const className = cn('card p-4 sm:p-5', href && 'transition-all hover:-translate-y-0.5 hover:border-accent/40 hover:shadow-md')
+  const className = cn(
+    'card relative overflow-hidden p-4 sm:p-5 border-border/80 transition-all hover:-translate-y-0.5 hover:border-accent/50 hover:shadow-card',
+    href && 'cursor-pointer',
+  )
   return href ? (
     <a href={href} className={className}>
+      <div className="absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-accent/40 to-transparent" />
       {body}
     </a>
   ) : (
-    <div className={className}>{body}</div>
+    <div className={className}>
+      <div className="absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-accent/40 to-transparent" />
+      {body}
+    </div>
   )
 }
 
-const RECORDING_STATE_STYLE: Record<RecordingState, { label: string; className: string }> = {
-  discovered: { label: 'Discovered', className: 'bg-surface-sunken text-content-muted' },
-  // Deliberately neutral rather than a warning colour: a file the camera is still writing
-  // is the system working, not a problem, and the next scan picks it up.
-  settling: { label: 'Still writing', className: 'bg-surface-sunken text-content-muted' },
-  metadata_extracted: { label: 'Inspected', className: 'bg-surface-sunken text-content-muted' },
-  queued: { label: 'Queued', className: 'bg-accent-muted text-accent' },
-  processing: { label: 'Processing', className: 'bg-accent-muted text-state-busy' },
-  completed: { label: 'Completed', className: 'bg-state-ok/15 text-state-ok' },
-  failed: { label: 'Failed', className: 'bg-state-error/15 text-state-error' },
-  // Distinct from Failed on purpose. Failed will be retried; this will not, and a user
-  // looking at the list has to be able to tell which of the two they are seeing.
-  invalid: { label: 'Unusable file', className: 'bg-state-warn/15 text-state-warn' },
-  ignored: { label: 'Ignored', className: 'bg-surface-sunken text-content-faint' },
-  deleted: { label: 'Deleted', className: 'bg-surface-sunken text-content-faint' },
+const RECORDING_STATE_STYLE: Record<RecordingState, { label: string; dot: string; className: string }> = {
+  discovered: { label: 'Discovered', dot: 'bg-content-faint', className: 'bg-surface-sunken text-content-muted border-border' },
+  settling: { label: 'Still writing', dot: 'bg-content-faint animate-pulse', className: 'bg-surface-sunken text-content-muted border-border' },
+  metadata_extracted: { label: 'Inspected', dot: 'bg-cyan', className: 'bg-cyan/10 text-cyan border-cyan/30' },
+  queued: { label: 'Queued', dot: 'bg-state-warn', className: 'bg-state-warn/10 text-state-warn border-state-warn/30' },
+  processing: { label: 'Processing', dot: 'bg-cyan animate-ping', className: 'bg-cyan/15 text-cyan border-cyan/40' },
+  completed: { label: 'Completed', dot: 'bg-state-ok', className: 'bg-state-ok/15 text-state-ok border-state-ok/30' },
+  failed: { label: 'Failed', dot: 'bg-state-error', className: 'bg-state-error/15 text-state-error border-state-error/30' },
+  invalid: { label: 'Unusable', dot: 'bg-state-warn', className: 'bg-state-warn/15 text-state-warn border-state-warn/30' },
+  ignored: { label: 'Ignored', dot: 'bg-content-faint', className: 'bg-surface-sunken text-content-faint border-border' },
+  deleted: { label: 'Deleted', dot: 'bg-content-faint', className: 'bg-surface-sunken text-content-faint border-border' },
 }
 
 export function StateBadge({ state }: { state: RecordingState }) {
   const style = RECORDING_STATE_STYLE[state] ?? RECORDING_STATE_STYLE.discovered
-  return <span className={cn('badge', style.className)}>{style.label}</span>
+  return (
+    <span className={cn('badge border', style.className)}>
+      <span className={cn('h-1.5 w-1.5 rounded-full', style.dot)} />
+      {style.label}
+    </span>
+  )
 }
 
-const JOB_STATE_STYLE: Record<JobState, string> = {
-  queued: 'bg-surface-sunken text-content-muted',
-  running: 'bg-accent-muted text-state-busy',
-  completed: 'bg-state-ok/15 text-state-ok',
-  failed: 'bg-state-error/15 text-state-error',
-  cancelled: 'bg-surface-sunken text-content-faint',
+const JOB_STATE_STYLE: Record<JobState, { dot: string; className: string }> = {
+  queued: { dot: 'bg-state-warn', className: 'bg-state-warn/10 text-state-warn border-state-warn/30' },
+  running: { dot: 'bg-cyan animate-pulse', className: 'bg-cyan/15 text-cyan border-cyan/40' },
+  completed: { dot: 'bg-state-ok', className: 'bg-state-ok/15 text-state-ok border-state-ok/30' },
+  failed: { dot: 'bg-state-error', className: 'bg-state-error/15 text-state-error border-state-error/30' },
+  cancelled: { dot: 'bg-content-faint', className: 'bg-surface-sunken text-content-faint border-border' },
 }
 
 export function JobStateBadge({ state }: { state: JobState }) {
-  return <span className={cn('badge capitalize', JOB_STATE_STYLE[state])}>{state}</span>
+  const style = JOB_STATE_STYLE[state] ?? JOB_STATE_STYLE.queued
+  return (
+    <span className={cn('badge border capitalize', style.className)}>
+      <span className={cn('h-1.5 w-1.5 rounded-full', style.dot)} />
+      {state}
+    </span>
+  )
 }
 
 /**
@@ -122,12 +138,12 @@ export function ConfidenceBadge({
 }) {
   const band = confidenceBand(confidence)
   const className = {
-    high: 'bg-state-ok/15 text-state-ok',
-    medium: 'bg-state-warn/15 text-state-warn',
-    low: 'bg-state-error/15 text-state-error',
+    high: 'border-state-ok/40 bg-state-ok/10 text-state-ok',
+    medium: 'border-state-warn/40 bg-state-warn/10 text-state-warn',
+    low: 'border-state-error/40 bg-state-error/10 text-state-error',
   }[band]
   return (
-    <span className={cn('badge tabular', className)} title={`${label} confidence`}>
+    <span className={cn('badge tabular font-mono border', className)} title={`${label} confidence`}>
       {label} {formatPercent(confidence)}
     </span>
   )
@@ -149,15 +165,17 @@ export function PlateText({
   className?: string
 }) {
   return (
-    <span className={cn('inline-flex items-center gap-1.5', className)}>
-      <span className="tabular font-mono font-semibold tracking-wide">{text}</span>
+    <span className={cn('inline-flex items-center gap-2', className)}>
+      <span className="tabular font-mono font-black tracking-widest uppercase rounded border border-border/90 bg-surface-sunken px-2 py-0.5 shadow-inner text-content">
+        {text}
+      </span>
       {confidence !== undefined && <ConfidenceBadge confidence={confidence} />}
       {matchedPattern === null && (
         <span
-          className="badge bg-state-warn/15 text-state-warn"
+          className="badge border border-state-warn/30 bg-state-warn/10 text-state-warn"
           title="This reading did not match a known Australian plate format"
         >
-          unverified format
+          unverified
         </span>
       )}
     </span>

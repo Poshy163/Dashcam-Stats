@@ -31,12 +31,12 @@ const REPROCESS_OPTIONS = [
 ] as const
 
 const CLASS_COLOUR: Record<string, string> = {
-  car: 'bg-state-busy',
-  truck: 'bg-state-warn',
-  bus: 'bg-state-warn',
-  motorcycle: 'bg-state-ok',
-  bicycle: 'bg-state-ok',
-  person: 'bg-state-error',
+  car: 'bg-cyan text-slate-950 font-bold',
+  truck: 'bg-accent text-slate-950 font-bold',
+  bus: 'bg-state-warn text-slate-950',
+  motorcycle: 'bg-state-ok text-slate-950',
+  bicycle: 'bg-state-ok text-slate-950',
+  person: 'bg-state-error text-white',
 }
 
 /** Latest telemetry sample at or before `t`. Binary search: this runs on every player tick.
@@ -566,46 +566,57 @@ export default function RecordingViewer() {
         </div>
 
         <div className="space-y-3">
-          <section className="card p-3">
-            <h2 className="mb-2 text-sm font-semibold">Telemetry</h2>
+          <section className="card cockpit-panel p-4">
+            <div className="hud-tag mb-2">
+              <span className="h-1.5 w-1.5 rounded-full bg-cyan animate-pulse"></span>
+              TELEMETRY SENSOR HUD
+            </div>
             {telemetry.data && telemetry.data.length > 0 ? (
-              <dl className="space-y-1.5 text-sm">
-                <Row label="Time" value={point?.capturedAt ? formatDateTime(point.capturedAt) : '—'} />
-                <Row
-                  label="Position"
-                  value={
-                    point?.hasFix ? (
-                      <span>
-                        {formatCoords(point.lat, point.lon)}
-                        {point.quality.interpolated && (
-                          <span className="ml-1 text-2xs text-content-faint">interpolated</span>
-                        )}
-                      </span>
-                    ) : point?.quality.gpsStatus === 'no_fix' ? (
-                      'No GPS fix'
-                    ) : (
-                      'Position unavailable'
-                    )
-                  }
-                />
-                <Row label="Speed" value={formatSpeed(point?.speedKmh)} />
-                <Row
-                  label="Heading"
-                  value={
-                    point?.headingDeg != null ? (
-                      <DerivedHint>{Math.round(point.headingDeg)}°</DerivedHint>
-                    ) : (
-                      '—'
-                    )
-                  }
-                />
-                <Row
-                  label="OCR confidence"
-                  value={point?.ocrConfidence != null ? `${Math.round(point.ocrConfidence * 100)}%` : '—'}
-                />
-              </dl>
+              <div className="space-y-3">
+                <div className="rounded-xl border border-accent/40 bg-surface-sunken/80 p-3 flex items-center justify-between shadow-inner">
+                  <div>
+                    <span className="font-mono text-2xs uppercase tracking-wider text-content-muted">Vehicle Speed</span>
+                    <div className="font-mono text-3xl font-black text-accent">{formatSpeed(point?.speedKmh)}</div>
+                  </div>
+                  <div className="text-right font-mono text-2xs space-y-1">
+                    <div>HDG: <span className="text-content font-bold">{point?.headingDeg != null ? `${Math.round(point.headingDeg)}°` : '—'}</span></div>
+                    <div>OCR CONF: <span className="text-cyan font-bold">{point?.ocrConfidence != null ? `${Math.round(point.ocrConfidence * 100)}%` : '—'}</span></div>
+                  </div>
+                </div>
+
+                <dl className="space-y-1.5 text-xs font-mono">
+                  <Row label="Timestamp" value={point?.capturedAt ? formatDateTime(point.capturedAt) : '—'} />
+                  <Row
+                    label="GPS Position"
+                    value={
+                      point?.hasFix ? (
+                        <span className="text-content font-semibold">
+                          {formatCoords(point.lat, point.lon)}
+                          {point.quality.interpolated && (
+                            <span className="ml-1 text-2xs text-cyan">(interp)</span>
+                          )}
+                        </span>
+                      ) : point?.quality.gpsStatus === 'no_fix' ? (
+                        <span className="text-state-warn">No GPS fix</span>
+                      ) : (
+                        'Position unavailable'
+                      )
+                    }
+                  />
+                  <Row
+                    label="True Heading"
+                    value={
+                      point?.headingDeg != null ? (
+                        <DerivedHint>{Math.round(point.headingDeg)}°</DerivedHint>
+                      ) : (
+                        '—'
+                      )
+                    }
+                  />
+                </dl>
+              </div>
             ) : (
-              <p className="hint">
+              <p className="hint font-mono text-xs">
                 No telemetry for this recording. The camera writes GPS as an on-screen
                 overlay, so it is only available when that overlay could be read.
               </p>
