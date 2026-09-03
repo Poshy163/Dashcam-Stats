@@ -270,8 +270,6 @@ export default function Backup() {
   })
   const rebuildObd = useMutation({ mutationFn: api.obd.rebuild, onSuccess: invalidate })
 
-  if (status.isError) return <ErrorState error={status.error} retry={() => status.refetch()} />
-
   const data = status.data
   const [countdownOffset, setCountdownOffset] = useState<number>(0)
 
@@ -293,6 +291,8 @@ export default function Backup() {
     }, 1000)
     return () => clearInterval(timer)
   }, [data?.unitOnline, data?.ignitionState, data?.sleepCountdownRemainingS])
+
+  if (status.isError) return <ErrorState error={status.error} retry={() => status.refetch()} />
 
   const liveCountdown =
     data?.sleepCountdownRemainingS !== null && data?.sleepCountdownRemainingS !== undefined

@@ -2989,9 +2989,7 @@ class TestSleepCountdownAndPrediction:
         assert pred["headroom_s"] < 0
         assert "Exceeds sleep window by" in pred["summary"]
 
-    async def test_webhook_arms_ignition_off_countdown(
-        self, db_session, monkeypatch, client
-    ):
+    async def test_webhook_arms_ignition_off_countdown(self, db_session, monkeypatch, client):
         import asyncio
 
         from app.ingest import puller, status
