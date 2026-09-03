@@ -49,6 +49,7 @@ from app.ingest.obd_reconciliation import (
     specs_for_poll_plan,
 )
 from app.ingest.obd_transfer import get_obd_transfer_status
+from app.obd import battery
 
 router = APIRouter(prefix="/api/obd", tags=["obd-import"])
 
@@ -440,6 +441,10 @@ async def drive_series(drive_id: str, session: SessionDep) -> dict[str, object]:
             }
             for spec in specs
         ],
+        # Two readings out of one number: what the alternator was doing while the engine
+        # ran, and -- only if it stopped inside this drive -- what the battery's own
+        # resting voltage implies. See :mod:`app.obd.battery` for why they cannot be mixed.
+        "battery": battery.estimate(battery.samples_from_rows(samples)),
         "samples": [_series_sample(row, specs) for row in samples],
         "diagnostics": [
             {

@@ -6,7 +6,7 @@ import type { PointerEvent as ReactPointerEvent } from 'react'
 import Spinner from '@/components/Spinner'
 import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
 import { EmptyState, ErrorState, PageHeader, StatTile } from '@/components/ui'
-import { api, type OBDSeriesSample } from '@/lib/api'
+import { api, type OBDBattery, type OBDSeriesSample } from '@/lib/api'
 import { formatDateTime, formatDuration, formatRelative, formatSpeed, formatTime } from '@/lib/format'
 
 /** One metric drawn against elapsed drive time. */
@@ -16,8 +16,17 @@ interface Series {
   colorClass: string
   values: (number | null)[]
   unit?: string
-  /** Logger poll-plan cadence, never inferred from a sparse or interrupted trace. */
-  expectedCadenceS?: number
+  /**
+   * The backend signal this trace came from, used to look its poll cadence up in
+   * `signal_metadata`.
+   *
+   * It is a name rather than a number because the number used to be written out at each
+   * call site, and the medium-tier traces that were missed — throttle, MAF, timing advance,
+   * both fuel estimates — silently fell back to the fast-tier 5 s and were drawn as
+   * unconnected dots: their real 15 s spacing was three times the bridge that fallback
+   * allows. The cadence is the logger's own fact and is now only ever read from it.
+   */
+  signal?: string
   provenance?: 'measured' | 'derived'
 }
 
@@ -30,6 +39,9 @@ const PAD_B = 22
 
 /** Fast samples beyond the documented 5 s cadence plus 50% tolerance are a gap. */
 const FAST_GAP_THRESHOLD_S = 7.5
+
+/** Only for a trace the poll plan does not name; every real signal carries its own. */
+const DEFAULT_CADENCE_S = 5
 
 function formatTick(value: number, span?: number): string {
   // Decimals follow the axis range, not the value's size: a 12.1–12.9 V axis labelled
@@ -48,6 +60,152 @@ function formatElapsed(seconds: number): string {
   return `${m}:${String(s).padStart(2, '0')}`
 }
 
+const CONFIDENCE_NOTE: Record<string, string> = {
+  settled: 'settled reading',
+  provisional: 'taken soon after shutdown',
+  single_reading: 'one reading only',
+}
+
+/**
+ * The battery, as far as one voltage reading can honestly describe it.
+ *
+ * Deliberately two separate statements rather than one number. While the engine runs the
+ * alternator owns the bus, so the reading describes the *charging system* and says nothing
+ * about how full the battery is — a battery at 40% and one at 100% both sit at ~14 V while
+ * being charged. Only a reading taken with the engine off belongs to the battery itself.
+ *
+ * The uncertainty is shown, not hidden: the adapter quantises to 0.1 V, which in the middle
+ * of the charge curve is worth about seven points, so a bare percentage would imply a
+ * precision the hardware cannot deliver.
+ */
+function BatteryCard({ battery }: { battery: OBDBattery }) {
+  const soc = battery.stateOfCharge
+  const charging = battery.charging
+  const tone =
+    soc == null
+      ? 'text-content-muted'
+      : soc.percent >= 80
+        ? 'text-state-ok'
+        : soc.percent >= 50
+          ? 'text-state-warn'
+          : 'text-state-error'
+  const barTone =
+    soc == null
+      ? 'bg-content-faint'
+      : soc.percent >= 80
+        ? 'bg-state-ok'
+        : soc.percent >= 50
+          ? 'bg-state-warn'
+          : 'bg-state-error'
+  const chargingTone =
+    charging?.state === 'healthy'
+      ? 'text-state-ok'
+      : charging?.state == null
+        ? 'text-content-muted'
+        : 'text-state-warn'
+
+  return (
+    <section className="card p-4 sm:p-5">
+      <div className="flex flex-wrap items-baseline gap-2">
+        <h2 className="font-medium">Battery</h2>
+        <span className="text-xs text-content-faint">
+          estimated from the adapter&rsquo;s voltage reading
+        </span>
+      </div>
+
+      <div className="mt-4 grid gap-5 lg:grid-cols-2">
+        <div>
+          <div className="text-xs text-content-faint">State of charge</div>
+          {soc ? (
+            <>
+              <div className={`mt-1 flex items-baseline gap-2 ${tone}`}>
+                <span className="tabular text-3xl font-semibold">{soc.percent}%</span>
+                <span className="text-sm">&plusmn;{soc.uncertaintyPct.toFixed(0)}</span>
+              </div>
+              <div
+                className="mt-2 h-2 w-full overflow-hidden rounded-full bg-surface-muted"
+                role="img"
+                aria-label={`Battery about ${soc.percent} percent charged`}
+              >
+                <div
+                  className={`h-full rounded-full ${barTone}`}
+                  style={{ width: `${Math.max(2, Math.min(100, soc.percent))}%` }}
+                />
+              </div>
+              <div className="mt-2 text-sm text-content-muted">{soc.summary}</div>
+              <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                <div>
+                  <dt className="text-content-faint">Resting voltage</dt>
+                  <dd className="tabular mt-0.5">{soc.restingV.toFixed(2)} V</dd>
+                </div>
+                <div>
+                  <dt className="text-content-faint">Confidence</dt>
+                  <dd className="mt-0.5">
+                    {CONFIDENCE_NOTE[soc.confidence] ?? soc.confidence}
+                    {soc.restDurationS > 0 && (
+                      <span className="text-content-faint">
+                        {' '}
+                        · {formatDuration(soc.restDurationS)} at rest
+                      </span>
+                    )}
+                  </dd>
+                </div>
+              </dl>
+              {!soc.engineOffConfirmed && (
+                <div className="mt-2 text-xs text-state-warn">
+                  The engine was assumed off from the voltage alone — RPM was not sampled at
+                  that moment.
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="mt-1 text-sm text-content-muted">
+              {battery.stateOfChargeUnavailableReason ??
+                'No reading was taken with the engine off, so state of charge cannot be derived.'}
+            </div>
+          )}
+        </div>
+
+        <div>
+          <div className="text-xs text-content-faint">Charging system</div>
+          {charging ? (
+            <>
+              <div className={`mt-1 flex items-baseline gap-2 ${chargingTone}`}>
+                <span className="tabular text-3xl font-semibold">
+                  {charging.typicalV.toFixed(1)} V
+                </span>
+                <span className="text-sm capitalize">{charging.state}</span>
+              </div>
+              <div className="mt-2 text-sm text-content-muted">{charging.summary}</div>
+              <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                <div>
+                  <dt className="text-content-faint">While running</dt>
+                  <dd className="tabular mt-0.5">
+                    {charging.minV.toFixed(1)} – {charging.maxV.toFixed(1)} V
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-content-faint">Cranking dip</dt>
+                  <dd className="tabular mt-0.5">
+                    {battery.crankingDipV != null
+                      ? `${battery.crankingDipV.toFixed(1)} V`
+                      : 'Not captured'}
+                  </dd>
+                </div>
+              </dl>
+            </>
+          ) : (
+            <div className="mt-1 text-sm text-content-muted">
+              The engine never ran during this drive, so there is nothing to say about the
+              alternator.
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
+  )
+}
+
 /**
  * A drive lasts minutes and holds a few hundred samples, so the whole series is drawn
  * as-is — no windowing or downsampling. Null values split the line into segments rather
@@ -61,6 +219,7 @@ function TimeChart({
   elapsedS,
   timesIso,
   series,
+  cadences,
 }: {
   title: string
   unit: string
@@ -68,9 +227,16 @@ function TimeChart({
   /** Original sample timestamps, so the tooltip can name the wall-clock moment. */
   timesIso: string[]
   series: Series[]
+  /** Signal name to poll cadence, straight from the drive's own `signal_metadata`. */
+  cadences: Record<string, number>
 }) {
   const svgRef = useRef<SVGSVGElement>(null)
   const [hover, setHover] = useState<number | null>(null)
+
+  // The logger's cadence for this trace, or the fast-tier default when a series is drawn
+  // from something the poll plan does not name (a locally derived trace, say).
+  const cadenceOf = (item: Series) =>
+    (item.signal ? cadences[item.signal] : undefined) ?? DEFAULT_CADENCE_S
 
   const drawn = series.filter((s) => s.values.some((v) => v != null))
   const tFirst = elapsedS[0]
@@ -109,7 +275,7 @@ function TimeChart({
       if (v != null && t != null) observed.push({ t, v })
     })
     if (observed.length === 0) return { lines: [], dots: [] }
-    const bridge = (item.expectedCadenceS ?? 5) * 1.5
+    const bridge = cadenceOf(item) * 1.5
 
     const lines: string[] = []
     const dots: [number, number][] = []
@@ -205,7 +371,7 @@ function TimeChart({
           {drawn.map((s) => {
             const { min: lo, max: hi, last, lastAt } = stats(s.values)
             const stale =
-              lastAt != null && tLast - lastAt > (s.expectedCadenceS ?? 5) * 1.5
+              lastAt != null && tLast - lastAt > cadenceOf(s) * 1.5
             const seriesUnit = s.unit ?? unit
             return (
               <span key={s.label} className="flex items-center gap-1.5">
@@ -514,10 +680,21 @@ export default function ObdDriveDetail() {
     [query.data, elapsedS],
   )
 
+  // Signal name to poll cadence, taken from the drive's own metadata. This is per-drive
+  // rather than a constant on purpose: the cadences belong to the poll plan the logger was
+  // running at the time, and an older drive is entitled to different ones.
+  const cadences = useMemo(() => {
+    const out: Record<string, number> = {}
+    for (const signal of query.data?.signalMetadata ?? []) {
+      out[signal.name] = signal.expectedCadenceS
+    }
+    return out
+  }, [query.data])
+
   if (query.isLoading) return <Spinner label="Loading drive…" className="py-24" />
   if (query.isError) return <ErrorState error={query.error} retry={() => query.refetch()} />
   if (!query.data) return null
-  const { drive, journey, samples, diagnostics } = query.data
+  const { drive, journey, samples, diagnostics, battery } = query.data
   const timesIso = samples.map((s) => s.t)
 
   // Instantaneous L/100 km is meaningless while (nearly) stopped — the divisor is the
@@ -818,6 +995,8 @@ export default function ObdDriveDetail() {
         </section>
       )}
 
+      {battery && <BatteryCard battery={battery} />}
+
       {samples.length < 2 ? (
         <EmptyState
           title="Not enough samples to chart"
@@ -831,11 +1010,13 @@ export default function ObdDriveDetail() {
               unit="km/h"
               elapsedS={elapsedS}
               timesIso={timesIso}
+              cadences={cadences}
               series={[
                 {
                   label: 'Vehicle speed',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.vehicleSpeedKmh),
+                  signal: 'vehicle_speed',
                 },
               ]}
             />
@@ -844,11 +1025,13 @@ export default function ObdDriveDetail() {
               unit="rpm"
               elapsedS={elapsedS}
               timesIso={timesIso}
+              cadences={cadences}
               series={[
                 {
                   label: 'RPM',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.engineRpm),
+                  signal: 'engine_rpm',
                 },
               ]}
             />
@@ -857,18 +1040,19 @@ export default function ObdDriveDetail() {
               unit="°C"
               elapsedS={elapsedS}
               timesIso={timesIso}
+              cadences={cadences}
               series={[
                 {
                   label: 'Coolant',
                   colorClass: 'text-state-error',
                   values: metric(samples, (s) => s.coolantTemperatureC),
-                  expectedCadenceS: 15,
+                  signal: 'coolant_temperature',
                 },
                 {
                   label: 'Intake air',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.intakeAirTemperatureC),
-                  expectedCadenceS: 15,
+                  signal: 'intake_air_temperature',
                 },
               ]}
             />
@@ -877,11 +1061,13 @@ export default function ObdDriveDetail() {
               unit="V"
               elapsedS={elapsedS}
               timesIso={timesIso}
+              cadences={cadences}
               series={[
                 {
                   label: 'Voltage',
                   colorClass: 'text-state-ok',
                   values: metric(samples, (s) => s.adapterVoltageV),
+                  signal: 'adapter_voltage',
                 },
               ]}
             />
@@ -890,16 +1076,19 @@ export default function ObdDriveDetail() {
               unit="%"
               elapsedS={elapsedS}
               timesIso={timesIso}
+              cadences={cadences}
               series={[
                 {
                   label: 'Engine load',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.engineLoadPct),
+                  signal: 'engine_load',
                 },
                 {
                   label: 'Throttle',
                   colorClass: 'text-state-warn',
                   values: metric(samples, (s) => s.throttlePositionPct),
+                  signal: 'throttle_position',
                 },
               ]}
             />
@@ -908,18 +1097,19 @@ export default function ObdDriveDetail() {
               unit="%"
               elapsedS={elapsedS}
               timesIso={timesIso}
+              cadences={cadences}
               series={[
                 {
                   label: 'Short term',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.shortTermFuelTrimPct),
-                  expectedCadenceS: 15,
+                  signal: 'short_term_fuel_trim_bank_1',
                 },
                 {
                   label: 'Long term',
                   colorClass: 'text-state-warn',
                   values: metric(samples, (s) => s.longTermFuelTrimPct),
-                  expectedCadenceS: 15,
+                  signal: 'long_term_fuel_trim_bank_1',
                 },
               ]}
             />
@@ -928,11 +1118,13 @@ export default function ObdDriveDetail() {
               unit="L/h"
               elapsedS={elapsedS}
               timesIso={timesIso}
+              cadences={cadences}
               series={[
                 {
                   label: 'Estimated fuel rate',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.estimatedFuelRateLH),
+                  signal: 'estimated_fuel_rate',
                   provenance: 'derived',
                 },
               ]}
@@ -942,11 +1134,13 @@ export default function ObdDriveDetail() {
               unit="L/100 km"
               elapsedS={elapsedS}
               timesIso={timesIso}
+              cadences={cadences}
               series={[
                 {
                   label: 'Est. consumption (5+ km/h)',
                   colorClass: 'text-accent',
                   values: movingConsumption,
+                  signal: 'estimated_fuel_consumption',
                   provenance: 'derived',
                 },
               ]}
@@ -956,18 +1150,19 @@ export default function ObdDriveDetail() {
               unit="V"
               elapsedS={elapsedS}
               timesIso={timesIso}
+              cadences={cadences}
               series={[
                 {
                   label: 'Sensor 1',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.oxygenSensor1VoltageV),
-                  expectedCadenceS: 15,
+                  signal: 'oxygen_sensor_1_voltage',
                 },
                 {
                   label: 'Sensor 2',
                   colorClass: 'text-state-warn',
                   values: metric(samples, (s) => s.oxygenSensor2VoltageV),
-                  expectedCadenceS: 15,
+                  signal: 'oxygen_sensor_2_voltage',
                 },
               ]}
             />
@@ -976,17 +1171,20 @@ export default function ObdDriveDetail() {
               unit="g/s · °"
               elapsedS={elapsedS}
               timesIso={timesIso}
+              cadences={cadences}
               series={[
                 {
                   label: 'MAF',
                   colorClass: 'text-accent',
                   values: metric(samples, (s) => s.massAirFlowGS),
+                  signal: 'mass_air_flow',
                   unit: 'g/s',
                 },
                 {
                   label: 'Timing advance',
                   colorClass: 'text-state-warn',
                   values: metric(samples, (s) => s.timingAdvanceDeg),
+                  signal: 'timing_advance',
                   unit: '°',
                 },
               ]}

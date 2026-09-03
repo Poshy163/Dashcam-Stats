@@ -525,11 +525,48 @@ export interface OBDSignalMetadata {
   discrete: boolean
 }
 
+/**
+ * What the adapter's voltage reading supports saying about the battery.
+ *
+ * Two measurements out of one number, kept apart deliberately: `charging` is the alternator
+ * while the engine ran, and `stateOfCharge` is the battery's own resting voltage - which is
+ * null whenever the engine never stopped inside the drive, because a battery at 40% and one
+ * at 100% both read ~14 V while being charged.
+ */
+export interface OBDBattery {
+  observedMinV: number
+  observedMaxV: number
+  lastV: number
+  crankingDipV: number | null
+  charging: {
+    state: 'healthy' | 'low' | 'high'
+    summary: string
+    typicalV: number
+    minV: number
+    maxV: number
+    sampleCount: number
+  } | null
+  stateOfCharge: {
+    percent: number
+    /** What one 0.1 V adapter step is worth on the charge curve at this voltage. */
+    uncertaintyPct: number
+    restingV: number
+    confidence: 'settled' | 'provisional' | 'single_reading'
+    restDurationS: number
+    engineOffConfirmed: boolean
+    sampleCount: number
+    measuredAt: string
+    summary: string
+  } | null
+  stateOfChargeUnavailableReason?: string
+}
+
 export interface OBDDriveSeries {
   drive: OBDDriveSummary
   journey: { id: number; title: string | null; overlapS: number } | null
   units: Record<string, string>
   signalMetadata: OBDSignalMetadata[]
+  battery: OBDBattery | null
   samples: OBDSeriesSample[]
   diagnostics: { observedAt: string | null; kind: string; payload: Record<string, unknown> }[]
 }

@@ -4155,6 +4155,13 @@ class TestDriveSeriesApi:
         assert payload["samples"][0]["provenance"]["engine_rpm"] == "measured"
         assert payload["drive"]["processing_status"] == "ready"
         assert payload["drive"]["gap_analysis"]["poll_plan_version"] == 1
+        # Every sample here is 14.1 V with the engine turning, so the alternator is
+        # reportable and state of charge is not: a battery being charged reads ~14 V
+        # whether it is nearly flat or full.
+        assert payload["battery"]["charging"]["state"] == "healthy"
+        assert payload["battery"]["charging"]["typical_v"] == 14.1
+        assert payload["battery"]["state_of_charge"] is None
+        assert "engine off" in payload["battery"]["state_of_charge_unavailable_reason"]
         assert payload["diagnostics"] == [
             {
                 "observed_at": BASE.isoformat(),
