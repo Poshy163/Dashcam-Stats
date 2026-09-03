@@ -1132,6 +1132,31 @@ class AppSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
 
 
+class UnifiCredential(Base):
+    """How this app signs in to the UniFi console, when the operator has wired it up.
+
+    In its own table for exactly the reason :class:`AuthCredential` is: every value in
+    ``app_settings`` is echoed back by ``GET /api/settings`` to render the Settings page, so
+    a console credential living there would be handed to any browser that asked.
+
+    Stored in the clear rather than hashed, unlike the sign-in password, because this one is
+    *presented* to another system rather than verified against something a user types --
+    there is no version of this that works without being able to reproduce the secret. That
+    is the argument for preferring an API key, which is scoped to the Network application
+    and revocable from the console without changing anybody's login.
+
+    One row, id 1. Either ``api_key`` alone, or ``username`` and ``password`` together.
+    """
+
+    __tablename__ = "unifi_credentials"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    api_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    password: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+
+
 class AuthCredential(Base):
     """The single sign-in account, when the operator has configured one.
 

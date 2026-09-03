@@ -1408,6 +1408,50 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.unifi_enabled",
+        "Bounce the unit onto 5 GHz from the access point",
+        "bool",
+        False,
+        "ingest",
+        "Nothing on the head unit can change its Wi-Fi band — its firmware owns that choice "
+        "and will not leave a working 2.4 GHz link even when the 5 GHz radio of the same "
+        "access point is far stronger. The access point can: disconnecting the unit makes it "
+        "re-associate from scratch and pick the strongest radio. With this on, a backup that "
+        "finds the unit on 2.4 GHz asks your UniFi console to reconnect it once, waits a few "
+        "seconds, and carries on either way — a console that is unreachable never holds up a "
+        "copy. Needs the console address below and an API key saved from the Backup page.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.unifi_url",
+        "UniFi console address",
+        "string",
+        "",
+        "ingest",
+        "Base address of the UniFi console, for example https://192.168.1.1 — the same one "
+        "you open to manage the network. Leave the path off.",
+        requires="ingest.unifi_enabled",
+    ),
+    SettingDef(
+        "ingest.unifi_site",
+        "UniFi site",
+        "string",
+        "default",
+        "ingest",
+        "The site the access point belongs to. Almost always 'default'.",
+        requires="ingest.unifi_enabled",
+    ),
+    SettingDef(
+        "ingest.unifi_verify_tls",
+        "Verify the console's certificate",
+        "bool",
+        False,
+        "ingest",
+        "Off by default because a UniFi console presents a self-signed certificate for its "
+        "LAN address. Turn it on only if you have installed a real certificate on it.",
+        requires="ingest.unifi_enabled",
+    ),
+    SettingDef(
         "ingest.wifi_selection_nudge",
         "Nudge the unit toward 5 GHz",
         "bool",

@@ -49,24 +49,44 @@ somebody turning a key. Weighed against saving a few minutes of transfer, that i
 trade worth making — and it is precisely the "never leave the car worse than it was found"
 rule this subsystem is built around.
 
-The two safe ways to actually get 5 GHz, neither of which belongs in this module:
+**What is actually possible, measured rather than assumed (2026-09-03).**
 
-* **Give the router a 5 GHz-only SSID and point the unit at it.** No 2.4 GHz band to lock
-  onto, nothing for this code to do, no risk. This is the real fix and the one to reach for.
-* ``cmd wifi connect-network <ssid> wpa2 <passphrase> -b <bssid>`` pins an exact BSSID and
-  therefore a band, without ever setting ``WIFI_ON`` to 0. It is genuinely safe, and it is
-  not here only because it needs the network's passphrase stored in this app — a real
-  decision for the operator to make rather than one to take on their behalf.
+An earlier version of this note offered ``cmd wifi connect-network … -b <bssid>`` as the
+safe way to pin a band, needing only the passphrase. That was wrong for this hardware:
+``connect-network`` **is not in this build's verb list at all**. Nor is ``disconnect``, nor
+any roam verb; ``add-suggestion`` exists but its own help says shell suggestions need an
+approval that requires root, and this is a ``user`` build with ``ro.debuggable=0``, so
+``adb root`` can never succeed. The ROM has no ``wifi_frequency_band`` setting either, and
+the unit's own Wi-Fi picker groups by SSID, so there is not even a band to tap in the UI.
+
+And the deeper reason none of that would have helped: ``dumpsys wifi`` logs **"No partial
+scan because firmware roaming is supported"** every twenty seconds. The *firmware* owns
+BSSID selection on this chip. Both radios are one saved network, so Android's network
+selection has nothing to switch to — the band is a BSSID roam, and the firmware only roams
+when the current link degrades. Observed sitting on 2.4 GHz at -57 dBm while the same access
+point's 5 GHz radio was twenty decibels stronger at -37 dBm. The selection nudge below is
+real and does run every cycle; it simply cannot overrule that.
+
+So the levers that remain are both outside the unit:
+
+* **The access point.** Disassociating the client makes it re-associate from scratch and
+  pick the strongest radio. That is now implemented here — see
+  :func:`_maybe_kick_to_fast_band` and :mod:`app.ingest.unifi` — bounded to one bounce per
+  visit behind a cooldown, and never able to hold up a copy.
+* **Band steering, or a 5 GHz-only SSID, on the router.** Steering on the existing SSID
+  needs no new network and fixes it permanently at association time; a dedicated 5 GHz SSID
+  is the most certain of all. Either removes the need for the bounce entirely.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
+import time
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
-from app.ingest import adb
+from app.ingest import adb, unifi
 
 log = get_logger(__name__)
 
@@ -126,11 +146,110 @@ _SCAN_ROW = re.compile(r"^\s*([0-9a-fA-F:]{17})\s+(\d{4,5})\s+(-?\d+)")
 _SELECTION_NUDGE = "cmd wifi set-network-selection-config disabled disabled -a 1"
 
 
+#: ``MAC: 40:45:da:9b:3b:fe`` as ``cmd wifi status`` prints it. This is the address the
+#: access point knows the unit by, and it is read live rather than configured because
+#: Android may hand out a per-network randomised MAC -- a stored one would go stale the
+#: first time that rotated, and the bounce would then target nothing.
+_MAC = re.compile(r"MAC:\s*([0-9a-fA-F:]{17})")
+
+#: How long the unit is given to come back on the fast radio after the access point drops
+#: it. A re-association is a scan, an association and a DHCP lease; on this unit that has
+#: been comfortably under fifteen seconds, and waiting longer would eat the driveway window
+#: this is supposed to protect.
+KICK_SETTLE_S = 25.0
+
+#: Gap between checks while waiting for it to come back.
+KICK_POLL_S = 2.5
+
+#: The least time between two bounces. Under ``require_5ghz`` the poller re-runs this gate
+#: every thirty seconds for as long as the car is on the driveway, and a unit that keeps
+#: choosing 2.4 GHz -- because that is genuinely the better radio where it is parked -- must
+#: not be disconnected over and over for the whole visit.
+KICK_COOLDOWN_S = 300.0
+
+#: When the last bounce was asked for, so the cooldown survives across gate calls.
+_last_kick_at: float | None = None
+
+
+def reset_kick_cooldown_for_tests() -> None:
+    global _last_kick_at
+    _last_kick_at = None
+
+
 def _policy() -> str:
     try:
         return str(get_settings_service().get_nowait("ingest.wifi_band") or "any")
     except Exception:
         return "any"
+
+
+def _kick_enabled() -> bool:
+    try:
+        return bool(get_settings_service().get_nowait("ingest.unifi_enabled"))
+    except Exception:
+        return False
+
+
+def parse_mac(status_reply: str) -> str:
+    """The unit's own MAC, as the access point sees it, or "" when it will not say."""
+    found = _MAC.search(status_reply)
+    return found.group(1).lower() if found else ""
+
+
+async def read_client_mac(address: str) -> str:
+    """Ask the unit for its Wi-Fi MAC. "" rather than an exception when it cannot answer."""
+    try:
+        reply = await adb.shell(address, "cmd wifi status", timeout=BAND_TIMEOUT_S)
+    except adb.AdbError as exc:
+        log.debug("could not read the unit's WiFi MAC", error=str(exc))
+        return ""
+    return parse_mac(reply)
+
+
+async def _maybe_kick_to_fast_band(address: str, frequency: int) -> int:
+    """Ask the access point to bounce the unit, and report the band it came back on.
+
+    Returns the frequency to act on -- unchanged when the bounce is switched off, not
+    configured, still inside its cooldown, refused, or simply did not move it. The unit
+    cannot be made to change band from its own shell (see :mod:`app.ingest.unifi` for the
+    measurements), so this is the only lever there is; it is still only ever a courtesy,
+    and every failure path here falls through to copying on the slow band.
+    """
+    global _last_kick_at
+
+    if not _kick_enabled():
+        return frequency
+    now = time.monotonic()
+    if _last_kick_at is not None and now - _last_kick_at < KICK_COOLDOWN_S:
+        log.debug("not bouncing the unit again yet", since_s=round(now - _last_kick_at, 1))
+        return frequency
+
+    mac = await read_client_mac(address)
+    if not mac:
+        return frequency
+
+    # Stamped before the call, not after: a bounce that times out still disconnected the
+    # unit, and retrying that every thirty seconds is the failure this cooldown prevents.
+    _last_kick_at = now
+    asked, detail = await unifi.kick_client(mac)
+    if not asked:
+        log.info("could not ask the access point to move the unit to 5GHz", reason=detail)
+        return frequency
+    log.info("asked the access point to reconnect the unit so it re-picks a radio", mac=mac)
+
+    deadline = time.monotonic() + KICK_SETTLE_S
+    current = frequency
+    while time.monotonic() < deadline:
+        await asyncio.sleep(KICK_POLL_S)
+        seen, _ssid = await read_link(address)
+        if seen is None:
+            # Mid-reassociation the unit has no link to report; that is the expected middle
+            # of this operation, not a failure.
+            continue
+        current = seen
+        if is_fast(seen):
+            return seen
+    return current
 
 
 def _nudge_enabled() -> bool:
@@ -258,6 +377,18 @@ async def gate(address: str) -> bool:
         return True
     if is_fast(frequency):
         _publish(frequency, held=False, reason=None)
+        return True
+
+    # On the slow radio, and the unit itself cannot be made to leave it. If the operator has
+    # given this app their access point, ask it to drop the unit so it re-associates and
+    # picks the strongest radio -- which at every measured parking spot is the 5 GHz one.
+    frequency = await _maybe_kick_to_fast_band(address, frequency)
+    if is_fast(frequency):
+        _publish(frequency, held=False, reason=None)
+        log.info(
+            "the access point moved the unit onto 5GHz; transferring at full speed",
+            frequency_mhz=frequency,
+        )
         return True
 
     if policy == "prefer_5ghz":

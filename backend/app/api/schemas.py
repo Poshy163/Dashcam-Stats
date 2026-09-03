@@ -393,6 +393,19 @@ class CredentialRequest(BaseModel):
     current_password: str | None = Field(default=None, max_length=1024)
 
 
+class UnifiCredentialRequest(BaseModel):
+    """How to sign in to the UniFi console. Either an API key, or a username and password.
+
+    An API key is preferred: it is scoped to the Network application and can be revoked from
+    the console without disturbing anybody's login. Write-only -- there is no schema that
+    reads either value back.
+    """
+
+    api_key: str | None = Field(default=None, max_length=512)
+    username: str | None = Field(default=None, max_length=255)
+    password: str | None = Field(default=None, max_length=1024)
+
+
 class CredentialClearRequest(BaseModel):
     current_password: str | None = Field(default=None, max_length=1024)
 

@@ -7,14 +7,15 @@ source, so it must answer from memory without touching the database or the head 
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from fastapi import status as http_status
 from sqlalchemy import func, select
 
 from app.api.deps import PaginationDep, SessionDep, SettingsDep
-from app.api.schemas import IngestRadioStatusOut
+from app.api.schemas import IngestRadioStatusOut, UnifiCredentialRequest
 from app.core.logging import get_logger
-from app.db.models import IngestRadioTransition, IngestRun
+from app.db.models import IngestRadioTransition, IngestRun, UnifiCredential, utcnow
+from app.ingest import unifi
 from app.ingest.models import RunState
 from app.ingest.puller import start_run
 from app.ingest.status import get_status
@@ -163,6 +164,56 @@ async def ingest_show_test() -> dict[str, object]:
     log.info("opened the backup page on the head unit by hand", url=redacted(url))
     # Redacted: this is echoed into the UI and straight into any screenshot of it.
     return {"shown": True, "url": redacted(url)}
+
+
+@router.put("/ingest/unifi/credential", status_code=http_status.HTTP_204_NO_CONTENT)
+async def set_unifi_credential(body: UnifiCredentialRequest, session: SessionDep) -> Response:
+    """Save how this app signs in to the UniFi console.
+
+    Write-only, and deliberately not a setting: everything in ``app_settings`` is echoed by
+    ``GET /api/settings`` to any authenticated browser. There is no matching GET here for the
+    same reason -- the value can be replaced, never read back.
+    """
+    api_key = (body.api_key or "").strip()
+    username = (body.username or "").strip()
+    password = body.password or ""
+    if api_key and (username or password):
+        raise HTTPException(
+            http_status.HTTP_400_BAD_REQUEST,
+            "Give either an API key or a username and password, not both.",
+        )
+    if not api_key and not (username and password):
+        raise HTTPException(
+            http_status.HTTP_400_BAD_REQUEST,
+            "Give an API key, or a username and password.",
+        )
+    row = await session.get(UnifiCredential, unifi.CREDENTIAL_ID)
+    if row is None:
+        row = UnifiCredential(id=unifi.CREDENTIAL_ID)
+        session.add(row)
+    row.api_key = api_key or None
+    row.username = username or None
+    row.password = password or None
+    row.updated_at = utcnow()
+    await session.commit()
+    return Response(status_code=http_status.HTTP_204_NO_CONTENT)
+
+
+@router.delete("/ingest/unifi/credential", status_code=http_status.HTTP_204_NO_CONTENT)
+async def clear_unifi_credential(session: SessionDep) -> Response:
+    """Forget the console credential. The bounce then simply stops happening."""
+    row = await session.get(UnifiCredential, unifi.CREDENTIAL_ID)
+    if row is not None:
+        await session.delete(row)
+        await session.commit()
+    return Response(status_code=http_status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/ingest/unifi/test", summary="Check the UniFi console answers")
+async def test_unifi() -> dict[str, object]:
+    """Prove the address and credential work, without touching the unit's connection."""
+    ok, detail = await unifi.probe()
+    return {"ok": ok, "detail": detail}
 
 
 @router.post("/ingest/cancel", summary="Stop the running transfer")
