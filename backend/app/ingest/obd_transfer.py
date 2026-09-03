@@ -111,6 +111,17 @@ class OBDTransferStatus:
         with self._lock:
             self.logger = value
             self.logger_checked_at = datetime.now(UTC)
+            if isinstance(value, dict):
+                from app.ingest.status import get_status
+
+                target = value.get("sleep_window_observed_s") or value.get("sleep_window_target_s")
+                if isinstance(target, int) and not isinstance(target, bool) and target > 0:
+                    get_status().set_sleep_window(target)
+                if value.get("acc_state_known") is True:
+                    if value.get("acc_on") is True:
+                        get_status().set_ignition_state("on")
+                    elif value.get("acc_on") is False:
+                        get_status().set_ignition_state("off")
 
     def finish(self, result: OBDTransferResult) -> None:
         with self._lock:

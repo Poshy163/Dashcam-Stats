@@ -86,6 +86,13 @@ class IngestStatus:
         #: Bluetooth off and drop the hotspot that wireless CarPlay runs over.
         self.ignition_hold: bool = False
         self.ignition_hold_reason: str | None = None
+        #: Current sleep window in seconds (e.g. 1200 for active Wi-Fi backup, 300 for idle).
+        self.sleep_window_s: int = 1200
+        #: Ignition state: "on", "off", or "unknown".
+        self.ignition_state: str = "unknown"
+        #: When ignition went off (monotonic and wall-clock).
+        self.ignition_off_monotonic: float | None = None
+        self.ignition_off_wall: datetime | None = None
         #: The recording watcher's most recent verdict — a human summary, whether it was
         #: clean, and when it was collected. Unlike the holds above this is NOT cleared when
         #: the unit leaves: the last drive's story is exactly what someone wants to see while
@@ -235,6 +242,9 @@ class IngestStatus:
                 self.unit_uptime_s = None
                 self.arrival_hold = False
                 self.arrival_hold_reason = None
+                self.ignition_state = "unknown"
+                self.ignition_off_monotonic = None
+                self.ignition_off_wall = None
             self.unit_online = online
 
     def set_wifi(self, frequency_mhz: int | None, *, held: bool, reason: str | None) -> None:
@@ -249,10 +259,48 @@ class IngestStatus:
             self.arrival_hold = held
             self.arrival_hold_reason = reason if held else None
 
-    def set_ignition(self, *, held: bool, reason: str | None) -> None:
+    def set_ignition(
+        self,
+        *,
+        held: bool,
+        reason: str | None,
+        state: str | None = None,
+    ) -> None:
         with self._lock:
             self.ignition_hold = held
             self.ignition_hold_reason = reason if held else None
+            if state:
+                self.ignition_state = state
+            elif held:
+                self.ignition_state = "on"
+            else:
+                self.ignition_state = "off"
+
+            if self.ignition_state == "off":
+                if self.ignition_off_monotonic is None:
+                    self.ignition_off_monotonic = time.monotonic()
+                    self.ignition_off_wall = datetime.now(UTC)
+            elif self.ignition_state == "on":
+                self.ignition_off_monotonic = None
+                self.ignition_off_wall = None
+
+    def set_ignition_state(self, state: str) -> None:
+        """Update the ACC state directly (e.g. from a webhook or background probe)."""
+        with self._lock:
+            self.ignition_state = state
+            if state == "off":
+                if self.ignition_off_monotonic is None:
+                    self.ignition_off_monotonic = time.monotonic()
+                    self.ignition_off_wall = datetime.now(UTC)
+                self.ignition_hold = False
+                self.ignition_hold_reason = None
+            elif state == "on":
+                self.ignition_off_monotonic = None
+                self.ignition_off_wall = None
+
+    def set_sleep_window(self, seconds: int) -> None:
+        with self._lock:
+            self.sleep_window_s = max(1, int(seconds))
 
     def set_recorder_health(self, summary: str, *, ok: bool) -> None:
         with self._lock:
@@ -340,6 +388,78 @@ class IngestStatus:
             return None
         return round(remaining / rate, 1)
 
+    def sleep_countdown_remaining_s(self) -> float | None:
+        """Remaining seconds before the head unit sleeps, or None if unknown/offline."""
+        if not self.unit_online:
+            return None
+        if self.ignition_state == "on":
+            return float(self.sleep_window_s)
+        if self.ignition_state == "off":
+            if self.ignition_off_monotonic is not None:
+                elapsed = time.monotonic() - self.ignition_off_monotonic
+                return max(0.0, float(self.sleep_window_s) - elapsed)
+            if self._started_at is not None:
+                elapsed = time.monotonic() - self._started_at
+                return max(0.0, float(self.sleep_window_s) - elapsed)
+            return float(self.sleep_window_s)
+        if self._started_at is not None:
+            elapsed = time.monotonic() - self._started_at
+            return max(0.0, float(self.sleep_window_s) - elapsed)
+        return float(self.sleep_window_s)
+
+    def sleep_window_prediction(self) -> dict[str, object] | None:
+        """Predict whether the transfer will complete before sleep, and by how long."""
+        if not self.unit_online:
+            return None
+
+        remaining = self.sleep_countdown_remaining_s()
+        if remaining is None:
+            return None
+
+        eta = self.eta_seconds()
+        if eta is not None:
+            est_duration = eta
+        elif self.backlog_known and self.backlog_files == 0:
+            return {
+                "will_pass": True,
+                "headroom_s": round(remaining, 1),
+                "estimated_duration_s": 0.0,
+                "summary": "Card is up to date (no files to transfer)",
+            }
+        elif self.backlog_known and self.backlog_bytes > 0:
+            speed = 25.0 if (self.wifi_frequency_mhz and self.wifi_frequency_mhz >= 4900) else 5.0
+            if self.speed_recent_mbs() > 0:
+                speed = self.speed_recent_mbs()
+            elif self.throughput_mbs() > 0:
+                speed = self.throughput_mbs()
+            est_duration = round(self.backlog_bytes / (speed * 1_000_000), 1)
+        elif self.bytes_total > 0 and self.phase is Phase.TRANSFERRING:
+            speed = 25.0 if (self.wifi_frequency_mhz and self.wifi_frequency_mhz >= 4900) else 5.0
+            remaining_bytes = max(0, self.bytes_total - self.bytes_done)
+            est_duration = round(remaining_bytes / (speed * 1_000_000), 1)
+        else:
+            return None
+
+        headroom = round(remaining - est_duration, 1)
+        will_pass = headroom >= 0
+
+        headroom_abs = abs(headroom)
+        m = int(headroom_abs // 60)
+        s = int(headroom_abs % 60)
+        time_str = f"{m}m {s}s" if m > 0 else f"{s}s"
+
+        if will_pass:
+            summary = f"Will complete with ~{time_str} headroom before sleep"
+        else:
+            summary = f"Exceeds sleep window by ~{time_str} (chunked transfer will save progress and resume next trip)"
+
+        return {
+            "will_pass": will_pass,
+            "headroom_s": headroom,
+            "estimated_duration_s": est_duration,
+            "summary": summary,
+        }
+
     def snapshot(self) -> dict[str, object]:
         """The shape consumed by /api/ingest/status, Home Assistant and the UI.
 
@@ -349,6 +469,8 @@ class IngestStatus:
         refining it, so an existing automation cannot be broken by this file.
         """
         with self._lock:
+            countdown = self.sleep_countdown_remaining_s()
+            prediction = self.sleep_window_prediction()
             return {
                 "state": self.state.value,
                 "phase": self.phase.value,
@@ -373,6 +495,15 @@ class IngestStatus:
                 "arrival_hold_reason": self.arrival_hold_reason,
                 "ignition_hold": self.ignition_hold,
                 "ignition_hold_reason": self.ignition_hold_reason,
+                "sleep_window_seconds": self.sleep_window_s,
+                "sleep_countdown_remaining_s": (
+                    round(countdown, 1) if countdown is not None else None
+                ),
+                "ignition_state": self.ignition_state,
+                "ignition_off_at": (
+                    self.ignition_off_wall.isoformat() if self.ignition_off_wall else None
+                ),
+                "sleep_window_prediction": prediction,
                 "recorder_health": self.recorder_health,
                 "recorder_health_ok": self.recorder_health_ok,
                 "recorder_health_at": (

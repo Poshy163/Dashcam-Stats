@@ -145,6 +145,8 @@ async def ingest_webhook(payload: IngestWebhookRequest | None = None) -> IngestW
     import asyncio
 
     trigger_name = payload.trigger if payload and payload.trigger else "webhook"
+    if trigger_name == "obd_app_ignition_off":
+        state.set_ignition_state("off")
     log.info(
         "ingest webhook received",
         trigger=trigger_name,

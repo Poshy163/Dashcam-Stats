@@ -1,9 +1,11 @@
+import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 
 import Spinner from '@/components/Spinner'
 import { EmptyState, ErrorState, JobStateBadge, PageHeader, ProgressBar, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
+import type { IngestStatus } from '@/lib/api'
 import {
   formatBytes,
   formatDateTime,
@@ -18,6 +20,11 @@ export default function Dashboard() {
     queryKey: ['status'],
     queryFn: api.status,
     refetchInterval: 10_000,
+  })
+  const ingest = useQuery({
+    queryKey: ['ingest-status'],
+    queryFn: api.ingest.status,
+    refetchInterval: (query) => (query.state.data?.state === 'running' ? 2_000 : 10_000),
   })
   // Completed jobs, which is what the heading says. /api/jobs orders by state rank first —
   // running, then failed, then next-to-be-claimed — deliberately, for the Queue page. With
@@ -67,6 +74,10 @@ export default function Dashboard() {
           </Link>
         }
       />
+
+      {ingest.data && (ingest.data.unitOnline || ingest.data.state === 'running') && (
+        <DashcamStatusBanner status={ingest.data} />
+      )}
 
       <SystemStatus
         active={processing.processing}
@@ -310,3 +321,93 @@ function CheckIcon({ className = iconClass }: IconProps) { return <svg className
 function AttentionIcon({ className = iconClass }: IconProps) { return <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M12 3 2.8 20h18.4z" strokeLinejoin="round" /><path d="M12 9v5m0 3v.1" strokeLinecap="round" /></svg> }
 function ArrowIcon({ className = 'h-4 w-4' }: IconProps) { return <svg className={className} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M4 10h12m-4-4 4 4-4 4" strokeLinecap="round" strokeLinejoin="round" /></svg> }
 function RoutePreviewIcon() { return <svg className="relative h-36 w-full max-w-sm" viewBox="0 0 320 150" fill="none"><path d="M15 95c35-60 70 26 103-22s69 36 101-11 50 24 84-38" stroke="rgb(var(--accent) / .16)" strokeWidth="18" strokeLinecap="round" /><path d="M15 95c35-60 70 26 103-22s69 36 101-11 50 24 84-38" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeDasharray="2 8" /><circle cx="15" cy="95" r="9" fill="rgb(var(--surface-raised))" stroke="rgb(var(--state-ok))" strokeWidth="4" /><circle cx="303" cy="24" r="9" fill="rgb(var(--surface-raised))" stroke="currentColor" strokeWidth="4" /></svg> }
+function CarIcon({ className = iconClass }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M5 17h14m-12 0a2 2 0 1 0 4 0m8 0a2 2 0 1 0 4 0M4 17l1.5-6h13l1.5 6M6 11l2-5h8l2 5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function DashcamStatusBanner({ status }: { status: IngestStatus }) {
+  const [countdownOffset, setCountdownOffset] = useState<number>(0)
+
+  useEffect(() => {
+    setCountdownOffset(0)
+  }, [status.sleepCountdownRemainingS, status.ignitionState])
+
+  useEffect(() => {
+    if (
+      !status.unitOnline ||
+      status.ignitionState === 'on' ||
+      status.sleepCountdownRemainingS === null ||
+      status.sleepCountdownRemainingS === undefined
+    ) {
+      return
+    }
+    const timer = setInterval(() => {
+      setCountdownOffset((prev) => prev + 1)
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [status.unitOnline, status.ignitionState, status.sleepCountdownRemainingS])
+
+  const liveCountdown =
+    status.sleepCountdownRemainingS !== null && status.sleepCountdownRemainingS !== undefined
+      ? Math.max(0, status.sleepCountdownRemainingS - countdownOffset)
+      : null
+  const prediction = status.sleepWindowPrediction
+  const running = status.state === 'running'
+
+  return (
+    <div className="card flex flex-wrap items-center justify-between gap-4 border-accent/40 bg-surface-raised p-4 sm:p-5">
+      <div className="flex items-center gap-3">
+        <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-accent-muted text-accent">
+          <CarIcon />
+        </span>
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-sm font-bold tracking-tight text-content">
+              {running ? 'Dashcam backup in progress' : 'Dashcam connected'}
+            </h3>
+            {status.wifiFrequencyMhz && (
+              <span
+                className={`badge ${
+                  status.wifiFrequencyMhz >= 4900
+                    ? 'bg-state-ok/15 text-state-ok'
+                    : 'bg-state-warn/15 text-state-warn'
+                }`}
+              >
+                {status.wifiFrequencyMhz >= 4900 ? '5 GHz' : '2.4 GHz'} ({status.wifiFrequencyMhz} MHz)
+              </span>
+            )}
+            {liveCountdown !== null && liveCountdown !== undefined && (
+              <span
+                className={`badge ${
+                  prediction?.willPass
+                    ? 'bg-state-ok/15 text-state-ok'
+                    : prediction?.willPass === false
+                      ? 'bg-state-warn/15 text-state-warn'
+                      : 'bg-surface-sunken text-content-muted'
+                }`}
+              >
+                ⏱️ Sleep countdown: {formatDuration(liveCountdown)}
+              </span>
+            )}
+          </div>
+          <p className="mt-1 text-xs text-content-muted">
+            {prediction
+              ? prediction.summary
+              : status.ignitionState === 'on'
+                ? `Ignition is ON • ${formatDuration(status.sleepWindowSeconds ?? 1200)} countdown will start when parked`
+                : running
+                  ? `${status.filesDone} of ${status.filesTotal} files • ${formatBytes(status.bytesDone)} of ${formatBytes(status.bytesTotal)}`
+                  : 'Ready on your local network'}
+          </p>
+        </div>
+      </div>
+      <Link to="/backup" className="btn btn-sm self-center">
+        View backup <ArrowIcon />
+      </Link>
+    </div>
+  )
+}

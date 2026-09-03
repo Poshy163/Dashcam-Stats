@@ -211,10 +211,13 @@ async def widen_sleep_window(address: str) -> bool:
     # an upgraded process can briefly retain an old false toggle or explicit duration, and the
     # persistent vendor property must never leave the app-owned policy or oscillate.
     wanted = INGEST_SLEEP_WINDOW_ACTIVE_SECONDS
-    if await adb.sleep_countdown(address) >= wanted:
+    observed = await adb.sleep_countdown(address)
+    if observed >= wanted:
+        get_status().set_sleep_window(observed)
         return True
     if await adb.set_sleep_countdown(address, wanted):
         log.info("widened the head unit's ignition-off window", seconds=wanted)
+        get_status().set_sleep_window(wanted)
         return True
     return False
 
@@ -319,6 +322,7 @@ async def close_sleep_window(address: str, *, drained: bool) -> None:
                 # continue through the parked server fallback, which writes and verifies it.
                 if await adb.sleep_countdown(address) == idle:
                     log.info("accepted the OBD app's verified idle sleep window", seconds=idle)
+                    get_status().set_sleep_window(idle)
                     return
 
     if not await adb.is_parked(address):
@@ -329,6 +333,7 @@ async def close_sleep_window(address: str, *, drained: bool) -> None:
     if await adb.sleep_countdown(address) != idle:
         if await adb.set_sleep_countdown(address, idle):
             log.info("restored the head unit's idle sleep window", seconds=idle)
+            get_status().set_sleep_window(idle)
         else:
             log.warning(
                 "could not verify the head unit's idle sleep window",
@@ -1050,10 +1055,10 @@ async def run_pull(
                         "Could not read whether the ignition is off, and a backup only "
                         "starts when it is. It will be re-checked shortly."
                     )
-                status.set_ignition(held=True, reason=reason)
+                status.set_ignition(held=True, reason=reason, state=ignition)
                 result = RunResult(state=RunState.IDLE)
                 return result
-        status.set_ignition(held=False, reason=None)
+        status.set_ignition(held=False, reason=None, state="off")
 
         if not info.source:
             # Present and authorised, but its card is unmounted, reformatted or somewhere

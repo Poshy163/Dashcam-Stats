@@ -2884,6 +2884,141 @@ class TestIngestWebhook:
             reset_status_for_tests()
 
 
+class TestSleepCountdownAndPrediction:
+    async def test_sleep_countdown_remaining_and_ignition_states(self):
+        import time
+
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        status = get_status()
+
+        # Offline -> None
+        assert status.sleep_countdown_remaining_s() is None
+
+        # Online, ignition on -> full window (1200s)
+        status.set_unit_online(True)
+        status.set_ignition_state("on")
+        status.set_sleep_window(1200)
+        assert status.sleep_countdown_remaining_s() == 1200.0
+
+        # Ignition goes off -> monotonic countdown starts
+        status.set_ignition_state("off")
+        rem1 = status.sleep_countdown_remaining_s()
+        assert rem1 is not None and 1199.0 <= rem1 <= 1200.0
+
+        # Monotonic time advances by 100 seconds
+        status.ignition_off_monotonic = time.monotonic() - 100.0
+        rem2 = status.sleep_countdown_remaining_s()
+        assert rem2 is not None and 1099.0 <= rem2 <= 1101.0
+
+        # Countdown expires -> clamps to 0.0
+        status.ignition_off_monotonic = time.monotonic() - 1500.0
+        assert status.sleep_countdown_remaining_s() == 0.0
+
+        # Unit goes offline -> resets to None
+        status.set_unit_online(False)
+        assert status.sleep_countdown_remaining_s() is None
+
+    async def test_sleep_window_prediction_will_pass(self):
+        import time
+
+        from app.ingest.models import Phase
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        status = get_status()
+        status.set_unit_online(True)
+        status.set_sleep_window(1200)
+        status.set_ignition_state("off")
+        status.ignition_off_monotonic = time.monotonic()
+
+        assert status.try_begin()
+        status.set_phase(Phase.TRANSFERRING)
+        status.bytes_total = 100_000_000
+        status.bytes_done = 0
+
+        # Fake recent samples: 20 MB/s speed (takes 5.0 seconds for 100 MB)
+        now = time.monotonic()
+        status._samples.append((now - 1.0, 0))
+        status._samples.append((now, 20_000_000))
+        assert status.speed_recent_mbs() == 20.0
+        assert status.eta_seconds() == 5.0
+
+        pred = status.sleep_window_prediction()
+        assert pred is not None
+        assert pred["will_pass"] is True
+        assert 1190.0 <= pred["headroom_s"] <= 1200.0
+        assert pred["estimated_duration_s"] == 5.0
+        assert "Will complete with" in pred["summary"]
+        assert "headroom before sleep" in pred["summary"]
+
+        snapshot = status.snapshot()
+        assert snapshot["sleep_window_seconds"] == 1200
+        assert snapshot["sleep_countdown_remaining_s"] is not None
+        assert snapshot["ignition_state"] == "off"
+        assert snapshot["sleep_window_prediction"] == pred
+
+    async def test_sleep_window_prediction_exceeds_window(self):
+        import time
+
+        from app.ingest.models import Phase
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        status = get_status()
+        status.set_unit_online(True)
+        status.set_sleep_window(300)
+        status.set_ignition_state("off")
+        status.ignition_off_monotonic = time.monotonic()
+
+        assert status.try_begin()
+        status.set_phase(Phase.TRANSFERRING)
+        # 10 GB at 5 MB/s = 2000s, window is only 300s
+        status.bytes_total = 10_000_000_000
+        status.bytes_done = 0
+
+        now = time.monotonic()
+        status._samples.append((now - 1.0, 0))
+        status._samples.append((now, 5_000_000))
+        assert status.eta_seconds() == 2000.0
+
+        pred = status.sleep_window_prediction()
+        assert pred is not None
+        assert pred["will_pass"] is False
+        assert pred["headroom_s"] < 0
+        assert "Exceeds sleep window by" in pred["summary"]
+
+    async def test_webhook_arms_ignition_off_countdown(
+        self, db_session, monkeypatch, client
+    ):
+        import asyncio
+
+        from app.ingest import puller, status
+
+        status.reset_status_for_tests()
+
+        def fake_start_run(*, trigger="manual", **kwargs):
+            return asyncio.create_task(asyncio.sleep(0))
+
+        monkeypatch.setattr(puller, "start_run", fake_start_run)
+
+        st = status.get_status()
+        st.set_unit_online(True)
+        st.set_ignition_state("on")
+        assert st.ignition_state == "on"
+
+        response = await client.post(
+            "/api/ingest/webhook",
+            json={"trigger": "obd_app_ignition_off", "vehicle_id": "test_car"},
+        )
+        assert response.status_code == 200
+        assert st.ignition_state == "off"
+        assert st.ignition_off_monotonic is not None
+        rem = st.sleep_countdown_remaining_s()
+        assert rem is not None and 1195.0 <= rem <= 1200.0
+
+
 async def _true() -> bool:
     return True
 

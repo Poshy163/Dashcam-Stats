@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 
@@ -272,6 +273,32 @@ export default function Backup() {
   if (status.isError) return <ErrorState error={status.error} retry={() => status.refetch()} />
 
   const data = status.data
+  const [countdownOffset, setCountdownOffset] = useState<number>(0)
+
+  useEffect(() => {
+    setCountdownOffset(0)
+  }, [data?.sleepCountdownRemainingS, data?.ignitionState])
+
+  useEffect(() => {
+    if (
+      !data?.unitOnline ||
+      data?.ignitionState === 'on' ||
+      data?.sleepCountdownRemainingS === null ||
+      data?.sleepCountdownRemainingS === undefined
+    ) {
+      return
+    }
+    const timer = setInterval(() => {
+      setCountdownOffset((prev) => prev + 1)
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [data?.unitOnline, data?.ignitionState, data?.sleepCountdownRemainingS])
+
+  const liveCountdown =
+    data?.sleepCountdownRemainingS !== null && data?.sleepCountdownRemainingS !== undefined
+      ? Math.max(0, data.sleepCountdownRemainingS - countdownOffset)
+      : null
+  const prediction = data?.sleepWindowPrediction
   const eventSequenceGap = obdStatus.data?.eventStream?.sequenceGap ?? 0
   const running = data?.state === 'running'
   const transition = radioStatus.data?.transition
@@ -494,7 +521,7 @@ export default function Backup() {
         </div>
       )}
 
-      <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+      <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         <StatTile
           label="Status"
           value={descriptor.label}
@@ -544,6 +571,45 @@ export default function Backup() {
           }
         />
         <StatTile
+          label="Sleep countdown"
+          value={
+            !data?.unitOnline
+              ? '—'
+              : data.ignitionState === 'on'
+                ? 'Engine on'
+                : liveCountdown !== null && liveCountdown !== undefined
+                  ? formatDuration(liveCountdown)
+                  : data.sleepCountdownRemainingS !== null && data.sleepCountdownRemainingS !== undefined
+                    ? formatDuration(data.sleepCountdownRemainingS)
+                    : data.sleepWindowSeconds
+                      ? formatDuration(data.sleepWindowSeconds)
+                      : '—'
+          }
+          hint={
+            !data?.unitOnline
+              ? 'Car is not here'
+              : data.ignitionState === 'on'
+                ? `${formatDuration(data.sleepWindowSeconds ?? 1200)} window ready`
+                : prediction?.summary ??
+                  (liveCountdown !== null && liveCountdown !== undefined && liveCountdown > 0
+                    ? 'Counting down to sleep'
+                    : 'Awake window ended')
+          }
+          tone={
+            !data?.unitOnline
+              ? 'default'
+              : data.ignitionState === 'on'
+                ? 'default'
+                : prediction
+                  ? prediction.willPass
+                    ? 'ok'
+                    : 'warn'
+                  : running
+                    ? 'busy'
+                    : 'default'
+          }
+        />
+        <StatTile
           label="Still on the camera"
           value={backlogKnown && data ? formatBytes(data.backlogBytes) : '—'}
           hint={backlogHint}
@@ -586,12 +652,40 @@ export default function Backup() {
                   {data.wifiFrequencyMhz >= 4900 ? '5 GHz' : '2.4 GHz'} ({data.wifiFrequencyMhz} MHz)
                 </span>
               )}
+              {liveCountdown !== null && liveCountdown !== undefined && (
+                <span
+                  className={`badge ${
+                    prediction?.willPass
+                      ? 'bg-state-ok/15 text-state-ok'
+                      : prediction?.willPass === false
+                        ? 'bg-state-warn/15 text-state-warn'
+                        : 'bg-surface-sunken text-content-muted'
+                  }`}
+                  title={prediction?.summary}
+                >
+                  ⏱️ Sleep in {formatDuration(liveCountdown)}
+                  {prediction &&
+                    (prediction.willPass
+                      ? ` • Will pass (+${formatDuration(prediction.headroomS)})`
+                      : ` • Short by ${formatDuration(Math.abs(prediction.headroomS))}`)}
+                </span>
+              )}
             </div>
             <div className="tabular text-sm text-content-muted">
               {formatBytes(data.bytesDone)} of {formatBytes(data.bytesTotal)}
             </div>
           </div>
           <ProgressBar value={fraction} />
+          {prediction && (
+            <div
+              className={`mt-2 flex items-center gap-1.5 text-xs font-medium ${
+                prediction.willPass ? 'text-state-ok' : 'text-state-warn'
+              }`}
+            >
+              <span>{prediction.willPass ? '✓' : '⚠'}</span>
+              <span>{prediction.summary}</span>
+            </div>
+          )}
           <div className="mt-2 flex flex-wrap items-baseline justify-between gap-2 text-xs text-content-faint">
             <span className="truncate">{data.currentFile ?? ' '}</span>
             {data.activeSkipped > 0 && (

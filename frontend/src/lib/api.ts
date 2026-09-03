@@ -211,6 +211,16 @@ export interface IngestStatus {
   ignitionHold: boolean
   /** Why it is being held for the ignition. Null unless held. */
   ignitionHoldReason: string | null
+  sleepWindowSeconds: number | null
+  sleepCountdownRemainingS: number | null
+  ignitionState: 'on' | 'off' | 'unknown'
+  ignitionOffAt: string | null
+  sleepWindowPrediction: {
+    willPass: boolean
+    headroomS: number
+    estimatedDurationS: number
+    summary: string
+  } | null
   /** The recording watcher's last verdict in one line; null until it has collected once. */
   recorderHealth: string | null
   /** Whether that verdict was clean. Null when no verdict yet. */
