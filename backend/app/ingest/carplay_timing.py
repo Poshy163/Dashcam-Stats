@@ -127,7 +127,8 @@ def on_unit_present(address: str) -> None:
     if not _enabled():
         return
     now = time.monotonic()
-    if now - _last_armed.get(address, 0.0) < ARM_DEBOUNCE_S:
+    last = _last_armed.get(address)
+    if last is not None and now - last < ARM_DEBOUNCE_S:
         return
     _last_armed[address] = now
     task = asyncio.create_task(arm(address), name="ingest-carplay-timing")

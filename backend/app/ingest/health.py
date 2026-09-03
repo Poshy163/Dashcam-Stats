@@ -586,7 +586,8 @@ def on_unit_seen(address: str, source_dir: str) -> None:
     if not _wanted() or not source_dir:
         return
     now = time.monotonic()
-    if now - _last_armed.get(address, 0.0) < ARM_DEBOUNCE_S:
+    last = _last_armed.get(address)
+    if last is not None and now - last < ARM_DEBOUNCE_S:
         return
     _last_armed[address] = now
     task = asyncio.create_task(_collect_then_arm(address, source_dir), name="ingest-health")
@@ -605,7 +606,8 @@ def on_unit_present(address: str) -> None:
     if not _wanted():
         return
     now = time.monotonic()
-    if now - _last_refresh.get(address, 0.0) < REFRESH_S:
+    last = _last_refresh.get(address)
+    if last is not None and now - last < REFRESH_S:
         return
     _last_refresh[address] = now
     task = asyncio.create_task(refresh(address), name="ingest-health-refresh")

@@ -189,3 +189,31 @@ class TestArming:
         finally:
             await carplay_timing.shutdown()
             carplay_timing.reset_for_tests()
+
+    async def test_presence_arms_even_when_system_uptime_is_under_debounce_window(self, monkeypatch):
+        calls: list[str] = []
+
+        async def fake_arm(address):
+            calls.append(address)
+            return True
+
+        # When runner / VM uptime is under ARM_DEBOUNCE_S (e.g. 12s on fresh container).
+        monkeypatch.setattr("time.monotonic", lambda: 12.0)
+        monkeypatch.setattr(carplay_timing, "arm", fake_arm)
+        monkeypatch.setattr(
+            carplay_timing,
+            "get_settings_service",
+            lambda: _Settings({carplay_timing.ENABLED_KEY: True}),
+        )
+        carplay_timing.reset_for_tests()
+        try:
+            carplay_timing.on_unit_present("u:5555")
+            for _ in range(10):
+                await asyncio.sleep(0)
+            if carplay_timing._tasks:
+                await asyncio.gather(*list(carplay_timing._tasks), return_exceptions=True)
+            assert calls == ["u:5555"]
+        finally:
+            await carplay_timing.shutdown()
+            carplay_timing.reset_for_tests()
+
