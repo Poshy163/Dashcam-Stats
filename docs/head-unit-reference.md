@@ -229,14 +229,49 @@ Both are reversible from the `shell` user, but by *different* mechanisms and wit
 lifetimes:
 
 ```sh
-setprop persist.log.tag ""      # clears suppression; survives reboot
-setprop ctl.start logd          # starts the daemon; does NOT survive reboot
+setprop persist.log.tag S            # keep the vendor's blanket silence (survives reboot)
+setprop log.tag.AndroidRuntime E     # raise one tag; does NOT survive reboot
+setprop ctl.start logd               # starts the daemon; does NOT survive reboot
 ```
 
 `start logd` proper is refused (`Must be root`); setting `ctl.start` works because the shell
-user holds that permission for this service. Because the `ctl.start` half is not persistent,
-**`logd` has to be restarted after every ignition cycle** — which is why
-`app/ingest/unit_logs.py` re-runs both on every arming rather than once.
+user holds that permission for this service. Neither the per-tag levels nor the `ctl.start`
+half persist, so **both are re-applied after every ignition cycle** — which is why
+`app/ingest/unit_logs.py` runs them on every arming rather than once.
+
+**Do not clear `persist.log.tag`.** The first version of the collector did (`setprop
+persist.log.tag ""`) and filtered on the reading side. That unleashed every native writer —
+the media codec and camera server alone log hundreds of kilobytes a second — and the cost
+is paid by the writers and by `logd` whether or not anyone reads the result. Measured back
+to back with `top` over ten seconds, engine on, recorder running:
+
+| | `persist.log.tag` cleared | `persist.log.tag=S` + allow-list |
+| --- | --- | --- |
+| `logd` CPU | 23.6 % of a core | 14.9 % |
+| `main` buffer growth in 10 s | rolled over (>1,100 lines) | 0 lines |
+| our own tags captured | yes | yes |
+
+So the blanket silence stays and only an allow-list (`ingest.unit_log_allowed_tags`,
+defaults in `unit_logs.DEFAULT_ALLOW_TAGS`) is raised with `log.tag.<tag>=E`. `log.tag` does
+not gate the kernel buffer, so the reading-side filter is still needed as well.
+
+### CarPlay frame timing, sampled on the unit
+
+The CarPlay picture is drawn on a `SurfaceView[](BLAST)#N` layer of Zlink's, and the timing
+of *that* surface — not Zlink's own views, which `dumpsys gfxinfo` reports — is where the
+CarPlay lag lives. `dumpsys SurfaceFlinger --latency '<layer name>'` prints the display
+period and the last 128 frames' desired/actual/ready present times in nanoseconds; the
+intervals between successive actual-present values give fps, and any interval over about
+2.5 periods is a frame that landed late. Measured with CarPlay in use: 23–26 fps delivered,
+median interval 35 ms, p95 70 ms, worst 106 ms, a quarter to a third of frames late.
+
+`app/ingest/carplay_timing.py` ships a toybox script (`carplay_timing.sh`) that does this
+every few seconds while a phone is attached to the hotspot, emitting one line per surface
+under the logcat tag `CarPlayTiming` (at error priority, because the collector keeps only
+`*:E`) and to `/data/local/tmp/dashcam_carplay_timing.log`. Gotchas learned the hard way:
+the layer names carry no package name (`--list | grep -i surfaceview`, skip "Background
+for"); toybox `ps` shows the script as `sh`, so check `/proc/<pid>/cmdline` instead; and
+inside a shell loop, redirect adb's stdin (`</dev/null`) or it consumes the loop's input.
 
 ### Volume, and why the capture is filtered
 
@@ -305,7 +340,31 @@ Each check sends IMEI, brand, model, firmware version and an SDK key. Its own lo
 `/sdcard/Documents/fotalogs/RsOta_*.log`.
 
 **To stop it:** block those hosts at the router or DNS. The app is `SYSTEM` + `PERSISTENT`
-and cannot be removed or reliably disabled without root.
+and cannot be removed or reliably disabled without root. (`dumpsys package` prints
+`enabled=0` for it — that is `COMPONENT_ENABLED_STATE_DEFAULT`, i.e. *enabled*, not
+disabled; it fires on `BOOT_COMPLETED` and holds JobScheduler jobs and alarms for the daily
+check.)
+
+**What it has ever been told (read from its own logs, 2026-09-03):** every check on record —
+twenty of them across a week, the last one minutes after a reboot — was an OMA-FUMO session
+(`"session":"FUMO-REQ"`, `"version":"A1.0"`) answered with
+`{"code":"1500","msg":"Not found package"}`. The identity it sends is brand `QCTech`, model
+`Q30_1025HJYEFPSL_U` (`ro.product.model`), firmware
+`QC_Q30_1025HJYEFPSL_U_Q30_MB_1025_CarCharger_user_2026060112` (`ro.build.display.id`), OS
+14, a dummy IMEI (no modem) and a utdid. There is no published firmware for this model, so
+no OTA can arrive; the updater's logs are the update check, and nothing needs replaying.
+
+**Local update path** (from the APK): `have_local_update=true`, so the updater's UI offers a
+local update from the internal storage root — it looks for `/storage/emulated/0/update.zip`,
+a standard A/B package (`payload.bin` + `payload_properties.txt`) staged to
+`/data/ota_package/` and verified against `/system/etc/security/otacerts.zip`. Only a package
+signed with this ROM's OTA key applies. Also `key_force_update=true`: if the seller ever
+publishes, the updater is configured to force it.
+
+**Zlink's own updater** (Settings → Check for Updates, in the app) exists on 6.1.02 and was
+tried: Zlink's `zj` log shows `update error: … HTTP 404 Not Found`. No package there either;
+a newer Zlink reaches this unit only as a seller-supplied file. The public APK mirrors carry
+older 6.0.x builds, and the "Dofun Play" store other ZQC firmware uses is not on this unit.
 
 ## 9. Firmware / rooting feasibility
 
@@ -322,6 +381,15 @@ plus this exact model's stock FDL1/FDL2 from its PAC firmware, which is not publ
 whitelabel unit. **And a GSI would replace `/system`, taking `ZqcCamera` and every vendor
 app with it** — no recorder, no burned-in overlay, so the telemetry pipeline dies too. See
 `dashcam-backup-investigation.md` §17.
+
+**No open-source route exists either way.** There is no LineageOS or other open ROM for the
+Unisoc UIS786x head-unit family — the community around these boards has only modded factory
+ROMs, and those target FYT-based UIS7862 units, not this ZQC UIS7861 board. And CarPlay
+cannot be replaced by open software on Android: it needs Apple's MFi authentication chip, so
+every open implementation (LIVI, the pi-carplay lineage, Crankshaft/OpenAuto for Android Auto)
+runs on a Linux SBC with either that chip or a dongle that contains it. The practical
+replacement for Zlink on this unit is a Carlinkit-class dongle, which carries the MFi chip and
+its own radio and hands the unit finished video.
 
 ## 10. Command gotchas
 
