@@ -81,6 +81,7 @@ So the levers that remain are both outside the unit:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import time
 
@@ -437,3 +438,51 @@ def _publish(frequency: int | None, *, held: bool, reason: str | None) -> None:
     from app.ingest.status import get_status
 
     get_status().set_wifi(frequency, held=held, reason=reason)
+
+
+#: How often to refresh the live link frequency while the unit remains online.
+LINK_REFRESH_INTERVAL_S = 30.0
+
+_last_link_refresh_at: float = 0.0
+_link_refresh_task: asyncio.Task[None] | None = None
+
+
+async def refresh_link_if_due(address: str) -> int | None:
+    """Refresh the unit's live link frequency if due or unknown."""
+    global _last_link_refresh_at
+    now = time.monotonic()
+    from app.ingest.status import get_status
+
+    status = get_status()
+    if (
+        status.wifi_frequency_mhz is not None
+        and now - _last_link_refresh_at < LINK_REFRESH_INTERVAL_S
+    ):
+        return status.wifi_frequency_mhz
+
+    _last_link_refresh_at = now
+    freq, _ssid = await read_link(address)
+    if freq is not None:
+        _publish(freq, held=status.wifi_band_hold, reason=status.wifi_band_hold_reason)
+    return freq
+
+
+def on_unit_present(address: str) -> None:
+    """Schedule a non-blocking refresh of the Wi-Fi link frequency."""
+    global _link_refresh_task
+    if _link_refresh_task is not None and not _link_refresh_task.done():
+        return
+    _link_refresh_task = asyncio.create_task(
+        refresh_link_if_due(address),
+        name="ingest-band-refresh",
+    )
+
+
+async def shutdown() -> None:
+    """Cancel any pending link-refresh task."""
+    global _link_refresh_task
+    if _link_refresh_task is not None and not _link_refresh_task.done():
+        _link_refresh_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _link_refresh_task
+    _link_refresh_task = None

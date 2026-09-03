@@ -23,6 +23,9 @@ class MainActivity : Activity() {
     private lateinit var offGraceSeconds: EditText
     private lateinit var parkedIntervalSeconds: EditText
     private lateinit var voltageOnlyMode: CheckBox
+    private lateinit var webhookEnabled: CheckBox
+    private lateinit var webhookUrl: EditText
+    private lateinit var webhookApiKey: EditText
     private lateinit var ownership: CheckBox
     private lateinit var enabled: CheckBox
     private lateinit var status: TextView
@@ -68,6 +71,17 @@ class MainActivity : Activity() {
             isChecked = current.voltageOnlyMode
         }
         layout.addView(voltageOnlyMode)
+        webhookEnabled = CheckBox(this).apply {
+            text = "Send webhook to Dashcam Analyser on engine-off / sleep"
+            isChecked = current.webhookEnabled
+        }
+        layout.addView(webhookEnabled)
+        webhookUrl = field(
+            layout,
+            "Webhook URL (e.g. http://192.168.1.16:8199/api/ingest/webhook)",
+            current.webhookUrl,
+        )
+        webhookApiKey = field(layout, "Webhook API key (X-API-Key)", current.webhookApiKey)
         ownership = CheckBox(this).apply {
             text = "I explicitly transferred adapter ownership from Home Assistant and phones"
             isChecked = current.ownershipTransferred
@@ -116,6 +130,9 @@ class MainActivity : Activity() {
             offGraceSeconds = offGraceSeconds.text.toString().toLongOrNull() ?: -1,
             parkedIntervalSeconds = parkedIntervalSeconds.text.toString().toLongOrNull() ?: -1,
             voltageOnlyMode = voltageOnlyMode.isChecked,
+            webhookEnabled = webhookEnabled.isChecked,
+            webhookUrl = webhookUrl.text.toString().trim(),
+            webhookApiKey = webhookApiKey.text.toString().trim(),
         )
         if (!config.thresholdConfigurationValid) {
             rejectConfiguration(

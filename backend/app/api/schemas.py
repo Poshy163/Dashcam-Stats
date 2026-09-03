@@ -574,6 +574,18 @@ class IngestRadioStatusOut(BaseModel):
     transition: IngestRadioTransitionOut | None = None
 
 
+class IngestWebhookRequest(BaseModel):
+    trigger: str = "webhook"
+    vehicle_id: str | None = None
+    timestamp: str | None = None
+
+
+class IngestWebhookResponse(BaseModel):
+    started: bool
+    already_running: bool = False
+    state: str
+
+
 class StatusTotals(BaseModel):
     recordings: int = 0
     journeys: int = 0

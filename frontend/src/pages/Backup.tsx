@@ -494,7 +494,7 @@ export default function Backup() {
         </div>
       )}
 
-      <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
         <StatTile
           label="Status"
           value={descriptor.label}
@@ -512,6 +512,36 @@ export default function Backup() {
               : undefined
           }
           tone={running ? 'busy' : 'default'}
+        />
+        <StatTile
+          label="Wi-Fi"
+          value={
+            !data?.unitOnline
+              ? '—'
+              : data.wifiFrequencyMhz
+                ? data.wifiFrequencyMhz >= 4900
+                  ? '5 GHz'
+                  : '2.4 GHz'
+                : 'Connected'
+          }
+          hint={
+            !data?.unitOnline
+              ? 'Car is not here'
+              : data.wifiFrequencyMhz
+                ? data.wifiFrequencyMhz >= 4900
+                  ? `${data.wifiFrequencyMhz} MHz • Fast link`
+                  : `${data.wifiFrequencyMhz} MHz • Slow link`
+                : 'Reading frequency…'
+          }
+          tone={
+            !data?.unitOnline
+              ? 'default'
+              : data.wifiFrequencyMhz && data.wifiFrequencyMhz >= 4900
+                ? 'ok'
+                : data.wifiFrequencyMhz
+                  ? 'warn'
+                  : 'default'
+          }
         />
         <StatTile
           label="Still on the camera"
@@ -538,11 +568,22 @@ export default function Backup() {
       {running && data && (
         <div className="card mb-6 px-5 py-4">
           <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
-            <div className="text-sm font-medium">
-              {PHASES[data.phase]}
+            <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
+              <span>{PHASES[data.phase]}</span>
               {data.filesTotal > 0 && (
-                <span className="ml-2 font-normal text-content-muted">
+                <span className="font-normal text-content-muted">
                   {data.filesDone} of {data.filesTotal} files
+                </span>
+              )}
+              {data.wifiFrequencyMhz && (
+                <span
+                  className={`badge ${
+                    data.wifiFrequencyMhz >= 4900
+                      ? 'bg-state-ok/15 text-state-ok'
+                      : 'bg-state-warn/15 text-state-warn'
+                  }`}
+                >
+                  {data.wifiFrequencyMhz >= 4900 ? '5 GHz' : '2.4 GHz'} ({data.wifiFrequencyMhz} MHz)
                 </span>
               )}
             </div>

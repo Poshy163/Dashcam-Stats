@@ -333,3 +333,18 @@ class TestTheSelectionNudge:
         # The nudge raises, apply_selection_nudge swallows it, and the gate proceeds on the
         # band it can still read.
         assert await band.gate("u:5555")
+
+    async def test_refresh_link_if_due_updates_status(self, unit_shell):
+        unit_shell.replies["cmd wifi status"] = _STATUS_5G
+        freq = await band.refresh_link_if_due("u:5555")
+        assert freq == 5220
+        assert get_status().wifi_frequency_mhz == 5220
+
+    async def test_on_unit_present_schedules_refresh(self, unit_shell):
+        import asyncio
+
+        unit_shell.replies["cmd wifi status"] = _STATUS_5G
+        band.on_unit_present("u:5555")
+        await asyncio.sleep(0.05)
+        assert get_status().wifi_frequency_mhz == 5220
+        await band.shutdown()

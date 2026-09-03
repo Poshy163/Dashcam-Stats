@@ -17,6 +17,9 @@ data class LoggerConfig(
     val offGraceSeconds: Long = 30,
     val parkedIntervalSeconds: Long = 30,
     val voltageOnlyMode: Boolean = false,
+    val webhookEnabled: Boolean = false,
+    val webhookUrl: String = "",
+    val webhookApiKey: String = "",
 ) {
     val thresholdConfigurationValid: Boolean
         get() = voltageOn in 10.0..16.0 && voltageOff in 10.0..16.0 &&
@@ -59,6 +62,9 @@ object LoggerPreferences {
             offGraceSeconds = prefs.getLong("off_grace_seconds", 30),
             parkedIntervalSeconds = prefs.getLong("parked_interval_seconds", 30),
             voltageOnlyMode = prefs.getBoolean("voltage_only_mode", false),
+            webhookEnabled = prefs.getBoolean("webhook_enabled", false),
+            webhookUrl = prefs.getString("webhook_url", "")?.trim().orEmpty(),
+            webhookApiKey = prefs.getString("webhook_api_key", "")?.trim().orEmpty(),
         )
     }
 
@@ -75,6 +81,9 @@ object LoggerPreferences {
             .putLong("off_grace_seconds", config.offGraceSeconds)
             .putLong("parked_interval_seconds", config.parkedIntervalSeconds)
             .putBoolean("voltage_only_mode", config.voltageOnlyMode)
+            .putBoolean("webhook_enabled", config.webhookEnabled)
+            .putString("webhook_url", config.webhookUrl.trim())
+            .putString("webhook_api_key", config.webhookApiKey.trim())
             .apply()
     }
 

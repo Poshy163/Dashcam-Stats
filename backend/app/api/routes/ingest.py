@@ -12,12 +12,16 @@ from fastapi import status as http_status
 from sqlalchemy import func, select
 
 from app.api.deps import PaginationDep, SessionDep, SettingsDep
-from app.api.schemas import IngestRadioStatusOut, UnifiCredentialRequest
+from app.api.schemas import (
+    IngestRadioStatusOut,
+    IngestWebhookRequest,
+    IngestWebhookResponse,
+    UnifiCredentialRequest,
+)
 from app.core.logging import get_logger
 from app.db.models import IngestRadioTransition, IngestRun, UnifiCredential, utcnow
-from app.ingest import unifi
+from app.ingest import puller, unifi
 from app.ingest.models import RunState
-from app.ingest.puller import start_run
 from app.ingest.status import get_status
 
 log = get_logger(__name__)
@@ -110,13 +114,53 @@ async def ingest_run() -> dict[str, object]:
     # owns the task, so it cannot be garbage collected mid-flight and shutdown can stop it.
     import asyncio
 
-    task = start_run(trigger="manual")
+    task = puller.start_run(trigger="manual")
     await asyncio.sleep(0)
     if task.done() and task.exception() is not None:
         raise HTTPException(
             http_status.HTTP_500_INTERNAL_SERVER_ERROR, str(task.exception())
         ) from task.exception()
     return {"started": True, "state": get_status().snapshot()["state"]}
+
+
+@router.post(
+    "/ingest/webhook",
+    response_model=IngestWebhookResponse,
+    summary="Webhook trigger to start ingest on ignition off",
+)
+async def ingest_webhook(payload: IngestWebhookRequest | None = None) -> IngestWebhookResponse:
+    """Trigger ingest from an external client (e.g. Android OBD app, Home Assistant, Tasker).
+
+    Unlike /ingest/run, if a transfer is already running this returns 200 with already_running=True
+    rather than 409 Conflict, so outbound webhooks do not log errors on duplicate notifications.
+    """
+    state = get_status()
+    if state.running:
+        return IngestWebhookResponse(
+            started=False,
+            already_running=True,
+            state=str(state.snapshot()["state"]),
+        )
+
+    import asyncio
+
+    trigger_name = payload.trigger if payload and payload.trigger else "webhook"
+    log.info(
+        "ingest webhook received",
+        trigger=trigger_name,
+        vehicle_id=payload.vehicle_id if payload else None,
+    )
+    task = puller.start_run(trigger=trigger_name)
+    await asyncio.sleep(0)
+    if task.done() and task.exception() is not None:
+        raise HTTPException(
+            http_status.HTTP_500_INTERNAL_SERVER_ERROR, str(task.exception())
+        ) from task.exception()
+    return IngestWebhookResponse(
+        started=True,
+        already_running=False,
+        state=str(get_status().snapshot()["state"]),
+    )
 
 
 @router.post("/ingest/show-test", summary="Open the backup page on the dashcam now")

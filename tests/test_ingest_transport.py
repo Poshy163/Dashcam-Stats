@@ -2775,6 +2775,47 @@ class TestTheCarScreenTestButton:
         assert "Activity not started" in response.json()["detail"]
 
 
+class TestIngestWebhook:
+    async def test_webhook_triggers_run(self, db_session, monkeypatch, client):
+        import asyncio
+
+        from app.ingest import puller, status
+
+        status.reset_status_for_tests()
+        started_triggers: list[str] = []
+
+        def fake_start_run(*, trigger="manual", **kwargs):
+            started_triggers.append(trigger)
+            return asyncio.create_task(asyncio.sleep(0))
+
+        monkeypatch.setattr(puller, "start_run", fake_start_run)
+
+        response = await client.post(
+            "/api/ingest/webhook",
+            json={"trigger": "obd_app_ignition_off", "vehicle_id": "test_car"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["started"] is True
+        assert data["already_running"] is False
+        assert started_triggers == ["obd_app_ignition_off"]
+
+    async def test_webhook_when_already_running_returns_ok_not_409(
+        self, db_session, monkeypatch, client
+    ):
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        st = get_status()
+        assert st.try_begin()
+
+        response = await client.post("/api/ingest/webhook")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["started"] is False
+        assert data["already_running"] is True
+
+
 async def _true() -> bool:
     return True
 

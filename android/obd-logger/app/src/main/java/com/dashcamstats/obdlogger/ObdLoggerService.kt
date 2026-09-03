@@ -1867,6 +1867,9 @@ class ObdLoggerService : Service() {
                     outcome = "observed",
                     reasonCode = if (value.on) "acc_on" else "acc_off",
                 )
+                if (!value.on) {
+                    dispatchIngestWebhook()
+                }
             }
             is SleepWindowControllerObservation.Attempt -> {
                 val evidence = value.evidence
@@ -1972,6 +1975,59 @@ class ObdLoggerService : Service() {
     private fun updateNotification(message: String) {
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(message))
     }
+
+    private var lastWebhookDispatchAtMillis = 0L
+
+    private fun dispatchIngestWebhook() {
+        val config = LoggerPreferences.load(this)
+        if (!config.webhookEnabled || config.webhookUrl.isBlank()) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastWebhookDispatchAtMillis < 30_000L) {
+            return
+        }
+        lastWebhookDispatchAtMillis = now
+        scope.launch {
+            val success = sendWebhookPost(
+                url = config.webhookUrl,
+                apiKey = config.webhookApiKey,
+                vehicleId = config.vehicleId,
+            )
+            emitEvent(
+                kind = "ingest.webhook",
+                level = if (success) "info" else "warning",
+                outcome = if (success) "dispatched" else "failed",
+                reasonCode = if (success) "webhook_ok" else "webhook_failed",
+            )
+        }
+    }
+
+    private fun sendWebhookPost(url: String, apiKey: String, vehicleId: String): Boolean = runCatching {
+        val endpoint = java.net.URL(url.trim())
+        val connection = endpoint.openConnection() as java.net.HttpURLConnection
+        try {
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 5000
+            connection.readTimeout = 5000
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            if (apiKey.isNotBlank()) {
+                connection.setRequestProperty("X-API-Key", apiKey.trim())
+            }
+            val payload = JSONObject()
+                .put("trigger", "obd_app_ignition_off")
+                .put("vehicle_id", vehicleId)
+                .put("timestamp", Instant.now().toString())
+                .toString()
+            connection.outputStream.use { os ->
+                os.write(payload.toByteArray(Charsets.UTF_8))
+                os.flush()
+            }
+            val code = connection.responseCode
+            code in 200..299
+        } finally {
+            connection.disconnect()
+        }
+    }.getOrDefault(false)
 
     companion object {
         private const val EVENT_PROJECTION_RETRY_INTERVAL_MILLIS = 30_000L

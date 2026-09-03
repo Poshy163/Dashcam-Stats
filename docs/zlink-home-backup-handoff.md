@@ -134,3 +134,18 @@ With the vehicle stationary and CarPlay connected, capture only sanitised state:
 Do not record network names, BSSIDs, MAC addresses, phone names or credentials. Do not use
 `force-stop`, `POWER_OFF`, a global ACC broadcast, direct hotspot commands or a WiFi toggle
 in this test.
+
+## Direct ignition-off webhook and GUI band display
+
+To complement the server's periodic presence and ACC polling, the Android companion app
+(`obd-logger`) and external automations (Home Assistant, Tasker) can explicitly notify the
+server the moment ignition turns off or the device enters sleep:
+
+- **Endpoint:** `POST /api/ingest/webhook` (or `POST /api/ingest/run`)
+- **Authentication:** Header `X-API-Key: <api_key>` (or query parameter `?k=<api_key>`)
+- **Payload (optional):** `{"trigger": "obd_app_ignition_off", "vehicle_id": "..."}`
+- **Behavior:** Starts an ingest run immediately if not already active; returns 200 OK with
+  `already_running=true` if a run is already moving files rather than failing with 409 Conflict.
+- **GUI Display:** The Backup page GUI displays the live Wi-Fi band and frequency (e.g. `5 GHz • 5520 MHz`)
+  across stat tiles and the active transfer progress card, verifying link speed at a glance.
+
