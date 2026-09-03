@@ -1577,6 +1577,20 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.chunk_size",
+        "Transfer batch chunk size",
+        "int",
+        5,
+        "ingest",
+        "How many files to stream and verify per chunk. Completed files are committed to "
+        "permanent storage and reclaimed from the card after each chunk, so an interrupted "
+        "transfer retains its progress and never re-downloads completed files.",
+        minimum=1,
+        maximum=50,
+        unit="files",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
         "ingest.ha_webhook_url",
         "Home Assistant webhook",
         "string",

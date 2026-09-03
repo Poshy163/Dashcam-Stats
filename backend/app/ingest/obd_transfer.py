@@ -255,7 +255,7 @@ _LOGGER_SLEEP_WINDOW_POLICIES = frozenset(
         "server_owned",
     }
 )
-_LOGGER_SLEEP_WINDOW_TARGETS = frozenset({300, 900})
+_LOGGER_SLEEP_WINDOW_TARGETS = frozenset({300, 900, 1200})
 _LOGGER_SLEEP_WINDOW_ERRORS = frozenset(
     {
         "sleep countdown update was refused",
@@ -501,7 +501,7 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
             if item is None or (
                 isinstance(item, int)
                 and not isinstance(item, bool)
-                and (item in _LOGGER_SLEEP_WINDOW_TARGETS or 1 <= item <= MAX_LOGGER_SLEEP_WINDOW_SECONDS)
+                and item in _LOGGER_SLEEP_WINDOW_TARGETS
             ):
                 clean[key] = item
         elif key == "sleep_window_observed_s":

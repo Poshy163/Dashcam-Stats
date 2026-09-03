@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -436,16 +437,17 @@ async def _move(
     port: int,
     timeout_s: int,
     lease: radio_coordinator.RadioTransition | None = None,
+    chunk_size: int = 5,
+    on_chunk_completed: Callable[[list[RemoteFile]], Awaitable[None]] | None = None,
 ) -> transport.TransferResult:
-    """Stream *files* off the unit into *staging*, one listener per directory.
+    """Stream *files* off the unit into *staging*, in bounded chunks per directory.
 
-    One listener per directory rather than one for the run. The card keeps ordinary
-    segments and incident-locked ones in separate directories, and ``tar`` is rooted at
-    the directory it is run from -- so the alternative was rooting it at the parent and
-    letting members arrive as ``Video/x.ts``, which the receiver refuses outright because
-    a member carrying a path is how a tar stream escapes its staging directory. Batching
-    keeps that guard untouched and costs one extra connection setup, only on cards that
-    actually have locked recordings.
+    One listener per directory chunk rather than one for the entire run. The card keeps
+    ordinary segments and incident-locked ones in separate directories, and ``tar`` is
+    rooted at the directory it is run from. Chunking streams files in small batches (e.g. 5
+    at a time) so completed recordings are committed and reclaimed from the card
+    progressively. If a transfer is interrupted, all recordings completed before the drop
+    are preserved on disk and freed on the card rather than lost in staging and redone.
 
     Its own function because the run calls it more than once: for the plan drawn on
     arrival, and again for each sweep that finds recordings the camera closed while the
@@ -455,50 +457,63 @@ async def _move(
     # Seeded complete; `_absorb` ANDs each batch onto it.
     transferred = transport.TransferResult(complete=True)
     for directory, batch in _by_directory(files, info.source):
-        if lease is not None:
-            lease.raise_if_lease_lost()
-        # Anything still listening is serving a *previous* batch's file list, so clear it
-        # before starting ours rather than connecting to the wrong stream.
-        await adb.clear_listener(info.address)
-        listener = await adb.launch_listener(
-            info.address,
-            directory,
-            [item.name for item in batch],
-            port=port,
-            timeout_s=timeout_s,
+        chunks = (
+            [batch[i : i + chunk_size] for i in range(0, len(batch), chunk_size)]
+            if chunk_size > 0
+            else [batch]
         )
-        was_serving = False
-        try:
-            part = await asyncio.to_thread(
-                transport.receive,
-                host,
-                port,
-                staging,
-                expected={item.name: item.size for item in batch},
-                on_file_started=status.file_started,
-                on_file_done=status.file_done,
-                on_bytes=status.add_bytes,
-                cancel=status.cancel_event,
+        for chunk in chunks:
+            if lease is not None:
+                lease.raise_if_lease_lost()
+            # Anything still listening is serving a *previous* batch's file list, so clear it
+            # before starting ours rather than connecting to the wrong stream.
+            await adb.clear_listener(info.address)
+            listener = await adb.launch_listener(
+                info.address,
+                directory,
+                [item.name for item in chunk],
+                port=port,
+                timeout_s=timeout_s,
             )
-        finally:
-            # The adb session *is* the listener's lifetime now, so it has to be ended
-            # explicitly; leaving it would hold the port against the next batch.
-            was_serving = await adb.stop_listener(listener)
+            was_serving = False
+            status.set_phase(Phase.TRANSFERRING)
+            try:
+                part = await asyncio.to_thread(
+                    transport.receive,
+                    host,
+                    port,
+                    staging,
+                    expected={item.name: item.size for item in chunk},
+                    on_file_started=status.file_started,
+                    on_file_done=status.file_done,
+                    on_bytes=status.add_bytes,
+                    cancel=status.cancel_event,
+                )
+            finally:
+                # The adb session *is* the listener's lifetime now, so it has to be ended
+                # explicitly; leaving it would hold the port against the next batch.
+                was_serving = await adb.stop_listener(listener)
 
-        # Which side stopped first. An incomplete transfer whose listener was still serving
-        # is the car leaving, which is the expected ending and not a fault; one whose
-        # listener had already exited is the unit giving up -- `tar` failing, the remote
-        # `timeout` firing -- and that is worth saying out loud, because the two used to
-        # produce the same sentence and only one of them is anybody's problem.
-        if part.error and not part.complete and not was_serving:
-            part.error = f"{part.error} (the head unit stopped serving first)"
-        _absorb(transferred, part)
-        if lease is not None:
-            lease.raise_if_lease_lost()
-        if not part.complete:
-            # The window shut, or the operator cancelled. Standing up another listener into
-            # a link that has already gone would spend what is left of the window on a
-            # connection that cannot be answered.
+            # Which side stopped first. An incomplete transfer whose listener was still serving
+            # is the car leaving, which is the expected ending and not a fault; one whose
+            # listener had already exited is the unit giving up -- `tar` failing, the remote
+            # `timeout` firing -- and that is worth saying out loud, because the two used to
+            # produce the same sentence and only one of them is anybody's problem.
+            if part.error and not part.complete and not was_serving:
+                part.error = f"{part.error} (the head unit stopped serving first)"
+            _absorb(transferred, part)
+
+            if on_chunk_completed is not None:
+                await on_chunk_completed(chunk)
+
+            if lease is not None:
+                lease.raise_if_lease_lost()
+            if not part.complete or status.cancel_event.is_set():
+                # The window shut, or the operator cancelled. Standing up another listener into
+                # a link that has already gone would spend what is left of the window on a
+                # connection that cannot be answered.
+                break
+        if not transferred.complete or status.cancel_event.is_set():
             break
     return transferred
 
@@ -1463,6 +1478,25 @@ async def run_pull(
                 name="ingest-show-backup-page",
             )
 
+        chunk_size = int(_get("chunk_size", 5))
+        committed: list[str] = []
+        expected: dict[str, int] = {item.name: item.size for item in plan.files}
+        wanted = list(plan.files)
+
+        async def _commit_and_reclaim_chunk(chunk: list[RemoteFile]) -> None:
+            chunk_expected = {item.name: item.size for item in chunk}
+            status.set_phase(Phase.VERIFYING)
+            chunk_committed = await asyncio.to_thread(commit, staging, footage, chunk_expected)
+            if chunk_committed:
+                committed.extend(chunk_committed)
+                if bool(_get("delete_after_verify", False)):
+                    if radio_transition is not None:
+                        radio_transition.raise_if_lease_lost()
+                    by_name = {item.name: item for item in chunk}
+                    to_reclaim = [by_name[name] for name in chunk_committed if name in by_name]
+                    if to_reclaim:
+                        await _reclaim(info, to_reclaim, lease=radio_transition)
+
         transferred = await _move(
             info,
             plan.files,
@@ -1471,31 +1505,25 @@ async def run_pull(
             port=port,
             timeout_s=timeout_s,
             lease=radio_transition,
+            chunk_size=chunk_size,
+            on_chunk_completed=_commit_and_reclaim_chunk,
         )
-        if radio_transition is not None:
-            radio_transition.raise_if_lease_lost()
 
         status.set_phase(Phase.VERIFYING)
-        expected = {item.name: item.size for item in plan.files}
-        if radio_transition is not None:
-            radio_transition.raise_if_lease_lost()
-        committed = await asyncio.to_thread(commit, staging, footage, expected)
-        if radio_transition is not None:
-            radio_transition.raise_if_lease_lost()
-        wanted = list(plan.files)
-
-        if bool(_get("delete_after_verify", False)) and committed:
-            # Grouped by directory the same way the transfer was: `rm` runs from the
-            # directory, so a locked recording deleted against the ordinary Video path
-            # would either miss or -- far worse -- match a different file that happened to
-            # share its name. `_reclaim` does that grouping and, unlike the bare
-            # `suppress(AdbError)` this replaced, says so in the log either way.
-            by_name = {item.name: item for item in plan.files}
-            await _reclaim(
-                info,
-                [by_name[name] for name in committed if name in by_name],
-                lease=radio_transition,
-            )
+        remaining_expected = {
+            item.name: item.size for item in plan.files if item.name not in set(committed)
+        }
+        if remaining_expected and staging.is_dir():
+            more_committed = await asyncio.to_thread(commit, staging, footage, remaining_expected)
+            if more_committed:
+                committed.extend(more_committed)
+                if bool(_get("delete_after_verify", False)):
+                    if radio_transition is not None:
+                        radio_transition.raise_if_lease_lost()
+                    by_name = {item.name: item for item in plan.files}
+                    to_reclaim = [by_name[name] for name in more_committed if name in by_name]
+                    if to_reclaim:
+                        await _reclaim(info, to_reclaim, lease=radio_transition)
 
         # The sweeps: re-check the card before calling the run done. The plan was drawn
         # when the car arrived, and the recording the camera was writing at that moment --
@@ -1541,25 +1569,28 @@ async def run_pull(
                 port=port,
                 timeout_s=timeout_s,
                 lease=radio_transition,
+                chunk_size=chunk_size,
+                on_chunk_completed=_commit_and_reclaim_chunk,
             )
             _absorb(transferred, part)
-            if radio_transition is not None:
-                radio_transition.raise_if_lease_lost()
             status.set_phase(Phase.VERIFYING)
             more_expected = {item.name: item.size for item in more.files}
-            more_committed = await asyncio.to_thread(commit, staging, footage, more_expected)
-            if radio_transition is not None:
-                radio_transition.raise_if_lease_lost()
+            remaining_more = {
+                name: size for name, size in more_expected.items() if name not in set(committed)
+            }
+            if remaining_more and staging.is_dir():
+                more_committed = await asyncio.to_thread(commit, staging, footage, remaining_more)
+                if more_committed:
+                    committed.extend(more_committed)
+                    if bool(_get("delete_after_verify", False)):
+                        if radio_transition is not None:
+                            radio_transition.raise_if_lease_lost()
+                        by_name = {item.name: item for item in more.files}
+                        to_reclaim = [by_name[name] for name in more_committed if name in by_name]
+                        if to_reclaim:
+                            await _reclaim(info, to_reclaim, lease=radio_transition)
             expected.update(more_expected)
-            committed = [*committed, *more_committed]
             wanted.extend(more.files)
-            if bool(_get("delete_after_verify", False)) and more_committed:
-                by_name = {item.name: item for item in more.files}
-                await _reclaim(
-                    info,
-                    [by_name[name] for name in more_committed if name in by_name],
-                    lease=radio_transition,
-                )
 
         # The rescue: cut-short recordings stranded outside Video by a power cut. After
         # the sweeps, while the link is still proven good, and only on a run that has not
@@ -1627,9 +1658,31 @@ async def run_pull(
             throughput_mbs=result.throughput_mbs,
         )
     except adb.AdbError as exc:
+        salvage_plan = locals().get("plan")
+        salvage_committed = locals().get("committed", [])
+        if salvage_plan is not None and getattr(salvage_plan, "files", None) and staging.is_dir():
+            remaining_expected = {
+                item.name: item.size
+                for item in salvage_plan.files
+                if item.name not in set(salvage_committed)
+            }
+            if remaining_expected:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(commit, staging, footage, remaining_expected)
         result = RunResult(state=RunState.ERROR, error=str(exc))
         log.warning("the control channel failed during a pull", error=str(exc))
     except Exception as exc:
+        salvage_plan = locals().get("plan")
+        salvage_committed = locals().get("committed", [])
+        if salvage_plan is not None and getattr(salvage_plan, "files", None) and staging.is_dir():
+            remaining_expected = {
+                item.name: item.size
+                for item in salvage_plan.files
+                if item.name not in set(salvage_committed)
+            }
+            if remaining_expected:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(commit, staging, footage, remaining_expected)
         result = RunResult(state=RunState.ERROR, error=f"{type(exc).__name__}: {exc}")
         log.exception("the ingest run failed", error=str(exc))
     finally:

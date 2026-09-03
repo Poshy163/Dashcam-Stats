@@ -2486,6 +2486,71 @@ class TestARunEndToEnd:
         assert result.state is RunState.OK
         assert sorted(unit.deleted) == sorted(unit.payload)
 
+    async def test_chunked_progressive_commit_and_reclaim_on_interrupted_pull(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """When a transfer is interrupted, previously completed chunks are already committed
+        to footage and reclaimed from the card, so they are not re-downloaded next run."""
+        from app.ingest import puller, transport
+        from app.ingest.models import RunState
+
+        unit.payload.clear()
+        unit.payload.update(
+            {
+                "20260903120000_camera_0.ts": b"X" * 1000,
+                "20260903120100_camera_0.ts": b"Y" * 1000,
+                "20260903120200_camera_0.ts": b"Z" * 1000,
+                "20260903120300_camera_0.ts": b"W" * 1000,
+            }
+        )
+        await self._enable(
+            **{
+                "ingest.delete_after_verify": True,
+                "ingest.chunk_size": 2,
+            }
+        )
+
+        existing_receive = puller.transport.receive
+        calls = {"count": 0}
+
+        def failing_receive(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                res = transport.TransferResult()
+                res.error = "Connection reset by peer"
+                res.complete = False
+                return res
+            return existing_receive(*args, **kwargs)
+
+        monkeypatch.setattr(puller.transport, "receive", failing_receive)
+
+        result = await puller.run_pull(trigger="manual")
+
+        assert result.state is RunState.PARTIAL
+        assert result.files == 2
+        assert sorted(unit.deleted) == [
+            "20260903120000_camera_0.ts",
+            "20260903120100_camera_0.ts",
+        ]
+        footage = app_config.footage_dir
+        assert (footage / "20260903120000_camera_0.ts").exists()
+        assert (footage / "20260903120100_camera_0.ts").exists()
+
+        monkeypatch.setattr(puller.transport, "receive", existing_receive)
+        unit.deleted.clear()
+        for name in ["20260903120000_camera_0.ts", "20260903120100_camera_0.ts"]:
+            del unit.payload[name]
+
+        second_result = await puller.run_pull(trigger="manual")
+        assert second_result.state is RunState.OK
+        assert second_result.files == 2
+        assert sorted(unit.deleted) == [
+            "20260903120200_camera_0.ts",
+            "20260903120300_camera_0.ts",
+        ]
+        assert (footage / "20260903120200_camera_0.ts").exists()
+        assert (footage / "20260903120300_camera_0.ts").exists()
+
 
 class TestTheShellIsNotCachedIntoABlankScreen:
     """`index.html` is the only unhashed file in the build, and that makes it dangerous.
@@ -2809,11 +2874,14 @@ class TestIngestWebhook:
         st = get_status()
         assert st.try_begin()
 
-        response = await client.post("/api/ingest/webhook")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["started"] is False
-        assert data["already_running"] is True
+        try:
+            response = await client.post("/api/ingest/webhook")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["started"] is False
+            assert data["already_running"] is True
+        finally:
+            reset_status_for_tests()
 
 
 async def _true() -> bool:
