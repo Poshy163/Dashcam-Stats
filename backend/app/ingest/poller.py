@@ -26,7 +26,7 @@ import contextlib
 import time
 
 from app.core.logging import get_logger
-from app.ingest import adb, health, puller, radio_coordinator, radios, unit_logs
+from app.ingest import adb, carplay_timing, health, puller, radio_coordinator, radios, unit_logs
 from app.ingest.models import RunState, UnitInfo, UnitState, ingest_setting
 from app.ingest.status import get_status
 
@@ -94,6 +94,7 @@ class IngestPoller:
         # the app going down is exactly the kind of absence it exists to cover.
         await health.shutdown()
         await unit_logs.shutdown()
+        await carplay_timing.shutdown()
         log.info("ingest poller stopped")
 
     @property
@@ -451,6 +452,7 @@ class IngestPoller:
                     # home, where the arrival collect above fires only once.
                     health.on_unit_present(info.address)
                     unit_logs.on_unit_present(info.address)
+                    carplay_timing.on_unit_present(info.address)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

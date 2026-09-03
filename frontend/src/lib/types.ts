@@ -421,6 +421,51 @@ export interface UnitLogTag {
   count: number
 }
 
+/** One reading of the CarPlay video surface, sampled on the unit. */
+export interface CarPlayTimingSample {
+  occurredAt: string
+  accOn: boolean
+  phoneAttached: boolean
+  load: number | null
+  socC: number | null
+  zlinkCpuPct: number | null
+  hotspotRxKbit: number | null
+  staMhz: number | null
+  staRssi: number | null
+  apMhz: number | null
+  layer: string
+  fps: number
+  medianMs: number | null
+  p95Ms: number | null
+  maxMs: number | null
+  latePct: number | null
+  frames: number
+  periodMs: number | null
+}
+
+/** A minute of samples: rates averaged, everything else at its worst. */
+export interface CarPlayTimingMinute {
+  bucketStart: string
+  samples: number
+  fps: number | null
+  latePct: number | null
+  p95Ms: number | null
+  maxMs: number | null
+  socC: number | null
+  load: number | null
+  zlinkCpuPct: number | null
+  hotspotRxKbit: number | null
+  staMhz: number | null
+  apMhz: number | null
+}
+
+export interface CarPlayTimingOut {
+  hours: number
+  total: number
+  samples: CarPlayTimingSample[]
+  minutes: CarPlayTimingMinute[]
+}
+
 export type SettingType = 'bool' | 'int' | 'float' | 'string' | 'select' | 'path' | 'bytes'
 
 export interface SettingDef {

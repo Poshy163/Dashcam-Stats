@@ -3,7 +3,21 @@
 The unit ships with logging switched off — ``persist.log.tag=S`` and no ``logd`` process at
 all — so the vendor recorder fails silently and leaves nothing behind to read.  That is
 comfortable for the vendor and useless for anyone trying to work out why an hour of footage
-is missing.  This module turns logging back on and carries the *useful* part of it home.
+is missing.  This module turns the useful part of the log back on and carries it home.
+
+**Why the writers are silenced, not only the reader.**  The first version cleared
+``persist.log.tag`` outright and filtered on the reading side.  That unleashed every
+chatty native component -- the media codec and camera server alone wrote hundreds of
+kilobytes a second -- and the cost is paid by the *writers* and by ``logd`` whether or
+not anyone reads the result.  Measured back to back on the unit: ``logd`` at 23.6% of a
+core with the flood on, 14.9% with it off, and the main buffer rolling over more than a
+thousand lines in ten seconds versus none at all -- on a chip where CarPlay is starving
+for exactly that kind of headroom.  So the vendor's blanket ``persist.log.tag=S`` is
+kept, and only an allow-list of tags is raised to error level with ``log.tag.<tag>``:
+the crash reporters, the process killers, the thermal service, the recorder's own
+liveness line, and the CarPlay timing sampler.  Everything else is never written.  The
+reading-side filter below still applies, because ``log.tag`` does not gate the kernel
+buffer and a raised tag can still be noisy.
 
 **Why a filter is the whole design.**  Measured on the live unit: at warning level and
 above the log runs at roughly 22 KiB/s — about 80 MB an hour — and 79% of it is two tags,
@@ -92,6 +106,26 @@ REFRESH_S = 60.0
 
 ENABLED_KEY = "ingest.unit_logs"
 DENY_KEY = "ingest.unit_log_silenced_tags"
+
+#: Tags allowed to write at all.  Everything not named here stays under the vendor's
+#: blanket ``persist.log.tag=S`` and is never written -- see the module note for the
+#: measured cost of doing otherwise.  Each is raised to error level on every arming,
+#: because ``log.tag.<tag>`` does not persist across a reboot.
+ALLOW_KEY = "ingest.unit_log_allowed_tags"
+DEFAULT_ALLOW_TAGS: tuple[str, ...] = (
+    "AndroidRuntime",
+    "DEBUG",
+    "ActivityManager",
+    "WindowManager",
+    "lowmemorykiller",
+    "UnisocWatchdog",
+    "ThermalManagerService",
+    "ZQC-CamSubStream0",
+    "ZQC-CamSubStream1",
+    "CarPlayTiming",
+    "zj",
+    "System.err",
+)
 STATUS_KEY = "ingest.unit_log_status"
 
 #: Tags silenced by default.  Every entry was measured on this firmware rather than
@@ -213,6 +247,30 @@ def silenced_tags() -> tuple[str, ...]:
     return tuple(tags) or DEFAULT_DENY_TAGS
 
 
+def allowed_tags() -> tuple[str, ...]:
+    """The allow list, from settings, falling back to the curated defaults.
+
+    Validated the same way as the deny list and for the same reason: every entry ends up
+    inside a remote ``setprop``.
+    """
+    try:
+        raw = get_settings_service().get_nowait(ALLOW_KEY)
+    except Exception:
+        raw = None
+    if not raw or not str(raw).strip():
+        return DEFAULT_ALLOW_TAGS
+    tags: list[str] = []
+    for candidate in str(raw).split(","):
+        tag = candidate.strip()
+        if not tag:
+            continue
+        if not _SAFE_TAG.match(tag):
+            log.warning("ignoring an unsafe unit-log allow tag", tag=tag[:40])
+            continue
+        tags.append(tag)
+    return tuple(tags) or DEFAULT_ALLOW_TAGS
+
+
 def capture_command() -> str:
     """The detached logcat invocation, bounded in size and filtered to what matters.
 
@@ -229,18 +287,21 @@ def capture_command() -> str:
 
 
 async def ensure_logging(address: str) -> bool:
-    """Undo the vendor's log suppression.  True when ``logd`` is running afterwards.
+    """Raise the allowed tags under the vendor's blanket silence, and start ``logd``.
 
-    Two separate levers, and only one of them persists.  ``persist.log.tag`` survives a
-    reboot, so clearing it is a one-off; ``ctl.start`` does not, so ``logd`` has to be
-    started again after every ignition cycle — which is why this runs on every arming
-    rather than once.  ``start logd`` proper is refused ("Must be root"); setting
-    ``ctl.start`` works because the shell user holds that permission for this service.
+    True when ``logd`` is running afterwards.  ``persist.log.tag=S`` is the vendor's own
+    default and is re-asserted here so a unit that was ever left unsuppressed is put
+    back; the per-tag ``log.tag.<tag>`` levels do not persist, and neither does
+    ``ctl.start``, so both are applied on every arming rather than once.  ``start logd``
+    proper is refused ("Must be root"); setting ``ctl.start`` works because the shell
+    user holds that permission for this service.
     """
+    raise_tags = " ".join(f"setprop log.tag.{tag} E;" for tag in allowed_tags())
     try:
         await adb.shell(
             address,
-            'setprop persist.log.tag ""; setprop ctl.start logd; sleep 1; getprop init.svc.logd',
+            f"setprop persist.log.tag S; {raise_tags} setprop ctl.start logd; sleep 1; "
+            "getprop init.svc.logd",
             timeout=UNIT_LOG_TIMEOUT_S,
         )
         state = await adb.shell(address, "getprop init.svc.logd", timeout=UNIT_LOG_TIMEOUT_S)

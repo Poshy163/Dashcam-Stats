@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
 
+import CarPlayTimingView from '@/components/CarPlayTimingView'
 import Spinner from '@/components/Spinner'
 import UnitLogView from '@/components/UnitLogView'
 import { EmptyState, ErrorState, PageHeader, Pagination } from '@/components/ui'
@@ -24,7 +25,8 @@ export default function Logs() {
   const [live, setLive] = useState(false)
   const [expanded, setExpanded] = useState<number | null>(null)
 
-  const source = params.get('source') === 'unit' ? 'unit' : 'server'
+  const rawSource = params.get('source')
+  const source = rawSource === 'unit' || rawSource === 'carplay' ? rawSource : 'server'
   const page = Number(params.get('page') ?? 1)
   const level = params.get('level') ?? ''
   const search = params.get('search') ?? ''
@@ -39,7 +41,7 @@ export default function Logs() {
 
   const setSource = (value: string) => {
     const next = new URLSearchParams(params)
-    if (value === 'unit') next.set('source', 'unit')
+    if (value === 'unit' || value === 'carplay') next.set('source', value)
     else next.delete('source')
     // Level and tag vocabularies differ between the two sources (WARNING vs W, logger
     // vs tag), so carrying a filter across would silently return nothing.
@@ -98,6 +100,7 @@ export default function Logs() {
               {[
                 { value: 'server', label: 'Server' },
                 { value: 'unit', label: 'Head unit' },
+                { value: 'carplay', label: 'CarPlay timing' },
               ].map((option) => (
                 <button
                   key={option.value}
@@ -122,6 +125,7 @@ export default function Logs() {
       />
 
       {source === 'unit' && <UnitLogView live={live} />}
+      {source === 'carplay' && <CarPlayTimingView live={live} />}
 
       {source === 'server' && (
         <>

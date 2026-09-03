@@ -320,3 +320,66 @@ class _Settings:
         if key == unit_logs.DENY_KEY:
             return self._deny
         return True
+
+
+class _AllowSettings:
+    def __init__(self, allowed: str = "") -> None:
+        self.allowed = allowed
+
+    def get_nowait(self, key: str, default=None):
+        if key == unit_logs.ALLOW_KEY:
+            return self.allowed
+        return default
+
+
+class TestTheAllowedTagList:
+    def test_the_defaults_name_the_evidence_worth_having(self, monkeypatch):
+        monkeypatch.setattr(unit_logs, "get_settings_service", lambda: _AllowSettings(""))
+        tags = unit_logs.allowed_tags()
+        for wanted in ("AndroidRuntime", "ZQC-CamSubStream0", "UnisocWatchdog", "CarPlayTiming"):
+            assert wanted in tags
+
+    def test_it_takes_an_operator_list(self, monkeypatch):
+        monkeypatch.setattr(unit_logs, "get_settings_service", lambda: _AllowSettings("Foo, Bar"))
+        assert unit_logs.allowed_tags() == ("Foo", "Bar")
+
+    def test_it_drops_shell_metacharacters_rather_than_quoting_them(self, monkeypatch):
+        monkeypatch.setattr(
+            unit_logs, "get_settings_service", lambda: _AllowSettings("Good, $(rm -rf /), Fine")
+        )
+        assert unit_logs.allowed_tags() == ("Good", "Fine")
+
+
+class TestEnsureLogging:
+    """The measured lesson: silence the writers, raise only what is wanted."""
+
+    async def test_it_keeps_the_vendor_silence_and_raises_only_the_allow_list(self, monkeypatch):
+        from app.ingest import adb
+
+        shells: list[str] = []
+
+        async def fake_shell(address, command, **kwargs):
+            shells.append(command)
+            return "running"
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+        monkeypatch.setattr(unit_logs, "get_settings_service", lambda: _AllowSettings(""))
+
+        assert await unit_logs.ensure_logging("u:5555")
+
+        setup = shells[0]
+        assert "setprop persist.log.tag S" in setup
+        assert 'persist.log.tag ""' not in setup, "clearing it is what unleashed the flood"
+        assert "setprop log.tag.CarPlayTiming E;" in setup
+        assert "setprop log.tag.AndroidRuntime E;" in setup
+        assert "setprop ctl.start logd" in setup
+
+    async def test_it_reports_logd_not_coming_up(self, monkeypatch):
+        from app.ingest import adb
+
+        async def fake_shell(address, command, **kwargs):
+            return "stopped"
+
+        monkeypatch.setattr(adb, "shell", fake_shell)
+        monkeypatch.setattr(unit_logs, "get_settings_service", lambda: _AllowSettings(""))
+        assert not await unit_logs.ensure_logging("u:5555")

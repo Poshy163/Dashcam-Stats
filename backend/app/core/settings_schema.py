@@ -1096,6 +1096,32 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.show_on_unit",
     ),
     SettingDef(
+        "ingest.carplay_timing",
+        "Sample CarPlay frame timing on the unit",
+        "bool",
+        True,
+        "ingest",
+        "Runs a small sampler on the head unit that, while a phone is attached to CarPlay, "
+        "reads the timing of the CarPlay video surface every few seconds along with load, "
+        "temperature, Zlink's CPU and the hotspot's bitrate. The lines come home with the "
+        "unit log and show under Logs → CarPlay timing. Read-only on the unit; costs about a "
+        "fifth of a second of work per sample and nothing while no phone is attached.",
+        requires="ingest.unit_logs",
+    ),
+    SettingDef(
+        "ingest.carplay_timing_interval_s",
+        "Seconds between CarPlay timing samples",
+        "int",
+        15,
+        "ingest",
+        "Shorter catches brief stalls; longer costs the unit less. Fifteen seconds resolves "
+        "a drive minute by minute.",
+        minimum=5,
+        maximum=120,
+        unit="s",
+        requires="ingest.carplay_timing",
+    ),
+    SettingDef(
         "ingest.unit_display_url",
         "Dashcam screen address",
         "string",
@@ -1325,6 +1351,19 @@ SETTINGS: tuple[SettingDef, ...] = (
         "the camera ISP tuning spam (ParamSet, isp_alg_fw) that is otherwise about "
         "four fifths of everything the unit logs. Add a tag here if your firmware is "
         "chatty somewhere else; entries with shell metacharacters are ignored.",
+        requires="ingest.unit_logs",
+    ),
+    SettingDef(
+        "ingest.unit_log_allowed_tags",
+        "Log tags allowed to write on the unit",
+        "string",
+        "",
+        "ingest",
+        "Comma-separated tags raised to error level under the unit's own blanket log "
+        "silence; every other tag is never written. Leave empty for the curated defaults "
+        "(crash reporters, process killers, the thermal service, the recorder's liveness "
+        "line, the CarPlay timing sampler). Measured on the unit: letting everything write "
+        "cost the logger a quarter of a core that CarPlay needed.",
         requires="ingest.unit_logs",
     ),
     SettingDef(

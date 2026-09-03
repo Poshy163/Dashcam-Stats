@@ -60,6 +60,7 @@ from app.db.models import (
 )
 from app.db.session import current_revision
 from app.hardware.detect import detect_hardware_async
+from app.ingest import carplay_timing
 from app.pipeline.orchestrator import expand_stages, invalidate_recordings
 from app.pipeline.revisions import outdated_stages
 from app.retention import current_usage, evaluate_safety, plan_idle
@@ -670,6 +671,46 @@ async def list_unit_logs(
         page_size=page.page_size,
         pages=page.pages(total),
     )
+
+
+@router.get(
+    "/unit-logs/carplay-timing",
+    summary="CarPlay frame timing sampled on the head unit",
+)
+async def carplay_timing_samples(
+    session: SessionDep, hours: int = Query(24, ge=1, le=24 * 14)
+) -> dict[str, object]:
+    """The sampler's lines, parsed into numbers and bucketed by minute.
+
+    Read straight from the collected unit log rather than a table of its own: the
+    sampler is one tag among the rest, and the collector already carries it home.
+    """
+    since = datetime.now(UTC) - timedelta(hours=hours)
+    rows = (
+        (
+            await session.execute(
+                select(UnitLogEntry)
+                .where(
+                    UnitLogEntry.tag == carplay_timing.TAG,
+                    UnitLogEntry.occurred_at >= since,
+                )
+                .order_by(UnitLogEntry.occurred_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    samples = [
+        parsed
+        for parsed in (carplay_timing.parse_sample(r.occurred_at, r.message) for r in rows)
+        if parsed is not None
+    ]
+    return {
+        "hours": hours,
+        "total": len(samples),
+        "samples": samples,
+        "minutes": carplay_timing.summarise(samples),
+    }
 
 
 @router.get("/unit-logs/tags", summary="Tags present in the collected unit log")

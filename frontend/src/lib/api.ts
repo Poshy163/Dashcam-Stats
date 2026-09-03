@@ -9,6 +9,7 @@
 import type {
   AuthSession,
   AuthState,
+  CarPlayTimingOut,
   Heatmap,
   HeatmapFilters,
   Job,
@@ -778,6 +779,8 @@ export const api = {
   unitLogs: {
     list: (query?: Query) => request<Paginated<UnitLogEntry>>('/unit-logs', { query }),
     tags: () => request<UnitLogTag[]>('/unit-logs/tags'),
+    carplayTiming: (query?: Query) =>
+      request<CarPlayTimingOut>('/unit-logs/carplay-timing', { query }),
   },
 
   search: (q: string) => request<SearchResults>('/search', { query: { q } }),
