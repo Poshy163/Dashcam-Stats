@@ -190,7 +190,9 @@ class TestArming:
             await carplay_timing.shutdown()
             carplay_timing.reset_for_tests()
 
-    async def test_presence_arms_even_when_system_uptime_is_under_debounce_window(self, monkeypatch):
+    async def test_presence_arms_even_when_system_uptime_is_under_debounce_window(
+        self, monkeypatch
+    ):
         calls: list[str] = []
 
         async def fake_arm(address):
@@ -216,4 +218,3 @@ class TestArming:
         finally:
             await carplay_timing.shutdown()
             carplay_timing.reset_for_tests()
-
