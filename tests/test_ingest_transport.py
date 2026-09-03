@@ -1413,16 +1413,23 @@ class TestARunEndToEnd:
         assert get_status().ignition_hold is False
         assert get_status().ignition_hold_reason is None
 
-    async def test_an_unreadable_ignition_never_holds_a_backup(self, db_session, unit, app_config):
-        """The gate exists to keep radios alone while the car is in use; a unit whose ACC
-        line cannot be read must not be a unit that never gets backed up."""
+    async def test_an_unreadable_ignition_holds_and_says_so(self, db_session, unit, app_config):
+        """A backup starts on one condition only -- a clear ignition-off. An unreadable line
+        is not that, so it holds; but it holds *visibly*, with a reason the operator can
+        act on, rather than silently never backing up."""
         from app.ingest.models import RunState
         from app.ingest.puller import run_pull
+        from app.ingest.status import get_status
 
         await self._enable()
         unit.ignition["state"] = "unknown"
 
-        assert (await run_pull(trigger="manual")).state is RunState.OK
+        result = await run_pull(trigger="manual")
+
+        assert result.state is RunState.IDLE
+        assert get_status().ignition_hold is True
+        assert "Could not read" in (get_status().ignition_hold_reason or "")
+        assert unit.served["names"] is None, "nothing touched"
 
     async def test_the_gate_can_be_switched_off(self, db_session, unit, app_config):
         from app.ingest.models import RunState

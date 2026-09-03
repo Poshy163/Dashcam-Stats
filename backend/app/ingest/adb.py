@@ -721,13 +721,13 @@ async def is_parked(address: str) -> bool:
 
 
 async def ignition_state(address: str) -> str:
-    """``"on"``, ``"off"`` or ``"unknown"`` -- the ACC line, without a bias either way.
+    """``"on"``, ``"off"`` or ``"unknown"`` -- the ACC line, reported as it is.
 
-    :func:`is_parked` deliberately reads anything unclear as "being driven", because its
-    callers blank the screen. The backup gate wants the opposite bias: it exists to keep the
-    radios alone *while the car is in use*, and a unit whose ACC line cannot be read must
-    not be a unit that never gets backed up. So this reports the three cases as they are,
-    and the caller holds only on a clear ``"on"``.
+    :func:`is_parked` folds the unclear cases into "being driven" because its callers blank
+    the screen. The backup gate keeps the same pessimism -- it starts a copy only on a clear
+    ``"off"`` -- but it wants to *say why* it is holding, and "the ignition is on" and "the
+    ignition could not be read" are different things to tell the operator. Hence three
+    values rather than a boolean.
     """
     try:
         answer = (await shell(address, "settings get global acc_status", timeout=10.0)).strip()

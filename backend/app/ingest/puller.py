@@ -1007,26 +1007,35 @@ async def run_pull(
         if not info.online:
             result = RunResult(state=RunState.OFFLINE, error="the head unit is not on the network")
             return result
-        # The car is in use. A backup turns the unit's Bluetooth off and drops its hotspot
-        # to keep the radio clear -- and wireless CarPlay runs over exactly that Bluetooth
-        # and that hotspot. Observed in the field: eight quiet/restore cycles in fifteen
-        # minutes while the operator sat in the car, each one dropping CarPlay, and a run
-        # that started as they arrived tearing the link down mid-handshake so the phone
-        # never reconnected on its own. So while the ignition is on, nothing here touches
-        # the unit at all -- not the listing, not the band gate, not the radios. The unit
-        # stays awake for a window after ignition-off, and that window is the backup's.
-        # Held as IDLE, like the band gate: the poller re-checks every thirty seconds, and
-        # a hold is a postponement, not a fault. Only a clear "on" holds -- a unit whose
-        # ACC line cannot be read is backed up as before, not never.
+        # A backup starts on one condition only: the ignition is off. A backup turns the
+        # unit's Bluetooth off and drops its hotspot to keep the radio clear -- and wireless
+        # CarPlay runs over exactly that Bluetooth and that hotspot. Observed in the field:
+        # eight quiet/restore cycles in fifteen minutes while the operator sat in the car,
+        # each one dropping CarPlay, and a run that started as they arrived tearing the link
+        # down mid-handshake so the phone never reconnected on its own. So unless the unit
+        # says, clearly, that the ignition is off, nothing here touches it at all -- not the
+        # listing, not the band gate, not the radios. The unit stays awake for a window
+        # after ignition-off, and that window is the backup's.
+        #
+        # Strict on purpose, at the operator's request: an unreadable ignition line holds
+        # too, rather than being waved through. That is the pessimistic bias `is_parked`
+        # has always had, but with the reason on the Backup page instead of silence, so a
+        # unit that never backs up says why. Held as IDLE, like the band gate: the poller
+        # re-checks every thirty seconds, and a hold is a postponement, not a fault.
         if bool(_get("only_when_parked", True)):
-            if await adb.ignition_state(info.address) == "on":
-                status.set_ignition(
-                    held=True,
-                    reason=(
+            ignition = await adb.ignition_state(info.address)
+            if ignition != "off":
+                if ignition == "on":
+                    reason = (
                         "The ignition is on. Backing up now would disconnect CarPlay, so "
                         "the copy waits until the car is switched off."
-                    ),
-                )
+                    )
+                else:
+                    reason = (
+                        "Could not read whether the ignition is off, and a backup only "
+                        "starts when it is. It will be re-checked shortly."
+                    )
+                status.set_ignition(held=True, reason=reason)
                 result = RunResult(state=RunState.IDLE)
                 return result
         status.set_ignition(held=False, reason=None)

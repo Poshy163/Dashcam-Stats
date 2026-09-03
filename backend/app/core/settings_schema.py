@@ -1212,9 +1212,9 @@ SETTINGS: tuple[SettingDef, ...] = (
         "clear — and wireless CarPlay runs over exactly that Bluetooth and that hotspot. "
         "Backing up while the car is in use disconnects CarPlay, and a run that starts as "
         "you arrive can tear the link down mid-handshake, so it never reconnects on its own. "
-        "With this on, the backup waits until the ignition is off and uses the unit's "
-        "awake window afterwards. If the ignition state cannot be read, the backup runs "
-        "as before rather than never running.",
+        "With this on, a backup starts on one condition only: the unit reports the "
+        "ignition off. It then uses the unit's awake window. If the ignition state cannot "
+        "be read, the backup holds and the Backup page says so, rather than guessing.",
         requires="ingest.enabled",
     ),
     SettingDef(
