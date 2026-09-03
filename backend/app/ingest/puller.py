@@ -1007,6 +1007,30 @@ async def run_pull(
         if not info.online:
             result = RunResult(state=RunState.OFFLINE, error="the head unit is not on the network")
             return result
+        # The car is in use. A backup turns the unit's Bluetooth off and drops its hotspot
+        # to keep the radio clear -- and wireless CarPlay runs over exactly that Bluetooth
+        # and that hotspot. Observed in the field: eight quiet/restore cycles in fifteen
+        # minutes while the operator sat in the car, each one dropping CarPlay, and a run
+        # that started as they arrived tearing the link down mid-handshake so the phone
+        # never reconnected on its own. So while the ignition is on, nothing here touches
+        # the unit at all -- not the listing, not the band gate, not the radios. The unit
+        # stays awake for a window after ignition-off, and that window is the backup's.
+        # Held as IDLE, like the band gate: the poller re-checks every thirty seconds, and
+        # a hold is a postponement, not a fault. Only a clear "on" holds -- a unit whose
+        # ACC line cannot be read is backed up as before, not never.
+        if bool(_get("only_when_parked", True)):
+            if await adb.ignition_state(info.address) == "on":
+                status.set_ignition(
+                    held=True,
+                    reason=(
+                        "The ignition is on. Backing up now would disconnect CarPlay, so "
+                        "the copy waits until the car is switched off."
+                    ),
+                )
+                result = RunResult(state=RunState.IDLE)
+                return result
+        status.set_ignition(held=False, reason=None)
+
         if not info.source:
             # Present and authorised, but its card is unmounted, reformatted or somewhere
             # unexpected. Saying "not on the network" here sent the operator looking at

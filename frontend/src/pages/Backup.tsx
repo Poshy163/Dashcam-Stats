@@ -415,6 +415,16 @@ export default function Backup() {
         </div>
       )}
 
+      {data?.ignitionHold && data.state !== 'disabled' && (
+        <div className="card mb-6 border-state-warn/40 px-5 py-4 text-sm">
+          <div className="font-medium text-state-warn">Waiting for the ignition to go off</div>
+          <div className="mt-1 text-content-muted">
+            {data.ignitionHoldReason ??
+              'A backup turns the dashcam’s Bluetooth off and drops its hotspot, and wireless CarPlay runs over both. So while the car is switched on nothing is touched; the copy runs in the window after the ignition goes off, and is re-checked every half minute while the car is here.'}
+          </div>
+        </div>
+      )}
+
       {data?.recorderHealth && data.state !== 'disabled' && (
         <div
           className={`card mb-6 px-5 py-4 text-sm ${

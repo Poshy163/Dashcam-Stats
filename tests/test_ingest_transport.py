@@ -1333,6 +1333,15 @@ class TestARunEndToEnd:
             assert address == "127.0.0.1:5555"
             return True
 
+        # The ignition gate reads the ACC line before anything else touches the unit.
+        # Off by default so every existing run test still runs; flipped by the gate tests.
+        ignition = {"state": "off"}
+
+        async def ignition_state(address):
+            assert address == "127.0.0.1:5555"
+            return ignition["state"]
+
+        monkeypatch.setattr(adb, "ignition_state", ignition_state)
         monkeypatch.setattr(adb, "describe", describe)
         monkeypatch.setattr(adb, "inventory", inventory)
         monkeypatch.setattr(adb, "launch_listener", launch_listener)
@@ -1348,7 +1357,7 @@ class TestARunEndToEnd:
             return real_receive(host, served["port"], staging, **kwargs)
 
         monkeypatch.setattr(puller.transport, "receive", receive)
-        return SimpleNamespace(payload=payload, served=served, deleted=deleted)
+        return SimpleNamespace(payload=payload, served=served, deleted=deleted, ignition=ignition)
 
     async def _enable(self, **overrides):
         from app.core.settings_service import get_settings_service
@@ -1362,6 +1371,67 @@ class TestARunEndToEnd:
         }
         values.update(overrides)
         await get_settings_service().set_many(values)
+
+    async def test_the_ignition_being_on_holds_the_backup_and_touches_nothing(
+        self, db_session, unit, app_config
+    ):
+        """Wireless CarPlay runs over the Bluetooth and hotspot a backup switches off.
+        Observed: eight quiet/restore cycles in fifteen minutes with the operator in the
+        car, each dropping CarPlay. While the ignition is on, nothing is touched at all."""
+        from app.ingest.models import RunState
+        from app.ingest.puller import run_pull
+        from app.ingest.status import get_status
+
+        await self._enable()
+        unit.ignition["state"] = "on"
+
+        result = await run_pull(trigger="manual")
+
+        assert result.state is RunState.IDLE, result.error
+        assert result.error is None, "a hold is a postponement, not a fault"
+        assert get_status().ignition_hold is True
+        assert "CarPlay" in (get_status().ignition_hold_reason or "")
+        # The fixture seeds `served` with None values and the fake listener fills them in;
+        # a run that never launched one leaves them untouched.
+        assert unit.served["names"] is None, "no listener, no transfer, no radio touched"
+        assert unit.served["port"] is None
+        assert unit.deleted == []
+
+    async def test_the_ignition_going_off_releases_the_hold(self, db_session, unit, app_config):
+        from app.ingest.models import RunState
+        from app.ingest.puller import run_pull
+        from app.ingest.status import get_status
+
+        await self._enable()
+        unit.ignition["state"] = "on"
+        assert (await run_pull(trigger="manual")).state is RunState.IDLE
+        unit.ignition["state"] = "off"
+
+        result = await run_pull(trigger="manual")
+
+        assert result.state is RunState.OK, result.error
+        assert get_status().ignition_hold is False
+        assert get_status().ignition_hold_reason is None
+
+    async def test_an_unreadable_ignition_never_holds_a_backup(self, db_session, unit, app_config):
+        """The gate exists to keep radios alone while the car is in use; a unit whose ACC
+        line cannot be read must not be a unit that never gets backed up."""
+        from app.ingest.models import RunState
+        from app.ingest.puller import run_pull
+
+        await self._enable()
+        unit.ignition["state"] = "unknown"
+
+        assert (await run_pull(trigger="manual")).state is RunState.OK
+
+    async def test_the_gate_can_be_switched_off(self, db_session, unit, app_config):
+        from app.ingest.models import RunState
+        from app.ingest.puller import run_pull
+
+        await self._enable(**{"ingest.only_when_parked": False})
+        unit.ignition["state"] = "on"
+
+        assert (await run_pull(trigger="manual")).state is RunState.OK
 
     async def test_a_successful_window_lands_the_footage_and_is_recorded(
         self, db_session, unit, app_config

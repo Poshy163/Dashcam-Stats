@@ -1203,6 +1203,21 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.only_when_parked",
+        "Back up only after the ignition is off",
+        "bool",
+        True,
+        "ingest",
+        "A backup turns the unit's Bluetooth off and drops its hotspot to keep the radio "
+        "clear — and wireless CarPlay runs over exactly that Bluetooth and that hotspot. "
+        "Backing up while the car is in use disconnects CarPlay, and a run that starts as "
+        "you arrive can tear the link down mid-handshake, so it never reconnects on its own. "
+        "With this on, the backup waits until the ignition is off and uses the unit's "
+        "awake window afterwards. If the ignition state cannot be read, the backup runs "
+        "as before rather than never running.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
         "ingest.quiet_radios",
         "Turn off Bluetooth and the hotspot while copying",
         "bool",

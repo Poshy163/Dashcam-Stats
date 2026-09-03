@@ -206,6 +206,10 @@ export interface IngestStatus {
   arrivalHold: boolean
   /** Why the pull is being held for arrival. Null unless held. */
   arrivalHoldReason: string | null
+  /** True while the pull is being held because the ignition is on and CarPlay would be cut. */
+  ignitionHold: boolean
+  /** Why it is being held for the ignition. Null unless held. */
+  ignitionHoldReason: string | null
   /** The recording watcher's last verdict in one line; null until it has collected once. */
   recorderHealth: string | null
   /** Whether that verdict was clean. Null when no verdict yet. */

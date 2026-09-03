@@ -720,6 +720,27 @@ async def is_parked(address: str) -> bool:
     return answer == PARKED
 
 
+async def ignition_state(address: str) -> str:
+    """``"on"``, ``"off"`` or ``"unknown"`` -- the ACC line, without a bias either way.
+
+    :func:`is_parked` deliberately reads anything unclear as "being driven", because its
+    callers blank the screen. The backup gate wants the opposite bias: it exists to keep the
+    radios alone *while the car is in use*, and a unit whose ACC line cannot be read must
+    not be a unit that never gets backed up. So this reports the three cases as they are,
+    and the caller holds only on a clear ``"on"``.
+    """
+    try:
+        answer = (await shell(address, "settings get global acc_status", timeout=10.0)).strip()
+    except AdbError as exc:
+        log.debug("could not read the ignition state", error=str(exc))
+        return "unknown"
+    if answer == "1":
+        return "on"
+    if answer == PARKED:
+        return "off"
+    return "unknown"
+
+
 async def sleep_countdown(address: str) -> int:
     """How many seconds the unit currently stays awake after ignition-off. 0 if unknown."""
     try:

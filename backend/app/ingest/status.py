@@ -82,6 +82,10 @@ class IngestStatus:
         self.unit_uptime_s: float | None = None
         self.arrival_hold: bool = False
         self.arrival_hold_reason: str | None = None
+        #: Held because the ignition is on: the car is in use, and a backup would turn its
+        #: Bluetooth off and drop the hotspot that wireless CarPlay runs over.
+        self.ignition_hold: bool = False
+        self.ignition_hold_reason: str | None = None
         #: The recording watcher's most recent verdict — a human summary, whether it was
         #: clean, and when it was collected. Unlike the holds above this is NOT cleared when
         #: the unit leaves: the last drive's story is exactly what someone wants to see while
@@ -140,6 +144,8 @@ class IngestStatus:
             self.arrival_hold_reason = None
             self.wifi_band_hold = False
             self.wifi_band_hold_reason = None
+            self.ignition_hold = False
+            self.ignition_hold_reason = None
             self._samples.clear()
             self._started_at = time.monotonic()
             self._started_wall = datetime.now(UTC)
@@ -242,6 +248,11 @@ class IngestStatus:
             self.unit_uptime_s = uptime_s
             self.arrival_hold = held
             self.arrival_hold_reason = reason if held else None
+
+    def set_ignition(self, *, held: bool, reason: str | None) -> None:
+        with self._lock:
+            self.ignition_hold = held
+            self.ignition_hold_reason = reason if held else None
 
     def set_recorder_health(self, summary: str, *, ok: bool) -> None:
         with self._lock:
@@ -360,6 +371,8 @@ class IngestStatus:
                 "unit_uptime_s": self.unit_uptime_s,
                 "arrival_hold": self.arrival_hold,
                 "arrival_hold_reason": self.arrival_hold_reason,
+                "ignition_hold": self.ignition_hold,
+                "ignition_hold_reason": self.ignition_hold_reason,
                 "recorder_health": self.recorder_health,
                 "recorder_health_ok": self.recorder_health_ok,
                 "recorder_health_at": (
