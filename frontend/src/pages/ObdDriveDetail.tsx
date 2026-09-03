@@ -935,6 +935,8 @@ export default function ObdDriveDetail() {
         />
       </div>
 
+      {battery && <BatteryCard battery={battery} />}
+
       {drive.gapAnalysis && (
         <section className="card overflow-x-auto">
           <div className="border-b border-border p-3">
@@ -994,8 +996,6 @@ export default function ObdDriveDetail() {
           </table>
         </section>
       )}
-
-      {battery && <BatteryCard battery={battery} />}
 
       {samples.length < 2 ? (
         <EmptyState
