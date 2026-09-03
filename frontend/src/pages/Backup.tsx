@@ -56,10 +56,32 @@ function radioSummary(status: IngestRadioStatus, backupRunning: boolean): {
   // Durable recovery wins over the current setting. A user may switch quieting off after
   // an interrupted run, but that does not cancel the obligation to restore what it changed.
   if (transition?.recoveryRequired) {
+    // Name the radios that are actually still off, rather than saying "Bluetooth or the
+    // hotspot" and leaving the reader to work out which from two lines of evidence below.
+    const stillOff = [
+      transition.bluetooth.disableAttempted && !transition.bluetooth.restoreVerified
+        ? 'Bluetooth'
+        : null,
+      transition.hotspot.disableAttempted && !transition.hotspot.restoreVerified
+        ? 'the hotspot'
+        : null,
+    ].filter(Boolean) as string[]
+    const names = stillOff.length ? stillOff.join(' and ') : 'a radio'
+    const subject = stillOff.length === 1 ? `${names} is` : `${names} are`
+
+    // Three different things used to render as one screen. The dashcam saying "I tried and
+    // it did not come back" is a real fault; the dashcam saying nothing because it fell
+    // asleep mid-restore is the ordinary ending; and never having got that far is neither.
+    if (transition.restoreEvidenceSource === 'unit') {
+      return {
+        title: `The dashcam could not switch ${names} back on`,
+        detail: `The dashcam restored what it could before sleeping and reported that ${subject} still off. It will be switched back on the next time the car is on the network — no backup will run until it is.`,
+        tone: 'error',
+      }
+    }
     return {
-      title: 'Radio recovery still required',
-      detail:
-        'The original Bluetooth or hotspot state has not been verified yet. Recovery will retry when the dashcam is reachable.',
+      title: `${names.charAt(0).toUpperCase()}${names.slice(1)} may still be off`,
+      detail: `The backup switched ${names} off and asked for ${stillOff.length === 1 ? 'it' : 'them'} back, but the dashcam went off the network before confirming. This is fixed automatically the next time the car is seen, before any footage is copied.`,
       tone: 'error',
     }
   }
@@ -159,9 +181,18 @@ function radioSummary(status: IngestRadioStatus, backupRunning: boolean): {
     }
   }
   if (changed && restored) {
+    if (transition.restoreEvidenceSource === 'unit') {
+      return {
+        title: 'Bluetooth and the hotspot are back on',
+        detail: transition.unitSleepReportedAt
+          ? 'The dashcam switched them back on and confirmed it from the car in the seconds before it went to sleep. Nothing is outstanding.'
+          : 'The dashcam switched them back on and confirmed it from the car. Nothing is outstanding.',
+        tone: 'ok',
+      }
+    }
     return {
-      title: 'Radio recovery checks passed',
-      detail: 'The latest backup passed every required Bluetooth and hotspot recovery check.',
+      title: 'Bluetooth and the hotspot are back on',
+      detail: 'Everything the last backup switched off was switched back on and checked.',
       tone: 'ok',
     }
   }
@@ -179,31 +210,49 @@ function radioSummary(status: IngestRadioStatus, backupRunning: boolean): {
   }
 }
 
-function radioEvidence(label: string, radio: IngestRadioDeviceState, active: boolean): string {
-  const baseline =
-    radio.baseline === 'transport'
-      ? 'carried the transfer'
-      : radio.baseline === 'unknown'
-        ? 'was not captured'
-        : `was ${radio.baseline}`
-
+/**
+ * One radio's history through the backup, as a sentence.
+ *
+ * This used to read `Bluetooth was on; off verified; restore not verified.` -- three
+ * internal flags joined by semicolons. Every word of it is accurate and none of it answers
+ * the only question being asked, which is whether the driver's hands-free works right now.
+ * So each state gets a sentence that says what happened and, where anything is outstanding,
+ * what the app is going to do about it.
+ */
+function radioEvidence(
+  label: string,
+  radio: IngestRadioDeviceState,
+  active: boolean,
+  evidenceSource: 'server' | 'unit' | null = null,
+): string {
   if (!radio.disableAttempted) {
-    if (radio.disableVerified && radio.baseline === 'off') return `${label} was already off.`
-    if (radio.disableVerified && radio.baseline === 'transport') {
-      return `${label} carried the transfer and was intentionally left alone.`
+    if (radio.baseline === 'off') return `${label} was already off, so the backup left it alone.`
+    if (radio.baseline === 'transport') {
+      return `${label} was carrying the transfer itself, so the backup left it alone.`
     }
-    return `${label} baseline ${baseline}; no change was attempted.`
+    if (radio.baseline === 'unknown') {
+      return `${label} could not be read before the backup, so it was left untouched.`
+    }
+    return `${label} was ${radio.baseline} and the backup did not need to change it.`
   }
 
-  const quiet = radio.disableVerified ? 'off verified' : 'off not verified'
-  const restore = radio.restoreAttempted
-    ? radio.restoreVerified
-      ? 'restore verified'
-      : 'restore not verified'
-    : active
-      ? 'restore pending'
-      : 'restore not attempted'
-  return `${label} ${baseline}; ${quiet}; ${restore}.`
+  const wasOff = radio.disableVerified
+    ? `${label} was switched off for the transfer`
+    : `${label} was asked to switch off for the transfer, though that was never confirmed`
+
+  if (radio.restoreVerified) {
+    // Where the proof came from matters here and only here: it is the difference between
+    // "we checked" and "the car checked, and told us before it slept".
+    const who =
+      evidenceSource === 'unit' ? ' — confirmed by the dashcam itself' : ' — confirmed'
+    return `${wasOff}, and is back on${who}.`
+  }
+  if (radio.restoreAttempted) {
+    return `${wasOff}, and switching it back on was requested but never confirmed.`
+  }
+  return active
+    ? `${wasOff}. It will be switched back on when the copy finishes.`
+    : `${wasOff}, and switching it back on was never attempted.`
 }
 
 export default function Backup() {
@@ -305,7 +354,7 @@ export default function Backup() {
   const recoveryBlocked = !running && transition?.recoveryRequired === true
   const transitionBusy = !running && transition?.active === true
   const descriptor = recoveryBlocked
-    ? { label: 'Recovery needed', tone: 'error' as const }
+    ? { label: 'Radios need switching back on', tone: 'error' as const }
     : transitionBusy
       ? ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
         ? { label: 'Restoring radios', tone: 'busy' as const }
@@ -316,7 +365,7 @@ export default function Backup() {
   const statusHint = running && data
     ? PHASES[data.phase]
     : recoveryBlocked
-      ? 'Backup blocked until radios recover'
+      ? 'No backup will start until the car is back and they are on'
       : transitionBusy
         ? ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
           ? 'Verifying the original radio state'
@@ -485,6 +534,7 @@ export default function Backup() {
                   'Bluetooth',
                   radioStatus.data.transition.bluetooth,
                   radioStatus.data.transition.active,
+                  radioStatus.data.transition.restoreEvidenceSource,
                 )}
               </div>
               <div>
@@ -492,8 +542,16 @@ export default function Backup() {
                   'Hotspot',
                   radioStatus.data.transition.hotspot,
                   radioStatus.data.transition.active,
+                  radioStatus.data.transition.restoreEvidenceSource,
                 )}
               </div>
+              {radioStatus.data.transition.unitReportedAt && (
+                <div>
+                  Dashcam reported in{' '}
+                  {formatRelative(radioStatus.data.transition.unitReportedAt)}
+                  {radioStatus.data.transition.unitSleepReportedAt ? ', just before sleeping' : ''}
+                </div>
+              )}
               <div>Updated {formatRelative(radioStatus.data.transition.updatedAt)}</div>
             </div>
           )}

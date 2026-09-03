@@ -565,6 +565,11 @@ class IngestRadioTransitionOut(BaseModel):
     bluetooth: IngestRadioDeviceStateOut
     hotspot: IngestRadioDeviceStateOut
     obd_logger: IngestRadioLoggerStateOut
+    #: Which side actually proved the baseline: ``server`` over ADB, ``unit`` from the
+    #: head unit's own pre-sleep watchdog, or ``None`` when nothing has proved it yet.
+    restore_evidence_source: str | None = None
+    unit_reported_at: datetime | None = None
+    unit_sleep_reported_at: datetime | None = None
 
 
 class IngestRadioStatusOut(BaseModel):
@@ -572,6 +577,28 @@ class IngestRadioStatusOut(BaseModel):
 
     quieting_enabled: bool
     transition: IngestRadioTransitionOut | None = None
+
+
+class IngestRadioRecoveryRequest(BaseModel):
+    """One pre-sleep radio report from the head unit's detached watchdog.
+
+    Posted by a hand-rolled HTTP request over ``nc``, not by a browser and not by anything
+    holding this application's API key -- the token here is minted per transition and
+    authorises exactly this one report. Every field is bounded because the sender is a
+    shell script on a device this app does not own.
+    """
+
+    transition_id: str = Field(max_length=36)
+    token: str = Field(max_length=64)
+    reason: str = Field(default="", max_length=32)
+    bluetooth: str = Field(default="skip", max_length=8)
+    hotspot: str = Field(default="skip", max_length=8)
+    interface: str = Field(default="", max_length=32)
+
+
+class IngestRadioRecoveryResponse(BaseModel):
+    #: The watchdog greps for this exact field before it stops retrying.
+    accepted: bool
 
 
 class IngestWebhookRequest(BaseModel):

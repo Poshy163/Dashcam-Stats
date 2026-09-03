@@ -49,6 +49,16 @@ PUBLIC_PATHS = frozenset(
         "/api/auth/state",
         "/api/auth/login",
         "/api/auth/logout",
+        # Not a login-page endpoint, and the one deliberate exception to the paragraph
+        # above. The caller is the head unit's detached radio watchdog: a shell script,
+        # fifteen seconds from the unit sleeping, reporting whether Bluetooth and the
+        # hotspot actually came back. It cannot hold a session, and giving it this app's
+        # API key so that it could would put a credential good for every route in this
+        # application onto a device the app does not own -- to buy one POST that carries no
+        # footage, no telemetry and no settings. It authenticates instead with a token
+        # minted for a single transition and compared in constant time; a request without
+        # one changes nothing and is told only that it was not accepted.
+        "/api/ingest/radio-recovery",
     }
 )
 

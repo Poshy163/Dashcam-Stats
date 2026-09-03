@@ -95,6 +95,11 @@ async def test_radio_status_exposes_only_bounded_restore_evidence(client, db_ses
             "resume_attempted": True,
             "resume_verified": True,
         },
+        # Which side proved the baseline, and when the unit last spoke. Three timestamps
+        # and one enum: no device address, no token, no capsule reference.
+        "restore_evidence_source": None,
+        "unit_reported_at": None,
+        "unit_sleep_reported_at": None,
     }
     assert "secret" not in response.text
 

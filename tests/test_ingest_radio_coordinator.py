@@ -359,9 +359,16 @@ class FakeController:
         ("CarSpot", "roadtrip99"),
     )
 
-    def __init__(self, address: str, *, watchdog_deadline_s: int) -> None:
+    def __init__(
+        self,
+        address: str,
+        *,
+        watchdog_deadline_s: int,
+        report: object | None = None,
+    ) -> None:
         self.address = address
         self.watchdog_deadline_s = watchdog_deadline_s
+        self.report = report
         self.calls: list[str] = []
         self.released = False
         type(self).instances.append(self)

@@ -258,6 +258,15 @@ export interface IngestRadioTransitionStatus {
     resumeAttempted: boolean
     resumeVerified: boolean
   }
+  /**
+   * Which side actually proved the radios came back: `server` over ADB, `unit` from the
+   * dashcam's own pre-sleep watchdog, or null when nothing has proved it yet. The last of
+   * those is not a failure -- it is the ordinary state of a window still in progress.
+   */
+  restoreEvidenceSource: 'server' | 'unit' | null
+  unitReportedAt: string | null
+  /** Set when the dashcam's report said it was about to sleep, rather than merely ending. */
+  unitSleepReportedAt: string | null
 }
 
 /** Durable safety evidence for the current, or most recent, radio transition. */

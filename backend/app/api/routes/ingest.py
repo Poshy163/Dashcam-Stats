@@ -13,6 +13,8 @@ from sqlalchemy import func, select
 
 from app.api.deps import PaginationDep, SessionDep, SettingsDep
 from app.api.schemas import (
+    IngestRadioRecoveryRequest,
+    IngestRadioRecoveryResponse,
     IngestRadioStatusOut,
     IngestWebhookRequest,
     IngestWebhookResponse,
@@ -20,7 +22,7 @@ from app.api.schemas import (
 )
 from app.core.logging import get_logger
 from app.db.models import IngestRadioTransition, IngestRun, UnifiCredential, utcnow
-from app.ingest import puller, unifi
+from app.ingest import puller, radio_coordinator, unifi
 from app.ingest.models import RunState
 from app.ingest.status import get_status
 
@@ -100,8 +102,49 @@ async def ingest_radio_status(
             "resume_attempted": bool(row.logger_resume_attempted),
             "resume_verified": bool(row.logger_resume_verified),
         },
+        # Which side answered. The Backup page says something quite different for "the
+        # dashcam restored these and told us before it slept" than for "we asked and got
+        # no reply", and those were previously the same screen.
+        "restore_evidence_source": row.restore_evidence_source,
+        "unit_reported_at": row.unit_reported_at.isoformat() if row.unit_reported_at else None,
+        "unit_sleep_reported_at": (
+            row.unit_sleep_reported_at.isoformat() if row.unit_sleep_reported_at else None
+        ),
     }
     return result
+
+
+@router.post(
+    "/ingest/radio-recovery",
+    response_model=IngestRadioRecoveryResponse,
+    summary="Pre-sleep radio report from the head unit",
+)
+async def ingest_radio_recovery(
+    payload: IngestRadioRecoveryRequest,
+) -> IngestRadioRecoveryResponse:
+    """Accept the head unit's own evidence that it put both radios back.
+
+    Reachable without a session, because the caller is a shell script on the head unit with
+    fifteen seconds left before the unit sleeps -- it has no cookie, and handing it this
+    application's API key so that it could have one would put a credential that opens every
+    route onto a device this app does not own. It authenticates with a token minted for one
+    transition and compared in constant time by the coordinator.
+
+    Always 200. The watchdog is looking for ``accepted`` and nothing else, and a status code
+    that distinguished "wrong token" from "unknown transition" would be an oracle for the
+    one caller in the world that is not supposed to need one.
+    """
+    accepted = await radio_coordinator.apply_unit_report(
+        radio_coordinator.UnitRadioReport(
+            transition_id=payload.transition_id,
+            token=payload.token,
+            reason=payload.reason,
+            bluetooth=payload.bluetooth,
+            hotspot=payload.hotspot,
+            interface=payload.interface,
+        )
+    )
+    return IngestRadioRecoveryResponse(accepted=accepted)
 
 
 @router.post("/ingest/run", summary="Pull from the head unit now")

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
+import secrets
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -25,8 +27,9 @@ from app.core.logging import get_logger
 from app.core.process_lock import ProcessFileLock, try_acquire
 from app.db.models import IngestRadioTransition
 from app.db.session import session_scope
-from app.ingest import adb, obd_control, radios
+from app.ingest import adb, obd_control, origin, radios
 from app.ingest.ha_import_queue import redact
+from app.ingest.status import get_status
 
 log = get_logger(__name__)
 
@@ -467,6 +470,22 @@ class RadioTransition:
             finally:
                 await self.close()
 
+    async def _unit_already_verified(self, radio: str) -> bool:
+        """Whether the unit's own watchdog already proved this radio came back.
+
+        Consulted only when this side's readback failed, and it usually failed for the
+        reason the watchdog exists: the unit has gone. Without this the server would write
+        its own blindness over the unit's direct observation and re-raise a recovery that
+        has already happened -- the exact false alarm the report was added to end.
+        """
+        async with session_scope() as session:
+            row = await session.scalar(
+                select(IngestRadioTransition).where(IngestRadioTransition.id == self.id)
+            )
+        if row is None or row.restore_evidence_source != "unit":
+            return False
+        return bool(getattr(row, f"{radio}_restore_verified", False))
+
     async def _persist_restore_failure(self, error: object) -> None:
         """Expire an exceptional restore directly, before its process fence is released."""
         now = _now()
@@ -508,6 +527,8 @@ class RadioTransition:
         if row.bluetooth_disable_attempted:
             await self.checkpoint(bluetooth_restore_attempted=True)
             bluetooth_ok = await self.controller.restore_bluetooth(row.bluetooth_before)
+            if not bluetooth_ok:
+                bluetooth_ok = await self._unit_already_verified("bluetooth")
             await self.checkpoint(bluetooth_restore_verified=bluetooth_ok)
             if not bluetooth_ok:
                 errors.append("Bluetooth baseline restoration could not be verified")
@@ -530,6 +551,8 @@ class RadioTransition:
                 hotspot_restore_mode,
                 expected_interface=row.hotspot_interface,
             )
+            if not hotspot_ok:
+                hotspot_ok = await self._unit_already_verified("hotspot")
             await self.checkpoint(hotspot_restore_verified=hotspot_ok)
             if not hotspot_ok:
                 errors.append("hotspot baseline restoration could not be verified")
@@ -691,6 +714,34 @@ class RadioTransition:
             self.process_fence.release()
 
 
+def _watchdog_report(transition_id: str, token: str) -> radios.WatchdogReport | None:
+    """Describe where the unit's own watchdog should report, or ``None`` if it cannot.
+
+    Every reason this returns ``None`` is a deployment where the report could not arrive
+    anyway -- no learned address, or an HTTPS front door the watchdog cannot speak to. The
+    transition is still perfectly safe in that case: it simply falls back to what it did
+    before, which is the server's own restore plus repair on next arrival.
+    """
+    endpoint = origin.callback_endpoint()
+    if endpoint is None:
+        return None
+    host, port = endpoint
+    status = get_status()
+    try:
+        return radios.WatchdogReport(
+            host=host,
+            port=port,
+            token=token,
+            transition_id=transition_id,
+            acc_off_elapsed_s=status.ignition_off_elapsed_s(),
+        )
+    except ValueError:
+        # A learned origin that cannot be expressed safely in a shell script is not worth
+        # failing a backup over.
+        log.warning("could not describe a watchdog report endpoint for this transition")
+        return None
+
+
 async def begin(
     *,
     trigger: str,
@@ -714,7 +765,12 @@ async def begin(
         if isinstance(logger_status, dict) and isinstance(logger_status.get("capabilities"), list)
         else []
     )
-    controller = radios.RadioController(address, watchdog_deadline_s=watchdog_deadline_s)
+    report_token = radios.new_report_token()
+    controller = radios.RadioController(
+        address,
+        watchdog_deadline_s=watchdog_deadline_s,
+        report=_watchdog_report(transition_id, report_token),
+    )
     controller.claim()
     try:
         device_boot_id = await radios.read_device_boot_id(address)
@@ -738,6 +794,7 @@ async def begin(
             capabilities_json=capabilities,
             logger_status_path=logger_status_path,
             logger_quiesce_capable=obd_control.supports_quiesce(logger_status),
+            unit_report_token=report_token if controller.report is not None else None,
         )
         async with session_scope() as session:
             session.add(row)
@@ -787,6 +844,127 @@ async def pending_recovery_address() -> str | None:
     """Return the durable transition endpoint without contacting the head unit."""
     row = await _active_row()
     return row.device_address if row is not None else None
+
+
+#: What the on-unit watchdog is allowed to say about one radio.
+#:
+#: ``skip`` is not "unknown" -- it is the watchdog stating that this radio was never
+#: touched, and therefore has nothing owing. Only ``0`` and ``1`` are claims about a
+#: readback, and only those two move the durable flags.
+_REPORTED_STATES = frozenset({"1", "0", "skip"})
+
+#: The transition identifier as this module mints it, matched before it reaches a query.
+_SAFE_TRANSITION_ID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+
+
+@dataclass(frozen=True, slots=True)
+class UnitRadioReport:
+    """One pre-sleep report from the head unit's own detached watchdog."""
+
+    transition_id: str
+    token: str
+    reason: str
+    bluetooth: str
+    hotspot: str
+    interface: str = ""
+
+    def valid(self) -> bool:
+        return (
+            bool(_SAFE_TRANSITION_ID.fullmatch(self.transition_id))
+            and bool(self.token)
+            and self.bluetooth in _REPORTED_STATES
+            and self.hotspot in _REPORTED_STATES
+        )
+
+
+async def apply_unit_report(report: UnitRadioReport) -> bool:
+    """Accept the unit's own restoration evidence and close the transition on it.
+
+    This is the answer to the failure that made the whole feature necessary: the ordinary
+    end of a backup window is the head unit sleeping, and after that instant the server can
+    prove nothing about either radio. It was left holding *attempted, not verified*, which
+    is indistinguishable from a watchdog that never ran, so the next backup was blocked
+    waiting for the car to come back and answer a question nobody had asked it.
+
+    The evidence here is not weaker than the server's -- it is the same two readbacks,
+    ``bluetooth_on`` and a serving AP interface, taken on the device by the process that
+    did the restoring, seconds after it did it. What it is not is *unauthenticated*: the
+    token was minted for this transition, handed to that one watchdog, and is compared in
+    constant time. An expired or unknown transition is refused without saying which.
+
+    A live owner is never closed out from underneath. If the server still holds a healthy
+    lease then the run is still going and its own restore will finish the row; the report
+    is recorded as evidence and nothing else moves.
+    """
+    if not report.valid():
+        return False
+    now = _now()
+    async with session_scope() as session:
+        row = await session.scalar(
+            select(IngestRadioTransition).where(
+                IngestRadioTransition.transition_id == report.transition_id
+            )
+        )
+        if row is None or not row.unit_report_token:
+            return False
+        if not secrets.compare_digest(str(row.unit_report_token), report.token):
+            log.warning(
+                "rejected a radio recovery report with the wrong token",
+                transition_id=report.transition_id,
+            )
+            return False
+
+        values: dict[str, object] = {
+            "unit_reported_at": now,
+            "restore_evidence_source": "unit",
+            "updated_at": now,
+        }
+        if report.reason == "pre_sleep":
+            values["unit_sleep_reported_at"] = now
+
+        outstanding: list[str] = []
+        if report.bluetooth in {"0", "1"}:
+            values["bluetooth_restore_attempted"] = True
+            values["bluetooth_restore_verified"] = report.bluetooth == "1"
+            if report.bluetooth == "0":
+                outstanding.append("Bluetooth")
+        if report.hotspot in {"0", "1"}:
+            values["hotspot_restore_attempted"] = True
+            values["hotspot_restore_verified"] = report.hotspot == "1"
+            if report.hotspot == "0":
+                outstanding.append("the hotspot")
+
+        owner_live = bool(row.active) and row.lease_expires_at > now
+        if not owner_live:
+            if outstanding:
+                values["phase"] = TransitionPhase.RECOVERY_REQUIRED.value
+                values["recovery_required"] = True
+                values["last_error"] = (
+                    f"the head unit reported before sleeping that {' and '.join(outstanding)} "
+                    "could not be restored"
+                )
+            else:
+                # The token has done its one job. Clearing it makes the report single-use
+                # without needing a separate replay table.
+                values["phase"] = TransitionPhase.COMPLETE.value
+                values["recovery_required"] = False
+                values["active"] = False
+                values["completed_at"] = now
+                values["last_error"] = None
+                values["unit_report_token"] = None
+
+        await session.execute(
+            update(IngestRadioTransition).where(IngestRadioTransition.id == row.id).values(**values)
+        )
+    log.info(
+        "accepted a radio recovery report from the head unit",
+        transition_id=report.transition_id,
+        reason=report.reason,
+        bluetooth=report.bluetooth,
+        hotspot=report.hotspot,
+        owner_live=owner_live,
+    )
+    return True
 
 
 async def _adopt_expired(

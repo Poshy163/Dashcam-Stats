@@ -19,6 +19,19 @@ on this side so that anything still off is turned back on the moment the unit is
 before a single byte is asked for. The watchdog gates on a flag file the restore removes,
 so a stale watchdog whose run already restored does nothing.
 
+**The unit gets the last word, because only it is still awake to have one.** The watchdog
+above was armed against the server dying; the commoner ending is quieter than that. The
+head unit sleeps on a vendor countdown nothing here can pause, and when it does, both
+radios are mid-restore and every readback this side could make is gone -- leaving the
+durable row holding *attempted, not verified*, which is indistinguishable from a watchdog
+that never ran and therefore blocks the next backup on evidence nobody ever asked the car
+for. So the watchdog now watches that countdown too (:data:`WATCHDOG_SLEEP_GUARD_S`,
+derived on the device from ACC plus the window, whichever deadline comes first), restores
+into it, reads *both* radios back where they are, and posts the result to
+``/api/ingest/radio-recovery`` with a token minted for that one transition. Same two
+readbacks, same standard of proof; the only thing that moved is which side of the link is
+holding the evidence when the unit goes quiet.
+
 **Only turn off what can be turned back on.** Bluetooth's state is readable
 (``settings get global bluetooth_on``), so it is toggled freely and only when it was
 actually on. A generic hotspot is restarted only when its exact SSID and passphrase were
@@ -99,6 +112,8 @@ WATCHDOG_PID_PARTIAL_PATH = f"{WATCHDOG_PID_PATH}.partial"
 WATCHDOG_SCRIPT_PATH = f"{FLAG_PATH}.watchdog.sh"
 WATCHDOG_SCRIPT_PARTIAL_PATH = f"{WATCHDOG_SCRIPT_PATH}.partial"
 WATCHDOG_ACTIVE_PATH = f"{FLAG_PATH}.watchdog_active"
+WATCHDOG_REPORT_PATH = f"{FLAG_PATH}.watchdog_report"
+WATCHDOG_REPORT_PARTIAL_PATH = f"{WATCHDOG_REPORT_PATH}.partial"
 WATCHDOG_ACTIVE_PARTIAL_PATH = f"{WATCHDOG_ACTIVE_PATH}.partial"
 WATCHDOG_SCRIPT_PREFIX = f"{FLAG_PATH}.watchdog_"
 _WATCHDOG_TOKEN = re.compile(r"^[0-9a-f]{32}$")
@@ -109,6 +124,27 @@ _WATCHDOG_TOKEN = re.compile(r"^[0-9a-f]{32}$")
 WATCHDOG_LEASE_POLL_S = 2
 WATCHDOG_MAX_RENEW_INTERVAL_S = 30.0
 WATCHDOG_RENEW_RETRY_S = 1.0
+
+#: How long before the head unit's own sleep the watchdog lands the radios.
+#:
+#: The vendor countdown is not ours to pause, so the last thing that happens in a backup
+#: window is the unit going quiet -- and every ADB readback after that point is gone.
+#: Firing here instead means the restore, the on-device verification *and* the report all
+#: complete while the unit is still awake and still on the network. Fifteen seconds is the
+#: work plus headroom: enabling Bluetooth, :data:`HOTSPOT_REARM_SETTLE_S` for the AP to
+#: re-arm behind it, starting the saved profile, two interface readbacks and one POST.
+WATCHDOG_SLEEP_GUARD_S = 15
+
+#: The vendor property holding the sleep window's *length*, in seconds. The unit counts it
+#: down from the moment ACC drops -- the same model this app's own countdown uses (see
+#: :meth:`app.ingest.status.IngestStatus.sleep_countdown_remaining_s`), so the watchdog can
+#: derive the sleep instant locally from ACC plus this, with no server involvement at all.
+SLEEP_COUNTDOWN_PROPERTY = "persist.sys.sleep.countdown.time"
+
+#: ``Settings.Global`` key carrying the vendor's ignition state, read exactly as the on-unit
+#: app reads it. Anything that is not a recognised *off* is treated as "not sleeping soon":
+#: an unreadable ACC must never invent a deadline and restore the radios early.
+ACC_STATUS_SETTING = "acc_status"
 
 # Hotspot credentials are needed only to undo a process that dies after stopping the
 # AP. They never belong in the server database or its backups. A short-lived mode-0600
@@ -715,6 +751,188 @@ def _new_watchdog_handle(*, pid: int = 0) -> WatchdogHandle:
     return WatchdogHandle(token=secrets.token_hex(16), pid=pid)
 
 
+#: Where the unit posts its own restoration evidence. Public by path, authorised only by
+#: the single-use token below -- never by the app's API key, which has no business being
+#: written to a device this app does not own.
+WATCHDOG_REPORT_ENDPOINT = "/api/ingest/radio-recovery"
+
+_REPORT_TOKEN = re.compile(r"^[0-9a-f]{32,64}$")
+_REPORT_HOST = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+
+
+@dataclass(frozen=True, slots=True)
+class WatchdogReport:
+    """Where and how the detached watchdog reports the baseline it actually restored.
+
+    Every field is expanded into a shell script running on the head unit, so every field is
+    validated to a character class that cannot carry shell syntax. The token is minted per
+    transition and dies with it: possession proves the report came from the watchdog this
+    server armed, and nothing else. It is deliberately *not* the API key -- a key that opens
+    every route in the application does not belong in a file on the head unit.
+    """
+
+    host: str
+    port: int
+    token: str
+    transition_id: str
+    guard_s: int = WATCHDOG_SLEEP_GUARD_S
+    #: Seconds of the unit's sleep countdown already spent when the watchdog is armed.
+    #:
+    #: The countdown starts at ignition-off, and arming happens some way into it -- the
+    #: webhook, the probe, the card inventory and the radio capture all land first. A
+    #: watchdog that anchored the countdown at its own start would therefore aim at a
+    #: deadline that much *too late*, which on this feature means firing after the unit has
+    #: already slept: exactly the failure it exists to prevent. So the elapsed time is
+    #: carried across and subtracted once.
+    acc_off_elapsed_s: int = 0
+    path: str = WATCHDOG_REPORT_ENDPOINT
+
+    def __post_init__(self) -> None:
+        if not _REPORT_HOST.fullmatch(self.host):
+            raise ValueError("invalid watchdog report host")
+        if not 1 <= self.port <= 65535:
+            raise ValueError("invalid watchdog report port")
+        if not _REPORT_TOKEN.fullmatch(self.token):
+            raise ValueError("invalid watchdog report token")
+        if not _SAFE_TRANSITION_ID.fullmatch(self.transition_id):
+            raise ValueError("invalid watchdog report transition id")
+        if self.guard_s < 0 or self.guard_s > 600:
+            raise ValueError("invalid watchdog sleep guard")
+        if self.acc_off_elapsed_s < 0 or self.acc_off_elapsed_s > 86400:
+            raise ValueError("invalid watchdog ignition-off elapsed time")
+        if self.path != WATCHDOG_REPORT_ENDPOINT:
+            raise ValueError("invalid watchdog report path")
+
+
+def new_report_token() -> str:
+    """Mint the single-use bearer the watchdog presents when it reports."""
+    return secrets.token_hex(24)
+
+
+def _watchdog_report_functions(
+    report: WatchdogReport | None,
+    *,
+    restore_bluetooth: bool,
+    hotspot_baseline: str,
+    transport_host: str,
+) -> str:
+    """Shell that reads both radios back on the device and posts what it found.
+
+    This is the half the old watchdog never had. It restored, and then it was silent -- so
+    a window that ended the ordinary way left the server holding *attempted, not verified*
+    for both radios, which is indistinguishable from a watchdog that never ran and is
+    therefore treated as recovery still owing. The next backup is blocked on evidence that
+    only the unit could ever have produced, and the unit was never asked for it.
+
+    The readbacks are the same two the server does over ADB: ``bluetooth_on`` for the
+    stack, and an AP-named interface holding its own IPv4 for the hotspot -- excluded by
+    address rather than by name, so the interface the unit is reached on is never mistaken
+    for a soft AP (:func:`_serving_ap` explains why that distinction is load-bearing).
+
+    A failed readback is reported, not hidden. ``0`` here is worth strictly more than
+    silence: it tells the server the watchdog ran, that the baseline is genuinely still
+    wrong, and that recovery on next arrival is real work rather than a formality.
+    """
+    if report is None:
+        return ""
+    bluetooth_check = (
+        (
+            'bt="$(/system/bin/settings get global bluetooth_on 2>/dev/null)"; '
+            'case "$bt" in 1) bt=1;; *) bt=0;; esac; '
+        )
+        if restore_bluetooth
+        else "bt=skip; "
+    )
+    if hotspot_baseline == "on":
+        hotspot_check = 'ap_scan; if [ -n "$ap_iface" ]; then hs=1; else hs=0; fi; '
+    elif hotspot_baseline == "off":
+        hotspot_check = 'ap_scan; if [ -n "$ap_iface" ]; then hs=0; else hs=1; fi; '
+    else:
+        hotspot_check = 'hs=skip; ap_iface=""; '
+    # A shell double-quoted string, because four of its six values are read back from the
+    # device at report time. The two that are not -- the transition and the token -- are
+    # validated to hex and UUID character classes by :class:`WatchdogReport`, so neither
+    # can close the quoting and become syntax.
+    body = (
+        '"{\\"transition_id\\":\\"' + report.transition_id + '\\",'
+        '\\"token\\":\\"' + report.token + '\\",'
+        '\\"reason\\":\\"$reason\\",'
+        '\\"bluetooth\\":\\"$bt\\",'
+        '\\"hotspot\\":\\"$hs\\",'
+        '\\"interface\\":\\"$ap_iface\\"}"'
+    )
+    return (
+        # Excluded by address, exactly as the server does it: if this app is itself a
+        # client of the unit's hotspot then that hotspot is the transfer's own link.
+        f"transport='{transport_host}'; ap_iface=\"\"; "
+        'ap_scan() { ap_iface=""; '
+        f"/system/bin/ip -o addr show up > '{WATCHDOG_REPORT_PARTIAL_PATH}' 2>/dev/null "
+        "|| return 0; "
+        "while read -r _idx iface fam addr _rest; do "
+        '[ "$fam" = inet ] || continue; '
+        'addr="${addr%%/*}"; '
+        '[ "$addr" = "$transport" ] && continue; '
+        'case "$iface" in ap*|softap*|swlan*|wlan*|wl*) ap_iface="$iface"; break;; esac; '
+        f"done < '{WATCHDOG_REPORT_PARTIAL_PATH}'; "
+        f"rm -f '{WATCHDOG_REPORT_PARTIAL_PATH}'; return 0; }}; "
+        "verify_radios() { " + bluetooth_check + hotspot_check + "return 0; }; "
+        # Written before it is sent, and left behind afterwards, at a fixed path that the
+        # next run overwrites. Purely for diagnosis: it is the only way to tell "the
+        # watchdog never fired" from "it fired and the POST could not get out", which are
+        # the same silence from this side. Recovery itself does not read it -- a server
+        # that has the unit back on the network can ask the radios directly, and that
+        # answer is current where this file is a minute stale.
+        "publish_report() { "
+        f"body={body}; "
+        f"printf '%s\\n' \"$body\" > '{WATCHDOG_REPORT_PATH}' 2>/dev/null; "
+        f"chmod 600 '{WATCHDOG_REPORT_PATH}' 2>/dev/null; "
+        'len="${#body}"; attempt=0; '
+        'while [ "$attempt" -lt 3 ]; do '
+        "if printf 'POST %s HTTP/1.1\\r\\nHost: %s:%s\\r\\n"
+        "Content-Type: application/json\\r\\nContent-Length: %s\\r\\n"
+        "Connection: close\\r\\n\\r\\n%s' "
+        f"'{report.path}' '{report.host}' '{report.port}' \"$len\" \"$body\" "
+        f"| nc -w 5 '{report.host}' '{report.port}' 2>/dev/null "
+        "| grep -q '\"accepted\": *true'; then return 0; fi; "
+        'attempt="$((attempt + 1))"; sleep 2; done; return 1; }; '
+    )
+
+
+def _watchdog_sleep_guard_functions(report: WatchdogReport | None) -> str:
+    """Shell that folds the unit's own sleep deadline into the watchdog's expiry.
+
+    Two clocks can end a backup window and only one of them was ever watched. The lease is
+    the server's liveness -- it stops being renewed when this app dies or the car drives
+    out of range. The *sleep* is the vendor's, it is the ordinary ending, and it arrives
+    with no warning at all on the wire: the unit simply stops answering.
+
+    So the deadline used here is the earlier of the two. Sleep is derived exactly as the
+    server derives it -- ACC-off plus the window length -- but read on the device, which is
+    the only place both values are still available once the link is gone.
+
+    Every read fails closed to "no sleep deadline". An unreadable ACC or a missing property
+    must never manufacture an early restore: the lease alone still bounds the window, and
+    restoring the driver's Bluetooth a quarter of an hour early is its own kind of damage.
+    """
+    if report is None or report.guard_s <= 0:
+        return "sleep_fold() { return 0; }; "
+    return (
+        "sleep_fold() { "
+        f'window="$(/system/bin/getprop {SLEEP_COUNTDOWN_PROPERTY} 2>/dev/null)"; '
+        'case "$window" in ""|*[!0-9]*) acc_off_at=""; return 0;; esac; '
+        '[ "$window" -gt 0 ] || { acc_off_at=""; return 0; }; '
+        f'acc="$(/system/bin/settings get global {ACC_STATUS_SETTING} 2>/dev/null)"; '
+        'case "$acc" in 0|off|OFF|false|False|FALSE) ;; '
+        '*) acc_off_at=""; return 0;; esac; '
+        # Consumed exactly once. If the driver comes back and the ignition cycles, the
+        # second countdown genuinely does start from the moment this loop observes it.
+        '[ -n "$acc_off_at" ] || { acc_off_at="$((now - acc_elapsed))"; acc_elapsed=0; }; '
+        f'left="$((acc_off_at + window - {int(report.guard_s)} - now))"; '
+        '[ "$left" -lt "$remaining" ] && { remaining="$left"; '
+        '[ "$left" -gt 0 ] || reason=pre_sleep; }; return 0; }; '
+    )
+
+
 def _watchdog_owner_cleanup_command(
     handle: WatchdogHandle,
     *,
@@ -897,6 +1115,7 @@ async def _arm_watchdog(
     hotspot_baseline: str = "unknown",
     hotspot_capsule_path: str | None = None,
     hotspot_restore_mode: str | None = None,
+    report: WatchdogReport | None = None,
 ) -> WatchdogHandle | None:
     """Leave an exact radio-restoration watchdog running on the unit.
 
@@ -987,8 +1206,28 @@ async def _arm_watchdog(
         f"'{ready_path}' '{lease_path}' '{lease_partial_path}' "
         f"'{expiry_claim_path}' '{script_path}' '{script_partial_path}'; fi; }}; "
     )
+    guard_functions = _watchdog_sleep_guard_functions(report)
+    report_functions = _watchdog_report_functions(
+        report,
+        restore_bluetooth=restore_bluetooth,
+        hotspot_baseline=hotspot_baseline,
+        transport_host=address.partition(":")[0].strip(),
+    )
+    # One expiry, two clocks. ``remaining`` is the server's lease until ``sleep_fold``
+    # finds the unit's own sleep arriving sooner, and the claim below re-reads through the
+    # same function so a deadline that moved cannot be claimed and then walked back.
+    remaining_now = (
+        "remaining_now() { "
+        'now="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; '
+        f"expiry=\"$(cat '{lease_path}' 2>/dev/null)\"; "
+        'case "$now:$expiry" in "":*|*:""|*[!0-9:]*) remaining=0; return 0;; esac; '
+        'remaining="$((expiry - now))"; sleep_fold; }; '
+    )
     watchdog_script = (
-        f"umask 077; token='{candidate.token}'; {cleanup_owned}"
+        f"umask 077; token='{candidate.token}'; "
+        'reason=lease_expired; acc_off_at=""; '
+        f"acc_elapsed={int(report.acc_off_elapsed_s) if report is not None else 0}; "
+        f"{guard_functions}{remaining_now}{report_functions}{cleanup_owned}"
         f"rm -f '{lease_partial_path}' '{expiry_claim_path}'; "
         f"(set -C; printf '%s %s\\n' \"$token\" \"$$\" > '{WATCHDOG_ACTIVE_PATH}') "
         "2>/dev/null || exit 1; "
@@ -1005,10 +1244,7 @@ async def _arm_watchdog(
         "|| exit 0; "
         f"[ -f '{FLAG_PATH}' ] && [ \"$(cat '{ready_path}' 2>/dev/null)\" = armed ] "
         "|| { cleanup_owned; exit 0; }; "
-        'now="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; '
-        f"expiry=\"$(cat '{lease_path}' 2>/dev/null)\"; "
-        'case "$now:$expiry" in "":*|*:""|*[!0-9:]*) remaining=0;; '
-        '*) remaining="$((expiry - now))";; esac; '
+        "remaining_now; "
         'if [ "$remaining" -gt 0 ]; then '
         f"delay={WATCHDOG_LEASE_POLL_S}; "
         '[ "$remaining" -le "$delay" ] && delay="$remaining"; '
@@ -1017,10 +1253,7 @@ async def _arm_watchdog(
         f'[ "$(cat \'{WATCHDOG_ACTIVE_PATH}\' 2>/dev/null)" = "{owned_state}" ] '
         "|| exit 0; "
         f"[ -f '{FLAG_PATH}' ] || {{ cleanup_owned; exit 0; }}; "
-        'now="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; '
-        f"expiry=\"$(cat '{lease_path}' 2>/dev/null)\"; "
-        'case "$now:$expiry" in "":*|*:""|*[!0-9:]*) remaining=0;; '
-        '*) remaining="$((expiry - now))";; esac; '
+        "remaining_now; "
         'if [ "$remaining" -gt 0 ]; then '
         f"mv -f '{expiry_claim_path}' '{ready_path}' "
         "2>/dev/null || exit 0; continue; fi; "
@@ -1029,6 +1262,10 @@ async def _arm_watchdog(
         f"if [ -f '{FLAG_PATH}' ] && "
         f'[ "$(cat \'{WATCHDOG_ACTIVE_PATH}\' 2>/dev/null)" = "{owned_state}" ]; then '
         + "; ".join(restore_commands)
+        # The report is the point of firing early. Verification runs on the device, while
+        # the device is still awake, and is posted before the sleep this whole guard exists
+        # to get in front of.
+        + ("; verify_radios; publish_report" if report is not None else "")
         + "; fi; cleanup_owned"
     )
     launcher = (
@@ -1195,9 +1432,18 @@ class RadioController:
     command and verification after it.
     """
 
-    def __init__(self, address: str, *, watchdog_deadline_s: int) -> None:
+    def __init__(
+        self,
+        address: str,
+        *,
+        watchdog_deadline_s: int,
+        report: WatchdogReport | None = None,
+    ) -> None:
         self.address = address
         self.watchdog_deadline_s = watchdog_deadline_s
+        # Where the detached watchdog posts the baseline it actually restored. ``None``
+        # keeps the old behaviour exactly: restore, and stay silent about it.
+        self.report = report
         self._watchdog: WatchdogHandle | None = None
         self._watchdog_renewal_task: asyncio.Task[None] | None = None
         self._watchdog_lost = asyncio.Event()
@@ -1438,6 +1684,7 @@ class RadioController:
             hotspot_baseline=self._hotspot_baseline,
             hotspot_capsule_path=self._hotspot_capsule_path,
             hotspot_restore_mode=self._hotspot_restore_mode,
+            report=self.report,
         )
         if self._watchdog is None:
             # Candidate cleanup is generation-scoped. A newer server process may have

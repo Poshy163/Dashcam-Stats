@@ -123,6 +123,45 @@ def _stored() -> str:
         return ""
 
 
+def callback_endpoint() -> tuple[str, int] | None:
+    """Host and port the head unit should post back to, or ``None`` if unknown.
+
+    The same learned address the car's browser is sent to, minus the browser. A watchdog
+    reporting in from the unit has exactly the problem this module exists for -- it cannot
+    ask the app where the app is -- and it has less to work with than the browser does,
+    since it speaks a hand-rolled HTTP request over ``nc`` rather than following a URL. So
+    it is handed a host and a port and nothing else.
+
+    ``ingest.unit_display_url`` wins where it is set, for the same reason it wins for the
+    display: an operator who had to override the learned address had a reason, and that
+    reason applies to every route from the car back to here, not just the one carrying
+    pixels.
+    """
+    override = str(_get_setting("ingest.unit_display_url")).strip()
+    base = override or _origin or _stored()
+    if not base:
+        return None
+    parts = urlsplit(base if "//" in base else f"http://{base}")
+    host = parts.hostname or ""
+    if not host or host.lower() in _UNREACHABLE:
+        return None
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    # The watchdog's request is plaintext over the LAN. An HTTPS deployment is reached
+    # through a proxy this app cannot speak for, so rather than post a token in the clear
+    # to a port that will not answer, it reports nothing and the old next-arrival repair
+    # remains in charge.
+    if parts.scheme == "https":
+        return None
+    return host, port
+
+
+def _get_setting(key: str) -> str:
+    try:
+        return str(get_settings_service().get_nowait(key) or "")
+    except Exception:
+        return ""
+
+
 def with_api_key(url: str) -> str:
     """Attach the API key to a URL bound for the head unit, if there is one to attach.
 

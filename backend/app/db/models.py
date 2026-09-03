@@ -830,6 +830,18 @@ class IngestRadioTransition(Base):
     hotspot_restore_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     obd_transfer_complete: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # The unit's own pre-sleep landing.  The head unit sleeps on a vendor countdown this
+    # app cannot pause, and the ordinary end of a window is the car going quiet mid-run --
+    # after which no ADB readback is possible and the row would sit in ``recovery_required``
+    # until the next arrival.  So the detached watchdog restores, *verifies on the device*,
+    # and posts that evidence back with this single-use token before the unit sleeps.
+    unit_report_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    unit_reported_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    unit_sleep_reported_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    # ``server`` when an ADB readback proved the baseline, ``unit`` when the on-device
+    # watchdog did.  Kept apart so the Backup page can say which one actually answered.
+    restore_evidence_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
     recovery_required: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 

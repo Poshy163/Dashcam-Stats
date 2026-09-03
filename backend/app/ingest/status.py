@@ -387,6 +387,19 @@ class IngestStatus:
             return None
         return round(remaining / rate, 1)
 
+    def ignition_off_elapsed_s(self) -> int:
+        """Seconds since the ignition went off, or ``0`` if that is not known.
+
+        The head unit's sleep countdown starts here, not when a backup gets around to
+        arming its watchdog, and the gap between the two is everything the run does first
+        -- the webhook, the probe, the card inventory, the radio capture. Handing that gap
+        to the watchdog is what lets it aim at the real sleep instant instead of one a
+        minute late.
+        """
+        if self.ignition_state != "off" or self.ignition_off_monotonic is None:
+            return 0
+        return int(max(0.0, time.monotonic() - self.ignition_off_monotonic))
+
     def sleep_countdown_remaining_s(self) -> float | None:
         """Remaining seconds before the head unit sleeps, or None if unknown/offline."""
         if not self.unit_online:
