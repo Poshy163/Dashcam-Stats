@@ -176,10 +176,16 @@ class TestArming:
             "get_settings_service",
             lambda: _Settings({carplay_timing.ENABLED_KEY: True}),
         )
-        carplay_timing.on_unit_present("u:5555")
-        carplay_timing.on_unit_present("u:5555")
-        # Let the scheduled task actually run before judging what it did.
-        for _ in range(3):
-            await asyncio.sleep(0)
-        assert calls == ["u:5555"], "the second call inside the debounce must not re-arm"
-        await carplay_timing.shutdown()
+        carplay_timing.reset_for_tests()
+        try:
+            carplay_timing.on_unit_present("u:5555")
+            carplay_timing.on_unit_present("u:5555")
+            # Let the scheduled task actually run before judging what it did.
+            for _ in range(10):
+                await asyncio.sleep(0)
+            if carplay_timing._tasks:
+                await asyncio.gather(*list(carplay_timing._tasks), return_exceptions=True)
+            assert calls == ["u:5555"], "the second call inside the debounce must not re-arm"
+        finally:
+            await carplay_timing.shutdown()
+            carplay_timing.reset_for_tests()
