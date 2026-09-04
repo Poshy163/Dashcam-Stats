@@ -72,10 +72,15 @@ jobs:
       - name: Generate test fixtures
         run: python backend/scripts/make_fixtures.py --out tests/fixtures
 
+      # `-n auto` is one runner core per worker. The suite is mostly waiting -- database
+      # round trips, ffmpeg, sockets -- so it parallelises nearly linearly: 300s to 75s on
+      # a 16-core machine, and this job was the critical path the whole rest of CI waited
+      # on. `-v` is dropped with it: 1,700 test names interleaved from four workers is not
+      # a readable log, and --durations still names anything slow.
       - name: Pytest
         env:
           PYTHONPATH: backend
-        run: pytest tests -v --tb=short --durations=15
+        run: pytest tests -n auto --tb=short --durations=15
 
   frontend:
     name: Frontend (lint + build)
@@ -179,9 +184,14 @@ jobs:
   docker:
     name: Docker build
     runs-on: ubuntu-latest
-    # Keep the server image build behind every shipped component. release.yml calls this
-    # entire workflow and cannot publish if the Android companion fails to compile or lint.
-    needs: [backend, frontend, android-obd-logger]
+    # Deliberately no `needs`. This job only *builds* -- `push: false` -- and publishing is
+    # release.yml's `publish`, which waits on `needs: ci`, meaning every job in this file.
+    # So a red Android lint still cannot ship an image; the gate is where it always was.
+    # What the old `needs` bought was skipping this job when a test failed, and what it
+    # cost was three minutes on every green run, because the image build sat idle behind a
+    # four-minute test job it shares nothing with. Green runs vastly outnumber red ones,
+    # so the trade goes the other way: a failing build now also spends a few runner
+    # minutes here, and every passing one reaches the registry sooner.
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3

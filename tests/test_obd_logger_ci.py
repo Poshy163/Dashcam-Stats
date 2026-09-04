@@ -6,11 +6,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_obd_logger_build_is_inside_the_reusable_release_gate() -> None:
+    """A broken Android companion must not be able to ship a server image.
+
+    The gate is ``publish: needs: ci``: it waits on the whole called workflow, and the
+    Android job is in that workflow, so that job failing fails the workflow and the
+    publish never runs.
+
+    This used to also assert ``needs: [backend, frontend, android-obd-logger]`` on the
+    ``docker`` job, which was a different thing wearing the same clothes -- an ordering
+    inside ci.yml rather than the release gate, and one that cost three minutes on every
+    green run by holding the image build behind a test job it shares nothing with.
+    Dropping it changes nothing about what can be published, so what is pinned here now
+    is the gate itself plus the property that makes building early safe: the image built
+    inside ci.yml is never pushed anywhere.
+    """
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
     assert "  android-obd-logger:\n" in ci
-    assert "needs: [backend, frontend, android-obd-logger]" in ci
+    assert "push: false" in ci, "the image built inside ci.yml must never be published"
+    assert "push: true" not in ci
     for task in (
         ":app:testDebugUnitTest",
         ":app:lintDebug",

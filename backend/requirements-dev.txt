@@ -3,6 +3,11 @@
 pytest>=8.3,<9
 pytest-asyncio>=0.24,<1.2
 pytest-cov>=6.0,<8
+# The suite is ~1,700 tests of mostly-waiting work -- database round trips, ffmpeg,
+# sockets -- so it parallelises almost linearly and was the whole of CI's critical path
+# at four minutes. Each worker is its own process, which is also why adding this found a
+# test that only passed because an earlier one had already imported `app.main`.
+pytest-xdist>=3.6,<4
 anyio>=4.6,<5
 # Exercises the FastAPI app through real HTTP rather than by calling handlers directly,
 # so dependency wiring and middleware are actually covered.

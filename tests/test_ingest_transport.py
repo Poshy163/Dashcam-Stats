@@ -1038,6 +1038,13 @@ class TestLearningTheAddressFromTheDashboard:
 
     @pytest.fixture(autouse=True)
     def _forget(self):
+        # Import before the reset, not after. `app.main` sets the build tag as an import
+        # side effect (`create_app()` runs at module scope), and these tests import it in
+        # their own bodies -- so on a worker where nothing had imported it yet, the reset
+        # ran first and the import then put the tag straight back, and the assertion saw
+        # `?v=2d697de5&kiosk=1`. Serially it passed only because some earlier test had
+        # already spent the side effect. Spending it here makes that luck unnecessary.
+        from app import main  # noqa: F401
         from app.ingest import origin
 
         origin.reset_for_tests()
