@@ -205,6 +205,14 @@ def parse_sample(occurred_at: datetime, message: str) -> dict[str, Any] | None:
         "soc_c": _number(fields.get("soc")),
         "zlink_cpu_pct": _number(fields.get("zlink_cpu")),
         "hotspot_rx_kbit": _number(fields.get("rx_kbit")),
+        # What the AP lost in the interval (tx_dropped + tx_errors + rx_dropped), which is
+        # the stall that average bitrate cannot show.
+        "ap_drops": _number(fields.get("ap_drops")),
+        # The OBD logger's CPU, and whether Bluetooth was up at all. Together these are the
+        # coexistence question: the logger polls the car over BLE while driving, and BLE
+        # shares this unit's one radio with the hotspot CarPlay runs over.
+        "obd_cpu_pct": _number(fields.get("obd_cpu")),
+        "bluetooth_on": None if fields.get("bt") in (None, "na") else fields.get("bt") == "1",
         "sta_mhz": sta_mhz,
         "sta_rssi": sta_rssi,
         "ap_mhz": int(fields["ap"]) if fields.get("ap", "na").isdigit() else None,
@@ -269,6 +277,8 @@ def summarise(samples: list[dict[str, Any]], bucket_s: int = 60) -> list[dict[st
                 "load": worst(rows, "load"),
                 "zlink_cpu_pct": worst(rows, "zlink_cpu_pct"),
                 "hotspot_rx_kbit": worst(rows, "hotspot_rx_kbit"),
+                "ap_drops": worst(rows, "ap_drops"),
+                "obd_cpu_pct": worst(rows, "obd_cpu_pct"),
                 "sta_mhz": rows[-1].get("sta_mhz"),
                 "ap_mhz": rows[-1].get("ap_mhz"),
             }

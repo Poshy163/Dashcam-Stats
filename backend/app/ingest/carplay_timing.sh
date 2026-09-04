@@ -17,7 +17,7 @@ TAG=CarPlayTiming
 [ -f "$PIDF" ] && kill "$(cat "$PIDF")" 2>/dev/null
 echo $$ > "$PIDF"
 
-prev_ticks=0; prev_t=0; prev_rx=0; idle_n=0
+prev_ticks=0; prev_t=0; prev_rx=0; idle_n=0; prev_drops=0; prev_oticks=0; prev_ot=0
 emit() {
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $1" >> "$LOG"
   log -p "$PRIO" -t "$TAG" "$1" 2>/dev/null
@@ -51,7 +51,38 @@ while :; do
   prev_rx=${rx:-0}
   sta=$(cmd wifi status 2>/dev/null | grep -oE 'Frequency: [0-9]+MHz|RSSI: -?[0-9]+' | head -2 | tr -d ' ' | tr '\n' '/' )
   ap=$(dumpsys wifi 2>/dev/null | grep -oE 'wlan2=SoftApInfo\{[^}]*frequency= [0-9]+' | grep -oE '[0-9]+$' | head -1)
-  head="acc=$acc phone=$phone load=$load soc=$soc zlink_cpu=$zcpu rx_kbit=$kbit sta=$sta ap=${ap:-na}"
+  # What the hotspot link *lost*, not just what it carried. Dropped and errored frames on
+  # the AP are the direct evidence of a link that stalled, which average bitrate cannot
+  # show: measured across 234 samples rx_kbit correlates with late frames at r=-0.00, yet a
+  # picture that visibly stutters is plainly losing something. Standard netdev counters, so
+  # they are always present; the delta is what matters, not the total.
+  drops=na
+  d_now=$(cat /sys/class/net/wlan2/statistics/tx_dropped 2>/dev/null)
+  e_now=$(cat /sys/class/net/wlan2/statistics/tx_errors 2>/dev/null)
+  r_now=$(cat /sys/class/net/wlan2/statistics/rx_dropped 2>/dev/null)
+  if [ -n "$d_now" ] && [ -n "$e_now" ] && [ -n "$r_now" ]; then
+    total=$((d_now + e_now + r_now))
+    [ "$prev_drops" -gt 0 ] && drops=$((total - prev_drops))
+    prev_drops=$total
+  fi
+  # The OBD logger's own CPU, read exactly as Zlink's is. It polls the car over BLE while
+  # driving -- at a duty cycle its own event stream has reported as high as 100% -- and
+  # Bluetooth shares this unit's single radio with the hotspot CarPlay runs over (see the
+  # opening note in app/ingest/radios.py). If that coexistence costs frames, this is the
+  # column that will show it. Until it is recorded the question cannot be settled at all:
+  # the logger polls whenever the engine runs and CarPlay samples exist only when the
+  # engine runs, so the data collected so far has no contrast to correlate against.
+  opid=$(pidof com.dashcamstats.obdlogger 2>/dev/null | cut -d' ' -f1)
+  ocpu=na
+  if [ -n "$opid" ] && [ -r /proc/$opid/stat ]; then
+    oticks=$(awk '{print $14+$15}' /proc/$opid/stat 2>/dev/null)
+    if [ "$prev_ot" -gt 0 ] && [ -n "$oticks" ]; then
+      odt=$((now-prev_ot)); [ "$odt" -gt 0 ] && ocpu=$(( (oticks-prev_oticks) / odt ))
+    fi
+    prev_oticks=${oticks:-0}; prev_ot=$now
+  fi
+  bt=$(settings get global bluetooth_on 2>/dev/null)
+  head="acc=$acc phone=$phone load=$load soc=$soc zlink_cpu=$zcpu rx_kbit=$kbit ap_drops=$drops obd_cpu=$ocpu bt=${bt:-na} sta=$sta ap=${ap:-na}"
 
   if [ "$phone" -gt 0 ]; then
     idle_n=0

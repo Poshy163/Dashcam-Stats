@@ -63,6 +63,39 @@ class TestParsing:
         assert sample["frames"] == 126
         assert sample["period_ms"] == 17.5
 
+    def test_the_coexistence_columns_are_read(self):
+        """Recorded so the BLE-versus-CarPlay question can be settled rather than argued.
+
+        The logger polls the car over Bluetooth while driving and Bluetooth shares this
+        unit's one radio with the hotspot CarPlay runs over. Nothing in the samples
+        collected so far can test that: the logger polls whenever the engine runs and
+        CarPlay samples exist only when the engine runs, so there was no contrast.
+        """
+        line = VIDEO_LINE.replace("rx_kbit=1631", "rx_kbit=1631 ap_drops=42 obd_cpu=9 bt=1")
+
+        sample = carplay_timing.parse_sample(datetime(2026, 9, 4, 9, 0, tzinfo=UTC), line)
+
+        assert sample["ap_drops"] == 42.0
+        assert sample["obd_cpu_pct"] == 9.0
+        assert sample["bluetooth_on"] is True
+
+    def test_an_unreadable_coexistence_column_is_none_not_zero(self):
+        """``na`` means the read failed. Zero would read as a healthy link."""
+        line = VIDEO_LINE.replace("rx_kbit=1631", "rx_kbit=1631 ap_drops=na obd_cpu=na bt=na")
+
+        sample = carplay_timing.parse_sample(datetime(2026, 9, 4, 9, 0, tzinfo=UTC), line)
+
+        assert sample["ap_drops"] is None
+        assert sample["obd_cpu_pct"] is None
+        assert sample["bluetooth_on"] is None
+
+    def test_a_line_from_before_the_new_columns_still_parses(self):
+        """Samples already in the database predate these fields."""
+        sample = carplay_timing.parse_sample(datetime(2026, 9, 4, 9, 0, tzinfo=UTC), VIDEO_LINE)
+
+        assert sample is not None and sample["fps"] is not None
+        assert sample["ap_drops"] is None and sample["obd_cpu_pct"] is None
+
     def test_a_heartbeat_is_not_a_sample(self):
         assert carplay_timing.parse_sample(datetime.now(UTC), HEARTBEAT_LINE) is None
 

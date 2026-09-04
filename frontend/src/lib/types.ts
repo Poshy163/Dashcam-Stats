@@ -430,6 +430,11 @@ export interface CarPlayTimingSample {
   socC: number | null
   zlinkCpuPct: number | null
   hotspotRxKbit: number | null
+  /** Frames the hotspot lost in the interval: the stall average bitrate cannot show. */
+  apDrops: number | null
+  /** The OBD logger's CPU. It polls over BLE, which shares this unit's one radio. */
+  obdCpuPct: number | null
+  bluetoothOn: boolean | null
   staMhz: number | null
   staRssi: number | null
   apMhz: number | null
@@ -463,6 +468,8 @@ export interface CarPlayTimingMinute {
   load: number | null
   zlinkCpuPct: number | null
   hotspotRxKbit: number | null
+  apDrops: number | null
+  obdCpuPct: number | null
   staMhz: number | null
   apMhz: number | null
 }
