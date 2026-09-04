@@ -269,6 +269,26 @@ def _sign_is_ambiguous(separator: str | None, value: str | None) -> bool:
         return ":" not in (separator or "")
     if not separator:
         return False
+    # A *doubled* separator is the same fault wearing the one glyph this function could not
+    # previously suspect. ``-`` and ``:`` are thin and adjacent in shape -- the note on
+    # :data:`_DOTLIKE` says so, and the branch above already guards a colon misread as a
+    # minus -- but the reverse was unguarded, because a colon in the sign position is
+    # indistinguishable from the label's own colon when you only look at the last character.
+    #
+    # Counting them tells the two apart. The overlay prints exactly one colon per label, so
+    # ``N:34.7971`` is a genuine positive and ``N:-34.7971`` keeps its minus in the value
+    # (``latsep`` cannot hold a ``-``). ``N::34.7971`` has a second colon standing precisely
+    # where the sign belongs, and that is a minus that decoded as a colon.
+    #
+    # Found in the live library: 42 recordings on 3 September read
+    # ``E:138.7044 N::34.7971`` at 0.97 confidence with no problem recorded, putting a
+    # stationary car in Shizuoka -- Adelaide's longitude is also Japan's, so a lost latitude
+    # sign lands there rather than somewhere obviously absurd. Nothing downstream caught it:
+    # the car was parked, so there was no jump for the outlier check to see, and the
+    # paired-camera recovery then copied the confident wrong fix onto the other camera's
+    # unreadable frames.
+    if separator.count(":") > 1:
+        return True
     # Nothing dot-shaped belongs between ``N:`` and the digits, so anything found there is
     # a glyph that decoded wrongly, and the sign is the most likely casualty.
     return separator[-1] in _DOTLIKE

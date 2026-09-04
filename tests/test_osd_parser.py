@@ -128,6 +128,38 @@ class TestCoordinatesAreNeverInvented:
         assert r.has_position is False
         assert r.lat is None and r.lon is None
 
+    @pytest.mark.parametrize(
+        "line",
+        [
+            # The real one, off the live library: 42 recordings on 3 September 2026 read
+            # this at 0.97 confidence with no problem recorded, and put a stationary car in
+            # Shizuoka. Adelaide's longitude is also Japan's, so a lost latitude sign lands
+            # somewhere plausible rather than somewhere absurd, and the car was parked, so
+            # there was no jump for the outlier check to catch either.
+            "2026-09-03 16:04:21 E:138.7044 N::34.7971 0 km/h",
+            # The same fault on the longitude.
+            "2026-09-03 16:04:21 E::138.7044 N:-34.7971 0 km/h",
+        ],
+    )
+    def test_a_minus_misread_as_a_second_colon_is_refused(self, line):
+        """``-`` and ``:`` swap both ways, and this is the direction nothing guarded.
+
+        A colon in the sign position cannot be told from the label's own colon by looking
+        at the last character, which is what the dot-shaped test does. Counting them can:
+        the overlay prints exactly one colon per label, so a second one is standing where
+        the minus should be.
+        """
+        r = parse_osd_text(line)
+        assert r.has_position is False
+        assert r.lat is None and r.lon is None
+
+    def test_one_colon_per_label_still_reads_normally(self):
+        """The guard counts colons, so it must not fire on the ordinary two-label reading."""
+        r = parse_osd_text("2026-09-03 16:04:21 E:138.7044 N:-34.7971 0 km/h")
+        assert r.lat == pytest.approx(-34.7971)
+        assert r.lon == pytest.approx(138.7044)
+        assert r.has_position is True
+
     def test_a_genuinely_negative_longitude_keeps_its_sign(self):
         """The western hemisphere still parses: the label's colon is beside the minus."""
         r = parse_osd_text("2026-07-28 13:49:02 E:-122.4194 N:37.7749 62 km/h")
