@@ -262,7 +262,17 @@ class TestDetailEndpoints:
 
         async with session_scope() as session:
             base = datetime(2026, 8, 4, 17, 43, tzinfo=UTC)
-            j = Journey(started_at=base, ended_at=base + timedelta(minutes=18), duration_s=1080.0)
+            j = Journey(
+                started_at=base,
+                ended_at=base + timedelta(minutes=18),
+                duration_s=1080.0,
+                # The rollups the summarise stage would have written for the 60 km/h
+                # telemetry below. Without them this is a journey the car never drove, and
+                # the list hides those -- which would make these tests fail for a reason
+                # that has nothing to do with the revision gating they are about.
+                avg_speed_kmh=52.0,
+                max_speed_kmh=60.0,
+            )
             session.add(j)
             await session.flush()
             rec = Recording(

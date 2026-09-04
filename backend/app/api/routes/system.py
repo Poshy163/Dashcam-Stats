@@ -33,7 +33,7 @@ from app.api.schemas import (
     StatusTotals,
     UnitLogEntryOut,
 )
-from app.api.visibility import visible_journey_ids, visible_revision
+from app.api.visibility import drive_filter, visible_journey_ids, visible_revision
 from app.auth.service import ensure_credential_loaded
 from app.config import get_config
 from app.core.logging import get_logger
@@ -149,10 +149,14 @@ async def get_status(session: SessionDep):
             ).scalar()
             or 0
         ),
+        # Drives, not journeys. The parked sessions are hidden from the list beside this
+        # tile, and a count that included them would disagree with what the page shows.
         journeys=int(
             (
                 await session.execute(
-                    select(func.count(Journey.id)).where(Journey.id.in_(visible_journey_ids()))
+                    select(func.count(Journey.id)).where(
+                        Journey.id.in_(visible_journey_ids()), drive_filter()
+                    )
                 )
             ).scalar()
             or 0
@@ -268,10 +272,14 @@ async def get_status(session: SessionDep):
         footage_writable=safety.writable,
     )
 
+    # "Latest run telemetry" means the last time the car was driven. Without the filter
+    # this panel showed whatever had been recorded most recently, which for a car that
+    # spends most of its life parked is almost always a parked session: nineteen minutes,
+    # forty-seven metres, zero average, and the last real drive nowhere on the page.
     latest = (
         await session.execute(
             select(Journey)
-            .where(Journey.id.in_(visible_journey_ids()))
+            .where(Journey.id.in_(visible_journey_ids()), drive_filter())
             .order_by(Journey.started_at.desc())
             .limit(1)
         )

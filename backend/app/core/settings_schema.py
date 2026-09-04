@@ -647,6 +647,38 @@ SETTINGS: tuple[SettingDef, ...] = (
         unit="km",
         requires="journeys.use_gps_continuity",
     ),
+    SettingDef(
+        "journeys.min_avg_speed_kmh",
+        "Minimum average speed for a drive",
+        "float",
+        5.0,
+        "journeys",
+        "A journey whose average speed never reached this was a parked session rather "
+        "than a drive, and is hidden from the journeys list and the dashboard. Clustering "
+        "groups recordings by time and place, and a parked car goes on recording, so "
+        "leaving the car anywhere for an afternoon produces one of these: hours of "
+        "footage and a few tens of metres of travel. Set to 0 to stop testing the average.",
+        minimum=0.0,
+        maximum=100.0,
+        unit="km/h",
+        requires="journeys.enabled",
+    ),
+    SettingDef(
+        "journeys.min_top_speed_kmh",
+        "Minimum top speed for a drive",
+        "float",
+        10.0,
+        "journeys",
+        "The second half of the same test, and both have to be met. The average alone "
+        "would keep a slow crawl around a car park; the top speed alone would keep an hour "
+        "of idling broken by one reversing manoeuvre. A journey whose speed was never "
+        "established at all fails the test and is hidden, but is never deleted for it -- "
+        "see the storage rule. Set to 0 to stop testing the top speed.",
+        minimum=0.0,
+        maximum=200.0,
+        unit="km/h",
+        requires="journeys.enabled",
+    ),
     # ---------------------------------------------------------------- storage
     SettingDef(
         "storage.max_footage_gb",

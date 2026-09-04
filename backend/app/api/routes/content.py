@@ -36,7 +36,12 @@ from app.api.schemas import (
     TrackedObjectOut,
     VehicleOut,
 )
-from app.api.visibility import telemetry_quality_view, visible_journey_ids, visible_revision
+from app.api.visibility import (
+    drive_filter,
+    telemetry_quality_view,
+    visible_journey_ids,
+    visible_revision,
+)
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service, local_zone
 from app.db.models import (
@@ -516,8 +521,21 @@ async def list_journeys(
     date_to: datetime | None = None,
     has_gps: bool | None = None,
     sort: str = Query("started_desc"),
+    include_parked: bool = Query(
+        False,
+        description=(
+            "Include journeys that never became drives -- the parked sessions hidden by "
+            "the speed thresholds under Journeys. Off by default; the detail page of one "
+            "is always reachable by id regardless."
+        ),
+    ),
 ):
     stmt = select(Journey).where(Journey.id.in_(visible_journey_ids()))
+    if not include_parked:
+        # A parked session is a real grouping of real footage and not a drive. Hidden here
+        # rather than never created, because the recordings still have to belong somewhere
+        # and the retention rule needs the grouping to find the footage by.
+        stmt = stmt.where(drive_filter())
     if date_from:
         stmt = stmt.where(Journey.started_at >= _day_start(date_from))
     if date_to:
