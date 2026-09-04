@@ -446,6 +446,14 @@ export interface CarPlayTimingSample {
 /** A minute of samples: rates averaged, everything else at its worst. */
 export interface CarPlayTimingMinute {
   bucketStart: string
+  /**
+   * Which surface this row is for. There is always more than one, and they are not
+   * pooled: measured live, two surfaces in the same minute ran 35 ms and 53 ms
+   * cadences, and the mean of the two was a rate neither ever achieved.
+   */
+  layer: string
+  /** Position in SurfaceFlinger's list; `#N` is reassigned between sessions. */
+  layerIndex: number
   samples: number
   fps: number | null
   latePct: number | null

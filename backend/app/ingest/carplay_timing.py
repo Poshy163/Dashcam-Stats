@@ -209,6 +209,15 @@ def parse_sample(occurred_at: datetime, message: str) -> dict[str, Any] | None:
         "sta_rssi": sta_rssi,
         "ap_mhz": int(fields["ap"]) if fields.get("ap", "na").isdigit() else None,
         "layer": fields.get("layer", ""),
+        # Which of the surfaces this was, in the order SurfaceFlinger listed them. The
+        # layer's own `#N` is a sequence number that is reassigned between sessions -- it
+        # has been observed as #99/#104 one session and #100/#103 the next, with the fast
+        # and slow surfaces swapping which number they carried -- so it cannot be used to
+        # follow one surface over time, and neither can the name, which this build prints
+        # as a bare `SurfaceView[](BLAST)` with no package. The index at least keeps the
+        # surfaces of a single sample apart.
+        "layer_index": int(_number(fields.get("idx")) or 0),
+        "late_threshold_ms": _number(fields.get("thr")),
         "fps": fps,
         "median_ms": _number(fields.get("med")),
         "p95_ms": _number(fields.get("p95")),
@@ -220,29 +229,37 @@ def parse_sample(occurred_at: datetime, message: str) -> dict[str, Any] | None:
 
 
 def summarise(samples: list[dict[str, Any]], bucket_s: int = 60) -> list[dict[str, Any]]:
-    """Per-bucket figures across every surface, in time order.
+    """Per-bucket figures, **one row per surface**, in time order.
 
     fps and late% are averaged (they are already per-sample rates); p95, max, temperature,
     load, Zlink CPU and bitrate take the worst seen in the bucket, because the question a
     bucket answers is "how bad did it get", not "what was typical".
+
+    Buckets are per surface because there is always more than one. Pooling them produced a
+    figure that described neither: measured over 234 samples, one surface ran a 35 ms
+    cadence and the other 53 ms in the same minute, and the mean of the two was a number no
+    surface ever achieved. They cannot be told apart from the sampler's output -- see
+    ``layer_index`` -- so they are kept apart rather than blended, and the caller chooses.
     """
-    buckets: dict[int, list[dict[str, Any]]] = {}
+    buckets: dict[tuple[int, str], list[dict[str, Any]]] = {}
     for sample in samples:
         key = int(sample["occurred_at"].timestamp()) // bucket_s * bucket_s
-        buckets.setdefault(key, []).append(sample)
+        buckets.setdefault((key, str(sample.get("layer", ""))), []).append(sample)
 
     def worst(rows: list[dict[str, Any]], field: str) -> float | None:
         values = [r[field] for r in rows if r.get(field) is not None]
         return max(values) if values else None
 
     out: list[dict[str, Any]] = []
-    for key in sorted(buckets):
-        rows = buckets[key]
+    for key, layer in sorted(buckets, key=lambda k: (k[0], k[1])):
+        rows = buckets[(key, layer)]
         fps = [r["fps"] for r in rows if r.get("fps") is not None]
         late = [r["late_pct"] for r in rows if r.get("late_pct") is not None]
         out.append(
             {
                 "bucket_start": datetime.fromtimestamp(key, tz=rows[0]["occurred_at"].tzinfo),
+                "layer": layer,
+                "layer_index": rows[-1].get("layer_index") or 0,
                 "samples": len(rows),
                 "fps": sum(fps) / len(fps) if fps else None,
                 "late_pct": sum(late) / len(late) if late else None,

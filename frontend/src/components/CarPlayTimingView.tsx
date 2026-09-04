@@ -94,6 +94,7 @@ function MiniChart({ minutes, series }: { minutes: CarPlayTimingMinute[]; series
 
 export default function CarPlayTimingView({ live }: { live: boolean }) {
   const [hours, setHours] = useState(24)
+  const [surface, setSurface] = useState('')
   const query = useQuery({
     queryKey: ['carplay-timing', hours],
     queryFn: () => api.unitLogs.carplayTiming({ hours }),
@@ -103,7 +104,20 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
   if (query.isLoading) return <Spinner />
   if (query.isError) return <ErrorState error={query.error} />
   const data = query.data
-  const minutes = data?.minutes ?? []
+  const allMinutes = data?.minutes ?? []
+
+  // The unit always draws on more than one SurfaceView, and nothing in the sampler's
+  // output says which is CarPlay's video: the layer's `#N` is reassigned between
+  // sessions and the name carries no package. Measured live, two surfaces in the same
+  // minute ran 35 ms and 53 ms cadences, so an average across them described neither.
+  // They are shown one at a time instead, busiest first, and the operator picks.
+  const layers = [...new Set(allMinutes.map((m) => m.layer).filter(Boolean))].sort(
+    (a, b) =>
+      allMinutes.filter((m) => m.layer === b).length -
+      allMinutes.filter((m) => m.layer === a).length,
+  )
+  const layer = layers.includes(surface) ? surface : layers[0] ?? ''
+  const minutes = layer ? allMinutes.filter((m) => m.layer === layer) : allMinutes
 
   const meanFps = minutes.length ? minutes.reduce((a, m) => a + (m.fps ?? 0), 0) / minutes.length : null
   const meanLate = minutes.length ? minutes.reduce((a, m) => a + (m.latePct ?? 0), 0) / minutes.length : null
@@ -130,6 +144,24 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
             {h < 48 ? `${h} h` : `${h / 24} d`}
           </button>
         ))}
+        {layers.length > 1 && (
+          <>
+            <span className="label ml-3 text-xs">Surface</span>
+            {layers.map((l) => (
+              <button
+                key={l}
+                onClick={() => setSurface(l)}
+                title="The unit draws on more than one SurfaceView and does not say which is CarPlay's video. Each is shown separately rather than averaged together."
+                className={cn(
+                  'rounded px-2 py-1',
+                  l === layer ? 'bg-surface text-content shadow-sm' : 'text-content-muted hover:text-content',
+                )}
+              >
+                {l}
+              </button>
+            ))}
+          </>
+        )}
         <span className="ml-auto text-content-muted">
           {data?.total ?? 0} samples · {minutes.length} minutes with a phone attached
         </span>

@@ -102,6 +102,40 @@ class TestSummarising:
         assert first["max_ms"] == 88.2, "worst interval in the bucket"
         assert first["sta_mhz"] == 5520 and first["ap_mhz"] == 5180
 
+    def test_two_surfaces_in_one_minute_stay_apart(self):
+        """Pooling them produced a figure that described neither.
+
+        Measured over 234 live samples: in the same minute one surface ran a 35 ms cadence
+        and the other 53 ms, and the mean of the two was a rate no surface ever achieved.
+        """
+        t0 = datetime(2026, 9, 3, 7, 30, 5, tzinfo=UTC)
+        fast = carplay_timing.parse_sample(t0, VIDEO_LINE)
+        slow = carplay_timing.parse_sample(
+            t0 + timedelta(seconds=5),
+            VIDEO_LINE.replace("layer=#104", "layer=#100")
+            .replace("fps=23.4", "fps=16.8")
+            .replace("med=35.3", "med=53.0"),
+        )
+
+        minutes = carplay_timing.summarise([s for s in (fast, slow) if s])
+
+        assert len(minutes) == 2, "one row per surface, not one blended row"
+        by_layer = {m["layer"]: m for m in minutes}
+        assert by_layer["#104"]["fps"] == pytest.approx(23.4)
+        assert by_layer["#100"]["fps"] == pytest.approx(16.8)
+        # Both describe the same minute; neither is an average of the other.
+        assert {m["bucket_start"] for m in minutes} == {datetime(2026, 9, 3, 7, 30, tzinfo=UTC)}
+
+    def test_the_surface_index_survives_into_the_bucket(self):
+        """`#N` is reassigned between sessions, so the position is what can be followed."""
+        t0 = datetime(2026, 9, 3, 7, 30, 5, tzinfo=UTC)
+        sample = carplay_timing.parse_sample(
+            t0, VIDEO_LINE.replace("layer=#104", "layer=#104 idx=2")
+        )
+
+        assert sample["layer_index"] == 2
+        assert carplay_timing.summarise([sample])[0]["layer_index"] == 2
+
 
 class TestArming:
     async def test_the_script_is_deployed_by_base64_and_started_detached(self, monkeypatch):

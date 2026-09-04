@@ -59,20 +59,32 @@ while :; do
     if [ -z "$layers" ]; then
       emit "$head | no video surface"
     else
+      idx=0
       echo "$layers" | while read -r L; do
-        dumpsys SurfaceFlinger --latency "$L" </dev/null 2>/dev/null | awk -v layer="${L##*#}" '
+        idx=$((idx+1))
+        dumpsys SurfaceFlinger --latency "$L" </dev/null 2>/dev/null | awk -v layer="${L##*#}" -v idx="$idx" '
           NR==1 { period=$1/1e6; next }
           NF>=3 && $2>0 && $2<9e18 { p[n++]=$2 }
           END {
-            if (n<3) { printf "layer=#%s frames=%d (idle)\n", layer, n; exit }
+            if (n<3) { printf "layer=#%s idx=%s frames=%d (idle)\n", layer, idx, n; exit }
             # sort presented timestamps, then the intervals between them
             for (i=0;i<n;i++) for (j=i+1;j<n;j++) if (p[j]<p[i]) { t=p[i]; p[i]=p[j]; p[j]=t }
             m=0; for (i=1;i<n;i++) { d[m++]=(p[i]-p[i-1])/1e6 }
             for (i=0;i<m;i++) for (j=i+1;j<m;j++) if (d[j]<d[i]) { t=d[i]; d[i]=d[j]; d[j]=t }
-            span=(p[n-1]-p[0])/1e9; late=0; thr=2.5*period
+            med=d[int(m/2)]
+            span=(p[n-1]-p[0])/1e9; late=0
+            # A late frame is one that missed its slot, and the slot is this surface`s own
+            # cadence -- not the display`s. The old threshold was 2.5 display periods, which
+            # on a 57 Hz panel is 44 ms; a 30 fps source cannot be shown evenly there and has
+            # to alternate 2-vsync (35 ms) and 3-vsync (53 ms) holds, so every ordinary
+            # 3-vsync hold counted late. Worse, a surface running steadily at 19 fps scored
+            # 100% late while dropping nothing at all. Measuring from the median instead
+            # separates the two questions the fields already answer separately: fps says how
+            # fast the surface runs, late says how unevenly.
+            thr=med+1.5*period
             for (i=0;i<m;i++) if (d[i]>thr) late++
-            printf "layer=#%s fps=%.1f med=%.1f p95=%.1f max=%.1f late=%d%% n=%d period=%.1f\n",
-              layer, (span>0? n/span:0), d[int(m/2)], d[int(m*0.95)-1<0?0:int(m*0.95)-1], d[m-1], 100*late/m, n, period
+            printf "layer=#%s idx=%s fps=%.1f med=%.1f p95=%.1f max=%.1f late=%d%% n=%d period=%.1f thr=%.1f\n",
+              layer, idx, (span>0? n/span:0), med, d[int(m*0.95)-1<0?0:int(m*0.95)-1], d[m-1], 100*late/m, n, period, thr
           }' | while read -r stat; do emit "$head | $stat"; done
       done
     fi

@@ -261,9 +261,33 @@ The CarPlay picture is drawn on a `SurfaceView[](BLAST)#N` layer of Zlink's, and
 of *that* surface — not Zlink's own views, which `dumpsys gfxinfo` reports — is where the
 CarPlay lag lives. `dumpsys SurfaceFlinger --latency '<layer name>'` prints the display
 period and the last 128 frames' desired/actual/ready present times in nanoseconds; the
-intervals between successive actual-present values give fps, and any interval over about
-2.5 periods is a frame that landed late. Measured with CarPlay in use: 23–26 fps delivered,
-median interval 35 ms, p95 70 ms, worst 106 ms, a quarter to a third of frames late.
+intervals between successive actual-present values give fps. Measured with CarPlay in use:
+23–26 fps delivered, median interval 35 ms, p95 70 ms, worst 106 ms.
+
+**A late frame is one that missed its slot by more than one refresh** (`median + 1.5
+periods`), not one over 2.5 display periods, which is what this originally counted and what
+produced the “a quarter to a third of frames late” figure quoted here for months. That
+threshold measured the source against the *display*: the panel runs at ~57 Hz, a 30 fps
+source cannot divide into it evenly, and so it has to alternate 2-vsync (35 ms) and 3-vsync
+(53 ms) holds — every one of which counted late. Two consequences, both confirmed against
+234 live samples: a healthy stream carried an ~11 % structural floor of “late” frames, and a
+surface running steadily at 19 fps while dropping nothing at all scored **100 %**. The two
+questions are now answered by the two fields that should answer them — `fps` for how fast
+the surface runs, `late` for how unevenly. Samples from before this change are not
+comparable with ones after it.
+
+`late_pct` correlates with nothing physical across those 234 samples: SoC temperature
+−0.20 (*negative*), Zlink CPU −0.01, hotspot bitrate −0.00, load −0.34. Thermal
+throttling, Zlink's own CPU and the phone→unit bitrate are all ruled out as causes.
+
+**There is always more than one such surface, and nothing identifies which is CarPlay's.**
+The layer's `#N` is a SurfaceFlinger sequence number that is reassigned between sessions —
+observed as #99/#104 one session and #100/#103 the next, with the fast and slow surfaces
+swapping which number they carried — and the name is a bare `SurfaceView[](BLAST)` with no
+package. So the samples are kept per surface and never averaged across them (a mean of a
+35 ms and a 53 ms cadence is a rate neither surface ever achieved); the Logs view shows one
+at a time. Telling them apart properly needs a look at the full `dumpsys SurfaceFlinger`
+with the car awake and a phone attached.
 
 `app/ingest/carplay_timing.py` ships a toybox script (`carplay_timing.sh`) that does this
 every few seconds while a phone is attached to the hotspot, emitting one line per surface
