@@ -17,7 +17,7 @@ TAG=CarPlayTiming
 [ -f "$PIDF" ] && kill "$(cat "$PIDF")" 2>/dev/null
 echo $$ > "$PIDF"
 
-prev_ticks=0; prev_t=0; prev_rx=0; idle_n=0; prev_drops=0; prev_oticks=0; prev_ot=0
+prev_ticks=0; prev_t=0; prev_rx=0; idle_n=0; prev_drops=-1; prev_oticks=0; prev_ot=0
 emit() {
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $1" >> "$LOG"
   log -p "$PRIO" -t "$TAG" "$1" 2>/dev/null
@@ -62,7 +62,10 @@ while :; do
   r_now=$(cat /sys/class/net/wlan2/statistics/rx_dropped 2>/dev/null)
   if [ -n "$d_now" ] && [ -n "$e_now" ] && [ -n "$r_now" ]; then
     total=$((d_now + e_now + r_now))
-    [ "$prev_drops" -gt 0 ] && drops=$((total - prev_drops))
+    # -1 until the first reading, because a healthy link legitimately sits at zero: using
+    # the total itself as the sentinel reported `na` -- unreadable -- for exactly the case
+    # the column exists to recognise, and the live unit does read 0/0/0.
+    [ "$prev_drops" -ge 0 ] && drops=$((total - prev_drops))
     prev_drops=$total
   fi
   # The OBD logger's own CPU, read exactly as Zlink's is. It polls the car over BLE while
