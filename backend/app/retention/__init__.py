@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.retention.idle import plan_idle
+from app.retention.parked import plan_parked
 from app.retention.planner import (
     RetentionCandidate,
     RetentionPlan,
@@ -23,4 +24,5 @@ __all__ = [
     "execute",
     "plan",
     "plan_idle",
+    "plan_parked",
 ]

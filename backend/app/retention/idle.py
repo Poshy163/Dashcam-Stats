@@ -56,18 +56,23 @@ IDLE_REASON = "static — the car never moved and nothing was seen"
 IDLE_DISTANCE_M = 50.0
 
 
-def _static_condition(threshold_kmh: float):
-    """The per-clip test: settled, current analysis that proved there is nothing.
+def settled_condition():
+    """Analysis is finished, current, and final enough to delete on.
 
-    A SQL expression so it can be a ``WHERE`` directly. ``file_missing``/``DELETED`` are
+    A SQL expression, so it can be a ``WHERE`` directly. ``file_missing``/``DELETED`` are
     left out because callers restrict to live rows.
 
-    Telemetry and detection must be ``DONE`` — silence is not evidence. Metadata and plate
-    analysis must be settled too, and every persisted stage result must belong to the
-    current pipeline revision. This matters after a partial reprocess: detection may have
-    finished empty before the plate stage failed, leaving apparently persuasive zeroes on
-    a recording whose overall verdict is ``FAILED``. Only ``COMPLETED`` is final enough to
-    delete, and an ignored recording is deliberately outside all automatic processing.
+    Silence is not evidence. A stage that has not run yet reports no vehicles exactly as
+    convincingly as one that ran and found none, so every stage has to be ``DONE`` and
+    every persisted result has to belong to the current pipeline revision. That matters
+    after a partial reprocess: detection may have finished empty before the plate stage
+    failed, leaving apparently persuasive zeroes on a recording whose overall verdict is
+    ``FAILED``. Only ``COMPLETED`` is final enough to delete on, and an ignored recording
+    is deliberately outside all automatic processing.
+
+    Shared with :mod:`app.retention.parked`, which has to demand the same thing and would
+    otherwise restate it -- and a second copy of this list is a copy that can fall behind
+    a new stage.
     """
     return and_(
         Recording.state == RecordingState.COMPLETED,
@@ -81,21 +86,45 @@ def _static_condition(threshold_kmh: float):
         Recording.telemetry_revision == CURRENT_REVISIONS["telemetry"],
         Recording.detection_revision == CURRENT_REVISIONS["detection"],
         Recording.plate_revision == CURRENT_REVISIONS["plates"],
-        Recording.max_speed_kmh.isnot(None),
-        Recording.max_speed_kmh < threshold_kmh,
-        or_(Recording.distance_m.is_(None), Recording.distance_m < IDLE_DISTANCE_M),
-        Recording.vehicle_count == 0,
-        Recording.plate_count == 0,
+    )
+
+
+def spared_condition():
+    """Footage no automatic rule may remove, whatever else it concludes."""
+    return and_(
         Recording.protected.is_(False),
         Recording.event_type.is_(None),
     )
 
 
-def _live():
+def _static_condition(threshold_kmh: float):
+    """The per-clip test: settled analysis that proved there is nothing here.
+
+    Settled and unprotected are :func:`settled_condition` and :func:`spared_condition`;
+    what this rule adds is the evidence of emptiness -- no speed, no distance, nothing
+    seen. All three are needed, and the middle one is why a clip parked where other cars
+    pass is not caught by this rule at all: it saw them.
+    """
+    return and_(
+        settled_condition(),
+        Recording.max_speed_kmh.isnot(None),
+        Recording.max_speed_kmh < threshold_kmh,
+        or_(Recording.distance_m.is_(None), Recording.distance_m < IDLE_DISTANCE_M),
+        Recording.vehicle_count == 0,
+        Recording.plate_count == 0,
+        spared_condition(),
+    )
+
+
+def live_condition():
     return and_(
         Recording.file_missing.is_(False),
         Recording.state != RecordingState.DELETED,
     )
+
+
+#: Kept as the module's own short name for it; shared under the public one above.
+_live = live_condition
 
 
 async def plan_idle(

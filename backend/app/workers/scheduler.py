@@ -22,7 +22,7 @@ from app.journeys.builder import JourneyBuilder
 from app.pipeline.repair import repair_durations
 from app.retention import execute as run_retention
 from app.retention import plan as plan_retention
-from app.retention import plan_idle
+from app.retention import plan_idle, plan_parked
 from app.scanner.discovery import Scanner, queue_unprocessed
 from app.workers import queue
 
@@ -262,6 +262,12 @@ class Scheduler:
             covered_notifications = set(self._pending_idle_recordings)
             idle = await plan_idle(session, plan.safety)
             await run_retention(session, idle, dry_run=False, trigger="idle-cleanup")
+            # Footage of a car that never moved, which the static rule above cannot touch
+            # because a parked car sees traffic. Same self-authorising shape, same safety
+            # report, and it runs here rather than on its own timer so that "on every
+            # restart" comes free: this task's first run is scheduled for immediately.
+            parked = await plan_parked(session, plan.safety)
+            await run_retention(session, parked, dry_run=False, trigger="parked-cleanup")
             self._pending_idle_recordings.difference_update(covered_notifications)
         self._idle_cleanup_finished()
 

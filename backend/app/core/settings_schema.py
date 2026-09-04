@@ -772,6 +772,28 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="storage.delete_idle",
     ),
     SettingDef(
+        "storage.delete_parked_journeys",
+        "Automatically delete footage from parked sessions",
+        "bool",
+        True,
+        "storage",
+        "Removes the footage behind journeys that never became drives -- the same ones "
+        "the two speed thresholds under Journeys hide. This goes further than the "
+        "static-clip rule above, and deliberately: it deletes clips that *did* see cars, "
+        "because a car parked on a street watches traffic all day and the static rule "
+        "spares every second of it. That is the footage that fills the disk. "
+        "It reuses those thresholds rather than having its own, so the list and the disk "
+        "agree about what a drive is -- which does mean raising them to hide more also "
+        "deletes more. Positive evidence is required either way: a journey has to have "
+        "recorded a speed and had it come out too low, so one whose speed was never read "
+        "is hidden but kept. Every other guard still applies -- protected and event clips "
+        "are never touched, every recording in the journey must be fully analysed with "
+        "nothing queued against it, the footage folder must be writable, and a run that "
+        "would remove more than the single-run safety fraction blocks instead.",
+        requires="storage.cleanup_enabled",
+        dangerous=True,
+    ),
+    SettingDef(
         "storage.cleanup_enabled",
         "Run cleanup automatically",
         "bool",
