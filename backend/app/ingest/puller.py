@@ -1825,6 +1825,15 @@ async def run_pull(
         if display_task is not None:
             display_task.cancel()
             await asyncio.gather(display_task, return_exceptions=True)
+            # Cancelling that task stops the page being *re-raised*; it does not take it
+            # off the screen. Without this the car sits on a finished progress bar and --
+            # the part that actually costs something -- goes to sleep with the browser in
+            # front, where the driver's phone does not pair and CarPlay does not come up on
+            # the next drive, however correctly both radios were restored. Only when this
+            # run was the one that put the page there.
+            if bool(_get("hand_screen_back", True)):
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(adb.hand_screen_back(info.address), timeout=25.0)
 
         # Radios first, before any other tidying: this is the one piece of cleanup whose
         # failure follows somebody into the car. Bounded, because the usual reason a

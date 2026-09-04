@@ -686,6 +686,103 @@ async def chrome_is_foreground(address: str) -> bool:
     return any("mFocusedApp=" in line and CHROME_PACKAGE in line for line in reply.splitlines())
 
 
+#: The vendor CarPlay app, and what the car's screen belongs to when nothing is copying.
+#:
+#: Named here rather than taken from :mod:`app.ingest.radios` because this module may not
+#: import that one, and because the two uses are different: there it is a package whose
+#: build is attested before a radio is touched, here it is simply whose screen this is.
+CARPLAY_PACKAGE = "com.zjinnova.zlink"
+
+
+async def foreground_package(address: str) -> str:
+    """The package of the visible activity, or ``""`` if it cannot be read.
+
+    The resumed *activity*, not the focused *window* -- see :func:`chrome_is_foreground`
+    for why that distinction cost a whole feature once.
+    """
+    try:
+        reply = await shell(
+            address,
+            "dumpsys activity activities | grep -E 'topResumedActivity=|mResumedActivity=|mFocusedApp='",
+            timeout=6.0,
+        )
+    except AdbError as exc:
+        log.warning("could not read the head unit's foreground app", error=str(exc))
+        return ""
+    for line in reply.splitlines():
+        if "topResumedActivity=" in line or "mResumedActivity=" in line:
+            match = _FOREGROUND_COMPONENT.search(line)
+            if match:
+                return match.group(1)
+    for line in reply.splitlines():
+        if "mFocusedApp=" in line:
+            match = _FOREGROUND_COMPONENT.search(line)
+            if match:
+                return match.group(1)
+    return ""
+
+
+#: ``u0 com.example/.Activity`` out of a dumpsys activity line.
+_FOREGROUND_COMPONENT = re.compile(r"u0 ([A-Za-z0-9_.]+)/")
+
+
+async def hand_screen_back(address: str, package: str = CARPLAY_PACKAGE) -> bool:
+    """Put *package* back in front of the backup page. Never raises.
+
+    The backup page is opened over whatever the car was showing, and on this unit that is
+    the vendor CarPlay app. Closing the transfer used to mean cancelling the task that kept
+    the page there -- which stops it being *re-raised*, and leaves it exactly where it was.
+    So the car sat on a finished progress bar until somebody touched the screen, and, far
+    more to the point, went to sleep that way: the observed effect is that Bluetooth does
+    not pair with the driver's phone while the browser owns the foreground, so CarPlay does
+    not come up on the next drive even though both radios were restored correctly.
+
+    The launcher activity is resolved rather than hard-coded. It is currently
+    ``…features.main.MainActivity``, and a name learned from one build of a vendor app is
+    the kind of thing that is right until the day it is not; ``monkey`` is the fallback for
+    a build where resolution fails, since it needs only the package.
+
+    Best-effort by contract, like everything else that touches the car's screen: the
+    footage is already home by the time this runs.
+    """
+    component = ""
+    try:
+        reply = await shell(
+            address,
+            f"cmd package resolve-activity --brief -c android.intent.category.LAUNCHER {package}",
+            timeout=8.0,
+        )
+        for line in reply.splitlines():
+            candidate = line.strip()
+            if candidate.startswith(f"{package}/"):
+                component = candidate
+                break
+    except AdbError as exc:
+        log.warning("could not resolve the CarPlay app's launcher", error=str(exc))
+
+    commands = []
+    if component:
+        commands.append(f"am start -n {component}")
+    commands.append(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
+    for command in commands:
+        try:
+            reply = await shell(address, command, timeout=10.0)
+        except AdbError as exc:
+            log.warning("could not hand the screen back to CarPlay", error=str(exc))
+            continue
+        if "Error" in reply or "No activities found" in reply:
+            continue
+        if await foreground_package(address) == package:
+            log.info("handed the car's screen back to CarPlay after the transfer")
+            return True
+    log.warning(
+        "could not put CarPlay back in front of the backup page; "
+        "the unit may sleep showing the browser",
+        package=package,
+    )
+    return False
+
+
 #: The unit's own ignition line, as ``settings global acc_status`` reports it.
 #:
 #: Measured on the live unit: ``1`` with the engine on, flipping to ``0`` within a second

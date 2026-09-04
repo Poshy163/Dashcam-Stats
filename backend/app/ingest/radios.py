@@ -601,6 +601,15 @@ _STOP_VIA_TETHERING = (
 #: fixed literals and the package build is attested before either radio changes. The
 #: broadcast result is not success evidence; only the captured AP interface becoming
 #: stable is.
+#: Puts the vendor CarPlay app back in front of the backup page before the unit sleeps.
+#:
+#: ``monkey`` needs only the package, which is what makes it the right tool for a string
+#: baked into a detached script minutes before it runs: the launcher activity is a vendor
+#: implementation detail and this cannot re-resolve it once armed.
+_HAND_SCREEN_BACK = (
+    f"monkey -p {ZLINK_PACKAGE} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true"
+)
+
 _START_VIA_HOTSPOT_CONTROLLER = (
     f"am broadcast --user 0 -p {HOTSPOT_CONTROLLER_PACKAGE} "
     f"-a {HOTSPOT_START_ACTION} >/dev/null 2>&1 || true"
@@ -1116,6 +1125,7 @@ async def _arm_watchdog(
     hotspot_capsule_path: str | None = None,
     hotspot_restore_mode: str | None = None,
     report: WatchdogReport | None = None,
+    hand_screen_back: bool = True,
 ) -> WatchdogHandle | None:
     """Leave an exact radio-restoration watchdog running on the unit.
 
@@ -1189,6 +1199,15 @@ async def _arm_watchdog(
         restore_commands.append(_START_VIA_HOTSPOT_CONTROLLER)
     if not restore_commands:
         return None
+    if hand_screen_back:
+        # Last, and only alongside a real restore. Turning both radios back on is not
+        # enough on this unit: the observed behaviour is that the driver's phone does not
+        # pair while the browser owns the foreground, so a car that sleeps showing the
+        # backup page wakes up without CarPlay however correct its radios are. ``monkey``
+        # rather than a resolved component because this string is fixed at arm time and has
+        # to keep working against a vendor app that may be updated between then and the
+        # moment it fires; the package is the only part of that which cannot move.
+        restore_commands.append(_HAND_SCREEN_BACK)
     lease_ttl_s = max(1, int(deadline_s))
     candidate = _new_watchdog_handle()
     script_path = candidate.script_path
