@@ -433,6 +433,117 @@ def _absorb(total: transport.TransferResult, part: transport.TransferResult) -> 
         total.error = part.error
 
 
+#: How many finished chunks may be waiting to be committed before the transfer waits.
+#:
+#: Backpressure, not a buffer to be filled. Each queued chunk is `chunk_size` recordings
+#: sitting in staging on the footage filesystem, so an unbounded queue would trade card
+#: space for local disk on a link fast enough to outrun the commit -- and the whole point of
+#: committing progressively is that an interrupted window leaves finished files where the
+#: scanner can see them, not stranded in staging.
+COMMIT_QUEUE_DEPTH = 2
+
+
+class _CommitPipeline:
+    """Commit-and-reclaim running *behind* the transfer instead of inside it.
+
+    The bulk socket and the ADB control channel are independent -- :mod:`app.ingest.radios`
+    relies on exactly that, since the control channel is idle while the tar stream moves
+    bytes. Yet the commit and the card delete used to run between chunks with the stream
+    stopped, so the one thing guaranteed not to be doing work during them was the link.
+
+    The cost of that is small on average and occasionally large. A commit is a ``stat`` and
+    a rename; a reclaim is one ADB round trip, measured at ~185 ms against the live unit, on
+    a chunk that takes some twelve seconds to move. But an ADB call that wedges takes its
+    full timeout, and this application has recorded twenty-second ones -- twenty seconds of
+    a twenty-minute window spent holding a healthy link idle while a delete decides whether
+    it is going to answer.
+
+    So chunks are handed to a worker and the stream carries straight on. Nothing about the
+    safety ordering changes: a card delete still happens only after the commit for those
+    exact files returned them, and both still run one chunk at a time in arrival order.
+    What changes is who waits.
+
+    Failures are kept, not raised into the transfer. The first one stops further work --
+    nothing should still be erasing a card after a commit failed -- but the queue keeps
+    draining so :meth:`close` can never deadlock, and the error surfaces there.
+    """
+
+    def __init__(
+        self,
+        handler: Callable[[list[RemoteFile]], Awaitable[None]],
+        *,
+        depth: int = COMMIT_QUEUE_DEPTH,
+    ) -> None:
+        self._handler = handler
+        self._queue: asyncio.Queue[list[RemoteFile]] = asyncio.Queue(maxsize=max(1, depth))
+        self._worker: asyncio.Task[None] | None = None
+        #: Reported once, to whichever of `submit` or `close` reaches it first.
+        self._error: BaseException | None = None
+        #: Latched, and never cleared. Reporting the failure must not un-stop the worker:
+        #: the reason it stopped is that a commit failed, and that stays true after
+        #: somebody has been told about it.
+        self._failed = False
+
+    def start(self) -> None:
+        if self._worker is None:
+            self._worker = asyncio.create_task(self._drain(), name="ingest-commit-pipeline")
+
+    async def submit(self, chunk: list[RemoteFile]) -> None:
+        """Hand a finished chunk over, waiting only if the queue is already full."""
+        if self._worker is None:
+            # No pipeline: do it inline, which is the old behaviour exactly.
+            await self._handler(chunk)
+            return
+        self._raise_if_failed()
+        await self._queue.put(chunk)
+
+    async def _drain(self) -> None:
+        while True:
+            chunk = await self._queue.get()
+            try:
+                if not self._failed:
+                    await self._handler(chunk)
+            except asyncio.CancelledError:
+                self._queue.task_done()
+                raise
+            except BaseException as exc:
+                # Kept rather than raised here: a worker that dies takes the queue's
+                # drain with it, and `close` is where the run can act on this.
+                self._failed = True
+                if self._error is None:
+                    self._error = exc
+                self._queue.task_done()
+            else:
+                self._queue.task_done()
+
+    def _raise_if_failed(self) -> None:
+        error = self._error
+        if error is not None:
+            self._error = None
+            raise error
+
+    async def close(self, *, discard: bool = False) -> None:
+        """Finish what is queued, then stop. ``discard`` abandons it instead.
+
+        The transfer's own bookkeeping reads the committed list immediately after the last
+        chunk, so this has to be awaited before then -- a run may not decide what is still
+        outstanding while a worker is halfway through telling it.
+        """
+        worker = self._worker
+        self._worker = None
+        if worker is None:
+            return
+        try:
+            if not discard:
+                await self._queue.join()
+        finally:
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await worker
+        if not discard:
+            self._raise_if_failed()
+
+
 async def _move(
     info: UnitInfo,
     files: list[RemoteFile],
@@ -1502,17 +1613,35 @@ async def run_pull(
                     if to_reclaim:
                         await _reclaim(info, to_reclaim, lease=radio_transition)
 
-        transferred = await _move(
-            info,
-            plan.files,
-            staging=staging,
-            host=host,
-            port=port,
-            timeout_s=timeout_s,
-            lease=radio_transition,
-            chunk_size=chunk_size,
-            on_chunk_completed=_commit_and_reclaim_chunk,
+        # Started here rather than around the whole run: the sweeps below draw their own
+        # plans and commit inline, and a pipeline outliving the transfer it belongs to
+        # would have chunks in flight while the run decided it was finished.
+        pipeline = _CommitPipeline(
+            _commit_and_reclaim_chunk,
+            depth=int(_get("commit_queue_depth", COMMIT_QUEUE_DEPTH)),
         )
+        pipeline.start()
+        try:
+            transferred = await _move(
+                info,
+                plan.files,
+                staging=staging,
+                host=host,
+                port=port,
+                timeout_s=timeout_s,
+                lease=radio_transition,
+                chunk_size=chunk_size,
+                on_chunk_completed=pipeline.submit,
+            )
+        except BaseException:
+            # The window shut or the lease went. Whatever is queued has not been committed,
+            # and the second pass below is what picks those files up -- so drop it rather
+            # than spend a dead link finding out.
+            await pipeline.close(discard=True)
+            raise
+        # Awaited before `committed` is read: the run may not work out what is still
+        # outstanding while the worker is halfway through telling it.
+        await pipeline.close()
 
         status.set_phase(Phase.VERIFYING)
         remaining_expected = {
