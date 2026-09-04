@@ -74,21 +74,49 @@ def robust_centre(points: Sequence[tuple[float, float]]) -> tuple[float, float] 
     return (median(p[0] for p in points), median(p[1] for p in points))
 
 
+#: How many directly-read positions a journey needs before they may fix its centre without
+#: help. Three is the floor the pass as a whole already uses: below it there is no majority
+#: to be had, and two fixes cannot vote on which of them is wrong.
+MIN_ANCHORS = 3
+
+
 def spatial_outliers(
     points: Sequence[tuple[float, float]],
     *,
     span_s: float,
+    direct: Sequence[bool] | None = None,
 ) -> set[int]:
     """Indices of coordinates that cannot belong to a drive of ``span_s`` seconds.
 
     Returns an empty set when there is too little to judge with. Two fixes cannot vote on
     which of them is wrong, and guessing between them would be worse than keeping both:
     a wrongly rejected fix is a hole in a route, and holes are hard to notice.
+
+    ``direct`` marks, per point, which coordinates were read off the overlay rather than
+    synthesised from their neighbours. Where enough of those exist they fix the centre
+    alone, and they alone can call the pass off. Without the distinction the vote is
+    circular, and on this library it went the whole way round: a rear clip printed its
+    latitude with the minus sign decoded as a second colon, paired-camera recovery copied
+    that position into every hole in the drive until the copies outnumbered the readings,
+    the median moved to Japan, and the genuine fixes -- decoded clean at 0.96 confidence --
+    became the outliers and were cleared. What was left was 1,167 seconds of the misread and
+    nothing else, still on the heat map two fixes later, because every pass over it since
+    had asked the copies where the car was. A synthesised position is worth drawing and
+    worth judging; deciding where the vehicle was is the one thing it must never do.
     """
     if len(points) < 3:
         return set()
 
-    centre = robust_centre(points)
+    # Whose opinion counts about where this drive happened, and whose survival can veto the
+    # pass. Defaults to everything, which is both the behaviour that predates the
+    # distinction and the right answer for a journey with too few readings to anchor on.
+    jury: Sequence[int] = range(len(points))
+    if direct is not None:
+        read = [index for index, is_direct in enumerate(direct) if is_direct]
+        if len(read) >= MIN_ANCHORS:
+            jury = read
+
+    centre = robust_centre([points[index] for index in jury])
     if centre is None:
         return set()
 
@@ -99,12 +127,17 @@ def spatial_outliers(
         if haversine_m(centre[0], centre[1], lat, lon) > radius
     }
 
-    # Refuse to act if most of the set looks wrong. That means the centre is not what was
+    # Refuse to act if most of the jury looks wrong. That means the centre is not what was
     # assumed -- the drive genuinely moved a long way, or the majority is corrupt and the
     # minority is right -- and either way this is the wrong tool. Discarding most of a
     # journey's positions on a guess is far worse than leaving them alone for a human to
     # notice.
-    if len(outliers) * 2 >= len(points):
+    #
+    # Counted over the jury rather than over every point, so a drive whose synthesised
+    # copies outnumber its readings is still judged by the readings. Rejecting most of the
+    # *points* was never the danger here; rejecting most of the *evidence* is.
+    jury_outliers = sum(1 for index in jury if index in outliers)
+    if jury_outliers * 2 >= len(jury):
         return set()
     return outliers
 
@@ -126,6 +159,7 @@ def looks_like_sign_loss(
 
 
 __all__ = [
+    "MIN_ANCHORS",
     "MIN_RADIUS_M",
     "NO_FIX_EPSILON_FALLBACK",
     "SUSTAINED_SPEED_KMH",

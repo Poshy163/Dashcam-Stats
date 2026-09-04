@@ -41,7 +41,7 @@ from app.osd.outliers import (
     robust_centre,
     spatial_outliers,
 )
-from app.osd.reasons import GpsQuality, GpsReason
+from app.osd.reasons import TRUSTED, GpsQuality, GpsReason
 from app.osd.track_quality import MAX_ROAD_SPEED_MS
 from app.osd.validate import is_plausible_step
 
@@ -716,6 +716,10 @@ class JourneyBuilder:
                         # guard there was reading a `TrackPoint` attribute that did not
                         # exist and defaulting to False on every row.
                         TelemetryPoint.breaks_segment,
+                        # Which of these the camera actually printed, as against which
+                        # were carried in from a neighbour. `_find_outliers` needs it to
+                        # keep a copied position from voting on where the drive was.
+                        TelemetryPoint.gps_quality,
                     ).where(
                         TelemetryPoint.recording_id.in_(recording_ids),
                         TelemetryPoint.has_fix.is_(True),
@@ -944,7 +948,15 @@ class JourneyBuilder:
             return set(), None, plausible_radius_m(span_s)
 
         points = [(float(r.lat), float(r.lon)) for r in located]
-        outliers = spatial_outliers(points, span_s=span_s)
+        # A null quality predates the column. Those rows were written when `has_fix` was
+        # the whole verdict and nothing could yet be synthesised, so they are readings --
+        # and treating them as anything else would silently un-anchor every journey
+        # recorded before the column existed.
+        direct = [
+            getattr(row, "gps_quality", None) is None or row.gps_quality in TRUSTED
+            for row in located
+        ]
+        outliers = spatial_outliers(points, span_s=span_s, direct=direct)
         radius = plausible_radius_m(span_s)
         centre = robust_centre([p for i, p in enumerate(points) if i not in outliers])
 

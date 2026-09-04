@@ -91,6 +91,61 @@ class TestSpatialOutliers:
         points = [(LAT, LON)] * 20 + [(-LAT, LON)] * 3
         assert spatial_outliers(points, span_s=600.0) == {20, 21, 22}
 
+    def test_copies_outnumbering_the_readings_do_not_move_the_centre(self):
+        """Journey 270, reduced to its arithmetic.
+
+        Six fixes the camera actually printed, forty carried in from the other camera and
+        all sign-flipped. By count the flipped ones are the drive; by evidence they are one
+        misread photocopied forty times. Told which is which, the pass keeps the six.
+        """
+        read = [(LAT + i * 1e-4, LON) for i in range(6)]
+        copied = [(-LAT + i * 1e-4, LON) for i in range(40)]
+        points = read + copied
+        direct = [True] * 6 + [False] * 40
+
+        outliers = spatial_outliers(points, span_s=9295.0, direct=direct)
+
+        assert outliers == set(range(6, 46))
+
+    def test_without_that_distinction_the_copies_win(self):
+        """Why the flag had to exist -- the same input, judged by headcount.
+
+        This is not a hypothetical: it is what the live library did. The drive kept 1,167
+        seconds of Japan and cleared every genuine reading, and because each rebuild asked
+        the survivors where the car was, the verdict was stable and reprocessing it changed
+        nothing.
+        """
+        read = [(LAT + i * 1e-4, LON) for i in range(6)]
+        copied = [(-LAT + i * 1e-4, LON) for i in range(40)]
+        points = read + copied
+
+        assert spatial_outliers(points, span_s=9295.0) == set(range(6))
+
+    def test_too_few_readings_to_anchor_on_falls_back_to_the_whole_set(self):
+        """Two readings cannot outvote anything, and pretending otherwise is a guess."""
+        read = [(LAT, LON), (LAT + 1e-4, LON)]
+        copied = [(-LAT + i * 1e-4, LON) for i in range(40)]
+        points = read + copied
+        direct = [True] * 2 + [False] * 40
+
+        assert spatial_outliers(points, span_s=9295.0, direct=direct) == spatial_outliers(
+            points, span_s=9295.0
+        )
+
+    def test_readings_that_disagree_among_themselves_still_call_the_pass_off(self):
+        """The guard survives the change: an unanchored anchor is no anchor.
+
+        Half the readings flipped puts their own median on the equator, so every point is
+        thousands of kilometres from it. Nothing here is trustworthy enough to delete
+        anything with.
+        """
+        read = [(LAT, LON)] * 5 + [(-LAT, LON)] * 5
+        copied = [(-LAT, LON)] * 20
+        points = read + copied
+        direct = [True] * 10 + [False] * 20
+
+        assert spatial_outliers(points, span_s=9295.0, direct=direct) == set()
+
     def test_the_centre_is_not_dragged_by_the_outliers(self):
         # A mean of twenty good fixes and one 7,700 km away lands 370 km from the truth,
         # which is far enough to start rejecting the good ones instead.
@@ -1044,3 +1099,114 @@ class TestJourneyBoundariesRecluster:
 
         async with session_scope() as session:
             assert await JourneyBuilder().needs_recluster(session) is False
+
+
+class TestACopiedPositionCannotDecideWhereTheDriveWas:
+    """Journey 270 of the live library, end to end.
+
+    Two and a half hours parked at home. The rear camera printed its latitude with the
+    minus sign decoded as a second colon -- ``N::34.7971`` -- and paired-camera recovery
+    copied the resulting position into every hole in the drive. The copies came to
+    outnumber the readings, so the median moved to Shizuoka, and the fixes the front camera
+    had decoded cleanly at 0.96 confidence were cleared as the outliers. What survived was
+    1,167 seconds of Japan and nothing else.
+
+    The parser stopped producing that reading, but no pass over the stored rows could undo
+    it: every rebuild asked the survivors where the car had been, and the survivors were
+    the copies.
+    """
+
+    async def _journey(self) -> int:
+        async with session_scope() as session:
+            started = datetime(2026, 9, 3, 5, 59, 49, tzinfo=UTC)
+            journey = Journey(
+                started_at=started,
+                ended_at=started + timedelta(seconds=9295),
+                duration_s=9295.0,
+            )
+            session.add(journey)
+            await session.flush()
+
+            rec = Recording(
+                rel_path="j270.ts",
+                filename="j270.ts",
+                size_bytes=1,
+                state=RecordingState.COMPLETED,
+                journey_id=journey.id,
+                started_at=started,
+                ended_at=started + timedelta(seconds=9295),
+                telemetry_point_count=46,
+                gps_point_count=46,
+                # Not a no-lock session: the camera had a fix throughout. This drive's
+                # problem was never the sky.
+                gps_no_fix_count=0,
+            )
+            session.add(rec)
+            await session.flush()
+
+            def add(offset: float, lat: float, quality: str) -> None:
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec.id,
+                        journey_id=journey.id,
+                        t_offset_s=offset,
+                        captured_at=started + timedelta(seconds=offset),
+                        lat=lat,
+                        lon=LON,
+                        has_fix=True,
+                        speed_kmh=0.0,
+                        gps_quality=quality,
+                    )
+                )
+
+            # What the front camera read, spread across the session.
+            for i in range(6):
+                add(float(i * 1500), LAT + i * 1e-4, "valid")
+            # What recovery copied in from the rear clip, in every gap between them.
+            for i in range(40):
+                add(float(i * 220 + 10), -LAT + i * 1e-4, "interpolated")
+
+            await session.flush()
+            return journey.id
+
+    async def _rebuild(self, journey_id: int) -> None:
+        async with session_scope() as session:
+            journey = (
+                await session.execute(select(Journey).where(Journey.id == journey_id))
+            ).scalar_one()
+            await JourneyBuilder().refresh(session, journey)
+            await session.commit()
+
+    async def _surviving_latitudes(self, journey_id: int) -> list[float]:
+        async with session_scope() as session:
+            return list(
+                (
+                    await session.execute(
+                        select(TelemetryPoint.lat).where(
+                            TelemetryPoint.journey_id == journey_id,
+                            TelemetryPoint.lat.is_not(None),
+                        )
+                    )
+                ).scalars()
+            )
+
+    async def test_the_readings_survive_and_the_copies_are_cleared(self, db_session):
+        journey_id = await self._journey()
+
+        await self._rebuild(journey_id)
+
+        latitudes = await self._surviving_latitudes(journey_id)
+        assert len(latitudes) == 6, "the six the camera actually printed"
+        assert all(lat < 0 for lat in latitudes), "and none of the forty it did not"
+
+    async def test_the_journey_no_longer_claims_to_be_in_japan(self, db_session):
+        journey_id = await self._journey()
+
+        await self._rebuild(journey_id)
+
+        async with session_scope() as session:
+            journey = (
+                await session.execute(select(Journey).where(Journey.id == journey_id))
+            ).scalar_one()
+        assert journey.max_lat is not None and journey.max_lat < 0
+        assert haversine_m(journey.min_lat, journey.min_lon, LAT, LON) < 5_000
