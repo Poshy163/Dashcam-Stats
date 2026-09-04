@@ -163,6 +163,125 @@ async def test_paired_camera_recovers_ocr_hole_but_not_explicit_no_fix(db_sessio
     assert points[1].quality_json["gps_status"] == "no_fix"
 
 
+async def test_a_recovered_point_is_not_evidence_for_another_recovery(db_session):
+    """A copy is not a second camera's decode, and copying it again makes it immortal.
+
+    Watched on the live library. A latitude whose sign was lost to OCR was written into one
+    camera and recovered into the other. The parser was then fixed and every recording in
+    the journey reprocessed -- after which *zero* points read the bad coordinate directly
+    and 1,168 still carried it as a recovery, reseeding each other from a value no overlay
+    had produced for hours. Reprocessing cannot clear what is copied back in from a
+    neighbour, so the copy must not qualify as a donor.
+    """
+    cameras = list((await db_session.execute(select(Camera).order_by(Camera.id))).scalars())
+    now = datetime.now(UTC)
+    front = Recording(
+        rel_path="front-loop.ts",
+        filename="front-loop.ts",
+        size_bytes=1,
+        camera_id=cameras[0].id,
+        started_at=now,
+        ended_at=now + timedelta(seconds=3),
+        telemetry_state=StageState.DONE,
+    )
+    rear = Recording(
+        rel_path="rear-loop.ts",
+        filename="rear-loop.ts",
+        size_bytes=1,
+        camera_id=cameras[1].id,
+        started_at=now,
+        ended_at=now + timedelta(seconds=3),
+        telemetry_state=StageState.DONE,
+    )
+    db_session.add_all([front, rear])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            # The front camera cannot read its own overlay.
+            TelemetryPoint(
+                recording_id=front.id,
+                t_offset_s=0,
+                captured_at=now,
+                has_fix=False,
+                quality_json={"gps_status": "missing", "problems": ["position unreadable"]},
+            ),
+            # The rear one has a position, but it is itself a copy from a third recording
+            # -- exactly what a reprocessed neighbour looks like mid-repair.
+            TelemetryPoint(
+                recording_id=rear.id,
+                t_offset_s=0,
+                captured_at=now,
+                lat=34.7971,
+                lon=138.7044,
+                has_fix=True,
+                quality_json={"gps_status": "recovered", "gps_source": "paired_camera"},
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    assert await recover_from_paired_camera(db_session, front) == 0
+
+    points = list(
+        (
+            await db_session.execute(
+                select(TelemetryPoint).where(TelemetryPoint.recording_id == front.id)
+            )
+        ).scalars()
+    )
+    assert points[0].has_fix is False, "a copy of a copy is not evidence"
+    assert points[0].lat is None
+
+
+async def test_a_donor_from_before_the_source_field_still_counts(db_session):
+    """Points predating ``gps_source`` are genuine decodes and must stay usable."""
+    cameras = list((await db_session.execute(select(Camera).order_by(Camera.id))).scalars())
+    now = datetime.now(UTC)
+    front = Recording(
+        rel_path="front-legacy.ts",
+        filename="front-legacy.ts",
+        size_bytes=1,
+        camera_id=cameras[0].id,
+        started_at=now,
+        ended_at=now + timedelta(seconds=3),
+        telemetry_state=StageState.DONE,
+    )
+    rear = Recording(
+        rel_path="rear-legacy.ts",
+        filename="rear-legacy.ts",
+        size_bytes=1,
+        camera_id=cameras[1].id,
+        started_at=now,
+        ended_at=now + timedelta(seconds=3),
+        telemetry_state=StageState.DONE,
+    )
+    db_session.add_all([front, rear])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            TelemetryPoint(
+                recording_id=front.id,
+                t_offset_s=0,
+                captured_at=now,
+                has_fix=False,
+                quality_json={"gps_status": "missing", "problems": ["position unreadable"]},
+            ),
+            TelemetryPoint(
+                recording_id=rear.id,
+                t_offset_s=0,
+                captured_at=now,
+                lat=-34.8,
+                lon=138.6,
+                has_fix=True,
+                quality_json={"gps_status": "valid"},
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    assert await recover_from_paired_camera(db_session, front) == 1
+
+
 def test_protected_and_tagged_recordings_are_retention_events():
     assert _is_event(Recording(rel_path="p.ts", filename="p.ts", protected=True))
     assert _is_event(Recording(rel_path="e.ts", filename="e.ts", event_type="harsh_braking"))

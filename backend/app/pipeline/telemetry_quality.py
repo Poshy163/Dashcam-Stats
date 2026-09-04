@@ -136,6 +136,14 @@ def _revert_implausible(target: list[TelemetryPoint], filled: list[TelemetryPoin
     return reverted
 
 
+#: Sources that are a copy of somebody else's reading rather than this camera's own decode.
+#:
+#: Stated as what to exclude rather than what to require, because a point that predates the
+#: field carries no ``gps_source`` at all, and those are genuine decodes: demanding a
+#: positive ``"direct"`` would silently stop recovering from the whole existing library.
+_SYNTHETIC_GPS_SOURCES = frozenset({"paired_camera", "interpolated", "context_repaired"})
+
+
 async def recover_from_paired_camera(session: AsyncSession, recording: Recording) -> int:
     """Fill OCR-only holes from an overlapping camera, never an explicit GPS no-fix.
 
@@ -191,10 +199,24 @@ async def recover_from_paired_camera(session: AsyncSession, recording: Recording
             .scalars()
             .all()
         )
+        # Only the partner's *own* successful decode counts, which is what the docstring
+        # above has always claimed and what this dictionary did not enforce. A point that
+        # was itself recovered from somewhere else is not independent evidence -- it is a
+        # copy, and copying it again makes a wrong fix self-sustaining.
+        #
+        # Watched that happen: a latitude whose sign was lost to OCR was written into one
+        # camera, recovered into the other, and then survived the parser fix that should
+        # have ended it. After reprocessing every recording in the journey, *zero* points
+        # still read the bad coordinate directly and 1,168 still carried it as a recovery,
+        # reseeding each other with a value no overlay had produced for hours. Reprocessing
+        # cannot clear something that is always being copied back in from a neighbour.
         by_second = {
             round(point.captured_at.timestamp()): point
             for point in source
-            if point.captured_at is not None and point.lat is not None and point.lon is not None
+            if point.captured_at is not None
+            and point.lat is not None
+            and point.lon is not None
+            and (point.quality_json or {}).get("gps_source") not in _SYNTHETIC_GPS_SOURCES
         }
         changed = 0
         filled: list[TelemetryPoint] = []
