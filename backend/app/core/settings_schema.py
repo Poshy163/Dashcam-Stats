@@ -1077,9 +1077,9 @@ SETTINGS: tuple[SettingDef, ...] = (
         "so the car shows what is being copied. Nothing is installed for it. The address is "
         "worked out on its own — whatever you open this dashboard on is what the car is sent "
         "to — so there is normally nothing to configure. It only fires when there is "
-        "something to copy, and nothing puts the previous screen back afterwards. Worth "
-        "knowing that a transfer can begin while you are still manoeuvring, so this can take "
-        "the screen over mid-park.",
+        "something to copy, and the screen is handed back to CarPlay when the copy finishes "
+        "unless you turn that off below. Worth knowing that a transfer can begin while you "
+        "are still manoeuvring, so this can take the screen over mid-park.",
         requires="ingest.enabled",
     ),
     SettingDef(
@@ -1089,10 +1089,11 @@ SETTINGS: tuple[SettingDef, ...] = (
         True,
         "ingest",
         "The head unit's own CarPlay app raises its dashboard over the backup page part-way "
-        "through a transfer, and nothing else puts ours back — observed live. With this on, "
-        "the page is checked every few seconds for as long as the copy runs and raised back "
-        "in front if something covered it, without reloading it. It stops the instant the "
-        "transfer ends, so it never competes with you while driving.",
+        "through a transfer, and nothing else puts ours back while the copy runs — observed "
+        "live. With this on, the page is checked every few seconds for as long as the copy "
+        "runs and raised back in front if something covered it, without reloading it. It "
+        "stops the instant the transfer ends, and CarPlay is then given the screen back, so "
+        "it never competes with you while driving.",
         requires="ingest.show_on_unit",
     ),
     SettingDef(
@@ -1589,6 +1590,40 @@ SETTINGS: tuple[SettingDef, ...] = (
         maximum=50,
         unit="files",
         requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.commit_queue_depth",
+        "Chunks that may await filing while copying",
+        "int",
+        2,
+        "ingest",
+        "Filing a finished chunk into permanent storage and erasing it from the card used to "
+        "happen with the copy stopped, so the link sat idle through both. It now runs behind "
+        "the transfer, and this is how far ahead the copy may get: each waiting chunk is that "
+        "many recordings held in the staging area rather than filed, so raising it trades "
+        "local disk for a little speed. The gain is small — one card delete is about a fifth "
+        "of a second against a chunk that takes some twelve seconds to copy — and the real "
+        "benefit is that a delete which hangs no longer holds up a good connection. Set to 1 "
+        "to keep filing close behind the copy.",
+        minimum=1,
+        maximum=10,
+        unit="chunks",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
+        "ingest.hand_screen_back",
+        "Return the dashcam screen to CarPlay afterwards",
+        "bool",
+        True,
+        "ingest",
+        "Puts the head unit's CarPlay app back in front when the copying is done. Closing the "
+        "backup page was never the same as taking it off the screen, so the car was left "
+        "showing a finished progress bar — and, the part that costs something, went to sleep "
+        "that way. Observed live: while the browser holds the foreground the driver's phone "
+        "does not pair, so the next drive starts without CarPlay even though Bluetooth and "
+        "the hotspot were both restored correctly. Turn off only if you would rather the car "
+        "kept showing the backup page.",
+        requires="ingest.show_on_unit",
     ),
     SettingDef(
         "ingest.ha_webhook_url",
