@@ -3011,8 +3011,17 @@ class TestSleepCountdownAndPrediction:
         finally:
             reset_status_for_tests()
 
-    def test_the_watchdogs_ignition_anchor_is_not_moved_by_a_window_write(self):
-        """Re-anchoring the display must not make the pre-sleep watchdog fire late."""
+    def test_the_watchdog_is_handed_the_countdowns_age_not_the_ignitions(self):
+        """The reverse of what an earlier version of this test asserted.
+
+        It held that the watchdog's anchor must stay on ignition-off so it would not fire
+        late. Live, that was the wrong direction: a top-up twenty minutes into a park was
+        handed twenty minutes of elapsed time against a window it had just rewritten,
+        concluded the unit had already slept, and fired on its first poll mid-transfer --
+        which the server read as its watchdog vanishing and aborted a healthy run over,
+        six times in fifteen minutes. The countdown restarts on the write, so its age is
+        what the watchdog needs. Ignition-off is still recorded; it is just not the anchor.
+        """
         import time
 
         from app.ingest.status import get_status, reset_status_for_tests
@@ -3022,11 +3031,34 @@ class TestSleepCountdownAndPrediction:
             status = get_status()
             status.set_unit_online(True)
             status.set_ignition_state("off")
-            status.ignition_off_monotonic = time.monotonic() - 722.0
+            status.ignition_off_monotonic = time.monotonic() - 1100.0
 
+            # The bulk upload widened the window a moment ago: the countdown is young.
+            status.set_sleep_window(900, restarted=True)
+
+            assert status.sleep_countdown_elapsed_s() <= 1, (
+                "aim at the write, or the watchdog decides sleep is already behind it"
+            )
+            assert 1095 <= status.ignition_off_elapsed_s() <= 1105
+        finally:
+            reset_status_for_tests()
+
+    def test_the_countdowns_age_is_ignition_off_when_nothing_was_written_since(self):
+        """A write before ignition-off does not start a countdown; ignition-off does."""
+        import time
+
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        try:
+            status = get_status()
+            status.set_unit_online(True)
             status.set_sleep_window(300, restarted=True)
+            status.sleep_window_started_monotonic = time.monotonic() - 600.0
+            status.set_ignition_state("off")
+            status.ignition_off_monotonic = time.monotonic() - 40.0
 
-            assert 720 <= status.ignition_off_elapsed_s() <= 725
+            assert 38 <= status.sleep_countdown_elapsed_s() <= 42
         finally:
             reset_status_for_tests()
 
@@ -3338,6 +3370,48 @@ class TestDrainingWhileTheCarIsStillHere:
         status = IngestStatus()
         status.state = state
         return status
+
+    def _parked(self, state, *, remaining_s, ignition="off"):
+        """A status whose unit is parked with this much of its sleep countdown left."""
+        import time
+
+        status = self._status(state)
+        status.set_unit_online(True)
+        status.ignition_state = ignition
+        status.sleep_window_s = 300
+        status.ignition_off_monotonic = time.monotonic() - (300.0 - remaining_s)
+        return status
+
+    def test_a_top_up_is_not_started_inside_the_last_moments_before_sleep(self):
+        """A top-up no longer extends the window, so this one would only get cut off.
+
+        It would quiet both radios, move a segment or two, and be interrupted by a sleep
+        it could not postpone -- churn with nothing to show, and the next arrival collects
+        the same files anyway.
+        """
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+        status = self._parked(RunState.OK, remaining_s=30.0)
+
+        assert poller._should_drain_again(status) is False
+
+    def test_a_top_up_goes_ahead_with_time_to_finish(self):
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+        status = self._parked(RunState.OK, remaining_s=200.0)
+
+        assert poller._should_drain_again(status) is True
+
+    def test_the_sleep_guard_only_applies_while_the_ignition_is_off(self):
+        """While driving the countdown is not running; the full window never trips it."""
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+        status = self._parked(RunState.OK, remaining_s=30.0, ignition="on")
+
+        assert poller._should_drain_again(status) is True
 
     def test_a_run_that_moved_files_goes_again(self):
         """It stopped for a reason that more copying is the answer to. (No run has actually
@@ -4168,6 +4242,81 @@ class TestTheSleepWindowIsManagedNotLeftWide:
 
         assert await puller.reconcile_startup_in_awake_window()
         assert events == ["pending-address", "coordinator-startup"]
+
+    async def test_the_visits_first_run_widens_the_window_before_recovering(self, monkeypatch):
+        from app.ingest import puller
+
+        events: list[str] = []
+
+        async def no_pending():
+            return None
+
+        async def widened_recovery(address):
+            events.append(f"widened:{address}")
+            return True
+
+        async def forbidden_bare(*, address):
+            raise AssertionError("the bulk upload earns the long window; do not skip it")
+
+        monkeypatch.setattr(puller.radio_coordinator, "pending_recovery_address", no_pending)
+        monkeypatch.setattr(puller, "reconcile_pending_in_awake_window", widened_recovery)
+        monkeypatch.setattr(puller.radio_coordinator, "reconcile_pending", forbidden_bare)
+
+        assert await puller._recover_before_run("u:5555", first_of_visit=True)
+        assert events == ["widened:u:5555"]
+
+    async def test_a_top_up_reconciles_without_touching_the_window(self, monkeypatch):
+        """Every write restarts the unit's countdown, and a top-up wrote twice.
+
+        Widen on the way in, narrow on the way out, and the recorder closing a segment a
+        minute meant another top-up ninety seconds later -- so the unit sat awake at home
+        for a day with both radios cut and restored on every pass. The reconcile still
+        runs; the widen is the bulk upload's alone.
+        """
+        from app.ingest import puller
+
+        events: list[str] = []
+
+        async def no_pending():
+            events.append("pending-address")
+            return None
+
+        async def forbidden_widen(address):
+            raise AssertionError("a top-up must not rewrite the sleep window")
+
+        async def bare_recovery(*, address):
+            events.append(f"reconciled:{address}")
+            return True
+
+        monkeypatch.setattr(puller.radio_coordinator, "pending_recovery_address", no_pending)
+        monkeypatch.setattr(puller, "reconcile_pending_in_awake_window", forbidden_widen)
+        monkeypatch.setattr(puller.radio_coordinator, "reconcile_pending", bare_recovery)
+
+        assert await puller._recover_before_run("u:5555", first_of_visit=False)
+        assert events == ["pending-address", "reconciled:u:5555"]
+
+    async def test_a_top_up_still_widens_when_a_recovery_is_owed(self, monkeypatch):
+        """Restoring an exact radio baseline is the one thing that must not race sleep."""
+        from app.ingest import puller
+
+        events: list[str] = []
+
+        async def pending():
+            return "u:5555"
+
+        async def widened_recovery(address):
+            events.append(f"widened:{address}")
+            return True
+
+        async def forbidden_bare(*, address):
+            raise AssertionError("a durable recovery gets the full window whichever run it is")
+
+        monkeypatch.setattr(puller.radio_coordinator, "pending_recovery_address", pending)
+        monkeypatch.setattr(puller, "reconcile_pending_in_awake_window", widened_recovery)
+        monkeypatch.setattr(puller.radio_coordinator, "reconcile_pending", forbidden_bare)
+
+        assert await puller._recover_before_run("u:5555", first_of_visit=False)
+        assert events == ["widened:u:5555"]
 
     def test_application_lifespan_uses_guarded_startup_recovery(self):
         import inspect

@@ -733,7 +733,10 @@ def _watchdog_report(transition_id: str, token: str) -> radios.WatchdogReport | 
             port=port,
             token=token,
             transition_id=transition_id,
-            acc_off_elapsed_s=status.ignition_off_elapsed_s(),
+            # From the countdown's own anchor, which moves on every window write -- not
+            # from ignition-off. See IngestStatus.sleep_countdown_elapsed_s for the run
+            # this got wrong.
+            acc_off_elapsed_s=status.sleep_countdown_elapsed_s(),
         )
     except ValueError:
         # A learned origin that cannot be expressed safely in a shell script is not worth

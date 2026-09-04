@@ -274,6 +274,33 @@ def test_a_report_target_that_could_carry_shell_syntax_is_refused(overrides):
         _report_config(**overrides)
 
 
+async def test_the_server_hands_the_watchdog_the_countdowns_age(monkeypatch):
+    """Not the ignition's. The two differed by eighteen minutes on the run that broke.
+
+    A top-up twenty minutes into a park had just rewritten the window, so the unit's
+    countdown was seconds old. Handed the ignition-off figure instead, the watchdog took
+    the countdown for long expired, decided the unit had already slept, and fired on its
+    first poll mid-transfer -- and the server, finding its watchdog gone, aborted a healthy
+    run. The number carried across has to be the countdown's own age.
+    """
+    from app.ingest import origin, radio_coordinator
+
+    class Status:
+        def sleep_countdown_elapsed_s(self):
+            return 5
+
+        def ignition_off_elapsed_s(self):
+            return 1100
+
+    monkeypatch.setattr(radio_coordinator, "get_status", lambda: Status())
+    monkeypatch.setattr(origin, "callback_endpoint", lambda: ("192.168.1.16", 8199))
+
+    report = radio_coordinator._watchdog_report(TRANSITION_ID, TOKEN)
+
+    assert report is not None
+    assert report.acc_off_elapsed_s == 5
+
+
 @requires_sh
 def test_the_sleep_guard_aims_at_the_real_sleep_not_the_arming_time(tmp_path):
     """The countdown starts at ignition-off, and arming happens well into it.

@@ -253,6 +253,28 @@ async def reconcile_startup_in_awake_window() -> bool:
     return await reconcile_pending_in_awake_window(address)
 
 
+async def _recover_before_run(address: str, *, first_of_visit: bool) -> bool:
+    """Reconcile radio recovery before a run, widening the sleep window only when earned.
+
+    The reconcile happens every run, top-ups included -- a failed restore can otherwise sit
+    active while the unit stays online and never be adopted. What must *not* happen every
+    run is the widen, and it did: each top-up rewrote the window to 900 s on the way in
+    and 300 s on the way out, and every write restarts the unit's countdown. With the
+    recorder closing a segment a minute while parked, that was a transfer every ninety
+    seconds, each cutting both radios and both times resetting the countdown, so the unit
+    sat awake at home for a day. The visit's first run is the bulk upload and earns the
+    long window; a run copying the two segments that arrived since does not, and gets the
+    idle countdown it found -- which the close at the end then leaves alone, because the
+    property already reads idle.
+
+    A durable recovery still gets the window whichever run it lands in. Restoring an
+    exact radio baseline is the one thing that must not race the sleep boundary.
+    """
+    if first_of_visit or await radio_coordinator.pending_recovery_address() is not None:
+        return await reconcile_pending_in_awake_window(address)
+    return await radio_coordinator.reconcile_pending(address=address)
+
+
 async def close_sleep_window(address: str, *, drained: bool) -> None:
     """Narrow the window once every device-side obligation is proven complete.
 
@@ -1186,10 +1208,12 @@ async def run_pull(
 
         # Reconcile before every run, including a same-visit re-drain. A failed restore
         # can otherwise remain active while the unit stays online: each later run merely
-        # collides with its row and no path ever adopts the now-expired lease.
-        # Await the longer countdown first.  This path is also used by manual pulls, which
-        # bypass the poller's arrival recovery and must not race the resting sleep window.
-        if not await reconcile_pending_in_awake_window(info.address):
+        # collides with its row and no path ever adopts the now-expired lease. Whether this
+        # run is the visit's first decides whether it may also widen the sleep window --
+        # see _recover_before_run -- and is decided here, once, so the screen logic below
+        # agrees with it.
+        first_of_visit = status.since_finished() > status.online_for()
+        if not await _recover_before_run(info.address, first_of_visit=first_of_visit):
             result = RunResult(
                 state=RunState.IDLE,
                 error="an earlier ingest radio transition still requires recovery",
@@ -1549,7 +1573,7 @@ async def run_pull(
         # Only the first pull of a visit may take the screen over.  The actual launch is
         # deferred until immediately before the transfer starts, after the OBD/radio gates;
         # that way a safety refusal does not show a misleading copying screen.
-        first_of_visit = status.since_finished() > status.online_for()
+        # `first_of_visit` was decided before the recovery gate above.
         display = ""
         if bool(_get("show_on_unit", False)) and first_of_visit:
             display = display_url()

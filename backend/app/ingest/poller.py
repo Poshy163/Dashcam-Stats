@@ -68,6 +68,16 @@ IDLE_RECHECK_S = 30.0
 #: The budget is reset when the visit ends or a non-error result is observed.
 ERROR_RETRY_DELAYS_S = (15.0, 30.0, 60.0)
 
+#: Do not start a top-up with less than this left on the unit's sleep countdown.
+#:
+#: A top-up no longer widens the window, so the countdown keeps running underneath it and
+#: the unit sleeps on schedule whether or not a copy is in flight. Starting one this close
+#: to the boundary just quiets both radios, moves a segment or two, and gets cut off by the
+#: sleep it could not extend -- churn with nothing to show for it, and the next arrival
+#: would have collected the same files anyway. Ninety seconds covers a small batch with the
+#: radio capture and restore either side of it.
+REDRAIN_MIN_COUNTDOWN_S = 90.0
+
 
 class IngestPoller:
     def __init__(self) -> None:
@@ -165,7 +175,17 @@ class IngestPoller:
             return True
         if status.state in (RunState.OK, RunState.PARTIAL):
             self._idle_since = 0.0
-            return status.since_finished() >= self._redrain_cooldown_s()
+            if status.since_finished() < self._redrain_cooldown_s():
+                return False
+            # Let it sleep. Only while the ignition is off is a countdown actually
+            # running; while driving the figure is the full window and never trips this.
+            remaining = status.sleep_countdown_remaining_s()
+            about_to_sleep = (
+                status.ignition_state == "off"
+                and remaining is not None
+                and remaining < REDRAIN_MIN_COUNTDOWN_S
+            )
+            return not about_to_sleep
         if status.state is RunState.ERROR:
             if self._error_retries_started >= len(ERROR_RETRY_DELAYS_S):
                 return False

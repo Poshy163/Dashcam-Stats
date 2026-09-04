@@ -431,6 +431,41 @@ class IngestStatus:
             return 0
         return int(max(0.0, time.monotonic() - self.ignition_off_monotonic))
 
+    def _countdown_anchor(self) -> float | None:
+        """When the unit's countdown last (re)started, in monotonic seconds.
+
+        Whichever came *last* of the ignition going off and the window being rewritten. A
+        window written while the engine was still running does not start a countdown;
+        ignition-off does. And a write after ignition-off restarts it -- which is the fact
+        the whole model turns on, and the one that was got wrong twice: once for the
+        dashboard, which floored at zero, and once for the on-unit watchdog, which fired
+        early. Both now read this one function.
+        """
+        anchor = self.sleep_window_started_monotonic
+        if anchor is None or (
+            self.ignition_off_monotonic is not None and self.ignition_off_monotonic > anchor
+        ):
+            anchor = self.ignition_off_monotonic
+        return anchor
+
+    def sleep_countdown_elapsed_s(self) -> int:
+        """Seconds the unit's countdown has already run, or ``0`` if not known.
+
+        This -- not :meth:`ignition_off_elapsed_s` -- is what the detached watchdog must be
+        handed. It aims its pre-sleep restore at ``anchor + window``, and the anchor moves
+        every time the window is written. Handed ignition-off instead, a top-up run twenty
+        minutes into a park was told the countdown was twenty minutes gone, concluded the
+        unit had already slept, and fired on its first poll in the middle of a healthy
+        transfer; the server then found its watchdog missing and aborted the run. Six
+        times in fifteen minutes, on the live unit.
+        """
+        if self.ignition_state != "off":
+            return 0
+        anchor = self._countdown_anchor()
+        if anchor is None:
+            return 0
+        return int(max(0.0, time.monotonic() - anchor))
+
     def sleep_countdown_remaining_s(self) -> float | None:
         """Remaining seconds before the head unit sleeps, or None if unknown/offline."""
         if not self.unit_online:
@@ -438,13 +473,7 @@ class IngestStatus:
         if self.ignition_state == "on":
             return float(self.sleep_window_s)
         if self.ignition_state == "off":
-            # The unit counts from whichever came last: the ignition going off, or the
-            # moment its window was rewritten.
-            anchor = self.sleep_window_started_monotonic
-            if anchor is None or (
-                self.ignition_off_monotonic is not None and self.ignition_off_monotonic > anchor
-            ):
-                anchor = self.ignition_off_monotonic
+            anchor = self._countdown_anchor()
             if anchor is not None:
                 elapsed = time.monotonic() - anchor
                 return max(0.0, float(self.sleep_window_s) - elapsed)

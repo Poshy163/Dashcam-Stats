@@ -787,12 +787,16 @@ class WatchdogReport:
     guard_s: int = WATCHDOG_SLEEP_GUARD_S
     #: Seconds of the unit's sleep countdown already spent when the watchdog is armed.
     #:
-    #: The countdown starts at ignition-off, and arming happens some way into it -- the
-    #: webhook, the probe, the card inventory and the radio capture all land first. A
-    #: watchdog that anchored the countdown at its own start would therefore aim at a
-    #: deadline that much *too late*, which on this feature means firing after the unit has
-    #: already slept: exactly the failure it exists to prevent. So the elapsed time is
-    #: carried across and subtracted once.
+    #: Measured from when the countdown last *restarted*, which is the later of ignition-off
+    #: and the most recent write of the window property -- every such write restarts it.
+    #: Arming happens some way into the countdown (the webhook, the probe, the card
+    #: inventory and the radio capture all land first), so a watchdog anchoring at its own
+    #: start would aim too late and fire after the unit had slept. But handing it the time
+    #: since *ignition-off* is the opposite mistake, and it was made: a top-up run twenty
+    #: minutes into a park was told the countdown was twenty minutes gone, decided sleep
+    #: was already behind it, and fired on its first poll mid-transfer -- which the server
+    #: read as its watchdog vanishing and aborted a healthy run over. The value carried
+    #: here has to be the countdown's own age.
     acc_off_elapsed_s: int = 0
     path: str = WATCHDOG_REPORT_ENDPOINT
 
