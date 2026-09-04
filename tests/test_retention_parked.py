@@ -273,3 +273,37 @@ class TestItActuallyDeletes:
 
         assert run.deleted_count == 0
         assert run.blocked
+
+
+class TestTheReportAgreesWithTheRun:
+    """The preview exists so a person can check the rule before it acts on its own.
+
+    Both endpoints promise in their own docstrings to mirror the scheduled pass. Adding a
+    third self-authorising rule to the scheduler and not to them would have quietly broken
+    that: the preview would have shown a clean plan while a restart deleted 27 GB.
+    """
+
+    async def test_the_preview_lists_the_parked_footage(self, client, ready):
+        parked = await _journey(ready, avg=0.0, top=1.0)
+        await _rec(ready, "parked.ts", journey=parked, vehicles=40)
+        await ready.commit()
+
+        body = (await client.post("/api/retention/plan")).json()
+
+        reasons = {c["filename"]: c["reason"] for c in body["candidates"]}
+        assert "parked.ts" in reasons
+        assert reasons["parked.ts"].startswith("parked session")
+
+    async def test_run_now_removes_it_like_the_scheduler_would(self, client, ready, temp_dirs):
+        _, footage = temp_dirs
+        clip = footage / "parked.ts"
+        clip.write_bytes(b"G" * 4096)
+        parked = await _journey(ready, avg=0.0, top=1.0)
+        await _rec(ready, "parked.ts", journey=parked, vehicles=40, size=4096)
+        drive = await _journey(ready, avg=44.0, top=90.0)
+        await _rec(ready, "drive.ts", journey=drive, size=500_000)
+        await ready.commit()
+
+        await client.post("/api/retention/run")
+
+        assert not clip.exists()

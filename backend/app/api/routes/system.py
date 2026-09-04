@@ -63,7 +63,7 @@ from app.hardware.detect import detect_hardware_async
 from app.ingest import carplay_timing
 from app.pipeline.orchestrator import expand_stages, invalidate_recordings
 from app.pipeline.revisions import outdated_stages
-from app.retention import current_usage, evaluate_safety, plan_idle
+from app.retention import current_usage, evaluate_safety, plan_idle, plan_parked
 from app.retention import execute as run_retention
 from app.retention import plan as plan_retention
 from app.scanner.discovery import Scanner
@@ -501,26 +501,35 @@ def _plan_out(plan) -> RetentionPlanOut:
     )
 
 
+def _merge_into(plan, other) -> None:
+    """Fold a self-authorising pass into the preview the size-based one is building.
+
+    Candidates are deduplicated by recording, because a clip can satisfy more than one rule
+    and the preview is a list of files rather than of verdicts. A block on either pass wins:
+    hiding a tripped runaway guard behind a clean size-based plan would show a preview that
+    looks safe while the real run refuses.
+    """
+    seen = {c.recording_id for c in plan.candidates}
+    for candidate in other.candidates:
+        if candidate.recording_id not in seen:
+            plan.candidates.append(candidate)
+            seen.add(candidate.recording_id)
+    if other.blocked and not plan.blocked:
+        plan.blocked, plan.blocked_reason = True, other.blocked_reason
+
+
 @router.post("/retention/plan", response_model=RetentionPlanOut)
 async def retention_plan(session: SessionDep):
     """Evaluate retention without touching anything.
 
-    Both passes together — the size-based oldest-first *and* the idle-drive cleanup — so the
-    preview shows everything a real run would remove, each candidate carrying the reason it
-    was picked. This is the report a person uses to check the idle rule is catching the right
-    footage before turning deletion on.
+    Every pass together — the size-based oldest-first, the static-clip cleanup and the
+    parked-session cleanup — so the preview shows everything a real run would remove, each
+    candidate carrying the reason it was picked. This is the report a person uses to check
+    the automatic rules are catching the right footage before letting them act.
     """
     plan = await plan_retention(session)
-    idle = await plan_idle(session, plan.safety)
-    seen = {c.recording_id for c in plan.candidates}
-    for candidate in idle.candidates:
-        if candidate.recording_id not in seen:
-            plan.candidates.append(candidate)
-            seen.add(candidate.recording_id)
-    # A blocked idle pass (e.g. its runaway guard tripped) must not be hidden behind a clean
-    # size-based one, or the preview would look safe while a real run would refuse.
-    if idle.blocked and not plan.blocked:
-        plan.blocked, plan.blocked_reason = True, idle.blocked_reason
+    _merge_into(plan, await plan_idle(session, plan.safety))
+    _merge_into(plan, await plan_parked(session, plan.safety))
     return _plan_out(plan)
 
 
@@ -534,11 +543,13 @@ async def retention_run(session: SessionDep):
     plan = await plan_retention(session)
     enabled = await get_settings_service().deletion_enabled()
     await run_retention(session, plan, dry_run=not enabled, trigger="manual")
-    # Same static-clip cleanup the scheduler runs, so "run now" behaves like the scheduled
-    # pass. It authorises its own deletion, so it runs for real regardless of the master
-    # switch; reuses the safety just evaluated.
+    # The same two self-authorising cleanups the scheduler runs, so "run now" behaves like
+    # the scheduled pass. Both act regardless of the master switch, and both reuse the
+    # safety report just evaluated rather than walking the footage tree again.
     idle = await plan_idle(session, plan.safety)
     await run_retention(session, idle, dry_run=False, trigger="idle-cleanup")
+    parked = await plan_parked(session, plan.safety)
+    await run_retention(session, parked, dry_run=False, trigger="parked-cleanup")
     return _plan_out(plan)
 
 
