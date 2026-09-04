@@ -2929,6 +2929,107 @@ class TestSleepCountdownAndPrediction:
         finally:
             reset_status_for_tests()
 
+    def test_rewriting_the_window_restarts_the_countdown(self):
+        """Observed live: the dashboard sat on ``0s`` while the unit had five minutes left.
+
+        The unit counts from when its property was written. The app counted from
+        ignition-off, so once a backup widened the window to 1200 s and then restored the
+        300 s idle one, more than 300 s had already passed since the ignition went off and
+        the countdown floored at zero for the rest of the park.
+        """
+        import time
+
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        try:
+            status = get_status()
+            status.set_unit_online(True)
+            status.set_ignition_state("off")
+            # Twelve minutes since the ignition went off, mid-backup on the wide window.
+            status.ignition_off_monotonic = time.monotonic() - 722.0
+            status.set_sleep_window(1200, restarted=True)
+            status.sleep_window_started_monotonic = status.ignition_off_monotonic
+
+            remaining = status.sleep_countdown_remaining_s()
+            assert remaining is not None and 477.0 <= remaining <= 479.0
+
+            # The transfer ends and the idle window is written back.
+            status.set_sleep_window(300, restarted=True)
+
+            restored = status.sleep_countdown_remaining_s()
+            assert restored is not None and 299.0 <= restored <= 300.0, (
+                "the unit restarted its countdown at the write, so the app must too"
+            )
+        finally:
+            reset_status_for_tests()
+
+    def test_reading_the_same_window_back_does_not_extend_it(self):
+        """Finding the property already correct changes nothing on the unit."""
+        import time
+
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        try:
+            status = get_status()
+            status.set_unit_online(True)
+            status.set_ignition_state("off")
+            # Ignition went off first, the window was written after it: the unit is
+            # counting from the write.
+            status.ignition_off_monotonic = time.monotonic() - 400.0
+            status.set_sleep_window(300, restarted=True)
+            status.sleep_window_started_monotonic = time.monotonic() - 120.0
+
+            status.set_sleep_window(300)
+
+            remaining = status.sleep_countdown_remaining_s()
+            assert remaining is not None and 179.0 <= remaining <= 181.0
+        finally:
+            reset_status_for_tests()
+
+    def test_a_window_that_changed_re_anchors_even_without_the_flag(self):
+        """The on-unit app writes this property too, and reports only the value."""
+        import time
+
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        try:
+            status = get_status()
+            status.set_unit_online(True)
+            status.set_ignition_state("off")
+            status.ignition_off_monotonic = time.monotonic() - 400.0
+            status.set_sleep_window(300, restarted=True)
+            status.sleep_window_started_monotonic = time.monotonic() - 280.0
+
+            # Observed from the OBD app's status.json, with no write of our own.
+            status.set_sleep_window(1200)
+
+            remaining = status.sleep_countdown_remaining_s()
+            assert remaining is not None and 1199.0 <= remaining <= 1200.0
+        finally:
+            reset_status_for_tests()
+
+    def test_the_watchdogs_ignition_anchor_is_not_moved_by_a_window_write(self):
+        """Re-anchoring the display must not make the pre-sleep watchdog fire late."""
+        import time
+
+        from app.ingest.status import get_status, reset_status_for_tests
+
+        reset_status_for_tests()
+        try:
+            status = get_status()
+            status.set_unit_online(True)
+            status.set_ignition_state("off")
+            status.ignition_off_monotonic = time.monotonic() - 722.0
+
+            status.set_sleep_window(300, restarted=True)
+
+            assert 720 <= status.ignition_off_elapsed_s() <= 725
+        finally:
+            reset_status_for_tests()
+
     def test_sleep_window_prediction_will_pass(self):
         import time
 

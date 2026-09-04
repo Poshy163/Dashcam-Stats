@@ -92,6 +92,15 @@ class IngestStatus:
         #: When ignition went off (monotonic and wall-clock).
         self.ignition_off_monotonic: float | None = None
         self.ignition_off_wall: datetime | None = None
+        #: When the unit's own countdown last restarted, which is when the vendor property
+        #: was last *written* -- not when the ignition went off.
+        #:
+        #: Kept apart from ``ignition_off_monotonic`` deliberately. That one anchors the
+        #: real ignition-off instant and is what :meth:`ignition_off_elapsed_s` hands the
+        #: detached watchdog so it can aim at the true sleep moment; re-anchoring it here
+        #: would quietly make the watchdog fire late, which is the failure it exists to
+        #: prevent.
+        self.sleep_window_started_monotonic: float | None = None
         #: The recording watcher's most recent verdict — a human summary, whether it was
         #: clean, and when it was collected. Unlike the holds above this is NOT cleared when
         #: the unit leaves: the last drive's story is exactly what someone wants to see while
@@ -296,10 +305,32 @@ class IngestStatus:
             elif state == "on":
                 self.ignition_off_monotonic = None
                 self.ignition_off_wall = None
+                self.sleep_window_started_monotonic = None
 
-    def set_sleep_window(self, seconds: int) -> None:
+    def set_sleep_window(self, seconds: int, *, restarted: bool = False) -> None:
+        """Record the unit's sleep window. ``restarted`` when we just wrote the property.
+
+        Writing it restarts the unit's own countdown from that moment, so the app has to
+        move its reference point too. Without this the countdown kept measuring from
+        ignition-off while the unit measured from the write, and every backup produced the
+        same symptom: the window is widened to 1200 s for the transfer, restored to 300 s
+        when it finishes, and by then more than 300 s has passed since the ignition went
+        off -- so the dashboard showed ``0s`` and stayed there while the unit still had its
+        full five minutes left.
+
+        A *change* in the value re-anchors too, whoever made it. The on-unit OBD app owns
+        this property as well and writes it without telling us when; all that reaches here
+        is the value it observed. But a window that is not what it was is a window somebody
+        rewrote, and rewriting it is what restarts the countdown -- so the change itself is
+        the evidence. Reading back the same value proves only that nothing happened, and
+        must not move the reference.
+        """
         with self._lock:
-            self.sleep_window_s = max(1, int(seconds))
+            seconds = max(1, int(seconds))
+            changed = seconds != self.sleep_window_s
+            self.sleep_window_s = seconds
+            if restarted or changed:
+                self.sleep_window_started_monotonic = time.monotonic()
 
     def set_recorder_health(self, summary: str, *, ok: bool) -> None:
         with self._lock:
@@ -407,8 +438,15 @@ class IngestStatus:
         if self.ignition_state == "on":
             return float(self.sleep_window_s)
         if self.ignition_state == "off":
-            if self.ignition_off_monotonic is not None:
-                elapsed = time.monotonic() - self.ignition_off_monotonic
+            # The unit counts from whichever came last: the ignition going off, or the
+            # moment its window was rewritten.
+            anchor = self.sleep_window_started_monotonic
+            if anchor is None or (
+                self.ignition_off_monotonic is not None and self.ignition_off_monotonic > anchor
+            ):
+                anchor = self.ignition_off_monotonic
+            if anchor is not None:
+                elapsed = time.monotonic() - anchor
                 return max(0.0, float(self.sleep_window_s) - elapsed)
             if self._started_at is not None:
                 elapsed = time.monotonic() - self._started_at

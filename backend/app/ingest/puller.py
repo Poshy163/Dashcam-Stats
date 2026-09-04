@@ -217,7 +217,10 @@ async def widen_sleep_window(address: str) -> bool:
         return True
     if await adb.set_sleep_countdown(address, wanted):
         log.info("widened the head unit's ignition-off window", seconds=wanted)
-        get_status().set_sleep_window(wanted)
+        # The write restarts the unit's own countdown, so the app's reference point moves
+        # with it. The read-back branch above deliberately does not: finding the property
+        # already correct changed nothing on the unit.
+        get_status().set_sleep_window(wanted, restarted=True)
         return True
     return False
 
@@ -333,7 +336,7 @@ async def close_sleep_window(address: str, *, drained: bool) -> None:
     if await adb.sleep_countdown(address) != idle:
         if await adb.set_sleep_countdown(address, idle):
             log.info("restored the head unit's idle sleep window", seconds=idle)
-            get_status().set_sleep_window(idle)
+            get_status().set_sleep_window(idle, restarted=True)
         else:
             log.warning(
                 "could not verify the head unit's idle sleep window",
