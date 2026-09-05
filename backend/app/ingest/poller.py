@@ -88,6 +88,9 @@ class IngestPoller:
         self._idle_since: float = 0.0
         #: Retries already started for consecutive errors during this online visit.
         self._error_retries_started = 0
+        #: Footage-copying passes started during this visit. Reset wherever the visit ends,
+        #: beside the error budget, because both are allowances that a visit spends.
+        self._backups_this_visit = 0
         #: The unit as this visit first described it, kept only while the arrival gate is
         #: holding. See the note in :meth:`_loop`; cleared the moment the port goes quiet.
         self._visit_info: UnitInfo | None = None
@@ -175,6 +178,20 @@ class IngestPoller:
             return True
         if status.state in (RunState.OK, RunState.PARTIAL):
             self._idle_since = 0.0
+            # Enough is enough for one visit.
+            #
+            # The camera keeps recording while the car sits on the driveway, so "has
+            # anything changed since the last run" stays true for as long as the unit is
+            # awake -- about thirteen further passes inside a fifteen-minute sleep window
+            # at the default cooldown. The first two earn their keep: the arrival backup,
+            # and one pass for whatever was written while it ran, which is where the tail
+            # of the drive lives -- closed after the first pass had already drawn up its
+            # list. After that, every pass copies footage of a stationary car, and that is
+            # exactly what the parked-session retention rule deletes again later. A radio
+            # cycle and a transfer, spent to store something already scheduled for removal.
+            limit = self._max_backups_per_visit()
+            if limit and self._backups_this_visit >= limit:
+                return False
             if status.since_finished() < self._redrain_cooldown_s():
                 return False
             # Let it sleep. Only while the ignition is off is a countdown actually
@@ -207,6 +224,10 @@ class IngestPoller:
 
     def _redrain_cooldown_s(self) -> float:
         return max(0.0, float(ingest_setting("redrain_cooldown_s") or 0))
+
+    def _max_backups_per_visit(self) -> int:
+        """Passes a visit may copy on, or 0 for no limit -- the behaviour before this."""
+        return max(0, int(ingest_setting("max_backups_per_visit") or 0))
 
     def _min_uptime_s(self) -> float:
         return max(0.0, float(ingest_setting("min_uptime_s") or 0))
@@ -304,6 +325,7 @@ class IngestPoller:
                     status.set_state(RunState.DISABLED)
                     self._was_online = False
                     self._error_retries_started = 0
+                    self._backups_this_visit = 0
                     self._visit_info = None
                     await asyncio.sleep(max(MIN_POLL_S, 15.0))
                     continue
@@ -320,6 +342,7 @@ class IngestPoller:
                     status.set_state(RunState.OFFLINE)
                     self._was_online = False
                     self._error_retries_started = 0
+                    self._backups_this_visit = 0
                     self._visit_info = None
                     await asyncio.sleep(self._interval())
                     continue
@@ -380,6 +403,7 @@ class IngestPoller:
                     status.set_state(RunState.OFFLINE)
                     self._was_online = False
                     self._error_retries_started = 0
+                    self._backups_this_visit = 0
                 else:
                     if not self._was_online:
                         # If a previous window ended with the unit's radios still off --
@@ -430,6 +454,7 @@ class IngestPoller:
                             )
                             self._idle_since = 0.0
                             self._error_retries_started = 0
+                            self._backups_this_visit = 0
                             # Not awaited: a pull runs for as long as the window lasts and
                             # the poll has to keep ticking underneath it. `start_run` keeps
                             # the reference so the task cannot be collected and shutdown can
@@ -441,6 +466,7 @@ class IngestPoller:
                             # only just proven good, and paid for the round trip twice at
                             # the most expensive moment of the day.
                             puller.start_run(trigger="auto", info=info)
+                            self._backups_this_visit += 1
                             self._was_online = True
                         else:
                             # Held for the arrival gate. IDLE like the band hold: not a
@@ -472,6 +498,7 @@ class IngestPoller:
                         else:
                             log.info("the head unit is still here; looking for more to copy")
                         puller.start_run(trigger="auto", info=info, continuation=True)
+                        self._backups_this_visit += 1
                     # `_was_online` is set the moment a pull actually starts (above), not
                     # merely because the unit is present -- otherwise the arrival gate's
                     # hold would be mistaken for a window already under way, and the next
@@ -492,6 +519,7 @@ class IngestPoller:
                 log.debug("ingest poll failed", error=f"{type(exc).__name__}: {exc}")
                 self._was_online = False
                 self._error_retries_started = 0
+                self._backups_this_visit = 0
                 # Cleared wherever `_was_online` is, because the two together are what
                 # decides whether the next tick reuses a describe. Left armed on this path,
                 # a transient adb failure -- or the feature being switched off and back on

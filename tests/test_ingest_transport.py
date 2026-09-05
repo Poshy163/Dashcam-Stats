@@ -3420,6 +3420,71 @@ class TestDrainingWhileTheCarIsStillHere:
 
         assert poller._should_drain_again(status) is True
 
+    def test_a_visit_stops_copying_once_it_has_had_its_passes(self):
+        """The camera keeps recording while the car sits there, so "is there more?" never
+        stops being true. Two passes is the arrival backup plus one for what the camera
+        wrote during it; everything after that is footage of a stationary car, which the
+        parked-session retention rule deletes again later.
+        """
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+        poller._backups_this_visit = 2
+
+        assert poller._should_drain_again(self._status(RunState.OK)) is False
+
+    def test_the_pass_that_catches_the_drives_tail_is_still_allowed(self):
+        """The second pass is the one the whole feature exists for.
+
+        The arrival backup lists the card before the recorder has closed the segment it was
+        writing as the car pulled up, so the end of the drive is only ever collected by the
+        pass after it.
+        """
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+        poller._backups_this_visit = 1
+
+        assert poller._should_drain_again(self._status(RunState.OK)) is True
+
+    def test_zero_means_no_limit(self, monkeypatch):
+        """The behaviour before the cap existed, kept reachable for anyone who wants it."""
+        from app.ingest import poller as poller_module
+        from app.ingest.models import RunState
+
+        monkeypatch.setattr(poller_module.IngestPoller, "_max_backups_per_visit", lambda self: 0)
+        poller = self._poller()
+        poller._backups_this_visit = 99
+
+        assert poller._should_drain_again(self._status(RunState.OK)) is True
+
+    def test_the_cap_does_not_touch_the_error_retry_budget(self):
+        """A failed pass is not a pass that copied anything, and stranding files that a
+        receive timeout interrupted is the failure this retry budget exists to prevent.
+        """
+        from app.ingest.models import RunState
+
+        poller = self._poller()
+        poller._backups_this_visit = 99
+        status = self._status(RunState.ERROR)
+
+        assert poller._should_drain_again(status) is True
+
+    def test_the_counter_is_spent_per_visit_not_for_all_time(self):
+        """Reset wherever the visit ends, or the second day would never back up at all."""
+        import inspect
+
+        from app.ingest import poller as poller_module
+
+        source = inspect.getsource(poller_module.IngestPoller._loop)
+        resets = source.count("self._backups_this_visit = 0")
+        budgets = source.count("self._error_retries_started = 0")
+
+        assert resets == budgets, (
+            "every place the visit's error budget is cleared is a visit boundary, and the "
+            f"backup allowance has to be cleared there too ({resets} vs {budgets})"
+        )
+
     def test_a_run_that_moved_files_goes_again(self):
         """It stopped for a reason that more copying is the answer to. (No run has actually
         finished on this status, so there is no cooldown to wait out.)"""

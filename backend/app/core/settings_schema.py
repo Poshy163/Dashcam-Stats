@@ -1264,6 +1264,26 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.max_backups_per_visit",
+        "Backups per visit",
+        "int",
+        2,
+        "ingest",
+        "How many times one visit may copy footage before it stops looking. Two by "
+        "default: the arrival backup, and one pass to collect what the camera wrote while "
+        "that backup was running -- which includes the tail of the drive you just "
+        "finished, closed after the first pass had already drawn up its list. "
+        "Beyond those two, everything the camera adds is the car sitting still on the "
+        "driveway, and that footage is what the parked-session rule under Storage deletes "
+        "again later. Copying it costs a radio cycle, a transfer and disk, to store "
+        "something scheduled for removal. Set to 1 to back up strictly once per visit and "
+        "leave the drive's last segment until next time; 0 for no limit, which is how this "
+        "behaved before.",
+        minimum=0,
+        maximum=50,
+        requires="ingest.enabled",
+    ),
+    SettingDef(
         "ingest.min_uptime_s",
         "Only start a backup after the unit has been running for",
         "int",
