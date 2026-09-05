@@ -182,7 +182,15 @@ WORKDIR /app
 COPY backend/ /app/backend/
 COPY --from=frontend /build/dist /app/frontend/dist
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# Carriage returns stripped before the script is ever run, as well as being kept out of the
+# checkout by .gitattributes. Belt and braces, because the two failures are not the same
+# failure: .gitattributes fixes `git clone`, and this fixes everything else -- a source zip
+# from the Releases page, an editor that rewrites on save, a `COPY` from a Windows host that
+# never went through git at all. The cost is one sed; the symptom it prevents is
+# `/usr/bin/env: 'bash\r': No such file or directory` and a container that exits 127 before
+# a single line of the application runs.
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh \
+    && chmod +x /usr/local/bin/entrypoint.sh
 
 # Runs unprivileged. The entrypoint joins this account to whatever group owns the render
 # node before dropping privileges, because that GID differs from host to host.

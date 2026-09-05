@@ -1,0 +1,33 @@
+# Line endings for files that are executed rather than read.
+#
+# A shell script is parsed by its interpreter byte for byte, and a carriage return is not
+# whitespace to it -- it is part of the token. `#!/usr/bin/env bash\r` asks the kernel for an
+# interpreter literally named "bash\r", which does not exist, and the failure surfaces as
+#
+#     /usr/bin/env: 'bash\r': No such file or directory
+#
+# with the container exiting 127 before a single line of the application runs.
+#
+# That is not hypothetical. Building this image on a Windows checkout produced exactly that:
+# git's `core.autocrlf=true` rewrote docker/entrypoint.sh to CRLF on checkout, the Dockerfile
+# COPYed it in byte for byte, and the image could not start. It passed CI the whole time,
+# because a Linux runner checks the same commit out with LF -- so the defect was invisible
+# to every automated check and reachable only by a contributor on Windows.
+#
+# `text eol=lf` says: normalise to LF in the repository, and check out LF *on every platform*.
+# The blobs were already LF; what was missing was the instruction not to convert them on the
+# way out.
+*.sh text eol=lf
+
+# The Gradle wrapper is a shell script without the extension, and CI runs it as `bash ./gradlew`.
+gradlew text eol=lf
+
+# Executed on the head unit by toybox sh after being base64'd across adb -- the same failure,
+# somewhere far harder to see, because it would come back as a sampler that silently never
+# produced a line rather than as a build that failed.
+backend/app/ingest/carplay_timing.sh text eol=lf
+
+# Read by Docker, which is tolerant of CRLF, but keeping it LF avoids a spurious whole-file
+# diff whenever a Windows and a Linux checkout touch it in turn.
+Dockerfile text eol=lf
+docker/*.sh text eol=lf
