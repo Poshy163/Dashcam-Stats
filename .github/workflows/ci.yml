@@ -39,12 +39,40 @@ jobs:
           cache: pip
           cache-dependency-path: backend/requirements*.txt
 
-      # The test suite generates its own fixture clips rather than committing video,
-      # so a real ffmpeg has to be present.
+      # The test suite generates its own fixture clips rather than committing video, and
+      # the decode paths are exercised for real, so ffmpeg has to be present. Tests that
+      # need video skip themselves without it, which would turn a missing ffmpeg into a
+      # quietly smaller suite rather than a failure -- so this step must not be allowed to
+      # "succeed" by doing nothing.
+      #
+      # Cached as .debs rather than installed from the network every run. `apt-get update`
+      # alone pulls tens of megabytes of package lists, and ffmpeg drags in most of the
+      # Debian media stack behind it: together they were 38-68s of a 3.4 minute job, spent
+      # fetching bytes that are identical from one run to the next.
+      - name: Restore the ffmpeg packages
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg-debs
+          key: ffmpeg-debs-${{ runner.os }}-v1
+
       - name: Install ffmpeg
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          set -eux
+          if [ ! -d ~/ffmpeg-debs ] || [ -z "$(ls -A ~/ffmpeg-debs 2>/dev/null)" ]; then
+            sudo apt-get update
+            # Download only, so the same .debs can be cached and replayed next run.
+            sudo apt-get install -y --no-install-recommends --download-only ffmpeg
+            mkdir -p ~/ffmpeg-debs
+            sudo cp /var/cache/apt/archives/*.deb ~/ffmpeg-debs/
+            sudo chown -R "$(id -u):$(id -g)" ~/ffmpeg-debs
+          fi
+          # -f resolves anything dpkg could not order by itself; without it a single
+          # out-of-order dependency would leave ffmpeg half-configured.
+          sudo dpkg -i ~/ffmpeg-debs/*.deb || sudo apt-get install -f -y
+          # The whole point of the step, asserted rather than assumed: a silent failure
+          # here does not fail the build, it deletes test coverage.
+          ffmpeg -version | head -1
 
       - name: Install dependencies
         working-directory: backend

@@ -44,17 +44,10 @@ RUN python -m venv /opt/venv \
 # ---------------------------------------------------------------------------------------
 FROM python:3.12-slim-bookworm AS runtime
 
-ARG VERSION=dev
-ARG VCS_REF=unknown
-ARG BUILD_DATE=unknown
-
-LABEL org.opencontainers.image.title="Dashcam Analyser" \
-      org.opencontainers.image.description="Self-hosted dashcam footage analysis: telemetry, vehicle and licence-plate detection, journeys and maps" \
-      org.opencontainers.image.source="https://github.com/Poshy163/Dashcam-Stats" \
-      org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.created="${BUILD_DATE}"
+# The build stamp -- VERSION, VCS_REF, BUILD_DATE -- is deliberately NOT declared here.
+# It lives at the very end of this stage instead. See the note above the LABEL there:
+# consuming a build argument at the top invalidates every layer beneath it, and these
+# three change on every single build.
 
 # The non-free component carries the Intel iHD VAAPI driver, which is what Gen9+ iGPUs
 # (including the Iris Xe in a 13th-gen i9) actually use for hardware decode.
@@ -167,8 +160,7 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
     DASHCAM_DATA_DIR=/data \
     DASHCAM_FOOTAGE_DIR=/dashcam \
-    DASHCAM_PORT=8080 \
-    DASHCAM_VERSION=${VERSION}
+    DASHCAM_PORT=8080
 
 # LIBVA_DRIVER_NAME is deliberately NOT set here.
 #
@@ -199,6 +191,34 @@ RUN useradd --system --create-home --uid 1000 --shell /usr/sbin/nologin dashcam 
     && chown -R dashcam:dashcam /app /data
 
 ENV PYTHONPATH=/app/backend
+
+# The build stamp, last, because it is the only thing in this file that changes on every
+# build -- and a layer that changes invalidates every layer beneath it.
+#
+# It used to sit at the top of this stage. CI builds the image twice, once to test it and
+# once to publish it, and the two pass different values: `ci-<sha>` against `main`, plus a
+# BUILD_DATE that is a fresh timestamp every run. So the publish build shared no cached
+# layer with the test build that had just finished -- it re-ran the apt install, re-fetched
+# the Intel compute runtime, and rebuilt the venv, about ninety seconds of work that had
+# been done minutes earlier. It also meant no build ever reused the previous one's cache,
+# because BUILD_DATE alone guaranteed a miss on the second instruction.
+#
+# Down here the same three values land after everything expensive, so changing them costs
+# one metadata layer. Labels and environment do not care where they are declared; the
+# cache does.
+ARG VERSION=dev
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+
+ENV DASHCAM_VERSION=${VERSION}
+
+LABEL org.opencontainers.image.title="Dashcam Analyser" \
+      org.opencontainers.image.description="Self-hosted dashcam footage analysis: telemetry, vehicle and licence-plate detection, journeys and maps" \
+      org.opencontainers.image.source="https://github.com/Poshy163/Dashcam-Stats" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
 
 VOLUME ["/data"]
 EXPOSE 8080
