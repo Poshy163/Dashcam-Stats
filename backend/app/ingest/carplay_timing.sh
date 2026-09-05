@@ -11,6 +11,18 @@
 # CarPlayTiming, so the unit-log collector ships it home on the next visit.
 INTERVAL="${1:-15}"
 PRIO="${2:-w}"
+# How often the video surfaces themselves are read, as against the context around them.
+#
+# SurfaceFlinger keeps a ring of 127 frames per layer, which at the 24 fps this link runs
+# at is about 5.3 seconds. Reading it once every INTERVAL seconds therefore observed 5.3 s
+# out of every 15 -- a 36% duty cycle, with 64% of the drive never looked at, which is
+# enough for a two-second stutter to be missed better than half the time. At 4 s the
+# windows overlap instead of leaving gaps (and stay inside the ring even at 28 fps, where
+# it holds 4.5 s). The overlap is then removed per layer by MARKPFX below, so a frame is
+# never counted twice. The context reads above keep the slow cadence: they are the
+# expensive part, and load and temperature do not move in four seconds.
+FRAME_INTERVAL="${3:-4}"
+MARKPFX=/data/local/tmp/.dashcam_cpt_seen_
 LOG=/data/local/tmp/dashcam_carplay_timing.log
 PIDF=/data/local/tmp/.dashcam_carplay_timing.pid
 TAG=CarPlayTiming
@@ -89,6 +101,9 @@ while :; do
 
   if [ "$phone" -gt 0 ]; then
     idle_n=0
+    # One context reading, several surface readings under it -- see FRAME_INTERVAL.
+    watched=0
+    while [ "$watched" -lt "$INTERVAL" ]; do
     layers=$(dumpsys SurfaceFlinger --list 2>/dev/null | grep 'SurfaceView\[\](BLAST)')
     if [ -z "$layers" ]; then
       emit "$head | no video surface"
@@ -96,17 +111,36 @@ while :; do
       idx=0
       echo "$layers" | while read -r L; do
         idx=$((idx+1))
-        dumpsys SurfaceFlinger --latency "$L" </dev/null 2>/dev/null | awk -v layer="${L##*#}" -v idx="$idx" '
+        id=${L##*#}
+        mark="$MARKPFX$id"
+        seen=$(cat "$mark" 2>/dev/null)
+        dumpsys SurfaceFlinger --latency "$L" </dev/null 2>/dev/null | awk -v layer="$id" -v idx="$idx" -v seen="${seen:-0}" -v mark="$mark" '
           NR==1 { period=$1/1e6; next }
           NF>=3 && $2>0 && $2<9e18 { p[n++]=$2 }
           END {
             if (n<3) { printf "layer=#%s idx=%s frames=%d (idle)\n", layer, idx, n; exit }
             # sort presented timestamps, then the intervals between them
             for (i=0;i<n;i++) for (j=i+1;j<n;j++) if (p[j]<p[i]) { t=p[i]; p[i]=p[j]; p[j]=t }
-            m=0; for (i=1;i<n;i++) { d[m++]=(p[i]-p[i-1])/1e6 }
+            # Where this window ended, for the next one to start after. Printed with an
+            # explicit integer format: these are nanosecond timestamps, and awk`s default
+            # output would render them in exponent form, which reads back as a different
+            # number and would silently disable the de-duplication entirely.
+            printf "%.0f\n", p[n-1] > mark
+            # Only intervals whose later frame is new. Consecutive reads of a 5.3 s ring
+            # four seconds apart share about a second of frames, and counting those twice
+            # would inflate every hold count by the overlap. The interval that straddles
+            # the boundary belongs to this window and is kept exactly once.
+            m=0
+            for (i=1;i<n;i++) if (p[i] > seen+0) {
+              d[m]=(p[i]-p[i-1])/1e6
+              if (m==0) first=p[i-1]
+              last=p[i]; m++
+            }
+            if (m<2) { printf "layer=#%s idx=%s frames=%d new=0 (no new frames)\n", layer, idx, n; exit }
+            span=(last-first)/1e9
             for (i=0;i<m;i++) for (j=i+1;j<m;j++) if (d[j]<d[i]) { t=d[i]; d[i]=d[j]; d[j]=t }
             med=d[int(m/2)]
-            span=(p[n-1]-p[0])/1e9; late=0
+            late=0; hitch=0
             # A late frame is one that missed its slot, and the slot is this surface`s own
             # cadence -- not the display`s. The old threshold was 2.5 display periods, which
             # on a 57 Hz panel is 44 ms; a 30 fps source cannot be shown evenly there and has
@@ -116,16 +150,26 @@ while :; do
             # separates the two questions the fields already answer separately: fps says how
             # fast the surface runs, late says how unevenly.
             thr=med+1.5*period
-            for (i=0;i<m;i++) if (d[i]>thr) late++
-            printf "layer=#%s idx=%s fps=%.1f med=%.1f p95=%.1f max=%.1f late=%d%% n=%d period=%.1f thr=%.1f\n",
-              layer, idx, (span>0? n/span:0), med, d[int(m*0.95)-1<0?0:int(m*0.95)-1], d[m-1], 100*late/m, n, period, thr
+            # A hitch is a hold long enough to see, which is a different question again.
+            # Across a day of driving `late` sat at a median of 11% while the worst single
+            # hold reached 265 ms -- a quarter of a second of frozen picture that `late`
+            # scored 26%, because one long hold among many even ones barely moves a rate.
+            # Twice the median is the surface`s own definition of "stopped for a moment",
+            # so it needs no panel constant and follows the link if its cadence changes.
+            hthr=2*med
+            for (i=0;i<m;i++) { if (d[i]>thr) late++; if (d[i]>=hthr) hitch++ }
+            printf "layer=#%s idx=%s fps=%.1f med=%.1f p95=%.1f max=%.1f late=%d%% hitch=%d n=%d new=%d span=%.1f period=%.1f thr=%.1f\n",
+              layer, idx, (span>0? m/span:0), med, d[int(m*0.95)-1<0?0:int(m*0.95)-1], d[m-1], 100*late/m, hitch, n, m, span, period, thr
           }' | while read -r stat; do emit "$head | $stat"; done
       done
     fi
+    sleep "$FRAME_INTERVAL"
+    watched=$((watched + FRAME_INTERVAL))
+    done
   else
     idle_n=$((idle_n+1))
     # A heartbeat once a minute while no phone is attached: enough to prove it is alive.
     [ $((idle_n % 4)) -eq 1 ] && emit "$head | no phone on hotspot"
+    sleep "$INTERVAL"
   fi
-  sleep "$INTERVAL"
 done

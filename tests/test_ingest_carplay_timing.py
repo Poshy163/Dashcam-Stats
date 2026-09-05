@@ -18,6 +18,11 @@ VIDEO_LINE = (
     "sta=RSSI:-33/Frequency:5520MHz/ ap=5180 | layer=#104 fps=23.4 med=35.3 p95=70.6 "
     "max=88.2 late=38% n=126 period=17.5"
 )
+CONTINUOUS_LINE = (
+    "acc=1 phone=1 load=21.04 soc=63.7 zlink_cpu=56 rx_kbit=1590 ap_drops=0 obd_cpu=4 bt=1 "
+    "sta=RSSI:-33/Frequency:5520MHz/ ap=5180 | layer=#103 idx=1 fps=28.1 med=35.1 p95=35.1 "
+    "max=263.1 late=1% hitch=2 n=127 new=96 span=3.4 period=17.5 thr=61.4"
+)
 HEARTBEAT_LINE = (
     "acc=1 phone=0 load=15.95 soc=71.6 zlink_cpu=na rx_kbit=na "
     "sta=RSSI:-35/Frequency:5520MHz/ ap=5180 | no phone on hotspot"
@@ -111,6 +116,45 @@ class TestParsing:
         assert carplay_timing.parse_sample(datetime.now(UTC), "a=1 | layer=#1 fps=x") is None
 
 
+class TestTheHoldsAPersonActuallyNotices:
+    """`late_pct` and `hitches` answer different questions, and only one matches perception.
+
+    Measured across a day of driving: late_pct sat at a median of 11% while the worst single
+    hold reached 265 ms -- a quarter-second of frozen picture that late_pct scored 26%,
+    because one long hold among many even ones barely moves a rate. The two correlate at
+    r=+0.34. The operator was seeing the holds; the dashboard was reporting the rate.
+    """
+
+    def test_the_hold_count_and_the_window_it_covered_are_read(self):
+        sample = carplay_timing.parse_sample(datetime.now(UTC), CONTINUOUS_LINE)
+
+        assert sample["hitches"] == 2
+        assert sample["new_frames"] == 96
+        assert sample["span_s"] == 3.4
+        assert sample["max_ms"] == 263.1
+        assert sample["late_pct"] == 1.0, "a rate barely moves for one long hold"
+
+    def test_a_line_from_before_the_holds_were_counted_says_so(self):
+        """None, not zero. `we were not counting` is not `there were none`."""
+        sample = carplay_timing.parse_sample(datetime.now(UTC), VIDEO_LINE)
+
+        assert sample["hitches"] is None
+        assert sample["new_frames"] is None
+        assert sample["span_s"] is None
+
+    def test_no_new_frames_is_not_a_sample(self):
+        """Re-reading the ring with nothing added must contribute no timing at all.
+
+        The window is shorter than the ring it reads, so a stalled surface produces this
+        line rather than a duplicate of the last one.
+        """
+        line = (
+            CONTINUOUS_LINE.split(" | ")[0] + " | layer=#103 idx=1 frames=127 new=0 (no new frames)"
+        )
+
+        assert carplay_timing.parse_sample(datetime.now(UTC), line) is None
+
+
 class TestSummarising:
     def test_buckets_average_the_rates_and_keep_the_worst_of_the_rest(self):
         t0 = datetime(2026, 9, 3, 7, 30, 5, tzinfo=UTC)
@@ -134,6 +178,34 @@ class TestSummarising:
         assert first["soc_c"] == 75.1, "worst temperature in the bucket"
         assert first["max_ms"] == 88.2, "worst interval in the bucket"
         assert first["sta_mhz"] == 5520 and first["ap_mhz"] == 5180
+
+    def test_holds_and_coverage_are_summed_across_the_bucket(self):
+        """A minute holds every hitch in it, not the worst single window's share.
+
+        `span_s` against the bucket length is the coverage figure, and it is what separates
+        a quiet minute from an unwatched one -- the distinction the old single-read cadence
+        could not make at all, because it only ever looked at a third of the time.
+        """
+        base = datetime(2026, 9, 5, 6, 20, tzinfo=UTC)
+        rows = [
+            carplay_timing.parse_sample(base + timedelta(seconds=n), CONTINUOUS_LINE)
+            for n in (0, 4, 8, 12)
+        ]
+
+        buckets = carplay_timing.summarise(rows, bucket_s=60)
+
+        assert len(buckets) == 1
+        assert buckets[0]["hitches"] == 8, "four windows of two holds each"
+        assert round(buckets[0]["span_s"], 1) == 13.6
+
+    def test_a_bucket_that_never_counted_holds_reports_none(self):
+        base = datetime(2026, 9, 5, 6, 20, tzinfo=UTC)
+        rows = [carplay_timing.parse_sample(base, VIDEO_LINE)]
+
+        buckets = carplay_timing.summarise(rows, bucket_s=60)
+
+        assert buckets[0]["hitches"] is None
+        assert buckets[0]["span_s"] is None
 
     def test_two_surfaces_in_one_minute_stay_apart(self):
         """Pooling them produced a figure that described neither.
@@ -170,6 +242,52 @@ class TestSummarising:
         assert carplay_timing.summarise([sample])[0]["layer_index"] == 2
 
 
+class TestTheScriptOnTheUnit:
+    """Properties of the shell that the Python cannot assert by running it.
+
+    There is no device here, so these read the shipped script. They pin the two things a
+    careless edit would break: that the expensive context reads stay slow while the surface
+    reads go fast, and that the overlap between consecutive ring reads is removed.
+    """
+
+    def _script(self) -> str:
+        from pathlib import Path
+
+        return (
+            Path(carplay_timing.__file__).with_name("carplay_timing.sh").read_text(encoding="utf-8")
+        )
+
+    def test_the_surfaces_are_read_faster_than_the_context_around_them(self):
+        script = self._script()
+
+        assert 'FRAME_INTERVAL="${3:-4}"' in script
+        assert 'sleep "$FRAME_INTERVAL"' in script
+        # The inner loop is what keeps `dumpsys wifi` and the thermal walk on the slow
+        # cadence. Without it every context read would run four times as often for nothing.
+        assert 'while [ "$watched" -lt "$INTERVAL" ]' in script
+
+    def test_the_overlap_between_consecutive_reads_is_removed(self):
+        """A 4 s cadence against a 5.3 s ring shares about a second of frames every time.
+
+        Counted twice, every hold in the overlap would be reported twice, and the coverage
+        figure would claim more of the drive than was actually watched.
+        """
+        script = self._script()
+
+        assert 'seen=$(cat "$mark" 2>/dev/null)' in script
+        assert "if (p[i] > seen+0)" in script
+        # Written with an explicit integer format: these are nanosecond timestamps, and
+        # awk's default output renders them in exponent form, which reads back as a
+        # different number and would silently disable the de-duplication entirely.
+        assert 'printf "%.0f\\n", p[n-1] > mark' in script
+
+    def test_a_hold_is_measured_against_the_surfaces_own_cadence(self):
+        script = self._script()
+
+        assert "hthr=2*med" in script
+        assert "if (d[i]>=hthr) hitch++" in script
+
+
 class TestArming:
     async def test_the_script_is_deployed_by_base64_and_started_detached(self, monkeypatch):
         shells: list[str] = []
@@ -190,7 +308,36 @@ class TestArming:
         assert any("base64 -d" in c and carplay_timing.REMOTE_SCRIPT in c for c in shells)
         launch = next(c for c in shells if "setsid" in c)
         # The interval from the setting, then the logcat priority the collector keeps.
-        assert f"sh {carplay_timing.REMOTE_SCRIPT} 20 e </dev/null >/dev/null 2>&1 &" in launch
+        assert (
+            f"sh {carplay_timing.REMOTE_SCRIPT} 20 e {carplay_timing.FRAME_INTERVAL_S} "
+            "</dev/null >/dev/null 2>&1 &"
+        ) in launch
+
+    async def test_the_frame_cadence_is_passed_to_the_script(self, monkeypatch):
+        """The whole point of the change is the third argument.
+
+        Deploying a script that can sample continuously and then starting it without the
+        cadence would leave it on the script's own default -- which is the same number, so
+        the mistake would look identical until someone changed one of them.
+        """
+        sent: list[str] = []
+
+        async def fake_shell(address, command, **kwargs):
+            sent.append(command)
+            return adb.AdbResult(0, "", "")
+
+        monkeypatch.setattr(carplay_timing.adb, "shell", fake_shell)
+        monkeypatch.setattr(
+            carplay_timing,
+            "get_settings_service",
+            lambda: _Settings({carplay_timing.ENABLED_KEY: True}),
+        )
+
+        await carplay_timing.arm("unit:5555")
+
+        launch = [c for c in sent if "setsid" in c]
+        assert launch, "the sampler is never started"
+        assert f"e {carplay_timing.FRAME_INTERVAL_S}" in launch[0], launch[0]
 
     async def test_the_shipped_script_is_what_gets_deployed(self):
         text = carplay_timing.script()

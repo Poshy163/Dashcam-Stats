@@ -24,9 +24,13 @@ statement about severity: the unit-log collector (:mod:`app.ingest.unit_logs`) k
 the database with everything else, and :func:`parse_sample` turns them back into numbers
 for the API and the Logs page. No new transport, no new table.
 
-**What it costs.** Four ``dumpsys`` calls and a few file reads every sample -- about a
-fifth of a second of work every fifteen seconds -- and nothing at all while no phone is
-attached beyond a heartbeat a minute. It never changes a setting, a radio or a process.
+**What it costs.** The expensive reads -- ``dumpsys wifi``, the thermal zones, the CPU
+counters -- stay on the fifteen-second cadence, because load and temperature do not move
+faster than that. Only the two cheap SurfaceFlinger calls run every four seconds, which is
+what it takes to see every frame: the ring holds 127 of them, about 5.3 seconds, so the
+original single read per interval observed roughly a third of the drive and missed the
+rest. Nothing at all runs while no phone is attached beyond a heartbeat a minute. It never
+changes a setting, a radio or a process.
 """
 
 from __future__ import annotations
@@ -58,6 +62,16 @@ ENABLED_KEY = "ingest.carplay_timing"
 INTERVAL_KEY = "ingest.carplay_timing_interval_s"
 DEFAULT_INTERVAL_S = 15
 MIN_INTERVAL_S = 5
+
+#: How often the video surfaces are read, as against the context around them.
+#:
+#: Not a preference, so not a setting: it is derived from the ring SurfaceFlinger keeps,
+#: which is 127 frames -- 5.3 s at the 24 fps this link runs at, 4.5 s at 28. Reading it
+#: once per ``INTERVAL_KEY`` observed about a third of the drive; at four seconds the
+#: windows overlap instead of leaving gaps, and the sampler removes the overlap so nothing
+#: is counted twice. Raising it past 4 reopens the gap; lowering it buys nothing, because
+#: the frames are already all seen.
+FRAME_INTERVAL_S = 4
 MAX_INTERVAL_S = 120
 
 ARM_TIMEOUT_S = 20.0
@@ -112,13 +126,17 @@ async def arm(address: str) -> bool:
         await adb.shell(
             address,
             # `e` is the logcat priority the lines are emitted at -- see the module note.
-            f"setsid sh {REMOTE_SCRIPT} {every} e </dev/null >/dev/null 2>&1 &",
+            f"setsid sh {REMOTE_SCRIPT} {every} e {FRAME_INTERVAL_S} </dev/null >/dev/null 2>&1 &",
             timeout=ARM_TIMEOUT_S,
         )
     except adb.AdbError as exc:
         log.warning("could not arm the CarPlay timing sampler", error=str(exc))
         return False
-    log.info("armed the CarPlay timing sampler on the unit", interval_s=every)
+    log.info(
+        "armed the CarPlay timing sampler on the unit",
+        interval_s=every,
+        frame_interval_s=FRAME_INTERVAL_S,
+    )
     return True
 
 
@@ -166,6 +184,17 @@ def _number(value: str | None) -> float | None:
         return float(value.rstrip("%"))
     except ValueError:
         return None
+
+
+def _int_or_none(value: str | None) -> int | None:
+    """A count, or None when the sampler that produced this line did not emit it.
+
+    Distinct from ``int(_number(...) or 0)``: zero hitches and a sampler too old to have
+    counted them are different facts, and folding them together would show a day of
+    pre-upgrade samples as a day with no holds in it.
+    """
+    number = _number(value)
+    return None if number is None else int(number)
 
 
 def parse_sample(occurred_at: datetime, message: str) -> dict[str, Any] | None:
@@ -231,7 +260,20 @@ def parse_sample(occurred_at: datetime, message: str) -> dict[str, Any] | None:
         "p95_ms": _number(fields.get("p95")),
         "max_ms": _number(fields.get("max")),
         "late_pct": _number(fields.get("late")),
+        # Holds long enough to see, which is a different question from `late_pct` and the
+        # one that matches what a person in the car actually notices. Across a day of
+        # driving late_pct sat at a median of 11% while the worst single hold reached
+        # 265 ms -- a quarter-second of frozen picture that late_pct scored 26%, because
+        # one long hold among many even ones barely moves a rate. The two correlate at
+        # r=+0.34: they are not measuring the same thing.
+        "hitches": _int_or_none(fields.get("hitch")),
         "frames": int(_number(fields.get("n")) or 0),
+        # How many intervals this window actually contributed, and how long they covered.
+        # Consecutive reads of the ring overlap, so `new_frames` is below `frames` by the
+        # overlap; `span_s` summed across a drive is the coverage the old single-read
+        # cadence could not reach. Null on samples from before the sampler counted them.
+        "new_frames": _int_or_none(fields.get("new")),
+        "span_s": _number(fields.get("span")),
         "period_ms": _number(fields.get("period")),
     }
 
@@ -258,6 +300,16 @@ def summarise(samples: list[dict[str, Any]], bucket_s: int = 60) -> list[dict[st
         values = [r[field] for r in rows if r.get(field) is not None]
         return max(values) if values else None
 
+    def total(rows: list[dict[str, Any]], field: str) -> float | None:
+        """Summed, not worst -- and None rather than 0 when nothing reported it.
+
+        Counts and durations add up across a bucket where rates do not. Returning 0 for a
+        bucket of samples that predate the field would read as "a minute with no holds in
+        it", which is the opposite of "we were not counting".
+        """
+        values = [r[field] for r in rows if r.get(field) is not None]
+        return sum(values) if values else None
+
     out: list[dict[str, Any]] = []
     for key, layer in sorted(buckets, key=lambda k: (k[0], k[1])):
         rows = buckets[(key, layer)]
@@ -271,6 +323,11 @@ def summarise(samples: list[dict[str, Any]], bucket_s: int = 60) -> list[dict[st
                 "samples": len(rows),
                 "fps": sum(fps) / len(fps) if fps else None,
                 "late_pct": sum(late) / len(late) if late else None,
+                # Summed: how many visible holds this minute held, and how much of it was
+                # actually observed. `span_s` against `bucket_s` is the coverage figure --
+                # it is what says whether a quiet minute was smooth or merely unwatched.
+                "hitches": total(rows, "hitches"),
+                "span_s": total(rows, "span_s"),
                 "p95_ms": worst(rows, "p95_ms"),
                 "max_ms": worst(rows, "max_ms"),
                 "soc_c": worst(rows, "soc_c"),
