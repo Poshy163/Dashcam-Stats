@@ -131,7 +131,7 @@ def api_key_from_request(request: Request) -> str:
     All three, because one caller needs each. The head unit arrives with the key in the
     query string, since a browser navigation carries nothing else; it is given the cookie
     on that first request and uses it for every fetch the page makes afterwards; and a
-    script or a Home Assistant sensor is better served by a header than by a key in a URL
+    script or external monitor is better served by a header than by a key in a URL
     that ends up in access logs.
     """
     from_cookie = request.cookies.get(SECURE_API_KEY_COOKIE_NAME) or request.cookies.get(
@@ -158,7 +158,7 @@ def _origin_is_ours(request: Request) -> bool:
     enough to delete footage, replace the database or switch sign-in back off.
 
     Only cookie-authenticated requests are checked. A browser sends ``Origin`` on every
-    unsafe request including its own; Home Assistant and curl send none and authenticate
+    unsafe request including its own; scripts and curl send none and authenticate
     with Basic anyway, so nothing scripted is affected.
     """
     if request.method not in UNSAFE_METHODS:
@@ -177,7 +177,7 @@ def _challenge(request: Request) -> JSONResponse:
     headers = {}
     if request.headers.get("Authorization"):
         # Sent only to a caller that already tried to speak Basic, which is a script or a
-        # Home Assistant sensor with the wrong credentials. Sending it unconditionally
+        # API client with the wrong credentials. Sending it unconditionally
         # would put the browser's own native password box in front of the login page, and
         # there is no way to sign out of one of those.
         headers["WWW-Authenticate"] = 'Basic realm="Dashcam Analyser", charset="UTF-8"'

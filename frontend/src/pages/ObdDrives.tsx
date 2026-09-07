@@ -7,27 +7,6 @@ import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/comp
 import { api } from '@/lib/api'
 import { formatDateTime, formatDuration, formatRelative, formatSpeed } from '@/lib/format'
 
-const IMPORT_STATE_STYLE: Record<string, { label: string; className: string }> = {
-  imported: { label: 'In Home Assistant', className: 'bg-state-ok/15 text-state-ok' },
-  ready_to_import: { label: 'Waiting for HA', className: 'bg-accent-muted text-accent' },
-  retry_wait: { label: 'Retrying HA', className: 'bg-state-warn/15 text-state-warn' },
-  importing: { label: 'Importing', className: 'bg-accent-muted text-state-busy' },
-  failed: { label: 'Import failed', className: 'bg-state-error/15 text-state-error' },
-  quarantined: { label: 'Quarantined', className: 'bg-state-error/15 text-state-error' },
-}
-
-function ImportBadge({ state }: { state: string }) {
-  const style = IMPORT_STATE_STYLE[state] ?? {
-    label: state.replace(/_/g, ' '),
-    className: 'bg-surface-sunken text-content-muted',
-  }
-  return (
-    <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${style.className}`}>
-      {style.label}
-    </span>
-  )
-}
-
 const LIFECYCLE_STYLE: Record<string, { label: string; className: string }> = {
   complete: { label: 'Complete', className: 'bg-state-ok/15 text-state-ok' },
   interrupted: { label: 'Interrupted', className: 'bg-state-warn/15 text-state-warn' },
@@ -72,7 +51,7 @@ export default function ObdDrives() {
     <div className="space-y-4">
       <PageHeader
         title="OBD drives"
-        subtitle="Every recorded drive, kept at the logger's full sample resolution. Home Assistant holds the hourly rollups; the traces live here."
+        subtitle="Every recorded drive, kept locally at the logger's full sample resolution."
       />
 
       {totals.data && totals.data.driveCount > 0 && (
@@ -123,7 +102,7 @@ export default function ObdDrives() {
         />
       ) : (
         <div className="card overflow-x-auto">
-          <table className="w-full min-w-[58rem] text-sm">
+          <table className="w-full min-w-[52rem] text-sm">
             <thead className="border-b border-border text-left text-xs text-content-muted">
               <tr>
                 <th className="p-2 font-medium">Started</th>
@@ -135,7 +114,6 @@ export default function ObdDrives() {
                 <th className="p-2 font-medium">Fuel</th>
                 <th className="p-2 font-medium">Samples</th>
                 <th className="p-2 font-medium">DTCs</th>
-                <th className="p-2 font-medium">Import</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
@@ -187,9 +165,6 @@ export default function ObdDrives() {
                     ) : (
                       <span className="text-content-faint">none</span>
                     )}
-                  </td>
-                  <td className="p-2">
-                    <ImportBadge state={drive.importState} />
                   </td>
                 </tr>
               ))}

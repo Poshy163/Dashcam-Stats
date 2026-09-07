@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
-from types import SimpleNamespace
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -115,10 +114,9 @@ async def test_integrity_loser_preserves_matching_trusted_winners_file(
             sample_count=1,
             diagnostic_count=0,
             metadata_trusted=True,
-            state=OBDBundleState.READY_TO_IMPORT.value,
+            state=OBDBundleState.STORED.value,
             copied_at=observed,
             verified_at=observed,
-            next_attempt_at=observed,
         )
         session.add(row)
         await session.flush()
@@ -136,9 +134,6 @@ async def test_integrity_loser_preserves_matching_trusted_winners_file(
         },
         summary={},
         diagnostics_document={},
-        latest_sample={},
-        latest_values={},
-        statistics=[],
     )
     deleted: list[str] = []
 
@@ -178,11 +173,6 @@ async def test_integrity_loser_preserves_matching_trusted_winners_file(
     monkeypatch.setattr(obd_transfer, "_register", uniqueness_loser)
     monkeypatch.setattr(obd_transfer, "write_verification_receipt", _none)
     monkeypatch.setattr(obd_transfer, "_delete_remote_if_hash", delete)
-    monkeypatch.setattr(
-        obd_transfer,
-        "get_import_worker",
-        lambda: SimpleNamespace(wake=lambda: None),
-    )
     item = RemoteFile(filename, len(body), 1, "/safe/ready")
 
     result = await obd_transfer.sync_remote_bundles(_unit(), remote=[item], config=app_config)
@@ -227,10 +217,9 @@ async def test_verified_bundle_match_requires_exact_canonical_bytes(
                 sample_count=1,
                 diagnostic_count=0,
                 metadata_trusted=True,
-                state=OBDBundleState.READY_TO_IMPORT.value,
+                state=OBDBundleState.STORED.value,
                 copied_at=observed,
                 verified_at=observed,
-                next_attempt_at=observed,
             )
         )
         await session.flush()

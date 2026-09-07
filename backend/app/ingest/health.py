@@ -20,7 +20,7 @@ it appends one line — unit clock, card writable or read-only, age of the newes
 free space, free memory, and the age of each camera's newest recording — and when the car
 is next seen, the app collects the log, reads the drive's story out of it, and reports
 anything that went wrong where a person will see it: the log, the Settings page, and the
-Home Assistant webhook that reaches a phone.
+configured webhook endpoint that can reach a phone.
 
 **Why per camera as well as overall.** A car with a rear camera records from both at once,
 so the newest file on the card stays fresh while *either* of them works. A rear camera that

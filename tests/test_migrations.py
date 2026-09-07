@@ -216,6 +216,134 @@ class TestMigrations:
             assert drive.processing_status == "pending"
             assert drive.manifest_json == raw_manifest
 
+    async def test_0022_retires_delivery_state_without_losing_obd_history(self, app_config):
+        import asyncio
+        from datetime import UTC, datetime
+
+        from alembic import command
+
+        from app.db.session import alembic_config
+
+        await init_db(seed=False)
+        await dispose_engine()
+        config = alembic_config()
+        await asyncio.to_thread(command.downgrade, config, "0021")
+
+        import sqlite3
+
+        now = datetime(2026, 9, 7, tzinfo=UTC).isoformat()
+        with sqlite3.connect(app_config.db_path) as connection:
+            connection.execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                ("ingest.ha_mqtt_host", '"broker.local"', now),
+            )
+            connection.execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                ("ingest.mqtt_host", '"preferred.local"', now),
+            )
+            connection.execute(
+                """INSERT INTO obd_bundles
+                (drive_id, bundle_hash, schema_version, filename, size_bytes, vehicle_id,
+                 logger_id, logger_version, drive_started_at, drive_finished_at,
+                 sample_count, diagnostic_count, metadata_trusted, state, attempts,
+                 copied_at, verified_at, created_at, updated_at, duplicate)
+                VALUES (?, ?, 1, ?, 123, 'car', 'logger', '1.0', ?, ?, 1, 0, 1,
+                        'retry_wait', 4, ?, ?, ?, ?, 0)""",
+                (
+                    "migration_drive",
+                    "a" * 64,
+                    "migration_drive.obd2.zip",
+                    now,
+                    now,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO obd_bundles
+                (drive_id, bundle_hash, schema_version, filename, size_bytes, vehicle_id,
+                 logger_id, logger_version, drive_started_at, drive_finished_at,
+                 sample_count, diagnostic_count, metadata_trusted, state, attempts,
+                 copied_at, verified_at, created_at, updated_at, duplicate)
+                VALUES (?, ?, 1, ?, 123, 'car', 'logger', '1.0', ?, ?, 1, 0, 1,
+                        'importing', 1, ?, ?, ?, ?, 0)""",
+                (
+                    "interrupted_import",
+                    "c" * 64,
+                    "interrupted_import.obd2.zip",
+                    now,
+                    now,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            bundle_id = connection.execute(
+                "SELECT id FROM obd_bundles WHERE drive_id = 'migration_drive'"
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO obd_drives
+                (bundle_id, drive_id, vehicle_id, started_at, finished_at,
+                 completion_status, clean_end, units, manifest_json, summary_json, created_at)
+                VALUES (?, 'migration_drive', 'car', ?, ?, 'complete', 1, '{}', '{}', '{}', ?)""",
+                (bundle_id, now, now, now),
+            )
+            drive_db_id = connection.execute(
+                "SELECT id FROM obd_drives WHERE drive_id = 'migration_drive'"
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO obd_samples
+                (drive_db_id, sample_id, sequence, captured_at, ecu_data_status, raw_json)
+                VALUES (?, 'migration_sample', 0, ?, 'live', '{"engine_rpm":900}')""",
+                (drive_db_id, now),
+            )
+            connection.execute(
+                """INSERT INTO obd_diagnostics
+                (drive_db_id, event_hash, observed_at, kind, payload_json)
+                VALUES (?, ?, ?, 'pipeline_metrics', '{"samples_persisted":1}')""",
+                (drive_db_id, "b" * 64, now),
+            )
+            connection.commit()
+
+        await asyncio.to_thread(command.upgrade, config, "head")
+        await init_db(seed=False)
+        async with session_scope() as session:
+            bundle = (
+                await session.execute(
+                    select(OBDBundle).where(OBDBundle.drive_id == "migration_drive")
+                )
+            ).scalar_one()
+            interrupted = (
+                await session.execute(
+                    select(OBDBundle).where(OBDBundle.drive_id == "interrupted_import")
+                )
+            ).scalar_one()
+            values = {
+                row.key: row.value
+                for row in (await session.execute(select(models.AppSetting))).scalars()
+            }
+        assert bundle.state == models.OBDBundleState.STORED.value
+        assert interrupted.state == models.OBDBundleState.VALIDATING.value
+        assert bundle.bundle_hash == "a" * 64
+        with sqlite3.connect(app_config.db_path) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM obd_drives").fetchone()[0] == 1
+            assert connection.execute("SELECT COUNT(*) FROM obd_samples").fetchone()[0] == 1
+            assert connection.execute("SELECT COUNT(*) FROM obd_diagnostics").fetchone()[0] == 1
+        assert values["ingest.mqtt_host"] == "preferred.local"
+        assert "ingest.ha_mqtt_host" not in values
+        columns = set(OBDBundle.__table__.columns.keys())
+        assert {
+            "attempts",
+            "next_attempt_at",
+            "last_http_status",
+            "import_started_at",
+            "imported_at",
+            "ha_result",
+        }.isdisjoint(columns)
+
 
 class TestSeeding:
     async def test_seeds_front_and_rear_cameras(self, migrated):

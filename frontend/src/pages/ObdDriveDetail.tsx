@@ -755,7 +755,7 @@ export default function ObdDriveDetail() {
             </span>
           )}
           <span className="ml-auto text-xs text-content-faint">
-            projection {drive.processingStatus} · summary {drive.summarySource}
+            Summary {drive.processingStatus} · derived from {drive.summarySource === 'derived' ? 'samples' : drive.summarySource}
           </span>
         </div>
         <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
@@ -810,15 +810,8 @@ export default function ObdDriveDetail() {
           <div>
             <dt className="text-xs text-content-faint">Export / backup</dt>
             <dd className="mt-0.5">
-              {drive.exportStatus} · {drive.backupStatus}
-              {drive.verifiedAt ? ` ${formatRelative(drive.verifiedAt)}` : ''}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-xs text-content-faint">Home Assistant</dt>
-            <dd className="mt-0.5">
-              {drive.importState.replace(/_/g, ' ')}
-              {drive.importedAt ? ` ${formatRelative(drive.importedAt)}` : ''}
+              {drive.exportStatus} · {drive.backupStatus} · {drive.storageStatus}
+              {drive.storedAt ? ` ${formatRelative(drive.storedAt)}` : ''}
             </dd>
           </div>
         </dl>

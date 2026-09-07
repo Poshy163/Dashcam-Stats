@@ -28,7 +28,7 @@ from app.core.process_lock import ProcessFileLock, try_acquire
 from app.db.models import IngestRadioTransition
 from app.db.session import session_scope
 from app.ingest import adb, obd_control, origin, radios
-from app.ingest.ha_import_queue import redact
+from app.ingest.obd_storage import redact
 from app.ingest.status import get_status
 
 log = get_logger(__name__)

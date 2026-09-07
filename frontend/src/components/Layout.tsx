@@ -7,6 +7,7 @@ import { cn } from '@/lib/cn'
 import { motion } from '@/lib/kiosk'
 import { invalidateAnalysisQueries, resetForIdentityChange } from '@/lib/queryInvalidation'
 import type { AuthState } from '@/lib/types'
+import type { Theme } from '@/lib/useTheme'
 
 type IconProps = { className?: string }
 type NavItem = {
@@ -34,33 +35,25 @@ const SYSTEM_NAV: NavItem[] = [
   { to: '/settings', label: 'Settings', icon: GearIcon },
 ]
 
-function useTheme() {
-  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
-    const stored = localStorage.getItem('dashcam-theme')
-    if (stored === 'dark' || stored === 'light') return stored
-    return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
-  })
-
-  useEffect(() => {
-    document.documentElement.classList.toggle('dark', theme === 'dark')
-    localStorage.setItem('dashcam-theme', theme)
-  }, [theme])
-
-  return { theme, toggle: () => setTheme((current) => (current === 'dark' ? 'light' : 'dark')) }
-}
-
 export default function Layout({
   children,
   auth,
+  theme,
+  onToggleTheme,
 }: {
   children: ReactNode
   auth?: AuthState
+  theme: Theme
+  onToggleTheme: () => void
 }) {
   const client = useQueryClient()
-  const { theme, toggle } = useTheme()
   const [query, setQuery] = useState('')
   const [navOpen, setNavOpen] = useState(false)
   const navigate = useNavigate()
+  const sidebarRef = useRef<HTMLElement>(null)
+  const menuButtonRef = useRef<HTMLButtonElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
+  const navWasOpen = useRef(false)
 
   const signOut = useMutation({
     mutationFn: api.auth.logout,
@@ -128,11 +121,55 @@ export default function Layout({
   }, [client, pending, done])
 
   useEffect(() => {
-    const close = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setNavOpen(false)
+    const content = contentRef.current
+    if (content) content.inert = navOpen
+    document.body.style.overflow = navOpen ? 'hidden' : ''
+
+    if (!navOpen) {
+      if (navWasOpen.current) menuButtonRef.current?.focus()
+      navWasOpen.current = false
+      return
     }
-    window.addEventListener('keydown', close)
-    return () => window.removeEventListener('keydown', close)
+
+    navWasOpen.current = true
+    const sidebar = sidebarRef.current
+    const focusable = sidebar?.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )
+    focusable?.[0]?.focus()
+
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setNavOpen(false)
+        return
+      }
+      if (event.key !== 'Tab' || !focusable?.length) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (!first || !last) return
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    window.addEventListener('keydown', handleKey)
+    return () => {
+      window.removeEventListener('keydown', handleKey)
+      document.body.style.overflow = ''
+      if (content) content.inert = false
+    }
+  }, [navOpen])
+
+  useEffect(() => {
+    const desktop = window.matchMedia('(min-width: 768px)')
+    const closeOnDesktop = () => {
+      if (desktop.matches) setNavOpen(false)
+    }
+    desktop.addEventListener('change', closeOnDesktop)
+    return () => desktop.removeEventListener('change', closeOnDesktop)
   }, [])
 
   const renderNavGroup = (label: string, items: NavItem[]) => (
@@ -190,10 +227,12 @@ export default function Layout({
       )}
 
       <aside
+        ref={sidebarRef}
         id="primary-navigation"
+        aria-label="Primary navigation"
         className={cn(
           'fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-nav-border bg-nav px-3.5 py-5 shadow-float transition-transform md:translate-x-0 md:shadow-none',
-          navOpen ? 'translate-x-0' : '-translate-x-full',
+          navOpen ? 'visible translate-x-0' : 'invisible -translate-x-full md:visible',
         )}
       >
         <div className="flex h-12 items-center justify-between px-2">
@@ -202,11 +241,8 @@ export default function Layout({
               <LogoIcon className="h-6 w-6" />
             </span>
             <div>
-              <div className="flex items-center gap-1.5">
-                <span className="text-base font-extrabold tracking-tight text-white">DASHCAM</span>
-                <span className="rounded bg-accent/20 px-1 py-0.2 text-[10px] font-mono font-bold text-accent">HUD</span>
-              </div>
-              <span className="block font-mono text-2xs uppercase tracking-wider text-nav-muted/80">Telemetry Suite</span>
+              <span className="text-base font-extrabold tracking-tight text-white">Dashcam Analyser</span>
+              <span className="block text-xs text-nav-muted/80">Vehicle insights</span>
             </div>
           </NavLink>
           <button
@@ -219,8 +255,8 @@ export default function Layout({
         </div>
 
         <nav className="mt-8 flex-1 space-y-7 overflow-y-auto px-1">
-          {renderNavGroup('Cockpit Library', LIBRARY_NAV)}
-          {renderNavGroup('System & Diagnostics', SYSTEM_NAV)}
+          {renderNavGroup('Library', LIBRARY_NAV)}
+          {renderNavGroup('System', SYSTEM_NAV)}
         </nav>
 
         <NavLink
@@ -231,7 +267,7 @@ export default function Layout({
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-nav-content">
               <span className={cn('h-2 w-2 rounded-full', busy ? cn('bg-cyan shadow-glow-cyan', motion('animate-pulse')) : 'bg-state-ok')} />
-              {busy ? 'Pipeline Active' : 'Cluster Idle'}
+              {busy ? 'Processing active' : 'Queue idle'}
             </div>
             {busy && (
               <span className="font-mono text-2xs font-semibold text-cyan">
@@ -245,10 +281,11 @@ export default function Layout({
         </NavLink>
       </aside>
 
-      <div className="min-h-full md:pl-64">
+      <div ref={contentRef} className="min-h-full md:pl-64">
         <header className="sticky top-0 z-30 border-b border-border/80 bg-surface/90 backdrop-blur-xl">
           <div className="mx-auto flex h-16 max-w-[1600px] items-center gap-3 px-4 sm:px-6 lg:px-8">
             <button
+              ref={menuButtonRef}
               className="grid h-10 w-10 shrink-0 place-items-center rounded-lg border border-border bg-surface-raised text-content shadow-sm md:hidden"
               onClick={() => setNavOpen((open) => !open)}
               aria-label="Toggle navigation"
@@ -302,7 +339,7 @@ export default function Layout({
 
             <button
               className="grid h-10 w-10 shrink-0 place-items-center rounded-lg text-content-muted hover:bg-surface-sunken hover:text-content"
-              onClick={toggle}
+              onClick={onToggleTheme}
               aria-label="Toggle theme"
             >
               {theme === 'dark' ? <SunIcon /> : <MoonIcon />}

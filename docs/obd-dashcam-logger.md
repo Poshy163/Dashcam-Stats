@@ -154,8 +154,8 @@ Do not enable the persistent ownership checkbox until the cutover below is compl
 
 ## Ownership cutover and safety proof
 
-1. Turn off `switch.nissan_tiida_obd2_connection` in Home Assistant and confirm it remains off.
-2. Stop every phone OBD scanner and confirm Home Assistant no longer has a GATT connection.
+1. Stop every existing OBD client and confirm it remains disconnected.
+2. Stop every phone OBD scanner and confirm no other client has a GATT connection.
 3. Open the companion, check the explicit ownership-transfer box, enable logging and grant the
    requested permissions.
 4. Confirm the notification/status moves through `parked` and `probing` to `ecu_online` only after
@@ -321,9 +321,8 @@ member names/sizes/SHA-256 hashes, then renames it atomically. The manifest reco
 `clean_end` flag, lifecycle clocks/reason, exact units, counts, and a
 size/hash/count map for all three payload members. The whole-file SHA-256 is recorded in SQLite
 and recomputed by the server after copy; it cannot be embedded in the archive it hashes. The
-server is the primary high-resolution history. Home Assistant receives the final sample identity,
-the latest non-null value for every telemetry field with its original observation timestamp, and
-historical aggregate statistics under their original UTC timestamps.
+server is the primary high-resolution history, retaining every sample and its original
+observation timestamp.
 
 The manifest also carries the drive's non-negative `error_count`; the server validates and stores
 it rather than replacing it with zero. Ready bundles are never written to internal-storage
@@ -357,8 +356,8 @@ full `VACUUM`, so their freed pages are reused and the file may not shrink on di
 ## Rollback and remaining physical checks
 
 Disable logging in the companion and wait for its status to show `disabled`, or uninstall it after
-the server has verified every pending bundle. Then turn the Home Assistant connection switch back
-on. Never run the two owners concurrently.
+the server has verified every pending bundle. Only then may another BLE client claim the adapter.
+Never run two owners concurrently.
 
 The source, JVM tests, Python contract tests and build path can be verified offline. Deployment is
 not proven until the physical unit is online and these hardware-specific checks pass: APK install

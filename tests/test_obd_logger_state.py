@@ -12,7 +12,7 @@ from app.obd.logger import (
 
 def test_obd_logger_requires_explicit_ownership_transfer() -> None:
     gate = EngineGate(LoggerSettings())
-    with pytest.raises(OwnershipNotTransferred, match="Home Assistant"):
+    with pytest.raises(OwnershipNotTransferred, match="other OBD clients"):
         gate.enable()
     assert gate.state is LoggerState.DISABLED
 

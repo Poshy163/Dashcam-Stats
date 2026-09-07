@@ -1,4 +1,4 @@
-"""OBD copy/import visibility and deliberate manual recovery controls."""
+"""OBD storage visibility and deliberate manual recovery controls."""
 
 from __future__ import annotations
 
@@ -21,15 +21,6 @@ from app.db.models import (
     OBDSample,
     utcnow,
 )
-from app.ingest.ha_import_queue import (
-    configuration_status,
-    get_import_worker,
-    move_to_quarantine,
-    queue_claim_lock,
-    rebuild_queue,
-    redact,
-    restore_from_quarantine,
-)
 from app.ingest.obd_bundle import (
     SAFE_DRIVE_ID,
     BundleError,
@@ -48,10 +39,17 @@ from app.ingest.obd_reconciliation import (
     reconcile_drive_projection,
     specs_for_poll_plan,
 )
+from app.ingest.obd_storage import (
+    move_to_quarantine,
+    reconcile_orphan_bundles,
+    redact,
+    restore_from_quarantine,
+    storage_claim_lock,
+)
 from app.ingest.obd_transfer import get_obd_transfer_status
 from app.obd import battery
 
-router = APIRouter(prefix="/api/obd", tags=["obd-import"])
+router = APIRouter(prefix="/api/obd", tags=["obd"])
 
 
 async def _quarantine_row(
@@ -74,7 +72,6 @@ async def _quarantine_row(
             row.state = OBDBundleState.QUARANTINED.value
             row.failure_kind = "integrity"
             row.last_error = redact(error)
-    row.next_attempt_at = None
     row.updated_at = utcnow()
 
 
@@ -93,13 +90,9 @@ def _bundle(row: OBDBundle) -> dict[str, object]:
         "diagnostic_count": row.diagnostic_count,
         "metadata_trusted": row.metadata_trusted,
         "state": row.state,
-        "attempts": row.attempts,
-        "next_attempt_at": row.next_attempt_at.isoformat() if row.next_attempt_at else None,
         "last_error": row.last_error,
         "failure_kind": row.failure_kind,
-        "last_http_status": row.last_http_status,
         "verified_at": row.verified_at.isoformat() if row.verified_at else None,
-        "imported_at": row.imported_at.isoformat() if row.imported_at else None,
         "duplicate": row.duplicate,
         "warnings": row.validation_warnings or [],
     }
@@ -176,8 +169,7 @@ def _drive(row: OBDDrive, *, include_quality: bool = False) -> dict[str, object]
         "sample_count": row.sample_count,
         "error_count": row.error_count,
         "dtcs_observed": row.dtcs_observed or [],
-        # The queue row's state says how far along the HA hand-off is; the drive row
-        # itself only exists once validation and registration have already succeeded.
+        # The drive exists only after validation and registration have succeeded.
         "bundle_id": bundle.id,
         "bundle_filename": bundle.filename,
         "bundle_sha256": bundle.bundle_hash,
@@ -191,8 +183,8 @@ def _drive(row: OBDDrive, *, include_quality: bool = False) -> dict[str, object]
         "backup_status": "verified" if bundle.verified_at else "pending",
         "copied_at": bundle.copied_at.isoformat() if bundle.copied_at else None,
         "verified_at": bundle.verified_at.isoformat() if bundle.verified_at else None,
-        "imported_at": bundle.imported_at.isoformat() if bundle.imported_at else None,
-        "import_state": bundle.state,
+        "stored_at": bundle.verified_at.isoformat() if bundle.verified_at else None,
+        "storage_status": bundle.state,
         "bundle_error": bundle.last_error,
         "validation_warnings": bundle.validation_warnings or [],
     }
@@ -232,7 +224,7 @@ def _series_sample(row: OBDSample, specs=SIGNALS) -> dict[str, object]:
     return result
 
 
-@router.get("/drives", summary="List imported drives with their rollups")
+@router.get("/drives", summary="List stored drives with their rollups")
 async def list_drives(session: SessionDep, page: PaginationDep) -> dict[str, object]:
     total = int((await session.execute(select(func.count(OBDDrive.id)))).scalar() or 0)
     rows = (
@@ -257,7 +249,7 @@ async def list_drives(session: SessionDep, page: PaginationDep) -> dict[str, obj
     }
 
 
-@router.get("/drives/summary", summary="Aggregate rollups across every imported drive")
+@router.get("/drives/summary", summary="Aggregate rollups across every stored drive")
 async def drives_summary(session: SessionDep) -> dict[str, object]:
     (
         count,
@@ -476,20 +468,9 @@ async def reprocess_drive(drive_id: str, session: SessionDep) -> dict[str, objec
     if drive is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "OBD drive was not found")
     result = await reconcile_drive_projection(session, drive)
-    ha_refresh_queued = False
-    if result.get("status") == "ready" and drive.bundle.state == OBDBundleState.IMPORTED.value:
-        drive.bundle.state = OBDBundleState.READY_TO_IMPORT.value
-        drive.bundle.next_attempt_at = utcnow()
-        drive.bundle.import_started_at = None
-        drive.bundle.last_error = None
-        drive.bundle.failure_kind = None
-        drive.bundle.updated_at = utcnow()
-        ha_refresh_queued = True
-        get_import_worker().wake()
     return {
         "result": result,
         "drive": _drive(drive, include_quality=True),
-        "ha_refresh_queued": ha_refresh_queued,
     }
 
 
@@ -539,42 +520,30 @@ async def download_drive_bundle(drive_id: str, session: SessionDep) -> FileRespo
     )
 
 
-@router.get("/status", summary="OBD logger, backup and Home Assistant queue status")
+@router.get("/status", summary="OBD logger and backup status")
 async def obd_status(session: SessionDep) -> dict[str, object]:
     grouped = (
         await session.execute(select(OBDBundle.state, func.count()).group_by(OBDBundle.state))
     ).all()
     counts = {state_name: int(count) for state_name, count in grouped}
-    latest = (
+    last_stored = (
         (
             await session.execute(
                 select(OBDBundle)
-                .where(OBDBundle.verified_at.is_not(None))
+                .where(OBDBundle.state == OBDBundleState.STORED.value)
+                .order_by(OBDBundle.verified_at.desc(), OBDBundle.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    last_completed = (
+        (
+            await session.execute(
+                select(OBDBundle)
+                .where(OBDBundle.state == OBDBundleState.STORED.value)
                 .order_by(OBDBundle.drive_finished_at.desc(), OBDBundle.id.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    importing = (
-        (
-            await session.execute(
-                select(OBDBundle)
-                .where(OBDBundle.state == OBDBundleState.IMPORTING.value)
-                .order_by(OBDBundle.drive_started_at.asc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    last_imported = (
-        (
-            await session.execute(
-                select(OBDBundle)
-                .where(OBDBundle.state == OBDBundleState.IMPORTED.value)
-                .order_by(OBDBundle.imported_at.desc())
                 .limit(1)
             )
         )
@@ -593,35 +562,14 @@ async def obd_status(session: SessionDep) -> dict[str, object]:
         .scalars()
         .first()
     )
-    since = datetime.now(UTC) - timedelta(hours=1)
-    imported_last_hour = int(
-        (
-            await session.execute(
-                select(func.count(OBDBundle.id)).where(OBDBundle.imported_at >= since)
-            )
-        ).scalar()
-        or 0
-    )
-    auth, auth_error = await asyncio.to_thread(configuration_status)
-    waiting = sum(
-        counts.get(item.value, 0)
-        for item in (
-            OBDBundleState.READY_TO_IMPORT,
-            OBDBundleState.RETRY_WAIT,
-            OBDBundleState.IMPORTING,
-        )
-    )
     transfer = get_obd_transfer_status().snapshot()
     return {
         **transfer,
         "event_stream": get_logger_event_status().snapshot(),
-        "home_assistant_authentication": auth,
-        "home_assistant_configuration_error": auth_error,
         "counts": counts,
-        "waiting_for_home_assistant": waiting,
-        "current_import": importing.filename if importing else None,
-        "last_completed_drive": _bundle(latest) if latest else None,
-        "imported_drive_count": counts.get(OBDBundleState.IMPORTED.value, 0),
+        "last_stored_drive": _bundle(last_stored) if last_stored else None,
+        "last_completed_drive": _bundle(last_completed) if last_completed else None,
+        "stored_drive_count": counts.get(OBDBundleState.STORED.value, 0),
         "duplicate_count": int(
             (
                 await session.execute(
@@ -632,14 +580,7 @@ async def obd_status(session: SessionDep) -> dict[str, object]:
         ),
         "failed_count": counts.get(OBDBundleState.FAILED.value, 0)
         + counts.get(OBDBundleState.QUARANTINED.value, 0),
-        "last_successful_home_assistant_sync": (
-            last_imported.imported_at.isoformat()
-            if last_imported and last_imported.imported_at
-            else None
-        ),
-        "last_import_error": last_error.last_error if last_error else None,
-        "imports_last_hour": imported_last_hour,
-        "worker_running": get_import_worker().running,
+        "last_storage_error": last_error.last_error if last_error else None,
     }
 
 
@@ -710,7 +651,7 @@ async def list_logger_events(
     }
 
 
-@router.get("/bundles", summary="List durable OBD import queue rows")
+@router.get("/bundles", summary="List durable OBD bundle records")
 async def list_bundles(
     session: SessionDep,
     page: PaginationDep,
@@ -754,14 +695,12 @@ async def validate_one(bundle_id: RowId, session: SessionDep) -> dict[str, objec
         OBDBundleState.WAITING_FOR_BACKUP.value,
         OBDBundleState.COPYING.value,
         OBDBundleState.VALIDATING.value,
-        OBDBundleState.IMPORTING.value,
     }:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            "The bundle is currently being copied, validated, or imported",
+            "The bundle is currently being copied or validated",
         )
     original_state = row.state
-    original_next_attempt_at = row.next_attempt_at
     try:
         path = bundle_path_for(row)
     except (BundleError, OSError) as exc:
@@ -769,10 +708,9 @@ async def validate_one(bundle_id: RowId, session: SessionDep) -> dict[str, objec
         path = None
     else:
         path_error = None
-    # Claim with a committed compare-and-swap before touching the filesystem. A queue
-    # worker racing this endpoint can now either claim READY first or observe VALIDATING,
-    # never move/post the same bytes concurrently.
-    async with queue_claim_lock():
+    # Claim with a committed compare-and-swap before touching the filesystem. This keeps
+    # concurrent validation requests from moving or checking the same bytes at once.
+    async with storage_claim_lock():
         claimed = await session.execute(
             update(OBDBundle)
             .where(OBDBundle.id == bundle_id, OBDBundle.state == original_state)
@@ -792,7 +730,6 @@ async def validate_one(bundle_id: RowId, session: SessionDep) -> dict[str, objec
         row.state = OBDBundleState.FAILED.value
         row.failure_kind = "local_path"
         row.last_error = redact(path_error)
-        row.next_attempt_at = None
         row.updated_at = utcnow()
         return {"valid": False, "bundle": _bundle(row)}
     was_quarantined = original_state == OBDBundleState.QUARANTINED.value
@@ -818,7 +755,6 @@ async def validate_one(bundle_id: RowId, session: SessionDep) -> dict[str, objec
             # crash must leave recovery with either quarantine+trusted or verified+trusted.
             row = await store_validated_bundle(session, checked)
             row.state = OBDBundleState.VALIDATING.value
-            row.next_attempt_at = None
             row.updated_at = utcnow()
             await session.commit()
         except BundleError as exc:
@@ -836,25 +772,21 @@ async def validate_one(bundle_id: RowId, session: SessionDep) -> dict[str, objec
             await asyncio.to_thread(restore_from_quarantine, path)
         except (BundleError, OSError) as exc:
             row.state = OBDBundleState.QUARANTINED.value
-            row.next_attempt_at = None
             row.failure_kind = "quarantine_io"
             row.last_error = redact(exc)
             return {"valid": False, "bundle": _bundle(row)}
-        row.state = OBDBundleState.READY_TO_IMPORT.value
-        row.next_attempt_at = utcnow()
+        row.state = OBDBundleState.STORED.value
         row.failure_kind = None
         row.last_error = None
     elif was_untrusted:
         # The trusted history was committed above while the row remained claimed. A
         # non-quarantined rejected copy is already in the verified directory, so only
         # the final durable queue transition remains.
-        row.state = OBDBundleState.READY_TO_IMPORT.value
-        row.next_attempt_at = utcnow()
+        row.state = OBDBundleState.STORED.value
         row.failure_kind = None
         row.last_error = None
     elif row.state == OBDBundleState.VALIDATING.value:
         row.state = original_state
-        row.next_attempt_at = original_next_attempt_at
         row.updated_at = utcnow()
     drive = (
         await session.execute(select(OBDDrive).where(OBDDrive.bundle_id == row.id))
@@ -865,71 +797,12 @@ async def validate_one(bundle_id: RowId, session: SessionDep) -> dict[str, objec
             drive,
             summary_source=checked.summary_source,
         )
-    # Publish the final state before waking the worker. Besides avoiding a missed wake,
-    # this is the second half of the filesystem/database promotion protocol: if this
-    # commit fails after a quarantine move, startup recovery sees verified+trusted while
-    # the last durable state is VALIDATING and safely requeues it.
+    # Commit the final state after filesystem promotion. A crash while VALIDATING leaves
+    # the verified bytes and trusted metadata available for deliberate revalidation.
     await session.commit()
-    get_import_worker().wake()
     return {"valid": True, "bundle": _bundle(row)}
 
 
-@router.post("/bundles/{bundle_id}/retry", summary="Retry one failed HA import")
-async def retry_one(bundle_id: RowId, session: SessionDep) -> dict[str, object]:
-    row = await session.get(OBDBundle, bundle_id)
-    if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "OBD bundle was not found")
-    if row.state == OBDBundleState.IMPORTED.value:
-        return {"queued": False, "already_imported": True, "bundle": _bundle(row)}
-    if row.state in {
-        OBDBundleState.WAITING_FOR_BACKUP.value,
-        OBDBundleState.COPYING.value,
-        OBDBundleState.VALIDATING.value,
-        OBDBundleState.IMPORTING.value,
-    }:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "The bundle is currently being copied, validated, or imported",
-        )
-    if row.state == OBDBundleState.QUARANTINED.value:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "Validate the quarantined copy successfully before retrying it",
-        )
-    if row.verified_at is None:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Bundle has no verified server copy")
-    original_state = row.state
-    now = utcnow()
-    async with queue_claim_lock():
-        claimed = await session.execute(
-            update(OBDBundle)
-            .where(OBDBundle.id == bundle_id, OBDBundle.state == original_state)
-            .values(
-                state=OBDBundleState.READY_TO_IMPORT.value,
-                next_attempt_at=now,
-                import_started_at=None,
-                last_error=None,
-                failure_kind=None,
-                last_http_status=None,
-                updated_at=now,
-            )
-        )
-        if not claimed.rowcount:
-            await session.rollback()
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                "The bundle changed state before retry could claim it",
-            )
-        await session.commit()
-    row = await session.get(OBDBundle, bundle_id, populate_existing=True)
-    if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "OBD bundle was not found")
-    get_import_worker().wake()
-    return {"queued": True, "bundle": _bundle(row)}
-
-
-@router.post("/queue/rebuild", summary="Rebuild missing OBD queue rows safely")
-async def rebuild() -> dict[str, int]:
-    result = await rebuild_queue()
-    get_import_worker().wake()
-    return result
+@router.post("/storage/rebuild", summary="Register orphaned OBD bundles safely")
+async def rebuild_storage() -> dict[str, int]:
+    return await reconcile_orphan_bundles()

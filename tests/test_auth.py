@@ -216,7 +216,7 @@ class TestSigningIn:
 
 
 class TestApiClients:
-    """Home Assistant polls the ingest sensor and cannot hold a cookie."""
+    """External monitors poll ingest status and cannot hold a cookie."""
 
     @pytest.fixture
     async def secured(self, client):
@@ -547,7 +547,7 @@ class TestTheApiKey:
         assert response.status_code == 200
 
     async def test_a_configured_key_is_accepted_as_a_header(self, secured):
-        """The form a script or a Home Assistant sensor should use instead."""
+        """The form a script or external monitor should use instead."""
         await self._set_key(secured, self.KEY)
 
         response = await secured.get("/api/status", headers={"X-API-Key": self.KEY})

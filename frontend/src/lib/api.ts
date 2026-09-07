@@ -160,7 +160,7 @@ export interface ScanResult {
   errorMessage: string | null
 }
 
-/** Live progress of a pull off the head unit. Also the Home Assistant REST sensor shape. */
+/** Live progress of a pull from the head unit. */
 export interface IngestStatus {
   state:
     | 'disabled'
@@ -174,7 +174,7 @@ export interface IngestStatus {
     | 'cancelled'
   /**
    * Where a running transfer currently is. Separate from `state`, which says how a run
-   * *ended* and is also what the Home Assistant sensor publishes.
+   * ended.
    */
   phase: 'idle' | 'connecting' | 'scanning' | 'preparing' | 'transferring' | 'verifying'
   unitOnline: boolean
@@ -313,7 +313,7 @@ export interface OBDLoggerStatus {
     | 'unowned'
     | 'dashcam_voltage_only'
     | 'dashcam_full_obd'
-    | 'home_assistant_voltage_only'
+    | 'external_obd_client_voltage_only'
     | 'phone_reserved'
     | 'transitioning'
     | 'conflict_detected'
@@ -354,13 +354,9 @@ export interface OBDBundle {
   diagnosticCount: number
   metadataTrusted: boolean
   state: string
-  attempts: number
-  nextAttemptAt: string | null
   lastError: string | null
   failureKind: string | null
-  lastHttpStatus: number | null
   verifiedAt: string | null
-  importedAt: string | null
   duplicate: boolean
   warnings: string[]
 }
@@ -415,10 +411,10 @@ export interface OBDDriveSummary {
   bundleDownloadUrl: string | null
   exportStatus: string
   backupStatus: string
+  storageStatus: string
   copiedAt: string | null
+  storedAt: string | null
   verifiedAt: string | null
-  importedAt: string | null
-  importState: string
   bundleError: string | null
   validationWarnings: string[]
   gapAnalysis?: OBDGapAnalysis | null
@@ -588,19 +584,13 @@ export interface OBDStatus {
   lastCopyAt: string | null
   lastCopyError: string | null
   copyThroughputMbs: number
-  homeAssistantAuthentication: 'configured' | 'invalid' | 'not_configured'
-  homeAssistantConfigurationError: string | null
   counts: Record<string, number>
-  waitingForHomeAssistant: number
-  currentImport: string | null
+  storedDriveCount: number
+  lastStoredDrive: OBDBundle | null
   lastCompletedDrive: OBDBundle | null
-  importedDriveCount: number
+  lastStorageError: string | null
   duplicateCount: number
   failedCount: number
-  lastSuccessfulHomeAssistantSync: string | null
-  lastImportError: string | null
-  importsLastHour: number
-  workerRunning: boolean
 }
 
 export interface OBDLoggerEvent {
@@ -779,17 +769,10 @@ export const api = {
       ),
     validate: (id: number) =>
       post<{ valid: boolean; bundle: OBDBundle }>(`/obd/bundles/${id}/validate`),
-    retry: (id: number) =>
-      post<{ queued: boolean; alreadyImported?: boolean; bundle: OBDBundle }>(
-        `/obd/bundles/${id}/retry`,
+    rebuildStorage: () =>
+      post<{ registered: number; duplicates: number; quarantined: number }>(
+        '/obd/storage/rebuild',
       ),
-    rebuild: () =>
-      post<{
-        recoveredImports: number
-        registered: number
-        duplicates: number
-        quarantined: number
-      }>('/obd/queue/rebuild'),
   },
 
   settings: {

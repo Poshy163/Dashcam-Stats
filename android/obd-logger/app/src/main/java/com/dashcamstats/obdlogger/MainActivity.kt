@@ -99,7 +99,7 @@ class MainActivity : Activity() {
             inputType = InputType.TYPE_CLASS_NUMBER
         }
         ownership = CheckBox(this).apply {
-            text = "I explicitly transferred adapter ownership from Home Assistant and phones"
+            text = "I explicitly transferred adapter ownership from every other BLE client"
             isChecked = current.ownershipTransferred
         }
         enabled = CheckBox(this).apply {

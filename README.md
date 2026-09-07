@@ -53,9 +53,8 @@ interval, detection thresholds, retention limits, map tiles — is on the Settin
 
 Core deployment variables are `DASHCAM_DATA_DIR`, `DASHCAM_FOOTAGE_DIR`, `DASHCAM_PORT`,
 `DASHCAM_LOG_LEVEL` and `TZ`. Sign-in remains a UI setting. The optional dashcam OBD
-pipeline adds only Home Assistant's URL, import path and a **token-file path**; the token
-itself is a Docker secret and is never a setting or database value. See
-[OBD server import](docs/obd-server-import.md).
+pipeline needs no external service: verified bundles and their full-resolution sample
+history are retained in `/data`. See [OBD server import](docs/obd-server-import.md).
 
 **Set `TZ` before the first scan.** The dashcam writes local wall-clock time into its
 filenames and burns it into the picture, with no zone attached, so `TZ` is what decides
@@ -253,21 +252,20 @@ What that means in practice:
 Transferred files land in the same directory the scanner already watches, so they are
 analysed like anything else with no further configuration.
 
+The backup subsystem can send generic lifecycle webhooks and publish status to an MQTT
+broker. Both are optional settings under **Backup / Ingest**. MQTT uses ordinary
+state topics; it does not publish platform-specific discovery configuration.
+
 ### OBD-II drive bundles
 
 The optional Android companion can publish an atomic OBD bundle beside its redacted
 `status.json`. The arrival backup validates and stores five-second driving-critical samples
 (RPM, speed and load), with the remaining engine values rotated at a lower cadence, in the
-analytics database before deleting the dashcam copy. Home Assistant delivery uses a
-separate persistent queue, so an unavailable or misconfigured HA instance cannot fail or
-delay footage backup. The Backup page shows logger ownership/state, pending copies,
-validation failures and HA retries. Setup, secret handling, recovery and API controls are
+analytics database before deleting the dashcam copy. The Backup page shows logger
+ownership/state, pending copies, validation failures and retained history. Setup,
+recovery and API controls are
 in [docs/obd-server-import.md](docs/obd-server-import.md); the companion and ownership
 cutover are in [docs/obd-dashcam-logger.md](docs/obd-dashcam-logger.md).
-
-Home Assistant integration — a REST sensor, a webhook for phone notifications, and
-optional MQTT discovery — is documented with copy-paste config in
-[`examples/homeassistant/`](examples/homeassistant/README.md).
 
 **First run:** the head unit authorises an ADB *key*, so the first connection puts an
 "Allow USB debugging?" prompt on the dashcam's own screen. Accept it with "always allow"
@@ -316,7 +314,7 @@ to delete.** `/data` is never a deletion target. This behaviour has dedicated te
 ## API
 
 A REST API backs the whole UI, documented at `/api/docs` (OpenAPI at `/api/openapi.json`),
-so Home Assistant or anything else can query it.
+so other tools can query it.
 
 ```
 GET  /health                      liveness + component health, used by the Docker healthcheck
@@ -333,15 +331,13 @@ GET  /api/plates?q=ABC            full or partial plate search
 GET  /api/plates/{id}/observations every sighting, with location and confidence
 GET  /api/vehicles                vehicle sightings
 GET  /api/jobs                    queue state; pause, resume, retry, cancel
-GET  /api/ingest/status           live backup progress — also the Home Assistant sensor source
+GET  /api/ingest/status           live backup progress
 POST /api/ingest/run              pull from the head unit now
 POST /api/ingest/cancel           stop the running transfer
 GET  /api/ingest/history          past transfers
-GET  /api/obd/status              logger, verified-copy and Home Assistant queue health
-GET  /api/obd/bundles             durable OBD bundle/import rows (optional state filter)
+GET  /api/obd/status              logger and verified-copy health
+GET  /api/obd/bundles             durable OBD bundle rows (optional state filter)
 POST /api/obd/bundles/{id}/validate revalidate the retained copy; quarantine on failure
-POST /api/obd/bundles/{id}/retry  retry a verified failed Home Assistant import
-POST /api/obd/queue/rebuild       recover claims and register orphan verified copies
 GET  /api/settings                the settings catalogue and current values
 POST /api/scan                    scan now
 POST /api/retention/plan          evaluate retention (report-only unless enabled)
@@ -376,7 +372,7 @@ A few things that are deliberate rather than incidental:
   hostname going live and a password existing, the app is open — including to whoever
   would like to set the password themselves. Changing an existing account works from
   anywhere, with the current password.
-* **API clients keep working.** Home Assistant's REST sensor and `curl` cannot hold a
+* **API clients keep working.** Scripts and `curl` cannot hold a
   cookie, so the same username and password are accepted as HTTP Basic on `/api/*`.
 * **`/health` stays open.** The Docker healthcheck calls it with no credentials, and a 401
   there would restart the container forever. While sign-in is on it returns a bare status

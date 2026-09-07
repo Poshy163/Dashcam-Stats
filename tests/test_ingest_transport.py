@@ -454,7 +454,7 @@ class TestSingleFlight:
 
 
 class TestTheStatusSnapshot:
-    """One snapshot feeds the API, the UI, Home Assistant's sensor and the webhook."""
+    """One snapshot feeds the API, the UI and the webhook."""
 
     def test_it_carries_everything_the_sensor_needs(self):
         from app.ingest.models import DeltaPlan
@@ -490,7 +490,7 @@ class TestTheStatusSnapshot:
             "last_success_ts",
             "last_error",
         ):
-            assert key in snapshot, f"the Home Assistant REST sensor reads {key}"
+            assert key in snapshot, f"external status clients read {key}"
         assert snapshot["files_total"] == 2
         assert snapshot["files_done"] == 1
         assert snapshot["bytes_total"] == 3000
@@ -1052,7 +1052,7 @@ class TestLearningTheAddressFromTheDashboard:
         origin.reset_for_tests()
 
     async def test_an_api_call_never_teaches_it_an_address(self, client):
-        """Home Assistant polls this app under whatever name *it* was configured with.
+        """External monitors poll this app under whatever name they were configured with.
 
         Usually a container name or a Docker-internal host that nothing in a car could
         resolve, and inheriting it would send the head unit somewhere unreachable while
@@ -1210,7 +1210,7 @@ class TestTheLiveNumbers:
         assert status.snapshot()["files_done"] == 1
 
     def test_the_phase_leaves_the_state_the_sensor_reads_alone(self):
-        """`state` is the Home Assistant contract and keeps exactly its old meaning."""
+        """`state` is the public API contract and keeps exactly its old meaning."""
         from app.ingest.models import Phase
         from app.ingest.status import IngestStatus
 

@@ -1,7 +1,7 @@
 """Value types for the head-unit ingest.
 
-Deliberately plain dataclasses with no database or HTTP in them: the puller, the API, the
-Home Assistant reporter and the tests all speak this vocabulary, and keeping it free of
+Deliberately plain dataclasses with no database or HTTP in them: the puller, the API,
+event reporters and tests all speak this vocabulary, and keeping it free of
 SQLAlchemy is what lets the whole transport be tested without a device or a session.
 """
 
@@ -21,7 +21,7 @@ class UnitState(str, Enum):
 
 
 class RunState(str, Enum):
-    """The state a pull ended in, and the state the UI/Home Assistant display."""
+    """The state a pull ended in and the state external consumers display."""
 
     DISABLED = "disabled"
     IDLE = "idle"
@@ -39,7 +39,7 @@ class Phase(str, Enum):
 
     Separate from :class:`RunState` rather than folded into it, because the two answer
     different questions and one of them is already load-bearing: ``RunState`` is what the
-    Home Assistant sensor, the webhook and MQTT publish, so adding "scanning" to it would
+    API clients, the webhook and MQTT publish, so adding "scanning" to it would
     change an established contract to say something those consumers never asked about.
     ``RunState.RUNNING`` stays exactly as broad as it was; this says which part of it.
 

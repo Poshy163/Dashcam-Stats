@@ -118,7 +118,7 @@ export default function Settings() {
     <div className="space-y-4 pb-24">
       <PageHeader
         title="Settings"
-        subtitle="Changes take effect immediately — the container does not need restarting."
+        subtitle="Saved changes take effect without restarting the container."
       />
 
       <div className="grid gap-5 md:grid-cols-[13rem_minmax(0,1fr)]">
@@ -413,6 +413,11 @@ function Field({
   onReset: () => void
 }) {
   const [pendingDangerous, setPendingDangerous] = useState<unknown>(undefined)
+  const controlId = `setting-${setting.key.replace(/[^a-zA-Z0-9_-]/g, '-')}`
+  const labelId = `${controlId}-label`
+  const descriptionId = setting.description ? `${controlId}-description` : undefined
+  const errorId = error ? `${controlId}-error` : undefined
+  const describedBy = [descriptionId, errorId].filter(Boolean).join(' ') || undefined
 
   const change = (next: unknown) => {
     if (setting.dangerous && (next === true || next === 'delete')) {
@@ -425,10 +430,10 @@ function Field({
 
   const label = (
     <div className="flex flex-wrap items-baseline gap-2">
-      <span className="label">{setting.label}</span>
+      <span className="label" id={labelId}>{setting.label}</span>
       {setting.unit && <span className="text-2xs text-content-faint">({setting.unit})</span>}
       {setting.is_default === false && (
-        <button className="text-2xs text-content-faint hover:text-accent" onClick={onReset}>
+        <button type="button" className="text-2xs text-content-faint hover:text-accent" onClick={onReset}>
           reset to default
         </button>
       )}
@@ -442,6 +447,9 @@ function Field({
         return (
           <label className="flex items-center gap-2 text-sm">
             <input
+              id={controlId}
+              aria-labelledby={labelId}
+              aria-describedby={describedBy}
               type="checkbox"
               checked={checked}
               disabled={disabled}
@@ -454,6 +462,9 @@ function Field({
       case 'select':
         return (
           <select
+            id={controlId}
+            aria-labelledby={labelId}
+            aria-describedby={describedBy}
             className="input"
             value={String(value ?? '')}
             disabled={disabled}
@@ -469,6 +480,9 @@ function Field({
       case 'bytes':
         return (
           <input
+            id={controlId}
+            aria-labelledby={labelId}
+            aria-describedby={describedBy}
             type="number"
             className="input"
             value={Number(value ?? 0)}
@@ -483,6 +497,9 @@ function Field({
         return (
           <div className="flex gap-2">
             <input
+              id={controlId}
+              aria-labelledby={labelId}
+              aria-describedby={describedBy}
               type="text"
               className="input"
               value={String(value ?? '')}
@@ -509,7 +526,7 @@ function Field({
   return (
     <div className={cn('space-y-1', disabled && 'opacity-50')}>
       {label}
-      {setting.description && <p className="hint">{setting.description}</p>}
+      {setting.description && <p className="hint" id={descriptionId}>{setting.description}</p>}
       <div className="max-w-md">{control()}</div>
       {pendingDangerous !== undefined && (
         <div className="max-w-md rounded border border-state-error/40 p-2 text-xs">
@@ -539,7 +556,7 @@ function Field({
       {disabled && setting.requires && (
         <p className="text-2xs text-content-faint">Requires “{setting.requires}” to be enabled.</p>
       )}
-      {error && <p className="text-xs text-state-error">{error}</p>}
+      {error && <p className="text-xs text-state-error" id={errorId}>{error}</p>}
     </div>
   )
 }

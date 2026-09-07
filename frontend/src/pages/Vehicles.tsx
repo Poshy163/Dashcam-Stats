@@ -7,6 +7,8 @@ import { api, mediaUrl } from '@/lib/api'
 import { formatDateTime } from '@/lib/format'
 
 const CLASSES = ['', 'car', 'truck', 'bus', 'motorcycle']
+const classLabelText = (value: string) =>
+  value ? value.charAt(0).toUpperCase() + value.slice(1) : 'All types'
 
 export default function Vehicles() {
   const [params, setParams] = useSearchParams()
@@ -53,7 +55,7 @@ export default function Vehicles() {
           >
             {CLASSES.map((c) => (
               <option key={c} value={c}>
-                {c || 'All types'}
+                {classLabelText(c)}
               </option>
             ))}
           </select>

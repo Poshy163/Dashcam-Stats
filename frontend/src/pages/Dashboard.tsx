@@ -82,7 +82,7 @@ export default function Dashboard() {
       <SystemStatus
         active={processing.processing}
         waiting={processing.pending}
-        failed={processing.failed}
+        needsAttention={hasAttention}
       />
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4 lg:gap-4">
@@ -109,13 +109,13 @@ export default function Dashboard() {
             <div>
               <div className="hud-tag">
                 <span className="h-1.5 w-1.5 rounded-full bg-cyan animate-pulse"></span>
-                CAN-BUS TELEMETRY PIPELINE
+                Analysis status
               </div>
-              <h2 className="section-title mt-1">Library Analysis Index</h2>
+              <h2 className="section-title mt-1">Library analysis</h2>
               <p className="mt-0.5 text-xs font-mono text-content-muted">Processing status across indexed recordings</p>
             </div>
             <Link to="/queue" className="font-mono text-xs font-bold text-accent hover:underline flex items-center gap-1">
-              OPEN QUEUE <ArrowIcon />
+              Open queue <ArrowIcon />
             </Link>
           </div>
 
@@ -124,7 +124,7 @@ export default function Dashboard() {
               <div className="grid h-full w-full place-items-center rounded-full bg-surface-raised text-center shadow-inner border border-border">
                 <div>
                   <div className="tabular font-mono text-3xl font-black tracking-tight">{processTotal.toLocaleString()}</div>
-                  <div className="mt-0.5 font-mono text-2xs uppercase tracking-wider text-content-muted">CLIPS INDEXED</div>
+                  <div className="mt-0.5 font-mono text-2xs uppercase tracking-wider text-content-muted">Clips indexed</div>
                 </div>
               </div>
             </div>
@@ -142,7 +142,7 @@ export default function Dashboard() {
                 <ProgressMetric color="bg-accent-muted border border-accent/40" value={processing.recordingsToday} label="Added today" />
               </div>
               <div className="mt-5 rounded-lg border border-border/80 bg-surface-sunken/80 px-4 py-3 font-mono text-xs text-content-muted flex items-center justify-between">
-                <span>ANALYSIS THROUGHPUT:</span>
+                <span>Analysis throughput</span>
                 {processing.throughputPerHour === null ? (
                   <span className="text-content-faint">Calibrating…</span>
                 ) : (
@@ -158,9 +158,9 @@ export default function Dashboard() {
             <div>
               <div className="hud-tag">
                 <span className="h-1.5 w-1.5 rounded-full bg-accent"></span>
-                NVME / STORAGE HUD
+                Storage
               </div>
-              <h2 className="section-title mt-1">Footage Capacity</h2>
+              <h2 className="section-title mt-1">Footage capacity</h2>
               <p className="mt-0.5 text-xs font-mono text-content-muted">Dashcam footage library</p>
             </div>
             <span className="grid h-11 w-11 place-items-center rounded-xl border border-accent/30 bg-accent/10 text-accent shadow-sm"><StorageIcon /></span>
@@ -173,7 +173,7 @@ export default function Dashboard() {
               </div>
               <span className="tabular font-mono text-sm font-bold text-accent">{Math.round(storagePct * 100)}%</span>
             </div>
-            <ProgressBar value={storagePct} className="mt-4" />
+            <ProgressBar value={storagePct} label="Footage capacity used" className="mt-4" />
             <div className="mt-2 font-mono text-2xs text-content-muted">Capacity limit: {formatBytes(storage.limitBytes)}</div>
           </div>
           <div className="mt-6 rounded-lg border border-border bg-surface-sunken/70 p-3 text-xs font-mono leading-relaxed text-content-muted">
@@ -184,7 +184,7 @@ export default function Dashboard() {
             )}
           </div>
           <Link to="/settings" className="mt-4 inline-flex items-center gap-1.5 font-mono text-xs font-bold text-accent hover:underline">
-            MANAGE STORAGE <ArrowIcon />
+            Manage storage <ArrowIcon />
           </Link>
         </section>
       </div>
@@ -202,7 +202,7 @@ export default function Dashboard() {
                   <div>
                     <div className="hud-tag">
                       <span className="h-1.5 w-1.5 rounded-full bg-accent animate-ping"></span>
-                      LATEST RUN TELEMETRY
+                      Latest journey
                     </div>
                     <h2 className="mt-1 font-mono text-xl font-black tracking-tight">{formatDateTime(latestJourney.startedAt)}</h2>
                     <p className="mt-0.5 font-mono text-xs text-content-muted">{latestJourney.recordingCount} recordings · Trip #{latestJourney.id}</p>
@@ -230,9 +230,9 @@ export default function Dashboard() {
             <div>
               <div className="hud-tag">
                 <span className="h-1.5 w-1.5 rounded-full bg-cyan"></span>
-                DIAGNOSTIC STATUS
+                Diagnostics
               </div>
-              <h2 className="section-title mt-1">System Health</h2>
+              <h2 className="section-title mt-1">System health</h2>
             </div>
             <span className={`h-2.5 w-2.5 rounded-full ${hasAttention ? 'bg-state-warn shadow-glow-orange' : 'bg-state-ok shadow-[0_0_8px_rgba(16,210,130,0.6)]'}`} />
           </div>
@@ -248,21 +248,21 @@ export default function Dashboard() {
           ) : (
             <div className="mt-5 flex items-center gap-3 rounded-lg border border-state-ok/30 bg-state-ok/10 p-4 text-xs font-mono text-state-ok">
               <CheckIcon />
-              <span><strong className="font-bold">ALL SYSTEMS NOMINAL.</strong> No alerts active.</span>
+              <span><strong className="font-bold">No alerts.</strong> Available features are operating normally.</span>
             </div>
           )}
           <div className="mt-5 border-t border-border/80 pt-4 font-mono text-xs text-content-muted space-y-2">
             <div className="flex justify-between gap-3">
-              <span>ECU / CPU</span>
+              <span>Processor</span>
               <span className="truncate font-bold text-content">{hardware.cpu.model ?? 'Multi-Core'}</span>
             </div>
             <div className="flex justify-between gap-3">
-              <span>VISION ACCELERATOR</span>
+              <span>Inference</span>
               <span className="truncate font-bold text-cyan">{hardware.gpu.name ?? 'OpenVINO Device'}</span>
             </div>
             <div className="flex justify-between gap-3">
-              <span>CODEC ENGINE</span>
-              <span className="font-bold text-content">{hardware.decode.hardwareDecode ? 'VAAPI / QSV Hardware' : 'Software'}</span>
+              <span>Video decoding</span>
+              <span className="font-bold text-content">{hardware.decode.hardwareDecode ? 'Hardware accelerated' : 'Software'}</span>
             </div>
           </div>
         </section>
@@ -309,8 +309,8 @@ function friendlyStage(stage: string) {
   return stage.replace(/_/g, ' ').replace(/^./, (letter) => letter.toUpperCase())
 }
 
-function SystemStatus({ active, waiting, failed }: { active: number; waiting: number; failed: number }) {
-  const healthy = failed === 0
+function SystemStatus({ active, waiting, needsAttention }: { active: number; waiting: number; needsAttention: boolean }) {
+  const healthy = !needsAttention
   return (
     <section className={`relative flex flex-wrap items-center gap-4 rounded-xl border p-4 sm:px-5 overflow-hidden ${healthy ? 'border-state-ok/40 bg-state-ok/[0.06]' : 'border-state-warn/40 bg-state-warn/[0.08]'}`}>
       <div className={`absolute top-0 left-0 right-0 h-[1px] bg-gradient-to-r from-transparent ${healthy ? 'via-state-ok/60' : 'via-state-warn/60'} to-transparent`} />
@@ -319,13 +319,13 @@ function SystemStatus({ active, waiting, failed }: { active: number; waiting: nu
       </span>
       <div className="min-w-0 flex-1 font-mono">
         <h2 className={`text-xs sm:text-sm font-bold tracking-wider uppercase ${healthy ? 'text-state-ok' : 'text-state-warn'}`}>
-          {healthy ? (active > 0 ? 'TELEMETRY PIPELINE RUNNING · PROCESSING ACTIVE' : 'INSTRUMENT CLUSTER READY · ALL SYSTEMS NOMINAL') : 'SYSTEM ALERT · ATTENTION REQUIRED'}
+          {healthy ? (active > 0 ? 'Analysis is running' : 'All systems operational') : 'System needs attention'}
         </h2>
         <p className="mt-0.5 text-xs text-content-muted">
           {active > 0 ? `${active} stream${active === 1 ? '' : 's'} running · ${waiting} clips waiting` : `${waiting} recording${waiting === 1 ? '' : 's'} queued`}
         </p>
       </div>
-      <Link to="/queue" className="btn font-mono text-xs font-bold border-state-ok/40 hover:border-state-ok">VIEW QUEUE</Link>
+      <Link to="/queue" className="btn font-mono text-xs font-bold border-state-ok/40 hover:border-state-ok">View queue</Link>
     </section>
   )
 }

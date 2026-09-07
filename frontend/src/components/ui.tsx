@@ -14,12 +14,12 @@ export function PageHeader({
   actions?: ReactNode
 }) {
   return (
-    <div className="mb-7 flex flex-wrap items-start justify-between gap-4">
+    <div className="mb-7 flex flex-col items-stretch justify-between gap-4 sm:flex-row sm:items-start">
       <div className="min-w-0">
         <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">{title}</h1>
         {subtitle && <div className="mt-1.5 text-sm text-content-muted sm:text-base">{subtitle}</div>}
       </div>
-      {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
+      {actions && <div className="flex flex-wrap items-center gap-2 sm:justify-end">{actions}</div>}
     </div>
   )
 }
@@ -192,8 +192,10 @@ export function EmptyState({
   action?: ReactNode
 }) {
   return (
-    <div className="card flex flex-col items-center gap-2 px-6 py-16 text-center">
-      <div className="grid h-12 w-12 place-items-center rounded-full bg-accent-muted text-xl text-accent">·</div>
+    <div className="card flex flex-col items-center gap-2 px-6 py-16 text-center" role="status">
+      <div className="grid h-12 w-12 place-items-center rounded-full bg-accent-muted text-accent" aria-hidden="true">
+        <svg className="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M5 12h14M12 5v14" strokeLinecap="round" /></svg>
+      </div>
       <div className="mt-1 text-base font-semibold">{title}</div>
       {description && <div className="max-w-md text-sm text-content-muted">{description}</div>}
       {action && <div className="mt-2">{action}</div>}
@@ -204,7 +206,7 @@ export function EmptyState({
 export function ErrorState({ error, retry }: { error: unknown; retry?: () => void }) {
   const message = error instanceof Error ? error.message : 'Something went wrong'
   return (
-    <div className="card border-state-error/40 px-6 py-10 text-center">
+    <div className="card w-full border-state-error/40 px-6 py-10 text-center" role="alert">
       <div className="text-sm font-medium text-state-error">Could not load this page</div>
       <div className="mt-1 text-sm text-content-muted">{message}</div>
       {retry && (
@@ -231,7 +233,7 @@ export function Pagination({
     return <div className="tabular py-3 text-xs text-content-faint">{total} results</div>
   }
   return (
-    <div className="flex items-center justify-between gap-3 py-3">
+    <nav className="flex flex-wrap items-center justify-between gap-3 py-3" aria-label="Pagination">
       <div className="tabular text-xs text-content-faint">
         Page {page} of {pages} · {total} results
       </div>
@@ -243,14 +245,21 @@ export function Pagination({
           Next
         </button>
       </div>
-    </div>
+    </nav>
   )
 }
 
-export function ProgressBar({ value, className }: { value: number; className?: string }) {
+export function ProgressBar({ value, label, className }: { value: number; label: string; className?: string }) {
   const pct = Math.max(0, Math.min(100, value * 100))
   return (
-    <div className={cn('h-2.5 w-full overflow-hidden rounded-full bg-surface-sunken', className)}>
+    <div
+      className={cn('h-2.5 w-full overflow-hidden rounded-full bg-surface-sunken', className)}
+      role="progressbar"
+      aria-label={label}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={Math.round(pct)}
+    >
       <div
         className="h-full rounded-full bg-accent transition-[width] duration-500"
         style={{ width: `${pct}%` }}

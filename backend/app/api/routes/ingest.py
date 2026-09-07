@@ -1,8 +1,8 @@
 """Footage ingest: status, manual trigger, cancel and history.
 
 ``GET /api/ingest/status`` is deliberately plain and cheap. It is read by the Backup page
-every second and a half during a transfer *and* it is the Home Assistant REST sensor
-source, so it must answer from memory without touching the database or the head unit.
+every second and a half during a transfer and by external status clients, so it must
+answer from memory without touching the database or the head unit.
 """
 
 from __future__ import annotations
@@ -172,7 +172,7 @@ async def ingest_run() -> dict[str, object]:
     summary="Webhook trigger to start ingest on ignition off",
 )
 async def ingest_webhook(payload: IngestWebhookRequest | None = None) -> IngestWebhookResponse:
-    """Trigger ingest from an external client (e.g. Android OBD app, Home Assistant, Tasker).
+    """Trigger ingest from an external client (for example the Android OBD app or Tasker).
 
     Unlike /ingest/run, if a transfer is already running this returns 200 with already_running=True
     rather than 409 Conflict, so outbound webhooks do not log errors on duplicate notifications.

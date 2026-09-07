@@ -68,12 +68,6 @@ function ownerStatus(logger: OBDLoggerStatus): {
         hint: 'The dashcam owns BLE and may open a full OBD session after the voltage gate.',
         tone: 'ok',
       }
-    case 'home_assistant_voltage_only':
-      return {
-        label: 'Home Assistant',
-        hint: 'Home Assistant owns voltage-only BLE access; ECU state is reported separately.',
-        tone: 'ok',
-      }
     case 'phone_reserved':
       return {
         label: 'Phone reserved',
@@ -142,7 +136,7 @@ function ConnectionState({
   const hint = known ? (value ? activeHint : inactiveHint) : 'Requires logger status schema v4.'
 
   return (
-    <div className="rounded-xl border border-line/70 bg-surface-sunken/45 px-4 py-3">
+    <div className="rounded-xl border border-border/70 bg-surface-sunken/45 px-4 py-3">
       <div className="text-xs font-medium uppercase tracking-wide text-content-faint">{label}</div>
       <div className={cn('mt-1 text-base font-semibold', TONE_TEXT[tone])}>{stateLabel}</div>
       <div className="mt-1 text-xs leading-relaxed text-content-faint">{hint}</div>
@@ -182,7 +176,7 @@ export function ObdLoggerCard({
 
   return (
     <section className="card mb-6 overflow-hidden" aria-label="OBD logger live state">
-      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-line px-5 py-4">
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border px-5 py-4">
         <div>
           <h3 className="font-semibold">Live logger evidence</h3>
           <p className="mt-0.5 text-sm text-content-muted">
@@ -195,7 +189,7 @@ export function ObdLoggerCard({
       </div>
 
       <div className="grid gap-4 p-5 lg:grid-cols-2">
-        <div className="rounded-xl border border-line/70 p-4">
+        <div className="rounded-xl border border-border/70 p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="text-sm font-medium text-content-muted">Battery voltage at OBD port</div>
             <span className={cn('badge', TONE_BADGE[quality.tone])}>{quality.label}</span>
@@ -212,7 +206,7 @@ export function ObdLoggerCard({
           </p>
         </div>
 
-        <div className="rounded-xl border border-line/70 p-4">
+        <div className="rounded-xl border border-border/70 p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="text-sm font-medium text-content-muted">BLE owner (last report)</div>
             <span className={cn('badge', TONE_BADGE[owner.tone])}>{owner.label}</span>
@@ -272,7 +266,7 @@ export function ObdLoggerCard({
       </div>
 
       {adapterOnly && (
-        <div className="border-t border-line bg-accent-muted/35 px-5 py-3 text-sm text-content-muted">
+        <div className="border-t border-border bg-accent-muted/35 px-5 py-3 text-sm text-content-muted">
           <span className="font-medium text-content">Voltage-only adapter contact.</span> The ELM
           answered ATRV, while the full OBD session, ECU, and engine remain separate states.
         </div>

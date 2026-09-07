@@ -166,7 +166,7 @@ class ElmProtocolTest {
     }
 
     @Test
-    fun slowTierContinuityValuesMatchHomeAssistantDecoders() {
+    fun slowTierContinuityValuesMatchProtocolDecoders() {
         assertEquals(
             mapOf("oxygen_sensors_present" to listOf(1, 2, 8)),
             ElmProtocol.decode(0x13, byteArrayOf(0x83.toByte())),

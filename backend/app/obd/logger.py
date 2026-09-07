@@ -15,7 +15,7 @@ class LoggerState(str, Enum):
 
 
 class OwnershipNotTransferred(RuntimeError):
-    """Direct BLE remains owned by Home Assistant or a phone."""
+    """Direct BLE remains owned by another client or a phone."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +46,7 @@ class EngineGate:
     def enable(self) -> None:
         if not self.settings.ownership_transferred:
             raise OwnershipNotTransferred(
-                "turn off Home Assistant's OBD connection and stop phone scanners first"
+                "disconnect other OBD clients and stop phone scanners first"
             )
         self.state = LoggerState.PARKED
 

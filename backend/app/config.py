@@ -33,25 +33,6 @@ class AppConfig(BaseSettings):
     #: Escape hatch for tests and unusual deployments; normally left alone.
     database_url: str | None = None
 
-    # Home Assistant is the one deployment concern that deliberately does not live in
-    # the settings table.  The bearer token must never be returned by GET /api/settings,
-    # copied into the database backup, or cached into worker snapshots.  Only a path to a
-    # Docker secret is accepted.  The unprefixed aliases match Home Assistant's usual
-    # compose spelling; DASHCAM_* aliases keep this coherent with the existing config.
-    ha_url: str = Field(
-        default="",
-        validation_alias=AliasChoices("HA_URL", "DASHCAM_HA_URL"),
-    )
-    ha_token_file: Path = Field(
-        default=Path("/run/secrets/home_assistant_token"),
-        validation_alias=AliasChoices("HA_TOKEN_FILE", "DASHCAM_HA_TOKEN_FILE"),
-    )
-    ha_obd_import_path: str = Field(
-        default="/api/obd2_ble/import",
-        validation_alias=AliasChoices("HA_OBD_IMPORT_PATH", "DASHCAM_HA_OBD_IMPORT_PATH"),
-    )
-    ha_request_timeout_s: float = Field(default=30.0, ge=2.0, le=300.0)
-
     #: Atomic exports published by the companion logger.  Kept off the footage path so a
     #: missing/unmounted media share can never make OBD validation delete or overwrite
     #: footage (and vice versa).
@@ -77,9 +58,6 @@ class AppConfig(BaseSettings):
     obd_max_expanded_bytes: int = Field(default=32 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024)
     obd_max_compression_ratio: int = Field(default=200, ge=2, le=1000)
     obd_max_samples: int = Field(default=10000, ge=1, le=100000)
-    obd_import_poll_s: float = Field(default=5.0, ge=0.25, le=300.0)
-    obd_retry_base_s: float = Field(default=30.0, ge=1.0, le=86400.0)
-    obd_retry_max_s: float = Field(default=6 * 3600.0, ge=30.0, le=7 * 86400.0)
 
     # Authentication is deliberately absent from this file. It used to live here as
     # ``DASHCAM_AUTH_USERNAME``/``DASHCAM_AUTH_PASSWORD``, which meant the only way to put
@@ -89,7 +67,7 @@ class AppConfig(BaseSettings):
     # setting now, in ``app.core.settings_schema``, with the account in its own table. See
     # ``app.auth``.
 
-    @field_validator("data_dir", "footage_dir", "ha_token_file", mode="before")
+    @field_validator("data_dir", "footage_dir", mode="before")
     @classmethod
     def _expand(cls, v: object) -> object:
         if isinstance(v, str):

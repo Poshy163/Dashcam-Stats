@@ -138,7 +138,7 @@ in this test.
 ## Direct ignition-off webhook and GUI band display
 
 To complement the server's periodic presence and ACC polling, the Android companion app
-(`obd-logger`) and external automations (Home Assistant, Tasker) can explicitly notify the
+(`obd-logger`) and external automation clients can explicitly notify the
 server the moment ignition turns off or the device enters sleep:
 
 - **Endpoint:** `POST /api/ingest/webhook` (or `POST /api/ingest/run`)
@@ -148,4 +148,3 @@ server the moment ignition turns off or the device enters sleep:
   `already_running=true` if a run is already moving files rather than failing with 409 Conflict.
 - **GUI Display:** The Backup page GUI displays the live Wi-Fi band and frequency (e.g. `5 GHz • 5520 MHz`)
   across stat tiles and the active transfer progress card, verifying link speed at a glance.
-

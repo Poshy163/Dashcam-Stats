@@ -1,51 +1,17 @@
-# OBD bundle backup and Home Assistant import
+# OBD bundle backup and raw history
 
-The server treats OBD backup and Home Assistant delivery as two independent durable
-operations. A failed, offline or unauthorised Home Assistant instance never changes the
-result of a footage backup. The server retains the original verified archive plus the full
-full-resolution sample history (with five-second driving-critical values); Home Assistant receives a bounded final-sample identity,
-the newest non-null value and original UTC timestamp for each telemetry field, and at most
-744 UTC-hour statistics rows.
+The server collects immutable OBD bundles from the Android companion, validates them, and
+stores both the original archive and every sample in its own database. The five-second
+driving-critical values, slower telemetry tiers, diagnostic events, observation timestamps,
+and measured/derived provenance remain available through the OBD drives UI and API.
 
-The on-device companion and the one-owner BLE cutover are documented in
-[obd-dashcam-logger.md](obd-dashcam-logger.md). Do that ownership cutover before enabling
-the companion. Two clients must not share the ELM327 adapter.
-The strict archive/member/field contract is
+The companion and one-owner BLE cutover are documented in
+[obd-dashcam-logger.md](obd-dashcam-logger.md). The archive contract is
 [obd-bundle-schema-v1.md](obd-bundle-schema-v1.md).
 
-## Deployment configuration
+## Device paths
 
-Create a Home Assistant long-lived access token from the intended service account's profile
-and store only the token in a host file excluded from source control. Do not put it in the
-compose environment, the Dashcam Analyser settings API, a command line or this repository.
-
-```yaml
-services:
-  dashcam:
-    image: ghcr.io/poshy163/dashcam-analyser:latest
-    environment:
-      - HA_URL=http://homeassistant:8123
-      - HA_TOKEN_FILE=/run/secrets/home_assistant_token
-      - HA_OBD_IMPORT_PATH=/api/obd2_ble/import
-      # Override only if the removable-volume alias differs on the physical unit:
-      # - DASHCAM_OBD_REMOTE_DIR=/storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/ready
-      # - DASHCAM_OBD_STATUS_PATH=/storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/status.json
-      # - DASHCAM_OBD_REMOTE_RECEIPTS_DIR=/storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/receipts
-    secrets:
-      - home_assistant_token
-
-secrets:
-  home_assistant_token:
-    file: ./secrets/home_assistant_token
-```
-
-`HA_URL` may use plain HTTP only for a loopback, private/LAN, `.local`, or container host.
-Use HTTPS for a public DNS name. `HA_OBD_IMPORT_PATH` must remain an absolute `/api/...`
-path. The token file must be a regular non-symlink file, at most 16 KiB, and not writable by
-group or other users. Docker's read-only secret mount is accepted. Status, logs, database
-errors and API responses redact bearer values and never return the token.
-
-The default device paths are:
+The defaults are:
 
 ```text
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/ready
@@ -54,181 +20,82 @@ The default device paths are:
 /storage/Tfcard/Android/data/com.dashcamstats.obdlogger/files/obd/receipts
 ```
 
-Confirm all four through ADB on the physical unit before relying on an arrival window. Missing
-or malformed `status.json` is best-effort status only and never fails bundle or footage
-backup.
+Confirm all four through ADB on the physical unit before relying on an arrival window.
+`DASHCAM_OBD_REMOTE_DIR`, `DASHCAM_OBD_STATUS_PATH`,
+`DASHCAM_OBD_REMOTE_EVENTS_FILE`, and `DASHCAM_OBD_REMOTE_RECEIPTS_DIR` override them when
+the removable-volume alias differs. Missing or malformed status and event files fail soft;
+they never fail bundle or footage backup.
 
-`events.json` is a separate optional, atomic and size-bounded app-owned lifecycle snapshot. The
-server starts its read beside the card, bundle and status inventories on every visit, including
-an otherwise idle visit. Missing/invalid files fail soft; valid rows are code-and-number only,
-hashed, deduplicated by app-scoped random source plus sequence and retained independently of
-drive bundles. `DASHCAM_OBD_REMOTE_EVENTS_FILE` overrides the default path.
-
-`status.json` is also read at the start of every footage pull, whether or not a bundle is
-waiting. Schema v3 build identity (`app_version_name`, `app_version_code`,
-`poll_plan_version`, `build_git_sha`) is strictly bounded, redacted with the rest of the
-logger snapshot and passed through under `logger` by `/api/obd/status`; unknown fields remain
-dropped. While status reports `ownership_enabled: true` the pull leaves the unit's Bluetooth and
-hotspot alone instead of quieting them for transfer throughput — the logger owns that radio in
-every state, including `parked` and `backoff`, because voltage probing is how it notices the
-next engine start. A transient failed read never downgrades a previously observed positive
-ownership signal. Separately, a footage run that fails while the unit stays online is retried
-on a bounded backoff (15 s, 30 s, 60 s) within the same visit rather than waiting for the next
-offline/online edge, so one receive timeout cannot strand a ready bundle for a whole day.
+While `status.json` reports `ownership_enabled: true`, footage pulls leave Bluetooth and
+the hotspot alone in every logger state. The logger needs the radio while parked so it can
+probe voltage and notice the next engine start. A transient status read failure does not
+downgrade a previously observed positive ownership signal.
 
 ## Durable flow
 
-1. Inventory accepts only `<safe-drive-id>.obd2.zip`, ignores sibling `.partial` files and
-   copies oldest first into a unique `/data/obd/staging/.transfer-*.partial` directory.
-2. The server refuses links, unexpected/path-like/duplicate/encrypted/compressed ZIP
-   members, excessive sizes or compression ratios, invalid primary-payload hashes, unsafe
-   IDs and malformed primary JSON. It independently streams and bounds
-   `samples.ndjson.gz`. A missing or invalid derived `summary.json` is rebuilt from the
-   validated samples with an explicit warning; it cannot make primary history disappear.
-3. A valid archive is flushed and atomically renamed into `/data/obd/verified`. In one
-   database transaction the server adds its immutable identity, summary, diagnostics and
-   every high-resolution sample. Unique drive, sample ID and drive-sequence constraints make
-   replays idempotent. The manifest's non-negative drive `error_count` is retained alongside
-   the summary rather than inferred from sparse diagnostic events. A transaction failure
-   leaves no partial history.
-4. Only after the verified copy and transaction succeed does the server atomically publish
-   `receipts/<drive_id>.verified.json` on the dashcam. The strict receipt contains only
-   `schema_version`, `drive_id`, and the lowercase bundle SHA-256, is capped at 512 bytes,
-   and is read back before deletion. A receipt write/type/content/sync failure retains the
-   source archive. A same-name/size duplicate is also SHA-256 hashed on the device before
-   this fast path; a mismatch or unavailable remote hash command falls back to the bounded
-   copy/validation path. Immediately before deletion the server atomically renames the
-   current device pathname to a unique same-directory tombstone, hashes that isolated inode,
-   and deletes only that exact hash. A replacement that arrives before or after the rename is
-   retained. The server then may delete the proven source archive. Invalid bytes move to
-   `/data/obd/quarantine`; the device copy remains.
-   Even when the manifest cannot be trusted, a durable rejection row records the safe
-   filename, observed SHA-256, size and redacted error. It therefore remains in counts and
-   manual recovery after restart rather than becoming an untracked `.bad` file.
-5. The independent HA worker claims the oldest eligible drive and revalidates its retained
-   bytes. Its gzip JSON request uses `(drive_id, bundle_sha256, schema_version,
-   projection_version)` as the idempotency key. HTTP 404 during HA route startup, 408, 425,
-   429 (including HA's busy response), 5xx and transport failures use capped exponential
-   retry and `Retry-After`; other 4xx responses stop for operator action.
+1. Inventory accepts only `<safe-drive-id>.obd2.zip`, ignores `.partial` siblings, and
+   copies oldest first into a unique staging directory.
+2. Validation rejects links, unexpected or duplicate members, unsafe identifiers,
+   excessive sizes or compression ratios, bad hashes, and malformed JSON. A missing or
+   invalid derived summary is rebuilt from validated samples with a warning.
+3. A valid archive is flushed and atomically renamed under `/data/obd/verified`. One
+   database transaction stores its immutable identity, summary, diagnostics, and every
+   sample. Replays are idempotent and a failed transaction leaves no partial history.
+4. The server publishes a bounded receipt on the unit and reads it back in a separate ADB
+   round trip. Only an exact receipt and bundle hash permit deletion of the device copy.
+   Invalid bytes move to `/data/obd/quarantine`, while the device copy remains.
 
-The HA body keeps the literal final sample for drive/session identity, marks its existing
-v1 `ecu_data_status` field `last_known` (never a live ECU claim), and adds a strict
-`latest_values` map derived while streaming validation. Each present telemetry field carries
-its newest non-null value plus its original UTC timestamp, so tiered polling cannot hide a
-fresh coolant/trim/O2 value just because the final fast cycle omitted it. Diagnostics use the
-same rule: DTC, MIL, readiness, calibration, protocol, CVN and freeze-frame continuity values
-carry their original event timestamps, and older drives never regress newer retained state.
-Hardened lifecycle fields stay in the server API; the HA request strips them from its
-strict legacy summary shape and uses the existing `clean_end` field for compatibility.
+Bundle rows use `waiting_for_backup`, `copying`, `validating`, `stored`, `failed`, and
+`quarantined`. Existing installations migrate previously verified delivery-queue rows to
+`stored`; the migration preserves archives, samples, diagnostics, and unrelated settings.
 
-Projection version 3 can amend an identity that Home Assistant already accepted without
-weakening immutable-payload checks. The request carries exactly two self-contained,
-proof-only `supersedes_projections` candidates: version 1 pairs the producer summary with
-the legacy unwindowed diagnostic aggregate, while version 2 pairs the reconciled summary
-with the canonical-window diagnostic aggregate sent by the corrected v2 refresh. This
-bounded pair covers a lost acknowledgement where the server cannot know which predecessor
-committed. Home Assistant selects only its recorded version and requires that candidate's
-semantic fingerprint to match before applying v3; same-version changes and downgrades remain
-conflicts. The current v3 diagnostics are likewise filtered to the canonical drive window.
-The predecessor candidates contain only the same strict, identifier-free aggregate
-allowlist—not raw diagnostic events—and the complete encoded request remains subject to the
-8 MiB body limit.
-
-Each hourly row carries total `sample_count` plus `speed_sample_count` and
-`rpm_sample_count`. The latter two count only non-null readings, so Home Assistant can merge
-overlapping drives without diluting an average when a transport sample lacked that PID.
-Additive duration/distance/fuel/idle intervals are split at UTC-hour boundaries. Expected
-and missing-sample accounting assigns expected observation instants to their actual hour;
-missing data and cross-hour gaps are not charged wholesale to the previous hour.
-
-On restart, an `importing` claim becomes immediately retryable before another claim is
-made. Orphan discovery then runs in the background, so an archive history cannot block
-`/health`. Known, unchanged archive sizes are not rehashed on every boot; each one is still
-revalidated immediately before an HA attempt and through the manual Validate action.
-
-A projection-version startup refresh is forward-only. Imported rows are queued only when
-their persisted, allowlisted HA success result has no marker (legacy v1) or a valid positive
-integer marker below the server's current version. Current, future and malformed markers are
-left untouched, preventing an older server image from scheduling a projection rollback. A
-failed row is revived automatically only when it also retains `imported_at` plus that durable
-prior-success result, proving that the failure happened during a later projection refresh.
-Ordinary failed first imports remain failed for operator review.
+Revision `0022` removes the retired delivery queue's retry metadata and result columns.
+It renames existing notification settings to `ingest.webhook_url` and `ingest.mqtt_*`,
+preserving their values; an already configured new key takes precedence. Deployment URL,
+import-path, and token-file variables for the retired integration are no longer read.
+Remove their unused environment entries and secret mounts from your deployment when
+upgrading. No archive or raw telemetry is removed. Automatic pre-migration backups retain
+the original schema for recovery; downgrading reconstructs the old columns without the
+discarded delivery results.
 
 ## Operations and recovery
 
-The Backup page is the normal control surface. It shows the companion's redacted
-`ecu_online`/parked state, device pending count, copy throughput, queue states, the current
-HA import, authentication/configuration status, last success and last error. The API's nested
-`logger` snapshot additionally exposes the exact app version/code, poll plan and build revision
-for unattended deployment verification.
+The Backup page shows the logger state, pending device copies, current transfer, stored
+drive count, failures, last stored drive, and recent app events. The OBD drives pages expose
+full-resolution history. Journey matching is a server-side UTC span-overlap join, with the
+best overlap exposed in both directions.
 
-When reconciliation moves an interrupted drive's canonical end back to its last valid sample,
-later finalisation diagnostics remain untouched in the server's raw diagnostic table. They are
-excluded only from the bounded Home Assistant aggregate projection, whose timestamps must remain
-inside that canonical drive window. The unwindowed aggregate appears only in the v1 candidate of
-the bounded v3 predecessor proof described above; it is never applied as current state. This
-preserves the evidence while preventing a valid interrupted drive from being stranded by HA's
-strict timestamp contract.
-
-The same controls are available over the authenticated API:
+Authenticated endpoints include:
 
 ```text
 GET  /api/obd/status
 GET  /api/obd/events?drive_id={drive_id}&kind={kind}&level={level}&since={ISO8601}
-GET  /api/obd/bundles?state=retry_wait
+GET  /api/obd/bundles?state=stored
 GET  /api/obd/drives
+GET  /api/obd/drives/summary
 GET  /api/obd/drives/{drive_id}/series
 GET  /api/obd/drives/{drive_id}/bundle
+GET  /api/obd/drives/for-journey/{journey_id}
 POST /api/obd/drives/{drive_id}/reprocess
 POST /api/obd/bundles/{id}/validate
-POST /api/obd/bundles/{id}/retry
-POST /api/obd/queue/rebuild
+POST /api/obd/storage/rebuild
 ```
 
-The two `drives` endpoints back the **OBD drives** page. Home Assistant's long-term
-statistics are hourly and its state machine cannot be backdated, so the full 5-second
-sample resolution is only reachable here: the list returns each drive's stored rollups,
-and `series` returns every retained sample (ordered by sequence, original UTC timestamps),
-the explicit measured/derived provenance, tier-aware cadence/gap analysis, and sparse
-diagnostic events. `reprocess` idempotently rebuilds only this derived lifecycle/quality
-projection. `bundle` rechecks size and SHA-256 before returning the authenticated immutable
-archive.
+The list returns stored rollups and storage state. `series` returns every retained sample,
+ordered by sequence and original UTC timestamp, plus cadence/gap analysis and diagnostics.
+`reprocess` idempotently rebuilds derived lifecycle and quality fields. `bundle` verifies
+size and SHA-256 before returning the archive. Use Validate after investigating or repairing
+a retained copy; invalid bytes are quarantined without erasing the database record.
 
-- Use **Validate** after investigating a retained copy. A failed revalidation moves the
-  bytes to quarantine and disables HA retry. Pre-registration rejection rows are explicitly
-  marked as untrusted: validating a repaired or newly supported copy promotes that same row,
-  updates its observed hash, and transactionally stores all samples/diagnostics before it
-  becomes ready. A trusted immutable identity must still retain its original SHA-256.
-  Validate and Retry return 409 while a copy, validation or HA import claim is active.
-- Use **Retry** after fixing Home Assistant auth, schema/profile or network configuration.
-  Imported identities are not sent again; retrying one reports it already imported.
-- Use **Rebuild queue** after restoring `/data/obd/verified` independently from the
-  database. It registers valid orphans idempotently and quarantines invalid ones; it never
-  deletes an archive.
+**Recover stored bundles** on the Backup page registers valid archives that are missing
+from the database, such as after restoring an older database backup. It reports registered,
+duplicate, and quarantined counts. Startup also reconciles interrupted validations and
+orphan archives; this recovery does not require the head unit to be online.
 
-Useful deployment checks after migration are the current Alembic revision, OBD state counts,
-one representative drive's sample count, a successful HA response, and confirmation that no
-token appears in logs or `/api/obd/status`. Preserve `/data/obd` and `dashcam.db` together in
-backups.
+Preserve `/data/obd` and `dashcam.db` together in backups. Before upgrading an older local
+SQLite database, startup creates and integrity-checks a timestamped pre-migration snapshot.
+Failure aborts the upgrade with the original revision untouched.
 
-When an existing local SQLite database is stamped at an older Alembic revision, startup first
-creates and integrity-checks
-`/data/backups/pre-migration-<old>-to-<head>-<UTC timestamp>.db`. The schema upgrade begins
-only after that atomic snapshot succeeds; a backup or integrity-check failure aborts startup
-with the original revision untouched. A new database and an already-current database do not
-create a migration backup, so ordinary restarts do not accumulate redundant copies.
-
-## Rollback
-
-Disable ownership/logging in the Android companion and allow its pending count to reach zero.
-Stop the server or remove the three `HA_*` settings to stop delivery, then re-enable the old
-Home Assistant BLE owner only after the companion reports disabled. Removing HA configuration
-does not delete server samples or verified archives; queued rows remain visible for a later
-retry. Do not delete `/data/obd/verified`, quarantine files or the OBD database tables as part
-of routine rollback.
-
-Offline unit tests prove parsing, hashes, transaction rollback, retry classification and API
-recovery. They do not prove Android scoped-storage visibility, BLE behaviour, engine-off
-closure, the physical transfer window or a live Home Assistant import. Record those as separate
-deployment acceptance checks rather than treating a build or synthetic bundle as hardware
-evidence.
+Offline tests cover parsing, hashes, transaction rollback, migration, and API recovery.
+They do not prove Android scoped-storage visibility, BLE behavior, engine-off closure, or a
+physical transfer window. Record those as separate deployment checks.

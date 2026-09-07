@@ -44,7 +44,7 @@ Legacy `manifest.json` contains exactly these keys:
 
 The manifest hashes the stored bytes of `samples.ndjson.gz`, `diagnostics.json` and
 `summary.json`; it cannot hash itself. The whole archive SHA-256 is computed after the final
-atomic rename and becomes the server/receipt/HA idempotency identity.
+atomic rename and becomes the server and receipt idempotency identity.
 
 Hardened v1 uses one other exact manifest shape: all legacy keys plus
 `poll_plan_version: 2`, `last_sample_at_utc`,
@@ -104,8 +104,8 @@ explicit `null`; non-null values are finite and within these inclusive ranges:
 The optional unitless fields are `fuel_system_1` and `obd_standard` (non-empty strings up
 to 128 characters or `null`) and `oxygen_sensors_present` (unique integer indices 1..8 or
 `null`). `quality` contains exactly `transport` and `parser` (non-empty strings up to 128)
-plus `missing_pids` (at most 256 integer PIDs 0..255). Quality stays on the server and is
-never forwarded to Home Assistant.
+plus `missing_pids` (at most 256 integer PIDs 0..255). Quality stays with the retained
+server-side raw history.
 
 ## Diagnostics
 

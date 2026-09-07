@@ -15,6 +15,8 @@ import { api } from '@/lib/api'
 import { formatDateTime, formatDuration, realtimeFactor } from '@/lib/format'
 
 const STATES = ['', 'queued', 'running', 'failed', 'completed', 'cancelled']
+const stateLabel = (state: string) =>
+  state ? state.charAt(0).toUpperCase() + state.slice(1).replaceAll('_', ' ') : 'All states'
 
 export default function Queue() {
   const [params, setParams] = useSearchParams()
@@ -164,7 +166,7 @@ export default function Queue() {
                 </span>
               </div>
               <div className="mt-2">
-                <ProgressBar value={job.progress} />
+                <ProgressBar value={job.progress} label="Job progress" />
               </div>
               <div className="tabular mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-content-muted">
                 <span>Stage: {job.stageCurrent ?? '—'}</span>
@@ -207,7 +209,7 @@ export default function Queue() {
           }}
         >
           {STATES.map((s) => (
-            <option key={s} value={s}>{s || 'All states'}</option>
+            <option key={s} value={s}>{stateLabel(s)}</option>
           ))}
         </select>
       </div>

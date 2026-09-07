@@ -177,7 +177,7 @@ class _CachedSession:
 #: change, clearing the account.
 _session_epoch = 0
 #: Bumped only by something that changes the *password*. Kept separate so that one browser
-#: signing out does not make the next Home Assistant poll pay for a fresh derivation.
+#: signing out does not make the next API poll pay for a fresh derivation.
 _credential_epoch = 0
 
 _session_cache: dict[str, _CachedSession] = {}
@@ -773,10 +773,10 @@ async def resolve_api_key(presented: str) -> Principal | None:
 async def resolve_basic(header: str, *, address: str) -> Principal | None:
     """Verify an ``Authorization: Basic`` header against the account.
 
-    Home Assistant polls ``/api/ingest/status`` as a REST sensor and people drive this API
+    External tools poll ``/api/ingest/status`` and people drive this API
     from scripts; neither can hold a cookie. Verifying is a full scrypt derivation, which
     would be absurd on a five-second poll, so a header that checks out is remembered for
-    the cache window -- and so is one that does not, because a Home Assistant instance
+    the cache window -- and so is one that does not, because an API client
     configured with the wrong password retries forever and would otherwise buy an
     unauthenticated caller a derivation every time.
 

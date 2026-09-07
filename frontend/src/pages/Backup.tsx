@@ -306,18 +306,19 @@ export default function Backup() {
     client.invalidateQueries({ queryKey: ['obd-status'] })
     client.invalidateQueries({ queryKey: ['obd-bundles'] })
     client.invalidateQueries({ queryKey: ['obd-app-events'] })
+    client.invalidateQueries({ queryKey: ['obd-drives'] })
+    client.invalidateQueries({ queryKey: ['obd-drives-summary'] })
   }
   const pullNow = useMutation({ mutationFn: api.ingest.run, onSuccess: invalidate })
   const cancel = useMutation({ mutationFn: api.ingest.cancel, onSuccess: invalidate })
   // Deliberately not invalidating anything: this changes what is on the car's screen, not
   // anything this page displays.
   const showTest = useMutation({ mutationFn: api.ingest.showTest })
-  const retryObd = useMutation({ mutationFn: (id: number) => api.obd.retry(id), onSuccess: invalidate })
   const validateObd = useMutation({
     mutationFn: (id: number) => api.obd.validate(id),
     onSuccess: invalidate,
   })
-  const rebuildObd = useMutation({ mutationFn: api.obd.rebuild, onSuccess: invalidate })
+  const rebuildObdStorage = useMutation({ mutationFn: api.obd.rebuildStorage, onSuccess: invalidate })
 
   const data = status.data
   const [countdownOffset, setCountdownOffset] = useState<number>(0)
@@ -733,7 +734,7 @@ export default function Backup() {
               {formatBytes(data.bytesDone)} of {formatBytes(data.bytesTotal)}
             </div>
           </div>
-          <ProgressBar value={fraction} />
+          <ProgressBar value={fraction} label="Backup progress" />
           {prediction && (
             <div
               className={`mt-2 flex items-center gap-1.5 text-xs font-medium ${
@@ -766,24 +767,50 @@ export default function Backup() {
         <div>
           <h2 className="text-lg font-semibold">OBD telemetry</h2>
           <p className="mt-0.5 text-sm text-content-muted">
-            Immutable drive bundles are copied separately, validated, then retried to Home
-            Assistant without holding up footage.
+            Immutable drive bundles are copied separately and validated without holding up footage.
+            Recovery scans retained archives for bundles missing after a restart or database restore.
           </p>
         </div>
         <button
+          type="button"
           className="btn"
-          disabled={rebuildObd.isPending}
-          onClick={() => rebuildObd.mutate()}
+          disabled={rebuildObdStorage.isPending}
+          onClick={() => {
+            rebuildObdStorage.reset()
+            rebuildObdStorage.mutate()
+          }}
         >
-          {rebuildObd.isPending ? 'Rebuilding…' : 'Rebuild OBD queue'}
+          {rebuildObdStorage.isPending ? 'Recovering…' : 'Recover stored bundles'}
         </button>
       </div>
+
+      {rebuildObdStorage.data && (
+        <div className="card mb-4 border-state-ok/40 px-4 py-3 text-sm" role="status" aria-live="polite">
+          <div className="font-medium text-state-ok">Stored bundle recovery complete</div>
+          <div className="mt-1 text-content-muted">
+            {rebuildObdStorage.data.registered.toLocaleString()} registered ·{' '}
+            {rebuildObdStorage.data.duplicates.toLocaleString()} already known ·{' '}
+            {rebuildObdStorage.data.quarantined.toLocaleString()} quarantined
+          </div>
+        </div>
+      )}
+
+      {rebuildObdStorage.isError && (
+        <div className="card mb-4 border-state-error/50 px-4 py-3 text-sm" role="alert">
+          <div className="font-medium text-state-error">Stored bundle recovery failed</div>
+          <div className="mt-1 break-words text-content-muted">
+            {rebuildObdStorage.error instanceof Error
+              ? rebuildObdStorage.error.message
+              : 'Something went wrong'}
+          </div>
+        </div>
+      )}
 
       {obdStatus.isError ? (
         <ErrorState error={obdStatus.error} retry={() => obdStatus.refetch()} />
       ) : (
         <>
-          <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-8">
+          <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-5">
             <StatTile
               label="Logger state"
               value={obdStatus.data?.logger?.state ?? (data?.unitOnline ? 'Unknown' : 'Car away')}
@@ -807,19 +834,9 @@ export default function Backup() {
               tone={(obdStatus.data?.waitingOnUnit ?? 0) > 0 ? 'warn' : 'ok'}
             />
             <StatTile
-              label="Waiting for HA"
-              value={String(obdStatus.data?.waitingForHomeAssistant ?? 0)}
-              hint={obdStatus.data?.currentImport ?? 'oldest drive is sent first'}
-              tone={(obdStatus.data?.waitingForHomeAssistant ?? 0) > 0 ? 'busy' : 'ok'}
-            />
-            <StatTile
-              label="Imported drives"
-              value={String(obdStatus.data?.importedDriveCount ?? 0)}
-              hint={
-                obdStatus.data?.lastSuccessfulHomeAssistantSync
-                  ? `last sync ${formatRelative(obdStatus.data.lastSuccessfulHomeAssistantSync)}`
-                  : 'no successful sync yet'
-              }
+              label="Stored drives"
+              value={String(obdStatus.data?.storedDriveCount ?? 0)}
+              hint="validated and available locally"
               tone="ok"
             />
             <StatTile
@@ -828,14 +845,14 @@ export default function Backup() {
               hint={
                 (obdStatus.data?.copyThroughputMbs ?? 0) > 0
                   ? `last copy ${obdStatus.data?.copyThroughputMbs.toFixed(1)} MB/s`
-                  : 'safe idempotent HA replays'
+                  : 'duplicate bundles are ignored safely'
               }
               tone="default"
             />
             <StatTile
               label="Failed bundles"
               value={String(obdStatus.data?.failedCount ?? 0)}
-              hint={`${obdStatus.data?.importsLastHour ?? 0} imported in the last hour`}
+              hint="bundles requiring attention"
               tone={(obdStatus.data?.failedCount ?? 0) > 0 ? 'error' : 'ok'}
             />
             <StatTile
@@ -847,29 +864,12 @@ export default function Backup() {
               }
               hint={
                 obdStatus.data?.lastCompletedDrive?.driveFinishedAt
-                  ? `server copy ${formatRelative(obdStatus.data.lastCompletedDrive.driveFinishedAt)}`
+                  ? `finished ${formatRelative(obdStatus.data.lastCompletedDrive.driveFinishedAt)}`
                   : obdStatus.data?.logger?.lastDriveFinishedAtUtc
                     ? `unit ${formatRelative(obdStatus.data.logger.lastDriveFinishedAtUtc)}`
                     : 'no completed drive observed'
               }
               tone={obdStatus.data?.lastCompletedDrive ? 'ok' : 'default'}
-            />
-            <StatTile
-              label="Home Assistant auth"
-              value={
-                obdStatus.data?.homeAssistantAuthentication === 'configured'
-                  ? 'Configured'
-                  : obdStatus.data?.homeAssistantAuthentication === 'invalid'
-                    ? 'Invalid'
-                    : 'Not configured'
-              }
-              hint={
-                obdStatus.data?.homeAssistantConfigurationError ??
-                'token loaded from a protected file; never displayed'
-              }
-              tone={
-                obdStatus.data?.homeAssistantAuthentication === 'configured' ? 'ok' : 'warn'
-              }
             />
           </div>
 
@@ -940,36 +940,11 @@ export default function Backup() {
             </div>
           </section>
 
-          {obdStatus.data?.homeAssistantAuthentication !== 'configured' && (
-            <div className="card mb-6 border-state-warn/40 px-5 py-4 text-sm">
-              <div className="font-medium text-state-warn">
-                Home Assistant import is{' '}
-                {obdStatus.data?.homeAssistantAuthentication === 'invalid'
-                  ? 'misconfigured'
-                  : 'not configured'}
-              </div>
-              <div className="mt-1 text-content-muted">
-                {obdStatus.data?.homeAssistantConfigurationError ??
-                  'Set HA_URL and mount HA_TOKEN_FILE as a Docker secret. The token is never shown here.'}
-              </div>
-            </div>
-          )}
-
-          {obdStatus.data && !obdStatus.data.workerRunning && (
-            <div className="card mb-6 border-state-error/40 px-5 py-4 text-sm">
-              <div className="font-medium text-state-error">OBD import worker is not running</div>
-              <div className="mt-1 text-content-muted">
-                Verified samples remain safe on this server, but Home Assistant delivery
-                needs the service to be restarted or its server error investigated.
-              </div>
-            </div>
-          )}
-
-          {(obdStatus.data?.lastImportError || obdStatus.data?.lastCopyError) && (
+          {obdStatus.data?.lastCopyError && (
             <div className="card mb-6 px-5 py-4 text-sm">
               <div className="font-medium text-state-warn">Last OBD problem</div>
               <div className="mt-1 break-words text-content-muted">
-                {obdStatus.data.lastImportError ?? obdStatus.data.lastCopyError}
+                {obdStatus.data.lastCopyError}
               </div>
             </div>
           )}
@@ -1020,7 +995,6 @@ export default function Backup() {
                 <th className="px-4 py-3 font-medium">Drive</th>
                 <th className="px-4 py-3 font-medium">Samples</th>
                 <th className="px-4 py-3 font-medium">State</th>
-                <th className="px-4 py-3 font-medium">Attempts</th>
                 <th className="px-4 py-3 font-medium"><span className="sr-only">Actions</span></th>
               </tr>
             </thead>
@@ -1037,7 +1011,7 @@ export default function Backup() {
                   <td className="px-4 py-3">
                     <span
                       className={
-                        bundle.state === 'imported'
+                        bundle.state === 'stored'
                           ? 'text-state-ok'
                           : bundle.state === 'failed' || bundle.state === 'quarantined'
                             ? 'text-state-error'
@@ -1053,17 +1027,16 @@ export default function Backup() {
                     )}
                     {!bundle.metadataTrusted && (
                       <div className="mt-0.5 text-xs text-content-faint">
-                        Manifest untrusted — repair and validate before import
+                        Manifest untrusted — repair and validate before storage
                       </div>
                     )}
                   </td>
-                  <td className="tabular px-4 py-3">{bundle.attempts}</td>
                   <td className="whitespace-nowrap px-4 py-3 text-right">
                     <button
                       className="btn mr-2"
                       disabled={
                         validateObd.isPending ||
-                        ['waiting_for_backup', 'copying', 'validating', 'importing'].includes(
+                        ['waiting_for_backup', 'copying', 'validating'].includes(
                           bundle.state,
                         )
                       }
@@ -1076,15 +1049,6 @@ export default function Backup() {
                         ? 'Validating…'
                         : 'Validate'}
                     </button>
-                    {['ready_to_import', 'retry_wait', 'failed'].includes(bundle.state) && (
-                      <button
-                        className="btn"
-                        disabled={retryObd.isPending}
-                        onClick={() => retryObd.mutate(bundle.id)}
-                      >
-                        Retry
-                      </button>
-                    )}
                   </td>
                 </tr>
               ))}

@@ -1,6 +1,6 @@
 """Strict validation and transactional storage for dashcam OBD export bundles.
 
-The server is the primary high-resolution history.  Home Assistant receives the latest
+The server is the primary high-resolution history. External consumers can read the latest
 state plus bounded hourly statistics, but every validated five-second sample is retained
 here first.  Validation is deliberately a filesystem-only, streaming operation so it can
 run in ``asyncio.to_thread`` and never hold up the API event loop.
@@ -16,9 +16,8 @@ import math
 import re
 import stat
 import zipfile
-from collections import defaultdict
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -48,7 +47,6 @@ SAFE_SAMPLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$")
 DTC_RE = re.compile(r"^[PCBU][0-9A-F]{4}$")
 PID_HEX_RE = re.compile(r"^[0-9A-F]{2}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-SAFE_REASON_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 PIPELINE_METRIC_FIELDS_V1 = frozenset(
     {
         "commands_requested",
@@ -184,7 +182,7 @@ SUMMARY_FIELDS_V1 = frozenset(
     }
 )
 
-# Byte-for-byte shared with the logger and the Home Assistant endpoint.  Keeping this in
+# Byte-for-byte shared with the logger contract. Keeping this in
 # one place makes a unit spelling change a schema version change rather than a silent data
 # conversion during import.
 UNITS_V1: dict[str, str] = {
@@ -222,8 +220,8 @@ SAMPLE_TELEMETRY_FIELDS = frozenset(
         "dtc_count",
     }
 )
-# Quality remains server-side and is stripped from the HA body.  The names below are the
-# v1 logger contract; accepting only bounded JSON values prevents a future logger bug from
+# Quality remains server-side. The names below are the v1 logger contract; accepting only
+# bounded JSON values prevents a future logger bug from
 # turning an export into an unbounded opaque payload.
 SAMPLE_SERVER_FIELDS = frozenset({*SAMPLE_IDENTITY_FIELDS, *SAMPLE_TELEMETRY_FIELDS, "quality"})
 SAMPLE_NUMERIC_RANGES: dict[str, tuple[float, float]] = {
@@ -252,10 +250,6 @@ class BundleError(ValueError):
     """A permanent integrity/schema failure.  The copy belongs in quarantine."""
 
 
-class HAPayloadError(ValueError):
-    """A server projection cannot be represented safely; raw bundle bytes are valid."""
-
-
 class BundleConflict(BundleError):
     """A drive id was already stored from different immutable bytes."""
 
@@ -269,9 +263,6 @@ class ValidatedBundle:
     manifest: dict[str, Any]
     summary: dict[str, Any]
     diagnostics_document: dict[str, Any]
-    latest_sample: dict[str, Any]
-    latest_values: dict[str, dict[str, Any]]
-    statistics: list[dict[str, Any]]
     summary_source: str = "producer"
     warnings: tuple[str, ...] = ()
 
@@ -286,88 +277,6 @@ class ValidatedBundle:
     @property
     def vehicle_id(self) -> str:
         return str(self.manifest["vehicle_id"])
-
-    def ha_payload(
-        self,
-        *,
-        lifecycle: Mapping[str, Any] | None = None,
-        canonical_summary: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """The bounded v1 body.  Raw samples and filesystem metadata never leave here."""
-        # HA imports historical state. Keeping the strict v1 shape while changing the
-        # already-enumerated status value prevents an interrupted drive's final sample
-        # from claiming that the ECU is currently connected.
-        latest_sample = {
-            key: value
-            for key, value in self.latest_sample.items()
-            if key in SAMPLE_IDENTITY_FIELDS or key in SAMPLE_TELEMETRY_FIELDS
-        }
-        latest_sample["ecu_data_status"] = "last_known"
-        summary = {
-            key: value
-            for key, value in (canonical_summary or self.summary).items()
-            if key not in HARDENED_SUMMARY_FIELDS
-        }
-        _validate_ha_summary(summary, drive_id=self.drive_id)
-        if lifecycle is not None:
-            expected = {
-                "lifecycle_status",
-                "interruption_reason",
-                "gap_count",
-                "longest_gap_s",
-            }
-            if set(lifecycle) != expected:
-                raise HAPayloadError("Home Assistant lifecycle projection fields are incomplete")
-            lifecycle_status = lifecycle["lifecycle_status"]
-            reason = lifecycle["interruption_reason"]
-            gap_count = lifecycle["gap_count"]
-            longest_gap = lifecycle["longest_gap_s"]
-            if lifecycle_status not in {"complete", "interrupted", "recovered"}:
-                raise HAPayloadError("Home Assistant lifecycle status is invalid")
-            if reason is not None and (
-                not isinstance(reason, str) or not SAFE_REASON_RE.fullmatch(reason)
-            ):
-                raise HAPayloadError("Home Assistant interruption reason is not a safe code")
-            if lifecycle_status == "complete" and reason is not None:
-                raise HAPayloadError("a complete Home Assistant lifecycle cannot have a reason")
-            if (lifecycle_status == "complete") != bool(summary["clean_end"]):
-                raise HAPayloadError("Home Assistant lifecycle conflicts with clean_end")
-            if isinstance(gap_count, bool) or not isinstance(gap_count, int) or gap_count < 0:
-                raise HAPayloadError("Home Assistant gap count is invalid")
-            if (
-                isinstance(longest_gap, bool)
-                or not isinstance(longest_gap, (int, float))
-                or not math.isfinite(float(longest_gap))
-                or float(longest_gap) < 0
-                or float(longest_gap) > float(summary["duration_s"])
-            ):
-                raise HAPayloadError("Home Assistant longest gap is invalid")
-            if (gap_count == 0) != (float(longest_gap) == 0):
-                raise HAPayloadError("Home Assistant gap count and longest gap disagree")
-            summary.update(
-                {
-                    "lifecycle_status": lifecycle_status,
-                    "interruption_reason": reason,
-                    "gap_count": gap_count,
-                    "longest_gap_s": float(longest_gap),
-                }
-            )
-        return {
-            "schema_version": self.schema_version,
-            "drive_id": self.drive_id,
-            "bundle_sha256": self.bundle_sha256,
-            "vehicle_id": self.vehicle_id,
-            "units": dict(self.manifest["units"]),
-            "latest_sample": latest_sample,
-            "latest_values": self.latest_values,
-            "summary": summary,
-            "statistics": self.statistics,
-            "diagnostics": diagnostics_for_ha(
-                self.diagnostics_document,
-                start_time_utc=summary["start_time_utc"],
-                finish_time_utc=summary["finish_time_utc"],
-            ),
-        }
 
 
 def is_bundle_name(name: str) -> bool:
@@ -992,214 +901,6 @@ def iter_samples(
         raise BundleError(f"samples.ndjson.gz is corrupt: {type(exc).__name__}: {exc}") from None
 
 
-@dataclass(slots=True)
-class _Hour:
-    count: int = 0
-    distance_km: float = 0.0
-    engine_runtime_s: float = 0.0
-    estimated_fuel_used_l: float = 0.0
-    idle_duration_s: float = 0.0
-    speed_sum: float = 0.0
-    speed_count: int = 0
-    max_speed: float | None = None
-    rpm_sum: float = 0.0
-    rpm_count: int = 0
-    max_rpm: float | None = None
-    max_coolant: float | None = None
-    # Segment duration, original sample gap, speed, rpm, fuel rate. The original gap
-    # controls whether interpolation is trustworthy; the segment duration ensures a
-    # 12:59:58 -> 13:00:03 interval is charged 2s/3s to the correct UTC hours.
-    intervals: list[tuple[float, float, float | None, float | None, float | None]] = field(
-        default_factory=list
-    )
-
-
-def _hour_start(value: datetime) -> datetime:
-    return value.replace(minute=0, second=0, microsecond=0)
-
-
-def _present(sample: dict[str, Any], key: str) -> float | None:
-    value = sample.get(key)
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
-
-
-class _StatisticsBuilder:
-    """Incremental rollup: retains O(hours + gaps), never the raw drive."""
-
-    def __init__(self) -> None:
-        self.hours: dict[datetime, _Hour] = defaultdict(_Hour)
-        self.previous: dict[str, Any] | None = None
-        self.previous_at: datetime | None = None
-        self.first_at: datetime | None = None
-        self.transitions: list[tuple[datetime, datetime]] = []
-        self.ordinary_gaps: list[float] = []
-
-    def add(self, sample: dict[str, Any]) -> None:
-        captured = _utc(sample["timestamp_utc"], field_name="sample.timestamp_utc")
-        hour = self.hours[_hour_start(captured)]
-        hour.count += 1
-        speed = _present(sample, "vehicle_speed")
-        rpm = _present(sample, "engine_rpm")
-        coolant = _present(sample, "coolant_temperature")
-        if speed is not None:
-            hour.speed_sum += speed
-            hour.speed_count += 1
-            hour.max_speed = speed if hour.max_speed is None else max(hour.max_speed, speed)
-        if rpm is not None:
-            hour.rpm_sum += rpm
-            hour.rpm_count += 1
-            hour.max_rpm = rpm if hour.max_rpm is None else max(hour.max_rpm, rpm)
-        if coolant is not None:
-            hour.max_coolant = (
-                coolant if hour.max_coolant is None else max(hour.max_coolant, coolant)
-            )
-
-        if self.previous is None or self.previous_at is None:
-            self.first_at = captured
-            self.previous = sample
-            self.previous_at = captured
-            return
-
-        previous = self.previous
-        previous_at = self.previous_at
-        gap = max(0.0, (captured - previous_at).total_seconds())
-        self.transitions.append((previous_at, captured))
-        previous_speed = _present(previous, "vehicle_speed")
-        previous_rpm = _present(previous, "engine_rpm")
-        previous_fuel_rate = _present(previous, "estimated_fuel_rate")
-        cursor = previous_at
-        while cursor < captured:
-            segment_end = min(captured, _hour_start(cursor) + timedelta(hours=1))
-            segment = (segment_end - cursor).total_seconds()
-            self.hours[_hour_start(cursor)].intervals.append(
-                (segment, gap, previous_speed, previous_rpm, previous_fuel_rate)
-            )
-            cursor = segment_end
-        # Equal timestamps still count as two received samples/expected observations,
-        # but have no duration to integrate.
-        if 0 < gap <= 60:
-            self.ordinary_gaps.append(gap)
-        self.previous = sample
-        self.previous_at = captured
-
-    def finish(self) -> list[dict[str, Any]]:
-        if not self.hours:
-            return []
-        positive = sorted(self.ordinary_gaps)
-        expected_interval = positive[len(positive) // 2] if positive else 5.0
-        expected_interval = min(60.0, max(1.0, expected_interval))
-        maximum_integrated_gap = 3 * expected_interval
-        expected_by_hour: dict[datetime, int] = defaultdict(int)
-        if self.first_at is not None:
-            expected_by_hour[_hour_start(self.first_at)] += 1
-        # Count the evenly spaced expected observations arithmetically per crossed hour.
-        # Iterating one datetime per observation made a sparse 30-day/1-second-cadence
-        # drive perform 2.6 million operations. The stream is chronological, so all
-        # transitions together cross at most the drive's <=744 hour boundaries.
-        for previous_at, captured in self.transitions:
-            gap = max(0.0, (captured - previous_at).total_seconds())
-            steps = max(1, round(gap / expected_interval))
-            if gap == 0:
-                expected_by_hour[_hour_start(captured)] += 1
-                continue
-            delta = captured - previous_at
-            total_us = delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
-
-            def points_before(
-                offset_us: int,
-                *,
-                total_us: int = total_us,
-                steps: int = steps,
-            ) -> int:
-                """Expected points strictly before an offset from ``previous_at``."""
-                if offset_us <= 0:
-                    return 0
-                if offset_us > total_us:
-                    return steps
-                # ceil(offset * steps / total) - 1 implements the strict upper bound;
-                # an endpoint exactly on 13:00 therefore belongs to the 13:00 hour.
-                return min(
-                    steps,
-                    (offset_us * steps + total_us - 1) // total_us - 1,
-                )
-
-            cursor = _hour_start(previous_at)
-            final_hour = _hour_start(captured)
-            while cursor <= final_hour:
-                lower = cursor - previous_at
-                upper = cursor + timedelta(hours=1) - previous_at
-                lower_us = (
-                    lower.days * 86_400_000_000 + lower.seconds * 1_000_000 + lower.microseconds
-                )
-                upper_us = (
-                    upper.days * 86_400_000_000 + upper.seconds * 1_000_000 + upper.microseconds
-                )
-                count = points_before(upper_us) - points_before(lower_us)
-                if count:
-                    expected_by_hour[cursor] += count
-                cursor += timedelta(hours=1)
-        rows: list[dict[str, Any]] = []
-        for start, hour in sorted(self.hours.items()):
-            expected = max(hour.count, expected_by_hour.get(start, 0))
-            row: dict[str, Any] = {
-                "start_time_utc": start.isoformat(),
-                "sample_count": hour.count,
-                # HA merges drives which overlap the same UTC hour. Averages must be
-                # weighted only by samples where that metric was actually present, not
-                # by every transport sample in the hour.
-                "speed_sample_count": hour.speed_count,
-                "rpm_sample_count": hour.rpm_count,
-                "expected_sample_count": expected,
-                "missing_data_percentage": 100.0 * max(0, expected - hour.count) / expected,
-            }
-            distance_evidence = runtime_evidence = fuel_evidence = idle_evidence = False
-            for segment, original_gap, speed, rpm, fuel_rate in hour.intervals:
-                if segment <= 0 or original_gap > maximum_integrated_gap:
-                    continue
-                if speed is not None:
-                    hour.distance_km += speed * segment / 3600.0
-                    distance_evidence = True
-                if rpm is not None:
-                    runtime_evidence = True
-                    if rpm > 300:
-                        hour.engine_runtime_s += segment
-                        if speed is not None:
-                            idle_evidence = True
-                            if speed < 1.0:
-                                hour.idle_duration_s += segment
-                if fuel_rate is not None:
-                    hour.estimated_fuel_used_l += fuel_rate * segment / 3600.0
-                    fuel_evidence = True
-            if distance_evidence:
-                row["distance_km"] = hour.distance_km
-            if runtime_evidence:
-                row["engine_runtime_s"] = hour.engine_runtime_s
-            if fuel_evidence:
-                row["estimated_fuel_used_l"] = hour.estimated_fuel_used_l
-            if idle_evidence:
-                row["idle_duration_s"] = hour.idle_duration_s
-            if hour.speed_count:
-                row["average_speed_kmh"] = hour.speed_sum / hour.speed_count
-                row["maximum_speed_kmh"] = hour.max_speed
-            if hour.rpm_count:
-                row["average_rpm"] = hour.rpm_sum / hour.rpm_count
-                row["maximum_rpm"] = hour.max_rpm
-            if hour.max_coolant is not None:
-                row["maximum_coolant_temperature_c"] = hour.max_coolant
-            rows.append(row)
-        if len(rows) > 744:
-            raise BundleError("drive produces more than the 744 allowed hourly statistics rows")
-        return rows
-
-
-def aggregate_statistics(samples) -> list[dict[str, Any]]:
-    """Derive bounded hourly rows under original UTC hours without retaining samples."""
-    builder = _StatisticsBuilder()
-    for sample in samples:
-        builder.add(sample)
-    return builder.finish()
-
-
 def _validate_diagnostics(
     value: Any,
     *,
@@ -1580,65 +1281,6 @@ def _validate_summary(
     return value
 
 
-def _validate_ha_summary(value: Mapping[str, Any], *, drive_id: str) -> None:
-    """Validate the canonical mutable projection without re-binding it to raw clocks."""
-    try:
-        if set(value) != SUMMARY_FIELDS_V1:
-            raise HAPayloadError("Home Assistant summary projection fields are incomplete")
-        if value.get("schema_version") != SCHEMA_VERSION or value.get("drive_id") != drive_id:
-            raise HAPayloadError("Home Assistant summary projection identity is invalid")
-        started = _utc(value["start_time_utc"], field_name="summary.start_time_utc")
-        finished = _utc(value["finish_time_utc"], field_name="summary.finish_time_utc")
-        if finished < started:
-            raise HAPayloadError("Home Assistant summary finish precedes its start")
-        if not isinstance(value["clean_end"], bool):
-            raise HAPayloadError("Home Assistant summary clean_end is invalid")
-        sample_count = _integer(value["sample_count"], field_name="summary.sample_count")
-        expected = _integer(
-            value["expected_sample_count"], field_name="summary.expected_sample_count"
-        )
-        if expected < sample_count:
-            raise HAPayloadError("Home Assistant expected sample count is too small")
-        numeric_ranges = {
-            "duration_s": (0, 2_678_400),
-            "distance_km": (0, 300_000),
-            "average_speed_kmh": (0, 400),
-            "maximum_speed_kmh": (0, 400),
-            "average_rpm": (0, 20_000),
-            "maximum_rpm": (0, 20_000),
-            "idle_duration_s": (0, 2_678_400),
-            "estimated_fuel_used_l": (0, 750_000),
-            "average_fuel_consumption_l_per_100km": (0, 10_000),
-            "maximum_coolant_temperature_c": (-80, 250),
-            "maximum_engine_load_pct": (0, 100),
-            "missing_data_duration_s": (0, 2_678_400),
-            "received_sample_percentage": (0, 100),
-        }
-        non_nullable = {"duration_s", "missing_data_duration_s", "received_sample_percentage"}
-        for key, (minimum, maximum) in numeric_ranges.items():
-            _number(
-                value[key],
-                field_name=f"summary.{key}",
-                minimum=minimum,
-                maximum=maximum,
-                nullable=key not in non_nullable,
-            )
-        duration = float(value["duration_s"])
-        if abs(duration - (finished - started).total_seconds()) > 0.01:
-            raise HAPayloadError("Home Assistant summary duration conflicts with its clocks")
-        if float(value["missing_data_duration_s"]) > duration:
-            raise HAPayloadError("Home Assistant missing duration exceeds drive duration")
-        if not isinstance(value["dtcs_observed"], list) or len(value["dtcs_observed"]) > 128:
-            raise HAPayloadError("Home Assistant DTC projection is invalid")
-        if len(set(value["dtcs_observed"])) != len(value["dtcs_observed"]) or any(
-            not isinstance(code, str) or not DTC_RE.fullmatch(code)
-            for code in value["dtcs_observed"]
-        ):
-            raise HAPayloadError("Home Assistant DTC projection is invalid")
-    except BundleError as exc:
-        raise HAPayloadError(str(exc)) from None
-
-
 def validate_bundle(path: Path, *, config: AppConfig | None = None) -> ValidatedBundle:
     """Validate one immutable ZIP without extracting it or trusting member paths."""
     cfg = config or get_config()
@@ -1717,10 +1359,7 @@ def validate_bundle(path: Path, *, config: AppConfig | None = None) -> Validated
         raise BundleError(f"bundle ZIP is corrupt: {type(exc).__name__}: {exc}") from None
 
     count = 0
-    latest: dict[str, Any] | None = None
-    latest_values: dict[str, dict[str, Any]] = {}
-    statistics = _StatisticsBuilder()
-    for sample in iter_samples(
+    for _sample in iter_samples(
         resolved,
         drive_id=filename_drive_id,
         started=started,
@@ -1728,17 +1367,9 @@ def validate_bundle(path: Path, *, config: AppConfig | None = None) -> Validated
         config=cfg,
     ):
         count += 1
-        latest = sample
-        for key in SAMPLE_TELEMETRY_FIELDS:
-            if key in sample and sample[key] is not None:
-                latest_values[key] = {
-                    "value": sample[key],
-                    "timestamp_utc": sample["timestamp_utc"],
-                }
-        statistics.add(sample)
     if count != int(manifest["sample_count"]):
         raise BundleError("decompressed sample count does not match manifest")
-    if latest is None:
+    if count == 0:
         raise BundleError("a completed drive bundle must contain at least one sample")
     record_count = manifest["files"]["samples.ndjson.gz"]["record_count"]
     if record_count != count:
@@ -1806,172 +1437,9 @@ def validate_bundle(path: Path, *, config: AppConfig | None = None) -> Validated
         manifest=manifest,
         summary=summary,
         diagnostics_document=diagnostics,
-        latest_sample=latest,
-        latest_values=latest_values,
-        statistics=statistics.finish(),
         summary_source=summary_source,
         warnings=tuple(warnings),
     )
-
-
-_DIAGNOSTIC_WINDOW_UNSET = object()
-
-
-def diagnostics_for_ha(
-    document: dict[str, Any],
-    *,
-    start_time_utc: object = _DIAGNOSTIC_WINDOW_UNSET,
-    finish_time_utc: object = _DIAGNOSTIC_WINDOW_UNSET,
-) -> dict[str, Any]:
-    """Reduce events to HA's strict, identifier-free metadata object.
-
-    The immutable producer bundle can legitimately contain finalisation diagnostics after the
-    last valid sample.  Reconciliation projects that evidence-based sample time as the canonical
-    drive finish.  Home Assistant requires every projected diagnostic timestamp to fall inside
-    that canonical window, so keep later lifecycle evidence in the server's raw diagnostic table
-    and exclude it only from this bounded aggregate projection.
-
-    Omitting both bounds deliberately reproduces the projection-v1 aggregate.  That legacy
-    projection is emitted only as bounded amendment proof, allowing Home Assistant to verify an
-    already-imported v1 payload without copying raw diagnostic events into the request.
-    """
-    start_unset = start_time_utc is _DIAGNOSTIC_WINDOW_UNSET
-    finish_unset = finish_time_utc is _DIAGNOSTIC_WINDOW_UNSET
-    if start_unset != finish_unset:
-        raise HAPayloadError("Home Assistant diagnostic window is incomplete")
-    if start_unset:
-        events = document.get("events", [])
-    else:
-        started = _utc(start_time_utc, field_name="HA diagnostics start_time_utc")
-        finished = _utc(finish_time_utc, field_name="HA diagnostics finish_time_utc")
-        if finished < started:
-            raise HAPayloadError("Home Assistant diagnostic window is invalid")
-        events = [
-            event
-            for event in document.get("events", [])
-            if started
-            <= _utc(event.get("timestamp_utc"), field_name="diagnostic.timestamp_utc")
-            <= finished
-        ]
-    result: dict[str, Any] = {
-        "event_count": len(events),
-        "parser_failure_count": 0,
-        "connection_failure_count": 0,
-    }
-    for event in events:
-        kind = event.get("kind")
-        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        observed = event.get("timestamp_utc")
-        result["last_event_timestamp_utc"] = observed
-        if kind in {"confirmed_dtcs", "pending_dtcs", "permanent_dtcs"}:
-            codes = payload.get("codes", [])
-            if isinstance(codes, list):
-                result[kind] = [str(code)[:16] for code in codes if isinstance(code, str)][:128]
-                result[f"{kind}_timestamp_utc"] = observed
-        elif kind == "dtc_scan_complete":
-            result["dtc_scan_timestamp_utc"] = observed
-        elif kind == "dtc_mode_status":
-            mode_name = {0x03: "confirmed", 0x07: "pending", 0x0A: "permanent"}.get(
-                payload.get("mode")
-            )
-            if mode_name is not None:
-                result.setdefault("dtc_mode_status", {})[mode_name] = payload.get("status")
-                result["dtc_mode_status_timestamp_utc"] = observed
-                if payload.get("status") in {"ok", "no_data"}:
-                    value_field = f"{mode_name}_dtcs"
-                    if value_field in result:
-                        result[f"{value_field}_timestamp_utc"] = observed
-        elif kind == "mil_state":
-            result["check_engine_light"] = payload.get("on")
-            result["check_engine_light_timestamp_utc"] = observed
-        elif kind == "readiness":
-            result["readiness_supported"] = payload.get("supported", [])
-            result["readiness_incomplete"] = payload.get("incomplete", [])
-            result["readiness_complete"] = payload.get("complete")
-            result["readiness_timestamp_utc"] = observed
-            result["confirmed_dtc_count"] = payload.get("confirmed_dtc_count")
-            result["confirmed_dtc_count_timestamp_utc"] = observed
-            result["ignition_type"] = payload.get("ignition_type")
-            result["ignition_type_timestamp_utc"] = observed
-        elif kind == "readiness_scan_complete" and payload.get("status") == "ok":
-            # The full value events are deduplicated on the logger. A later compact
-            # successful observation proves that the unchanged values were seen again.
-            for timestamp_field in (
-                "check_engine_light_timestamp_utc",
-                "readiness_timestamp_utc",
-                "confirmed_dtc_count_timestamp_utc",
-                "ignition_type_timestamp_utc",
-            ):
-                if timestamp_field in result:
-                    result[timestamp_field] = observed
-        elif kind == "mode01_support":
-            result["supported_pids"] = list(payload.get("supported_pids", []))
-            result["supported_pids_timestamp_utc"] = observed
-        elif kind == "calibration_id":
-            result["calibration_id"] = payload.get("value")
-            result["calibration_id_timestamp_utc"] = observed
-            result.setdefault("mode09_pid_status", {})["04"] = "ok"
-            result["mode09_pid_status_timestamp_utc"] = observed
-        elif kind == "calibration_verification_numbers":
-            result["calibration_verification_numbers"] = list(payload.get("values", []))
-            result["calibration_verification_numbers_timestamp_utc"] = event.get("timestamp_utc")
-            result.setdefault("mode09_pid_status", {})["06"] = "ok"
-            result["mode09_pid_status_timestamp_utc"] = observed
-        elif kind == "mode09_support":
-            supported_pids = list(payload.get("supported_pids", []))
-            result["mode09_supported_pids"] = supported_pids
-            result["mode09_supported_pids_timestamp_utc"] = observed
-            result["mode09_pid_status"] = {f"{pid:02X}": "supported" for pid in supported_pids}
-            result["mode09_pid_status_timestamp_utc"] = observed
-        elif kind == "mode09_support_scan_complete" and payload.get("status") == "ok":
-            if "mode09_supported_pids" in result:
-                result["mode09_supported_pids_timestamp_utc"] = observed
-            result["mode09_scan_status"] = "ok"
-            result["mode09_scan_status_timestamp_utc"] = observed
-        elif kind == "mode09_support_scan_complete":
-            result["mode09_scan_status"] = payload.get("status")
-            result["mode09_scan_status_timestamp_utc"] = observed
-        elif kind == "mode09_count":
-            pid = payload.get("pid")
-            field_name = {
-                0x03: "calibration_id_message_count",
-                0x05: "calibration_verification_number_message_count",
-            }.get(pid)
-            if field_name is not None:
-                result[field_name] = payload.get("count")
-                result[f"{field_name}_timestamp_utc"] = observed
-                result.setdefault("mode09_pid_status", {})[f"{pid:02X}"] = "ok"
-                result["mode09_pid_status_timestamp_utc"] = observed
-        elif kind == "mode09_probe_status":
-            pid = payload.get("pid")
-            if isinstance(pid, int):
-                result.setdefault("mode09_pid_status", {})[f"{pid:02X}"] = payload.get("status")
-                result["mode09_pid_status_timestamp_utc"] = observed
-                if payload.get("status") == "ok":
-                    value_field = {
-                        0x03: "calibration_id_message_count",
-                        0x04: "calibration_id",
-                        0x05: "calibration_verification_number_message_count",
-                        0x06: "calibration_verification_numbers",
-                    }.get(pid)
-                    if value_field is not None and value_field in result:
-                        result[f"{value_field}_timestamp_utc"] = observed
-        elif kind == "freeze_frame":
-            result["freeze_frame"] = dict(payload)
-            result["freeze_frame_timestamp_utc"] = event.get("timestamp_utc")
-        elif kind == "freeze_frame_scan_complete":
-            result["freeze_frame_scan_status"] = payload.get("status")
-            result["freeze_frame_scan_timestamp_utc"] = observed
-        elif kind == "protocol_change":
-            result["protocol"] = payload.get("protocol")
-            result["protocol_timestamp_utc"] = observed
-            result["protocol_number"] = payload.get("protocol_number")
-            result["protocol_number_timestamp_utc"] = observed
-        elif kind == "parser_failure":
-            result["parser_failure_count"] += 1
-        elif kind == "connection_failure":
-            result["connection_failure_count"] += 1
-    return result
 
 
 def _sample_row(sample: dict[str, Any], drive_db_id: int) -> dict[str, Any]:
@@ -2051,13 +1519,10 @@ async def store_validated_bundle(session: AsyncSession, bundle: ValidatedBundle)
             now = utcnow()
             existing.filename = bundle.filename
             existing.size_bytes = bundle.size_bytes
-            existing.state = OBDBundleState.READY_TO_IMPORT.value
+            existing.state = OBDBundleState.STORED.value
             existing.verified_at = now
-            existing.next_attempt_at = now
-            existing.import_started_at = None
             existing.last_error = None
             existing.failure_kind = None
-            existing.last_http_status = None
             existing.updated_at = now
             await session.flush()
         drive = (
@@ -2117,15 +1582,12 @@ async def store_validated_bundle(session: AsyncSession, bundle: ValidatedBundle)
         "sample_count": manifest["sample_count"],
         "diagnostic_count": manifest["diagnostic_count"],
         "metadata_trusted": True,
-        "state": OBDBundleState.READY_TO_IMPORT.value,
+        "state": OBDBundleState.STORED.value,
         "copied_at": rejected.copied_at if rejected is not None else now,
         "verified_at": now,
-        "next_attempt_at": now,
         "validation_warnings": list(bundle.warnings) or None,
         "last_error": None,
         "failure_kind": None,
-        "last_http_status": None,
-        "import_started_at": None,
     }
     if rejected is None:
         row = OBDBundle(**values)
@@ -2276,9 +1738,7 @@ async def store_rejected_bundle(
         row.bundle_hash = bundle_hash
         row.size_bytes = size_bytes
     row.state = OBDBundleState.QUARANTINED.value if quarantined else OBDBundleState.FAILED.value
-    row.next_attempt_at = None
     row.verified_at = None
-    row.import_started_at = None
     row.failure_kind = "integrity" if quarantined else "quarantine_io"
     row.last_error = error[:2048]
     row.updated_at = now
@@ -2310,9 +1770,7 @@ __all__ = [
     "BundleConflict",
     "BundleError",
     "ValidatedBundle",
-    "aggregate_statistics",
     "bundle_path_for",
-    "diagnostics_for_ha",
     "drive_id_from_name",
     "file_sha256",
     "is_bundle_name",

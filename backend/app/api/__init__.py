@@ -1,6 +1,6 @@
 """The REST API.
 
-Designed to be consumed by something other than this UI — Home Assistant, a script, a
+Designed to be consumed by something other than this UI — a script, a mobile app, or a
 dashboard — so responses are stable, paginated, and free of internal filesystem detail.
 """
 

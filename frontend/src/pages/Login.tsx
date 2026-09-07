@@ -50,17 +50,14 @@ export default function Login({
           <span className="grid h-16 w-16 place-items-center rounded-2xl border border-accent/40 bg-surface-raised text-accent shadow-glow-orange">
             <LogoIcon className="h-8 w-8" />
           </span>
-          <div className="mt-4 flex items-center gap-2">
-            <h1 className="text-2xl font-black tracking-wider text-white">DASHCAM</h1>
-            <span className="rounded bg-accent/20 px-1.5 py-0.5 text-[10px] font-mono font-bold text-accent">HUD</span>
-          </div>
-          <p className="font-mono text-xs uppercase tracking-wider text-content-muted mt-1">Cockpit Authentication</p>
+          <h1 className="mt-4 text-2xl font-black tracking-tight text-content">Dashcam Analyser</h1>
+          <p className="mt-1 text-sm text-content-muted">Sign in to your vehicle library</p>
         </div>
 
         <form className="card cockpit-panel space-y-4 p-6 shadow-2xl" onSubmit={submit}>
           <div className="space-y-1.5">
             <label className="label" htmlFor="username">
-              Operator Username
+              Username
             </label>
             <input
               id="username"
@@ -75,7 +72,7 @@ export default function Login({
 
           <div className="space-y-1.5">
             <label className="label" htmlFor="password">
-              Security Key / Password
+              Password
             </label>
             <input
               id="password"
@@ -112,7 +109,7 @@ export default function Login({
             type="submit"
             disabled={signIn.isPending || !username.trim() || !password}
           >
-            {signIn.isPending ? 'Authenticating…' : 'Initialize Session ⚡'}
+            {signIn.isPending ? 'Signing in…' : 'Sign in'}
           </button>
         </form>
 

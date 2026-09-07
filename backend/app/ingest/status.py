@@ -1,6 +1,6 @@
 """The one live view of the ingest, and the single-flight guard around it.
 
-Everything that reports progress -- the API, the Home Assistant REST sensor, the webhook,
+Everything that reports progress -- the API, the webhook,
 MQTT and the Backup page -- reads this one snapshot, so they cannot disagree with each
 other. Live progress is deliberately in memory only: a pull writes a row to ``ingest_runs``
 when it finishes, but per-second byte counts are not worth a database write each, and the
@@ -540,10 +540,10 @@ class IngestStatus:
         }
 
     def snapshot(self) -> dict[str, object]:
-        """The shape consumed by /api/ingest/status, Home Assistant and the UI.
+        """The shape consumed by /api/ingest/status, external clients and the UI.
 
         Every field added here is additive. ``state`` in particular keeps exactly the
-        meaning it has always had, because it is what the Home Assistant REST sensor, the
+        meaning it has always had, because it is what API clients, the
         webhook and the MQTT topics publish -- ``phase`` sits alongside it rather than
         refining it, so an existing automation cannot be broken by this file.
         """

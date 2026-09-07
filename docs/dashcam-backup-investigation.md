@@ -60,7 +60,7 @@ while the engine runs — roughly a **60–120 second window**.
 | [`ingest/transport.py`](../backend/app/ingest/transport.py) | The socket + tar receive loop, on a worker thread |
 | [`ingest/puller.py`](../backend/app/ingest/puller.py) | Orchestration: delta → transfer → stage → commit → delete → persist |
 | [`ingest/status.py`](../backend/app/ingest/status.py) | The single in-memory live snapshot everything reads |
-| [`ingest/reporter.py`](../backend/app/ingest/reporter.py) | Home Assistant webhook + optional MQTT discovery |
+| [`ingest/reporter.py`](../backend/app/ingest/reporter.py) | Generic webhook and optional MQTT status publishing |
 | [`api/routes/ingest.py`](../backend/app/api/routes/ingest.py) | `/status`, `/run`, `/cancel`, `/history` |
 | [`pages/Backup.tsx`](../frontend/src/pages/Backup.tsx) | Dashboard, polls `/status` at 1.5 s while running |
 
@@ -79,7 +79,7 @@ while the engine runs — roughly a **60–120 second window**.
       than `skip_active_s` (15 s), skip names the library deliberately removed, size-compare
    5. `status.plan(plan)`
    6. `_footage_is_safe_to_write()` — DB session + `evaluate_safety` + `is_writable`
-   7. **`await report_event("started")`** — HTTP POST to the HA webhook, 10 s timeout,
+   7. **`await report_event("started")`** — HTTP POST to the configured webhook, 10 s timeout,
       plus optional blocking MQTT connect
    8. clean staging, `clear_listener()` (kill stray `nc`), `launch_listener()` (not awaited)
    9. `transport.receive()` on a worker thread — connect with retry, stream the tar, write
@@ -359,8 +359,8 @@ So **most of the requested panel already exists.** What is missing is small and 
 
 ### Recommendation — all inside `status.py`, no new subsystem
 
-1. **Add `phase` alongside `state`.** Keep `state` exactly as it is so the Home Assistant REST
-   sensor, the webhook and MQTT contracts do not change. New field, additive:
+1. **Add `phase` alongside `state`.** Keep `state` exactly as it is so API, webhook, and
+   MQTT clients do not break. New field, additive:
    `waiting_for_unit / connecting / scanning / preparing / transferring / verifying /
    complete / partial / failed / cancelled` (plus `pausing_recording` / `resuming_recording`
    only if §7 is ever implemented).
@@ -497,13 +497,13 @@ All app-side, no device access, every reliability property in §1 preserved.
 | 2 | `report_event("started")` is fired, not awaited | `puller.py` | Takes up to 10 s of webhook timeout (~340 MB) out from in front of the first byte |
 | 3 | One `stat` exec for the whole card instead of ~140 | `adb.py` | `set -- *.ts && [ -e "$1" ] && stat -c … *.ts; exit 0`. Empty-card guard kept |
 | 4 | Cheap arrival detection — `adb.is_listening()` does one TCP connect (400 ms) and only escalates to adb when the port answers; `MIN_POLL_S` 3 s → 1 s, default interval 8 s → 2 s | `adb.py`, `poller.py` | Recovers up to ~6 s (~200 MB) of window, and stops spawning 3 adb processes every 8 s all day |
-| 5 | `phase`, `speed_mbs_recent`, `eta_seconds`, `active_skipped`, `started_at` in the snapshot; `current_file` cleared on `file_done` | `models.py`, `status.py` | §6. Purely additive — `state` keeps its exact meaning, so no HA/MQTT consumer changes |
+| 5 | `phase`, `speed_mbs_recent`, `eta_seconds`, `active_skipped`, `started_at` in the snapshot; `current_file` cleared on `file_done` | `models.py`, `status.py` | §6. Purely additive — `state` keeps its exact meaning, so no API or MQTT consumer changes |
 | 6 | Dashboard shows the phase, recent speed, ETA, skipped count; progress clamped at 100 % | `Backup.tsx`, `api.ts` | §6 |
 | 8 | `stop_listener` returns whether the session was still alive | `adb.py`, `puller.py` | "The head unit stopped serving first" is now distinguishable from "the car left", which previously produced identical messages |
 | 9 | `ingest.transfer_order` — oldest-first (default) or newest-first | `settings_schema.py`, `puller.py` | §2e — a permanently oversized backlog no longer starves new footage |
 | 11 | The two DB reads and the staging clean now run *concurrently with* the card listing instead of after it | `puller.py` | None of the three needs the card, and on a hard NFS mount that series was worth hundreds of milliseconds. Still awaited — and still gating — exactly where each result is needed |
 | 12 | Connect retry interval 250 ms → 50 ms | `transport.py` | The interval is the error bar on the start of every transfer: whatever is left of the current gap when the listener comes up is dead window |
-| — | `ingest.show_on_unit` — open this app's Backup page on the head unit's own screen when a transfer starts | `adb.show_url`, `origin.py`, `main.py`, `settings_schema.py` | §5. Off by default, URL allowlisted, fired not awaited, only when there is something to copy. The address is **learned from the browser**: a bridged container sees only its own 172.x interfaces, never the host LAN address and published port that actually reach it, so the address the dashboard was opened on is used. Learned from the SPA route only — never from an API call, because Home Assistant polls under a container name no car could resolve. `ingest.unit_display_url` overrides it for reverse-proxy setups. **Superseded in part — see §14: the address is now persisted, and an API key is needed when sign-in is on** |
+| — | `ingest.show_on_unit` — open this app's Backup page on the head unit's own screen when a transfer starts | `adb.show_url`, `origin.py`, `main.py`, `settings_schema.py` | §5. Off by default, URL allowlisted, fired not awaited, only when there is something to copy. The address is **learned from the browser**: a bridged container sees only its own 172.x interfaces, never the host LAN address and published port that actually reach it, so the address the dashboard was opened on is used. Learned from the SPA route only, because an API client may use a container hostname the car cannot resolve. `ingest.unit_display_url` overrides it for reverse-proxy setups. **Superseded in part — see §14: the address is now persisted, and an API key is needed when sign-in is on** |
 
 ### Deliberately not done
 

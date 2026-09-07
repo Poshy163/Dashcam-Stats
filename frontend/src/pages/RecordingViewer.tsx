@@ -569,7 +569,7 @@ export default function RecordingViewer() {
           <section className="card cockpit-panel p-4">
             <div className="hud-tag mb-2">
               <span className="h-1.5 w-1.5 rounded-full bg-cyan animate-pulse"></span>
-              TELEMETRY SENSOR HUD
+              Telemetry
             </div>
             {telemetry.data && telemetry.data.length > 0 ? (
               <div className="space-y-3">

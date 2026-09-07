@@ -42,8 +42,8 @@ from app.db.session import dispose_engine, get_session_factory, init_db
 from app.hardware.detect import detect_hardware_async
 from app.hardware.ffmpeg import media_health
 from app.ingest import origin
-from app.ingest.ha_import_queue import get_import_worker
 from app.ingest.obd_reconciliation import reconcile_all_drives
+from app.ingest.obd_storage import reconcile_orphan_bundles, recover_interrupted_validations
 from app.ingest.poller import get_poller
 from app.ingest.puller import reconcile_startup_in_awake_window
 from app.ingest.status import hydrate_last_success
@@ -70,6 +70,15 @@ the precision the camera prints (about 11 m) and *heading and distance are deriv
 consecutive fixes rather than measured. G-force and event markers do not exist in this
 footage and are never reported.
 """.strip()
+
+
+async def _reconcile_obd_storage_after_startup() -> None:
+    try:
+        await reconcile_orphan_bundles()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.exception("OBD storage reconciliation failed", error=str(exc))
 
 
 @contextlib.asynccontextmanager
@@ -168,11 +177,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # and the process is being killed *by* the fault, so every restart re-armed the iGPU
     # and walked into the same native abort -- which is the crash loop itself.
     restore_gpu_failure_state()
+    recovered_validations = await recover_interrupted_validations()
+    if recovered_validations:
+        log.warning(
+            "recovered interrupted OBD bundle validations",
+            count=recovered_validations,
+        )
     await pool.start()
     await scheduler.start()
-    # Its own durable queue: an HA outage never occupies a footage worker or changes a
-    # backup run's result.  Startup reconciles any import interrupted by the last process.
-    await get_import_worker().start()
     # Radio recovery is a safety invariant, not an ingest feature toggle.  Reconcile a
     # process that died between disable and restore before the poller can start another
     # visit, even when ingest.enabled is currently false.  An offline unit leaves the
@@ -188,6 +200,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # after the API becomes startable rather than making health wait on full-resolution
     # history; every newly stored bundle is reconciled synchronously as well.
     obd_reconcile = asyncio.create_task(reconcile_all_drives(), name="obd-reconciliation")
+    obd_storage_reconcile = asyncio.create_task(
+        _reconcile_obd_storage_after_startup(), name="obd-storage-reconciliation"
+    )
 
     # Deliberately not awaited: compiling the models takes about a minute on the iGPU, and
     # blocking here would delay the health check and the UI for no benefit. The first job
@@ -207,8 +222,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         obd_reconcile.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await obd_reconcile
+        obd_storage_reconcile.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await obd_storage_reconcile
         await get_poller().stop()
-        await get_import_worker().stop()
         await scheduler.stop()
         await pool.stop()
         with contextlib.suppress(Exception):
@@ -241,7 +258,7 @@ def create_app() -> FastAPI:
     #
     # `allow_origins=["*"]` bought this application nothing. The SPA is served from this
     # same origin, so its requests were never subject to CORS at all, and the clients the
-    # permissiveness was written for -- Home Assistant's REST sensor, curl, a script on
+    # permissiveness was written for -- curl, a script on
     # another host -- are not browsers and have never been bound by it either. What it did
     # buy was a real hole in the default configuration: with sign-in off, any page the
     # owner happened to visit could read `/api/map/routes` and `/api/plates` straight out
@@ -417,7 +434,7 @@ def _mount_frontend(app: FastAPI) -> None:
         # dashcam's own browser needs in order to show the Backup page while a transfer
         # runs. Taken here rather than in middleware precisely because this route serves
         # the dashboard and nothing else: an API caller's idea of this app's address is
-        # its own, and Home Assistant's is usually a container name no car could resolve.
+        # its own, and a caller's address may be a container name no car could resolve.
         await origin.remember(request.url.scheme, request.headers.get("host", ""))
 
         redeemed = await _redeem_api_key(request, full_path)

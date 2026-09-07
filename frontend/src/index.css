@@ -13,7 +13,7 @@
     --border: 212 220 231;
     --content: 15 23 42;
     --content-muted: 71 85 105;
-    --content-faint: 140 152 170;
+    --content-faint: 100 116 139;
     --accent: 240 98 0;
     --accent-muted: 255 237 224;
     --cyan: 0 174 204;
@@ -41,7 +41,7 @@
     --border: 32 40 54;
     --content: 241 245 249;
     --content-muted: 148 163 184;
-    --content-faint: 88 102 122;
+    --content-faint: 120 136 158;
     --accent: 255 107 0;
     --accent-muted: 56 26 5;
     --cyan: 0 240 255;
@@ -72,6 +72,22 @@
     @apply bg-surface text-content antialiased;
     font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
     letter-spacing: -0.01em;
+  }
+
+  :where(a, button, input, select, textarea, summary):focus-visible {
+    @apply outline outline-2 outline-offset-2 outline-accent;
+  }
+
+  button,
+  [role='button'] {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  button:disabled,
+  input:disabled,
+  select:disabled,
+  textarea:disabled {
+    @apply cursor-not-allowed opacity-50;
   }
 
   /* Tabular figures everywhere numbers are compared down a column — speeds, sizes,

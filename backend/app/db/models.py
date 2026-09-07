@@ -142,21 +142,12 @@ class JobKind(str, enum.Enum):
 
 
 class OBDBundleState(str, enum.Enum):
-    """Durable state of the OBD copy/import pipeline.
-
-    This is deliberately separate from :class:`JobState`.  A media job can be rebuilt
-    from the footage, while an OBD bundle is itself the irreplaceable source until Home
-    Assistant acknowledges it.  Folding the two queues together would also let a slow HA
-    outage consume media workers, which is exactly the coupling the backup path must avoid.
-    """
+    """Durable state of an OBD bundle as it moves into server storage."""
 
     WAITING_FOR_BACKUP = "waiting_for_backup"
     COPYING = "copying"
     VALIDATING = "validating"
-    READY_TO_IMPORT = "ready_to_import"
-    IMPORTING = "importing"
-    IMPORTED = "imported"
-    RETRY_WAIT = "retry_wait"
+    STORED = "stored"
     FAILED = "failed"
     QUARANTINED = "quarantined"
 
@@ -859,7 +850,7 @@ class IngestRadioTransition(Base):
 
 
 class OBDBundle(Base):
-    """One immutable logger export and its independent Home Assistant queue state."""
+    """One immutable logger export retained by the analytics server."""
 
     __tablename__ = "obd_bundles"
 
@@ -888,22 +879,16 @@ class OBDBundle(Base):
     state: Mapped[str] = mapped_column(
         String(32), default=OBDBundleState.WAITING_FOR_BACKUP.value, index=True
     )
-    attempts: Mapped[int] = mapped_column(Integer, default=0)
-    next_attempt_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True, index=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_kind: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
-    last_http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     copied_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
-    import_started_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
-    imported_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True, index=True)
     remote_deleted_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
 
     duplicate: Mapped[bool] = mapped_column(Boolean, default=False)
-    ha_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     validation_warnings: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     drive: Mapped[OBDDrive | None] = relationship(back_populates="bundle", uselist=False)
@@ -915,7 +900,6 @@ class OBDBundle(Base):
             "schema_version",
             name="uq_obd_bundle_identity",
         ),
-        Index("ix_obd_bundle_claim", "state", "next_attempt_at", "drive_started_at", "id"),
     )
 
 

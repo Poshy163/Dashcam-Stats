@@ -26,7 +26,6 @@ from app.core.process_lock import ProcessFileLock, try_acquire
 from app.db.models import OBDBundle, OBDBundleState, utcnow
 from app.db.session import session_scope
 from app.ingest import adb, transport
-from app.ingest.ha_import_queue import get_import_worker, redact
 from app.ingest.models import DeltaPlan, RemoteFile, UnitInfo, ingest_setting
 from app.ingest.obd_bundle import (
     SAFE_DRIVE_ID,
@@ -40,6 +39,7 @@ from app.ingest.obd_bundle import (
     store_validated_bundle,
     validate_bundle,
 )
+from app.ingest.obd_storage import redact
 from app.ingest.status import IngestStatus
 
 log = get_logger(__name__)
@@ -47,17 +47,7 @@ log = get_logger(__name__)
 _SAFE_REMOTE_PATH = re.compile(r"^/[A-Za-z0-9._/-]{1,511}$")
 MAX_BUNDLES_PER_WINDOW = 64
 _REMOTE_RECLAIMABLE_STATES = {
-    OBDBundleState.READY_TO_IMPORT.value,
-    OBDBundleState.RETRY_WAIT.value,
-    OBDBundleState.IMPORTING.value,
-    OBDBundleState.IMPORTED.value,
-}
-_REMOTE_RECLAIMABLE_FAILED_KINDS = {
-    "authentication",
-    "configuration",
-    "payload",
-    "permanent",
-    "protocol",
+    OBDBundleState.STORED.value,
 }
 MAX_REMOTE_STATUS_BYTES = 64 * 1024
 MAX_RECEIPT_BYTES = 512
@@ -492,11 +482,14 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
             if item in {"valid", "stale", "invalid", "failed", "unavailable"}:
                 clean[key] = item
         elif key == "ble_owner":
+            # Logger versions before the standalone server used an integration-specific
+            # owner label. Normalize it at the compatibility boundary so it never leaks
+            # into the API or stored status snapshots.
             if item in {
                 "unowned",
                 "dashcam_voltage_only",
                 "dashcam_full_obd",
-                "home_assistant_voltage_only",
+                "external_obd_client_voltage_only",
                 "phone_reserved",
                 "transitioning",
                 "conflict_detected",
@@ -710,13 +703,10 @@ async def _already_verified(item: RemoteFile, config: AppConfig) -> OBDBundle | 
             if not still_repairable:
                 return current if current.state in _REMOTE_RECLAIMABLE_STATES else None
             now = utcnow()
-            current.state = OBDBundleState.READY_TO_IMPORT.value
+            current.state = OBDBundleState.STORED.value
             current.verified_at = now
-            current.next_attempt_at = now
-            current.import_started_at = None
             current.last_error = None
             current.failure_kind = None
-            current.last_http_status = None
             current.updated_at = now
             await session.flush()
             row = current
@@ -808,14 +798,11 @@ async def _delete_remote_if_hash(
 
 
 def _receipt_eligible(row: OBDBundle) -> bool:
-    """Whether durable server identity is independent of HA delivery outcome."""
-    if not row.metadata_trusted or row.verified_at is None:
-        return False
-    if row.state in _REMOTE_RECLAIMABLE_STATES:
-        return True
-    return (
-        row.state == OBDBundleState.FAILED.value
-        and row.failure_kind in _REMOTE_RECLAIMABLE_FAILED_KINDS
+    """Whether the server has a verified, durable copy safe to acknowledge."""
+    return bool(
+        row.metadata_trusted
+        and row.verified_at is not None
+        and row.state in _REMOTE_RECLAIMABLE_STATES
     )
 
 
@@ -1172,14 +1159,11 @@ async def sync_remote_bundles(
                     manifest=validated.manifest,
                     summary=validated.summary,
                     diagnostics_document=validated.diagnostics_document,
-                    latest_sample=validated.latest_sample,
-                    latest_values=validated.latest_values,
-                    statistics=validated.statistics,
                     summary_source=validated.summary_source,
                     warnings=validated.warnings,
                 )
                 row = await _register(validated)
-                if row.state == OBDBundleState.READY_TO_IMPORT.value:
+                if row.state == OBDBundleState.STORED.value:
                     try:
                         await asyncio.to_thread(_clear_stale_quarantine, name, cfg)
                     except (BundleError, OSError) as cleanup_error:
@@ -1309,7 +1293,6 @@ async def sync_remote_bundles(
             else:
                 await _mark_remote_deleted(row.id)
                 result.removed_from_unit += 1
-            get_import_worker().wake()
 
         missing_names = set(expected) - durable_names
         result.missing = len(missing_names)

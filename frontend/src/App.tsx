@@ -5,9 +5,11 @@ import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import Layout from '@/components/Layout'
 import RouteBoundary from '@/components/RouteBoundary'
 import Spinner from '@/components/Spinner'
+import { ErrorState } from '@/components/ui'
 import { api, setUnauthorizedHandler } from '@/lib/api'
 import { setDisplayTimeZone } from '@/lib/format'
 import { AUTH_STATE_KEY, resetForIdentityChange } from '@/lib/queryInvalidation'
+import { useTheme } from '@/lib/useTheme'
 
 // Route-level code splitting. The map and chart bundles are large and most sessions never
 // open a journey, so they should not sit in the initial payload.
@@ -36,13 +38,41 @@ import Login from '@/pages/Login'
 export default function App() {
   const client = useQueryClient()
   const location = useLocation()
+  const { theme, toggleTheme } = useTheme()
+  const auth = useQuery({ queryKey: AUTH_STATE_KEY, queryFn: api.auth.state, staleTime: 60_000 })
+  const locked = auth.data?.required === true && auth.data.authenticated === false
+
+  useEffect(() => {
+    const routeTitles: [RegExp, string][] = [
+      [/^\/$/, 'Overview'],
+      [/^\/recordings\//, 'Recording'],
+      [/^\/recordings$/, 'Recordings'],
+      [/^\/journeys\//, 'Journey'],
+      [/^\/journeys$/, 'Journeys'],
+      [/^\/heatmap$/, 'Map'],
+      [/^\/telemetry-health$/, 'Telemetry health'],
+      [/^\/obd\//, 'OBD drive'],
+      [/^\/obd$/, 'OBD drives'],
+      [/^\/plates\//, 'Plate'],
+      [/^\/plates$/, 'Plates'],
+      [/^\/vehicles$/, 'Vehicles'],
+      [/^\/queue$/, 'Queue'],
+      [/^\/backup$/, 'Backup'],
+      [/^\/logs$/, 'Activity logs'],
+      [/^\/settings$/, 'Settings'],
+      [/^\/search$/, 'Search'],
+    ]
+    const page = locked
+      ? 'Sign in'
+      : auth.isError
+        ? 'Unable to load'
+        : routeTitles.find(([pattern]) => pattern.test(location.pathname))?.[1]
+    document.title = page ? `${page} · Dashcam Analyser` : 'Dashcam Analyser'
+  }, [auth.isError, location.pathname, locked])
 
   // Asked for before anything else renders. Every page in the app opens by fetching
   // something, so mounting the shell before this resolves would fire a screenful of
   // requests that can only 401.
-  const auth = useQuery({ queryKey: AUTH_STATE_KEY, queryFn: api.auth.state, staleTime: 60_000 })
-  const locked = auth.data?.required === true && auth.data.authenticated === false
-
   // A thirty-day session expires while a tab is open, and the first request to notice is
   // whichever one happened to fire. Rather than have that page render an error, any 401
   // re-asks who we are, which flips `locked` and puts the login page up.
@@ -70,6 +100,14 @@ export default function App() {
 
   if (auth.isLoading) return <Spinner label="Loading…" className="py-24" />
 
+  if (auth.isError) {
+    return (
+      <main className="mx-auto flex min-h-full max-w-xl items-center px-4 py-12">
+        <ErrorState error={auth.error} retry={() => void auth.refetch()} />
+      </main>
+    )
+  }
+
   if (locked) {
     return (
       <Login
@@ -83,7 +121,7 @@ export default function App() {
   }
 
   return (
-    <Layout auth={auth.data}>
+    <Layout auth={auth.data} theme={theme} onToggleTheme={toggleTheme}>
       {/* Keyed on the path so a page that failed does not keep its error across a
           navigation — otherwise one broken route makes the whole app look broken. */}
       <RouteBoundary key={location.pathname}>

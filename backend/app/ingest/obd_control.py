@@ -21,8 +21,8 @@ from typing import Any
 
 from app.core.logging import get_logger
 from app.ingest import adb
-from app.ingest.ha_import_queue import redact
 from app.ingest.obd_bundle import SAFE_DRIVE_ID, SHA256_RE, is_bundle_name
+from app.ingest.obd_storage import redact
 
 log = get_logger(__name__)
 
