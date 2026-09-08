@@ -23,7 +23,7 @@ from app.db.session import get_session_factory
 log = structlog.get_logger(__name__)
 
 POLL_PLAN_VERSION = 5
-PROJECTION_VERSION = 2
+PROJECTION_VERSION = 3
 NOMINAL_CYCLE_S = 5.0
 GAP_TOLERANCE = 1.5
 MAX_RECORDED_GAPS = 100
@@ -264,12 +264,65 @@ def vehicle_data_present(summary: dict[str, Any]) -> bool:
     return isinstance(maximum_rpm, (int, float)) and maximum_rpm > 0
 
 
-def lifecycle_status(*, clean_end: bool, stop_reason: str | None, producer: str | None) -> str:
+@dataclass
+class ShutdownEvidence:
+    """Conservative shutdown inference; missing ECU values alone never prove a stop."""
+
+    running_at: datetime | None = None
+    stopped_at: datetime | None = None
+    last_at: datetime | None = None
+
+    def observe(self, sample: OBDSample) -> None:
+        at = sample.captured_at
+        if self.last_at is not None and at <= self.last_at:
+            self.running_at = self.stopped_at = None
+        self.last_at = at
+        rpm, speed, voltage = (
+            sample.engine_rpm,
+            sample.vehicle_speed_kmh,
+            sample.adapter_voltage_v,
+        )
+        if rpm is not None and rpm > 300:
+            self.running_at = at if voltage is not None and voltage >= 13 else None
+            self.stopped_at = None
+            return
+        if (speed is not None and speed > 0) or (voltage is not None and voltage >= 13):
+            self.stopped_at = None
+            return
+        if (
+            self.running_at is not None
+            and 0 < (at - self.running_at).total_seconds() <= 30
+            and rpm is not None
+            and 0 <= rpm <= 300
+            and speed == 0
+            and voltage is not None
+            and 10 <= voltage < 13
+        ):
+            self.stopped_at = at
+
+    def detected(self, finished_at: datetime) -> bool:
+        return (
+            self.stopped_at is not None
+            and 0 <= (finished_at - self.stopped_at).total_seconds() <= 30
+        )
+
+
+def lifecycle_status(
+    *,
+    clean_end: bool,
+    stop_reason: str | None,
+    producer: str | None,
+    shutdown_detected: bool = False,
+) -> str:
     """Return the truthful server lifecycle while accepting legacy v1 manifests."""
     if clean_end:
         return "complete"
     if stop_reason == "device_restart" or producer == "recovered":
         return "recovered"
+    if stop_reason == "ingestion_requested":
+        return "saved_for_backup"
+    if stop_reason == "connection_lost" and shutdown_detected:
+        return "shutdown_detected"
     return "interrupted"
 
 
@@ -629,6 +682,7 @@ async def reconcile_drive_projection(
         signal_states = {spec.name: _SignalState(spec) for spec in specs}
         transport = _Cadence()
         rollup = _Rollup()
+        shutdown = ShutdownEvidence()
         first_sample: datetime | None = None
         last_sample: datetime | None = None
         last_success: datetime | None = None
@@ -652,6 +706,7 @@ async def reconcile_drive_projection(
             )
             transport.observe(sample.captured_at, NOMINAL_CYCLE_S)
             rollup.observe(sample)
+            shutdown.observe(sample)
             if previous_sequence is None:
                 if sample.sequence > 0:
                     sequence_gaps = min(MAX_EXPECTED_CYCLES, sample.sequence)
@@ -684,6 +739,7 @@ async def reconcile_drive_projection(
             clean_end=bool(drive.clean_end),
             stop_reason=drive.stop_reason,
             producer=drive.completion_status,
+            shutdown_detected=shutdown.detected(bundle.drive_finished_at),
         )
         producer_finished = bundle.drive_finished_at
 
@@ -703,7 +759,7 @@ async def reconcile_drive_projection(
         manifest_finalised = manifest_time("finalised_at_utc")
         finalization_observed = manifest_finalised or manifest_noticed or producer_finished
         successful_response = _latest_time(last_success, manifest_last_response)
-        if lifecycle in {"interrupted", "recovered"}:
+        if lifecycle != "complete":
             effective_finished = last_sample or successful_response or producer_finished
         else:
             effective_finished = producer_finished
@@ -838,6 +894,11 @@ async def reconcile_drive_projection(
                 "manifest_last_sample_at": _iso(manifest_last_sample),
                 "raw_last_sample_at": _iso(last_sample),
                 "last_sample_matches_manifest": manifest_last_sample_matches,
+            },
+            "lifecycle_evidence": {
+                "producer_stop_reason": drive.stop_reason,
+                "shutdown_inferred": lifecycle == "shutdown_detected",
+                "shutdown_sample_at": _iso(shutdown.stopped_at),
             },
         }
         projection_document = {

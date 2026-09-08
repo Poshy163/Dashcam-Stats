@@ -1866,6 +1866,71 @@ class TestDriveSeriesApi:
     The server keeps every sample. These endpoints make that retained resolution reachable.
     """
 
+    @pytest.mark.parametrize(
+        ("stop_reason", "expected", "vehicle_data"),
+        [
+            ("ingestion_requested", "saved_for_backup", True),
+            ("connection_lost", "shutdown_detected", True),
+            ("ingestion_requested", "no_vehicle_data", False),
+        ],
+    )
+    async def test_shutdown_projection_repairs_history_without_changing_evidence(
+        self,
+        db_session,
+        app_config,
+        client,
+        stop_reason,
+        expected,
+        vehicle_data,
+    ):
+        from app.ingest.obd_reconciliation import reconcile_all_drives
+
+        drive_id = f"drive_ending_{stop_reason}"
+        samples = [_sample(drive_id, i, telemetry=False) for i in range(5)]
+        if vehicle_data:
+            samples[0].update(engine_rpm=737.5, vehicle_speed=0, adapter_voltage=13.8)
+            samples[1].update(engine_rpm=137.5, vehicle_speed=0, adapter_voltage=12.9)
+        for sample in samples[2:]:
+            sample.update(adapter_voltage=12.8)
+        path = make_bundle(
+            app_config.obd_verified_dir,
+            drive_id,
+            samples=samples,
+            summary_patch={"clean_end": False},
+            manifest_patch={
+                "stop_reason": stop_reason,
+                "clean_end": False,
+                "completion_status": "interrupted",
+            },
+        )
+        original_bytes = path.read_bytes()
+        checked = validate_bundle(path, config=app_config)
+        async with session_scope() as session:
+            await store_validated_bundle(session, checked)
+            drive = (await session.execute(select(OBDDrive))).scalars().one()
+            # Simulate the existing projection before upgrading the server.
+            drive.lifecycle_status = "interrupted"
+        assert (await reconcile_all_drives())["errors"] == 0
+        response = await client.get(f"/api/obd/drives/{drive_id}/series")
+        assert response.status_code == 200
+        projected = response.json()["drive"]
+        assert projected["lifecycle_status"] == expected
+        assert projected["producer_completion_status"] == "interrupted"
+        assert projected["stop_reason"] == stop_reason
+        assert projected["clean_end"] is False
+        assert projected["sample_count"] == 5
+        assert projected["finished_at"] == (BASE + timedelta(seconds=20)).isoformat()
+        second = await client.post(f"/api/obd/drives/{drive_id}/reprocess")
+        assert second.json()["result"]["changed"] is False
+        assert path.read_bytes() == original_bytes
+        async with session_scope() as session:
+            raw = (
+                (await session.execute(select(OBDSample).order_by(OBDSample.sequence)))
+                .scalars()
+                .all()
+            )
+            assert [row.raw_json for row in raw] == samples
+
     async def test_legacy_unclean_complete_is_projected_interrupted_idempotently(
         self, db_session, app_config, client
     ):

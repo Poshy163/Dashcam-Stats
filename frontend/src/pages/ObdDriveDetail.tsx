@@ -4,6 +4,7 @@ import { Link, useParams } from 'react-router-dom'
 import type { PointerEvent as ReactPointerEvent } from 'react'
 
 import Spinner from '@/components/Spinner'
+import { ObdLifecycleBadge, ObdLifecycleExplanation, ObdLifecycleReason } from '@/components/ObdLifecycle'
 import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
 import { EmptyState, ErrorState, PageHeader, StatTile } from '@/components/ui'
 import { api, type OBDBattery, type OBDSeriesSample } from '@/lib/api'
@@ -710,11 +711,7 @@ export default function ObdDriveDetail() {
         subtitle={
           <>
             {formatTime(drive.startedAt)} – {formatTime(drive.finishedAt)} · {drive.vehicleId}
-            {drive.lifecycleStatus !== 'complete' && (
-              <span className="ml-2 text-state-warn">
-                {drive.lifecycleStatus.replace(/_/g, ' ')} end
-              </span>
-            )}
+            <span className="ml-2"><ObdLifecycleBadge status={drive.lifecycleStatus} /></span>
           </>
         }
         actions={
@@ -738,26 +735,17 @@ export default function ObdDriveDetail() {
 
       <section className="card p-4 sm:p-5">
         <div className="flex flex-wrap items-center gap-2">
-          <span
-            className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
-              drive.lifecycleStatus === 'complete'
-                ? 'bg-state-ok/15 text-state-ok'
-                : drive.lifecycleStatus === 'recovered'
-                  ? 'bg-accent-muted text-accent'
-                  : 'bg-state-warn/15 text-state-warn'
-            }`}
-          >
-            {drive.lifecycleStatus.replace(/_/g, ' ')}
-          </span>
+          <ObdLifecycleBadge status={drive.lifecycleStatus} />
           {drive.interruptionReason && (
             <span className="text-sm text-content-muted">
-              {drive.interruptionReason.replace(/_/g, ' ')}
+              <ObdLifecycleReason status={drive.lifecycleStatus} reason={drive.interruptionReason} />
             </span>
           )}
           <span className="ml-auto text-xs text-content-faint">
             Summary {drive.processingStatus} · derived from {drive.summarySource === 'derived' ? 'samples' : drive.summarySource}
           </span>
         </div>
+        <ObdLifecycleExplanation status={drive.lifecycleStatus} />
         <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
           <div>
             <dt className="text-xs text-content-faint">Drive started</dt>

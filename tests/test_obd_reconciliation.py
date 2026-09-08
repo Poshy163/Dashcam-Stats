@@ -1,8 +1,121 @@
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from app.db.models import OBDSample
 from app.ingest.obd_reconciliation import (
     POLL_PLAN_VERSION,
+    ShutdownEvidence,
+    lifecycle_status,
     specs_for_poll_plan,
     vehicle_data_present,
 )
+
+
+@pytest.mark.parametrize(
+    ("reason", "shutdown", "expected"),
+    [
+        ("ingestion_requested", False, "saved_for_backup"),
+        ("ingestion_requested", True, "saved_for_backup"),
+        ("connection_lost", True, "shutdown_detected"),
+        ("connection_lost", False, "interrupted"),
+        ("device_restart", True, "recovered"),
+        ("parser_failure", True, "interrupted"),
+        ("process_terminated", True, "interrupted"),
+    ],
+)
+def test_terminal_classification_preserves_unexpected_failures(reason, shutdown, expected):
+    assert (
+        lifecycle_status(
+            clean_end=False,
+            stop_reason=reason,
+            producer="interrupted",
+            shutdown_detected=shutdown,
+        )
+        == expected
+    )
+
+
+def _ending_sample(seconds, rpm, speed, voltage):
+    return OBDSample(
+        captured_at=datetime(2026, 9, 8, tzinfo=UTC) + timedelta(seconds=seconds),
+        engine_rpm=rpm,
+        vehicle_speed_kmh=speed,
+        adapter_voltage_v=voltage,
+    )
+
+
+@pytest.mark.parametrize("rpm", [0, 137.5, 300])
+def test_recent_stationary_spin_down_is_shutdown_evidence(rpm):
+    evidence = ShutdownEvidence()
+    for sample in [
+        _ending_sample(0, 737.5, 0, 13.8),
+        _ending_sample(5, rpm, 0, 12.9),
+        _ending_sample(10, None, None, 12.8),
+        _ending_sample(20, None, None, 12.8),
+    ]:
+        evidence.observe(sample)
+    assert evidence.detected(sample.captured_at)
+    assert not evidence.detected(sample.captured_at + timedelta(seconds=16))
+
+
+@pytest.mark.parametrize(
+    ("rpm", "speed", "voltage"),
+    [
+        (None, 0, 12.8),
+        (0, None, 12.8),
+        (0, 0, None),
+        (0, 2, 12.8),
+        (0, 0, 13.0),
+        (500, 0, 12.8),
+        (0, 0, 0),
+        (-1, 0, 12.8),
+    ],
+)
+def test_missing_or_contradictory_signals_cannot_prove_shutdown(rpm, speed, voltage):
+    evidence = ShutdownEvidence()
+    evidence.observe(_ending_sample(0, 800, 0, 14))
+    sample = _ending_sample(5, rpm, speed, voltage)
+    evidence.observe(sample)
+    assert not evidence.detected(sample.captured_at)
+
+
+@pytest.mark.parametrize(
+    ("seconds", "rpm", "speed", "voltage"),
+    [
+        (10, 800, 0, 12.8),
+        (10, None, 2, 12.8),
+        (10, None, None, 14),
+        (5, None, None, 12.8),
+        (4, None, None, 12.8),
+    ],
+)
+def test_resumed_motion_or_reversed_clock_invalidates_shutdown(seconds, rpm, speed, voltage):
+    evidence = ShutdownEvidence()
+    evidence.observe(_ending_sample(0, 800, 0, 14))
+    evidence.observe(_ending_sample(5, 0, 0, 12.8))
+    sample = _ending_sample(seconds, rpm, speed, voltage)
+    evidence.observe(sample)
+    assert not evidence.detected(sample.captured_at)
+
+
+def test_shutdown_requires_recent_running_engine_evidence():
+    evidence = ShutdownEvidence()
+    evidence.observe(_ending_sample(0, 800, 0, 14))
+    sample = _ending_sample(31, 0, 0, 12.8)
+    evidence.observe(sample)
+    assert not evidence.detected(sample.captured_at)
+
+
+def test_low_voltage_alone_does_not_prove_an_alternator_shutdown():
+    evidence = ShutdownEvidence()
+    evidence.observe(_ending_sample(0, 800, 0, 12.8))
+    sample = _ending_sample(5, 0, 0, 12.8)
+    evidence.observe(sample)
+    assert not evidence.detected(sample.captured_at)
+    evidence = ShutdownEvidence()
+    evidence.observe(sample)
+    assert not evidence.detected(sample.captured_at)
 
 
 def test_v2_and_v3_keep_their_own_cadence_contracts() -> None:

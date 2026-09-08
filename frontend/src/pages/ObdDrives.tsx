@@ -3,31 +3,10 @@ import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 
 import Spinner from '@/components/Spinner'
+import { ObdLifecycleBadge, ObdLifecycleReason } from '@/components/ObdLifecycle'
 import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
 import { formatDateTime, formatDuration, formatRelative, formatSpeed } from '@/lib/format'
-
-const LIFECYCLE_STYLE: Record<string, { label: string; className: string }> = {
-  complete: { label: 'Complete', className: 'bg-state-ok/15 text-state-ok' },
-  interrupted: { label: 'Interrupted', className: 'bg-state-warn/15 text-state-warn' },
-  recovered: { label: 'Recovered', className: 'bg-accent-muted text-accent' },
-  // The bus went silent while the adapter kept answering, so the drive recorded samples
-  // but no vehicle data. Styled as an error rather than a warning: a drive with no
-  // statistics is a drive that was not captured, however cleanly it ended.
-  no_vehicle_data: { label: 'No vehicle data', className: 'bg-state-error/15 text-state-error' },
-}
-
-function LifecycleBadge({ status }: { status: string }) {
-  const style = LIFECYCLE_STYLE[status] ?? {
-    label: status.replace(/_/g, ' '),
-    className: 'bg-surface-sunken text-content-muted',
-  }
-  return (
-    <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${style.className}`}>
-      {style.label}
-    </span>
-  )
-}
 
 export default function ObdDrives() {
   const [page, setPage] = useState(1)
@@ -125,10 +104,10 @@ export default function ObdDrives() {
                     </Link>
                   </td>
                   <td className="p-2">
-                    <LifecycleBadge status={drive.lifecycleStatus} />
+                    <ObdLifecycleBadge status={drive.lifecycleStatus} />
                     {drive.interruptionReason && (
                       <div className="mt-1 text-xs text-content-faint">
-                        {drive.interruptionReason.replace(/_/g, ' ')}
+                        <ObdLifecycleReason status={drive.lifecycleStatus} reason={drive.interruptionReason} />
                       </div>
                     )}
                   </td>
