@@ -382,6 +382,7 @@ class IngestPoller:
                     # the recorder-health card current on a unit that stays present.
                     health.on_unit_present(self._address())
                     unit_logs.on_unit_present(self._address())
+                    carplay_timing.on_unit_present(self._address())
                     band.on_unit_present(self._address())
                     await asyncio.sleep(self._interval())
                     continue

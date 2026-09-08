@@ -54,6 +54,65 @@ def clean():
     carplay_timing.reset_for_tests()
 
 
+@pytest.mark.parametrize("ignition", ["off", "on", "unknown"])
+async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off(
+    monkeypatch,
+    ignition,
+):
+    from app.ingest import poller as poller_module
+    from app.ingest.models import RunState
+    from app.ingest.status import IngestStatus
+
+    status = IngestStatus()
+    status.state = RunState.OK
+    status.ignition_state = ignition
+    poller = poller_module.IngestPoller()
+    poller._running = poller._was_online = True
+    recovered = []
+    real_sleep = asyncio.sleep
+
+    async def stop_after_tick(_delay):
+        poller._running = False
+        await real_sleep(0)
+
+    async def listening(_address):
+        return True
+
+    async def recover(address):
+        recovered.append(address)
+
+    async def arm(_address):
+        return True
+
+    async def unexpected_probe():
+        raise AssertionError("an idle diagnostics refresh must not reconnect ADB")
+
+    monkeypatch.setattr(poller, "_enabled", lambda: True)
+    monkeypatch.setattr(poller, "_address", lambda: "u:5555")
+    monkeypatch.setattr(poller, "_should_drain_again", lambda _status: False)
+    monkeypatch.setattr(poller_module, "get_status", lambda: status)
+    monkeypatch.setattr(carplay_timing, "get_status", lambda: status)
+    monkeypatch.setattr(
+        carplay_timing,
+        "get_settings_service",
+        lambda: _Settings({carplay_timing.ENABLED_KEY: True}),
+    )
+    monkeypatch.setattr(carplay_timing, "recover_sampler_file", recover)
+    monkeypatch.setattr(carplay_timing, "arm", arm)
+    monkeypatch.setattr(poller_module.adb, "is_listening", listening)
+    monkeypatch.setattr(poller_module.puller, "probe_unit", unexpected_probe)
+    for module in (poller_module.health, poller_module.unit_logs, poller_module.band):
+        monkeypatch.setattr(module, "on_unit_present", lambda _address: None)
+    monkeypatch.setattr(poller_module.asyncio, "sleep", stop_after_tick)
+    try:
+        await poller._loop()
+        if carplay_timing._tasks:
+            await asyncio.gather(*list(carplay_timing._tasks))
+        assert recovered == (["u:5555"] if ignition == "off" else [])
+    finally:
+        await carplay_timing.shutdown()
+
+
 class TestParsing:
     def test_a_video_line_becomes_numbers(self):
         at = datetime(2026, 9, 3, 7, 30, tzinfo=UTC)
