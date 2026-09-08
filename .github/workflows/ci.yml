@@ -141,6 +141,7 @@ jobs:
   android-obd-logger:
     name: Android OBD logger (tests + lint + APK)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -151,13 +152,29 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
-      - uses: gradle/actions/setup-gradle@v4
+      # setup-gradle's implicit post-job cleanup hung after a successful 93-second
+      # build (run 34231347148), blocking publication. Keep wrapper validation,
+      # but cache only immutable downloads in visible, bounded, optional steps.
+      - uses: gradle/actions/wrapper-validation@v4
+
+      - name: Restore Gradle downloads
+        id: gradle-downloads
+        uses: actions/cache/restore@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          path: |
+            ~/.gradle/wrapper/dists
+            ~/.gradle/caches/modules-2/files-2.1
+          key: gradle-downloads-${{ runner.os }}-v1-${{ hashFiles('android/obd-logger/**/*.gradle.kts', 'android/obd-logger/gradle.properties', 'android/obd-logger/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-downloads-${{ runner.os }}-v1-
 
       - name: Install Android SDK
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - name: Test, lint and assemble
         working-directory: android/obd-logger
+        timeout-minutes: 10
         # Release stays unsigned in untrusted PR CI. Production signing is an explicit,
         # protected local/release operation documented with the companion.
         run: >-
@@ -167,6 +184,17 @@ jobs:
           :app:lintRelease
           :app:assembleDebug
           :app:assembleRelease
+
+      - name: Save Gradle downloads
+        if: success() && github.event_name != 'pull_request' && steps.gradle-downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          path: |
+            ~/.gradle/wrapper/dists
+            ~/.gradle/caches/modules-2/files-2.1
+          key: gradle-downloads-${{ runner.os }}-v1-${{ hashFiles('android/obd-logger/**/*.gradle.kts', 'android/obd-logger/gradle.properties', 'android/obd-logger/gradle/wrapper/gradle-wrapper.properties') }}
 
       # Job logs need a token to read; annotations do not. When Gradle fails, name the
       # failing tests and lint errors as annotations so the cause is visible from the
