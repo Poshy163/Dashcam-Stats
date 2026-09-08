@@ -108,9 +108,7 @@ async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off
         poller_module.band,
     ):
         monkeypatch.setattr(module, "on_unit_present", lambda _address: None)
-    monkeypatch.setattr(
-        poller_module.wifi_startup, "on_unit_present", startup_guard_checks.append
-    )
+    monkeypatch.setattr(poller_module.wifi_startup, "on_unit_present", startup_guard_checks.append)
     monkeypatch.setattr(poller_module.asyncio, "sleep", stop_after_tick)
     try:
         await poller._loop()
