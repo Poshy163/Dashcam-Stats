@@ -605,10 +605,10 @@ SETTINGS: tuple[SettingDef, ...] = (
         "journeys.gap_minutes",
         "Journey gap threshold",
         "float",
-        5.0,
+        1.0,
         "journeys",
-        "A gap longer than this between recordings starts a new journey. Five minutes "
-        "matches the observed pattern in this footage.",
+        "A gap longer than this with neither camera recording starts a new journey. "
+        "The default is one minute; a gap of exactly one minute stays in the same journey.",
         minimum=0.5,
         maximum=180.0,
         unit="minutes",

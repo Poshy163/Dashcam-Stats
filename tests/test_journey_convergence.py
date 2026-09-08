@@ -212,6 +212,11 @@ class TestTheLibraryHealsWithoutBeingPoked:
 
     async def _marooned(self, session):
         """A damaged clip sitting alone, with its neighbours in a journey of their own."""
+        from app.core.settings_service import get_settings_service
+
+        # Preserve this historical four-minute-gap GPS regression independently of the
+        # newer one-minute default, which correctly splits that gap on time alone.
+        await get_settings_service().set_many({"journeys.gap_minutes": 5.0})
         neighbours = Journey(started_at=BASE, ended_at=BASE + timedelta(seconds=240))
         alone = Journey(
             started_at=BASE + timedelta(seconds=480), ended_at=BASE + timedelta(seconds=600)

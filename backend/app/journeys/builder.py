@@ -1,8 +1,8 @@
 """Grouping recordings into journeys.
 
-The primary signal is the gap between the end of one recording and the start of the next.
-On the real corpus a five-minute threshold turns 354 front-camera segments into about 45
-journeys across twelve days, which matches the actual driving pattern.
+The primary signal is the uncovered gap across both cameras. By default, more than one
+minute with neither camera recording starts a new journey. A gap of exactly one minute
+remains in the same journey; overlapping front/rear footage counts as continuous coverage.
 
 Two details matter more than they look:
 
