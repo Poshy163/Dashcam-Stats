@@ -44,6 +44,9 @@ class PlateReading:
     crop: np.ndarray | None = None
     vehicle_crop: np.ndarray | None = None
     offset_s: float = 0.0
+    #: Orientation actually used for this reading, also applied to its saved previews.
+    mirrored: bool = False
+    orientation_margin: float | None = None
 
     @property
     def usable(self) -> bool:

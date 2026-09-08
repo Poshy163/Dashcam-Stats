@@ -135,6 +135,13 @@ AU_PATTERNS: tuple[PlatePattern, ...] = (
     # -- masks exactly one jurisdiction uses -----------------------------------------
     # SA's current series is the only one with a literal leading letter.
     PlatePattern("SA:S000AAA", "S###AAA", ("SA",), 0),
+    # EzyPlates' premium and Euro series. Narrow masks keep these distinct from the
+    # unconstrained personalised/signage shapes that must not validate arbitrary words.
+    # https://ezyplates.sa.gov.au/plate-styles/premium-number-plates
+    # https://ezyplates.sa.gov.au/plate-styles/euro-number-plates
+    PlatePattern("SA:PREMIUM:AA000A", "AA###A", ("SA",), 0),
+    PlatePattern("SA:EURO:SEA00A", "SEA##A", ("SA",), 0),
+    PlatePattern("SA:EURO:SXA00A", "SXA##A", ("SA",), 0),
     PlatePattern("WA:0AAA000", f"{DIGIT_SLOT}AAA###", ("WA",), 0),
     PlatePattern("TAS:A00AA", "A##AA", ("TAS",), 0),
     PlatePattern("ACT:AAA00A", "AAA##A", ("ACT",), 0),

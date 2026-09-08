@@ -704,6 +704,13 @@ export const api = {
   },
 
   plates: {
+    quality: () => request<{
+      revision: string
+      autoRevalidate: boolean
+      queuePaused: boolean
+      region: string
+      cameras: { cameraId: number | null; name: string | null; eligibleRecordings: number; currentRecordings: number; remainingRecordings: number; failedRecordings: number; excludedRecordings: number }[]
+    }>('/plates/quality'),
     /** `q` does partial matching: "ABC" matches "ABC123". */
     list: (query?: Query & { q?: string }) => request<Paginated<Plate>>('/plates', { query }),
     get: (id: number) => request<Plate>(`/plates/${id}`),

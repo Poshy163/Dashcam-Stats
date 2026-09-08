@@ -52,46 +52,49 @@ class TestTurningThePreviewRound:
         assert preview.flags["C_CONTIGUOUS"]
 
 
-class TestSettlingTheVote:
-    """``mirrored`` was decided only after eight sampled readings, and the crops are saved
-    after the loop -- so a recording with fewer readable plates than that reached the write
-    phase with the question still open and saved every preview unflipped."""
+class TestOrientationEvidence:
+    async def test_two_named_formats_do_not_outvote_the_stronger_read(self):
+        from tests.test_plate_quality import _StubOCR, crop
 
-    def test_a_short_recording_still_reaches_a_verdict(self):
         orientation = _PlateOrientation()
-        assert orientation.mirrored is None
-        # Three readings, all of which looked like real registrations upside down.
-        orientation._flipped = 3
-        orientation._sampled = 3
-        assert orientation.resolve() is True
+        # Synthetic reads with the same shape/confidence conflict as the reported case.
+        ocr = _StubOCR(upright=("9AB2222", 0.89), mirrored=("S123ABC", 0.999))
+        for _ in range(12):
+            assert await orientation.read(ocr, crop(), region="AU") == ("S123ABC", 0.999)
+            assert orientation.last_read_mirrored is True
+        assert orientation.describe()["votes_mirrored"] == 12
 
-    def test_silence_means_not_mirrored(self):
-        orientation = _PlateOrientation()
-        assert orientation.resolve() is False, (
-            "with no evidence either way the safe default is to change nothing"
-        )
+    async def test_initial_silence_cannot_lock_out_later_evidence(self):
+        from tests.test_plate_quality import _StubOCR, crop
 
-    def test_a_decision_already_made_is_not_revisited(self):
         orientation = _PlateOrientation()
-        orientation.mirrored = False
-        orientation._flipped = 99
+        noise = _StubOCR(upright=("", 0), mirrored=("", 0))
+        for _ in range(10):
+            await orientation.read(noise, crop(), region="AU")
+        clear = _StubOCR(upright=("junk", 0.90), mirrored=("S123ABC", 0.99))
+        assert await orientation.read(clear, crop(), region="AU") == ("S123ABC", 0.99)
+        assert orientation.last_read_mirrored is True
+
+    async def test_conflicting_close_reads_are_not_stored_as_a_guess(self):
+        from tests.test_plate_quality import _StubOCR, crop
+
+        orientation = _PlateOrientation()
+        ocr = _StubOCR(upright=("S123ABC", 0.96), mirrored=("S456DEF", 0.97))
+        assert await orientation.read(ocr, crop(), region="AU") == ("", 0.0)
+        assert orientation.describe()["rejected_ambiguous_orientation"] == 1
+
+    async def test_matching_text_is_not_rejected_for_a_confidence_tie(self):
+        from tests.test_plate_quality import _StubOCR, crop
+
+        orientation = _PlateOrientation()
+        ocr = _StubOCR(upright=("ABC123", 0.96), mirrored=("ABC123", 0.96))
+        assert await orientation.read(ocr, crop(), region="AU") == ("ABC123", 0.96)
+        assert orientation.last_read_mirrored is False
+
+    def test_silence_is_reported_without_claiming_a_mirror(self):
+        orientation = _PlateOrientation()
         assert orientation.resolve() is False
-
-    def test_a_narrow_win_does_not_flip_the_recording(self):
-        """The measured ratio on real footage is 14.6:1 one way and 8.5:1 the other, so a
-        3:1 threshold is nowhere near either. Four against three is noise."""
-        orientation = _PlateOrientation()
-        orientation._flipped, orientation._as_is, orientation._sampled = 4, 3, 7
-        assert orientation.resolve() is False
-
-    def test_the_verdict_is_reported(self):
-        orientation = _PlateOrientation()
-        orientation._flipped, orientation._sampled = 5, 5
-        orientation.resolve()
-        described = orientation.describe()
-        assert described["mirrored"] is True
-        assert described["votes_mirrored"] == 5
-        assert described["orientation_samples"] == 5
+        assert orientation.describe()["orientation_samples"] == 0
 
 
 class TestBoundingBoxesAreNotMoved:

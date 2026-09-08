@@ -511,6 +511,16 @@ SETTINGS: tuple[SettingDef, ...] = (
         "Find and read licence plates on detected vehicles.",
     ),
     SettingDef(
+        "plates.auto_revalidate",
+        "Automatically revalidate outdated plates",
+        "bool",
+        True,
+        "plates",
+        "After updates or plate-profile changes, check saved results and queue affected "
+        "footage for plate reprocessing in the background. Failed attempts remain visible.",
+        requires="plates.enabled",
+    ),
+    SettingDef(
         "plates.detection_confidence",
         "Plate detection threshold",
         "float",
@@ -554,19 +564,19 @@ SETTINGS: tuple[SettingDef, ...] = (
         "Normalisation rules applied to OCR output. Raw OCR is always kept regardless.",
         choices=(
             ("AU", "Australia (all states)"),
-            ("AU-SA", "South Australia only"),
+            ("AU-SA", "Prefer South Australia (keep interstate plates)"),
             ("none", "No regional normalisation"),
         ),
         requires="plates.enabled",
     ),
     SettingDef(
         "plates.max_ocr_per_track",
-        "Maximum OCR reads per vehicle",
+        "Maximum plate candidates per vehicle",
         "int",
         5,
         "plates",
-        "Best few crops of a tracked vehicle are read and voted on. OCR is never run on "
-        "every frame.",
+        "Inspect up to this many plate boxes in the vehicle's best saved image. Each "
+        "candidate is read in both orientations. This is not a count of independent frames.",
         minimum=1,
         maximum=30,
         requires="plates.enabled",

@@ -226,6 +226,10 @@ class PlateObservationOut(ApiModel):
     lon: float | None = None
     plate_crop_path: str | None = None
     vehicle_crop_path: str | None = None
+    ocr_mirrored: bool | None = None
+    orientation_method: str | None = None
+    orientation_margin: float | None = None
+    normalisation_substitutions: int | None = None
 
 
 class VehicleOut(ApiModel):

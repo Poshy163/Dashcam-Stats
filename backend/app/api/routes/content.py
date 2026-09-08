@@ -54,6 +54,7 @@ from app.db.models import (
     PlateObservation,
     ProcessingJob,
     Recording,
+    RecordingState,
     StageState,
     TelemetryPoint,
     TrackedObject,
@@ -295,6 +296,14 @@ def _observation_out(obs: PlateObservation, filename: str | None, camera: str | 
     data = PlateObservationOut.model_validate(obs)
     data.recording_filename = filename
     data.camera_name = camera
+    metadata = obs.bbox or {}
+    # Legacy preview mirroring did not necessarily match OCR. Only v4 records the actual
+    # reading orientation, so do not present old preview metadata as verified OCR evidence.
+    if metadata.get("orientation_method") == "per-crop-dual-ocr-v1":
+        data.ocr_mirrored = metadata.get("mirrored")
+        data.orientation_method = metadata["orientation_method"]
+        data.orientation_margin = metadata.get("orientation_margin")
+        data.normalisation_substitutions = metadata.get("normalisation_substitutions")
     return data
 
 
@@ -733,6 +742,97 @@ def _plate_has_visible_observation():
         )
         .exists()
     )
+
+
+@router.get("/plates/quality")
+async def plate_quality(session: SessionDep):
+    """Revision coverage by camera, including historical results awaiting repair.
+
+    This checks processing provenance, not OCR ground truth. Keep missing/ignored files
+    explicit so an operator cannot mistake an empty runnable queue for a complete repair.
+    """
+    from app.pipeline.plate_repair import validation_key
+
+    revision = CURRENT_REVISIONS["plates"]
+    target_key = validation_key()
+    eligible = and_(
+        Recording.ignored.is_(False),
+        Recording.file_missing.is_(False),
+        Recording.state != RecordingState.INVALID,
+    )
+    current = and_(
+        Recording.plate_revision == revision,
+        Recording.plate_state == StageState.DONE,
+        Recording.probe_json["plate_validation_key"].as_string() == target_key,
+    )
+    rows = (
+        await session.execute(
+            select(
+                Recording.camera_id,
+                Camera.name,
+                Camera.role,
+                func.count().label("recordings"),
+                func.sum(case((eligible, 1), else_=0)).label("eligible"),
+                func.sum(case((and_(eligible, current), 1), else_=0)).label("current"),
+                func.sum(
+                    case((and_(eligible, Recording.plate_state == StageState.FAILED), 1), else_=0)
+                ).label("failed"),
+            )
+            .outerjoin(Camera, Camera.id == Recording.camera_id)
+            .group_by(Recording.camera_id, Camera.name, Camera.role)
+        )
+    ).all()
+    observations = {
+        row.camera_id: row
+        for row in (
+            await session.execute(
+                select(
+                    Recording.camera_id,
+                    func.count().label("observations"),
+                    func.sum(case((current, 1), else_=0)).label("current"),
+                    func.sum(
+                        case(
+                            (
+                                PlateObservation.bbox["orientation_method"].as_string()
+                                == "per-crop-dual-ocr-v1",
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ).label("checked"),
+                )
+                .join(Recording, Recording.id == PlateObservation.recording_id)
+                .group_by(Recording.camera_id)
+            )
+        ).all()
+    }
+    cameras = []
+    for row in rows:
+        obs = observations.get(row.camera_id)
+        cameras.append(
+            {
+                "camera_id": row.camera_id,
+                "name": row.name,
+                "role": row.role,
+                "eligible_recordings": int(row.eligible),
+                "current_recordings": int(row.current),
+                "remaining_recordings": int(row.eligible - row.current),
+                "failed_recordings": int(row.failed),
+                "excluded_recordings": int(row.recordings - row.eligible),
+                "observations": int(obs.observations) if obs else 0,
+                "current_observations": int(obs.current or 0) if obs else 0,
+                "orientation_checked_observations": int(obs.checked or 0) if obs else 0,
+            }
+        )
+    return {
+        "revision": revision,
+        "validation_key": target_key,
+        "auto_revalidate": bool(get_settings_service().get_nowait("plates.auto_revalidate")),
+        "queue_paused": queue.is_paused(),
+        "region": get_settings_service().get_nowait("plates.region"),
+        "orientation_method": "per-crop-dual-ocr-v1",
+        "cameras": cameras,
+    }
 
 
 @router.get("/plates", response_model=Paginated[PlateOut])

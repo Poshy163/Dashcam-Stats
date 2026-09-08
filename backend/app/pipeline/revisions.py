@@ -13,7 +13,9 @@ CURRENT_REVISIONS: dict[str, str] = {
     # that none of those rules had ever seen, so their telemetry is rebuilt.
     "telemetry": "telemetry-v5",
     "detection": "detection-v3",
-    "plates": "plates-v3",
+    # v4 compares both OCR orientations per crop and saves the matching preview. Earlier
+    # outputs can contain backwards identities even beside correctly oriented images.
+    "plates": "plates-v4",
 }
 
 INVALIDATED_REVISION = "invalidated"

@@ -43,7 +43,15 @@ export default function Plates() {
   const query = useQuery({
     queryKey: ['plates', q, page, sort, flagged],
     queryFn: () => api.plates.list({ q: q || undefined, page, pageSize: 24, sort, flagged }),
+    refetchInterval: 15_000,
   })
+  const quality = useQuery({
+    queryKey: ['plate-quality'],
+    queryFn: api.plates.quality,
+    refetchInterval: 15_000,
+  })
+  const remaining = quality.data?.cameras.reduce((sum, camera) => sum + camera.remainingRecordings, 0) ?? 0
+  const failed = quality.data?.cameras.reduce((sum, camera) => sum + camera.failedRecordings, 0) ?? 0
 
   /**
    * Changing a *filter* resets to page 1, which is right — the old page number means
@@ -71,6 +79,17 @@ export default function Plates() {
         title="Licence plates"
         subtitle={query.data ? `${query.data.total} plates on record` : undefined}
       />
+
+      {quality.data && remaining > 0 && (
+        <div className="card space-y-1 p-3 text-sm" role="status">
+          <div className="font-medium">Updating past plate readings</div>
+          <p>{remaining.toLocaleString()} recordings still need validation.
+            {quality.data.queuePaused ? ' Processing is paused.' : quality.data.autoRevalidate ? ' Affected footage is queued automatically in the background.' : ' Automatic validation is disabled in Settings.'}
+          </p>
+          <p className="text-content-muted">{quality.data.cameras.map(camera => `${camera.name ?? 'Unknown camera'}: ${camera.currentRecordings.toLocaleString()} / ${camera.eligibleRecordings.toLocaleString()} checked`).join(' · ')}</p>
+          {failed > 0 && <Link className="text-state-warn underline" to="/queue">{failed} recordings failed validation — view the queue</Link>}
+        </div>
+      )}
 
       <div className="card flex flex-wrap items-end gap-3 p-3">
         <label className="min-w-[16rem] flex-1">

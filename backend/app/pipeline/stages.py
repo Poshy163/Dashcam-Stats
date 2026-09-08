@@ -87,6 +87,7 @@ from app.osd import (
     select_training_set,
 )
 from app.osd.reasons import GpsQuality, GpsReason
+from app.pipeline.plate_repair import stamp_validation, validation_key
 from app.pipeline.telemetry_quality import quality_rollup, recover_from_paired_camera
 
 
@@ -1645,105 +1646,86 @@ async def stage_detect(
 # --------------------------------------------------------------------------------------
 
 
-#: Readings to try both ways up before committing to an orientation for the recording.
-_ORIENTATION_SAMPLE = 8
-
-#: How decisively the mirrored side must win before the recording is treated as mirrored.
-#:
-#: Measured over 195 stored observations: the front camera votes 73 as-is against 5
-#: mirrored, and the rear votes 4 as-is against 34 mirrored -- 14.6:1 and 8.5:1. A 3:1
-#: threshold is nowhere near either, which is what makes it safe to decide automatically.
-_ORIENTATION_RATIO = 3.0
-
-#: Confidence a reading needs before its orientation vote counts at all.
+# A close contest between different registrations is not reliable orientation evidence.
+_ORIENTATION_MIN_MARGIN = 0.05
 _ORIENTATION_MIN_CONFIDENCE = 0.80
 
 
 class _PlateOrientation:
-    """Decides, per recording, whether plate crops need flipping before they are read.
+    """Compare both orientations per crop; never lock a recording from early guesses.
 
-    Some dashcams mirror the rear channel, so it reads like a rear-view mirror. Nothing in
-    this pipeline knew that, so every plate the rear camera saw was recognised backwards:
-    of 74 stored rear observations, 64% matched no Australian format, against 21% on the
-    front. The tell is arithmetic rather than impressionistic -- 65% of unmatched
-    seven-character reads end in "2", which is a mirrored leading "S", against a 3% base
-    rate -- and the badge misread as "ATOYOT" is "TOYOTA" spelled backwards.
-
-    Rather than a setting or an assumption about which camera is which, the orientation is
-    *measured*: the first few readings are recognised both ways up, and each way scores a
-    point when it produces a named Australian series at high confidence. Whichever side
-    wins decisively is used for the rest of the recording. If neither wins, nothing is
-    flipped -- so on footage that is not mirrored this costs a handful of extra OCR calls
-    and changes no result.
+    A backwards read can fit a named format too. Counting two such reads as equal votes
+    discarded a 0.999 correct read in favour of a 0.89 backwards one. The final recording
+    vote then flipped previews independently of the text. Selection now belongs to each
+    reading; the recording totals are diagnostics only.
     """
-
-    __slots__ = ("_as_is", "_flipped", "_sampled", "mirrored")
 
     def __init__(self) -> None:
         self.mirrored: bool | None = None
+        self.last_read_mirrored = False
+        self.last_margin = 0.0
         self._as_is = 0
         self._flipped = 0
         self._sampled = 0
+        self._ambiguous = 0
 
     @staticmethod
     def _is_named_hit(text: str, confidence: float, region: str) -> bool:
-        """A reading that looks like a real registration, not merely like characters."""
-        if not text or confidence < _ORIENTATION_MIN_CONFIDENCE:
-            return False
         result = normalise(text, region=region)
-        # "Matched a named series", which is what the docstring above says and what the
-        # vote needs. `state_hint` is not that: it is non-null only where a pattern belongs
-        # to exactly *one* state, which is true of four entries in the whole catalogue --
-        # SA, WA, TAS and ACT. Every widely-used format is multi-state, so on a rear channel
-        # full of NSW, VIC or QLD plates neither the as-is nor the flipped reading ever
-        # scored a point and the orientation was never resolved. `plausible_states` is
-        # non-empty for every named series and empty for the shape-only generics, which is
-        # exactly the line the vote wants drawn.
-        return result.matched and bool(result.plausible_states)
+        return (
+            confidence >= _ORIENTATION_MIN_CONFIDENCE
+            and result.matched
+            and bool(result.plausible_states)
+        )
 
     async def read(self, ocr, crop: np.ndarray, *, region: str) -> tuple[str, float]:
-        """Recognise *crop*, establishing the recording's orientation while it does."""
-        if self.mirrored is not None:
-            return await ocr.read(_flip(crop) if self.mirrored else crop)
-
         as_is = await ocr.read(crop)
         flipped = await ocr.read(_flip(crop))
-        self._as_is += self._is_named_hit(*as_is, region)
-        self._flipped += self._is_named_hit(*flipped, region)
         self._sampled += 1
-
-        if self._sampled >= _ORIENTATION_SAMPLE:
-            # Decide, and stop paying for two reads. Ties and silence both mean "as-is",
-            # which is the behaviour that predates this and the safe default.
-            self.mirrored = self._flipped >= max(1.0, self._as_is * _ORIENTATION_RATIO)
-
-        # Until the vote is in, take whichever reading actually looks like a plate.
-        if self._is_named_hit(*flipped, region) and not self._is_named_hit(*as_is, region):
-            return flipped
-        return flipped if flipped[1] > as_is[1] and self._flipped > self._as_is else as_is
+        candidates = [as_is, flipped]
+        # SA preference is a soft prior, not an interstate exclusion. Use the full
+        # catalogue to recognise strong interstate evidence, then prefer local formats
+        # in close contests. A clearer interstate read must still be able to win.
+        evidence_region = "AU" if region.upper() == "AU-SA" else region
+        normalised = [normalise(text, region=evidence_region) for text, _ in candidates]
+        named = [self._is_named_hit(*reading, evidence_region) for reading in candidates]
+        # Regional shape is evidence, not proof. Penalise substitutions instead of giving
+        # repaired text the same standing as an exact read. Keep OCR confidence itself raw.
+        scores = [
+            confidence
+            - 0.02 * result.substitutions
+            + (0.06 if region.upper() == "AU-SA" and "SA" in result.plausible_states else 0.0)
+            for (_, confidence), result in zip(candidates, normalised, strict=True)
+        ]
+        winner = int(named[1]) if named[0] != named[1] else int(scores[1] > scores[0])
+        self.last_margin = round(abs(scores[1] - scores[0]), 4)
+        self.last_read_mirrored = bool(winner)
+        different = normalised[0].normalised != normalised[1].normalised
+        if named[0] == named[1] and different and self.last_margin < _ORIENTATION_MIN_MARGIN:
+            self._ambiguous += 1
+            self.resolve()
+            return "", 0.0
+        if named[winner]:
+            if winner:
+                self._flipped += 1
+            else:
+                self._as_is += 1
+        self.resolve()
+        return candidates[winner]
 
     def resolve(self) -> bool:
-        """Settle the question for good, on however many samples there were.
-
-        Needed because the crops are saved after the reading loop, and a recording with
-        fewer than ``_ORIENTATION_SAMPLE`` readable plates never reached the decision point
-        inside ``read`` -- so ``mirrored`` was still ``None`` and the previews were saved
-        the way the camera produced them. On a short rear clip with two or three plates in
-        it, that is every preview in the recording.
-
-        The same evidence and the same ratio; only the sample count is relaxed, and the
-        default when nothing decisive was seen is still "not mirrored".
-        """
-        if self.mirrored is None:
-            self.mirrored = self._flipped >= max(1.0, self._as_is * _ORIENTATION_RATIO)
+        """Describe the majority of clear reads, without changing any individual result."""
+        self.mirrored = self._flipped > self._as_is
         return self.mirrored
 
     def describe(self) -> dict[str, object]:
         return {
             "mirrored": self.mirrored,
+            "orientation_method": "per-crop-dual-ocr-v1",
             "votes_as_is": self._as_is,
             "votes_mirrored": self._flipped,
             "orientation_samples": self._sampled,
+            "rejected_ambiguous_orientation": self._ambiguous,
         }
 
 
@@ -1796,6 +1778,7 @@ async def stage_plates(
 ) -> StageResult:
     """Read plates from tracked vehicles and upsert the plate database."""
     settings = get_settings_service()
+    profile_key = validation_key()
     if not bool(settings.get_nowait("plates.enabled")):
         recording.plate_state = StageState.SKIPPED
         return StageResult("plates", True, "disabled")
@@ -1833,6 +1816,7 @@ async def stage_plates(
         # ``_STAGE_DEPENDENTS`` was introduced to end, reached through the one path that
         # bypassed the write phase.
         await _clear_plate_observations(session, recording)
+        stamp_validation(recording, profile_key)
         recording.plate_state = StageState.DONE
         return StageResult("plates", True, "no vehicles to inspect")
 
@@ -1959,6 +1943,8 @@ async def stage_plates(
             text, confidence = await orientation.read(ocr, reading.crop, region=region_setting)
             reading.raw_text = text
             reading.ocr_confidence = confidence
+            reading.mirrored = orientation.last_read_mirrored
+            reading.orientation_margin = orientation.last_margin
 
         vote = vote_track_plate(readings)
         if vote is None or vote.ocr_confidence < min_store:
@@ -1984,9 +1970,8 @@ async def stage_plates(
             )
         )
 
-    # Settle the orientation before any crop is written. Until this call a recording with
-    # fewer readable plates than the sample size never reached a verdict at all.
-    mirrored = orientation.resolve()
+    # Recording-wide orientation is diagnostic only; previews follow each OCR reading.
+    orientation.resolve()
 
     # Positions are resolved here, at the offset each plate was actually read from, rather
     # than copied off the track. The track's coordinate belongs to its *first* frame,
@@ -2024,7 +2009,7 @@ async def stage_plates(
         await session.execute(
             delete(PlateObservation).where(PlateObservation.recording_id == recording.id)
         )
-        await _write_observations(session, recording, placed, touched_plate_ids, camera, mirrored)
+        await _write_observations(session, recording, placed, touched_plate_ids, camera)
         await session.flush()
         await _refresh_plate_rollups(session, touched_plate_ids, orphaned_media)
 
@@ -2033,6 +2018,7 @@ async def stage_plates(
 
     stored = len(hits)
     recording.plate_count = stored
+    stamp_validation(recording, profile_key)
     recording.plate_state = StageState.DONE
     return StageResult(
         "plates",
@@ -2068,7 +2054,6 @@ async def _write_observations(
     placed: list,
     touched_plate_ids: set[int],
     camera: Camera | None,
-    mirrored: bool,
 ) -> None:
     """Turn confirmed readings into rows. Split out so the write phase is one callable.
 
@@ -2081,6 +2066,7 @@ async def _write_observations(
 
     for hit, located in placed:
         track, vote, result = hit.track, hit.vote, hit.result
+        mirrored = vote.best.mirrored
         plate = await _upsert_plate(session, result, vote.ocr_confidence)
         touched_plate_ids.add(plate.id)
 
@@ -2144,7 +2130,13 @@ async def _write_observations(
                 # `mirrored` records that the saved crop was turned round relative to the
                 # frame, so the box and the picture can never be read as being in the same
                 # coordinate space by mistake.
-                bbox={"box": list(vote.best.bbox), "mirrored": mirrored},
+                bbox={
+                    "box": list(vote.best.bbox),
+                    "mirrored": mirrored,
+                    "orientation_method": "per-crop-dual-ocr-v1",
+                    "orientation_margin": vote.best.orientation_margin,
+                    "normalisation_substitutions": result.substitutions,
+                },
             )
         )
 

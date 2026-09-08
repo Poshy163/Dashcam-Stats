@@ -43,6 +43,7 @@ READ_ENDPOINTS = [
     "/api/recordings",
     "/api/journeys",
     "/api/plates",
+    "/api/plates/quality",
     "/api/vehicles",
     "/api/jobs",
     "/api/jobs/stats",

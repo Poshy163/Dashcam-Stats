@@ -143,7 +143,7 @@ export function ConfidenceBadge({
     low: 'border-state-error/40 bg-state-error/10 text-state-error',
   }[band]
   return (
-    <span className={cn('badge tabular font-mono border', className)} title={`${label} confidence`}>
+    <span className={cn('badge tabular font-mono border', className)} title={label === 'OCR' ? 'Average character confidence from the OCR model; not the probability that the whole registration is correct.' : `${label} confidence`}>
       {label} {formatPercent(confidence)}
     </span>
   )

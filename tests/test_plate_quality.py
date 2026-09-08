@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 from app.ai.normalise_au import AU_PATTERNS, normalise
-from app.pipeline.stages import _ORIENTATION_SAMPLE, _PlateOrientation
+from app.pipeline.stages import _PlateOrientation
 
 #: Read off vehicles and signage on the live library, with their stored confidences.
 NOT_PLATES = [
@@ -92,22 +92,22 @@ class TestOrientationIsMeasuredNotAssumed:
         ocr = _StubOCR(upright=("MJQ0EE2", 0.98), mirrored=("S330DGM", 0.99))
         orientation = _PlateOrientation()
 
-        for _ in range(_ORIENTATION_SAMPLE):
+        for _ in range(8):
             text, _confidence = await orientation.read(ocr, crop(), region="AU")
             assert text == "S330DGM", "the readable orientation was not preferred"
 
         assert orientation.mirrored is True
-        # Having decided, it stops paying for two reads per crop.
+        # Later crops are still checked both ways; early evidence cannot lock out recovery.
         before = ocr.reads
         await orientation.read(ocr, crop(), region="AU")
-        assert ocr.reads == before + 1
+        assert ocr.reads == before + 2
 
     async def test_an_ordinary_recording_is_left_alone(self):
         """The front channel. Nothing is flipped and no result changes."""
         ocr = _StubOCR(upright=("S352CJS", 0.99), mirrored=("SJ253S", 0.40))
         orientation = _PlateOrientation()
 
-        for _ in range(_ORIENTATION_SAMPLE):
+        for _ in range(8):
             text, _confidence = await orientation.read(ocr, crop(), region="AU")
             assert text == "S352CJS"
 
@@ -117,7 +117,7 @@ class TestOrientationIsMeasuredNotAssumed:
         """Silence must not be read as evidence of mirroring."""
         ocr = _StubOCR(upright=("KEECE", 0.99), mirrored=("ECEEK", 0.99))
         orientation = _PlateOrientation()
-        for _ in range(_ORIENTATION_SAMPLE):
+        for _ in range(8):
             await orientation.read(ocr, crop(), region="AU")
         assert orientation.mirrored is False
 
@@ -125,7 +125,7 @@ class TestOrientationIsMeasuredNotAssumed:
         """One mirrored hit against several upright ones must not win."""
         orientation = _PlateOrientation()
         upright = _StubOCR(upright=("S352CJS", 0.99), mirrored=("junk", 0.10))
-        for _ in range(_ORIENTATION_SAMPLE - 1):
+        for _ in range(8 - 1):
             await orientation.read(upright, crop(), region="AU")
         lucky = _StubOCR(upright=("nope", 0.10), mirrored=("S292CXG", 0.99))
         await orientation.read(lucky, crop(), region="AU")

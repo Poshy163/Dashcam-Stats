@@ -19,6 +19,7 @@ from app.core.logging import get_logger, prune_logs
 from app.core.settings_service import get_settings_service
 from app.db.session import session_scope
 from app.journeys.builder import JourneyBuilder
+from app.pipeline.plate_repair import queue_plate_repairs
 from app.pipeline.repair import repair_durations
 from app.retention import execute as run_retention
 from app.retention import plan as plan_retention
@@ -104,6 +105,12 @@ class Scheduler:
                 enabled=lambda: _fixed(True),
                 run=self._run_prune,
             ),
+            TaskState(
+                name="plate-revalidation",
+                interval_s=lambda: _fixed(30.0),
+                enabled=lambda: _flag("plates.auto_revalidate"),
+                run=self._run_plate_revalidation,
+            ),
         ]
 
         now = time.monotonic()
@@ -170,6 +177,10 @@ class Scheduler:
             await asyncio.sleep(1.0)
 
     # -- tasks -------------------------------------------------------------------------
+
+    async def _run_plate_revalidation(self) -> None:
+        async with session_scope() as session:
+            await queue_plate_repairs(session)
 
     async def _run_scan(self) -> None:
         summary = await self._scanner.scan(trigger="scheduled")
