@@ -35,6 +35,7 @@ from app.ingest import (
     radio_coordinator,
     radios,
     unit_logs,
+    wifi_startup,
 )
 from app.ingest.models import RunState, UnitInfo, UnitState, ingest_setting
 from app.ingest.status import get_status
@@ -117,6 +118,7 @@ class IngestPoller:
         await health.shutdown()
         await unit_logs.shutdown()
         await carplay_timing.shutdown()
+        await wifi_startup.shutdown()
         await band.shutdown()
         log.info("ingest poller stopped")
 
@@ -383,6 +385,7 @@ class IngestPoller:
                     health.on_unit_present(self._address())
                     unit_logs.on_unit_present(self._address())
                     carplay_timing.on_unit_present(self._address())
+                    wifi_startup.on_unit_present(self._address())
                     band.on_unit_present(self._address())
                     await asyncio.sleep(self._interval())
                     continue
@@ -513,6 +516,7 @@ class IngestPoller:
                     health.on_unit_present(info.address)
                     unit_logs.on_unit_present(info.address)
                     carplay_timing.on_unit_present(info.address)
+                    wifi_startup.on_unit_present(info.address)
                     band.on_unit_present(info.address)
             except asyncio.CancelledError:
                 raise

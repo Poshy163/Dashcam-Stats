@@ -123,6 +123,7 @@ DEFAULT_ALLOW_TAGS: tuple[str, ...] = (
     "ZQC-CamSubStream0",
     "ZQC-CamSubStream1",
     "CarPlayTiming",
+    "WifiStartupGuard",
     "zj",
     "System.err",
 )

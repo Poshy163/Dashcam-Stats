@@ -69,6 +69,7 @@ async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off
     poller = poller_module.IngestPoller()
     poller._running = poller._was_online = True
     recovered = []
+    startup_guard_checks = []
     real_sleep = asyncio.sleep
 
     async def stop_after_tick(_delay):
@@ -101,14 +102,22 @@ async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off
     monkeypatch.setattr(carplay_timing, "arm", arm)
     monkeypatch.setattr(poller_module.adb, "is_listening", listening)
     monkeypatch.setattr(poller_module.puller, "probe_unit", unexpected_probe)
-    for module in (poller_module.health, poller_module.unit_logs, poller_module.band):
+    for module in (
+        poller_module.health,
+        poller_module.unit_logs,
+        poller_module.band,
+    ):
         monkeypatch.setattr(module, "on_unit_present", lambda _address: None)
+    monkeypatch.setattr(
+        poller_module.wifi_startup, "on_unit_present", startup_guard_checks.append
+    )
     monkeypatch.setattr(poller_module.asyncio, "sleep", stop_after_tick)
     try:
         await poller._loop()
         if carplay_timing._tasks:
             await asyncio.gather(*list(carplay_timing._tasks))
         assert recovered == (["u:5555"] if ignition == "off" else [])
+        assert startup_guard_checks == ["u:5555"]
     finally:
         await carplay_timing.shutdown()
 
