@@ -130,6 +130,13 @@ class TestDeduplicationIdentity:
         [b] = unit_logs.parse(base.format(pid=222))
         assert a.line_hash != b.line_hash
 
+    def test_new_carplay_observation_hash_is_independent_of_logcat_transport_fields(self):
+        base = "sample=1725750000-17-1 session=1725750000-17 | event=sampler_started"
+        [a] = unit_logs.parse(f"2026-09-01 13:19:41.979 +0000 111 2 E CarPlayTiming: {base}")
+        [b] = unit_logs.parse(f"2026-09-01 13:19:42.001 +0000 222 3 E CarPlayTiming: {base}")
+
+        assert a.line_hash == b.line_hash
+
 
 class TestServerSideEnforcement:
     """The unit's filterspec silently ignores long tags, so the deny list is applied twice."""

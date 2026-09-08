@@ -178,7 +178,8 @@ export default function Dashboard() {
           </div>
           <div className="mt-6 rounded-lg border border-border bg-surface-sunken/70 p-3 text-xs font-mono leading-relaxed text-content-muted">
             {storage.deletionEnabled ? (
-              storage.footageWritable ? 'Automatic cleanup active.' : 'Cleanup enabled; footage mount is read-only.'
+              storage.footageWritable == null ? 'Cleanup enabled; mount safety is checked before each run.' :
+                storage.footageWritable ? 'Automatic cleanup active.' : 'Cleanup enabled; footage mount is read-only.'
             ) : (
               <>Retention policy: <strong className="font-semibold text-content">Report-only mode</strong></>
             )}

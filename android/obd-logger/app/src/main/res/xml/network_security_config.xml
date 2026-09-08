@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The configured analyser is on a private LAN and currently uses HTTP. LoggerConfig accepts
+  cleartext only for private/loopback IP literals; HTTPS remains available for every host.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

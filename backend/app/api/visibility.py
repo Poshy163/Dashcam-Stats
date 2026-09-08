@@ -8,7 +8,7 @@ live while the queue is rebuilding it.
 from sqlalchemy import and_, or_, select, true
 
 from app.core.settings_service import get_settings_service
-from app.db.models import Journey, Recording, RecordingState
+from app.db.models import Journey, Recording, RecordingState, TelemetryPoint
 from app.pipeline.revisions import INVALIDATED_REVISION
 
 
@@ -38,7 +38,7 @@ def visible_revision(column):
     )
 
 
-def telemetry_quality_view(row: object) -> dict:
+def telemetry_quality_view(row: TelemetryPoint) -> dict:
     """The quality block for one ``telemetry_points`` row, columns winning over the JSON.
 
     Two routes render this -- the recording's telemetry list and the overlay-reader debug
@@ -63,12 +63,19 @@ def telemetry_quality_view(row: object) -> dict:
         "candidate_count": 1,
         "problems": ["quality unavailable until telemetry is reprocessed"],
     }
-    return {
+    result = {
         **quality,
         "gps_quality": row.gps_quality,
         "gps_reason": row.gps_reason or quality.get("gps_reason"),
         "breaks_segment": bool(row.breaks_segment),
     }
+    if row.gps_quality:
+        # The viewer reads gps_status too. Keep the original observation explainable,
+        # while presenting the final verdict consistently after journey validation.
+        if quality.get("gps_status") != row.gps_quality:
+            result["observed_gps_status"] = quality.get("gps_status")
+        result["gps_status"] = row.gps_quality
+    return result
 
 
 def is_a_drive(*, min_avg_speed_kmh: float, min_top_speed_kmh: float):

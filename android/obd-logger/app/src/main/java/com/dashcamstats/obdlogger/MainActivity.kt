@@ -83,7 +83,9 @@ class MainActivity : Activity() {
             "Webhook URL (e.g. http://192.168.1.16:8199/api/ingest/webhook)",
             current.webhookUrl,
         )
-        webhookApiKey = field(layout, "Webhook API key (X-API-Key)", current.webhookApiKey)
+        webhookApiKey = field(layout, "Webhook API key (X-API-Key)", current.webhookApiKey).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
         backupAwakeSeconds = field(
             layout,
             "Backup awake time (Wi-Fi connected, seconds)",
@@ -159,6 +161,17 @@ class MainActivity : Activity() {
             )
             return
         }
+        val webhookError = webhookConfigurationError(config)
+        when (webhookError) {
+            "webhook_api_key_required" -> rejectConfiguration("Enter the webhook API key")
+            "webhook_api_key_too_long" -> rejectConfiguration("Webhook API key is too long")
+            "invalid_webhook_url" -> rejectConfiguration(
+                "Use the /api/ingest/webhook HTTPS endpoint, or HTTP with a private LAN IP address",
+            )
+            null -> Unit
+            else -> rejectConfiguration("Webhook configuration is invalid")
+        }
+        if (webhookError != null) return
         if (config.enabled && config.ownershipTransferred && !config.canRun) {
             rejectConfiguration("A valid adapter address, vehicle ID and logger ID are required")
             return

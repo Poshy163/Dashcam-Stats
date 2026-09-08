@@ -261,15 +261,13 @@ async def get_status(session: SessionDep):
     )
 
     settings = get_settings_service()
-    # Same walk, same cache. This endpoint reads exactly one field off the report, and it
-    # used to pay for a second full traversal of the share to get it -- so a single open
-    # dashboard walked the whole tree twelve times a minute, on the event loop.
-    safety = await evaluate_safety(session, measure_max_age_s=FOOTAGE_MEASURE_TTL_S)
+    # Writability requires creating a probe file. A dashboard read must not do that;
+    # retention still runs its authoritative safety checks before any deletion.
     storage = StatusStorage(
         limit_bytes=limit,
         used_bytes=used,
         deletion_enabled=bool(settings.get_nowait("storage.enable_deletion")),
-        footage_writable=safety.writable,
+        footage_writable=None,
     )
 
     # "Latest run telemetry" means the last time the car was driven. Without the filter
@@ -724,11 +722,21 @@ async def carplay_timing_samples(
         for parsed in (carplay_timing.parse_sample(r.occurred_at, r.message) for r in rows)
         if parsed is not None
     ]
+    # Frame timing alone cannot distinguish a smooth interval from an interval the sampler
+    # did not observe.  Return non-frame observations separately, including explicit
+    # no-surface/no-new-frame lines from newer sampler versions.
+    events = [
+        parsed
+        for parsed in (carplay_timing.parse_event(r.occurred_at, r.message) for r in rows)
+        if parsed is not None
+    ]
     return {
         "hours": hours,
         "total": len(samples),
         "samples": samples,
         "minutes": carplay_timing.summarise(samples),
+        "events": events,
+        "sessions": carplay_timing.sessions(samples, events),
     }
 
 
@@ -809,6 +817,7 @@ async def system_info(session: SessionDep):
     config = get_config()
     return {
         "version": config.version,
+        "source_revision": config.source_revision,
         "data_dir": str(config.data_dir),
         "footage_dir": str(config.footage_dir),
         "scheduler": get_scheduler().describe(),

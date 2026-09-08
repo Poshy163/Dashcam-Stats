@@ -898,6 +898,36 @@ async def delete(address: str, source: str, names: list[str]) -> int:
     return len(names)
 
 
+async def delete_if_unchanged(address: str, source: str, items: list[RemoteFile]) -> int:
+    """Delete only recordings whose size and mtime still match the inventory.
+
+    A filename is not an identity. The recorder can recycle or replace a segment between
+    inventory/copy and reclaim; deleting that path unconditionally would erase bytes the
+    server never received. Each comparison and unlink execute in one remote shell so no
+    extra control round trip is needed per file. A changed or vanished file is retained.
+    """
+    if not items:
+        return 0
+    if any(ch in source for ch in "'\r\n"):
+        raise AdbError(
+            f"refusing to put an unexpected source path into a shell command: {source!r}"
+        )
+
+    clauses: list[str] = []
+    for item in items:
+        name = _checked(item.name)
+        expected = f"{item.size}|{item.mtime}"
+        clauses.append(
+            f"[ \"$(stat -c '%s|%Y' '{name}' 2>/dev/null)\" = '{expected}' ] "
+            f"&& rm -f '{name}' && echo deleted"
+        )
+    # The explicit exit is load-bearing: without it, a failed ``cd`` followed by the
+    # semicolon-separated later clauses would inspect and delete in the shell's original
+    # directory. Failure returns no deletion acknowledgements and therefore retains all.
+    reply = await shell(address, f"cd '{source}' || exit 0; " + "; ".join(clauses) + "; exit 0")
+    return sum(line.strip() == "deleted" for line in reply.splitlines())
+
+
 async def describe(address: str, override: str = "") -> UnitInfo:
     """One control round trip that answers "is it here, and where is the footage"."""
     info = UnitInfo(address=address)

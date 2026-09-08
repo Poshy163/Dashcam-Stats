@@ -10,6 +10,8 @@ from app.db.backup import create_backup, validate_database
 from app.db.models import (
     Camera,
     Journey,
+    Plate,
+    PlateObservation,
     Recording,
     RecordingState,
     StageState,
@@ -161,6 +163,158 @@ async def test_paired_camera_recovers_ocr_hole_but_not_explicit_no_fix(db_sessio
     assert points[0].quality_json["gps_source"] == "paired_camera"
     assert points[1].has_fix is False
     assert points[1].quality_json["gps_status"] == "no_fix"
+
+
+async def test_paired_camera_honours_the_column_verdict_over_stale_legacy_json(db_session):
+    """A migration can repudiate a position without rewriting historical JSON.
+
+    Recovery is for an unreadable overlay, not a way to conceal a stored rejected/no-fix
+    verdict.  In particular, migration 0009 clears a bad coordinate and sets
+    ``gps_quality='rejected'`` while retaining the original OCR provenance.
+    """
+    cameras = list((await db_session.execute(select(Camera).order_by(Camera.id))).scalars())
+    now = datetime.now(UTC)
+    front = Recording(
+        rel_path="front-rejected.ts",
+        filename="front-rejected.ts",
+        size_bytes=1,
+        camera_id=cameras[0].id,
+        started_at=now,
+        ended_at=now + timedelta(seconds=3),
+        telemetry_state=StageState.DONE,
+    )
+    rear = Recording(
+        rel_path="rear-direct.ts",
+        filename="rear-direct.ts",
+        size_bytes=1,
+        camera_id=cameras[1].id,
+        started_at=now,
+        ended_at=now + timedelta(seconds=3),
+        telemetry_state=StageState.DONE,
+    )
+    db_session.add_all([front, rear])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            TelemetryPoint(
+                recording_id=front.id,
+                t_offset_s=0,
+                captured_at=now,
+                has_fix=False,
+                gps_quality="rejected",
+                # The historic blob is deliberately stale: this is the exact migration
+                # shape, where the column is the corrected authority.
+                quality_json={"gps_status": "valid", "gps_source": "direct"},
+            ),
+            TelemetryPoint(
+                recording_id=rear.id,
+                t_offset_s=0,
+                captured_at=now,
+                lat=-34.8,
+                lon=138.6,
+                has_fix=True,
+                gps_quality="valid",
+                quality_json={"gps_status": "valid", "gps_source": "direct"},
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    assert await recover_from_paired_camera(db_session, front) == 0
+    point = (
+        await db_session.execute(
+            select(TelemetryPoint).where(TelemetryPoint.recording_id == front.id)
+        )
+    ).scalar_one()
+    assert point.has_fix is False
+    assert point.gps_quality == "rejected"
+
+
+async def test_paired_camera_rejects_a_synthetic_donor_by_column_when_legacy_json_is_missing(
+    db_session,
+):
+    """A migrated copy must not become independent evidence just because JSON is absent."""
+    cameras = list((await db_session.execute(select(Camera).order_by(Camera.id))).scalars())
+    now = datetime.now(UTC)
+    front = Recording(
+        rel_path="front-hole.ts",
+        filename="front-hole.ts",
+        size_bytes=1,
+        camera_id=cameras[0].id,
+        started_at=now,
+        ended_at=now + timedelta(seconds=3),
+        telemetry_state=StageState.DONE,
+    )
+    rear = Recording(
+        rel_path="rear-copy.ts",
+        filename="rear-copy.ts",
+        size_bytes=1,
+        camera_id=cameras[1].id,
+        started_at=now,
+        ended_at=now + timedelta(seconds=3),
+        telemetry_state=StageState.DONE,
+    )
+    db_session.add_all([front, rear])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            TelemetryPoint(
+                recording_id=front.id,
+                t_offset_s=0,
+                captured_at=now,
+                has_fix=False,
+                quality_json={"gps_status": "missing"},
+            ),
+            TelemetryPoint(
+                recording_id=rear.id,
+                t_offset_s=0,
+                captured_at=now,
+                lat=-34.8,
+                lon=138.6,
+                has_fix=True,
+                gps_quality="interpolated",
+                quality_json=None,
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    assert await recover_from_paired_camera(db_session, front) == 0
+
+
+async def test_reprocessing_keeps_a_dismissed_plate_without_remaining_observations(db_session):
+    """A dismissal is a manual exclusion, including after a corrected OCR result vanishes."""
+    from app.pipeline.stages import _clear_plate_observations
+
+    now = datetime.now(UTC)
+    recording = Recording(
+        rel_path="dismissed-plate.ts",
+        filename="dismissed-plate.ts",
+        size_bytes=1,
+        state=RecordingState.PROCESSING,
+    )
+    plate = Plate(normalised_text="FALSE123", display_text="FALSE123", dismissed=True)
+    db_session.add_all([recording, plate])
+    await db_session.flush()
+    db_session.add(
+        PlateObservation(
+            plate_id=plate.id,
+            recording_id=recording.id,
+            t_offset_s=0,
+            captured_at=now,
+            raw_text="FALSE123",
+            normalised_text="FALSE123",
+            ocr_confidence=0.9,
+            detection_confidence=0.9,
+        )
+    )
+    await db_session.flush()
+
+    await _clear_plate_observations(db_session, recording)
+    retained = await db_session.get(Plate, plate.id)
+    assert retained is not None
+    assert retained.dismissed is True
+    assert retained.observation_count == 0
 
 
 async def test_a_recovered_point_is_not_evidence_for_another_recovery(db_session):

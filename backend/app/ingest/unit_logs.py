@@ -209,10 +209,26 @@ class ParsedLine:
         """Identity for deduplication.
 
         A refresh re-reads lines a previous refresh already stored, so the same line must
-        land once.  Hashing the whole tuple (not just the message) keeps two different
+        land once.  Normal lines hash the whole tuple (not just the message), keeping two
         processes emitting an identical string at the same millisecond distinguishable.
+        CarPlay sampler lines with an explicit observation identity are the exception:
+        they use that identity so logcat and direct-file transport copies land once.
         """
-        material = f"{self.occurred_at.isoformat()}|{self.pid}|{self.tid}|{self.tag}|{self.message}"
+        # Newer CarPlay sampler observations carry an on-unit monotonic identity.  The
+        # same observation can arrive once through logcat (millisecond timestamp and real
+        # pid) and once through its direct recovery file (whole-second timestamp, pid 0),
+        # so transport fields cannot be its identity.  Legacy lines deliberately retain
+        # the normal full-line hash rather than guessing equivalence from their text.
+        sample_id = None
+        if self.tag == "CarPlayTiming":
+            match = re.search(r"(?:^|\s)sample=([A-Za-z0-9_-]{1,96})(?:\s|$)", self.message)
+            if match:
+                sample_id = match.group(1)
+        material = (
+            f"CarPlayTiming|{sample_id}"
+            if sample_id is not None
+            else f"{self.occurred_at.isoformat()}|{self.pid}|{self.tid}|{self.tag}|{self.message}"
+        )
         return hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()
 
 

@@ -53,11 +53,20 @@ class RecordingOut(ApiModel):
     time_from_osd: bool = False
 
     size_bytes: int = 0
+    container: str | None = None
     video_codec: str | None = None
+    video_profile: str | None = None
     width: int | None = None
     height: int | None = None
     fps: float | None = None
+    #: Container-declared rate when plausible; absent if the probe had to recover it.
+    fps_container: float | None = None
+    bitrate: int | None = None
+    pix_fmt: str | None = None
     has_audio: bool = False
+    audio_codec: str | None = None
+    audio_sample_rate: int | None = None
+    audio_channels: int | None = None
 
     state: str
     metadata_state: str
@@ -645,7 +654,8 @@ class StatusStorage(BaseModel):
     limit_bytes: int = 0
     used_bytes: int = 0
     deletion_enabled: bool = False
-    footage_writable: bool = False
+    #: Unknown on read-only status queries; retention verifies this before deleting.
+    footage_writable: bool | None = None
 
 
 class FeatureStatus(BaseModel):

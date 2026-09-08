@@ -439,8 +439,16 @@ class Scanner:
             )
             if verdict.ready:
                 recording.fingerprint = await fingerprint_file(entry.path, sample_bytes)
-                recording.fingerprint_size_bytes = entry.size
-                recording.fingerprint_mtime_ns = entry.mtime_ns
+                after = await asyncio.to_thread(entry.path.stat)
+                if (after.st_size, after.st_mtime_ns) == (entry.size, entry.mtime_ns):
+                    recording.fingerprint_size_bytes = entry.size
+                    recording.fingerprint_mtime_ns = entry.mtime_ns
+                else:
+                    recording.size_bytes = after.st_size
+                    recording.mtime_ns = after.st_mtime_ns
+                    recording.fingerprint = None
+                    recording.state = RecordingState.SETTLING
+                    summary.unsettled += 1
             elif verdict.invalid:
                 self._mark_invalid(recording, verdict.reason, now)
                 summary.invalid += 1
@@ -546,6 +554,19 @@ class Scanner:
             return
 
         fingerprint = await fingerprint_file(entry.path, sample_bytes)
+        # The scandir stat describes the path before the fingerprint read. If the camera,
+        # copier or operator replaced it during that read, recording the old stat as the
+        # digest's provenance can let the next scan take the unchanged fast path for bytes
+        # that were never fingerprinted consistently. Hold it for another observation.
+        after = await asyncio.to_thread(entry.path.stat)
+        if (after.st_size, after.st_mtime_ns) != (entry.size, entry.mtime_ns):
+            row.size_bytes = after.st_size
+            row.mtime_ns = after.st_mtime_ns
+            if row.state in QUEUEABLE_STATES or row.state is RecordingState.SETTLING:
+                row.state = RecordingState.SETTLING
+                row.error_message = None
+            summary.unsettled += 1
+            return
         # Recorded whatever the digest turns out to be, so the next scan takes the cheap
         # path either way. Without this a file that is touched without being changed --
         # `touch`, a share that rewrites mtimes, a restored backup -- would be read again

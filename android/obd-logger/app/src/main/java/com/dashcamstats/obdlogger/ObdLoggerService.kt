@@ -1980,39 +1980,38 @@ class ObdLoggerService : Service() {
 
     private fun dispatchIngestWebhook() {
         val config = LoggerPreferences.load(this)
-        if (!config.webhookEnabled || config.webhookUrl.isBlank()) return
+        if (!config.webhookEnabled) return
+        val configurationError = webhookConfigurationError(config)
+        if (configurationError != null) {
+            emitEvent("ingest.webhook", "warning", "failed", configurationError)
+            return
+        }
         val now = SystemClock.elapsedRealtime()
         if (now - lastWebhookDispatchAtMillis < 30_000L) {
             return
         }
         lastWebhookDispatchAtMillis = now
         scope.launch {
-            val success = sendWebhookPost(
+            val result = sendWebhookPost(
                 url = config.webhookUrl,
                 apiKey = config.webhookApiKey,
                 vehicleId = config.vehicleId,
             )
             emitEvent(
                 kind = "ingest.webhook",
-                level = if (success) "info" else "warning",
-                outcome = if (success) "dispatched" else "failed",
-                reasonCode = if (success) "webhook_ok" else "webhook_failed",
+                level = if (result.success) "info" else "warning",
+                outcome = if (result.success) "dispatched" else "failed",
+                reasonCode = result.reasonCode,
             )
         }
     }
 
-    private fun sendWebhookPost(url: String, apiKey: String, vehicleId: String): Boolean = runCatching {
-        val endpoint = java.net.URL(url.trim())
-        val connection = endpoint.openConnection() as java.net.HttpURLConnection
-        try {
-            connection.requestMethod = "POST"
-            connection.connectTimeout = 5000
-            connection.readTimeout = 5000
-            connection.doOutput = true
-            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            if (apiKey.isNotBlank()) {
-                connection.setRequestProperty("X-API-Key", apiKey.trim())
-            }
+    private fun sendWebhookPost(url: String, apiKey: String, vehicleId: String): WebhookResult {
+        var connection: java.net.HttpURLConnection? = null
+        return try {
+            val endpoint = java.net.URL(url.trim())
+            connection = endpoint.openConnection() as java.net.HttpURLConnection
+            configureWebhookConnection(connection, apiKey)
             val payload = JSONObject()
                 .put("trigger", "obd_app_ignition_off")
                 .put("vehicle_id", vehicleId)
@@ -2022,12 +2021,21 @@ class ObdLoggerService : Service() {
                 os.write(payload.toByteArray(Charsets.UTF_8))
                 os.flush()
             }
-            val code = connection.responseCode
-            code in 200..299
+            classifyWebhookResponse(connection.responseCode)
+        } catch (_: java.net.SocketTimeoutException) {
+            WebhookResult(false, "webhook_timeout")
+        } catch (_: java.io.IOException) {
+            WebhookResult(false, "webhook_network_error")
+        } catch (_: SecurityException) {
+            WebhookResult(false, "webhook_security_error")
+        } catch (_: IllegalArgumentException) {
+            WebhookResult(false, "invalid_webhook_url")
+        } catch (_: Exception) {
+            WebhookResult(false, "webhook_failed")
         } finally {
-            connection.disconnect()
+            connection?.disconnect()
         }
-    }.getOrDefault(false)
+    }
 
     companion object {
         private const val EVENT_PROJECTION_RETRY_INTERVAL_MILLIS = 30_000L
@@ -2037,4 +2045,26 @@ class ObdLoggerService : Service() {
         const val ACTION_RELOAD_CONFIGURATION =
             "com.dashcamstats.obdlogger.action.RELOAD_CONFIGURATION"
     }
+}
+
+internal fun configureWebhookConnection(connection: java.net.HttpURLConnection, apiKey: String) {
+    connection.requestMethod = "POST"
+    connection.connectTimeout = 5000
+    connection.readTimeout = 5000
+    connection.instanceFollowRedirects = false
+    connection.doOutput = true
+    connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+    if (apiKey.isNotBlank()) {
+        connection.setRequestProperty("X-API-Key", apiKey.trim())
+    }
+}
+
+internal data class WebhookResult(val success: Boolean, val reasonCode: String)
+
+internal fun classifyWebhookResponse(code: Int): WebhookResult = when (code) {
+    in 200..299 -> WebhookResult(true, "webhook_ok")
+    401, 403 -> WebhookResult(false, "webhook_auth_rejected")
+    in 400..499 -> WebhookResult(false, "webhook_client_error")
+    in 500..599 -> WebhookResult(false, "webhook_server_error")
+    else -> WebhookResult(false, "webhook_unexpected_response")
 }

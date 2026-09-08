@@ -2273,10 +2273,14 @@ async def _refresh_plate_rollups(
         if plate is None:
             continue
         count = int(row[0] or 0)
-        if count == 0 and not plate.flagged and not plate.notes:
+        if count == 0 and not plate.flagged and not plate.dismissed and not plate.notes:
             # No observation anywhere refers to this plate any more, so it is a reading
             # that a reprocess corrected. Kept only if a user has invested something in it
-            # -- a flag or a note -- because deleting that is not ours to do.
+            # -- a flag, dismissal, or note -- because deleting that is not ours to do.
+            # A dismissal is an exclusion that must survive an analysis correction: if the
+            # same false positive is seen again after reprocessing, it has to resolve to
+            # this still-dismissed identity rather than silently returning to the Plates
+            # page as a new record.
             orphaned.append(plate_id)
             continue
         plate.observation_count = count

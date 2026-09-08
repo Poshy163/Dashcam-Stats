@@ -84,6 +84,7 @@ class TestTheBuildStampIsLast:
         text = "\n".join(lines)
 
         assert "ENV DASHCAM_VERSION=${VERSION}" in text
+        assert "ENV DASHCAM_SOURCE_REVISION=${VCS_REF}" in text
         assert 'org.opencontainers.image.version="${VERSION}"' in text
         assert 'org.opencontainers.image.revision="${VCS_REF}"' in text
         assert 'org.opencontainers.image.created="${BUILD_DATE}"' in text

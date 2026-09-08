@@ -219,6 +219,7 @@ ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 
 ENV DASHCAM_VERSION=${VERSION}
+ENV DASHCAM_SOURCE_REVISION=${VCS_REF}
 
 LABEL org.opencontainers.image.title="Dashcam Analyser" \
       org.opencontainers.image.description="Self-hosted dashcam footage analysis: telemetry, vehicle and licence-plate detection, journeys and maps" \

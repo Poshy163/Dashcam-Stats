@@ -86,7 +86,7 @@ function emptyStateFor(stage: StageState, noun: string): string {
 function detectionCoverageLabel(stage: StageState): string {
   switch (stage) {
     case 'done':
-      return 'Full clip analysed'
+      return 'Sampled analysis completed'
     case 'running':
       return 'Analysis still running; coverage is incomplete'
     case 'failed':
@@ -557,7 +557,7 @@ export default function RecordingViewer() {
                     {detectionCoverageLabel(r.detectionState)}
                   </span>
                   {r.detectionState === 'done' && (
-                    <span>Blank areas mean no objects were detected.</span>
+                    <span>Blank areas have no stored detections; sampling or partial decoding can leave gaps.</span>
                   )}
                 </div>
               </div>
@@ -617,8 +617,7 @@ export default function RecordingViewer() {
               </div>
             ) : (
               <p className="hint font-mono text-xs">
-                No telemetry for this recording. The camera writes GPS as an on-screen
-                overlay, so it is only available when that overlay could be read.
+                {emptyStateFor(r.telemetryState, 'telemetry samples')}
               </p>
             )}
           </section>
@@ -667,10 +666,20 @@ export default function RecordingViewer() {
             <dl className="space-y-1.5 text-sm">
               <Row label="Duration" value={formatDuration(r.durationS)} />
               <Row label="Size" value={formatBytes(r.sizeBytes)} />
+              <Row label="Container" value={r.container ?? 'Unknown'} />
               <Row label="Codec" value={r.videoCodec ?? '—'} />
+              <Row label="Video profile" value={r.videoProfile ?? 'Unknown'} />
               <Row label="Resolution" value={r.width ? `${r.width}×${r.height}` : '—'} />
               <Row label="Frame rate" value={r.fps ? `${r.fps.toFixed(2)} fps` : '—'} />
-              <Row label="Audio" value={r.hasAudio ? 'yes' : 'none'} />
+              <Row label="Declared frame rate" value={r.fpsContainer != null ? `${r.fpsContainer.toFixed(2)} fps` : 'Unknown'} />
+              <Row label="Bitrate" value={r.bitrate != null ? `${(r.bitrate / 1_000_000).toFixed(2)} Mbit/s` : 'Unknown'} />
+              <Row label="Pixel format" value={r.pixFmt ?? 'Unknown'} />
+              <Row label="Audio" value={r.metadataState !== 'done' ? 'Unknown' : r.hasAudio ? (r.audioCodec ?? 'present') : 'none'} />
+              {r.hasAudio && <>
+                <Row label="Audio sample rate" value={r.audioSampleRate != null ? `${r.audioSampleRate} Hz` : 'Unknown'} />
+                <Row label="Audio channels" value={r.audioChannels ?? 'Unknown'} />
+              </>}
+              <Row label="Capture time source" value={!r.startedAt ? 'Unknown' : r.timeFromOsd ? 'Overlay OCR' : 'Filename'} />
               {r.journeyId && (
                 <div className="flex justify-between gap-3">
                   <dt className="text-content-muted">Journey</dt>
@@ -682,6 +691,11 @@ export default function RecordingViewer() {
                 </div>
               )}
             </dl>
+            <p className="hint mt-3">
+              Media properties come from the stored file probe. The frame rate may be
+              recovered when the declared rate is implausible. Capture time uses the
+              configured timezone; an overlay time is an OCR estimate.
+            </p>
           </section>
         </div>
       </div>

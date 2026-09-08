@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -400,20 +401,24 @@ async def _reclaim(
     so "is it deleting?" could not be answered from the Logs page at all -- the same shape
     of mistake as the backup-page warning that sat below the default log level.
     """
-    where = {item.name: item.directory or (info.source or "") for item in items}
+    grouped: dict[str, list[RemoteFile]] = {}
+    for item in items:
+        directory = item.directory or (info.source or "")
+        if directory:
+            grouped.setdefault(directory, []).append(item)
     removed = 0
-    for directory, names in _group_names([item.name for item in items], where).items():
+    for directory, directory_items in grouped.items():
         if lease is not None:
             lease.raise_if_lease_lost()
         try:
-            removed += await adb.delete(info.address, directory, names)
+            removed += await adb.delete_if_unchanged(info.address, directory, directory_items)
         except adb.AdbError as exc:
             # Still not fatal -- the copies are safe in the library and the card can be
             # reclaimed next window -- but no longer invisible.
             log.warning(
                 "could not reclaim space on the card",
                 directory=directory,
-                files=len(names),
+                files=len(directory_items),
                 error=str(exc),
             )
         if lease is not None:
@@ -821,10 +826,11 @@ def delta(
         except OSError:
             same = False
         if same:
-            # Recorded rather than merely skipped. The library has this one already, so it
-            # is not fetched -- but it is still occupying the card, and the same size check
-            # that justifies not copying it justifies giving that space back.
-            plan.already_local.append(item)
+            # Skip the redundant download, but do not classify this remote object as safe
+            # to delete. The footage transport preserves neither remote mtime nor a digest/
+            # receipt, so a same-size local filename cannot prove it contains the current
+            # remote bytes when the recorder reuses a name. Only this run's committed
+            # inventory is eligible for reclaim.
             continue
 
         plan.backlog_files += 1
@@ -901,9 +907,31 @@ def commit(staging: Path, footage: Path, expected: dict[str, int]) -> list[str]:
             target = footage / path.name
             existing = target.stat().st_size if target.is_file() else None
             if existing == wanted:
-                # Somebody else got there first -- a previous window, or the same file
-                # arriving twice. Nothing to do, and nothing to destroy.
+                # Somebody else got there first after delta planned this transfer. Equal
+                # size is not equal identity: a recorder-reused name or concurrent writer
+                # may have published unrelated bytes. This is a rare collision path, so a
+                # full streaming comparison is cheaper than risking the card source.
+                if not _files_equal(path, target):
+                    log.warning(
+                        "not committing a same-size recording over different local content",
+                        file=path.name,
+                        bytes=wanted,
+                    )
+                    # Move it below a directory that commit() and _clean() both ignore.
+                    # Otherwise the next chunk's broad staging pass would treat it as an
+                    # unexpected top-level file and delete the only local copy of the new
+                    # remote bytes. The source is retained too because this name is absent
+                    # from ``committed``.
+                    conflict_dir = staging / ".conflicts"
+                    conflict_dir.mkdir(exist_ok=True)
+                    conflict = conflict_dir / path.name
+                    if conflict.exists():
+                        conflict = conflict_dir / f"{path.stem}-{time.time_ns()}{path.suffix}"
+                    path.replace(conflict)
+                    continue
+                _sync_file_and_parent(target)
                 path.unlink()
+                committed.append(path.name)
                 continue
             if existing is not None and existing > wanted:
                 log.warning(
@@ -915,13 +943,59 @@ def commit(staging: Path, footage: Path, expected: dict[str, int]) -> list[str]:
                 path.unlink()
                 continue
 
-            # Same filesystem by construction, so this is a rename: atomic, and the
-            # scanner can never observe a half-written file under its own name.
+            # Flush the bytes before publication. A successful rename alone only makes the
+            # name atomic; it does not make dirty pages durable, yet the caller may delete
+            # the card copy as soon as this function reports the name committed.
+            _sync_file(path)
+
+            # Same filesystem by construction, so this is an atomic rename and the scanner
+            # can never observe a half-written file under its own name.
             path.replace(target)
+            # Persist the directory entry where the platform supports directory handles.
+            # Windows cannot open a directory this way; flushed file contents plus its
+            # replace semantics remain the strongest portable boundary available there.
+            _sync_directory(footage)
             committed.append(path.name)
         except OSError as exc:
             log.warning("could not commit a staged recording", file=path.name, error=str(exc))
     return committed
+
+
+def _sync_file(path: Path) -> None:
+    """Flush one local copy, propagating storage failures to the commit boundary."""
+    with path.open("r+b") as handle:
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _files_equal(left: Path, right: Path, *, chunk_size: int = 1 << 20) -> bool:
+    """Compare a finalization collision without loading recordings into memory."""
+    with left.open("rb") as left_handle, right.open("rb") as right_handle:
+        while True:
+            left_chunk = left_handle.read(chunk_size)
+            right_chunk = right_handle.read(chunk_size)
+            if left_chunk != right_chunk:
+                return False
+            if not left_chunk:
+                return True
+
+
+def _sync_directory(path: Path) -> None:
+    """Persist a directory entry where supported; never hide real storage errors."""
+    if os.name == "nt":
+        # Python/Win32 cannot obtain a fsync-compatible directory descriptor. File data is
+        # still flushed before ReplaceFile/MoveFileEx semantics publish the destination.
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sync_file_and_parent(path: Path) -> None:
+    _sync_file(path)
+    _sync_directory(path.parent)
 
 
 def _clean(staging: Path) -> None:
@@ -1328,25 +1402,6 @@ async def run_pull(
         else:
             get_obd_transfer_status().set_logger(None)
         await _await_event_mirror(obd_events, deadline=obd_events_deadline)
-
-        # Before the idle return, not after it. A card whose whole contents the library
-        # already holds produces exactly that idle run, every window, forever -- so leaving
-        # the reclaim until after this point is what made "delete from the card" look like
-        # it did nothing at all: only files a run happened to copy itself were ever given
-        # back, and everything copied before the setting was turned on stayed put.
-        if plan.already_local and bool(_get("delete_after_verify", False)):
-            # Gated on the same evaluator as every other destructive path here. The delta's
-            # own size check has already proved each of these exists locally, so an
-            # unmounted share yields an empty list rather than a wrong one -- but the check
-            # is cheap on a run that has something to reclaim, and this is the one place
-            # that erases footage from the card without having just written it.
-            safe, why = await safety
-            if safe:
-                await _reclaim(info, plan.already_local)
-            else:
-                log.warning(
-                    "not reclaiming card space: the footage directory is not safe", reason=why
-                )
 
         if not plan.files and not remote_obd:
             result = RunResult(state=RunState.IDLE)
@@ -1898,13 +1953,7 @@ async def run_pull(
         # phone every single time the engine started -- and, because anything that is not
         # OK reports as an error, it would call "nothing new to copy" a failure. The live
         # state is on /api/ingest/status for anyone who wants to look.
-        if result.state not in (RunState.IDLE, RunState.OFFLINE) and not continuation:
-            with contextlib.suppress(Exception):
-                await _persist(result, trigger)
-            with contextlib.suppress(Exception):
-                await report_event(
-                    "finished" if result.state is RunState.OK else "error", result=result
-                )
+        await _record_run_completion(result, trigger, continuation=continuation)
 
         # Last of all: narrow only after everything that needed the car has had its turn.
         # Numeric zero is not a drained card until this run actually inventoried it, and a
@@ -2030,6 +2079,32 @@ async def _persist(result: RunResult, trigger: str) -> None:
                 error=result.error,
             )
         )
+
+
+async def _record_run_completion(result: RunResult, trigger: str, *, continuation: bool) -> None:
+    """Persist every material attempt while announcing only once per visit."""
+    if result.state in (RunState.IDLE, RunState.OFFLINE):
+        return
+    try:
+        await _persist(result, trigger)
+    except Exception as exc:
+        # History is diagnostic evidence. Losing it must not fail a completed transfer,
+        # but swallowing the write error made a real 72-file run indistinguishable from
+        # one that never happened.
+        log.error(
+            "could not persist completed ingest run history",
+            trigger=trigger,
+            state=result.state.value,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    # History is one row per completed attempt, including a successful re-drain.
+    # Notification is one per visit. Coupling these conditions made history stale whenever
+    # an initial band/recovery hold returned IDLE and the continuation did the transfer.
+    if not continuation:
+        with contextlib.suppress(Exception):
+            await report_event(
+                "finished" if result.state is RunState.OK else "error", result=result
+            )
 
 
 async def report_event(

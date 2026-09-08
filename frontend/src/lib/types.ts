@@ -51,11 +51,19 @@ export interface Recording {
   timeFromOsd: boolean
 
   sizeBytes: number
+  container?: string | null
   videoCodec: string | null
+  videoProfile?: string | null
   width: number | null
   height: number | null
   fps: number | null
+  fpsContainer?: number | null
+  bitrate?: number | null
+  pixFmt?: string | null
   hasAudio: boolean
+  audioCodec?: string | null
+  audioSampleRate?: number | null
+  audioChannels?: number | null
 
   state: RecordingState
   metadataState: StageState
@@ -380,7 +388,7 @@ export interface Status {
     limitBytes: number
     usedBytes: number
     deletionEnabled: boolean
-    footageWritable: boolean
+    footageWritable: boolean | null
   }
   latestJourney: Journey | null
   hardware: HardwareInfo
@@ -424,13 +432,18 @@ export interface UnitLogTag {
 /** One reading of the CarPlay video surface, sampled on the unit. */
 export interface CarPlayTimingSample {
   occurredAt: string
+  sessionId?: string | null
+  zlinkProcessPresent?: boolean | null
+  hotspotNeighbourCount?: number | null
+  hotspotNeighbourStates?: Record<string, number> | null
+  surfaceKind?: 'package_window' | 'unattributed_surfaceview' | null
   accOn: boolean
   phoneAttached: boolean
   load: number | null
   socC: number | null
   zlinkCpuPct: number | null
   hotspotRxKbit: number | null
-  /** Frames the hotspot lost in the interval: the stall average bitrate cannot show. */
+  /** Reported netdev drop/error counter delta; zero does not rule out Wi-Fi retries or latency. */
   apDrops: number | null
   /** The OBD logger's CPU. It polls over BLE, which shares this unit's one radio. */
   obdCpuPct: number | null
@@ -446,11 +459,16 @@ export interface CarPlayTimingSample {
   latePct: number | null
   frames: number
   periodMs: number | null
+  hitches?: number | null
+  newFrames?: number | null
+  spanS?: number | null
+  lateThresholdMs?: number | null
 }
 
 /** A minute of samples: rates averaged, everything else at its worst. */
 export interface CarPlayTimingMinute {
   bucketStart: string
+  sessionId?: string | null
   /**
    * Which surface this row is for. There is always more than one, and they are not
    * pooled: measured live, two surfaces in the same minute ran 35 ms and 53 ms
@@ -474,11 +492,37 @@ export interface CarPlayTimingMinute {
   apMhz: number | null
 }
 
+export interface CarPlayTimingEvent {
+  occurredAt: string
+  sessionId: string | null
+  kind: string
+  hotspotNeighbourCount: number | null
+  hotspotNeighbourStates: Record<string, number> | null
+  surfaceKind?: 'package_window' | 'unattributed_surfaceview' | null
+  zlinkProcessPresent: boolean | null
+  staMhz: number | null
+  apMhz: number | null
+  layer: string | null
+  layerIndex: number | null
+}
+
+export interface CarPlayTimingSession {
+  sessionId: string
+  startedAt: string
+  endedAt: string
+  sampleCount: number
+  eventCount: number
+  surfaceNoNewFrames: number
+  surfaceUnavailable: number
+}
+
 export interface CarPlayTimingOut {
   hours: number
   total: number
   samples: CarPlayTimingSample[]
   minutes: CarPlayTimingMinute[]
+  events?: CarPlayTimingEvent[]
+  sessions?: CarPlayTimingSession[]
 }
 
 export type SettingType = 'bool' | 'int' | 'float' | 'string' | 'select' | 'path' | 'bytes'

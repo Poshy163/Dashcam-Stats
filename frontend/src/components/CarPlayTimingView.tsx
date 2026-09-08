@@ -1,13 +1,9 @@
 /**
  * CarPlay frame timing, as sampled on the head unit itself.
  *
- * The lag the operator feels in CarPlay was measured to live in the video path: Zlink's
- * own views render cleanly while the surface the CarPlay picture is drawn on delivers
- * frames late. A sampler on the unit reads that surface's timing from SurfaceFlinger every
- * few seconds while a phone is attached, alongside what could be starving it -- load,
- * temperature, Zlink's CPU, the hotspot's bitrate -- and the unit-log collector carries the
- * lines home. This view turns them back into a chart and a per-minute table, so a long
- * drive reads as a shape rather than a thousand log lines.
+ * Candidate surfaces need owner mapping before their cadence can be attributed to
+ * CarPlay. Keep separate capture periods, missing observations and radio context visible
+ * so a chart cannot imply continuity or a cause the measurements have not established.
  */
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
@@ -17,6 +13,7 @@ import { EmptyState, ErrorState } from '@/components/ui'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { formatDateTime } from '@/lib/format'
+import { inTimingPeriod, maxKnown, meanKnown, radioObservation, timingPeriods, timingSegments } from '@/lib/carplay'
 import type { CarPlayTimingMinute } from '@/lib/types'
 
 const CHART_W = 720
@@ -78,13 +75,15 @@ function MiniChart({ minutes, series }: { minutes: CarPlayTimingMinute[]; series
         )
       })}
       {series.map((s) => {
-        const points = s.values
-          .map((v, i) => (v == null ? null : `${x(i).toFixed(1)},${y(Math.max(s.min, Math.min(s.max, v)), s).toFixed(1)}`))
-          .filter((p): p is string => p != null)
-          .join(' ')
         return (
           <g key={s.label} className={s.colorClass}>
-            <polyline points={points} fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinejoin="round" />
+            {timingSegments(minutes, s.values).map((indices) => (
+              <polyline
+                key={indices[0]}
+                points={indices.map((i) => `${x(i).toFixed(1)},${y(Math.max(s.min, Math.min(s.max, s.values[i]!)), s).toFixed(1)}`).join(' ')}
+                fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinejoin="round"
+              />
+            ))}
           </g>
         )
       })}
@@ -95,6 +94,7 @@ function MiniChart({ minutes, series }: { minutes: CarPlayTimingMinute[]; series
 export default function CarPlayTimingView({ live }: { live: boolean }) {
   const [hours, setHours] = useState(24)
   const [surface, setSurface] = useState('')
+  const [periodId, setPeriodId] = useState('')
   const query = useQuery({
     queryKey: ['carplay-timing', hours],
     queryFn: () => api.unitLogs.carplayTiming({ hours }),
@@ -105,24 +105,44 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
   if (query.isError) return <ErrorState error={query.error} />
   const data = query.data
   const allMinutes = data?.minutes ?? []
+  // A capture that saw no frames must still be selectable and visible as missing timing.
+  const periods = timingPeriods([
+    ...allMinutes,
+    ...(data?.events ?? []).map((e) => ({ bucketStart: e.occurredAt, sessionId: e.sessionId })),
+  ])
+  const selectedPeriod = periodId === 'all' ? null : periods.find((p) => p.id === periodId) ?? periods.at(-1)
+  const observedMinutes = selectedPeriod
+    ? allMinutes.filter((m) => inTimingPeriod(m.bucketStart, m.sessionId, selectedPeriod))
+    : allMinutes
 
   // The unit always draws on more than one SurfaceView, and nothing in the sampler's
   // output says which is CarPlay's video: the layer's `#N` is reassigned between
   // sessions and the name carries no package. Measured live, two surfaces in the same
   // minute ran 35 ms and 53 ms cadences, so an average across them described neither.
   // They are shown one at a time instead, busiest first, and the operator picks.
-  const layers = [...new Set(allMinutes.map((m) => m.layer).filter(Boolean))].sort(
+  const layers = [...new Set(observedMinutes.map((m) => m.layer).filter(Boolean))].sort(
     (a, b) =>
-      allMinutes.filter((m) => m.layer === b).length -
-      allMinutes.filter((m) => m.layer === a).length,
+      observedMinutes.filter((m) => m.layer === b).length -
+      observedMinutes.filter((m) => m.layer === a).length,
   )
   const layer = layers.includes(surface) ? surface : layers[0] ?? ''
-  const minutes = layer ? allMinutes.filter((m) => m.layer === layer) : allMinutes
+  const minutes = layer ? observedMinutes.filter((m) => m.layer === layer) : observedMinutes
+  const samples = (data?.samples ?? []).filter((s) => (!layer || s.layer === layer) &&
+    (!selectedPeriod || inTimingPeriod(s.occurredAt, s.sessionId, selectedPeriod)))
+  const events = (data?.events ?? []).filter((e) => !selectedPeriod ||
+    inTimingPeriod(e.occurredAt, e.sessionId, selectedPeriod))
+  const spans = samples.map((s) => s.spanS).filter((s): s is number => s != null && s >= 0)
+  const sampledSeconds = spans.length ? spans.reduce((a, b) => a + b, 0) : null
 
-  const meanFps = minutes.length ? minutes.reduce((a, m) => a + (m.fps ?? 0), 0) / minutes.length : null
-  const meanLate = minutes.length ? minutes.reduce((a, m) => a + (m.latePct ?? 0), 0) / minutes.length : null
-  const worstLate = minutes.length ? Math.max(...minutes.map((m) => m.latePct ?? 0)) : null
-  const hottest = minutes.length ? Math.max(...minutes.map((m) => m.socC ?? 0)) : null
+  const meanFps = meanKnown(minutes.map((m) => m.fps))
+  const meanLate = meanKnown(minutes.map((m) => m.latePct))
+  const worstLate = maxKnown(minutes.map((m) => m.latePct))
+  const hottest = maxKnown(minutes.map((m) => m.socC))
+  const longestHold = maxKnown(minutes.map((m) => m.maxMs))
+  const surfaceKinds = [...new Set(samples.map((s) => s.surfaceKind).filter(Boolean))]
+  const surfaceDescription = surfaceKinds.length === 1 && surfaceKinds[0] === 'package_window'
+    ? 'ZLink package window; its presentation rate is not the decoded CarPlay frame rate.'
+    : 'Surface ownership is unverified; this may be a recorder or another video surface.'
   const last = minutes[minutes.length - 1]
 
   const series: Series[] = [
@@ -144,6 +164,24 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
             {h < 48 ? `${h} h` : `${h / 24} d`}
           </button>
         ))}
+        {periods.length > 0 && (
+          <label className="flex items-center gap-2 text-content-muted">
+            Observed period
+            <select
+              aria-label="Observed period"
+              className="rounded border border-border bg-surface px-2 py-1 text-content"
+              value={selectedPeriod?.id ?? 'all'}
+              onChange={(e) => setPeriodId(e.target.value)}
+            >
+              <option value="all">All periods</option>
+              {[...periods].reverse().map((p) => (
+                <option key={p.id} value={p.id}>
+                  {formatDateTime(new Date(p.start).toISOString())} – {new Date(p.end + 60_000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         {layers.length > 1 && (
           <>
             <span className="label ml-3 text-xs">Surface</span>
@@ -151,7 +189,7 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
               <button
                 key={l}
                 onClick={() => setSurface(l)}
-                title="The unit draws on more than one SurfaceView and does not say which is CarPlay's video. Each is shown separately rather than averaged together."
+                title="Each surface is shown separately. Package-window and unverified SurfaceView observations have different meanings."
                 className={cn(
                   'rounded px-2 py-1',
                   l === layer ? 'bg-surface text-content shadow-sm' : 'text-content-muted hover:text-content',
@@ -163,31 +201,31 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
           </>
         )}
         <span className="ml-auto text-content-muted">
-          {data?.total ?? 0} samples · {minutes.length} minutes with a phone attached
+          {samples.length} samples · {minutes.length} observed minutes
         </span>
       </div>
 
       {minutes.length === 0 ? (
         <EmptyState
           title="No CarPlay timing yet"
-          description="Samples appear once the car has been driven with a phone attached to CarPlay and the unit has been home to hand them over. While no phone is attached the sampler only heartbeats, which shows under the Head unit log as CarPlayTiming."
+          description="Samples appear after the unit collects surface timing and brings it home. Missing timing does not establish that CarPlay was smooth or disconnected; check the capture events below."
         />
       ) : (
         <>
           <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
             <div className="card p-3">
               <div className="label text-xs">Late frames</div>
-              <div className="text-2xl font-semibold tabular-nums">{meanLate?.toFixed(0)}%</div>
-              <div className="text-xs text-content-muted">mean · worst minute {worstLate?.toFixed(0)}%</div>
+              <div className="text-2xl font-semibold tabular-nums">{meanLate == null ? '—' : `${meanLate.toFixed(0)}%`}</div>
+              <div className="text-xs text-content-muted">minute mean · worst {worstLate == null ? '—' : `${worstLate.toFixed(0)}%`}</div>
             </div>
             <div className="card p-3">
               <div className="label text-xs">Delivered</div>
-              <div className="text-2xl font-semibold tabular-nums">{meanFps?.toFixed(1)} fps</div>
-              <div className="text-xs text-content-muted">CarPlay video surface</div>
+              <div className="text-2xl font-semibold tabular-nums">{meanFps == null ? '—' : `${meanFps.toFixed(1)} fps`}</div>
+              <div className="text-xs text-content-muted">selected surface · minute mean</div>
             </div>
             <div className="card p-3">
               <div className="label text-xs">Hottest</div>
-              <div className="text-2xl font-semibold tabular-nums">{hottest?.toFixed(0)} °C</div>
+              <div className="text-2xl font-semibold tabular-nums">{hottest == null ? '—' : `${hottest.toFixed(0)} °C`}</div>
               <div className="text-xs text-content-muted">SoC, worst minute</div>
             </div>
             <div className="card p-3">
@@ -195,7 +233,7 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
               <div className="text-2xl font-semibold tabular-nums">
                 {last?.apMhz ?? '—'} / {last?.staMhz ?? '—'}
               </div>
-              <div className="text-xs text-content-muted">hotspot MHz / home link MHz (last)</div>
+              <div className="text-xs text-content-muted">hotspot MHz / Wi-Fi MHz (last)</div>
             </div>
           </div>
 
@@ -213,10 +251,16 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
             </div>
             <MiniChart minutes={minutes} series={series} />
             <p className="mt-2 text-xs text-content-muted">
-              Late = the share of frames that landed two or more display refreshes after their slot. A home-link
-              value beside the hotspot means the unit was on your Wi-Fi as well, so its single radio was hopping
-              between two channels; on the road that column is empty.
+              Longest observed hold: {longestHold == null ? 'unknown' : `${longestHold.toFixed(0)} ms`}.
+              {' '}{sampledSeconds == null ? 'Sampled duration is unavailable for this capture.' : `${sampledSeconds.toFixed(0)} seconds of frame intervals recorded${spans.length < samples.length ? ' (some sample durations are unknown)' : ''}.`}
+              {' '}Gaps stay blank. Observed periods separate gaps in the data; they are not verified drive boundaries.
             </p>
+            <p className="mt-2 text-xs text-content-muted">
+              The current sampler counts holds above the surface’s median interval plus 1.5 display periods as late;
+              older sampler thresholds differ. Surface names alone do not identify CarPlay, and these measurements
+              do not include touch-to-response or audio latency. {radioObservation(last?.apMhz, last?.staMhz)}
+            </p>
+            <p className="mt-2 text-xs text-content-muted">{surfaceDescription}</p>
           </div>
 
           <div className="card overflow-x-auto">
@@ -232,12 +276,12 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
                   <th className="px-3 py-2 text-right">load</th>
                   <th className="px-3 py-2 text-right">Zlink %</th>
                   <th className="px-3 py-2 text-right">kbit/s</th>
-                  <th className="px-3 py-2 text-right">home link</th>
+                  <th className="px-3 py-2 text-right">Wi-Fi MHz</th>
                 </tr>
               </thead>
               <tbody className="tabular-nums">
                 {[...minutes].reverse().map((m) => (
-                  <tr key={m.bucketStart} className="border-t border-border">
+                  <tr key={`${m.sessionId ?? 'legacy'}:${m.bucketStart}`} className="border-t border-border">
                     <td className="px-3 py-1.5 whitespace-nowrap">{formatDateTime(m.bucketStart)}</td>
                     <td className="px-3 py-1.5 text-right">{m.fps?.toFixed(1) ?? '—'}</td>
                     <td className={cn('px-3 py-1.5 text-right', (m.latePct ?? 0) >= 25 && 'text-state-warn')}>{m.latePct?.toFixed(0) ?? '—'}</td>
@@ -255,6 +299,23 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
           </div>
         </>
       )}
+      <div className="card p-4 text-sm">
+        <div className="font-medium">Capture events</div>
+        <p className="mt-1 text-xs text-content-muted">
+          Neighbour and process observations do not establish an active CarPlay connection.
+          A surface with no new frames may be static, stalled or hidden.
+        </p>
+        {events.length ? (
+          <ul className="mt-3 space-y-2">
+            {[...events].reverse().slice(0, 12).map((event, index) => (
+              <li key={`${event.occurredAt}:${index}`} className="flex flex-wrap gap-x-3">
+                <span className="text-content-muted">{formatDateTime(event.occurredAt)}</span>
+                <span>{event.kind.replaceAll('_', ' ')}{event.layer ? ` · ${event.layer}` : ''}</span>
+              </li>
+            ))}
+          </ul>
+        ) : <p className="mt-3 text-content-muted">No capture events in this period. Older samplers did not record these events.</p>}
+      </div>
     </div>
   )
 }

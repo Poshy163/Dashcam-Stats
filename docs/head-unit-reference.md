@@ -257,12 +257,21 @@ not gate the kernel buffer, so the reading-side filter is still needed as well.
 
 ### CarPlay frame timing, sampled on the unit
 
-The CarPlay picture is drawn on a `SurfaceView[](BLAST)#N` layer of Zlink's, and the timing
-of *that* surface — not Zlink's own views, which `dumpsys gfxinfo` reports — is where the
-CarPlay lag lives. `dumpsys SurfaceFlinger --latency '<layer name>'` prints the display
-period and the last 128 frames' desired/actual/ready present times in nanoseconds; the
-intervals between successive actual-present values give fps. Measured with CarPlay in use:
-23–26 fps delivered, median interval 35 ms, p95 70 ms, worst 106 ms.
+The 8 September live hierarchy resolved the old anonymous `SurfaceView[](BLAST)#101`
+and `#104` layers to **com.zqc.camera**, through their parent layers. Their timing is
+recorder evidence, not CarPlay performance evidence. The ZLink application buffer was
+its package/activity-named layer #255, with owner PID matching ZLink. The local corrected
+sampler selects that buffer naming pattern as `package_window`, excludes anonymous
+surfaces and container/input-sink layers, and fails closed on an unknown name. Deployment
+of the new sampler remains pending; see `carplay-investigation-2026-09-08.md`.
+It retains only a numeric layer ID and kind, never a window title.
+`dumpsys SurfaceFlinger --latency '<layer name>'` prints the
+display period and the last 128 frames' desired/actual/ready present times in nanoseconds;
+the intervals between successive actual-present values describe that observed layer.
+Prior anonymous-layer observations recorded 23–26 presentations per second, median
+interval 35 ms, p95 70 ms and worst 106 ms. They cannot establish a CarPlay frame rate.
+Even the mapped ZLink app-window timing needs validation with a phone playing CarPlay;
+the phone was absent during the live mapping.
 
 **A late frame is one that missed its slot by more than one refresh** (`median + 1.5
 periods`), not one over 2.5 display periods, which is what this originally counted and what
@@ -276,25 +285,32 @@ questions are now answered by the two fields that should answer them — `fps` f
 the surface runs, `late` for how unevenly. Samples from before this change are not
 comparable with ones after it.
 
-`late_pct` correlates with nothing physical across those 234 samples: SoC temperature
-−0.20 (*negative*), Zlink CPU −0.01, hotspot bitrate −0.00, load −0.34. Thermal
-throttling, Zlink's own CPU and the phone→unit bitrate are all ruled out as causes.
+Across the earlier 234 samples, `late_pct` had weak correlations with SoC temperature
+(−0.20), Zlink CPU (−0.01), hotspot bitrate (−0.00), and load (−0.34). Those observations
+did not support a simple relationship in that limited drive sample; they cannot rule out
+thermal, app, wireless, decoder, or other pipeline causes. The sampler records coverage,
+session boundaries, raw neighbour state, radio context, and explicit no-surface/no-new-frame
+observations so later comparisons do not treat missing timing as a healthy result.
 
-**There is always more than one such surface, and nothing identifies which is CarPlay's.**
+**Never infer ownership from a numeric layer ID across boots.**
 The layer's `#N` is a SurfaceFlinger sequence number that is reassigned between sessions —
 observed as #99/#104 one session and #100/#103 the next, with the fast and slow surfaces
 swapping which number they carried — and the name is a bare `SurfaceView[](BLAST)` with no
 package. So the samples are kept per surface and never averaged across them (a mean of a
 35 ms and a 53 ms cadence is a rate neither surface ever achieved); the Logs view shows one
-at a time. Telling them apart properly needs a look at the full `dumpsys SurfaceFlinger`
-with the car awake and a phone attached.
+at a time. The live full `dumpsys SurfaceFlinger` established the camera parent chains
+and ZLink app owner for this boot; playback-specific attribution still needs a phone.
 
 `app/ingest/carplay_timing.py` ships a toybox script (`carplay_timing.sh`) that does this
-every few seconds while a phone is attached to the hotspot, emitting one line per surface
-under the logcat tag `CarPlayTiming` (at error priority, because the collector keeps only
-`*:E`) and to `/data/local/tmp/dashcam_carplay_timing.log`. Gotchas learned the hard way:
-the layer names carry no package name (`--list | grep -i surfaceview`, skip "Background
-for"); toybox `ps` shows the script as `sh`, so check `/proc/<pid>/cmdline` instead; and
+every few seconds while a non-expired WLAN2 neighbour is present. That aggregate neighbour
+observation does not identify a phone or prove an active CarPlay session. It emits one line
+per candidate surface under the logcat tag `CarPlayTiming` (at error priority, because the
+collector keeps only `*:E`) and to a bounded, rotated direct sampler file. The direct file
+is re-read and deduplicated when the unit returns, so logcat churn cannot silently turn an
+unobserved drive into a healthy-looking one. Gotchas learned the hard way:
+the bare layer names carry no package name and are now excluded; package/activity buffer
+matches use the observed ZLink naming pattern, not arbitrary package substrings; toybox `ps` shows the script as
+`sh`, so check `/proc/<pid>/cmdline` instead; and
 inside a shell loop, redirect adb's stdin (`</dev/null`) or it consumes the loop's input.
 
 ### Volume, and why the capture is filtered

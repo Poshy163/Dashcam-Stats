@@ -144,6 +144,37 @@ def _revert_implausible(target: list[TelemetryPoint], filled: list[TelemetryPoin
 _SYNTHETIC_GPS_SOURCES = frozenset({"paired_camera", "interpolated", "context_repaired"})
 
 
+def _is_explicitly_unavailable(point: TelemetryPoint, quality: dict) -> bool:
+    """Whether a stored row says that this camera supplied no usable position.
+
+    ``quality_json`` is the provenance captured when a row was decoded, while
+    ``gps_quality`` is the queryable verdict that migrations may correct later.  A row
+    whose old JSON still says ``valid`` can therefore have been rejected by migration
+    0009.  Recovery must honour the newer column: otherwise reprocessing turns a
+    repudiated local observation back into an apparently ordinary gap and hides that
+    distinction behind a copied coordinate.
+
+    Older rows have no column, so retain the legacy JSON check for them.
+    """
+    verdict = point.gps_quality
+    if verdict in {str(GpsQuality.NO_FIX), str(GpsQuality.REJECTED)}:
+        return True
+    return quality.get("gps_status") in {"no_fix", "rejected"}
+
+
+def _is_independent_donor(point: TelemetryPoint) -> bool:
+    """A directly accepted position, suitable as evidence for the other camera."""
+    if point.gps_quality not in (None, str(GpsQuality.VALID)):
+        return False
+    quality = point.quality_json or {}
+    return (
+        point.captured_at is not None
+        and point.lat is not None
+        and point.lon is not None
+        and quality.get("gps_source") not in _SYNTHETIC_GPS_SOURCES
+    )
+
+
 async def recover_from_paired_camera(session: AsyncSession, recording: Recording) -> int:
     """Fill OCR-only holes from an overlapping camera, never an explicit GPS no-fix.
 
@@ -213,16 +244,17 @@ async def recover_from_paired_camera(session: AsyncSession, recording: Recording
         by_second = {
             round(point.captured_at.timestamp()): point
             for point in source
-            if point.captured_at is not None
-            and point.lat is not None
-            and point.lon is not None
-            and (point.quality_json or {}).get("gps_source") not in _SYNTHETIC_GPS_SOURCES
+            if point.captured_at is not None and _is_independent_donor(point)
         }
         changed = 0
         filled: list[TelemetryPoint] = []
         for point in target:
             quality = dict(point.quality_json or {})
-            if point.has_fix or quality.get("gps_status") == "no_fix" or point.captured_at is None:
+            if (
+                point.has_fix
+                or _is_explicitly_unavailable(point, quality)
+                or point.captured_at is None
+            ):
                 continue
             donor = by_second.get(round(point.captured_at.timestamp()))
             if donor is None:

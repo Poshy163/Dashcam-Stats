@@ -306,7 +306,7 @@ class DatabaseLogSink:
         self._flush_interval_s = max(0.05, flush_interval_s)
         self._lock = threading.Lock()
         self._queue: deque[_PendingLog] = deque(maxlen=max(16, capacity))
-        self._dedupe: dict[tuple[str, str, str], _DedupeState] = {}
+        self._dedupe: dict[tuple[str, str, str, int | None, int | None, str], _DedupeState] = {}
         self._stats = SinkStats()
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
@@ -377,6 +377,9 @@ class DatabaseLogSink:
                 record.message,
                 record.recording_id,
                 record.job_id,
+                # Different stages carry different timings/outcomes even for one job.
+                # Collapsing them erased the evidence needed to profile the pipeline.
+                str((record.context or {}).get("stage") or "")[:64],
             )
             now = time.monotonic()
             state = self._dedupe.get(key)

@@ -1,23 +1,22 @@
 """Sampling CarPlay's own frame timing on the head unit, and reading it back.
 
 The operator's complaint was that Zlink -- the unit's CarPlay app -- lags while the rest of
-the Android UI stays smooth. Measured on the unit with CarPlay in use, that is exactly what
-the numbers say: Zlink's own views render cleanly (``gfxinfo``: under one percent janky),
-while the *video surface* CarPlay is drawn on -- a ``SurfaceView[](BLAST)`` layer, which
-``gfxinfo`` does not cover -- delivers 23-26 frames a second with a quarter to a third of
-them landing two or more frames late (SurfaceFlinger: median interval 35 ms, p95 70 ms,
-worst 106 ms). The lag lives in the video path.
+the Android UI stays smooth. SurfaceFlinger observed candidate ``SurfaceView[](BLAST)``
+layers while CarPlay was visible; those names do not identify their owning app, so their
+timing cannot on its own be attributed to Zlink or to all of CarPlay. The sampler preserves
+the observed layer timing for comparable drive-to-drive evidence.
 
 That was measured over adb on the driveway. The question that matters is what happens on a
 long drive, where the unit is hot, the recorder has been running for an hour, and -- this
 is the part the driveway cannot show -- there is no home network for the single radio to
 hop to. There is also no adb. So the sampling runs on the unit itself: a detached toybox
 shell script, armed on every visit the way the recording watcher is, that every few seconds
-while a phone is attached to the CarPlay hotspot reads each video surface's frame timing
+while a non-expired WLAN2 neighbour is present reads each candidate surface's frame timing
 from SurfaceFlinger and the things that could be starving it -- load, SoC temperature,
 Zlink's own CPU, the hotspot's incoming bitrate, and which channel each radio role is on.
 
-**How it gets home.** Each sample is one line, written to a file on the unit and emitted
+**How it gets home.** Each observation is one line, written to bounded, rotated files on
+the unit and emitted
 into logcat under the tag ``CarPlayTiming`` at *error* priority. Error priority is not a
 statement about severity: the unit-log collector (:mod:`app.ingest.unit_logs`) keeps only
 ``*:E``, so anything quieter would never ship. The collector then carries the lines into
@@ -29,7 +28,7 @@ counters -- stay on the fifteen-second cadence, because load and temperature do 
 faster than that. Only the two cheap SurfaceFlinger calls run every four seconds, which is
 what it takes to see every frame: the ring holds 127 of them, about 5.3 seconds, so the
 original single read per interval observed roughly a third of the drive and missed the
-rest. Nothing at all runs while no phone is attached beyond a heartbeat a minute. It never
+rest. Nothing at all runs while no WLAN2 neighbour is present beyond a heartbeat a minute. It never
 changes a setting, a radio or a process.
 """
 
@@ -39,13 +38,17 @@ import asyncio
 import base64
 import re
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
 from app.ingest import adb
+from app.ingest.status import get_status
+
+if TYPE_CHECKING:
+    from app.ingest.unit_logs import ParsedLine
 
 log = get_logger(__name__)
 
@@ -54,6 +57,15 @@ log = get_logger(__name__)
 REMOTE_SCRIPT = "/data/local/tmp/dashcam_carplay_timing.sh"
 REMOTE_PID = "/data/local/tmp/.dashcam_carplay_timing.pid"
 REMOTE_LOG = "/data/local/tmp/dashcam_carplay_timing.log"
+
+# The timing sampler has its own small, rotated file as well as logcat.  Logcat is a
+# useful transport when it is quiet, but a noisy tag can evict an entire drive before the
+# unit next reaches home.  Keeping several modest files bounds card use and lets the next
+# successful presence poll recover observations that logcat no longer contains.
+REMOTE_LOG_KIB = 512
+REMOTE_LOG_ROTATIONS = 6
+MAX_RECOVERY_BYTES_PER_FILE = REMOTE_LOG_KIB * 1024
+MAX_RECOVERY_LINES = 20_000
 
 #: The logcat tag every sample carries. The unit-log collector's allow-list must name it.
 TAG = "CarPlayTiming"
@@ -83,6 +95,7 @@ ARM_DEBOUNCE_S = 300.0
 
 _SCRIPT_PATH = Path(__file__).with_name("carplay_timing.sh")
 _last_armed: dict[str, float] = {}
+_last_recovered: dict[str, float] = {}
 _tasks: set[asyncio.Task[None]] = set()
 
 
@@ -141,10 +154,23 @@ async def arm(address: str) -> bool:
 
 
 def on_unit_present(address: str) -> None:
-    """Called from the presence poll. Arms in the background, at most once per debounce."""
+    """Arm cheaply whenever present; recover retained diagnostics only when parked."""
     if not _enabled():
         return
     now = time.monotonic()
+    # File recovery can read several MiB.  The sampler is also armed at departure, where
+    # this work would delay the first observation and compete with the reported lag.  The
+    # ingest status receives an exact read-only ACC verdict elsewhere; fail closed until it
+    # positively says off, then recover on a later presence tick.
+    if get_status().ignition_state == "off":
+        recovered = _last_recovered.get(address)
+        if recovered is None or now - recovered >= ARM_DEBOUNCE_S:
+            _last_recovered[address] = now
+            task = asyncio.create_task(
+                _recover_when_parked(address), name="ingest-carplay-timing-recover"
+            )
+            _tasks.add(task)
+            task.add_done_callback(_tasks.discard)
     last = _last_armed.get(address)
     if last is not None and now - last < ARM_DEBOUNCE_S:
         return
@@ -167,6 +193,7 @@ async def shutdown() -> None:
 
 def reset_for_tests() -> None:
     _last_armed.clear()
+    _last_recovered.clear()
 
 
 # ----------------------------------------------------------------------------------------
@@ -175,6 +202,7 @@ def reset_for_tests() -> None:
 
 _KV = re.compile(r"(\w+)=(\S+)")
 _STA = re.compile(r"RSSI:(-?\d+)|Frequency:(\d+)MHz")
+_FILE_LINE = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) (?P<message>.*)$")
 
 
 def _number(value: str | None) -> float | None:
@@ -195,6 +223,22 @@ def _int_or_none(value: str | None) -> int | None:
     """
     number = _number(value)
     return None if number is None else int(number)
+
+
+def _neighbour_states(value: str | None) -> dict[str, int] | None:
+    """Parse the sampler's aggregate neighbour states without retaining addresses."""
+    if value in (None, "na"):
+        return None
+    states: dict[str, int] = {}
+    for item in value.split(","):
+        state, separator, count = item.partition(":")
+        if not separator or not state:
+            return None
+        parsed = _int_or_none(count)
+        if parsed is None or parsed < 0:
+            return None
+        states[state] = parsed
+    return states or None
 
 
 def parse_sample(occurred_at: datetime, message: str) -> dict[str, Any] | None:
@@ -228,8 +272,17 @@ def parse_sample(occurred_at: datetime, message: str) -> dict[str, Any] | None:
             sta_mhz = int(mhz)
     return {
         "occurred_at": occurred_at,
+        "session_id": fields.get("session") or None,
         "acc_on": fields.get("acc") == "1",
+        # Legacy name retained for existing clients.  It only means a wlan2 neighbour
+        # was observed; it does not identify a phone or prove an active CarPlay session.
         "phone_attached": _number(fields.get("phone")) not in (None, 0.0),
+        "hotspot_neighbour_count": _int_or_none(fields.get("neigh_count")),
+        "hotspot_neighbour_states": _neighbour_states(fields.get("neigh")),
+        # Process presence is an observation of /proc, not a decoder health verdict.
+        "zlink_process_present": (
+            None if fields.get("zlink_proc") in (None, "na") else fields.get("zlink_proc") == "1"
+        ),
         "load": _number(fields.get("load")),
         "soc_c": _number(fields.get("soc")),
         "zlink_cpu_pct": _number(fields.get("zlink_cpu")),
@@ -246,6 +299,7 @@ def parse_sample(occurred_at: datetime, message: str) -> dict[str, Any] | None:
         "sta_rssi": sta_rssi,
         "ap_mhz": int(fields["ap"]) if fields.get("ap", "na").isdigit() else None,
         "layer": fields.get("layer", ""),
+        "surface_kind": fields.get("surface_kind") or None,
         # Which of the surfaces this was, in the order SurfaceFlinger listed them. The
         # layer's own `#N` is a sequence number that is reassigned between sessions -- it
         # has been observed as #99/#104 one session and #100/#103 the next, with the fast
@@ -278,6 +332,150 @@ def parse_sample(occurred_at: datetime, message: str) -> dict[str, Any] | None:
     }
 
 
+def parse_event(occurred_at: datetime, message: str) -> dict[str, Any] | None:
+    """Return a non-frame sampler observation, without turning absent timing into healthy timing."""
+    if " | " not in message:
+        return None
+    head, tail = message.split(" | ", 1)
+    fields = dict(_KV.findall(head))
+    event_fields = dict(_KV.findall(tail))
+    fields.update(event_fields)
+    kind: str | None = None
+    if tail.startswith("event="):
+        kind = fields.get("event")
+    elif tail == "no video surface":
+        kind = "surface_unavailable"
+    elif tail.startswith("layer=") and "new=0" in tail and "no new frames" in tail:
+        kind = "surface_no_new_frames"
+    if not kind:
+        return None
+    sta_mhz: int | None = None
+    for _rssi, mhz in _STA.findall(fields.get("sta", "")):
+        if mhz:
+            sta_mhz = int(mhz)
+    return {
+        "occurred_at": occurred_at,
+        "session_id": fields.get("session") or None,
+        "kind": kind,
+        "hotspot_neighbour_count": _int_or_none(fields.get("neigh_count")),
+        "hotspot_neighbour_states": _neighbour_states(fields.get("neigh")),
+        "zlink_process_present": (
+            None if fields.get("zlink_proc") in (None, "na") else fields.get("zlink_proc") == "1"
+        ),
+        "sta_mhz": sta_mhz,
+        "ap_mhz": int(fields["ap"]) if fields.get("ap", "na").isdigit() else None,
+        "layer": fields.get("layer") or None,
+        "surface_kind": fields.get("surface_kind") or None,
+        "layer_index": _int_or_none(fields.get("idx")),
+    }
+
+
+def parse_sampler_file(raw: str) -> list[ParsedLine]:
+    """Convert the sampler's ISO file lines into UnitLogEntry-compatible records.
+
+    Importing ``unit_logs`` here avoids a module cycle during ordinary startup.  The file
+    never contains neighbour addresses, SSIDs, or other device identifiers; only the
+    sampler's aggregate diagnostic fields are accepted.
+    """
+    from app.ingest.unit_logs import MAX_MESSAGE_CHARS, ParsedLine
+
+    entries: list[ParsedLine] = []
+    for line in raw.splitlines():
+        match = _FILE_LINE.match(line)
+        if not match:
+            continue
+        # Pre-session files cannot be safely deduplicated against logcat because their
+        # direct-file timestamp has second precision and no emitting pid.  Skip them
+        # rather than doubling historical observations.
+        if "sample=" not in match["message"]:
+            continue
+        try:
+            occurred_at = datetime.strptime(match["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        entries.append(
+            ParsedLine(
+                occurred_at=occurred_at,
+                # These direct-file records did not travel through logcat, so there is no
+                # trustworthy emitting pid/tid.  Zero is explicit provenance, not a guess.
+                pid=0,
+                tid=0,
+                level="E",
+                tag=TAG,
+                message=match["message"][:MAX_MESSAGE_CHARS],
+            )
+        )
+        if len(entries) >= MAX_RECOVERY_LINES:
+            break
+    return entries
+
+
+def sampler_file_read_command() -> str:
+    """Tail every generation oldest first; fixed paths need no shell interpolation."""
+    generations = " ".join(f"{REMOTE_LOG}.{index}" for index in range(REMOTE_LOG_ROTATIONS, 0, -1))
+    return (
+        f"for f in {generations} {REMOTE_LOG}; do "
+        f'[ -f "$f" ] && tail -c {MAX_RECOVERY_BYTES_PER_FILE} "$f"; '
+        "done; exit 0"
+    )
+
+
+async def recover_sampler_file(address: str) -> tuple[int, int]:
+    """Recover retained direct-file observations, returning ``(new, duplicate)``."""
+    raw = await adb.shell(address, sampler_file_read_command(), timeout=ARM_TIMEOUT_S)
+    # Test fakes from older callers sometimes return the lower-level result object.
+    if isinstance(raw, adb.AdbResult):
+        raw = raw.stdout
+    entries = parse_sampler_file(raw)
+    if not entries:
+        return 0, 0
+    from app.ingest.unit_logs import store
+
+    return await store(entries)
+
+
+async def _recover_when_parked(address: str) -> None:
+    """Best-effort direct-file recovery after a known ignition-off transition."""
+    try:
+        await recover_sampler_file(address)
+    except Exception as exc:
+        # Recovery is diagnostic only.  A full database or malformed historical file must
+        # not stop the later sampling/ingest work.
+        log.warning("could not recover the CarPlay timing sampler file", error=str(exc))
+
+
+def sessions(samples: list[dict[str, Any]], events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Summarise sampler lifetimes where the script emitted a session marker.
+
+    Older rows remain unassigned instead of being inferred into a session from a time gap.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in [*samples, *events]:
+        session_id = row.get("session_id")
+        if session_id:
+            grouped.setdefault(str(session_id), []).append(row)
+    result: list[dict[str, Any]] = []
+    for session_id, rows in grouped.items():
+        ordered = sorted(rows, key=lambda row: row["occurred_at"])
+        frame_rows = [row for row in ordered if "fps" in row]
+        result.append(
+            {
+                "session_id": session_id,
+                "started_at": ordered[0]["occurred_at"],
+                "ended_at": ordered[-1]["occurred_at"],
+                "sample_count": len(frame_rows),
+                "event_count": len(ordered) - len(frame_rows),
+                "surface_no_new_frames": sum(
+                    1 for row in ordered if row.get("kind") == "surface_no_new_frames"
+                ),
+                "surface_unavailable": sum(
+                    1 for row in ordered if row.get("kind") == "surface_unavailable"
+                ),
+            }
+        )
+    return result
+
+
 def summarise(samples: list[dict[str, Any]], bucket_s: int = 60) -> list[dict[str, Any]]:
     """Per-bucket figures, **one row per surface**, in time order.
 
@@ -291,10 +489,16 @@ def summarise(samples: list[dict[str, Any]], bucket_s: int = 60) -> list[dict[st
     surface ever achieved. They cannot be told apart from the sampler's output -- see
     ``layer_index`` -- so they are kept apart rather than blended, and the caller chooses.
     """
-    buckets: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    buckets: dict[tuple[int, str, str | None], list[dict[str, Any]]] = {}
     for sample in samples:
         key = int(sample["occurred_at"].timestamp()) // bucket_s * bucket_s
-        buckets.setdefault((key, str(sample.get("layer", ""))), []).append(sample)
+        # Surface sequence numbers are reused after each sampler re-arm.  Newer records
+        # carry a session marker, so never average two lifetimes simply because both had
+        # a `#104` layer in the same minute.  Legacy rows intentionally remain together
+        # under None because their session cannot be reconstructed safely.
+        buckets.setdefault(
+            (key, str(sample.get("layer", "")), sample.get("session_id")), []
+        ).append(sample)
 
     def worst(rows: list[dict[str, Any]], field: str) -> float | None:
         values = [r[field] for r in rows if r.get(field) is not None]
@@ -311,14 +515,15 @@ def summarise(samples: list[dict[str, Any]], bucket_s: int = 60) -> list[dict[st
         return sum(values) if values else None
 
     out: list[dict[str, Any]] = []
-    for key, layer in sorted(buckets, key=lambda k: (k[0], k[1])):
-        rows = buckets[(key, layer)]
+    for key, layer, session_id in sorted(buckets, key=lambda k: (k[0], k[1], k[2] or "")):
+        rows = buckets[(key, layer, session_id)]
         fps = [r["fps"] for r in rows if r.get("fps") is not None]
         late = [r["late_pct"] for r in rows if r.get("late_pct") is not None]
         out.append(
             {
                 "bucket_start": datetime.fromtimestamp(key, tz=rows[0]["occurred_at"].tzinfo),
                 "layer": layer,
+                "session_id": session_id,
                 "layer_index": rows[-1].get("layer_index") or 0,
                 "samples": len(rows),
                 "fps": sum(fps) / len(fps) if fps else None,

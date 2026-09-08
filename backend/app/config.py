@@ -29,6 +29,7 @@ class AppConfig(BaseSettings):
 
     #: Set by the container build so the UI can show what it is running.
     version: str = Field(default="dev")
+    source_revision: str = Field(default="unknown")
 
     #: Escape hatch for tests and unusual deployments; normally left alone.
     database_url: str | None = None

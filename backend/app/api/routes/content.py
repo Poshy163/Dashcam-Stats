@@ -1005,6 +1005,7 @@ async def correct_plate(plate_id: RowId, body: PlateCorrectRequest, session: Ses
     if target is not None and target.id != plate.id:
         await _move_plate_observations(session, plate.id, target)
         target.flagged = target.flagged or plate.flagged
+        target.dismissed = target.dismissed or plate.dismissed
         target.notes = "\n".join(filter(None, (target.notes, plate.notes))) or None
         await session.delete(plate)
         plate = target
@@ -1033,6 +1034,7 @@ async def merge_plate(plate_id: RowId, body: PlateMergeRequest, session: Session
         return await _attach_representative(session, target)
     await _move_plate_observations(session, source.id, target)
     target.flagged = target.flagged or source.flagged
+    target.dismissed = target.dismissed or source.dismissed
     target.notes = "\n".join(filter(None, (target.notes, source.notes))) or None
     await session.delete(source)
     await _recount_plate(session, target)

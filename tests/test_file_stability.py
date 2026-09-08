@@ -136,6 +136,22 @@ async def test_the_network_share_walk_runs_off_the_application_event_loop(share,
     )
 
 
+async def test_a_file_changed_during_fingerprinting_is_left_settling(share, monkeypatch):
+    from app.scanner import discovery
+
+    clip = share / "20260804111550_camera_0.ts"
+
+    async def changing_fingerprint(path, sample_bytes):
+        path.write_bytes(path.read_bytes() + b"new bytes")
+        return "digest-of-an-inconsistent-read"
+
+    monkeypatch.setattr(discovery, "fingerprint_file", changing_fingerprint)
+    summary = await Scanner(footage_dir=share).scan(trigger="test")
+
+    assert await _state(clip.name) is RecordingState.SETTLING
+    assert summary.unsettled >= 1
+
+
 class TestAnEmptyRecordingLeavesTheQueue:
     async def test_it_is_marked_invalid_rather_than_failed(self, share):
         summary = await Scanner(footage_dir=share).scan(trigger="test")

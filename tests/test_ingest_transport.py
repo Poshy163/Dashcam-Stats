@@ -252,6 +252,52 @@ class TestTheStagedCommit:
 
         assert commit(staging, footage, {"clip.ts": 160}) == []
         assert (footage / "clip.ts").read_bytes() == b"original" * 20
+        assert (staging / ".conflicts" / "clip.ts").read_bytes() == b"x" * 160
+
+        # A later chunk's commit must not delete the preserved conflicting arrival.
+        (staging / "next.ts").write_bytes(b"next")
+        assert commit(staging, footage, {"next.ts": 4}) == ["next.ts"]
+        assert (staging / ".conflicts" / "clip.ts").read_bytes() == b"x" * 160
+
+    def test_an_identical_same_size_collision_can_be_safely_reclaimed(self, tmp_path):
+        staging, footage = tmp_path / "staging", tmp_path / "footage"
+        staging.mkdir()
+        footage.mkdir()
+        body = b"the same bytes" * 20
+        (footage / "clip.ts").write_bytes(body)
+        (staging / "clip.ts").write_bytes(body)
+
+        assert commit(staging, footage, {"clip.ts": len(body)}) == ["clip.ts"]
+        assert not (staging / "clip.ts").exists()
+
+    def test_a_directory_sync_failure_never_reports_the_copy_committed(self, tmp_path, monkeypatch):
+        staging, footage = tmp_path / "staging", tmp_path / "footage"
+        staging.mkdir()
+        footage.mkdir()
+        (staging / "clip.ts").write_bytes(b"x" * 100)
+
+        def failed_sync(path):
+            raise OSError("storage I/O error")
+
+        monkeypatch.setattr("app.ingest.puller._sync_directory", failed_sync)
+
+        assert commit(staging, footage, {"clip.ts": 100}) == []
+
+    def test_an_existing_copy_must_be_durable_before_it_is_reclaimable(self, tmp_path, monkeypatch):
+        staging, footage = tmp_path / "staging", tmp_path / "footage"
+        staging.mkdir()
+        footage.mkdir()
+        body = b"identical" * 20
+        (staging / "clip.ts").write_bytes(body)
+        (footage / "clip.ts").write_bytes(body)
+
+        def failed_sync(path):
+            raise OSError("storage I/O error")
+
+        monkeypatch.setattr("app.ingest.puller._sync_file_and_parent", failed_sync)
+
+        assert commit(staging, footage, {"clip.ts": len(body)}) == []
+        assert (staging / "clip.ts").exists()
 
     def test_a_truncated_local_copy_is_completed(self, tmp_path):
         """This is what the size-based delta is for, so it must still work."""
@@ -729,6 +775,8 @@ class TestTheAdbControlChannel:
             await adb.launch_listener("u:5555", "/src", [hostile], port=9000, timeout_s=60)
         with pytest.raises(adb.AdbError):
             await adb.delete("u:5555", "/src", [hostile])
+        with pytest.raises(adb.AdbError):
+            await adb.delete_if_unchanged("u:5555", "/src", [RemoteFile(hostile, 1, 2)])
 
     async def test_an_empty_card_is_not_a_control_failure(self, monkeypatch):
         """Once delete-after-verify is on, an empty card is the steady state.
@@ -1321,9 +1369,9 @@ class TestARunEndToEnd:
 
         deleted: list[str] = []
 
-        async def delete(address, source, names):
-            deleted.extend(names)
-            return len(names)
+        async def delete(address, source, items):
+            deleted.extend(item.name for item in items)
+            return len(items)
 
         sleep_window = {"seconds": 300}
 
@@ -1352,7 +1400,7 @@ class TestARunEndToEnd:
         monkeypatch.setattr(adb, "describe", describe)
         monkeypatch.setattr(adb, "inventory", inventory)
         monkeypatch.setattr(adb, "launch_listener", launch_listener)
-        monkeypatch.setattr(adb, "delete", delete)
+        monkeypatch.setattr(adb, "delete_if_unchanged", delete)
         monkeypatch.setattr(adb, "sleep_countdown", current_sleep_window)
         monkeypatch.setattr(adb, "set_sleep_countdown", set_sleep_window)
         monkeypatch.setattr(adb, "is_parked", parked)
@@ -3876,16 +3924,9 @@ class TestProtectedRecordings:
 
 
 class TestReclaimingSpaceAlreadyBackedUp:
-    """ "Delete from the card" only ever deleted what a run copied *itself*.
+    """Deletion requires identity evidence from the current transfer."""
 
-    Everything copied before the setting was switched on stayed on the card for good: the
-    delta correctly skips a recording the library already has, so it never entered a plan,
-    never got committed, and was never a candidate for deletion. Observed on the live card
-    — 132 recordings still there, every sampled one already in the library, on a volume
-    that had been at 96% and recycling.
-    """
-
-    def test_files_the_library_already_has_are_recorded_not_just_skipped(self, tmp_path):
+    def test_same_size_local_name_is_skipped_but_never_reclaimed(self, tmp_path):
         from app.ingest.models import RemoteFile
         from app.ingest.puller import delta
 
@@ -3898,7 +3939,7 @@ class TestReclaimingSpaceAlreadyBackedUp:
         plan = delta(remote, tmp_path, skip_active_s=15, camera="both")
 
         assert [i.name for i in plan.files] == ["20260812120100_camera_0.ts"]
-        assert [i.name for i in plan.already_local] == ["20260812120000_camera_0.ts"]
+        assert plan.already_local == []
 
     def test_a_short_local_copy_is_refetched_not_reclaimed(self, tmp_path):
         """The size check is the whole guarantee. A truncated local copy is not a copy."""
@@ -3932,9 +3973,23 @@ class TestReclaimingSpaceAlreadyBackedUp:
 
         assert plan.already_local == []
 
-    def test_the_camera_filter_does_not_strand_the_other_lens(self, tmp_path):
-        """Front-only copying must still let the card give back rear footage the library
-        already holds, or the filter quietly becomes a leak."""
+    def test_a_reused_name_with_different_same_size_content_is_not_reclaimed(self, tmp_path):
+        name = "20260812120000_camera_0.ts"
+        local_body = b"old-local-content"
+        (tmp_path / name).write_bytes(local_body)
+        plan = delta(
+            # The protocol does not expose these remote bytes; equal length is all delta
+            # can observe even though this represents different content under a reused name.
+            [RemoteFile(name, len(local_body), 123)],
+            tmp_path,
+            skip_active_s=15,
+            camera="both",
+        )
+
+        assert plan.already_local == []
+        assert plan.files == [], "same size should not force a needless re-download"
+
+    def test_the_camera_filter_never_reclaims_an_unproven_other_lens(self, tmp_path):
         from app.ingest.models import RemoteFile
         from app.ingest.puller import delta
 
@@ -3947,7 +4002,7 @@ class TestReclaimingSpaceAlreadyBackedUp:
             camera="camera_0",
         )
 
-        assert [i.name for i in plan.already_local] == ["20260812120000_camera_1.ts"]
+        assert plan.already_local == []
 
     async def test_reclaim_groups_by_directory_and_reports_what_went(self, monkeypatch):
         from app.ingest import adb, puller
@@ -3955,11 +4010,11 @@ class TestReclaimingSpaceAlreadyBackedUp:
 
         calls: list[tuple[str, list[str]]] = []
 
-        async def fake_delete(address, source, names):
-            calls.append((source, list(names)))
-            return len(names)
+        async def fake_delete(address, source, items):
+            calls.append((source, [item.name for item in items]))
+            return len(items)
 
-        monkeypatch.setattr(adb, "delete", fake_delete)
+        monkeypatch.setattr(adb, "delete_if_unchanged", fake_delete)
         info = UnitInfo(address="u:5555", source="/card/Video")
 
         removed = await puller._reclaim(
@@ -3979,10 +4034,10 @@ class TestReclaimingSpaceAlreadyBackedUp:
         from app.ingest import adb, puller
         from app.ingest.models import RemoteFile, UnitInfo
 
-        async def fake_delete(address, source, names):
+        async def fake_delete(address, source, items):
             raise adb.AdbError("read-only file system")
 
-        monkeypatch.setattr(adb, "delete", fake_delete)
+        monkeypatch.setattr(adb, "delete_if_unchanged", fake_delete)
 
         removed = await puller._reclaim(
             UnitInfo(address="u:5555", source="/card/Video"),
@@ -4013,6 +4068,58 @@ class TestOneAnnouncementPerVisit:
 
         # The arrival run announces itself; the re-drains that follow do not.
         assert puller.run_pull.__kwdefaults__["continuation"] is False, "default is arrival"
+
+    async def test_a_re_drain_is_still_persisted_in_history(self, monkeypatch):
+        """Notification coalescing must not make completed transfer diagnostics vanish."""
+        from app.ingest import puller
+        from app.ingest.models import RunResult, RunState
+
+        persisted: list[RunResult] = []
+        announced: list[str] = []
+
+        async def persist(result, trigger):
+            persisted.append(result)
+
+        async def announce(event, **kwargs):
+            announced.append(event)
+
+        monkeypatch.setattr(puller, "_persist", persist)
+        monkeypatch.setattr(puller, "report_event", announce)
+        result = RunResult(state=RunState.OK, files=72, bytes=3_990_000_000)
+
+        await puller._record_run_completion(result, "auto", continuation=True)
+
+        assert persisted == [result]
+        assert announced == []
+
+    async def test_a_history_write_failure_is_visible_but_does_not_fail_the_run(self, monkeypatch):
+        from app.ingest import puller
+        from app.ingest.models import RunResult, RunState
+
+        errors: list[dict] = []
+
+        async def failed_persist(result, trigger):
+            raise RuntimeError("database unavailable")
+
+        class CapturingLog:
+            def error(self, message, **fields):
+                errors.append({"message": message, **fields})
+
+        monkeypatch.setattr(puller, "_persist", failed_persist)
+        monkeypatch.setattr(puller, "log", CapturingLog())
+
+        await puller._record_run_completion(
+            RunResult(state=RunState.OK, files=72), "auto", continuation=True
+        )
+
+        assert errors == [
+            {
+                "message": "could not persist completed ingest run history",
+                "trigger": "auto",
+                "state": "ok",
+                "error": "RuntimeError: database unavailable",
+            }
+        ]
 
     def test_start_run_carries_the_flag_through(self):
         """The poller is what knows a run is a continuation, so it has to reach run_pull."""
