@@ -28,8 +28,8 @@ PIDF=/data/local/tmp/.dashcam_carplay_timing.pid
 TAG=CarPlayTiming
 # Bounded direct-file history is independent from logcat's small, noisy buffers.  It is
 # read non-destructively and deduplicated when the unit returns home.
-LOG_KIB=512
-LOG_ROTATIONS=6
+LOG_KIB=1024
+LOG_ROTATIONS=8
 SESSION="$(date +%s)-$(cut -d' ' -f1 /proc/uptime 2>/dev/null | tr -d .)-$$"
 SCRIPT=/data/local/tmp/dashcam_carplay_timing.sh
 SEQF=/data/local/tmp/.dashcam_carplay_timing.seq
@@ -45,6 +45,46 @@ echo 0 > "$SEQF"
 
 prev_ticks=0; prev_t=0; prev_zpid=; prev_rx=0; prev_rx_t=0; idle_n=0; prev_drops=-1
 prev_oticks=0; prev_ot=0; prev_opid=; prev_neigh=na; prev_sta_mhz=na; prev_ap=na; started=0
+prev_cticks=0; prev_ct=0; prev_cpid=
+# All output is numeric aggregates. Never retain socket addresses, input events, screen
+# contents or full process/codec dumps. Missing proc access is unavailable, not zero.
+pressure() {
+  awk '$1=="some" {for(i=2;i<=NF;i++) if($i ~ /^avg10=/) {split($i,a,"=");print a[2];exit}}' "/proc/pressure/$1" 2>/dev/null
+}
+diagnostic_context() {
+  mem=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
+  pcpu=$(pressure cpu); pio=$(pressure io); pmem=$(pressure memory)
+  clocks=$(cat /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq 2>/dev/null | awk '
+    /^[0-9]+$/ {if(n==0 || $1<lo)lo=$1;if($1>hi)hi=$1;n++}
+    END {if(n)printf "cpu_min_khz=%d cpu_max_khz=%d",lo,hi;else printf "cpu_min_khz=na cpu_max_khz=na"}')
+  rss=na; threads=na; queues="zlink_tcp_sockets=na zlink_rx_queue_bytes=na zlink_tx_queue_bytes=na"
+  if [ -n "$zpid" ]; then
+    rss=$(awk '/^VmRSS:/ {print $2}' /proc/$zpid/status 2>/dev/null)
+    threads=$(awk '/^Threads:/ {print $2}' /proc/$zpid/status 2>/dev/null)
+    uid=$(awk '/^Uid:/ {print $2}' /proc/$zpid/status 2>/dev/null)
+    # Linux tcp tables expose the owning UID in column 8, queue bytes as hex in column
+    # 5. Count the app UID only; other processes' sockets must not become ZLink evidence.
+    if [ -n "$uid" ] && [ -r /proc/net/tcp ] && [ -r /proc/net/tcp6 ]; then
+      queues=$(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk -v uid="$uid" '
+        function hex(s, v,i,c) {v=0;s=tolower(s);for(i=1;i<=length(s);i++){c=index("0123456789abcdef",substr(s,i,1))-1;if(c<0)return 0;v=v*16+c}return v}
+        $2=="local_address" {headers++;next}
+        $8==uid && $5 ~ /^[0-9A-Fa-f]+:[0-9A-Fa-f]+$/ {split($5,q,":");tx+=hex(q[1]);rx+=hex(q[2]);n++}
+        END {if(headers==2)printf "zlink_tcp_sockets=%d zlink_rx_queue_bytes=%.0f zlink_tx_queue_bytes=%.0f",n,rx,tx;else printf "zlink_tcp_sockets=na zlink_rx_queue_bytes=na zlink_tx_queue_bytes=na"}')
+    fi
+  fi
+  # Decoder service is shared by recording and playback: explicitly device-wide context.
+  cpid=$(pidof media.unisoc.codec2 2>/dev/null | cut -d' ' -f1); ccpu=na
+  if [ -n "$cpid" ] && [ -r /proc/$cpid/stat ]; then
+    cticks=$(sed 's/.*) //' /proc/$cpid/stat 2>/dev/null | awk '{print $12+$13}')
+    if [ "$prev_cpid" = "$cpid" ] && [ "$prev_ct" -gt 0 ] && [ -n "$cticks" ] && [ "$cticks" -ge "$prev_cticks" ]; then
+      cdt=$((now-prev_ct)); [ "$cdt" -gt 0 ] && ccpu=$(( (cticks-prev_cticks)/cdt ))
+    fi
+    prev_cticks=${cticks:-0}; prev_ct=$now; prev_cpid=$cpid
+  else
+    prev_cticks=0; prev_ct=0; prev_cpid=
+  fi
+  diag="schema=2 mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na}"
+}
 emit() {
   # SurfaceFlinger pipelines run their loop bodies in subshells.  Keep the counter in a
   # tiny file so every emission, including one from a pipeline, receives a unique ID.
@@ -57,7 +97,7 @@ emit() {
   log -p "$PRIO" -t "$TAG" "$message" 2>/dev/null
 }
 rotate_log() {
-  # Keep current + six older files, each capped before the next context pass.  Do not
+  # Keep current + eight older files, rotated before the next context pass. Do not
   # truncate an open file: rename lets the next append create a clean generation.
   [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null)" -ge $((LOG_KIB * 1024)) ] || return
   rm -f "$LOG.$LOG_ROTATIONS"
@@ -156,7 +196,11 @@ while :; do
   fi
   bt=$(settings get global bluetooth_on 2>/dev/null)
   zlink_proc=0; [ -n "$zpid" ] && zlink_proc=1
-  head="session=$SESSION acc=$acc phone=$phone neigh_count=$phone neigh=$neigh load=$load soc=$soc zlink_proc=$zlink_proc zlink_cpu=$zcpu rx_kbit=$kbit ap_drops=$drops obd_cpu=$ocpu bt=${bt:-na} sta=$sta ap=${ap:-na}"
+  diag="schema=2"
+  if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
+    diagnostic_context
+  fi
+  head="session=$SESSION acc=$acc phone=$phone neigh_count=$phone neigh=$neigh load=$load soc=$soc zlink_proc=$zlink_proc zlink_cpu=$zcpu rx_kbit=$kbit ap_drops=$drops obd_cpu=$ocpu bt=${bt:-na} sta=$sta ap=${ap:-na} $diag"
 
   [ "$started" -eq 0 ] && emit "$head | event=sampler_started" && started=1
   if [ "$prev_neigh" != na ] && [ "$phone" != "$prev_neigh" ]; then
@@ -168,7 +212,9 @@ while :; do
   fi
   prev_neigh=$phone; prev_sta_mhz=$sta_mhz; prev_ap=${ap:-na}
 
-  if [ "$phone" -gt 0 ]; then
+  if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
+    # Preserve pressure/queue evidence even when no display layer is available.
+    emit "$head | event=diagnostic_context"
     idle_n=0
     # One context reading, several surface readings under it -- see FRAME_INTERVAL.
     watched=0
@@ -193,7 +239,12 @@ while :; do
         seen=$(cat "$mark" 2>/dev/null)
         dumpsys SurfaceFlinger --latency "$L" </dev/null 2>/dev/null | awk -v layer="$id" -v kind="$kind" -v idx="$idx" -v seen="${seen:-0}" -v mark="$mark" '
           NR==1 { period=$1/1e6; next }
-          NF>=3 && $2>0 && $2<9e18 { p[n++]=$2 }
+          NF>=3 && $2>0 && $2<9e18 {
+            p[n++]=$2
+            # Column 3 is frame-ready; column 2 is actual presentation. This measures
+            # local ready-to-present delay, NOT phone-to-display or touch latency.
+            if ($3>0 && $3<9e18 && $2>=$3) ready[sprintf("%.0f",$2)]=($2-$3)/1e6
+          }
           END {
             if (n<3) { printf "layer=%s surface_kind=%s idx=%s frames=%d (idle)\n", layer, kind, idx, n; exit }
             # sort presented timestamps, then the intervals between them
@@ -210,8 +261,9 @@ while :; do
             # SurfaceFlinger timestamps restart after a reboot.  A persisted marker from
             # before that restart must not discard every initial frame of the new session.
             if (p[n-1] < seen+0) seen=0
-            m=0
+            m=0; rn=0
             for (i=1;i<n;i++) if (p[i] > seen+0) {
+              key=sprintf("%.0f",p[i]); if(key in ready) rdelay[rn++]=ready[key]
               d[m]=(p[i]-p[i-1])/1e6
               if (m==0) first=p[i-1]
               last=p[i]; m++
@@ -219,6 +271,9 @@ while :; do
             if (m<2) { printf "layer=%s surface_kind=%s idx=%s frames=%d new=0 (no new frames)\n", layer, kind, idx, n; exit }
             span=(last-first)/1e9
             for (i=0;i<m;i++) for (j=i+1;j<m;j++) if (d[j]<d[i]) { t=d[i]; d[i]=d[j]; d[j]=t }
+            for (i=0;i<rn;i++) for(j=i+1;j<rn;j++) if(rdelay[j]<rdelay[i]) {t=rdelay[i];rdelay[i]=rdelay[j];rdelay[j]=t}
+            rp95="na"; rmax="na"
+            if(rn>0) {ri=int(rn*0.95);if(ri<rn*0.95)ri++;rp95=sprintf("%.1f",rdelay[ri-1]);rmax=sprintf("%.1f",rdelay[rn-1])}
             med=d[int(m/2)]
             late=0; hitch=0
             # A late frame is one that missed its slot, and the slot is this surface`s own
@@ -238,8 +293,8 @@ while :; do
             # so it needs no panel constant and follows the link if its cadence changes.
             hthr=2*med
             for (i=0;i<m;i++) { if (d[i]>thr) late++; if (d[i]>=hthr) hitch++ }
-            printf "layer=%s surface_kind=%s idx=%s fps=%.1f med=%.1f p95=%.1f max=%.1f late=%d%% hitch=%d n=%d new=%d span=%.1f period=%.1f thr=%.1f\n",
-              layer, kind, idx, (span>0? m/span:0), med, d[int(m*0.95)-1<0?0:int(m*0.95)-1], d[m-1], 100*late/m, hitch, n, m, span, period, thr
+            printf "layer=%s surface_kind=%s idx=%s fps=%.1f med=%.1f p95=%.1f max=%.1f late=%d%% hitch=%d n=%d new=%d span=%.1f period=%.1f thr=%.1f ready_n=%d ready_p95=%s ready_max=%s\n",
+              layer, kind, idx, (span>0? m/span:0), med, d[int(m*0.95)-1<0?0:int(m*0.95)-1], d[m-1], 100*late/m, hitch, n, m, span, period, thr, rn, rp95, rmax
           }' | while read -r stat; do emit "$head | $stat"; done
       done
     fi

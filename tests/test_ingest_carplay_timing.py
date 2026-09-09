@@ -550,7 +550,7 @@ class TestTheScriptOnTheUnit:
         assert "rdt=$((now-prev_rx_t))" in script
         assert '[ "$rx" -ge "$prev_rx" ]' in script
         assert "prev_zpid" in script and "prev_opid" in script
-        assert "LOG_ROTATIONS=6" in script
+        assert "LOG_ROTATIONS=8" in script
         assert "tail -c" in carplay_timing.sampler_file_read_command()
         assert "done; exit 0" in carplay_timing.sampler_file_read_command()
         assert "prev_sta_mhz" in script

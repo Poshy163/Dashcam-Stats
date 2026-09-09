@@ -430,7 +430,28 @@ export interface UnitLogTag {
 }
 
 /** One reading of the CarPlay video surface, sampled on the unit. */
-export interface CarPlayTimingSample {
+export interface CarPlayDiagnosticContext {
+  diagnosticSchema?: number | null
+  memAvailableKib?: number | null
+  cpuPressureAvg10?: number | null
+  ioPressureAvg10?: number | null
+  memoryPressureAvg10?: number | null
+  cpuMinKhz?: number | null
+  cpuMaxKhz?: number | null
+  zlinkRssKib?: number | null
+  zlinkThreads?: number | null
+  zlinkTcpSockets?: number | null
+  zlinkRxQueueBytes?: number | null
+  zlinkTxQueueBytes?: number | null
+  /** Shared codec service, not exclusively CarPlay. */
+  decoderServiceCpuPct?: number | null
+  /** Local buffer-ready to presentation delay, not end-to-end latency. */
+  readyToPresentSamples?: number | null
+  readyToPresentP95Ms?: number | null
+  readyToPresentMaxMs?: number | null
+}
+
+export interface CarPlayTimingSample extends CarPlayDiagnosticContext {
   occurredAt: string
   sessionId?: string | null
   zlinkProcessPresent?: boolean | null
@@ -492,7 +513,7 @@ export interface CarPlayTimingMinute {
   apMhz: number | null
 }
 
-export interface CarPlayTimingEvent {
+export interface CarPlayTimingEvent extends CarPlayDiagnosticContext {
   occurredAt: string
   sessionId: string | null
   kind: string

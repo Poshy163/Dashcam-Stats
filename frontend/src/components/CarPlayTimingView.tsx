@@ -131,6 +131,9 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
     (!selectedPeriod || inTimingPeriod(s.occurredAt, s.sessionId, selectedPeriod)))
   const events = (data?.events ?? []).filter((e) => !selectedPeriod ||
     inTimingPeriod(e.occurredAt, e.sessionId, selectedPeriod))
+  const diagnosticRows = [...samples, ...events].filter((s) => s.diagnosticSchema === 2)
+  const displayWait = maxKnown(samples.map((s) => s.readyToPresentMaxMs ?? null))
+  const receiveQueue = maxKnown(diagnosticRows.map((s) => s.zlinkRxQueueBytes ?? null))
   const spans = samples.map((s) => s.spanS).filter((s): s is number => s != null && s >= 0)
   const sampledSeconds = spans.length ? spans.reduce((a, b) => a + b, 0) : null
 
@@ -204,6 +207,21 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
           {samples.length} samples · {minutes.length} observed minutes
         </span>
       </div>
+
+      {diagnosticRows.length > 0 && (
+        <div className="card p-4 text-sm">
+          <div className="font-medium">Video delay diagnostics</div>
+          <p className="mt-2 text-content-muted">
+            Longest wait from buffer ready to display: {displayWait == null ? 'unavailable' : `${displayWait.toFixed(0)} ms`}.
+            {' '}Largest unread ZLink TCP queue: {receiveQueue == null ? 'unavailable' : `${(receiveQueue / 1024).toFixed(1)} KiB`}.
+          </p>
+          <p className="mt-2 text-xs text-content-muted">
+            Captured on the head unit without home Wi-Fi and recovered when parked at home.
+            These are local display and socket measurements, not the full delay from a tap or the phone.
+            Unavailable means Android did not expose a measurement. CPU, memory and I/O context is retained in the diagnostic log.
+          </p>
+        </div>
+      )}
 
       {minutes.length === 0 ? (
         <EmptyState

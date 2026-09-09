@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
 import re
 import time
 from datetime import UTC, datetime
@@ -62,8 +63,8 @@ REMOTE_LOG = "/data/local/tmp/dashcam_carplay_timing.log"
 # useful transport when it is quiet, but a noisy tag can evict an entire drive before the
 # unit next reaches home.  Keeping several modest files bounds card use and lets the next
 # successful presence poll recover observations that logcat no longer contains.
-REMOTE_LOG_KIB = 512
-REMOTE_LOG_ROTATIONS = 6
+REMOTE_LOG_KIB = 1024
+REMOTE_LOG_ROTATIONS = 8
 MAX_RECOVERY_BYTES_PER_FILE = REMOTE_LOG_KIB * 1024
 MAX_RECOVERY_LINES = 20_000
 
@@ -209,7 +210,8 @@ def _number(value: str | None) -> float | None:
     if value is None or value == "na":
         return None
     try:
-        return float(value.rstrip("%"))
+        number = float(value.rstrip("%"))
+        return number if math.isfinite(number) else None
     except ValueError:
         return None
 
@@ -239,6 +241,29 @@ def _neighbour_states(value: str | None) -> dict[str, int] | None:
             return None
         states[state] = parsed
     return states or None
+
+
+def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
+    """Optional v2 context. Missing/denied measurements stay null on old and new logs."""
+    names = {
+        "diagnostic_schema": "schema",
+        "mem_available_kib": "mem_available_kib",
+        "cpu_pressure_avg10": "cpu_pressure",
+        "io_pressure_avg10": "io_pressure",
+        "memory_pressure_avg10": "memory_pressure",
+        "cpu_min_khz": "cpu_min_khz",
+        "cpu_max_khz": "cpu_max_khz",
+        "zlink_rss_kib": "zlink_rss_kib",
+        "zlink_threads": "zlink_threads",
+        "zlink_tcp_sockets": "zlink_tcp_sockets",
+        "zlink_rx_queue_bytes": "zlink_rx_queue_bytes",
+        "zlink_tx_queue_bytes": "zlink_tx_queue_bytes",
+        "decoder_service_cpu_pct": "decoder_cpu",
+        "ready_to_present_samples": "ready_n",
+        "ready_to_present_p95_ms": "ready_p95",
+        "ready_to_present_max_ms": "ready_max",
+    }
+    return {name: _number(fields.get(key)) for name, key in names.items()}
 
 
 def parse_sample(occurred_at: datetime, message: str) -> dict[str, Any] | None:
@@ -273,6 +298,7 @@ def parse_sample(occurred_at: datetime, message: str) -> dict[str, Any] | None:
     return {
         "occurred_at": occurred_at,
         "session_id": fields.get("session") or None,
+        **_diagnostics(fields),
         "acc_on": fields.get("acc") == "1",
         # Legacy name retained for existing clients.  It only means a wlan2 neighbour
         # was observed; it does not identify a phone or prove an active CarPlay session.
@@ -357,6 +383,11 @@ def parse_event(occurred_at: datetime, message: str) -> dict[str, Any] | None:
         "occurred_at": occurred_at,
         "session_id": fields.get("session") or None,
         "kind": kind,
+        **_diagnostics(fields),
+        "acc_on": None if fields.get("acc") not in ("0", "1") else fields["acc"] == "1",
+        "load": _number(fields.get("load")),
+        "soc_c": _number(fields.get("soc")),
+        "zlink_cpu_pct": _number(fields.get("zlink_cpu")),
         "hotspot_neighbour_count": _int_or_none(fields.get("neigh_count")),
         "hotspot_neighbour_states": _neighbour_states(fields.get("neigh")),
         "zlink_process_present": (
@@ -380,7 +411,9 @@ def parse_sampler_file(raw: str) -> list[ParsedLine]:
     from app.ingest.unit_logs import MAX_MESSAGE_CHARS, ParsedLine
 
     entries: list[ParsedLine] = []
-    for line in raw.splitlines():
+    # Rotations are concatenated oldest first. If the line budget is reached, preserve
+    # the latest drive rather than repeatedly importing only the oldest generations.
+    for line in raw.splitlines()[-MAX_RECOVERY_LINES:]:
         match = _FILE_LINE.match(line)
         if not match:
             continue
