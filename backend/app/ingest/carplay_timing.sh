@@ -46,6 +46,7 @@ echo 0 > "$SEQF"
 prev_ticks=0; prev_t=0; prev_zpid=; prev_rx=0; prev_rx_t=0; idle_n=0; prev_drops=-1
 prev_oticks=0; prev_ot=0; prev_opid=; prev_neigh=na; prev_sta_mhz=na; prev_ap=na; started=0
 prev_cticks=0; prev_ct=0; prev_cpid=
+slow_pid=; slow_last=0; last_active=0
 # All output is numeric aggregates. Never retain socket addresses, input events, screen
 # contents or full process/codec dumps. Missing proc access is unavailable, not zero.
 pressure() {
@@ -83,7 +84,86 @@ diagnostic_context() {
   else
     prev_cticks=0; prev_ct=0; prev_cpid=
   fi
-  diag="schema=2 mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na}"
+  diag="schema=3 mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na}"
+}
+# These parsers emit allowlisted aggregates only. Never persist raw dumps. Codec records
+# can be published after disconnect: the source local timestamp is NOT collection time.
+codec_summary() {
+  awk '
+    /\{codec, / && /\(com\.zjinnova\.zlink, / {
+      for(k in v)delete v[k]
+      n=split($0,parts,", ")
+      for(i=1;i<=n;i++) {
+        p=parts[i];sub(/^\(/,"",p);split(p,kv,"=")
+        if(index(kv[1],"android.media.mediacodec.")==1) {
+          key=kv[1];sub(/^android\.media\.mediacodec\./,"",key)
+          value=kv[2];sub(/[)}]+$/,"",value);v[key]=value
+        }
+      }
+      if(v["encoder"]!="0" || v["mime"]!~/^video\//)next
+      stamp=parts[2];gsub(/[()]/,"",stamp);gsub(/ /,"_",stamp)
+      if(stamp!~/^[0-9][0-9]-[0-9][0-9]_[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]+$/)next
+      out="event=codec_summary codec_reported_local=" stamp
+      count=split("latency.avg latency.max latency.min latency.n lifetimeMs low-latency.on low-latency.off",keys," ")
+      split("codec_latency_avg_us codec_latency_max_us codec_latency_min_us codec_latency_n codec_lifetime_ms codec_low_latency_on codec_low_latency_off",names," ")
+      for(i=1;i<=count;i++)out=out " " names[i] "=" (v[keys[i]]~/^[0-9]+$/ ? v[keys[i]] : "na")
+      print out
+    }'
+}
+graphics_summary() {
+  awk '
+    /^\*\* Graphics info for pid [0-9]+ \[com\.zjinnova\.zlink\] \*\*$/ {owner=1;next}
+    /^\*\* Graphics info/ {owner=0}
+    owner && /^Stats since: [0-9]+ns$/ {v["gfx_since_ns"]=$3;sub(/ns$/,"",v["gfx_since_ns"])}
+    owner && /^Total frames rendered: [0-9]+$/ {v["gfx_frames"]=$4}
+    owner && /^Janky frames: [0-9]+ / {v["gfx_janky"]=$3}
+    owner && /^95th percentile: [0-9]+ms$/ {v["gfx_p95_ms"]=$3;sub(/ms$/,"",v["gfx_p95_ms"])}
+    owner && /^Number High input latency: [0-9]+$/ {v["gfx_high_input_latency"]=$5}
+    owner && /^Number Slow UI thread: [0-9]+$/ {v["gfx_slow_ui_thread"]=$5}
+    END {
+      n=split("gfx_since_ns gfx_frames gfx_janky gfx_p95_ms gfx_high_input_latency gfx_slow_ui_thread",keys," ")
+      printf "event=graphics_summary"
+      for(i=1;i<=n;i++)printf " %s=%s",keys[i],(v[keys[i]]~/^[0-9]+$/ ? v[keys[i]] : "na")
+      print ""
+    }'
+}
+network_summary() {
+  awk '
+    $1=="Tcp:" || $1=="Udp:" {
+      proto=$1
+      if($2!~/^[0-9]+$/) {for(i=2;i<=NF;i++)header[proto,i]=$i;next}
+      for(i=2;i<=NF;i++)if($i~/^[0-9]+$/)v[proto header[proto,i]]=$i
+    }
+    END {
+      split("Tcp:RetransSegs Udp:RcvbufErrors Udp:SndbufErrors",keys," ")
+      split("device_tcp_retrans_segs device_udp_rcvbuf_errors device_udp_sndbuf_errors",names," ")
+      printf "event=network_summary"
+      for(i=1;i<=3;i++)printf " %s=%s",names[i],(v[keys[i]]~/^[0-9]+$/ ? v[keys[i]] : "na")
+      print ""
+    }'
+}
+slow_diagnostics() {
+  # Background subshell: independent IDs avoid racing the foreground pipeline counter.
+  # Only one worker per sampler; each Binder dump has a two-second service timeout.
+  capture=$(date +%s); slow_seq=0
+  cache=/data/local/tmp/.dashcam_cpt_codec_snapshot
+  fresh="$cache.$SESSION"
+  dumpsys -t 2 media.metrics 2>/dev/null | codec_summary | tail -8 > "$fresh"
+  while IFS= read -r row; do
+    grep -Fqx "$row" "$cache" 2>/dev/null || emit_slow "$row"
+  done < "$fresh"
+  # A failed/empty dump must not forget previous summaries and re-emit them next time.
+  if [ -s "$fresh" ]; then mv "$fresh" "$cache"; else rm -f "$fresh"; fi
+  row=$(dumpsys -t 2 gfxinfo com.zjinnova.zlink 2>/dev/null | graphics_summary)
+  emit_slow "$row"
+  row=$(network_summary < /proc/net/snmp 2>/dev/null)
+  emit_slow "$row"
+}
+emit_slow() {
+  slow_seq=$((slow_seq+1))
+  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=3 | $1"
+  printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$message" >> "$LOG"
+  log -p "$PRIO" -t "$TAG" "$message" 2>/dev/null
 }
 emit() {
   # SurfaceFlinger pipelines run their loop bodies in subshells.  Keep the counter in a
@@ -201,6 +281,16 @@ while :; do
     diagnostic_context
   fi
   head="session=$SESSION acc=$acc phone=$phone neigh_count=$phone neigh=$neigh load=$load soc=$soc zlink_proc=$zlink_proc zlink_cpu=$zcpu rx_kbit=$kbit ap_drops=$drops obd_cpu=$ocpu bt=${bt:-na} sta=$sta ap=${ap:-na} $diag"
+
+  [ "$acc" = 1 ] || [ "$phone" -gt 0 ] && last_active=$now
+  # First pass recovers retained summaries, then once/minute during activity and for
+  # two minutes afterwards so decoder teardown records survive an offline departure.
+  if { [ "$slow_last" -eq 0 ] || [ $((now-last_active)) -le 120 ]; } && [ $((now-slow_last)) -ge 60 ]; then
+    if [ -z "$slow_pid" ] || ! kill -0 "$slow_pid" 2>/dev/null; then
+      slow_diagnostics &
+      slow_pid=$!; slow_last=$now
+    fi
+  fi
 
   [ "$started" -eq 0 ] && emit "$head | event=sampler_started" && started=1
   if [ "$prev_neigh" != na ] && [ "$phone" != "$prev_neigh" ]; then

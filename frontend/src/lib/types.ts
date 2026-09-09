@@ -449,6 +449,24 @@ export interface CarPlayDiagnosticContext {
   readyToPresentSamples?: number | null
   readyToPresentP95Ms?: number | null
   readyToPresentMaxMs?: number | null
+  /** Device-local report time without year/zone; may predate collection. */
+  codecReportedLocal?: string | null
+  codecLatencyAvgUs?: number | null
+  codecLatencyMaxUs?: number | null
+  codecLatencyMinUs?: number | null
+  codecLatencyN?: number | null
+  codecLifetimeMs?: number | null
+  codecLowLatencyOn?: number | null
+  codecLowLatencyOff?: number | null
+  gfxSinceNs?: number | null
+  gfxFrames?: number | null
+  gfxJanky?: number | null
+  gfxP95Ms?: number | null
+  gfxHighInputLatency?: number | null
+  gfxSlowUiThread?: number | null
+  deviceTcpRetransSegs?: number | null
+  deviceUdpRcvbufErrors?: number | null
+  deviceUdpSndbufErrors?: number | null
 }
 
 export interface CarPlayTimingSample extends CarPlayDiagnosticContext {

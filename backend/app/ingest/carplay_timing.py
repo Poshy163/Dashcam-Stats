@@ -244,7 +244,7 @@ def _neighbour_states(value: str | None) -> dict[str, int] | None:
 
 
 def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
-    """Optional v2 context. Missing/denied measurements stay null on old and new logs."""
+    """Optional context. Missing/denied measurements stay null on old and new logs."""
     names = {
         "diagnostic_schema": "schema",
         "mem_available_kib": "mem_available_kib",
@@ -263,7 +263,31 @@ def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
         "ready_to_present_p95_ms": "ready_p95",
         "ready_to_present_max_ms": "ready_max",
     }
-    return {name: _number(fields.get(key)) for name, key in names.items()}
+    for name in (
+        "codec_latency_avg_us",
+        "codec_latency_max_us",
+        "codec_latency_min_us",
+        "codec_latency_n",
+        "codec_lifetime_ms",
+        "codec_low_latency_on",
+        "codec_low_latency_off",
+        "gfx_since_ns",
+        "gfx_frames",
+        "gfx_janky",
+        "gfx_p95_ms",
+        "gfx_high_input_latency",
+        "gfx_slow_ui_thread",
+        "device_tcp_retrans_segs",
+        "device_udp_rcvbuf_errors",
+        "device_udp_sndbuf_errors",
+    ):
+        names[name] = name
+    result = {name: _number(fields.get(key)) for name, key in names.items()}
+    reported = fields.get("codec_reported_local", "")
+    result["codec_reported_local"] = (
+        reported if re.fullmatch(r"\d{2}-\d{2}_\d{2}:\d{2}:\d{2}\.\d{1,9}", reported) else None
+    )
+    return result
 
 
 def parse_sample(occurred_at: datetime, message: str) -> dict[str, Any] | None:

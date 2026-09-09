@@ -174,6 +174,102 @@ def test_full_sampler_pass_without_network_or_surface(tmp_path):
     events = [carplay_timing.parse_event(e.occurred_at, e.message) for e in entries]
     context = next(e for e in events if e and e["kind"] == "diagnostic_context")
     assert context["hotspot_neighbour_count"] == 0
-    assert context["diagnostic_schema"] == 2
+    assert context["diagnostic_schema"] == 3
     assert context["zlink_tcp_sockets"] is None
     assert any(e and e["kind"] == "surface_unavailable" for e in events)
+
+
+def diagnostic_awk(name, source):
+    match = re.search(rf"{name}\(\) \{{\n  awk '(.*?)'\n\}}", carplay_timing.script(), re.S)
+    assert match
+    return run_awk(match[1], source)
+
+
+def codec_record(owner="com.zjinnova.zlink", encoder="0", mime="video/avc", avg="156056"):
+    properties = {
+        "encoder": encoder,
+        "mime": mime,
+        "latency.avg": avg,
+        "latency.max": "640748",
+        "latency.min": "14008",
+        "latency.n": "25262",
+        "lifetimeMs": "859413",
+        "low-latency.on": "0",
+        "low-latency.off": "0",
+        "private": "SECRET",
+    }
+    body = ", ".join(f"android.media.mediacodec.{k}={v}" for k, v in properties.items())
+    return f"  123: {{codec, (09-09 10:53:13.378), ({owner}, 0, 10077), ({body})}}\n"
+
+
+def test_codec_summary_uses_only_zlink_video_decoder_and_preserves_source_time():
+    raw = (
+        codec_record()
+        + codec_record(owner="camera.recorder")
+        + codec_record(encoder="1")
+        + codec_record(mime="audio/aac")
+        + codec_record(owner="com.zjinnova.zlink.fake")
+    )
+    result = diagnostic_awk("codec_summary", raw)
+    assert len(result.splitlines()) == 1
+    assert "SECRET" not in result and "10077" not in result
+    event = carplay_timing.parse_event(datetime.now(UTC), "schema=3 | " + result.strip())
+    assert event["codec_reported_local"] == "09-09_10:53:13.378"
+    assert event["codec_latency_avg_us"] == 156056
+    assert event["codec_latency_max_us"] == 640748
+    assert event["codec_latency_n"] == 25262
+    assert event["codec_lifetime_ms"] == 859413
+    assert event["codec_low_latency_on"] == 0
+    assert event["gfx_frames"] is None
+
+
+def test_codec_missing_or_nonnumeric_metrics_do_not_become_zero_or_private_text():
+    result = diagnostic_awk("codec_summary", codec_record(avg="SECRET"))
+    assert "codec_latency_avg_us=na" in result and "SECRET" not in result
+    assert diagnostic_awk("codec_summary", "Permission Denial\n") == ""
+    assert (
+        carplay_timing.parse_event(datetime.now(UTC), "schema=3 | event=codec_summary")[
+            "codec_latency_avg_us"
+        ]
+        is None
+    )
+
+
+def test_gfx_summary_preserves_reset_epoch_and_excludes_other_apps_and_view_titles():
+    result = diagnostic_awk(
+        "graphics_summary",
+        """** Graphics info for pid 42 [com.zjinnova.zlink] **
+Stats since: 35373206938382ns
+Total frames rendered: 69154
+Janky frames: 1170 (1.69%)
+95th percentile: 21ms
+Number High input latency: 14394
+Number Slow UI thread: 588
+View title SECRET
+** Graphics info for pid 99 [other.app] **
+Total frames rendered: 999999
+""",
+    )
+    event = carplay_timing.parse_event(datetime.now(UTC), "schema=3 | " + result.strip())
+    assert event["gfx_frames"] == 69154
+    assert event["gfx_since_ns"] == 35373206938382
+    assert event["gfx_p95_ms"] == 21
+    assert event["gfx_high_input_latency"] == 14394
+    assert "SECRET" not in result and "999999" not in result
+    assert "gfx_frames=na" in diagnostic_awk("graphics_summary", "Permission Denial\n")
+
+
+def test_device_network_counters_follow_headers_and_missing_is_unavailable():
+    result = diagnostic_awk(
+        "network_summary",
+        """Tcp: OutSegs RetransSegs InSegs
+Tcp: 200 7 100
+Udp: SndbufErrors RcvbufErrors
+Udp: 0 3
+""",
+    )
+    assert result.strip() == (
+        "event=network_summary device_tcp_retrans_segs=7 "
+        "device_udp_rcvbuf_errors=3 device_udp_sndbuf_errors=0"
+    )
+    assert "device_tcp_retrans_segs=na" in diagnostic_awk("network_summary", "")

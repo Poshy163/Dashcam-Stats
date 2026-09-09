@@ -1,6 +1,6 @@
 # Offline CarPlay delay diagnostics
 
-Sampler schema 2 adds evidence for video that is delayed even when frame presentation is
+Sampler schema 3 adds evidence for video that is delayed even when frame presentation is
 regular. It runs on the head unit, independently of server connectivity. The server deploys
 the script when the unit is reachable; it must reach the unit at least once after an update.
 An offline cold reboot cannot start a detached shell that was not restored by the platform.
@@ -37,3 +37,42 @@ The CarPlay timing page shows the local display wait and unread TCP queue for th
 period. Detailed measurements are available in `/api/unit-logs/carplay-timing` samples and
 events, and under the CarPlayTiming tag in unit logs. Merely seeing schema 2 does not prove
 that every Android measurement is available; inspect the individual fields.
+
+## Decoder and Android UI reports (schema 3)
+
+An independent worker runs at most once per minute while ignition is on or a hotspot
+neighbour is present, and for two minutes afterwards. It also runs once at sampler startup
+to recover retained reports. Each Binder dump uses a two-second timeout; the worker never
+blocks the four-second surface loop. It collects:
+
+- `media.metrics` video **decoder** records whose owner is exactly `com.zjinnova.zlink`.
+  Camera encoders, other apps and audio codecs are excluded. Average/minimum/maximum
+  latency (microseconds), buffer count, session lifetime and low-latency toggle counts
+  survive as `codec_summary` events. Only the newest eight sanitized reports are retained
+  in a small deduplication snapshot; unchanged reports are not logged repeatedly.
+- `gfxinfo com.zjinnova.zlink` renderer epoch, frame/jank totals, p95 render time and
+  high-input-latency/slow-UI-thread counts as `graphics_summary` events. These are Android
+  renderer statistics, not measurements of a touch reaching the iPhone. Totals reset with
+  the renderer; compare the epoch before calculating deltas. The collector never resets them.
+- `/proc/net/snmp` cumulative TCP retransmitted segments and UDP receive/send buffer
+  errors as `network_summary` events. These are **device-wide**, not ZLink-specific or
+  wireless retry counters. Counters can reset at reboot; do not subtract across resets.
+
+Android can publish a decoder summary only after its session closes. `occurred_at` is
+collection time; `codec_reported_local` preserves the device's month-day/time with no
+invented year or zone. The UI lists reports separately from the selected capture period
+to avoid assigning an old session to a new drive. Historical records available at update
+are recovered, but records Android has already discarded cannot be reconstructed.
+
+[AOSP MediaCodec](https://android.googlesource.com/platform/frameworks/av/+/refs/heads/android12-release/media/libstagefright/MediaCodec.cpp)
+defines the latency units as microseconds and measures from sending a buffer to receiving
+its corresponding output. This includes codec buffering and is neither pure decode
+computation time nor end-to-end CarPlay latency. Low-latency on/off fields count requests;
+zero does not prove a hardware mode is disabled or can be forced. Session maxima do not
+provide the frame's time and may include startup/teardown, so compare repeated evidence
+and reported symptoms before inferring a cause.
+
+All three event types use the same bounded offline file, log transport and API as schema 2.
+Raw dumps, app UID, window titles, addresses and media metadata are never retained. Removing
+the sampler's files should also remove `.dashcam_cpt_codec_snapshot` and any interrupted
+`.dashcam_cpt_codec_snapshot.*` temporary file.

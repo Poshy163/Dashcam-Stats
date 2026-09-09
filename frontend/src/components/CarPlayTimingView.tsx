@@ -131,7 +131,12 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
     (!selectedPeriod || inTimingPeriod(s.occurredAt, s.sessionId, selectedPeriod)))
   const events = (data?.events ?? []).filter((e) => !selectedPeriod ||
     inTimingPeriod(e.occurredAt, e.sessionId, selectedPeriod))
-  const diagnosticRows = [...samples, ...events].filter((s) => s.diagnosticSchema === 2)
+  const diagnosticRows = [...samples, ...events].filter((s) => (s.diagnosticSchema ?? 0) >= 2)
+  // Codec session summaries can arrive after disconnection. Do not assign them to the
+  // selected drive using collection time; show source report time in a separate list.
+  const codecSummaries = [...new Map((data?.events ?? [])
+    .filter((e) => e.kind === 'codec_summary' && e.codecReportedLocal)
+    .map((e) => [`${e.codecReportedLocal}:${e.codecLifetimeMs}:${e.codecLatencyN}`, e])).values()]
   const displayWait = maxKnown(samples.map((s) => s.readyToPresentMaxMs ?? null))
   const receiveQueue = maxKnown(diagnosticRows.map((s) => s.zlinkRxQueueBytes ?? null))
   const spans = samples.map((s) => s.spanS).filter((s): s is number => s != null && s >= 0)
@@ -316,6 +321,29 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
             </table>
           </div>
         </>
+      )}
+      {codecSummaries.length > 0 && (
+        <div className="card p-4 text-sm">
+          <div className="font-medium">ZLink decoder session reports</div>
+          <p className="mt-1 text-xs text-content-muted">
+            Reports recovered within the selected time window, across all capture periods.
+            Android may publish these after disconnect. Source times are head-unit local
+            month-day and time. Delay measures codec input to output, not touch-to-screen latency.
+          </p>
+          <div className="mt-3 overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead><tr><th>Source report</th><th>Average</th><th>Maximum</th><th>Buffers</th></tr></thead>
+              <tbody>{codecSummaries.slice(-12).reverse().map((e, i) => (
+                <tr key={`${e.codecReportedLocal}:${i}`}>
+                  <td className="py-2">{e.codecReportedLocal?.replace('_', ' ')}</td>
+                  <td>{e.codecLatencyAvgUs == null ? 'Unavailable' : `${(e.codecLatencyAvgUs / 1000).toFixed(1)} ms`}</td>
+                  <td>{e.codecLatencyMaxUs == null ? 'Unavailable' : `${(e.codecLatencyMaxUs / 1000).toFixed(1)} ms`}</td>
+                  <td>{e.codecLatencyN ?? 'Unavailable'}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        </div>
       )}
       <div className="card p-4 text-sm">
         <div className="font-medium">Capture events</div>
