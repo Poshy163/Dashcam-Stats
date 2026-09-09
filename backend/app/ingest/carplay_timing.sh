@@ -90,7 +90,7 @@ diagnostic_context() {
 # can be published after disconnect: the source local timestamp is NOT collection time.
 codec_summary() {
   awk '
-    /\{codec, / && /\(com\.zjinnova\.zlink, / {
+    /^[ \t]*[0-9]+: \{codec, \([^)]*\), \(com\.zjinnova\.zlink, / {
       for(k in v)delete v[k]
       n=split($0,parts,", ")
       for(i=1;i<=n;i++) {
@@ -276,7 +276,7 @@ while :; do
   fi
   bt=$(settings get global bluetooth_on 2>/dev/null)
   zlink_proc=0; [ -n "$zpid" ] && zlink_proc=1
-  diag="schema=2"
+  diag="schema=3"
   if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
     diagnostic_context
   fi

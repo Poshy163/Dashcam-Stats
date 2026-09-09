@@ -127,7 +127,8 @@ def test_recovery_line_cap_keeps_latest_drive(monkeypatch):
     assert "sample=s-3" in entries[1].message
 
 
-def test_full_sampler_pass_without_network_or_surface(tmp_path):
+@pytest.mark.parametrize("acc", [0, 1])
+def test_full_sampler_pass_without_network_or_surface(tmp_path, acc):
     """Execute one actual shell pass: missing neighbours must not suppress diagnostics."""
     bash = r"C:\Program Files\Git\bin\bash.exe" if os.name == "nt" else shutil.which("bash")
     if not bash:
@@ -135,7 +136,7 @@ def test_full_sampler_pass_without_network_or_surface(tmp_path):
     if not Path(bash).exists():
         pytest.skip("Bash is unavailable")
     commands = {
-        "settings": 'case "$*" in *acc_status*) echo 1;; *bluetooth_on*) echo 1;; esac',
+        "settings": f'case "$*" in *acc_status*) echo {acc};; *bluetooth_on*) echo 1;; esac',
         "pidof": 'case "$1" in com.zjinnova.zlink) echo 9999999;; esac',
         "ip": "exit 0",
         "cmd": "exit 0",
@@ -172,11 +173,12 @@ def test_full_sampler_pass_without_network_or_surface(tmp_path):
     raw = (tmp_path / "dashcam_carplay_timing.log").read_text()
     entries = carplay_timing.parse_sampler_file(raw)
     events = [carplay_timing.parse_event(e.occurred_at, e.message) for e in entries]
-    context = next(e for e in events if e and e["kind"] == "diagnostic_context")
+    kind = "diagnostic_context" if acc else "sampler_started"
+    context = next(e for e in events if e and e["kind"] == kind)
     assert context["hotspot_neighbour_count"] == 0
     assert context["diagnostic_schema"] == 3
     assert context["zlink_tcp_sockets"] is None
-    assert any(e and e["kind"] == "surface_unavailable" for e in events)
+    assert any(e and e["kind"] == "surface_unavailable" for e in events) == bool(acc)
 
 
 def diagnostic_awk(name, source):
