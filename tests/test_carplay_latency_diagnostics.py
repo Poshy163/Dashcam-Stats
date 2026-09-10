@@ -176,9 +176,9 @@ def test_full_sampler_pass_without_network_or_surface(tmp_path, acc):
     kind = "diagnostic_context" if acc else "sampler_started"
     context = next(e for e in events if e and e["kind"] == kind)
     assert context["hotspot_neighbour_count"] == 0
-    assert context["diagnostic_schema"] == 3
+    assert context["diagnostic_schema"] == 4
     assert context["zlink_tcp_sockets"] is None
-    assert any(e and e["kind"] == "surface_unavailable" for e in events) == bool(acc)
+    # Frame sampling runs independently; its execution is tested separately below.
 
 
 def diagnostic_awk(name, source):
@@ -275,3 +275,94 @@ Udp: 0 3
         "device_udp_rcvbuf_errors=3 device_udp_sndbuf_errors=0"
     )
     assert "device_tcp_retrans_segs=na" in diagnostic_awk("network_summary", "")
+
+
+def test_tcp_info_is_scoped_to_established_zlink_sockets_and_redacts_endpoints():
+    program = re.search(r"awk -v uid=\"\$\{uid:-na\}\" '(.*?)'", carplay_timing.script(), re.S)[1]
+    source = """State Recv-Q Send-Q Local Address:Port Peer Address:Port
+ESTAB 0 0 PRIVATE:1 PEER:2 uid:10077 ino:SECRET
+ rtt:12.5/1.2 rto:240 retrans:1/8
+ESTAB 0 0 PRIVATE:3 PEER:4 uid:10077
+ rtt:24.0/2.0 rto:260 retrans:2/3
+ESTAB 0 0 OTHER:5 PEER:6 uid:100770
+ rtt:9999.0/1.0 rto:9999 retrans:9/99
+FIN-WAIT-1 0 0 CLOSED:7 PEER:8 uid:10077
+ rtt:8000.0/1.0 rto:9999 retrans:9/99
+"""
+    result = run_awk(program, source, uid=10077)
+    assert result == (
+        "zlink_tcp_info_sockets=2 zlink_tcp_rtt_max_ms=24 zlink_tcp_rto_max_ms=260 "
+        "zlink_tcp_retrans_pending=3 zlink_tcp_retrans_total=11"
+    )
+    assert "zlink_tcp_info_sockets=na" in run_awk(program, "", uid=10077)
+    empty = run_awk(program, "State Recv-Q Send-Q\n", uid=10077)
+    assert "zlink_tcp_info_sockets=0" in empty and "zlink_tcp_rtt_max_ms=na" in empty
+
+
+def test_surface_queue_requires_exact_package_buffer_layer():
+    source = """+ Layer (com.zjinnova.zlink/example.Main#42) uid=10077
+ activeBuffer=PRIVATE queued-frames=3 metadata={SECRET}
++ Layer (hash com.zjinnova.zlink/example.Main#43) uid=10077
+ queued-frames=99
++ Layer (camera/example.Main#44) uid=1000
+ queued-frames=100
+"""
+    assert diagnostic_awk("surface_queue_summary", source) == (
+        "zlink_queued_layers=1 zlink_queued_frames_max=3"
+    )
+    assert "zlink_queued_frames_max=na" in diagnostic_awk("surface_queue_summary", "")
+
+
+def test_deadline_subtracts_work_and_skips_overruns_without_catchup_burst():
+    program = re.search(r"awk -v deadline=.*?\'(.*?)\'", carplay_timing.script(), re.S)[1]
+    assert run_awk(program, "", deadline=1000, current=1400, step=3000) == "4000 2.600"
+    assert run_awk(program, "", deadline=4000, current=7800, step=3000) == "10000 2.200"
+
+
+def test_ring_without_overlap_reports_unobserved_interval():
+    stats = surface_stats(
+        [f"0 {10_000_000_000 + i * 33_333_333} 0" for i in range(4)], seen=9_000_000_000
+    )
+    assert "ring_overlap=0 ring_gap_ms=1000.0" in stats
+    parsed = carplay_timing.parse_sample(datetime.now(UTC), "schema=4 | " + stats.strip())
+    assert parsed["ring_overlap"] == 0
+    assert parsed["ring_gap_ms"] == 1000
+
+
+def test_frame_worker_uses_cached_context_and_records_actual_poll_gaps(tmp_path):
+    bash = r"C:\Program Files\Git\bin\bash.exe" if os.name == "nt" else shutil.which("bash")
+    if not bash or not Path(bash).exists():
+        pytest.skip("Bash is unavailable")
+    source = carplay_timing.script()
+    worker = source[source.index("frame_loop() {") : source.index("\nwhile :; do\n  rotate_log")]
+    worker = worker.replace("while :; do", "for iteration in 1 2 3; do")
+    delay = source[source.index("deadline_delay() {") : source.index("\ncleanup() {")]
+    program = (
+        r"""
+SESSION=fixture
+FRAME_CONTEXT=context
+FRAME_SEQ=frames.seq
+FRAME_INTERVAL=3
+printf '1\n1000\nsession=fixture schema=4\n' > "$FRAME_CONTEXT"
+echo 0 > clock.seq
+clock_ms() {
+  n=$(cat clock.seq); n=$((n+1)); echo "$n" > clock.seq
+  case "$n" in 1|2|3) echo 1000;; 4) echo 1400;; 5) echo 4000;; 6) echo 4700;; 7) echo 10500;; 8) echo 10600;; esac
+}
+sleep() { printf '%s\n' "$1" >> waits; }
+sample_surfaces() { printf '%s\n' "$head" >> samples; }
+"""
+        + delay
+        + "\n"
+        + worker
+        + "\nframe_loop\n"
+    )
+    script = tmp_path / "worker.sh"
+    script.write_text(program, encoding="utf-8", newline="\n")
+    subprocess.run([bash, str(script)], cwd=tmp_path, check=True, capture_output=True, timeout=5)
+    assert (tmp_path / "waits").read_text().splitlines() == ["2.600", "2.300", "2.400"]
+    rows = (tmp_path / "samples").read_text().splitlines()
+    assert "frame_poll_gap_ms=na" in rows[0]
+    assert "frame_poll_gap_ms=3000" in rows[1]
+    assert "frame_poll_gap_ms=6500" in rows[2]
+    assert "context_age_ms=9500" in rows[2]

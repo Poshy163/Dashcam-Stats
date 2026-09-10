@@ -1,12 +1,12 @@
 # Offline CarPlay delay diagnostics
 
-Sampler schema 3 adds evidence for video that is delayed even when frame presentation is
+Sampler schema 4 adds evidence for video that is delayed even when frame presentation is
 regular. It runs on the head unit, independently of server connectivity. The server deploys
 the script when the unit is reachable; it must reach the unit at least once after an update.
 An offline cold reboot cannot start a detached shell that was not restored by the platform.
 The script continues across ordinary sleep/resume when Android preserves the process.
 
-The existing four-second presentation cadence is unchanged. On the slower context cadence
+Presentation uses independent three-second deadlines. On the slower context cadence
 (15 seconds by default), it additionally reads:
 
 - ZLink UID TCP receive/send queue bytes and socket count, when proc access is permitted.
@@ -76,3 +76,48 @@ All three event types use the same bounded offline file, log transport and API a
 Raw dumps, app UID, window titles, addresses and media metadata are never retained. Removing
 the sampler's files should also remove `.dashcam_cpt_codec_snapshot` and any interrupted
 `.dashcam_cpt_codec_snapshot.*` temporary file.
+
+## Video buffering and sampling coverage (schema 4)
+
+The frame worker reads a small, atomically replaced context file. It schedules against
+elapsed uptime, subtracts execution time from the next sleep, and skips missed deadlines
+after an overrun instead of sending a burst of catch-up queries. Slow context reads no
+longer run between frame reads. Frame queries have a one-second service timeout. Re-arming
+terminates the previous worker; separate observation IDs/counters prevent races between
+frame, context and summary emissions.
+
+- `frame_poll_gap_ms` records actual starts of active polling passes, not the configured
+  interval. `context_age_ms` makes the age of reused context explicit.
+- `ring_overlap=0` means the oldest retained frame is newer than the last observed frame.
+  `ring_gap_ms` measures that separation. It flags unobserved history, not a proven
+  visible stall or exact dropped-frame count. Initial/reboot baselines are unavailable.
+- `surface_unchanged_ms` is elapsed time since polling last observed a newer presentation
+  timestamp. Static/hidden windows can legitimately stay unchanged. It is **not** the
+  age of an iPhone-generated frame.
+- A full SurfaceFlinger dump is filtered in memory on the context cadence for exact
+  ZLink package buffer layers. Only matching layer count and maximum `queued-frames`
+  are retained; anonymous camera buffers/window containers are excluded. No matching
+  layer is unavailable, distinct from a matching layer with zero queued buffers.
+- `ss -tine`, bounded to two seconds, contributes maximum RTT/RTO and retransmission
+  statistics from established sockets with exactly the app UID. No endpoints, socket
+  identifiers or raw dumps are logged. These sockets can include control/loopback traffic
+  and are not identified as the CarPlay video channel. Zero matching sockets produces
+  count zero and unavailable RTT. Lifetime retransmission totals are summed over the
+  currently observed sockets and can decrease when sockets close; do not treat them as
+  monotonic app counters. Omitted TCP_INFO fields remain unavailable.
+- ZLink main-thread CPU runtime/runqueue wait nanoseconds and process-start ticks are
+  retained. Compare deltas only within the same process lifetime. Runqueue wait means
+  waiting to be scheduled, not blocking on I/O, and excludes other ZLink/decoder threads.
+
+Field definitions: [ss TCP diagnostics](https://www.man7.org/linux/man-pages/man8/ss.8.html)
+and [Linux scheduler statistics](https://www.kernel.org/doc/html/v6.12/scheduler/sched-stats.html).
+
+Retained file recovery now also runs during a footage transfer when ignition is known off,
+with the existing five-minute throttle and byte/time limits. This path does not restart
+the sampler or reconnect the transport. Ignition-on/unknown still blocks recovery.
+
+Schema 4 cannot reconstruct these fields for older drives, prove continuous coverage under
+all loads/frame rates, or determine when the iPhone rendered a frame. Frame-worker context
+and sequence files use `.dashcam_cpt_context_*` / `.dashcam_cpt_frame_seq_*`; normal exit
+cleans them up. Per-layer `.fresh` markers accompany the existing `.dashcam_cpt_seen_*`
+markers and contain only elapsed timestamps.

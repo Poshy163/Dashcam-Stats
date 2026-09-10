@@ -23,13 +23,13 @@ statement about severity: the unit-log collector (:mod:`app.ingest.unit_logs`) k
 the database with everything else, and :func:`parse_sample` turns them back into numbers
 for the API and the Logs page. No new transport, no new table.
 
-**What it costs.** The expensive reads -- ``dumpsys wifi``, the thermal zones, the CPU
-counters -- stay on the fifteen-second cadence, because load and temperature do not move
-faster than that. Only the two cheap SurfaceFlinger calls run every four seconds, which is
-what it takes to see every frame: the ring holds 127 of them, about 5.3 seconds, so the
-original single read per interval observed roughly a third of the drive and missed the
-rest. Nothing at all runs while no WLAN2 neighbour is present beyond a heartbeat a minute. It never
-changes a setting, a radio or a process.
+**What it costs.** Resource, radio and transport context stays on the slower cadence.
+An independent shell worker reads the bounded SurfaceFlinger ring on three-second
+deadlines, subtracting execution time instead of adding a sleep after it. It reports
+actual polling gaps, context age and missing ring overlap. Decoder/UI session summaries
+remain on a slower background worker. These measurements never establish phone-side
+frame creation time or end-to-end visual latency.
+
 """
 
 from __future__ import annotations
@@ -76,15 +76,9 @@ INTERVAL_KEY = "ingest.carplay_timing_interval_s"
 DEFAULT_INTERVAL_S = 15
 MIN_INTERVAL_S = 5
 
-#: How often the video surfaces are read, as against the context around them.
-#:
-#: Not a preference, so not a setting: it is derived from the ring SurfaceFlinger keeps,
-#: which is 127 frames -- 5.3 s at the 24 fps this link runs at, 4.5 s at 28. Reading it
-#: once per ``INTERVAL_KEY`` observed about a third of the drive; at four seconds the
-#: windows overlap instead of leaving gaps, and the sampler removes the overlap so nothing
-#: is counted twice. Raising it past 4 reopens the gap; lowering it buys nothing, because
-#: the frames are already all seen.
-FRAME_INTERVAL_S = 4
+#: Target cadence for the independent frame worker. Deadline scheduling avoids drift;
+#: explicit overlap/gap fields expose incomplete coverage instead of assuming it away.
+FRAME_INTERVAL_S = 3
 MAX_INTERVAL_S = 120
 
 ARM_TIMEOUT_S = 20.0
@@ -158,6 +152,21 @@ def on_unit_present(address: str) -> None:
     """Arm cheaply whenever present; recover retained diagnostics only when parked."""
     if not _enabled():
         return
+    recover_on_unit_present(address)
+    now = time.monotonic()
+    last = _last_armed.get(address)
+    if last is not None and now - last < ARM_DEBOUNCE_S:
+        return
+    _last_armed[address] = now
+    task = asyncio.create_task(arm(address), name="ingest-carplay-timing")
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+def recover_on_unit_present(address: str) -> None:
+    """Recover parked evidence even during a long backup, without restarting capture."""
+    if not _enabled():
+        return
     now = time.monotonic()
     # File recovery can read several MiB.  The sampler is also armed at departure, where
     # this work would delay the first observation and compete with the reported lag.  The
@@ -172,13 +181,6 @@ def on_unit_present(address: str) -> None:
             )
             _tasks.add(task)
             task.add_done_callback(_tasks.discard)
-    last = _last_armed.get(address)
-    if last is not None and now - last < ARM_DEBOUNCE_S:
-        return
-    _last_armed[address] = now
-    task = asyncio.create_task(arm(address), name="ingest-carplay-timing")
-    _tasks.add(task)
-    task.add_done_callback(_tasks.discard)
 
 
 async def shutdown() -> None:
@@ -280,6 +282,21 @@ def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
         "device_tcp_retrans_segs",
         "device_udp_rcvbuf_errors",
         "device_udp_sndbuf_errors",
+        "zlink_tcp_info_sockets",
+        "zlink_tcp_rtt_max_ms",
+        "zlink_tcp_rto_max_ms",
+        "zlink_tcp_retrans_pending",
+        "zlink_tcp_retrans_total",
+        "zlink_queued_layers",
+        "zlink_queued_frames_max",
+        "zlink_main_runtime_ns",
+        "zlink_main_wait_ns",
+        "zlink_start_ticks",
+        "context_age_ms",
+        "frame_poll_gap_ms",
+        "ring_overlap",
+        "ring_gap_ms",
+        "surface_unchanged_ms",
     ):
         names[name] = name
     result = {name: _number(fields.get(key)) for name, key in names.items()}

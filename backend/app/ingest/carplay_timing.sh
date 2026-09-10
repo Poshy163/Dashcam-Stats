@@ -11,17 +11,11 @@
 # CarPlayTiming, so the unit-log collector ships it home on the next visit.
 INTERVAL="${1:-15}"
 PRIO="${2:-w}"
-# How often the video surfaces themselves are read, as against the context around them.
-#
-# SurfaceFlinger keeps a ring of 127 frames per layer, which at 24 presentations per second
-# is about 5.3 seconds. Reading it once every INTERVAL seconds therefore observed 5.3 s
-# out of every 15 at that cadence -- a 36% duty cycle, with 64% never looked at, which is
-# enough for a two-second stutter to be missed better than half the time. At 4 s the
-# windows overlap instead of leaving gaps (and stay inside the ring even at 28 fps, where
-# it holds 4.5 s). The overlap is then removed per layer by MARKPFX below, so a frame is
-# never counted twice. The context reads above keep the slow cadence: they are the
-# expensive part, and load and temperature do not move in four seconds.
-FRAME_INTERVAL="${3:-4}"
+# SurfaceFlinger retains only 127 frames. Use a separate three-second deadline loop
+# with headroom for the observed ~30 fps stream; slow diagnostics cannot delay it.
+# Ring overlap and actual polling gaps are logged, so overload or faster surfaces
+# cannot silently masquerade as continuous coverage.
+FRAME_INTERVAL="${3:-3}"
 MARKPFX=/data/local/tmp/.dashcam_cpt_seen_
 LOG=/data/local/tmp/dashcam_carplay_timing.log
 PIDF=/data/local/tmp/.dashcam_carplay_timing.pid
@@ -47,6 +41,25 @@ prev_ticks=0; prev_t=0; prev_zpid=; prev_rx=0; prev_rx_t=0; idle_n=0; prev_drops
 prev_oticks=0; prev_ot=0; prev_opid=; prev_neigh=na; prev_sta_mhz=na; prev_ap=na; started=0
 prev_cticks=0; prev_ct=0; prev_cpid=
 slow_pid=; slow_last=0; last_active=0
+FRAME_CONTEXT=/data/local/tmp/.dashcam_cpt_context_$SESSION
+FRAME_SEQ=/data/local/tmp/.dashcam_cpt_frame_seq_$SESSION
+frame_pid=
+clock_ms() { awk '{printf "%.0f",$1*1000}' /proc/uptime; }
+# Deadline scheduling subtracts work time. After an overrun, skip missed deadlines
+# instead of issuing a burst of catch-up Binder calls.
+deadline_delay() {
+  awk -v deadline="$1" -v current="$2" -v step="$3" 'BEGIN {
+    if(deadline<=current)deadline+=(int((current-deadline)/step)+1)*step
+    printf "%.0f %.3f",deadline,(deadline-current)/1000
+  }'
+}
+cleanup() {
+  [ -n "$frame_pid" ] && kill "$frame_pid" 2>/dev/null
+  [ -n "$slow_pid" ] && kill "$slow_pid" 2>/dev/null
+  rm -f "$FRAME_CONTEXT" "$FRAME_CONTEXT.new" "$FRAME_SEQ"
+}
+trap 'exit 0' TERM INT
+trap cleanup EXIT
 # All output is numeric aggregates. Never retain socket addresses, input events, screen
 # contents or full process/codec dumps. Missing proc access is unavailable, not zero.
 pressure() {
@@ -58,7 +71,7 @@ diagnostic_context() {
   clocks=$(cat /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq 2>/dev/null | awk '
     /^[0-9]+$/ {if(n==0 || $1<lo)lo=$1;if($1>hi)hi=$1;n++}
     END {if(n)printf "cpu_min_khz=%d cpu_max_khz=%d",lo,hi;else printf "cpu_min_khz=na cpu_max_khz=na"}')
-  rss=na; threads=na; queues="zlink_tcp_sockets=na zlink_rx_queue_bytes=na zlink_tx_queue_bytes=na"
+  uid=na; rss=na; threads=na; queues="zlink_tcp_sockets=na zlink_rx_queue_bytes=na zlink_tx_queue_bytes=na"
   if [ -n "$zpid" ]; then
     rss=$(awk '/^VmRSS:/ {print $2}' /proc/$zpid/status 2>/dev/null)
     threads=$(awk '/^Threads:/ {print $2}' /proc/$zpid/status 2>/dev/null)
@@ -84,7 +97,51 @@ diagnostic_context() {
   else
     prev_cticks=0; prev_ct=0; prev_cpid=
   fi
-  diag="schema=3 mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na}"
+  transport=$(timeout 2 ss -tine 2>/dev/null | tcp_summary)
+  display_queue=$(dumpsys -t 2 SurfaceFlinger 2>/dev/null | surface_queue_summary)
+  sched="zlink_main_runtime_ns=na zlink_main_wait_ns=na zlink_start_ticks=na"
+  if [ -n "$zpid" ]; then
+    sched=$(awk 'NF==3 && $1~/^[0-9]+$/ && $2~/^[0-9]+$/ {printf "zlink_main_runtime_ns=%s zlink_main_wait_ns=%s",$1,$2;found=1} END {if(!found)printf "zlink_main_runtime_ns=na zlink_main_wait_ns=na"}' /proc/$zpid/schedstat 2>/dev/null)
+    start_ticks=$(sed 's/.*) //' /proc/$zpid/stat 2>/dev/null | awk '{print $20}')
+    sched="$sched zlink_start_ticks=${start_ticks:-na}"
+  fi
+  diag="schema=4 mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
+}
+tcp_summary() {
+  # ss exposes TCP_INFO per socket. Match the exact app UID on the socket header,
+  # then parse only numeric fields on its indented detail line. Never emit endpoints.
+  awk -v uid="${uid:-na}" '
+    /^State[ \t]+Recv-Q/ {header=1;next}
+    /^[^ \t]/ {
+      selected=0
+      if($1!="ESTAB")next
+      for(i=1;i<=NF;i++)if($i=="uid:" uid)selected=1
+      if(selected)n++
+      next
+    }
+    selected && /^[ \t]/ {
+      for(i=1;i<=NF;i++) {
+        if($i~/^rtt:[0-9.]+\/[0-9.]+$/) {split(substr($i,5),r,"/");if(!nr || r[1]+0>rmax)rmax=r[1]+0;nr++}
+        if($i~/^retrans:[0-9]+\/[0-9]+$/) {split(substr($i,9),r,"/");pending+=r[1];total+=r[2];nt++}
+        if($i~/^rto:[0-9.]+$/) {v=substr($i,5)+0;if(!no || v>rto)rto=v;no++}
+      }
+      selected=0
+    }
+    END {
+      ok=header && uid~/^[0-9]+$/
+      printf "zlink_tcp_info_sockets=%s zlink_tcp_rtt_max_ms=%s zlink_tcp_rto_max_ms=%s zlink_tcp_retrans_pending=%s zlink_tcp_retrans_total=%s",
+        (ok?n+0:"na"),(ok && nr?rmax:"na"),(ok && no?rto:"na"),(ok && nt?pending:"na"),(ok && nt?total:"na")
+    }'
+}
+surface_queue_summary() {
+  awk '
+    /^\+ Layer / {selected=($0~/^\+ Layer \(com\.zjinnova\.zlink\/[A-Za-z0-9_.$]+#[0-9]+\) uid=[0-9]+$/)}
+    selected && /queued-frames=/ {
+      for(i=1;i<=NF;i++)if($i~/^queued-frames=[0-9]+$/) {
+        v=substr($i,15)+0;if(!n || v>max)max=v;n++
+      }
+    }
+    END {printf "zlink_queued_layers=%s zlink_queued_frames_max=%s",(n?n:"na"),(n?max:"na")}'
 }
 # These parsers emit allowlisted aggregates only. Never persist raw dumps. Codec records
 # can be published after disconnect: the source local timestamp is NOT collection time.
@@ -161,7 +218,7 @@ slow_diagnostics() {
 }
 emit_slow() {
   slow_seq=$((slow_seq+1))
-  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=3 | $1"
+  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=4 | $1"
   printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$message" >> "$LOG"
   log -p "$PRIO" -t "$TAG" "$message" 2>/dev/null
 }
@@ -189,8 +246,128 @@ rotate_log() {
   mv "$LOG" "$LOG.1"
 }
 
+sample_surfaces() {
+    # Live owner/parent mapping found the anonymous BLAST layers under the camera
+    # recorder. Only select the Zlink application buffer name, excluding window tokens,
+    # ActivityRecords, input sinks and hash-prefixed window containers. Fail closed when
+    # the vendor naming changes. Raw titles never leave this local latency query.
+    layers=$(dumpsys -t 1 SurfaceFlinger --list 2>/dev/null | awk '
+      /^com\.zjinnova\.zlink\/[A-Za-z0-9_.$]+#[0-9]+$/ { print "package_window\t" $0 }
+    ')
+    if [ -z "$layers" ]; then
+      emit "$head | no video surface"
+    else
+      idx=0
+      echo "$layers" | while IFS='	' read -r kind L; do
+        idx=$((idx+1))
+        # Never log a full window title: retain only its numeric SurfaceFlinger ID.
+        id=$(echo "$L" | sed -n 's/.*#\([0-9][0-9]*\)$/#\1/p')
+        [ -n "$id" ] || continue
+        mark="$MARKPFX${id#\#}"
+        seen=$(cat "$mark" 2>/dev/null)
+        dumpsys -t 1 SurfaceFlinger --latency "$L" </dev/null 2>/dev/null | awk -v layer="$id" -v kind="$kind" -v idx="$idx" -v seen="${seen:-0}" -v poll_ms="$poll_ms" -v mark="$mark" '
+          NR==1 { period=$1/1e6; next }
+          NF>=3 && $2>0 && $2<9e18 {
+            p[n++]=$2
+            # Column 3 is frame-ready; column 2 is actual presentation. This measures
+            # local ready-to-present delay, NOT phone-to-display or touch latency.
+            if ($3>0 && $3<9e18 && $2>=$3) ready[sprintf("%.0f",$2)]=($2-$3)/1e6
+          }
+          END {
+            if (n<3) { printf "layer=%s surface_kind=%s idx=%s frames=%d (idle)\n", layer, kind, idx, n; exit }
+            # sort presented timestamps, then the intervals between them
+            for (i=0;i<n;i++) for (j=i+1;j<n;j++) if (p[j]<p[i]) { t=p[i]; p[i]=p[j]; p[j]=t }
+            # Where this window ended, for the next one to start after. Printed with an
+            # explicit integer format: these are nanosecond timestamps, and awk`s default
+            # output would render them in exponent form, which reads back as a different
+            # number and would silently disable the de-duplication entirely.
+            printf "%.0f\n", p[n-1] > mark
+            # Only intervals whose later frame is new. Consecutive reads of a 5.3 s ring
+            # four seconds apart share about a second of frames, and counting those twice
+            # would inflate every hold count by the overlap. The interval that straddles
+            # the boundary belongs to this window and is kept exactly once.
+            # SurfaceFlinger timestamps restart after a reboot.  A persisted marker from
+            # before that restart must not discard every initial frame of the new session.
+            if (p[n-1] < seen+0) seen=0
+            overlap="na"; ring_gap="na"
+            if(seen>0) {overlap=(p[0]<=seen ? 1 : 0);ring_gap=sprintf("%.1f",(p[0]>seen ? (p[0]-seen)/1e6 : 0))}
+            unchanged="na"
+            if(poll_ms>0) {
+              freshfile=mark ".fresh";getline last_fresh < freshfile;close(freshfile)
+              if(p[n-1]>seen || !last_fresh || last_fresh>poll_ms) {
+                last_fresh=poll_ms;printf "%.0f\n",poll_ms > freshfile;close(freshfile)
+              }
+              unchanged=sprintf("%.0f",poll_ms-last_fresh)
+            }
+            m=0; rn=0
+            for (i=1;i<n;i++) if (p[i] > seen+0) {
+              key=sprintf("%.0f",p[i]); if(key in ready) rdelay[rn++]=ready[key]
+              d[m]=(p[i]-p[i-1])/1e6
+              if (m==0) first=p[i-1]
+              last=p[i]; m++
+            }
+            if (m<2) { printf "layer=%s surface_kind=%s idx=%s frames=%d new=0 ring_overlap=%s ring_gap_ms=%s surface_unchanged_ms=%s (no new frames)\n", layer, kind, idx, n, overlap, ring_gap, unchanged; exit }
+            span=(last-first)/1e9
+            for (i=0;i<m;i++) for (j=i+1;j<m;j++) if (d[j]<d[i]) { t=d[i]; d[i]=d[j]; d[j]=t }
+            for (i=0;i<rn;i++) for(j=i+1;j<rn;j++) if(rdelay[j]<rdelay[i]) {t=rdelay[i];rdelay[i]=rdelay[j];rdelay[j]=t}
+            rp95="na"; rmax="na"
+            if(rn>0) {ri=int(rn*0.95);if(ri<rn*0.95)ri++;rp95=sprintf("%.1f",rdelay[ri-1]);rmax=sprintf("%.1f",rdelay[rn-1])}
+            med=d[int(m/2)]
+            late=0; hitch=0
+            # A late frame is one that missed its slot, and the slot is this surface`s own
+            # cadence -- not the display`s. The old threshold was 2.5 display periods, which
+            # on a 57 Hz panel is 44 ms; a 30 fps source cannot be shown evenly there and has
+            # to alternate 2-vsync (35 ms) and 3-vsync (53 ms) holds, so every ordinary
+            # 3-vsync hold counted late. Worse, a surface running steadily at 19 fps scored
+            # 100% late while dropping nothing at all. Measuring from the median instead
+            # separates the two questions the fields already answer separately: fps says how
+            # fast the surface runs, late says how unevenly.
+            thr=med+1.5*period
+            # A hitch is a hold long enough to see, which is a different question again.
+            # Across a day of driving `late` sat at a median of 11% while the worst single
+            # hold reached 265 ms -- a quarter of a second of frozen picture that `late`
+            # scored 26%, because one long hold among many even ones barely moves a rate.
+            # Twice the median is the surface`s own definition of "stopped for a moment",
+            # so it needs no panel constant and follows the link if its cadence changes.
+            hthr=2*med
+            for (i=0;i<m;i++) { if (d[i]>thr) late++; if (d[i]>=hthr) hitch++ }
+            printf "layer=%s surface_kind=%s idx=%s fps=%.1f med=%.1f p95=%.1f max=%.1f late=%d%% hitch=%d n=%d new=%d span=%.1f period=%.1f thr=%.1f ready_n=%d ready_p95=%s ready_max=%s ring_overlap=%s ring_gap_ms=%s surface_unchanged_ms=%s\n",
+              layer, kind, idx, (span>0? m/span:0), med, d[int(m*0.95)-1<0?0:int(m*0.95)-1], d[m-1], 100*late/m, hitch, n, m, span, period, thr, rn, rp95, rmax, overlap, ring_gap, unchanged
+          }' | while read -r stat; do emit "$head | $stat"; done
+      done
+    fi
+}
+frame_loop() {
+  # Independent sequence file: emit() is also used from pipeline subshells.
+  SEQF=$FRAME_SEQ
+  SESSION="$SESSION-frame-$(clock_ms)"
+  trap - EXIT
+  frame_pid=; slow_pid=
+  echo 0 > "$SEQF"
+  frame_deadline=$(clock_ms); previous_poll=0
+  while :; do
+    poll_ms=$(clock_ms)
+    if [ -r "$FRAME_CONTEXT" ]; then
+      { IFS= read -r active; IFS= read -r context_ms; IFS= read -r head; } < "$FRAME_CONTEXT"
+      if [ "$active" = 1 ]; then
+        gap=na; [ "$previous_poll" -gt 0 ] && gap=$((poll_ms-previous_poll))
+        head="$head context_age_ms=$((poll_ms-context_ms)) frame_poll_gap_ms=$gap"
+        sample_surfaces
+        previous_poll=$poll_ms
+      else
+        previous_poll=0
+      fi
+    fi
+    # Preserve the deadline across iterations; work is part of the period.
+    set -- $(deadline_delay "$frame_deadline" "$(clock_ms)" "$((FRAME_INTERVAL*1000))")
+    frame_deadline=$1
+    sleep "$2"
+  done
+}
+
 while :; do
   rotate_log
+  context_ms=$(clock_ms)
   now=$(date +%s)
   acc=$(settings get global acc_status 2>/dev/null)
   # Aggregate reachability states only.  A neighbour is useful sampling context, but it
@@ -276,7 +453,7 @@ while :; do
   fi
   bt=$(settings get global bluetooth_on 2>/dev/null)
   zlink_proc=0; [ -n "$zpid" ] && zlink_proc=1
-  diag="schema=3"
+  diag="schema=4"
   if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
     diagnostic_context
   fi
@@ -306,95 +483,17 @@ while :; do
     # Preserve pressure/queue evidence even when no display layer is available.
     emit "$head | event=diagnostic_context"
     idle_n=0
-    # One context reading, several surface readings under it -- see FRAME_INTERVAL.
-    watched=0
-    while [ "$watched" -lt "$INTERVAL" ]; do
-    # Live owner/parent mapping found the anonymous BLAST layers under the camera
-    # recorder. Only select the Zlink application buffer name, excluding window tokens,
-    # ActivityRecords, input sinks and hash-prefixed window containers. Fail closed when
-    # the vendor naming changes. Raw titles never leave this local latency query.
-    layers=$(dumpsys SurfaceFlinger --list 2>/dev/null | awk '
-      /^com\.zjinnova\.zlink\/[A-Za-z0-9_.$]+#[0-9]+$/ { print "package_window\t" $0 }
-    ')
-    if [ -z "$layers" ]; then
-      emit "$head | no video surface"
-    else
-      idx=0
-      echo "$layers" | while IFS='	' read -r kind L; do
-        idx=$((idx+1))
-        # Never log a full window title: retain only its numeric SurfaceFlinger ID.
-        id=$(echo "$L" | sed -n 's/.*#\([0-9][0-9]*\)$/#\1/p')
-        [ -n "$id" ] || continue
-        mark="$MARKPFX${id#\#}"
-        seen=$(cat "$mark" 2>/dev/null)
-        dumpsys SurfaceFlinger --latency "$L" </dev/null 2>/dev/null | awk -v layer="$id" -v kind="$kind" -v idx="$idx" -v seen="${seen:-0}" -v mark="$mark" '
-          NR==1 { period=$1/1e6; next }
-          NF>=3 && $2>0 && $2<9e18 {
-            p[n++]=$2
-            # Column 3 is frame-ready; column 2 is actual presentation. This measures
-            # local ready-to-present delay, NOT phone-to-display or touch latency.
-            if ($3>0 && $3<9e18 && $2>=$3) ready[sprintf("%.0f",$2)]=($2-$3)/1e6
-          }
-          END {
-            if (n<3) { printf "layer=%s surface_kind=%s idx=%s frames=%d (idle)\n", layer, kind, idx, n; exit }
-            # sort presented timestamps, then the intervals between them
-            for (i=0;i<n;i++) for (j=i+1;j<n;j++) if (p[j]<p[i]) { t=p[i]; p[i]=p[j]; p[j]=t }
-            # Where this window ended, for the next one to start after. Printed with an
-            # explicit integer format: these are nanosecond timestamps, and awk`s default
-            # output would render them in exponent form, which reads back as a different
-            # number and would silently disable the de-duplication entirely.
-            printf "%.0f\n", p[n-1] > mark
-            # Only intervals whose later frame is new. Consecutive reads of a 5.3 s ring
-            # four seconds apart share about a second of frames, and counting those twice
-            # would inflate every hold count by the overlap. The interval that straddles
-            # the boundary belongs to this window and is kept exactly once.
-            # SurfaceFlinger timestamps restart after a reboot.  A persisted marker from
-            # before that restart must not discard every initial frame of the new session.
-            if (p[n-1] < seen+0) seen=0
-            m=0; rn=0
-            for (i=1;i<n;i++) if (p[i] > seen+0) {
-              key=sprintf("%.0f",p[i]); if(key in ready) rdelay[rn++]=ready[key]
-              d[m]=(p[i]-p[i-1])/1e6
-              if (m==0) first=p[i-1]
-              last=p[i]; m++
-            }
-            if (m<2) { printf "layer=%s surface_kind=%s idx=%s frames=%d new=0 (no new frames)\n", layer, kind, idx, n; exit }
-            span=(last-first)/1e9
-            for (i=0;i<m;i++) for (j=i+1;j<m;j++) if (d[j]<d[i]) { t=d[i]; d[i]=d[j]; d[j]=t }
-            for (i=0;i<rn;i++) for(j=i+1;j<rn;j++) if(rdelay[j]<rdelay[i]) {t=rdelay[i];rdelay[i]=rdelay[j];rdelay[j]=t}
-            rp95="na"; rmax="na"
-            if(rn>0) {ri=int(rn*0.95);if(ri<rn*0.95)ri++;rp95=sprintf("%.1f",rdelay[ri-1]);rmax=sprintf("%.1f",rdelay[rn-1])}
-            med=d[int(m/2)]
-            late=0; hitch=0
-            # A late frame is one that missed its slot, and the slot is this surface`s own
-            # cadence -- not the display`s. The old threshold was 2.5 display periods, which
-            # on a 57 Hz panel is 44 ms; a 30 fps source cannot be shown evenly there and has
-            # to alternate 2-vsync (35 ms) and 3-vsync (53 ms) holds, so every ordinary
-            # 3-vsync hold counted late. Worse, a surface running steadily at 19 fps scored
-            # 100% late while dropping nothing at all. Measuring from the median instead
-            # separates the two questions the fields already answer separately: fps says how
-            # fast the surface runs, late says how unevenly.
-            thr=med+1.5*period
-            # A hitch is a hold long enough to see, which is a different question again.
-            # Across a day of driving `late` sat at a median of 11% while the worst single
-            # hold reached 265 ms -- a quarter of a second of frozen picture that `late`
-            # scored 26%, because one long hold among many even ones barely moves a rate.
-            # Twice the median is the surface`s own definition of "stopped for a moment",
-            # so it needs no panel constant and follows the link if its cadence changes.
-            hthr=2*med
-            for (i=0;i<m;i++) { if (d[i]>thr) late++; if (d[i]>=hthr) hitch++ }
-            printf "layer=%s surface_kind=%s idx=%s fps=%.1f med=%.1f p95=%.1f max=%.1f late=%d%% hitch=%d n=%d new=%d span=%.1f period=%.1f thr=%.1f ready_n=%d ready_p95=%s ready_max=%s\n",
-              layer, kind, idx, (span>0? m/span:0), med, d[int(m*0.95)-1<0?0:int(m*0.95)-1], d[m-1], 100*late/m, hitch, n, m, span, period, thr, rn, rp95, rmax
-          }' | while read -r stat; do emit "$head | $stat"; done
-      done
-    fi
-    sleep "$FRAME_INTERVAL"
-    watched=$((watched + FRAME_INTERVAL))
-    done
   else
     idle_n=$((idle_n+1))
     # A heartbeat once a minute while no phone is attached: enough to prove it is alive.
     [ $((idle_n % 4)) -eq 1 ] && emit "$head | no phone on hotspot"
-    sleep "$INTERVAL"
   fi
+  if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then active=1; else active=0; fi
+  printf '%s\n%s\n%s\n' "$active" "$context_ms" "$head" > "$FRAME_CONTEXT.new"
+  mv "$FRAME_CONTEXT.new" "$FRAME_CONTEXT"
+  if [ -z "$frame_pid" ] || ! kill -0 "$frame_pid" 2>/dev/null; then
+    frame_loop &
+    frame_pid=$!
+  fi
+  sleep "$INTERVAL"
 done

@@ -467,6 +467,21 @@ export interface CarPlayDiagnosticContext {
   deviceTcpRetransSegs?: number | null
   deviceUdpRcvbufErrors?: number | null
   deviceUdpSndbufErrors?: number | null
+  zlinkTcpInfoSockets?: number | null
+  zlinkTcpRttMaxMs?: number | null
+  zlinkTcpRtoMaxMs?: number | null
+  zlinkTcpRetransPending?: number | null
+  zlinkTcpRetransTotal?: number | null
+  zlinkQueuedLayers?: number | null
+  zlinkQueuedFramesMax?: number | null
+  zlinkMainRuntimeNs?: number | null
+  zlinkMainWaitNs?: number | null
+  zlinkStartTicks?: number | null
+  contextAgeMs?: number | null
+  framePollGapMs?: number | null
+  ringOverlap?: number | null
+  ringGapMs?: number | null
+  surfaceUnchangedMs?: number | null
 }
 
 export interface CarPlayTimingSample extends CarPlayDiagnosticContext {

@@ -316,6 +316,9 @@ class IngestPoller:
                 # rewrote the live state to "disabled" -- which hid the Cancel button on
                 # the very transfer someone had just decided to stop.
                 if status.running:
+                    # Read-only and independently throttled, with an ignition-off gate.
+                    # A long footage copy must not hide the drive's retained timing log.
+                    carplay_timing.recover_on_unit_present(self._address())
                     await asyncio.sleep(self._interval())
                     continue
 

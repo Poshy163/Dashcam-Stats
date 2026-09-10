@@ -55,16 +55,20 @@ def clean():
 
 
 @pytest.mark.parametrize("ignition", ["off", "on", "unknown"])
+@pytest.mark.parametrize("running", [False, True])
 async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off(
     monkeypatch,
     ignition,
+    running,
 ):
     from app.ingest import poller as poller_module
     from app.ingest.models import RunState
     from app.ingest.status import IngestStatus
 
     status = IngestStatus()
-    status.state = RunState.OK
+    status.state = RunState.RUNNING if running else RunState.OK
+    if running:
+        status.try_begin()
     status.ignition_state = ignition
     poller = poller_module.IngestPoller()
     poller._running = poller._was_online = True
@@ -83,6 +87,7 @@ async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off
         recovered.append(address)
 
     async def arm(_address):
+        assert not running, "backup recovery must not restart the sampler"
         return True
 
     async def unexpected_probe():
@@ -115,7 +120,7 @@ async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off
         if carplay_timing._tasks:
             await asyncio.gather(*list(carplay_timing._tasks))
         assert recovered == (["u:5555"] if ignition == "off" else [])
-        assert startup_guard_checks == ["u:5555"]
+        assert startup_guard_checks == ([] if running else ["u:5555"])
     finally:
         await carplay_timing.shutdown()
 
@@ -468,11 +473,11 @@ class TestTheScriptOnTheUnit:
     def test_the_surfaces_are_read_faster_than_the_context_around_them(self):
         script = self._script()
 
-        assert 'FRAME_INTERVAL="${3:-4}"' in script
-        assert 'sleep "$FRAME_INTERVAL"' in script
+        assert 'FRAME_INTERVAL="${3:-3}"' in script
+        assert 'deadline_delay "$frame_deadline"' in script
         # The inner loop is what keeps `dumpsys wifi` and the thermal walk on the slow
         # cadence. Without it every context read would run four times as often for nothing.
-        assert 'while [ "$watched" -lt "$INTERVAL" ]' in script
+        assert "frame_loop &" in script
 
     def test_the_overlap_between_consecutive_reads_is_removed(self):
         """A 4 s cadence against a 5.3 s ring shares about a second of frames every time.
@@ -532,7 +537,7 @@ class TestTheScriptOnTheUnit:
             )
             return completed.stdout
 
-        assert "new=0 (no new frames)" in run(400), "equal ring must not be re-counted"
+        assert "new=0" in run(400) and "(no new frames)" in run(400)
         assert "new=2" in run(250), "only frames newer than the overlap marker count"
         rebooted_ring = "17500000\n0 10 0\n0 20 0\n0 30 0\n0 40 0\n"
         assert "new=3" in run(400, rebooted_ring), "lower timestamps reset after reboot"
@@ -564,7 +569,7 @@ class TestTheScriptOnTheUnit:
         awk = Path(r"C:\Program Files\Git\usr\bin\awk.exe")
         if not awk.exists():
             pytest.skip("Git AWK is unavailable")
-        program = self._script().split("layers=$(dumpsys SurfaceFlinger --list", 1)[1]
+        program = self._script().split("layers=$(dumpsys -t 1 SurfaceFlinger --list", 1)[1]
         program = program.split("awk '", 1)[1].split("'", 1)[0]
         window = "com.zjinnova.zlink/com.zjinnova.android.zlink.features.main.MainActivity#255"
         layers = "\n".join(

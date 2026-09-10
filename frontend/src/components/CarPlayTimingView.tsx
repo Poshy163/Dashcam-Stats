@@ -139,6 +139,10 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
     .map((e) => [`${e.codecReportedLocal}:${e.codecLifetimeMs}:${e.codecLatencyN}`, e])).values()]
   const displayWait = maxKnown(samples.map((s) => s.readyToPresentMaxMs ?? null))
   const receiveQueue = maxKnown(diagnosticRows.map((s) => s.zlinkRxQueueBytes ?? null))
+  const tcpRtt = maxKnown(diagnosticRows.map((s) => s.zlinkTcpRttMaxMs ?? null))
+  const queuedFrames = maxKnown(diagnosticRows.map((s) => s.zlinkQueuedFramesMax ?? null))
+  const missingOverlap = samples.filter((s) => s.ringOverlap === 0).length
+  const pollGap = maxKnown(diagnosticRows.map((s) => s.framePollGapMs ?? null))
   const spans = samples.map((s) => s.spanS).filter((s): s is number => s != null && s >= 0)
   const sampledSeconds = spans.length ? spans.reduce((a, b) => a + b, 0) : null
 
@@ -220,9 +224,21 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
             Longest wait from buffer ready to display: {displayWait == null ? 'unavailable' : `${displayWait.toFixed(0)} ms`}.
             {' '}Largest unread ZLink TCP queue: {receiveQueue == null ? 'unavailable' : `${(receiveQueue / 1024).toFixed(1)} KiB`}.
           </p>
+          <p className="mt-2 text-content-muted">
+            Highest ZLink TCP round-trip time: {tcpRtt == null ? 'unavailable' : `${tcpRtt.toFixed(1)} ms`}.
+            {' '}Most queued display buffers: {queuedFrames ?? 'unavailable'}.
+          </p>
+          {pollGap != null && (
+            <p className="mt-2 text-xs text-content-muted">
+              Longest frame polling interval: {(pollGap / 1000).toFixed(2)} s.
+              {' '}{missingOverlap} samples lacked overlap with the previous frame history;
+              missing intervals must not be treated as smooth playback.
+            </p>
+          )}
           <p className="mt-2 text-xs text-content-muted">
             Captured on the head unit without home Wi-Fi and recovered when parked at home.
             These are local display and socket measurements, not the full delay from a tap or the phone.
+            {' '}TCP statistics cover ZLink’s established sockets; they do not identify which carries video.
             Unavailable means Android did not expose a measurement. CPU, memory and I/O context is retained in the diagnostic log.
           </p>
         </div>
