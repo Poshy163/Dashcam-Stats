@@ -155,6 +155,7 @@ async def test_source_frames_replace_bad_saved_view_with_matching_time_and_coord
     result = await stages.stage_plates(db_session, rec)
     assert result.ok
     assert len(calls) == 1
+    assert calls[0]["preserve_final_frame"] is True
     assert result.stats["vehicle_frames_checked"] == 4
     obs = (await db_session.execute(select(PlateObservation))).scalar_one()
     assert obs.t_offset_s == 0

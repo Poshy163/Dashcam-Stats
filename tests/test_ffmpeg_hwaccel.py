@@ -19,6 +19,52 @@ from app.hardware.ffmpeg import Crop, build_filter_chain, select_hwaccel
 
 
 class TestFilterChainContract:
+    async def test_sparse_replay_retains_last_interval_without_padding_past_eof(self, tmp_path):
+        import contextlib
+        import shutil
+        import subprocess
+
+        from app.hardware.ffmpeg import iter_frames
+
+        executable = shutil.which("ffmpeg")
+        if executable is None:
+            pytest.skip("FFmpeg is unavailable")
+        video = tmp_path / "partial-second.mkv"
+        subprocess.run(
+            [
+                executable,
+                "-hide_banner",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x48:rate=25:duration=1.28",
+                "-c:v",
+                "ffv1",
+                str(video),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+
+        async def offsets(preserve):
+            async with contextlib.aclosing(
+                iter_frames(
+                    video,
+                    fps=1,
+                    preserve_final_frame=preserve,
+                    duration=5,
+                    frame_size=(64, 48),
+                    hwaccel="cpu",
+                )
+            ) as frames:
+                return [offset async for offset, _ in frames]
+
+        assert await offsets(False) == [0.0]
+        assert await offsets(True) == [0.0, 1.0]
+
     @pytest.mark.parametrize("label", ["vaapi", "qsv", "software"])
     def test_chain_never_downloads_frames_itself(self, label):
         """`hwdownload` must not appear while the decoder already downloads.

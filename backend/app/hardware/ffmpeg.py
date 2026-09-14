@@ -1090,6 +1090,7 @@ class Crop:
 def build_filter_chain(
     *,
     fps: float | None = None,
+    preserve_final_frame: bool = False,
     crop: Crop | None = None,
     scale: tuple[int, int] | None = None,
     hwaccel_label: str = "software",
@@ -1104,7 +1105,11 @@ def build_filter_chain(
     # or download at the decoder and filter normally. Everything downstream here is numpy
     # or a CPU filter, so downloading at the decoder is the cheaper half of that choice.
     if fps:
-        filters.append(f"fps={fps:g}")
+        # A sparse replay must retain a selected view in the last partial interval.
+        # Default end rounding can omit t=9 from a 9.28-second clip at 1 fps, even
+        # though the earlier 4 fps detection pass included it. Do not pad past EOF.
+        ending = ":eof_action=pass" if preserve_final_frame else ""
+        filters.append(f"fps={fps:g}{ending}")
     if crop:
         filters.append(crop.to_filter())
     if scale:
@@ -1117,6 +1122,7 @@ async def _decode_frames(
     path: Path | str,
     *,
     fps: float | None = None,
+    preserve_final_frame: bool = False,
     crop: Crop | None = None,
     scale: tuple[int, int] | None = None,
     frame_size: tuple[int, int] | None = None,
@@ -1147,7 +1153,12 @@ async def _decode_frames(
         width, height = info.width, info.height
 
     chain = build_filter_chain(
-        fps=fps, crop=crop, scale=scale, hwaccel_label=label, pix_fmt=pix_fmt
+        fps=fps,
+        preserve_final_frame=preserve_final_frame,
+        crop=crop,
+        scale=scale,
+        hwaccel_label=label,
+        pix_fmt=pix_fmt,
     )
 
     threads = native_thread_budget()
@@ -1251,6 +1262,7 @@ async def iter_frames(
     path: Path | str,
     *,
     fps: float | None = None,
+    preserve_final_frame: bool = False,
     crop: Crop | None = None,
     scale: tuple[int, int] | None = None,
     frame_size: tuple[int, int] | None = None,
@@ -1275,6 +1287,7 @@ async def iter_frames(
     """
     kwargs = {
         "fps": fps,
+        "preserve_final_frame": preserve_final_frame,
         "crop": crop,
         "scale": scale,
         "frame_size": frame_size,

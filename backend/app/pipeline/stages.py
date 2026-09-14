@@ -1983,6 +1983,7 @@ async def stage_plates(
                 iter_frames(
                     path,
                     fps=fps,
+                    preserve_final_frame=True,
                     duration=pending[-1][0].offset_s + 1 / fps,
                     frame_size=(recording.width, recording.height)
                     if recording.width and recording.height
