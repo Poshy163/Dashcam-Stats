@@ -465,6 +465,7 @@ def test_wireless_fields_remain_unavailable_for_historical_records():
 def test_wifi_country_is_allowlisted_and_not_invented_for_old_logs():
     def parse(text):
         return carplay_timing.parse_event(datetime.now(UTC), text)
+
     assert (
         parse("schema=5 wifi_country_code=GB | event=diagnostic_context")["wifi_country_code"]
         == "GB"
