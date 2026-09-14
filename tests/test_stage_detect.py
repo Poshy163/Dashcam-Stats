@@ -218,8 +218,9 @@ class TestTheVehicleCropsAreActuallyWritten:
             assert path.is_file(), f"the row points at {track.crop_path}, which is not on disk"
             assert path.stat().st_size > 0
 
-    async def test_plate_source_coordinates_survive_disabled_timeline_storage(
-        self, db_session, clip_with_a_vehicle
+    @pytest.mark.parametrize("timeline_enabled", [True, False])
+    async def test_plate_source_coordinates_survive_sparse_or_disabled_timeline_storage(
+        self, db_session, clip_with_a_vehicle, timeline_enabled
     ):
         from app.core.settings_service import get_settings_service
         from app.db.models import Detection
@@ -227,7 +228,8 @@ class TestTheVehicleCropsAreActuallyWritten:
         settings = get_settings_service()
         await settings.set_many(
             {
-                "advanced.keep_sparse_detections": False,
+                "advanced.keep_sparse_detections": timeline_enabled,
+                "advanced.detection_store_stride": 100,
                 "plates.enabled": True,
                 "plates.max_ocr_per_track": 3,
             }

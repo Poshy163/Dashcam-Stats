@@ -1590,7 +1590,7 @@ async def stage_detect(
 
         for (track, _located, _crop), stored in zip(prepared, objects):
             retained = set()
-            if not keep_detections and settings.get_nowait("plates.enabled"):
+            if settings.get_nowait("plates.enabled"):
                 retained = {
                     v.offset_s
                     for v in select_vehicle_views(
