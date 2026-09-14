@@ -271,6 +271,14 @@ def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
         "codec_latency_min_us",
         "codec_latency_n",
         "codec_lifetime_ms",
+        "codec_width",
+        "codec_height",
+        "codec_profile",
+        "codec_level",
+        "codec_flush_count",
+        "codec_resolution_change_count",
+        "codec_set_surface_count",
+        "codec_used_max_input_size",
         "codec_low_latency_on",
         "codec_low_latency_off",
         "gfx_since_ns",
@@ -315,6 +323,8 @@ def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
     ):
         names[name] = name
     result = {name: _number(fields.get(key)) for name, key in names.items()}
+    country = fields.get("wifi_country_code", "")
+    result["wifi_country_code"] = country if re.fullmatch(r"[A-Z]{2}", country) else None
     reported = fields.get("codec_reported_local", "")
     result["codec_reported_local"] = (
         reported if re.fullmatch(r"\d{2}-\d{2}_\d{2}:\d{2}:\d{2}\.\d{1,9}", reported) else None

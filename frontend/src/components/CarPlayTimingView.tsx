@@ -145,6 +145,7 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
   const recentPeerRtt = maxKnown(linkRows.map((e) => e.peerRecentRttMaxMs))
   const linkGap = maxKnown(linkRows.map((e) => e.linkPollGapMs))
   const radioSamples = linkRows.filter((e) => e.apSignalMinDbm != null).length
+  const countryCodes = [...new Set(diagnosticRows.map((e) => e.wifiCountryCode).filter(Boolean))]
   const queuedFrames = maxKnown(diagnosticRows.map((s) => s.zlinkQueuedFramesMax ?? null))
   const missingOverlap = samples.filter((s) => s.ringOverlap === 0).length
   const pollGap = maxKnown(diagnosticRows.map((s) => s.framePollGapMs ?? null))
@@ -254,6 +255,8 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
                 {' '}Highest RTT on recently receiving connections: {recentPeerRtt == null ? 'unavailable' : `${recentPeerRtt.toFixed(1)} ms`}.
               </p>
               <p className="mt-2 text-xs text-content-muted">
+                Reported Wi-Fi country: {countryCodes.join(', ') || 'unavailable'}.
+                {' '}
                 {linkRows.length} captures; {radioSamples} include Wi-Fi signal measurements.
                 {' '}Longest polling interval: {linkGap == null ? 'unavailable' : `${(linkGap / 1000).toFixed(2)} s`}.
                 {' '}Peer measurements cover ZLink IPv4 TCP connections to resolved hotspot neighbours, excluding local sockets.
@@ -369,13 +372,15 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
           </p>
           <div className="mt-3 overflow-x-auto">
             <table className="w-full text-left text-xs">
-              <thead><tr><th>Source report</th><th>Average</th><th>Maximum</th><th>Buffers</th></tr></thead>
+              <thead><tr><th>Source report</th><th>Average</th><th>Maximum</th><th>Buffers</th><th>Resolution</th><th>Flushes</th></tr></thead>
               <tbody>{codecSummaries.slice(-12).reverse().map((e, i) => (
                 <tr key={`${e.codecReportedLocal}:${i}`}>
                   <td className="py-2">{e.codecReportedLocal?.replace('_', ' ')}</td>
                   <td>{e.codecLatencyAvgUs == null ? 'Unavailable' : `${(e.codecLatencyAvgUs / 1000).toFixed(1)} ms`}</td>
                   <td>{e.codecLatencyMaxUs == null ? 'Unavailable' : `${(e.codecLatencyMaxUs / 1000).toFixed(1)} ms`}</td>
                   <td>{e.codecLatencyN ?? 'Unavailable'}</td>
+                  <td>{e.codecWidth != null && e.codecHeight != null ? `${e.codecWidth} × ${e.codecHeight}` : 'Unavailable'}</td>
+                  <td>{e.codecFlushCount ?? 'Unavailable'}</td>
                 </tr>
               ))}</tbody>
             </table>

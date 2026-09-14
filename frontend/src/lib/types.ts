@@ -456,6 +456,14 @@ export interface CarPlayDiagnosticContext {
   codecLatencyMinUs?: number | null
   codecLatencyN?: number | null
   codecLifetimeMs?: number | null
+  codecWidth?: number | null
+  codecHeight?: number | null
+  codecProfile?: number | null
+  codecLevel?: number | null
+  codecFlushCount?: number | null
+  codecResolutionChangeCount?: number | null
+  codecSetSurfaceCount?: number | null
+  codecUsedMaxInputSize?: number | null
   codecLowLatencyOn?: number | null
   codecLowLatencyOff?: number | null
   gfxSinceNs?: number | null
@@ -482,6 +490,7 @@ export interface CarPlayDiagnosticContext {
   ringOverlap?: number | null
   ringGapMs?: number | null
   surfaceUnchangedMs?: number | null
+  wifiCountryCode?: string | null
   peerTcpSockets?: number | null
   peerRxQueueBytes?: number | null
   peerTxQueueBytes?: number | null

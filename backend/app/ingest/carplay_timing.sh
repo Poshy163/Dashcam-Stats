@@ -67,6 +67,7 @@ pressure() {
   awk '$1=="some" {for(i=2;i<=NF;i++) if($i ~ /^avg10=/) {split($i,a,"=");print a[2];exit}}' "/proc/pressure/$1" 2>/dev/null
 }
 diagnostic_context() {
+  country=$(timeout 1 cmd wifi get-country-code 2>/dev/null | sed -n 's/^Wifi Country Code = \([A-Z][A-Z]\)$/\1/p')
   mem=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
   pcpu=$(pressure cpu); pio=$(pressure io); pmem=$(pressure memory)
   clocks=$(cat /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq 2>/dev/null | awk '
@@ -106,7 +107,7 @@ diagnostic_context() {
     start_ticks=$(sed 's/.*) //' /proc/$zpid/stat 2>/dev/null | awk '{print $20}')
     sched="$sched zlink_start_ticks=${start_ticks:-na}"
   fi
-  diag="schema=5 mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
+  diag="schema=5 wifi_country_code=${country:-na} mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
 }
 tcp_summary() {
   # ss exposes TCP_INFO per socket. Match the exact app UID on the socket header,
@@ -243,8 +244,8 @@ codec_summary() {
       stamp=parts[2];gsub(/[()]/,"",stamp);gsub(/ /,"_",stamp)
       if(stamp!~/^[0-9][0-9]-[0-9][0-9]_[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]+$/)next
       out="event=codec_summary codec_reported_local=" stamp
-      count=split("latency.avg latency.max latency.min latency.n lifetimeMs low-latency.on low-latency.off",keys," ")
-      split("codec_latency_avg_us codec_latency_max_us codec_latency_min_us codec_latency_n codec_lifetime_ms codec_low_latency_on codec_low_latency_off",names," ")
+      count=split("latency.avg latency.max latency.min latency.n lifetimeMs low-latency.on low-latency.off width height profile level flush-count resolution-change-count set-surface-count used-max-input-size",keys," ")
+      split("codec_latency_avg_us codec_latency_max_us codec_latency_min_us codec_latency_n codec_lifetime_ms codec_low_latency_on codec_low_latency_off codec_width codec_height codec_profile codec_level codec_flush_count codec_resolution_change_count codec_set_surface_count codec_used_max_input_size",names," ")
       for(i=1;i<=count;i++)out=out " " names[i] "=" (v[keys[i]]~/^[0-9]+$/ ? v[keys[i]] : "na")
       print out
     }'

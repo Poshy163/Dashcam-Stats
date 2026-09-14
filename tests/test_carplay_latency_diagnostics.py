@@ -198,6 +198,10 @@ def codec_record(owner="com.zjinnova.zlink", encoder="0", mime="video/avc", avg=
         "lifetimeMs": "859413",
         "low-latency.on": "0",
         "low-latency.off": "0",
+        "width": "1920",
+        "height": "720",
+        "flush-count": "2",
+        "resolution-change-count": "1",
         "private": "SECRET",
     }
     body = ", ".join(f"android.media.mediacodec.{k}={v}" for k, v in properties.items())
@@ -221,6 +225,10 @@ def test_codec_summary_uses_only_zlink_video_decoder_and_preserves_source_time()
     assert event["codec_latency_max_us"] == 640748
     assert event["codec_latency_n"] == 25262
     assert event["codec_lifetime_ms"] == 859413
+    assert event["codec_width"] == 1920
+    assert event["codec_height"] == 720
+    assert event["codec_flush_count"] == 2
+    assert event["codec_resolution_change_count"] == 1
     assert event["codec_low_latency_on"] == 0
     assert event["gfx_frames"] is None
 
@@ -452,3 +460,17 @@ def test_wireless_fields_remain_unavailable_for_historical_records():
     assert parsed["peer_rx_queue_bytes"] is None
     assert parsed["ap_station_count"] is None
     assert parsed["link_poll_gap_ms"] is None
+
+
+def test_wifi_country_is_allowlisted_and_not_invented_for_old_logs():
+    def parse(text):
+        return carplay_timing.parse_event(datetime.now(UTC), text)
+    assert (
+        parse("schema=5 wifi_country_code=GB | event=diagnostic_context")["wifi_country_code"]
+        == "GB"
+    )
+    assert (
+        parse("schema=5 wifi_country_code=SECRET | event=diagnostic_context")["wifi_country_code"]
+        is None
+    )
+    assert parse("schema=4 | event=diagnostic_context")["wifi_country_code"] is None

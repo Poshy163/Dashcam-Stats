@@ -161,3 +161,17 @@ cost must be checked on the actual head unit after deployment.
 
 References: [ss TCP_INFO fields](https://man7.org/linux/man-pages/man8/ss.8.html) and
 [Linux wireless station statistics](https://wireless.docs.kernel.org/en/latest/en/users/documentation/iw.html).
+
+Live compatibility check on 14 September: this firmware has `ss` but no standard `iw`.
+The isolated link probe completed in 300-350 ms per pass, with actual gaps of 2.97-3.07 s.
+Without active CarPlay, `wlan2` was absent and peer/radio values correctly stayed unavailable.
+The vendor `iwnpi` getters were inspected separately; their channel result did not match
+the active station channel, so those values are not promoted into production evidence.
+
+Decoder summaries additionally retain numeric width/height, profile/level, flush count,
+resolution-change count, surface-change count and largest used input size. The UI displays
+resolution and flushes. Today’s afternoon and smooth evening reports both used the Unisoc
+AVC decoder at1920x720, profile1/level4096, zero flushes and one resolution-change count;
+there was no resolution/profile difference to explain their different latency.
+`wifi_country_code` retains only a two-letter code reported by Android. The live firmware
+reported GB for its driver and boot default. No country-code mutation was performed.
