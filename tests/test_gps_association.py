@@ -286,7 +286,7 @@ class TestAgainstTheDatabase:
             return FakeDetector(), FakeOCR()
 
         async def fake_iter_frames(path, **kwargs):
-            yield 0.0, np.full((480, 640, 3), 120, dtype=np.uint8)
+            yield 40.0, np.full((480, 640, 3), 120, dtype=np.uint8)
 
         monkeypatch.setattr(stages, "_shared_plate_models", fake_models)
         monkeypatch.setattr(stages, "iter_frames", fake_iter_frames)
@@ -380,7 +380,7 @@ class TestAgainstTheDatabase:
             return FakeDetector(), FakeOCR()
 
         async def fake_iter_frames(path, **kwargs):
-            yield 0.0, np.full((480, 640, 3), 120, dtype=np.uint8)
+            yield 92.0, np.full((480, 640, 3), 120, dtype=np.uint8)
 
         monkeypatch.setattr(stages, "_shared_plate_models", fake_models)
         monkeypatch.setattr(stages, "iter_frames", fake_iter_frames)

@@ -17,6 +17,8 @@ So this drives the real stage body. It needs no ffmpeg, no model and no GPU.
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import numpy as np
 import pytest
 from sqlalchemy import select
@@ -215,6 +217,36 @@ class TestTheVehicleCropsAreActuallyWritten:
             path = app_config.media_dir / track.crop_path
             assert path.is_file(), f"the row points at {track.crop_path}, which is not on disk"
             assert path.stat().st_size > 0
+
+    async def test_plate_source_coordinates_survive_disabled_timeline_storage(
+        self, db_session, clip_with_a_vehicle
+    ):
+        from app.core.settings_service import get_settings_service
+        from app.db.models import Detection
+
+        settings = get_settings_service()
+        await settings.set_many(
+            {
+                "advanced.keep_sparse_detections": False,
+                "plates.enabled": True,
+                "plates.max_ocr_per_track": 3,
+            }
+        )
+        recording = Recording(
+            rel_path="retained.ts", filename="retained.ts", width=64, height=64, duration_s=3
+        )
+        db_session.add(recording)
+        await db_session.flush()
+        assert (await stages.stage_detect(db_session, recording)).ok
+        offsets = list(
+            (
+                await db_session.execute(
+                    select(Detection.t_offset_s).order_by(Detection.t_offset_s)
+                )
+            ).scalars()
+        )
+        assert len(offsets) == 3
+        assert all(b - a >= 0.5 for a, b in pairwise(offsets))
 
 
 class TestMotionGating:

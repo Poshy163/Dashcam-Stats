@@ -61,7 +61,7 @@ async def test_coverage_counts_stale_failed_and_excluded_recordings(db_session):
         )
     await db_session.flush()
     result = await plate_quality(db_session)
-    assert result["revision"] == "plates-v4"
+    assert result["revision"] == "plates-v5"
     rear = result["cameras"][0]
     assert rear["eligible_recordings"] == 4
     assert rear["current_recordings"] == 1

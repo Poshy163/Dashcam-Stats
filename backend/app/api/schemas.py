@@ -230,6 +230,10 @@ class PlateObservationOut(ApiModel):
     orientation_method: str | None = None
     orientation_margin: float | None = None
     normalisation_substitutions: int | None = None
+    recognition_method: str | None = None
+    confirmation: str | None = None
+    frames_checked: int | None = None
+    supporting_frame_offsets_s: list[float] | None = None
 
 
 class VehicleOut(ApiModel):

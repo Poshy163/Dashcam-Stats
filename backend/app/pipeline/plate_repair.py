@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_config
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
+from app.db.backup import ensure_plate_repair_backup
 from app.db.models import (
     BULK_PRIORITY,
+    Detection,
     JobKind,
     JobState,
     PlateObservation,
@@ -19,6 +23,7 @@ from app.db.models import (
     Recording,
     RecordingState,
     StageState,
+    TrackedObject,
 )
 from app.pipeline.revisions import CURRENT_REVISIONS
 
@@ -120,14 +125,56 @@ async def queue_plate_repairs(session: AsyncSession, *, limit: int = 200) -> int
     )
     if not recordings:
         return 0
-    await invalidate_recordings(session, [r.id for r in recordings], ["plates"])
+    if not get_config().database_url:
+        await asyncio.to_thread(ensure_plate_repair_backup, CURRENT_REVISIONS["plates"])
+    # Older installs could disable sparse detection storage. Re-reading the same saved
+    # JPEG is not a multi-frame repair: rebuild just those recordings' missing tracks.
+    sample_count = (
+        select(func.count(Detection.id))
+        .where(Detection.tracked_object_id == TrackedObject.id)
+        .correlate(TrackedObject)
+        .scalar_subquery()
+    )
+    alternative_to_saved = (
+        select(Detection.id)
+        .where(
+            Detection.tracked_object_id == TrackedObject.id,
+            func.abs(Detection.t_offset_s - TrackedObject.best_frame_offset_s) >= 0.5,
+        )
+        .exists()
+    )
+    missing_samples = set(
+        (
+            await session.execute(
+                select(TrackedObject.recording_id)
+                .where(
+                    TrackedObject.recording_id.in_([r.id for r in recordings]),
+                    TrackedObject.class_label.in_(["car", "truck", "bus", "motorcycle"]),
+                    TrackedObject.frame_count > 1,
+                    TrackedObject.last_seen_offset_s - TrackedObject.first_seen_offset_s >= 0.5,
+                    or_(
+                        sample_count == 0,
+                        and_(
+                            TrackedObject.last_seen_offset_s - TrackedObject.first_seen_offset_s
+                            >= 2,
+                            sample_count < 2,
+                            ~alternative_to_saved,
+                        ),
+                    ),
+                )
+                .distinct()
+            )
+        ).scalars()
+    )
     for recording in recordings:
+        stages = ["detection", "plates"] if recording.id in missing_samples else ["plates"]
+        await invalidate_recordings(session, [recording.id], stages)
         recording.probe_json = {**(recording.probe_json or {}), "plate_repair_requested": target}
         await queue.enqueue(
             session,
             recording.id,
             kind=JobKind.REPROCESS,
-            stages=["plates"],
+            stages=stages,
             priority=BULK_PRIORITY,
             force=True,
         )

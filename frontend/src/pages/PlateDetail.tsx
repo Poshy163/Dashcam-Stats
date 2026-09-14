@@ -219,8 +219,11 @@ export default function PlateDetail() {
                   )}
                   {o.voteCount > 1 && (
                     <span className="badge bg-surface-sunken text-content-muted">
-                      {o.voteCount} reads agreed
+                      {o.voteCount} {o.recognitionMethod === 'distinct-frames-v1' ? 'distinct frames' : 'reads'} agreed
                     </span>
+                  )}
+                  {o.confirmation === 'single_frame' && (
+                    <span className="badge bg-surface-sunken text-content-muted">Single-frame read</span>
                   )}
                 </div>
                 <div className="tabular flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-content-muted">

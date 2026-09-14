@@ -537,7 +537,9 @@ SETTINGS: tuple[SettingDef, ...] = (
         "float",
         0.3,
         "plates",
-        "Readings below this are not stored at all.",
+        "Readings below this are never stored. Additional evidence gates apply: named "
+        "single-frame reads need 0.92, named repeated reads 0.80, and generic formats "
+        "need two distinct frames at 0.90 or above.",
         minimum=0.0,
         maximum=1.0,
         requires="plates.enabled",
@@ -571,12 +573,13 @@ SETTINGS: tuple[SettingDef, ...] = (
     ),
     SettingDef(
         "plates.max_ocr_per_track",
-        "Maximum plate candidates per vehicle",
+        "Maximum distinct frames per vehicle",
         "int",
         5,
         "plates",
-        "Inspect up to this many plate boxes in the vehicle's best saved image. Each "
-        "candidate is read in both orientations. This is not a count of independent frames.",
+        "Inspect this many different source frames per vehicle, at least half a second "
+        "apart. Up to two plate boxes per frame are read in both orientations; only "
+        "different timestamps count towards confirmation.",
         minimum=1,
         maximum=30,
         requires="plates.enabled",
@@ -970,7 +973,8 @@ SETTINGS: tuple[SettingDef, ...] = (
         True,
         "advanced",
         "Keep sampled per-frame detection rows to drive the recording timeline. Tracks are "
-        "always kept regardless.",
+        "always kept regardless. Plate analysis also retains a bounded set of source "
+        "coordinates when this is off, so later plate repair remains possible.",
     ),
     SettingDef(
         "advanced.detection_store_stride",

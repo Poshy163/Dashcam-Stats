@@ -63,6 +63,7 @@ class PlateVote:
     vote_count: int
     best: PlateReading
     alternatives: list[tuple[str, int]] = field(default_factory=list)
+    supporting_offsets: list[float] = field(default_factory=list)
 
 
 class PlateDetector:

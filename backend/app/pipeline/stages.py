@@ -27,6 +27,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.detector import Detection2D, ObjectDetector
 from app.ai.normalise_au import normalise, patterns_for_region
+from app.ai.plate_frames import (
+    RECOGNITION_METHOD,
+    VehicleView,
+    sampling_rate,
+    select_vehicle_views,
+    temporal_vote,
+)
 from app.ai.plates import (
     PlateDetector,
     PlateOCR,
@@ -34,9 +41,7 @@ from app.ai.plates import (
     crop_with_margin,
     plate_box_in_frame,
     select_ocr_candidates,
-    vote_track_plate,
 )
-from app.ai.runtime import describe_runtime
 from app.ai.tracker import ByteTracker
 from app.config import get_config
 from app.core.logging import get_logger
@@ -1583,24 +1588,35 @@ async def stage_detect(
         session.add_all(objects)
         await session.flush()
 
-        if keep_detections:
-            for (track, _located, _crop), stored in zip(prepared, objects):
-                for index, (offset, confidence, x, y, w, h) in enumerate(track.samples):
-                    if index % stride:
-                        continue
-                    session.add(
-                        Detection(
-                            tracked_object_id=stored.id,
-                            recording_id=recording.id,
-                            t_offset_s=offset,
-                            class_label=track.class_label,
-                            confidence=confidence,
-                            x=x,
-                            y=y,
-                            w=w,
-                            h=h,
-                        )
+        for (track, _located, _crop), stored in zip(prepared, objects):
+            retained = set()
+            if not keep_detections and settings.get_nowait("plates.enabled"):
+                retained = {
+                    v.offset_s
+                    for v in select_vehicle_views(
+                        [
+                            VehicleView(offset, (x, y, x + w, y + h), confidence)
+                            for offset, confidence, x, y, w, h in track.samples
+                        ],
+                        int(settings.get_nowait("plates.max_ocr_per_track")),
                     )
+                }
+            for index, (offset, confidence, x, y, w, h) in enumerate(track.samples):
+                if not ((keep_detections and index % stride == 0) or offset in retained):
+                    continue
+                session.add(
+                    Detection(
+                        tracked_object_id=stored.id,
+                        recording_id=recording.id,
+                        t_offset_s=offset,
+                        class_label=track.class_label,
+                        confidence=confidence,
+                        x=x,
+                        y=y,
+                        w=w,
+                        h=h,
+                    )
+                )
 
     await write_with_retry(session, write, what=f"store detections for {recording.filename}")
 
@@ -1762,14 +1778,11 @@ class _PlateHit:
     vote: object
     #: Kept only when crops are being saved, since it is the one large field here.
     vehicle_crop: np.ndarray | None
+    frames_checked: int = 1
 
 
-# New detections carry a stored vehicle crop and do not decode here. Older/incomplete rows
-# still need a frame from a half-second window as a compatibility fallback. The general
-# decoder timeout is deliberately fifteen minutes for long sequential reads, but applying
-# it to that tiny random seek lets one damaged GOP monopolise the shared VAAPI slot. Normal
-# seeks complete in well under a second; fifteen seconds turns an unreadable candidate into
-# a skipped frame rather than a stopped queue.
+# A stalled source read must release the decoder and remain a visible failed repair.
+# This is a per-frame pipe timeout, not a deadline for the entire chronological pass.
 _PLATE_FRAME_SEEK_TIMEOUT_S = 15.0
 
 
@@ -1859,116 +1872,172 @@ async def stage_plates(
     stored_crops = 0
     decoded_fallbacks = 0
     missing_frames = 0
-    footage_path: Path | None = None
-    for index, track in enumerate(tracks):
-        if track.best_frame_offset_s is None or not track.best_bbox:
-            continue
-        if progress:
-            progress("plates", (index + 1) / max(1, len(tracks)))
-
-        bx1, by1, bx2, by2 = track.best_bbox
-        vehicle = _as_detection(bx1, by1, bx2, by2, track.class_label, track.confidence_max)
-        # Detection already selected and saved the sharpest crop for this track. Reusing it
-        # avoids one random NFS seek and one VAAPI process lifecycle per vehicle. On the live
-        # corpus that was 143 launches for a 60-second clip, and the repeated initialisation
-        # eventually made iHD report the decoder busy and sent the remainder to software.
-        vehicle_crop = await _load_jpeg(track.crop_path)
-        if vehicle_crop is not None:
-            stored_crops += 1
-        else:
-            frame = None
-            if footage_path is None:
-                # Resolution of a hard NFS path can itself block; keep even the compatibility
-                # fallback away from Uvicorn's event loop.
-                footage_path = await asyncio.to_thread(resolve_footage_path, recording.rel_path)
-            try:
-                # Closed rather than abandoned: this breaks after one frame, and an
-                # abandoned decoder keeps its ffmpeg child -- and the Intel media slot it
-                # sits behind -- alive until the event loop finalises the generator.
-                async with contextlib.aclosing(
-                    iter_frames(
-                        footage_path,
-                        start=track.best_frame_offset_s,
-                        duration=0.5,
-                        fps=None,
-                        frame_size=(recording.width, recording.height)
-                        if recording.width and recording.height
-                        else None,
-                        hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
-                        codec=recording.video_codec,
-                        timeout=_PLATE_FRAME_SEEK_TIMEOUT_S,
-                        on_decoder=decoders_used.add,
-                    )
-                ) as seek:
-                    async for _, decoded in seek:
-                        frame = decoded
-                        break
-            except FFmpegError:
-                pass
-            if frame is not None:
-                # Exact track box, matching the coordinates persisted beside the crop. The
-                # previous 2% expansion also made plate_box_in_frame subtly mis-register.
-                vehicle_crop = crop_with_margin(
-                    frame,
-                    (vehicle.x, vehicle.y, vehicle.x + vehicle.w, vehicle.y + vehicle.h),
-                    0.0,
-                )
-                decoded_fallbacks += 1
-        if vehicle_crop is None or vehicle_crop.size == 0:
-            missing_frames += 1
-            continue
-
-        boxes = await detector.detect(vehicle_crop, min_width_px=min_width)
-        readings: list[PlateReading] = []
-        for plate_box, confidence in boxes:
-            frame_box = plate_box_in_frame(vehicle, plate_box)
-            # The detector's coordinates are relative to vehicle_crop; crop from that same
-            # image. Reapplying them to a separately expanded full-frame box shifted crops.
-            crop = crop_with_margin(vehicle_crop, plate_box)
-            if crop is None:
-                continue
-            readings.append(
-                PlateReading(
-                    raw_text="",
-                    ocr_confidence=0.0,
-                    detection_confidence=confidence,
-                    bbox=frame_box,
-                    crop=crop,
-                    vehicle_crop=vehicle_crop,
-                    offset_s=track.best_frame_offset_s,
-                )
+    checked: dict[int, int] = {track.id: 0 for track in tracks}
+    readings_by_track: dict[int, list[PlateReading]] = {track.id: [] for track in tracks}
+    views_by_track: dict[int, list[VehicleView]] = {track.id: [] for track in tracks}
+    rows = (
+        await session.execute(
+            select(
+                Detection.tracked_object_id,
+                Detection.t_offset_s,
+                Detection.x,
+                Detection.y,
+                Detection.w,
+                Detection.h,
+                Detection.confidence,
+            ).where(Detection.recording_id == recording.id)
+        )
+    ).all()
+    for tid, offset, x, y, width, height, confidence in rows:
+        if tid in views_by_track:
+            views_by_track[tid].append(
+                VehicleView(offset, (x, y, x + width, y + height), confidence)
             )
 
-        for reading in select_ocr_candidates(readings, max_reads):
+    async def read_view(track: TrackedObject, view: VehicleView, vehicle_crop: np.ndarray) -> None:
+        nonlocal rejected
+        checked[track.id] += 1
+        boxes = await detector.detect(vehicle_crop, min_width_px=min_width)
+        candidates: list[PlateReading] = []
+        vehicle = _as_detection(*view.bbox, track.class_label, view.confidence)
+        for plate_box, confidence in boxes:
+            # A plate cut by the vehicle crop cannot supply all its characters. The
+            # reported Jeep passed the old width gate while losing its leading glyphs.
+            if plate_box[0] <= 0.001 or plate_box[2] >= 0.999:
+                continue
+            crop = crop_with_margin(vehicle_crop, plate_box)
+            if crop is not None:
+                candidates.append(
+                    PlateReading(
+                        raw_text="",
+                        ocr_confidence=0.0,
+                        detection_confidence=confidence,
+                        bbox=plate_box_in_frame(vehicle, plate_box),
+                        crop=crop,
+                        offset_s=view.offset_s,
+                    )
+                )
+        # At most two physical plate boxes per view. Neither box nor orientation
+        # attempts count as additional independent frames.
+        for reading in select_ocr_candidates(candidates, 2):
             text, confidence = await orientation.read(ocr, reading.crop, region=region_setting)
-            reading.raw_text = text
-            reading.ocr_confidence = confidence
+            reading.raw_text, reading.ocr_confidence = text, confidence
             reading.mirrored = orientation.last_read_mirrored
             reading.orientation_margin = orientation.last_margin
+            if (
+                has_plate_patterns
+                and not normalise(text, region=region_setting).matched
+                and not store_unmatched
+            ):
+                rejected += 1
+                continue
+            if confidence < max(min_store, 0.8):
+                continue
+            # Keep previews bounded; OCR and plate previews retain source pixels.
+            if save_crops:
+                import cv2
 
-        vote = vote_track_plate(readings)
-        if vote is None or vote.ocr_confidence < min_store:
-            continue
+                h, w = vehicle_crop.shape[:2]
+                scale = min(1.0, 640 / max(h, w))
+                reading.vehicle_crop = (
+                    cv2.resize(vehicle_crop, (max(1, round(w * scale)), max(1, round(h * scale))))
+                    if scale < 1
+                    else vehicle_crop
+                )
+            readings_by_track[track.id].append(reading)
 
-        result = normalise(vote.text, region=region_setting)
-        if has_plate_patterns and not result.matched and not store_unmatched:
-            # Confidence alone was the only gate, and confidence measures how sure the
-            # recogniser is that it read the characters correctly -- not whether what it
-            # read is a registration. It was completely right about "KEECE" on a door
-            # decal (0.998), "ARROW" on a road sign (0.975) and "TOYOTA" on a tailgate
-            # (0.929), and each became a plate card. Roughly half the plate database was
-            # signage. The catalogue already knows the answer; nothing was asking it.
-            rejected += 1
-            continue
-
-        hits.append(
-            _PlateHit(
-                track=track,
-                result=result,
-                vote=vote,
-                vehicle_crop=vehicle_crop if save_crops else None,
+    pending: list[tuple[VehicleView, TrackedObject]] = []
+    for track in tracks:
+        baseline = None
+        if track.best_frame_offset_s is not None and track.best_bbox:
+            baseline = VehicleView(
+                track.best_frame_offset_s, tuple(track.best_bbox), track.confidence_max
             )
+            views_by_track[track.id].append(baseline)
+        views = select_vehicle_views(views_by_track[track.id], max_reads, baseline=baseline)
+        if not views:
+            missing_frames += 1
+            continue
+        for view in views:
+            if (
+                view.offset_s == track.best_frame_offset_s
+                and tuple(track.best_bbox or ()) == view.bbox
+            ):
+                image = await _load_jpeg(track.crop_path)
+                if image is not None:
+                    stored_crops += 1
+                    await read_view(track, view, image)
+                    continue
+            pending.append((view, track))
+
+    if pending:
+        # One chronological decode per recording, not five random NFS/VAAPI seeks per
+        # track. Only selected views enter the plate models; other frames are discarded.
+        pending.sort(key=lambda item: item[0].offset_s)
+        fps = sampling_rate([view for view, _ in pending])
+        tolerance = 0.5 / fps + 1e-6
+        path = await asyncio.to_thread(resolve_footage_path, recording.rel_path)
+        cursor = 0
+        try:
+            async with contextlib.aclosing(
+                iter_frames(
+                    path,
+                    fps=fps,
+                    duration=pending[-1][0].offset_s + 1 / fps,
+                    frame_size=(recording.width, recording.height)
+                    if recording.width and recording.height
+                    else None,
+                    hwaccel="auto" if await settings.hardware_acceleration() else "cpu",
+                    codec=recording.video_codec,
+                    timeout=_PLATE_FRAME_SEEK_TIMEOUT_S,
+                    on_decoder=decoders_used.add,
+                )
+            ) as frames:
+                async for offset, frame in frames:
+                    while (
+                        cursor < len(pending) and pending[cursor][0].offset_s <= offset + tolerance
+                    ):
+                        view, track = pending[cursor]
+                        cursor += 1
+                        if abs(view.offset_s - offset) > tolerance:
+                            missing_frames += 1
+                            continue
+                        image = crop_with_margin(frame, view.bbox, 0.0)
+                        if image is None:
+                            missing_frames += 1
+                            continue
+                        decoded_fallbacks += 1
+                        # Record the actual sampled frame time, including unusual old
+                        # clocks that cannot be represented exactly at <=30 FPS.
+                        await read_view(
+                            track, VehicleView(offset, view.bbox, view.confidence), image
+                        )
+                    if progress:
+                        progress("plates", cursor / len(pending))
+                    if cursor == len(pending):
+                        break
+        except FFmpegError as exc:
+            raise StageError(f"plate source-frame decode failed: {exc}") from exc
+        missing_frames += len(pending) - cursor
+    if missing_frames:
+        # Never delete good historical observations or stamp a completed revision after
+        # an incomplete source read. Normal worker retries/failure reporting own recovery.
+        raise StageError(
+            f"plate revalidation could not read {missing_frames} selected vehicle frames"
         )
+
+    for track in tracks:
+        readings = readings_by_track[track.id]
+        vote = temporal_vote(
+            readings,
+            region=region_setting,
+            min_confidence=min_store,
+            store_unmatched=store_unmatched,
+        )
+        if vote is None:
+            continue
+        result = normalise(vote.best.raw_text, region=region_setting)
+        hits.append(_PlateHit(track, result, vote, vote.best.vehicle_crop, checked[track.id]))
 
     # Recording-wide orientation is diagnostic only; previews follow each OCR reading.
     orientation.resolve()
@@ -1979,7 +2048,7 @@ async def stage_plates(
     # hundred metres from the frame the plate was legible in -- and the observation then
     # carried that as the place the plate was seen.
     fixes = await _fix_track(session, recording.id)
-    placed = [(hit, fixes.at(float(hit.track.best_frame_offset_s or 0.0))) for hit in hits]
+    placed = [(hit, fixes.at(float(hit.vote.best.offset_s))) for hit in hits]
 
     # Everything below writes, and only what is below. One observation per plate per
     # tracked vehicle, so reprocessing replaces rather than accumulates.
@@ -2025,6 +2094,10 @@ async def stage_plates(
         True,
         stats={
             "observations": stored,
+            "recognition_method": RECOGNITION_METHOD,
+            "vehicle_frames_checked": sum(checked.values()),
+            "multi_frame_observations": sum(hit.vote.vote_count > 1 for hit in hits),
+            "single_frame_observations": sum(hit.vote.vote_count == 1 for hit in hits),
             "tracks": len(tracks),
             # All surfaced deliberately: "0 plates" is otherwise indistinguishable from
             # "read plenty and refused them all", the orientation vote is the kind of
@@ -2042,7 +2115,7 @@ async def stage_plates(
                 if "vaapi" in decoders_used
                 else None
             ),
-            "device": describe_runtime().get("device"),
+            "device": "CPU",
             **orientation.describe(),
         },
     )
@@ -2105,7 +2178,7 @@ async def _write_observations(
             if vehicle_preview is not None:
                 vehicle_crop_path = paths[-1]
 
-        offset = float(track.best_frame_offset_s or 0.0)
+        offset = float(vote.best.offset_s)
         session.add(
             PlateObservation(
                 plate_id=plate.id,
@@ -2131,6 +2204,10 @@ async def _write_observations(
                 # frame, so the box and the picture can never be read as being in the same
                 # coordinate space by mistake.
                 bbox={
+                    "recognition_method": RECOGNITION_METHOD,
+                    "supporting_frame_offsets_s": vote.supporting_offsets or [offset],
+                    "frames_checked": hit.frames_checked,
+                    "confirmation": "multi_frame" if vote.vote_count > 1 else "single_frame",
                     "box": list(vote.best.bbox),
                     "mirrored": mirrored,
                     "orientation_method": "per-crop-dual-ocr-v1",

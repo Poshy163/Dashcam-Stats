@@ -96,6 +96,20 @@ def create_pre_migration_backup(from_revision: str, to_revision: str) -> Path:
     return target
 
 
+def ensure_plate_repair_backup(revision: str) -> Path:
+    """One atomically published recovery snapshot before each plate algorithm upgrade."""
+    if not revision or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in revision):
+        raise ValueError("Invalid plate revision")
+    target = backup_dir() / f"before-{revision}.db"
+    if target.is_file():
+        return target
+    # Reuse the validated, fsynced online-backup implementation. Publishing a stable
+    # name means restarts/sweeps do not create another gigabyte-sized backup each time.
+    temporary = create_pre_migration_backup("plate-repair", revision)
+    os.replace(temporary, target)
+    return target
+
+
 def stage_restore(data: bytes) -> Path:
     directory = backup_dir()
     temporary = directory / "restore-upload.tmp"

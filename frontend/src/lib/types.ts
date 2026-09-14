@@ -218,6 +218,10 @@ export interface PlateObservation {
   ocrConfidence: number
   detectionConfidence: number
   voteCount: number
+  recognitionMethod?: string | null
+  confirmation?: 'multi_frame' | 'single_frame' | null
+  framesChecked?: number | null
+  supportingFrameOffsetsS?: number[] | null
   lat: number | null
   lon: number | null
   plateCropPath: string | null

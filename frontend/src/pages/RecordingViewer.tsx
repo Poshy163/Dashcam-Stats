@@ -641,6 +641,8 @@ export default function RecordingViewer() {
                       <PlateText text={observation.normalisedText} confidence={observation.ocrConfidence} />
                       <div className="tabular text-2xs text-content-faint">
                         {formatClock(observation.tOffsetS)}
+                        {observation.confirmation === 'multi_frame' && ` · ${observation.voteCount} frames agreed`}
+                        {observation.confirmation === 'single_frame' && ' · single-frame read'}
                       </div>
                     </button>
                     <Link to={`/plates/${observation.plateId}`} className="text-xs text-accent">

@@ -411,7 +411,7 @@ class TestPlateStageWriteLock:
                     duration_s=1.0,
                     frame_count=10,
                     best_frame_offset_s=float(index),
-                    best_bbox=[10, 10, 110, 110],
+                    best_bbox=[0.05, 0.05, 0.55, 0.55],
                 )
             )
         await db_session.flush()
@@ -453,7 +453,8 @@ class TestPlateStageWriteLock:
                     observed["wrote"] = True
                 except Exception as exc:
                     observed["error"] = f"{type(exc).__name__}: {exc}"
-            yield 0.0, np.zeros((200, 200, 3), dtype=np.uint8)
+            for offset in [0.0, 1.0, 2.0]:
+                yield offset, np.zeros((200, 200, 3), dtype=np.uint8)
 
         monkeypatch.setattr(stages, "_shared_plate_models", fake_models)
         monkeypatch.setattr(stages, "iter_frames", fake_iter_frames)
@@ -464,12 +465,12 @@ class TestPlateStageWriteLock:
             result = await asyncio.wait_for(stages.stage_plates(session, rec), timeout=30)
 
         assert result.ok, result.detail
-        assert seen_tracks["count"] == 3, "the loop did not run over every track"
-        assert observed["decode_timeouts"] == [stages._PLATE_FRAME_SEEK_TIMEOUT_S] * 3, (
+        assert seen_tracks["count"] == 1, "plate source reads must share one chronological decode"
+        assert observed["decode_timeouts"] == [stages._PLATE_FRAME_SEEK_TIMEOUT_S], (
             "a half-second plate seek inherited the fifteen-minute full-decode timeout; "
             "one bad GOP can hold VAAPI and stop every worker behind it"
         )
-        assert observed["frame_sizes"] == [(1920, 1080)] * 3, (
+        assert observed["frame_sizes"] == [(1920, 1080)], (
             "the plates stage ignored geometry already stored by metadata and will run "
             "ffprobe once per vehicle against the network share"
         )

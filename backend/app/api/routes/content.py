@@ -297,6 +297,11 @@ def _observation_out(obs: PlateObservation, filename: str | None, camera: str | 
     data.recording_filename = filename
     data.camera_name = camera
     metadata = obs.bbox or {}
+    if metadata.get("recognition_method") == "distinct-frames-v1":
+        data.recognition_method = metadata["recognition_method"]
+        data.confirmation = metadata.get("confirmation")
+        data.frames_checked = metadata.get("frames_checked")
+        data.supporting_frame_offsets_s = metadata.get("supporting_frame_offsets_s")
     # Legacy preview mirroring did not necessarily match OCR. Only v4 records the actual
     # reading orientation, so do not present old preview metadata as verified OCR evidence.
     if metadata.get("orientation_method") == "per-crop-dual-ocr-v1":
