@@ -140,6 +140,11 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
   const displayWait = maxKnown(samples.map((s) => s.readyToPresentMaxMs ?? null))
   const receiveQueue = maxKnown(diagnosticRows.map((s) => s.zlinkRxQueueBytes ?? null))
   const tcpRtt = maxKnown(diagnosticRows.map((s) => s.zlinkTcpRttMaxMs ?? null))
+  const linkRows = events.filter((e) => e.kind === 'wireless_link')
+  const peerQueue = maxKnown(linkRows.map((e) => e.peerRxQueueBytes))
+  const recentPeerRtt = maxKnown(linkRows.map((e) => e.peerRecentRttMaxMs))
+  const linkGap = maxKnown(linkRows.map((e) => e.linkPollGapMs))
+  const radioSamples = linkRows.filter((e) => e.apSignalMinDbm != null).length
   const queuedFrames = maxKnown(diagnosticRows.map((s) => s.zlinkQueuedFramesMax ?? null))
   const missingOverlap = samples.filter((s) => s.ringOverlap === 0).length
   const pollGap = maxKnown(diagnosticRows.map((s) => s.framePollGapMs ?? null))
@@ -241,6 +246,22 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
             {' '}TCP statistics cover ZLink’s established sockets; they do not identify which carries video.
             Unavailable means Android did not expose a measurement. CPU, memory and I/O context is retained in the diagnostic log.
           </p>
+          {linkRows.length > 0 && (
+            <div className="mt-3 border-t border-border pt-3">
+              <div className="font-medium">Hotspot connection diagnostics</div>
+              <p className="mt-2 text-content-muted">
+                Largest unread peer queue: {peerQueue == null ? 'unavailable' : `${(peerQueue / 1024).toFixed(1)} KiB`}.
+                {' '}Highest RTT on recently receiving connections: {recentPeerRtt == null ? 'unavailable' : `${recentPeerRtt.toFixed(1)} ms`}.
+              </p>
+              <p className="mt-2 text-xs text-content-muted">
+                {linkRows.length} captures; {radioSamples} include Wi-Fi signal measurements.
+                {' '}Longest polling interval: {linkGap == null ? 'unavailable' : `${(linkGap / 1000).toFixed(2)} s`}.
+                {' '}Peer measurements cover ZLink IPv4 TCP connections to resolved hotspot neighbours, excluding local sockets.
+                They may include control traffic and cannot measure the age of the picture from the phone.
+                Radio counters, receive activity and capture durations are available in the diagnostic log.
+              </p>
+            </div>
+          )}
         </div>
       )}
 

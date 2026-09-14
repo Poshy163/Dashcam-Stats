@@ -297,6 +297,21 @@ def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
         "ring_overlap",
         "ring_gap_ms",
         "surface_unchanged_ms",
+        "peer_tcp_sockets",
+        "peer_rx_queue_bytes",
+        "peer_tx_queue_bytes",
+        "peer_tcp_rtt_max_ms",
+        "peer_recent_rtt_max_ms",
+        "peer_receive_age_min_ms",
+        "peer_bytes_received_total",
+        "ap_station_count",
+        "ap_signal_min_dbm",
+        "ap_rx_bitrate_min_mbps",
+        "ap_tx_retries_total",
+        "ap_tx_failed_total",
+        "link_poll_gap_ms",
+        "link_probe_ms",
+        "link_context_age_ms",
     ):
         names[name] = name
     result = {name: _number(fields.get(key)) for name, key in names.items()}

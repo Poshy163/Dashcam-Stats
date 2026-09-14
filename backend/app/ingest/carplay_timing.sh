@@ -43,7 +43,7 @@ prev_cticks=0; prev_ct=0; prev_cpid=
 slow_pid=; slow_last=0; last_active=0
 FRAME_CONTEXT=/data/local/tmp/.dashcam_cpt_context_$SESSION
 FRAME_SEQ=/data/local/tmp/.dashcam_cpt_frame_seq_$SESSION
-frame_pid=
+frame_pid=; link_pid=
 clock_ms() { awk '{printf "%.0f",$1*1000}' /proc/uptime; }
 # Deadline scheduling subtracts work time. After an overrun, skip missed deadlines
 # instead of issuing a burst of catch-up Binder calls.
@@ -55,6 +55,7 @@ deadline_delay() {
 }
 cleanup() {
   [ -n "$frame_pid" ] && kill "$frame_pid" 2>/dev/null
+  [ -n "$link_pid" ] && kill "$link_pid" 2>/dev/null
   [ -n "$slow_pid" ] && kill "$slow_pid" 2>/dev/null
   rm -f "$FRAME_CONTEXT" "$FRAME_CONTEXT.new" "$FRAME_SEQ"
 }
@@ -105,7 +106,7 @@ diagnostic_context() {
     start_ticks=$(sed 's/.*) //' /proc/$zpid/stat 2>/dev/null | awk '{print $20}')
     sched="$sched zlink_start_ticks=${start_ticks:-na}"
   fi
-  diag="schema=4 mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
+  diag="schema=5 mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
 }
 tcp_summary() {
   # ss exposes TCP_INFO per socket. Match the exact app UID on the socket header,
@@ -132,6 +133,87 @@ tcp_summary() {
       printf "zlink_tcp_info_sockets=%s zlink_tcp_rtt_max_ms=%s zlink_tcp_rto_max_ms=%s zlink_tcp_retrans_pending=%s zlink_tcp_retrans_total=%s",
         (ok?n+0:"na"),(ok && nr?rmax:"na"),(ok && no?rto:"na"),(ok && nt?pending:"na"),(ok && nt?total:"na")
     }'
+}
+peer_tcp_summary() {
+  # IPv4 only, exact UID AND a resolved wlan2 neighbour. Addresses exist only in
+  # memory. Idle/control sockets are not evidence of current video round-trip time.
+  awk -v uid="${link_uid:-na}" -v peers="$link_peers" -v ok="$link_ok" '
+    BEGIN {split(peers,p," ");for(i in p)if(p[i]!="")allowed[p[i]]=1}
+    /^State[ \t]+Recv-Q/ {header=1;next}
+    /^[^ \t]/ {
+      selected=0
+      if($1!="ESTAB")next
+      owner=0;for(i=1;i<=NF;i++)if($i=="uid:" uid)owner=1
+      peer=$5;sub(/:[0-9]+$/,"",peer)
+      if(!owner || !(peer in allowed) || $2!~/^[0-9]+$/ || $3!~/^[0-9]+$/)next
+      selected=1;n++;rx+=$2;tx+=$3;next
+    }
+    selected && /^[ \t]/ {
+      rtt=-1;age=-1
+      for(i=1;i<=NF;i++) {
+        if($i~/^rtt:[0-9.]+\/[0-9.]+$/) {split(substr($i,5),r,"/");rtt=r[1]+0;if(!nr || rtt>rmax)rmax=rtt;nr++}
+        if($i~/^lastrcv:[0-9]+$/) {age=substr($i,9)+0;if(!na || age<amin)amin=age;na++}
+        if($i~/^bytes_received:[0-9]+$/) {bytes+=substr($i,16)+0;nb++}
+      }
+      if(age>=0 && age<=1000 && rtt>=0) {if(!ar || rtt>amax)amax=rtt;ar++}
+      selected=0
+    }
+    END {
+      valid=ok==1 && header && uid~/^[0-9]+$/
+      printf "peer_tcp_sockets=%s peer_rx_queue_bytes=%s peer_tx_queue_bytes=%s peer_tcp_rtt_max_ms=%s peer_recent_rtt_max_ms=%s peer_receive_age_min_ms=%s peer_bytes_received_total=%s",
+        (valid?n+0:"na"),(valid?rx+0:"na"),(valid?tx+0:"na"),(valid && nr?rmax:"na"),
+        (valid && ar?amax:"na"),(valid && na?amin:"na"),(valid && nb?sprintf("%.0f",bytes):"na")
+    }'
+}
+station_summary() {
+  # AP-wide station statistics, not a claim that every station is the phone.
+  awk -v ok="$station_ok" '
+    /^Station [0-9a-fA-F:]+ \(on wlan2\)/ {n++;selected=1;next}
+    /^Station / {selected=0;next}
+    selected && $1=="signal:" && $2~/^-?[0-9]+$/ {if(!ns || $2<signal)signal=$2;ns++}
+    selected && $1=="rx" && $2=="bitrate:" && $3~/^[0-9.]+$/ && $4=="MBit/s" {if(!nb || $3<bitrate)bitrate=$3;nb++}
+    selected && $1=="tx" && $2=="retries:" && $3~/^[0-9]+$/ {retries+=$3;nr++}
+    selected && $1=="tx" && $2=="failed:" && $3~/^[0-9]+$/ {failed+=$3;nf++}
+    END {
+      printf "ap_station_count=%s ap_signal_min_dbm=%s ap_rx_bitrate_min_mbps=%s ap_tx_retries_total=%s ap_tx_failed_total=%s",
+        (ok==1?n+0:"na"),(ok==1 && ns?signal:"na"),(ok==1 && nb?bitrate:"na"),
+        (ok==1 && nr?sprintf("%.0f",retries):"na"),(ok==1 && nf?sprintf("%.0f",failed):"na")
+    }'
+}
+link_loop() {
+  trap - EXIT
+  link_seq=0; link_previous=0; link_deadline=$(clock_ms)
+  while :; do
+    link_start=$(clock_ms)
+    if [ -r "$FRAME_CONTEXT" ]; then
+      { IFS= read -r active; IFS= read -r context_ms; IFS= read -r head; } < "$FRAME_CONTEXT"
+      if [ "$active" = 1 ]; then
+        link_zpid=$(pidof com.zjinnova.zlink 2>/dev/null | cut -d" " -f1)
+        link_uid=na
+        [ -n "$link_zpid" ] && link_uid=$(awk "/^Uid:/ {print \$2}" /proc/$link_zpid/status 2>/dev/null)
+        neighbour_rows=$(timeout 1 ip -4 neigh show dev wlan2 2>/dev/null); neighbour_rc=$?
+        # Keep resolved neighbours only. Failed/absent lookups cannot identify a peer.
+        link_peers=$(printf '%s\n' "$neighbour_rows" | awk '$1~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $0~/ lladdr / && $NF!="FAILED" && $NF!="INCOMPLETE" {printf "%s ",$1}')
+        socket_rows=$(timeout 1 ss -4tine 2>/dev/null); socket_rc=$?
+        link_ok=0; [ "$neighbour_rc" = 0 ] && [ "$socket_rc" = 0 ] && link_ok=1
+        peer_stats=$(printf '%s\n' "$socket_rows" | peer_tcp_summary)
+        station_rows=$(timeout 1 iw dev wlan2 station dump 2>/dev/null); station_rc=$?
+        station_ok=0; [ "$station_rc" = 0 ] && station_ok=1
+        station_stats=$(printf '%s\n' "$station_rows" | station_summary)
+        link_gap=na; [ "$link_previous" -gt 0 ] && link_gap=$((link_start-link_previous))
+        link_previous=$link_start; link_seq=$((link_seq+1))
+        message="sample=$SESSION-link-$link_seq $head | event=wireless_link link_poll_gap_ms=$link_gap link_probe_ms=$(($(clock_ms)-link_start)) link_context_age_ms=$((link_start-context_ms)) $peer_stats $station_stats"
+        printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$message" >> "$LOG"
+        log -p "$PRIO" -t "$TAG" "$message" 2>/dev/null
+        unset socket_rows neighbour_rows station_rows link_peers
+      else
+        link_previous=0
+      fi
+    fi
+    set -- $(deadline_delay "$link_deadline" "$(clock_ms)" 3000)
+    link_deadline=$1
+    sleep "$2"
+  done
 }
 surface_queue_summary() {
   awk '
@@ -218,7 +300,7 @@ slow_diagnostics() {
 }
 emit_slow() {
   slow_seq=$((slow_seq+1))
-  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=4 | $1"
+  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=5 | $1"
   printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$message" >> "$LOG"
   log -p "$PRIO" -t "$TAG" "$message" 2>/dev/null
 }
@@ -453,7 +535,7 @@ while :; do
   fi
   bt=$(settings get global bluetooth_on 2>/dev/null)
   zlink_proc=0; [ -n "$zpid" ] && zlink_proc=1
-  diag="schema=4"
+  diag="schema=5"
   if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
     diagnostic_context
   fi
@@ -494,6 +576,10 @@ while :; do
   if [ -z "$frame_pid" ] || ! kill -0 "$frame_pid" 2>/dev/null; then
     frame_loop &
     frame_pid=$!
+  fi
+  if [ -z "$link_pid" ] || ! kill -0 "$link_pid" 2>/dev/null; then
+    link_loop &
+    link_pid=$!
   fi
   sleep "$INTERVAL"
 done

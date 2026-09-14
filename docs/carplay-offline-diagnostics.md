@@ -121,3 +121,43 @@ all loads/frame rates, or determine when the iPhone rendered a frame. Frame-work
 and sequence files use `.dashcam_cpt_context_*` / `.dashcam_cpt_frame_seq_*`; normal exit
 cleans them up. Per-layer `.fresh` markers accompany the existing `.dashcam_cpt_seen_*`
 markers and contain only elapsed timestamps.
+
+## Hotspot-peer transport capture (schema 5)
+
+A separate three-second deadline worker now records `wireless_link` events while the
+existing sampler considers capture active. It does not block frame polling. Each of its
+three external probes (`ip`, `ss`, `iw`) has a one-second timeout; missed deadlines are
+skipped. `link_poll_gap_ms`, `link_probe_ms`, and `link_context_age_ms` expose timing and
+age of the inherited ignition/radio context. The parent terminates this worker on exit.
+The existing bounded offline log and parked recovery carry the new events home.
+
+The TCP probe matches **both** ZLink's exact UID and a resolved IPv4 neighbour on `wlan2`.
+It excludes local sockets and other apps. It records socket count, aggregate unread receive
+and pending send queues, received-byte counters, minimum time since a received packet,
+maximum RTT, and maximum RTT among sockets receiving within the previous second.
+This last distinction matters: an idle socket can retain an old RTT indefinitely. The
+legacy app-wide RTT cannot establish that the current phone video path has low delay.
+A recently receiving socket may still carry control traffic; this probe does not identify
+the video stream. IPv6-only peers and UDP video are not covered by these TCP measurements.
+Empty successful probes are distinct from denied, failed, timed-out or unsupported probes.
+Missing TCP_INFO fields remain unavailable. Received-byte totals can fall when sockets
+close; they are not a monotonic counter across sessions.
+
+`iw dev wlan2 station dump` contributes station count, weakest reported receive signal
+(dBm), lowest reported receive PHY bitrate (Mbit/s), and summed AP transmit retry/failure
+counters, when exposed. These are AP-wide, not exclusively the phone. AP transmit retries
+measure the head-unit-to-peer direction, **not** retries of video sent by the iPhone.
+Station counters can reset or change membership; do not subtract blindly across samples.
+PHY rate is not application throughput. Driver/permission/tool absence remains unavailable.
+No radio scans, channel changes, reboots, socket resets, or raw packet capture are performed.
+Addresses, UIDs, station MACs, and full probe output are filtered in memory and never logged.
+
+The CarPlay timing page shows peer-queue and recently receiving RTT maxima, capture count,
+polling gaps and how many captures contain signal information. Detailed fields are in the
+existing timing API. Schema 5 does not measure iPhone render timestamps or prove the cause
+of full-UI delay; it narrows the difference between transport starvation, an unread receiver
+queue, and delays earlier/later than these observation points. Hardware support and runtime
+cost must be checked on the actual head unit after deployment.
+
+References: [ss TCP_INFO fields](https://man7.org/linux/man-pages/man8/ss.8.html) and
+[Linux wireless station statistics](https://wireless.docs.kernel.org/en/latest/en/users/documentation/iw.html).

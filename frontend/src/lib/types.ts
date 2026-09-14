@@ -482,6 +482,21 @@ export interface CarPlayDiagnosticContext {
   ringOverlap?: number | null
   ringGapMs?: number | null
   surfaceUnchangedMs?: number | null
+  peerTcpSockets?: number | null
+  peerRxQueueBytes?: number | null
+  peerTxQueueBytes?: number | null
+  peerTcpRttMaxMs?: number | null
+  peerRecentRttMaxMs?: number | null
+  peerReceiveAgeMinMs?: number | null
+  peerBytesReceivedTotal?: number | null
+  apStationCount?: number | null
+  apSignalMinDbm?: number | null
+  apRxBitrateMinMbps?: number | null
+  apTxRetriesTotal?: number | null
+  apTxFailedTotal?: number | null
+  linkPollGapMs?: number | null
+  linkProbeMs?: number | null
+  linkContextAgeMs?: number | null
 }
 
 export interface CarPlayTimingSample extends CarPlayDiagnosticContext {

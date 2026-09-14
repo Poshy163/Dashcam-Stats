@@ -176,7 +176,7 @@ def test_full_sampler_pass_without_network_or_surface(tmp_path, acc):
     kind = "diagnostic_context" if acc else "sampler_started"
     context = next(e for e in events if e and e["kind"] == kind)
     assert context["hotspot_neighbour_count"] == 0
-    assert context["diagnostic_schema"] == 4
+    assert context["diagnostic_schema"] == 5
     assert context["zlink_tcp_sockets"] is None
     # Frame sampling runs independently; its execution is tested separately below.
 
@@ -366,3 +366,89 @@ sample_surfaces() { printf '%s\n' "$head" >> samples; }
     assert "frame_poll_gap_ms=3000" in rows[1]
     assert "frame_poll_gap_ms=6500" in rows[2]
     assert "context_age_ms=9500" in rows[2]
+
+
+def peer_stats(source, *, peers="192.0.2.2 ", uid=10077, ok=1):
+    program = re.search(
+        r'awk -v uid="\$\{link_uid:-na\}".*?\x27(.*?)\x27',
+        carplay_timing.script(),
+        re.S,
+    )[1]
+    return run_awk(program, source, uid=uid, peers=peers, ok=ok)
+
+
+def test_peer_transport_excludes_loopback_other_apps_and_idle_rtt():
+    source = """State Recv-Q Send-Q Local Address:Port Peer Address:Port
+ESTAB 4096 10 192.0.2.1:5000 192.0.2.2:6000 uid:10077 ino:PRIVATE
+ rtt:45.0/2.0 lastrcv:12 bytes_received:123456
+ESTAB 0 0 192.0.2.1:5001 192.0.2.2:6001 uid:10077
+ rtt:900.0/2.0 lastrcv:120000 bytes_received:44
+ESTAB 99999 99 127.0.0.1:1 127.0.0.1:2 uid:10077
+ rtt:9999.0/2.0 lastrcv:0 bytes_received:999999
+ESTAB 88888 88 192.0.2.1:1 192.0.2.2:2 uid:100770
+ rtt:8888.0/2.0 lastrcv:0 bytes_received:888888
+ESTAB 77777 77 192.0.2.1:1 192.0.2.20:2 uid:10077
+ rtt:7777.0/2.0 lastrcv:0 bytes_received:777777
+"""
+    result = peer_stats(source)
+    parsed = carplay_timing.parse_event(
+        datetime.now(UTC), "schema=5 | event=wireless_link " + result
+    )
+    assert parsed["peer_tcp_sockets"] == 2
+    assert parsed["peer_rx_queue_bytes"] == 4096
+    assert parsed["peer_tx_queue_bytes"] == 10
+    assert parsed["peer_tcp_rtt_max_ms"] == 900
+    assert parsed["peer_recent_rtt_max_ms"] == 45
+    assert parsed["peer_receive_age_min_ms"] == 12
+    assert parsed["peer_bytes_received_total"] == 123500
+    assert "192.0.2" not in result and "PRIVATE" not in result and "10077" not in result
+
+
+def test_peer_transport_missing_failed_and_empty_observations_are_distinct():
+    header = "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+    assert "peer_tcp_sockets=na" in peer_stats("", ok=0)
+    assert "peer_tcp_sockets=na" in peer_stats(header, uid="na")
+    assert "peer_tcp_sockets=na" in peer_stats(header, ok=0)
+    assert "peer_tcp_sockets=0" in peer_stats(header, peers="")
+    source = header + "ESTAB 0 0 192.0.2.1:1 192.0.2.2:2 uid:10077\n rtt:3.0/1.0\n"
+    assert "peer_recent_rtt_max_ms=na" in peer_stats(source)
+    assert "peer_receive_age_min_ms=na" in peer_stats(source)
+    assert "peer_bytes_received_total=na" in peer_stats(source)
+
+
+def test_station_statistics_are_scoped_numeric_and_fail_closed():
+    program = re.search(r'awk -v ok="\$station_ok" \x27(.*?)\x27', carplay_timing.script(), re.S)[1]
+    source = """Station aa:bb:cc:dd:ee:ff (on wlan2)
+ signal: -60 [-60, -64] dBm
+ rx bitrate: 234.0 MBit/s VHT-MCS 5
+ tx retries: 30
+ tx failed: 2
+Station bb:bb:cc:dd:ee:ff (on wlan2)
+ signal: -72 dBm
+ rx bitrate: 86.7 MBit/s
+ tx retries: 4
+ tx failed: 1
+Station cc:bb:cc:dd:ee:ff (on wlan0)
+ signal: -99 dBm
+ tx retries: 999
+"""
+    result = run_awk(program, source, ok=1)
+    parsed = carplay_timing.parse_event(
+        datetime.now(UTC), "schema=5 | event=wireless_link " + result
+    )
+    assert parsed["ap_station_count"] == 2
+    assert parsed["ap_signal_min_dbm"] == -72
+    assert parsed["ap_rx_bitrate_min_mbps"] == 86.7
+    assert parsed["ap_tx_retries_total"] == 34
+    assert parsed["ap_tx_failed_total"] == 3
+    assert "aa:bb" not in result and "999" not in result
+    assert "ap_station_count=na" in run_awk(program, source, ok=0)
+    assert "ap_station_count=0" in run_awk(program, "", ok=1)
+    assert "ap_signal_min_dbm=na" in run_awk(program, "", ok=1)
+
+
+def test_wireless_fields_remain_unavailable_for_historical_records():
+    parsed = carplay_timing.parse_event(datetime.now(UTC), "schema=4 | event=diagnostic_context")
+    assert parsed["peer_rx_queue_bytes"] is None
+    assert parsed["ap_station_count"] is None
+    assert parsed["link_poll_gap_ms"] is None
