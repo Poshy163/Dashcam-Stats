@@ -65,6 +65,68 @@ class TestFilterChainContract:
         assert chain.split(",")[-1] == "format=bgr24"
 
 
+class TestConfiguredDecoder:
+    @pytest.mark.parametrize("enabled,preference", [(True, "cpu"), (False, "auto")])
+    async def test_default_reader_uses_software_without_taking_media_slot(
+        self, monkeypatch, enabled, preference
+    ):
+        import contextlib
+        from types import SimpleNamespace
+
+        import numpy as np
+
+        import app.core.settings_service as settings_module
+        from app.hardware import ffmpeg
+
+        values = {
+            "processing.hardware_acceleration": enabled,
+            "processing.decoder_preference": preference,
+        }
+        monkeypatch.setattr(
+            settings_module, "get_settings_service", lambda: SimpleNamespace(get_nowait=values.get)
+        )
+
+        def forbidden():
+            pytest.fail("software decoding must not probe or acquire the hardware decoder")
+
+        monkeypatch.setattr(ffmpeg, "detect_hardware", forbidden)
+        monkeypatch.setattr(ffmpeg, "_vaapi_decode_lock", forbidden)
+        calls = []
+
+        async def decode(path, **kwargs):
+            calls.append(kwargs["hwaccel"])
+            yield 0.0, np.zeros((4, 4, 3), dtype=np.uint8)
+
+        monkeypatch.setattr(ffmpeg, "_decode_frames", decode)
+        reported = []
+        async with contextlib.aclosing(
+            ffmpeg.iter_frames("clip.ts", frame_size=(4, 4), on_decoder=reported.append)
+        ) as frames:
+            output = [item async for item in frames]
+        assert len(output) == 1
+        assert calls == ["cpu"]
+        assert reported == ["software"]
+
+    def test_cpu_preference_is_reported_as_a_choice_not_missing_hardware(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import app.core.settings_service as settings_module
+        from app.ai.runtime import describe_media_policy
+        from app.hardware import ffmpeg
+
+        values = {
+            "processing.hardware_acceleration": True,
+            "processing.decoder_preference": "cpu",
+        }
+        monkeypatch.setattr(
+            settings_module, "get_settings_service", lambda: SimpleNamespace(get_nowait=values.get)
+        )
+        monkeypatch.setattr(ffmpeg, "software_decode_reason", lambda: None)
+        policy = describe_media_policy()
+        assert policy["decode"] == "software"
+        assert policy["decode_reason"] == "software decoding is selected in Settings"
+
+
 class TestDecodeFallback:
     def test_iter_frames_wraps_a_single_attempt(self):
         """`iter_frames` is the public entry point and adds the software retry.

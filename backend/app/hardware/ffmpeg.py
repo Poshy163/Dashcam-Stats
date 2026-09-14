@@ -1029,9 +1029,24 @@ def select_hwaccel(preference: str, codec: str | None) -> tuple[list[str], str]:
     """Choose input-side hardware acceleration flags.
 
     Returns ``(args, label)`` where the label is what the UI displays as the decoder in
-    use. Falls back to software whenever the requested path is not actually available, or
-    when the iGPU is already committed to inference -- see :func:`software_decode_reason`.
+    use. Default callers inherit the configured decoder, including thumbnails that do
+    not pass an explicit preference. Falls back to software whenever the requested path
+    is unavailable or the iGPU is committed to inference.
     """
+    if preference == "auto":
+        from app.core.settings_service import get_settings_service
+
+        try:
+            settings = get_settings_service()
+        except RuntimeError:
+            # Standalone media tools do not initialise the application settings service.
+            pass
+        else:
+            preference = (
+                str(settings.get_nowait("processing.decoder_preference"))
+                if settings.get_nowait("processing.hardware_acceleration")
+                else "cpu"
+            )
     if preference == "cpu":
         return [], "software"
 

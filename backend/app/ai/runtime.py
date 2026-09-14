@@ -49,6 +49,8 @@ def describe_media_policy() -> dict[str, object]:
             reason = reason or "hardware acceleration is switched off in Settings"
         else:
             preference = str(settings.get_nowait("processing.decoder_preference"))
+            if preference == "cpu":
+                reason = reason or "software decoding is selected in Settings"
     except Exception as exc:
         log.debug("could not read the decode preference", error=str(exc))
 
