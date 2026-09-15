@@ -168,6 +168,34 @@ async def test_source_frames_replace_bad_saved_view_with_matching_time_and_coord
     assert obs.bbox["frames_checked"] == 4
 
 
+async def test_source_decode_uses_frame_clock_and_closes_at_last_selected_view(
+    db_session, monkeypatch
+):
+    rec, _ = await setup_track(db_session)
+    fake_models(monkeypatch)
+    closed = False
+
+    async def frames(path, **kwargs):
+        nonlocal closed
+        try:
+            # A container/output timestamp limit must not truncate a read whose
+            # stored detection offsets were assigned by the sampled frame counter.
+            if kwargs.get("duration") is not None:
+                yield 0, np.full((100, 100, 3), 100, dtype=np.uint8)
+                return
+            for t in [0, 1, 2, 31.25]:
+                yield t, np.full((100, 100, 3), 100, dtype=np.uint8)
+            pytest.fail("plate revalidation decoded beyond its last selected view")
+        finally:
+            closed = True
+
+    monkeypatch.setattr(stages, "iter_frames", frames)
+    result = await stages.stage_plates(db_session, rec)
+    assert result.ok
+    assert result.stats["vehicle_frames_checked"] == 4
+    assert closed
+
+
 async def test_incomplete_decode_does_not_stamp_success_or_replace_observations(
     db_session, monkeypatch
 ):
@@ -191,8 +219,42 @@ async def test_incomplete_decode_does_not_stamp_success_or_replace_observations(
     async def frames(path, **kwargs):
         yield 0, np.full((100, 100, 3), 100, dtype=np.uint8)
 
+    warnings = []
+    monkeypatch.setattr(stages.log, "warning", lambda message, **data: warnings.append(data))
     monkeypatch.setattr(stages, "iter_frames", frames)
-    with pytest.raises(stages.StageError, match="could not read 3"):
+    with pytest.raises(stages.StageError, match=r"could not read 3.*unread_tail=3"):
         await stages.stage_plates(db_session, rec)
     assert "plate_validation_key" not in (rec.probe_json or {})
     assert (await db_session.execute(select(PlateObservation))).scalar_one().id == old.id
+    assert warnings[-1]["decoded_frames"] == 1
+    assert warnings[-1]["last_decoded_offset_s"] == 0
+    assert warnings[-1]["last_requested_offset_s"] == 31.25
+    assert warnings[-1]["sample_fps"] == 4
+    assert [sample["offset_s"] for sample in warnings[-1]["missing_samples"]] == [1, 2, 31.25]
+    assert warnings[-1]["missing_reasons"] == {"unread_tail": 3}
+
+
+@pytest.mark.parametrize("reason", ["outside_tolerance", "empty_crop"])
+async def test_incomplete_frame_diagnostics_distinguish_bad_crops_from_clock_gaps(
+    db_session, monkeypatch, reason
+):
+    rec, _ = await setup_track(db_session)
+    fake_models(monkeypatch)
+    warnings = []
+    monkeypatch.setattr(stages.log, "warning", lambda message, **data: warnings.append(data))
+    if reason == "empty_crop":
+        monkeypatch.setattr(stages, "crop_with_margin", lambda *args: None)
+
+    async def frames(path, **kwargs):
+        for t in [0, 1, 2, 31.25]:
+            yield (
+                t + (0.25 if reason == "outside_tolerance" else 0),
+                np.full((100, 100, 3), 100, dtype=np.uint8),
+            )
+
+    monkeypatch.setattr(stages, "iter_frames", frames)
+    with pytest.raises(stages.StageError, match=rf"could not read 4.*{reason}=4"):
+        await stages.stage_plates(db_session, rec)
+    assert warnings[-1]["missing_reasons"] == {reason: 4}
+    assert [sample["offset_s"] for sample in warnings[-1]["missing_samples"]] == [0, 1, 2, 31.25]
+    assert "plate_validation_key" not in (rec.probe_json or {})

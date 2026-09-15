@@ -1872,6 +1872,26 @@ async def stage_plates(
     stored_crops = 0
     decoded_fallbacks = 0
     missing_frames = 0
+    missing_reasons: dict[str, int] = {}
+    missing_samples: list[dict[str, str | int | float | None]] = []
+    decoded_frames = 0
+    last_decoded_offset: float | None = None
+    fps: float | None = None
+
+    def missing_view(reason: str, track: TrackedObject, view: VehicleView | None = None) -> None:
+        nonlocal missing_frames
+        missing_frames += 1
+        missing_reasons[reason] = missing_reasons.get(reason, 0) + 1
+        # Keep diagnostics bounded on crowded clips, without plate text or GPS data.
+        if len(missing_samples) < 20:
+            missing_samples.append(
+                {
+                    "track_id": track.id,
+                    "offset_s": view.offset_s if view else None,
+                    "reason": reason,
+                }
+            )
+
     checked: dict[int, int] = {track.id: 0 for track in tracks}
     readings_by_track: dict[int, list[PlateReading]] = {track.id: [] for track in tracks}
     views_by_track: dict[int, list[VehicleView]] = {track.id: [] for track in tracks}
@@ -1956,7 +1976,7 @@ async def stage_plates(
             views_by_track[track.id].append(baseline)
         views = select_vehicle_views(views_by_track[track.id], max_reads, baseline=baseline)
         if not views:
-            missing_frames += 1
+            missing_view("no_candidate_views", track)
             continue
         for view in views:
             if (
@@ -1984,7 +2004,9 @@ async def stage_plates(
                     path,
                     fps=fps,
                     preserve_final_frame=True,
-                    duration=pending[-1][0].offset_s + 1 / fps,
+                    # Stored offsets use the decoded frame counter. FFmpeg's output
+                    # timestamp cutoff can end earlier on damaged transport streams.
+                    # Stop at the selected frame below, using the same counter instead.
                     frame_size=(recording.width, recording.height)
                     if recording.width and recording.height
                     else None,
@@ -1995,17 +2017,19 @@ async def stage_plates(
                 )
             ) as frames:
                 async for offset, frame in frames:
+                    decoded_frames += 1
+                    last_decoded_offset = offset
                     while (
                         cursor < len(pending) and pending[cursor][0].offset_s <= offset + tolerance
                     ):
                         view, track = pending[cursor]
                         cursor += 1
                         if abs(view.offset_s - offset) > tolerance:
-                            missing_frames += 1
+                            missing_view("outside_tolerance", track, view)
                             continue
                         image = crop_with_margin(frame, view.bbox, 0.0)
                         if image is None:
-                            missing_frames += 1
+                            missing_view("empty_crop", track, view)
                             continue
                         decoded_fallbacks += 1
                         # Record the actual sampled frame time, including unusual old
@@ -2019,12 +2043,27 @@ async def stage_plates(
                         break
         except FFmpegError as exc:
             raise StageError(f"plate source-frame decode failed: {exc}") from exc
-        missing_frames += len(pending) - cursor
+        for view, track in pending[cursor:]:
+            missing_view("unread_tail", track, view)
     if missing_frames:
         # Never delete good historical observations or stamp a completed revision after
         # an incomplete source read. Normal worker retries/failure reporting own recovery.
+        log.warning(
+            "plate source frames incomplete",
+            recording_id=recording.id,
+            sample_fps=fps,
+            decoded_frames=decoded_frames,
+            last_decoded_offset_s=last_decoded_offset,
+            selected_source_views=len(pending),
+            last_requested_offset_s=pending[-1][0].offset_s if pending else None,
+            missing_vehicle_frames=missing_frames,
+            missing_reasons=missing_reasons,
+            missing_samples=missing_samples,
+        )
+        reasons = ", ".join(f"{reason}={count}" for reason, count in missing_reasons.items())
         raise StageError(
-            f"plate revalidation could not read {missing_frames} selected vehicle frames"
+            f"plate revalidation could not read {missing_frames} selected vehicle frames "
+            f"({reasons}; last decoded offset={last_decoded_offset}, sample fps={fps})"
         )
 
     for track in tracks:
