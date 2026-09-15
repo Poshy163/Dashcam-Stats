@@ -151,6 +151,10 @@ jobs:
           java-version: "17"
 
       - uses: android-actions/setup-android@v3
+        with:
+          # The action's default also requests legacy "tools", which sdkmanager
+          # no longer finds. Command-line tools are installed by the action itself.
+          packages: platform-tools
 
       # setup-gradle's implicit post-job cleanup hung after a successful 93-second
       # build (run 34231347148), blocking publication. Keep wrapper validation,
