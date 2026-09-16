@@ -9,6 +9,8 @@ from app.ingest.models import RemoteFile
 async def test_adb_timeout_survives_process_exit_before_kill(monkeypatch):
     """A normal timeout must not turn a process-exit race into a startup crash."""
 
+    monkeypatch.setattr(adb, "_optional_until", {})
+
     class ExitedProcess:
         returncode = 0
 

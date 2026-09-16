@@ -227,6 +227,11 @@ class IngestStatus:
         with self._lock:
             self.phase = phase
 
+    def account_for_retry(self, discarded_bytes: int) -> None:
+        """Keep remaining-work estimates honest when partial stream bytes must be re-read."""
+        with self._lock:
+            self.bytes_total += max(0, discarded_bytes)
+
     def set_backlog(self, files: int, size: int) -> None:
         with self._lock:
             self.backlog_files = files

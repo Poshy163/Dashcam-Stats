@@ -117,6 +117,9 @@ async def _show_backup_page_during_transfer(address: str, url: str) -> None:
     for attempt, delay_s in enumerate(DISPLAY_RETRY_DELAYS_S, start=1):
         if delay_s:
             await asyncio.sleep(delay_s)
+        if adb.optional_requests_deferred(address):
+            log.info("deferring the backup display after an ADB timeout; prioritising footage")
+            return
         if await adb.chrome_is_foreground(address):
             if attempt == 1:
                 log.info("the backup page is already showing on the head unit")
@@ -124,6 +127,8 @@ async def _show_backup_page_during_transfer(address: str, url: str) -> None:
                 log.info("opened and verified the backup page on the head unit", attempt=attempt)
             shown = True
             break
+        if adb.optional_requests_deferred(address):
+            return
         reason = await adb.show_url(address, url)
         if reason:
             log.warning(
@@ -132,6 +137,8 @@ async def _show_backup_page_during_transfer(address: str, url: str) -> None:
                 error=reason,
             )
     if not shown:
+        if adb.optional_requests_deferred(address):
+            return
         # One last look: the final open may simply not have settled before the loop ended.
         shown = await adb.chrome_is_foreground(address)
         if shown:
@@ -146,7 +153,11 @@ async def _show_backup_page_during_transfer(address: str, url: str) -> None:
     last_reopen: float | None = None
     while True:
         await asyncio.sleep(HOLD_FOREGROUND_INTERVAL_S)
+        if adb.optional_requests_deferred(address):
+            continue
         if await adb.chrome_is_foreground(address):
+            continue
+        if adb.optional_requests_deferred(address):
             continue
         now = time.monotonic()
         if last_reopen is not None and now - last_reopen < HOLD_REOPEN_MIN_S:
@@ -574,6 +585,32 @@ class _CommitPipeline:
             self._raise_if_failed()
 
 
+async def _can_resume_stream(address: str) -> bool:
+    """Distinguish an absent unit from a stalled shell without resetting either radio."""
+    status = get_status()
+    remaining = status.sleep_countdown_remaining_s()
+    if status.cancel_event.is_set() or (remaining is not None and remaining < 60):
+        return False
+    reachable = await adb.is_listening(address)
+    responsive = await adb.probe_shell(address) if reachable else False
+    ignition = await adb.ignition_state(address, timeout=3.0) if responsive else "unknown"
+    remaining = status.sleep_countdown_remaining_s()
+    allowed = (
+        responsive
+        and ignition == "off"
+        and not status.cancel_event.is_set()
+        and (remaining is None or remaining >= 60)
+    )
+    log.info(
+        "checked the head unit after an interrupted footage stream",
+        adb_port_reachable=reachable,
+        basic_shell_responsive=responsive,
+        ignition=ignition,
+        retry_allowed=allowed,
+    )
+    return allowed
+
+
 async def _move(
     info: UnitInfo,
     files: list[RemoteFile],
@@ -602,6 +639,9 @@ async def _move(
     status = get_status()
     # Seeded complete; `_absorb` ANDs each batch onto it.
     transferred = transport.TransferResult(complete=True)
+    # One recovery per pass, never one per chunk. A bad link must not consume the
+    # whole sleep window retrying every recording. Later runs still use the normal delta.
+    recovery_used = False
     for directory, batch in _by_directory(files, info.source):
         chunks = (
             [batch[i : i + chunk_size] for i in range(0, len(batch), chunk_size)]
@@ -609,52 +649,76 @@ async def _move(
             else [batch]
         )
         for chunk in chunks:
-            if lease is not None:
-                lease.raise_if_lease_lost()
-            # Anything still listening is serving a *previous* batch's file list, so clear it
-            # before starting ours rather than connecting to the wrong stream.
-            await adb.clear_listener(info.address)
-            listener = await adb.launch_listener(
-                info.address,
-                directory,
-                [item.name for item in chunk],
-                port=port,
-                timeout_s=timeout_s,
-            )
-            was_serving = False
-            status.set_phase(Phase.TRANSFERRING)
-            try:
-                part = await asyncio.to_thread(
-                    transport.receive,
-                    host,
-                    port,
-                    staging,
-                    expected={item.name: item.size for item in chunk},
-                    on_file_started=status.file_started,
-                    on_file_done=status.file_done,
-                    on_bytes=status.add_bytes,
-                    cancel=status.cancel_event,
+            pending = chunk
+            batch_result = transport.TransferResult()
+            chunk_retried = False
+            while pending:
+                if lease is not None:
+                    lease.raise_if_lease_lost()
+                if status.cancel_event.is_set():
+                    batch_result.complete = False
+                    batch_result.error = "the transfer was cancelled"
+                    break
+                # Only restart this tar listener. Disconnect/root would also tear down
+                # other ADB work and must never be part of in-flight recovery.
+                await adb.clear_listener(info.address)
+                listener = await adb.launch_listener(
+                    info.address,
+                    directory,
+                    [item.name for item in pending],
+                    port=port,
+                    timeout_s=timeout_s,
                 )
-            finally:
-                # The adb session *is* the listener's lifetime now, so it has to be ended
-                # explicitly; leaving it would hold the port against the next batch.
-                was_serving = await adb.stop_listener(listener)
-
-            # Which side stopped first. An incomplete transfer whose listener was still serving
-            # is the car leaving, which is the expected ending and not a fault; one whose
-            # listener had already exited is the unit giving up -- `tar` failing, the remote
-            # `timeout` firing -- and that is worth saying out loud, because the two used to
-            # produce the same sentence and only one of them is anybody's problem.
-            if part.error and not part.complete and not was_serving:
-                part.error = f"{part.error} (the head unit stopped serving first)"
-            _absorb(transferred, part)
+                status.set_phase(Phase.TRANSFERRING)
+                try:
+                    part = await asyncio.to_thread(
+                        transport.receive,
+                        host,
+                        port,
+                        staging,
+                        expected={item.name: item.size for item in pending},
+                        on_file_started=status.file_started,
+                        on_file_done=status.file_done,
+                        on_bytes=status.add_bytes,
+                        cancel=status.cancel_event,
+                    )
+                finally:
+                    was_serving = await adb.stop_listener(listener)
+                batch_result.files.extend(part.files)
+                batch_result.bytes_received += part.bytes_received
+                batch_result.seconds += part.seconds
+                batch_result.complete = part.complete
+                batch_result.error = part.error
+                if part.error and not part.complete and not was_serving:
+                    batch_result.error = f"{part.error} (the head unit stopped serving first)"
+                pending = [item for item in pending if item.name not in set(part.files)]
+                if lease is not None:
+                    lease.raise_if_lease_lost()
+                if part.complete or not pending or not part.retryable or recovery_used:
+                    break
+                if not await _can_resume_stream(info.address):
+                    break
+                recovery_used = True
+                chunk_retried = True
+                completed_bytes = sum(item.size for item in chunk if item.name in part.files)
+                status.account_for_retry(part.bytes_received - completed_bytes)
+                log.warning(
+                    "retrying unfinished footage once after a connection interruption",
+                    files_remaining=len(pending),
+                    files_preserved=len(batch_result.files),
+                    error=part.error,
+                    listener_exited=not was_serving,
+                )
+            if chunk_retried and batch_result.complete:
+                log.info("resumed interrupted footage successfully", files=len(batch_result.files))
+            _absorb(transferred, batch_result)
 
             if on_chunk_completed is not None:
                 await on_chunk_completed(chunk)
 
             if lease is not None:
                 lease.raise_if_lease_lost()
-            if not part.complete or status.cancel_event.is_set():
+            if not batch_result.complete or status.cancel_event.is_set():
                 # The window shut, or the operator cancelled. Standing up another listener into
                 # a link that has already gone would spend what is left of the window on a
                 # connection that cannot be answered.
@@ -1907,15 +1971,6 @@ async def run_pull(
         if display_task is not None:
             display_task.cancel()
             await asyncio.gather(display_task, return_exceptions=True)
-            # Cancelling that task stops the page being *re-raised*; it does not take it
-            # off the screen. Without this the car sits on a finished progress bar and --
-            # the part that actually costs something -- goes to sleep with the browser in
-            # front, where the driver's phone does not pair and CarPlay does not come up on
-            # the next drive, however correctly both radios were restored. Only when this
-            # run was the one that put the page there.
-            if bool(_get("hand_screen_back", True)):
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(adb.hand_screen_back(info.address), timeout=25.0)
 
         # Radios first, before any other tidying: this is the one piece of cleanup whose
         # failure follows somebody into the car. Bounded, because the usual reason a
@@ -1936,6 +1991,12 @@ async def run_pull(
                     seconds=result.seconds,
                     error="radio restoration remains pending and will be retried",
                 )
+
+        # Restoring the driver's radios/logger outranks a courtesy screen change. An
+        # unresponsive launcher previously spent up to 25 seconds ahead of restoration.
+        if display_task is not None and bool(_get("hand_screen_back", True)):
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(adb.hand_screen_back(info.address), timeout=25.0)
 
         # Any preflight nobody got as far as needing -- an idle window, a share that failed
         # its checks. Collected rather than abandoned, so a short run cannot leave a task

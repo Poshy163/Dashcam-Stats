@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import re
 import shutil
+import time
 from dataclasses import dataclass
 
 from app.core.logging import get_logger
@@ -35,6 +36,16 @@ DEFAULT_ADB_PORT = 5555
 
 #: Control calls are all sub-second against a healthy unit; this only bounds a hung link.
 CONTROL_TIMEOUT_S = 20.0
+
+# Optional UI/diagnostic requests yield after a timeout. Safety commands, inventory,
+# and radio/logger restoration always retain their normal path through shell().
+OPTIONAL_BACKOFF_S = 60.0
+_optional_until: dict[str, float] = {}
+
+
+def optional_requests_deferred(address: str) -> bool:
+    return time.monotonic() < _optional_until.get(normalised_address(address), 0.0)
+
 
 #: Resolution order for the footage directory.
 #:
@@ -145,6 +156,8 @@ async def _adb(*args: str, timeout: float = CONTROL_TIMEOUT_S) -> AdbResult:
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
+        if len(args) >= 2 and args[0] == "-s":
+            _optional_until[normalised_address(args[1])] = time.monotonic() + OPTIONAL_BACKOFF_S
         # The adb client can exit in the instant between wait_for timing out and
         # kill(). uvloop reports that ordinary race as ProcessLookupError; never let it
         # replace the bounded AdbError (or, during application startup, abort lifespan).
@@ -177,6 +190,16 @@ async def shell(address: str, command: str, *, timeout: float = CONTROL_TIMEOUT_
         raise AdbError(result.stderr or f"adb shell failed ({result.returncode})")
     # The unit's shell is Android's: every line arrives with a carriage return attached.
     return result.stdout.replace("\r", "")
+
+
+async def probe_shell(address: str) -> bool:
+    """Bounded read-only proof of shell responsiveness; never reconnect a live listener."""
+    try:
+        return (await shell(address, "echo dashcam-control-ready", timeout=3.0)).strip() == (
+            "dashcam-control-ready"
+        )
+    except AdbError:
+        return False
 
 
 #: How long to wait for the unit's ADB port to answer during the presence tick.
@@ -817,7 +840,7 @@ async def is_parked(address: str) -> bool:
     return answer == PARKED
 
 
-async def ignition_state(address: str) -> str:
+async def ignition_state(address: str, *, timeout: float = 10.0) -> str:
     """``"on"``, ``"off"`` or ``"unknown"`` -- the ACC line, reported as it is.
 
     :func:`is_parked` folds the unclear cases into "being driven" because its callers blank
@@ -827,7 +850,7 @@ async def ignition_state(address: str) -> str:
     values rather than a boolean.
     """
     try:
-        answer = (await shell(address, "settings get global acc_status", timeout=10.0)).strip()
+        answer = (await shell(address, "settings get global acc_status", timeout=timeout)).strip()
     except AdbError as exc:
         log.debug("could not read the ignition state", error=str(exc))
         return "unknown"

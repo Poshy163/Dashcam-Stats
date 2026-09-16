@@ -165,7 +165,7 @@ def on_unit_present(address: str) -> None:
 
 def recover_on_unit_present(address: str) -> None:
     """Recover parked evidence even during a long backup, without restarting capture."""
-    if not _enabled():
+    if not _enabled() or adb.optional_requests_deferred(address):
         return
     now = time.monotonic()
     # File recovery can read several MiB.  The sampler is also armed at departure, where

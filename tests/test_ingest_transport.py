@@ -2018,6 +2018,12 @@ class TestARunEndToEnd:
             events.append("footage-copy")
             return await real_move(*args, **kwargs)
 
+        async def hand_screen_back(_address):
+            assert events[-1] == "radios-restored"
+            events.append("screen-cleanup")
+            # An unavailable launcher must not consume the radio restore window.
+            raise TimeoutError("launcher did not answer")
+
         monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
         monkeypatch.setattr(puller, "read_logger_status", logger_status)
         monkeypatch.setattr(puller, "inventory_remote_bundles", obd_inventory)
@@ -2025,10 +2031,14 @@ class TestARunEndToEnd:
         monkeypatch.setattr(puller, "verified_bundle_matches", verified)
         monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
         monkeypatch.setattr(puller, "_move", move)
+        monkeypatch.setattr(puller, "display_url", lambda: "http://server/backup")
+        monkeypatch.setattr(puller.adb, "hand_screen_back", hand_screen_back)
         await self._enable(
             **{
                 "ingest.quiet_radios": True,
                 "ingest.zlink_hotspot_rearm": True,
+                "ingest.show_on_unit": True,
+                "ingest.hand_screen_back": True,
             }
         )
 
@@ -2041,7 +2051,7 @@ class TestARunEndToEnd:
         assert events.index("bundle-verified") < events.index("obd-durable")
         assert events.index("obd-durable") < events.index("radios-quiet")
         assert events.index("radios-quiet") < events.index("footage-copy")
-        assert events[-1] == "radios-restored"
+        assert events[-2:] == ["radios-restored", "screen-cleanup"]
 
     async def test_lease_loss_after_commit_cancels_pull_before_card_reclaim(
         self, db_session, unit, app_config, monkeypatch

@@ -76,6 +76,7 @@ class TransferResult:
     seconds: float = 0.0
     complete: bool = False
     error: str | None = None
+    retryable: bool = False
 
     @property
     def throughput_mbs(self) -> float:
@@ -104,11 +105,18 @@ class _CountingReader:
         self._cancel = cancel
         self._maximum = maximum
         self.total = 0
+        self.connection_failed = False
 
     def read(self, size: int = -1) -> bytes:
         if self._cancel is not None and self._cancel.is_set():
             raise TransferCancelled("the transfer was cancelled")
-        chunk = self._source.read(_READ_SIZE if size is None or size < 0 else size)
+        try:
+            chunk = self._source.read(_READ_SIZE if size is None or size < 0 else size)
+        except OSError:
+            # Record the failing side. A timeout writing an NFS destination must not
+            # be mistaken for a timeout receiving bytes from the head unit.
+            self.connection_failed = True
+            raise
         if chunk:
             if self.total + len(chunk) > self._maximum:
                 raise UnsafeArchiveError("the raw archive stream exceeds its byte limit")
@@ -189,6 +197,7 @@ def receive(
         sock = _connect(host, port, started + CONNECT_RETRY_S)
     except OSError as exc:
         result.error = str(exc)
+        result.retryable = True
         result.seconds = time.monotonic() - started
         return result
 
@@ -265,6 +274,7 @@ def receive(
             result.complete = not missing
             if missing:
                 result.error = f"the stream ended with {len(missing)} file(s) still to come"
+                result.retryable = True
     except TransferCancelled as exc:
         result.error = str(exc)
     except UnsafeArchiveError as exc:
@@ -273,6 +283,12 @@ def receive(
         # The expected ending when the car leaves: the socket dies mid-member. Everything
         # already written is still good and is committed by size.
         result.error = f"{type(exc).__name__}: {exc}"
+        # Local disk/permission errors and rejected archives are not connection failures.
+        result.retryable = (
+            (reader is not None and reader.connection_failed)
+            or isinstance(exc, EOFError)
+            or (isinstance(exc, tarfile.ReadError) and str(exc) == "unexpected end of data")
+        )
     finally:
         if reader is not None:
             result.bytes_received = reader.total
