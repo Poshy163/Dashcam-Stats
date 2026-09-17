@@ -720,12 +720,12 @@ export default function Backup() {
                         ? 'bg-state-warn/15 text-state-warn'
                         : 'bg-surface-sunken text-content-muted'
                   }`}
-                  title={prediction?.summary}
+                  title={`Estimate from reported settings. The head unit's running countdown can differ. ${prediction?.summary ?? ''}`}
                 >
-                  ⏱️ Sleep in {formatDuration(liveCountdown)}
+                  ⏱️ Estimated sleep in {formatDuration(liveCountdown)}
                   {prediction &&
                     (prediction.willPass
-                      ? ` • Will pass (+${formatDuration(prediction.headroomS)})`
+                      ? ` • Likely fits (+${formatDuration(prediction.headroomS)})`
                       : ` • Short by ${formatDuration(Math.abs(prediction.headroomS))}`)}
                 </span>
               )}

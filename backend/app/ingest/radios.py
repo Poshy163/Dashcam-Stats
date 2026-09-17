@@ -125,6 +125,13 @@ WATCHDOG_LEASE_POLL_S = 2
 WATCHDOG_MAX_RENEW_INTERVAL_S = 30.0
 WATCHDOG_RENEW_RETRY_S = 1.0
 
+# A missed control reply is not evidence that the detached process died. Permit a
+# short outage only inside an already acknowledged lease, retaining ample time for
+# restoration before its expiry. Neither an unanswered write nor a probe extends it.
+WATCHDOG_UNVERIFIED_GRACE_S = 60.0
+# Covers the next 30-second renewal interval, two bounded ADB attempts and recovery.
+WATCHDOG_LEASE_RECOVERY_MARGIN_S = 90.0
+
 #: How long before the head unit's own sleep the watchdog lands the radios.
 #:
 #: The vendor countdown is not ours to pause, so the last thing that happens in a backup
@@ -1344,7 +1351,8 @@ def _watchdog_probe_command(handle: WatchdogHandle) -> str:
     )
 
 
-async def _watchdog_is_armed(address: str, handle: WatchdogHandle) -> bool:
+async def _watchdog_is_armed(address: str, handle: WatchdogHandle) -> bool | None:
+    """True proves readiness; False is a negative reply; None is no ADB evidence."""
     try:
         reply = await adb.shell(
             address,
@@ -1352,7 +1360,7 @@ async def _watchdog_is_armed(address: str, handle: WatchdogHandle) -> bool:
             timeout=RADIO_TIMEOUT_S,
         )
     except adb.AdbError:
-        return False
+        return None
     return reply.strip() == str(handle.pid)
 
 
@@ -1360,7 +1368,7 @@ async def _renew_watchdog_lease(
     address: str,
     deadline_s: int,
     handle: WatchdogHandle,
-) -> bool:
+) -> bool | None:
     """Atomically extend an armed watchdog using only the unit's monotonic uptime."""
 
     lease_ttl_s = max(1, int(deadline_s))
@@ -1390,7 +1398,7 @@ async def _renew_watchdog_lease(
     try:
         reply = await adb.shell(address, command, timeout=RADIO_TIMEOUT_S)
     except adb.AdbError:
-        return False
+        return None
     return reply.strip() == "renewed"
 
 
@@ -1400,37 +1408,76 @@ def _watchdog_renew_interval(deadline_s: int) -> float:
     return max(1.0, min(WATCHDOG_MAX_RENEW_INTERVAL_S, max(1, int(deadline_s)) / 3))
 
 
+@dataclass(slots=True)
+class WatchdogLeaseProof:
+    """Conservative local bounds on a positively acknowledged remote lease."""
+
+    valid_until: float = 0.0
+    confirmed_at: float = 0.0
+
+    def renewed(self, started: float, deadline_s: int) -> None:
+        # Use request start, not receipt: time spent awaiting ADB is already spent.
+        self.valid_until = started + max(1, int(deadline_s))
+        self.confirmed_at = started
+
+    def probed(self, started: float) -> None:
+        self.confirmed_at = started
+
+    def permits_retry(self) -> bool:
+        now = time.monotonic()
+        return (
+            now < self.confirmed_at + WATCHDOG_UNVERIFIED_GRACE_S
+            and now + WATCHDOG_LEASE_RECOVERY_MARGIN_S < self.valid_until
+        )
+
+
 async def _watchdog_renewal_loop(
     address: str,
     deadline_s: int,
     watchdog: WatchdogHandle,
     lost: asyncio.Event,
+    proof: WatchdogLeaseProof | None = None,
 ) -> None:
     """Keep the remote lease alive only while this owner and its watchdog are alive."""
 
     interval = _watchdog_renew_interval(deadline_s)
     while True:
         await asyncio.sleep(interval)
+        started = time.monotonic()
         try:
             renewed = await _renew_watchdog_lease(address, deadline_s, watchdog)
         except Exception:
             renewed = False
-        if renewed:
+        if renewed is True:
+            if proof is not None:
+                proof.renewed(started, deadline_s)
             continue
+        negative_reply = renewed is False
         # One immediate retry distinguishes a brief control-channel stumble from a lost
         # detached process without spending a meaningful part of the finite recovery lease.
         await asyncio.sleep(WATCHDOG_RENEW_RETRY_S)
+        started = time.monotonic()
         try:
             renewed = await _renew_watchdog_lease(address, deadline_s, watchdog)
         except Exception:
             renewed = False
-        if renewed:
+        if renewed is True:
+            if proof is not None:
+                proof.renewed(started, deadline_s)
+            continue
+        if renewed is None and not negative_reply and proof is not None and proof.permits_retry():
+            log.warning(
+                "radio watchdog renewal temporarily unavailable; retrying within "
+                "the last verified lease",
+                watchdog_pid=watchdog.pid,
+            )
             continue
         lost.set()
         log.error(
             "the detached on-unit radio watchdog could not be proven; "
             "the transfer must stop while the last lease can still restore the radios",
             watchdog_pid=watchdog.pid,
+            evidence="negative_reply" if negative_reply or renewed is False else "adb_unavailable",
         )
         return
 
@@ -1470,6 +1517,7 @@ class RadioController:
         self._watchdog: WatchdogHandle | None = None
         self._watchdog_renewal_task: asyncio.Task[None] | None = None
         self._watchdog_lost = asyncio.Event()
+        self._watchdog_proof = WatchdogLeaseProof()
         self._bluetooth_baseline = "unknown"
         self._hotspot_baseline = "unknown"
         self._hotspot_rearm_deadline: float | None = None
@@ -1700,6 +1748,7 @@ class RadioController:
         except adb.AdbError:
             log.warning("could not create the radio watchdog flag; leaving radios on")
             return False
+        armed_started = time.monotonic()
         self._watchdog = await _arm_watchdog(
             self.address,
             self.watchdog_deadline_s,
@@ -1718,6 +1767,7 @@ class RadioController:
                 "leaving radios on and recovery state intact"
             )
             return False
+        self._watchdog_proof.renewed(armed_started, self.watchdog_deadline_s)
         self._start_watchdog_renewal()
         return True
 
@@ -1734,6 +1784,7 @@ class RadioController:
                 self.watchdog_deadline_s,
                 watchdog,
                 self._watchdog_lost,
+                self._watchdog_proof,
             ),
             name="ingest-radio-watchdog-renewal",
         )
@@ -1756,15 +1807,35 @@ class RadioController:
                 return True
             if self._watchdog_lost.is_set():
                 return False
-            if await _watchdog_is_armed(self.address, watchdog):
+            started = time.monotonic()
+            first = await _watchdog_is_armed(self.address, watchdog)
+            if first is True:
+                self._watchdog_proof.probed(started)
                 return True
             # A second bounded read prevents one lost ADB reply from cancelling a healthy
             # bulk transfer, while still detecting a dead PID far inside its finite lease.
             await asyncio.sleep(WATCHDOG_RENEW_RETRY_S)
+            started = time.monotonic()
             healthy = await _watchdog_is_armed(self.address, watchdog)
-            if not healthy:
-                self._watchdog_lost.set()
-            return healthy
+            if healthy is True:
+                self._watchdog_proof.probed(started)
+                return True
+            if healthy is None and first is None and self._watchdog_proof.permits_retry():
+                log.warning(
+                    "radio watchdog check temporarily unavailable; retrying within "
+                    "the last verified lease",
+                    watchdog_pid=watchdog.pid,
+                )
+                return True
+            self._watchdog_lost.set()
+            log.warning(
+                "radio watchdog readiness could not be established",
+                watchdog_pid=watchdog.pid,
+                evidence="negative_reply"
+                if first is False or healthy is False
+                else "adb_unavailable",
+            )
+            return False
 
     async def disable_bluetooth(
         self,

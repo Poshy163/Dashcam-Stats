@@ -21,7 +21,7 @@ SettingType = Literal["bool", "int", "float", "string", "select", "path", "bytes
 # The Android OBD companion and the server jointly own one sleep policy. These values are
 # evidence-contract constants, not tuning knobs: accepting a different WebUI value would let
 # the puller fight the app over the persistent vendor property during radio recovery.
-INGEST_SLEEP_WINDOW_ACTIVE_SECONDS = 900
+INGEST_SLEEP_WINDOW_ACTIVE_SECONDS = 1200
 INGEST_SLEEP_WINDOW_IDLE_SECONDS = 300
 FIXED_SETTING_VALUES: dict[str, object] = {
     "ingest.manage_sleep_window": True,
@@ -1632,7 +1632,7 @@ SETTINGS: tuple[SettingDef, ...] = (
         "int",
         INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,
         "ingest",
-        "Fixed at 900 seconds (15 minutes) while WiFi backup or recovery is active. This "
+        "Fixed at 1200 seconds (20 minutes) while WiFi backup or recovery is active. This "
         "must match the OBD companion's app-owned policy, so it is shown for audit but "
         "cannot be edited.",
         minimum=INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,

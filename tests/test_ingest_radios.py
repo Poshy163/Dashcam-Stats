@@ -11,6 +11,7 @@ Bluetooth to come back.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -48,6 +49,110 @@ _APPROVED_VENDOR_ATTESTATION = "\n".join(
 _WATCHDOG_TOKEN = "0123456789abcdef0123456789abcdef"
 _WATCHDOG_PID = 4242
 _WATCHDOG_HANDLE = radios.WatchdogHandle(token=_WATCHDOG_TOKEN, pid=_WATCHDOG_PID)
+
+
+class TestWatchdogControlOutages:
+    @pytest.mark.parametrize("operation", ["probe", "renew"])
+    async def test_missing_adb_reply_is_distinct_from_a_negative_reply(
+        self, monkeypatch, operation
+    ):
+        async def unavailable(*args, **kwargs):
+            raise adb.AdbError("control request timed out")
+
+        monkeypatch.setattr(adb, "shell", unavailable)
+        if operation == "probe":
+            result = await radios._watchdog_is_armed("u:5555", _WATCHDOG_HANDLE)
+        else:
+            result = await radios._renew_watchdog_lease("u:5555", 480, _WATCHDOG_HANDLE)
+        assert result is None
+
+    @pytest.mark.parametrize(
+        "replies, age, remaining, allowed",
+        [
+            ([None, None], 20, 460, True),
+            ([None, True], 20, 460, True),
+            ([None, None], 61, 419, False),
+            ([None, None], 20, 90, False),
+            ([None, None], 20, 0, False),
+            ([False, None], 20, 460, False),
+            ([None, False], 20, 460, False),
+            ([False, False], 20, 460, False),
+        ],
+    )
+    async def test_health_grace_requires_recent_proof_and_recovery_headroom(
+        self, monkeypatch, replies, age, remaining, allowed
+    ):
+        answers = iter(replies)
+
+        async def probe(*args):
+            return next(answers)
+
+        monkeypatch.setattr(radios, "_watchdog_is_armed", probe)
+        monkeypatch.setattr(radios, "WATCHDOG_RENEW_RETRY_S", 0)
+        controller = radios.RadioController("u:5555", watchdog_deadline_s=480)
+        controller._watchdog = _WATCHDOG_HANDLE
+        now = time.monotonic()
+        controller._watchdog_proof = radios.WatchdogLeaseProof(now + remaining, now - age)
+        original_deadline = controller._watchdog_proof.valid_until
+
+        assert await controller.watchdog_healthy() is allowed
+        assert controller._watchdog_lost.is_set() is not allowed
+        assert controller._watchdog_proof.valid_until == original_deadline
+        if replies == [None, None]:
+            assert controller._watchdog_proof.confirmed_at == now - age
+
+    async def test_successful_probe_cannot_extend_a_lease(self, monkeypatch):
+        proof = radios.WatchdogLeaseProof()
+        started = time.monotonic() - 10
+        proof.renewed(started, 480)
+        proof.probed(time.monotonic())
+        assert proof.valid_until == started + 480
+        assert proof.permits_retry()
+
+    async def test_renewal_recovers_after_timeouts_without_cancelling_transfer(self, monkeypatch):
+        answers = iter([None, None, True])
+        lost = asyncio.Event()
+        now = time.monotonic()
+        proof = radios.WatchdogLeaseProof(now + 460, now - 20)
+        initial_deadline = proof.valid_until
+        calls = []
+
+        async def renew(*args):
+            calls.append(proof.valid_until)
+            try:
+                return next(answers)
+            except StopIteration:
+                raise asyncio.CancelledError from None
+
+        monkeypatch.setattr(radios, "_renew_watchdog_lease", renew)
+        monkeypatch.setattr(radios, "_watchdog_renew_interval", lambda _: 0)
+        monkeypatch.setattr(radios, "WATCHDOG_RENEW_RETRY_S", 0)
+        with pytest.raises(asyncio.CancelledError):
+            await radios._watchdog_renewal_loop("u:5555", 480, _WATCHDOG_HANDLE, lost, proof)
+        assert not lost.is_set()
+        assert calls[:3] == [initial_deadline] * 3
+        assert calls[3] > initial_deadline
+
+    @pytest.mark.parametrize(
+        "replies, age, remaining",
+        [([None, None], 61, 419), ([None, None], 20, 90), ([False, None], 20, 460)],
+    )
+    async def test_renewal_stops_for_stale_proof_short_lease_or_negative_reply(
+        self, monkeypatch, replies, age, remaining
+    ):
+        answers = iter(replies)
+        lost = asyncio.Event()
+        now = time.monotonic()
+        proof = radios.WatchdogLeaseProof(now + remaining, now - age)
+
+        async def renew(*args):
+            return next(answers)
+
+        monkeypatch.setattr(radios, "_renew_watchdog_lease", renew)
+        monkeypatch.setattr(radios, "_watchdog_renew_interval", lambda _: 0)
+        monkeypatch.setattr(radios, "WATCHDOG_RENEW_RETRY_S", 0)
+        await radios._watchdog_renewal_loop("u:5555", 480, _WATCHDOG_HANDLE, lost, proof)
+        assert lost.is_set()
 
 
 class StubSettings:

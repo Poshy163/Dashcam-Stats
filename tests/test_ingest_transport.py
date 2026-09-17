@@ -1570,7 +1570,7 @@ class TestARunEndToEnd:
 
         assert result.state is RunState.IDLE
         assert result.error == "an earlier ingest radio transition still requires recovery"
-        assert events == ["window:900", "reconcile"]
+        assert events == ["window:1200", "reconcile"]
         assert get_status().snapshot()["backlog_known"] is False
         assert unit.served["names"] is None, "the card was never inventoried"
 
@@ -4156,7 +4156,28 @@ class TestTheSleepWindowIsManagedNotLeftWide:
     parked somewhere the app will never reach — where the window buys nothing and the
     battery pays for it anyway."""
 
-    def test_the_policy_defaults_are_fifteen_minutes_active_and_five_minutes_idle(self):
+    def test_server_and_android_share_the_same_sleep_durations(self):
+        import re
+        from pathlib import Path
+
+        from app.core.settings_schema import (
+            INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,
+            INGEST_SLEEP_WINDOW_IDLE_SECONDS,
+        )
+
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "android/obd-logger/app/src/main/java/com/dashcamstats/obdlogger/SleepWindowController.kt"
+        ).read_text(encoding="utf-8")
+        for name, expected in [
+            ("ACTIVE_SLEEP_WINDOW_SECONDS", INGEST_SLEEP_WINDOW_ACTIVE_SECONDS),
+            ("IDLE_SLEEP_WINDOW_SECONDS", INGEST_SLEEP_WINDOW_IDLE_SECONDS),
+        ]:
+            match = re.search(rf"const val {name} = (\d+)", source)
+            assert match is not None
+            assert int(match.group(1)) == expected
+
+    def test_the_policy_defaults_are_twenty_minutes_active_and_five_minutes_idle(self):
         from app.core.settings_schema import (
             INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,
             INGEST_SLEEP_WINDOW_IDLE_SECONDS,
@@ -4190,11 +4211,11 @@ class TestTheSleepWindowIsManagedNotLeftWide:
 
         assert stored == {
             "ingest.manage_sleep_window": True,
-            "ingest.sleep_window_s": 900,
+            "ingest.sleep_window_s": 1200,
             "ingest.sleep_window_idle_s": 300,
         }
         assert settings.get_nowait("ingest.manage_sleep_window") is True
-        assert settings.get_nowait("ingest.sleep_window_s") == 900
+        assert settings.get_nowait("ingest.sleep_window_s") == 1200
         assert settings.get_nowait("ingest.sleep_window_idle_s") == 300
 
     async def test_existing_non_default_rows_are_coerced_when_the_cache_reloads(self, db_session):
@@ -4217,7 +4238,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         await settings.reload()
 
         assert settings.get_nowait("ingest.manage_sleep_window") is True
-        assert settings.get_nowait("ingest.sleep_window_s") == 900
+        assert settings.get_nowait("ingest.sleep_window_s") == 1200
         assert settings.get_nowait("ingest.sleep_window_idle_s") == 300
 
     async def test_webui_reports_the_policy_as_fixed_and_rejects_edits(self, client):
@@ -4228,7 +4249,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
 
         assert settings["ingest.manage_sleep_window"]["value"] is True
         assert settings["ingest.manage_sleep_window"]["read_only"] is True
-        assert settings["ingest.sleep_window_s"]["value"] == 900
+        assert settings["ingest.sleep_window_s"]["value"] == 1200
         assert settings["ingest.sleep_window_s"]["read_only"] is True
         assert settings["ingest.sleep_window_idle_s"]["value"] == 300
         assert settings["ingest.sleep_window_idle_s"]["read_only"] is True
@@ -4263,7 +4284,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
 
         await get_settings_service().set_many({"ingest.enabled": True})
         assert await puller.widen_sleep_window("u:5555")
-        assert set_to == [900]
+        assert set_to == [1200]
 
     async def test_puller_ignores_drifted_values_in_the_live_settings_cache(self, monkeypatch):
         from app.ingest import adb, puller
@@ -4299,7 +4320,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         assert await puller.widen_sleep_window("u:5555")
         await puller.close_sleep_window("u:5555", drained=True)
 
-        assert set_to == [900, 300]
+        assert set_to == [1200, 300]
 
     async def test_pending_recovery_waits_for_a_verified_active_window(
         self, db_session, monkeypatch
@@ -4329,7 +4350,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         assert await puller.reconcile_pending_in_awake_window("u:5555")
         assert events == [
             "read:u:5555",
-            "set:u:5555:900",
+            "set:u:5555:1200",
             "reconcile:u:5555",
         ]
 
@@ -4364,11 +4385,11 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         await get_settings_service().set_many({"ingest.enabled": True})
 
         assert not await puller.reconcile_pending_in_awake_window("u:5555")
-        assert events == ["read:u:5555", "set:u:5555:900"]
+        assert events == ["read:u:5555", "set:u:5555:1200"]
         assert warnings == [
             (
                 "radio recovery deferred because the managed awake window could not be verified",
-                {"address": "u:5555", "seconds": 900},
+                {"address": "u:5555", "seconds": 1200},
             )
         ]
 
@@ -4522,7 +4543,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         from app.ingest import adb, puller
 
         set_to: list[int] = []
-        current_window = 900
+        current_window = 1200
 
         async def current(address):
             return current_window
@@ -4570,7 +4591,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
         warnings: list[tuple[str, dict[str, object]]] = []
 
         async def current(address):
-            return 900
+            return 1200
 
         async def refused_set(address, seconds):
             set_to.append(seconds)
@@ -4672,7 +4693,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
 
         async def current(address):
             reads.append(address)
-            return 900
+            return 1200
 
         async def parked(address):
             return True
@@ -4703,8 +4724,8 @@ class TestTheSleepWindowIsManagedNotLeftWide:
                 "capabilities": ["adaptive_sleep_window_v2"],
                 "acc_state_known": True,
                 "acc_on": True,
-                "sleep_window_target_s": 900,
-                "sleep_window_observed_s": 900,
+                "sleep_window_target_s": 1200,
+                "sleep_window_observed_s": 1200,
                 "sleep_window_verified": True,
                 "updated_at_utc": datetime.now(UTC).isoformat(),
             }
@@ -4742,7 +4763,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
             return {"state": "status_unavailable", "last_error": "canonical"}
 
         async def current(address):
-            return 900
+            return 1200
 
         async def refused_set(address, seconds):
             set_to.append(seconds)
@@ -4776,7 +4797,7 @@ class TestTheSleepWindowIsManagedNotLeftWide:
             raise AssertionError("the server must not force-suspend the unit")
 
         async def current(address):
-            return 900
+            return 1200
 
         async def setter(address, seconds):
             set_to.append(seconds)
