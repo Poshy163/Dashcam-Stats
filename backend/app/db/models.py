@@ -268,6 +268,8 @@ class Journey(Base):
     # Set when a user has manually split/merged, so the automatic builder leaves it alone.
     manual: Mapped[bool] = mapped_column(Boolean, default=False)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Derived assessment only. Raw telemetry and retention decisions remain independent.
+    motion_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)

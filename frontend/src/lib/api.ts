@@ -694,6 +694,9 @@ export const api = {
   },
 
   journeys: {
+    motionQuality: () => request<{
+      total: number; pending: number; moving: number; unconfirmed: number; unknown: number
+    }>('/journeys/motion-quality'),
     list: (query?: Query) => request<Paginated<Journey>>('/journeys', { query }),
     get: (id: number) => request<JourneyDetail>(`/journeys/${id}`),
     merge: (journeyIds: number[]) => post<Journey>('/journeys/merge', { journeyIds }),

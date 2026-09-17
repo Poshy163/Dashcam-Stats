@@ -139,6 +139,7 @@ class TelemetryPointOut(ApiModel):
 
 
 class JourneyOut(ApiModel):
+    motion_json: dict | None = None
     id: int
     title: str | None = None
     started_at: datetime

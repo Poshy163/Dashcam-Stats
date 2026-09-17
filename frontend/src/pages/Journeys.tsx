@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
 
@@ -12,13 +12,24 @@ export default function Journeys() {
   const [params, setParams] = useSearchParams()
   const [selected, setSelected] = useState<number[]>([])
   const client = useQueryClient()
+  const motion = useQuery({
+    queryKey: ['journey-motion-quality'],
+    queryFn: () => api.journeys.motionQuality(),
+    refetchInterval: 30_000,
+  })
 
   const page = Number(params.get('page') ?? 1)
   const sort = params.get('sort') ?? 'started_desc'
+  const includeParked = params.get('include_parked') === 'true'
+  const pendingMotion = motion.data?.pending
+
+  useEffect(() => {
+    if (pendingMotion !== undefined) void invalidateAnalysisQueries(client)
+  }, [pendingMotion, client])
 
   const query = useQuery({
-    queryKey: ['journeys', page, sort],
-    queryFn: () => api.journeys.list({ page, pageSize: 25, sort }),
+    queryKey: ['journeys', page, sort, includeParked],
+    queryFn: () => api.journeys.list({ page, pageSize: 25, sort, includeParked }),
   })
 
   const merge = useMutation({
@@ -46,6 +57,20 @@ export default function Journeys() {
         subtitle={query.data ? `${query.data.total} journeys` : undefined}
         actions={
           <>
+            <label className="flex items-center gap-2 text-sm text-content-muted">
+              <input
+                type="checkbox"
+                checked={includeParked}
+                onChange={(e) => {
+                  const next = new URLSearchParams(params)
+                  if (e.target.checked) next.set('include_parked', 'true')
+                  else next.delete('include_parked')
+                  next.delete('page')
+                  setParams(next)
+                }}
+              />
+              Include parked / unconfirmed
+            </label>
             <select
               className="input w-auto"
               value={sort}
@@ -70,6 +95,14 @@ export default function Journeys() {
         }
       />
 
+      {motion.data && (
+        <p className="text-sm text-content-muted">
+          Movement checks: {motion.data.total - motion.data.pending} of {motion.data.total} sessions checked.
+          {' '}{motion.data.pending > 0 ? 'Historical checks are running automatically.' : 'Historical checks complete.'}
+          {' '}{motion.data.unconfirmed + motion.data.unknown} sessions without confirmed movement.
+        </p>
+      )}
+
       {query.isLoading && <Spinner className="py-20" />}
       {query.isError && <ErrorState error={query.error} retry={() => query.refetch()} />}
       {query.data?.items.length === 0 && (
@@ -91,6 +124,9 @@ export default function Journeys() {
             />
             <Link to={`/journeys/${journey.id}`} className="min-w-0 flex-1 group">
               <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                {journey.motionJson && journey.motionJson.status !== 'moving' && (
+                  <span className="text-xs text-content-muted">Movement not confirmed</span>
+                )}
                 <span className="font-mono text-base font-black text-white group-hover:text-accent transition-colors">{formatDate(journey.startedAt)}</span>
                 <span className="tabular font-mono text-xs text-content-muted">
                   {formatTime(journey.startedAt)} → {formatTime(journey.endedAt)}

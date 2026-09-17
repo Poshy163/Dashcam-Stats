@@ -33,6 +33,7 @@ from app.db.models import (
     TrackedObject,
 )
 from app.db.retry import commit_with_retry
+from app.journeys.motion import assess_motion
 from app.journeys.track import single_track
 from app.osd import haversine_m
 from app.osd.outliers import (
@@ -431,7 +432,12 @@ class JourneyBuilder:
         either there are fixes and both are populated, or there are none and neither is.
         """
         # Two shapes of wrong, both self-evident from the row alone.
-        never_computed = and_(Journey.has_gps.is_(True), Journey.distance_m.is_(None))
+        motion_status = Journey.motion_json["status"].as_string()
+        never_computed = and_(
+            Journey.has_gps.is_(True),
+            Journey.distance_m.is_(None),
+            or_(motion_status.is_(None), motion_status == "moving"),
+        )
         # A distance no vehicle could cover in the time the journey lasted. Recomputing is
         # what applies the current guards to a number produced by an older, looser one --
         # without this, a journey that already holds a bad distance keeps it forever,
@@ -685,6 +691,7 @@ class JourneyBuilder:
         )
         journey.recording_count = len(recordings)
         if not recordings:
+            journey.motion_json = assess_motion([]).evidence
             return journey
 
         starts = [as_utc(r.started_at) for r in recordings if r.started_at]
@@ -769,6 +776,17 @@ class JourneyBuilder:
 
         good = [p for p in points if p.id not in rejected_ids]
         track = self._one_track(good, recordings, front_ids)
+        motion = assess_motion(track)
+        observed_distance, observed_average = self._measure(track, min_move_m)
+        journey.motion_json = {
+            **motion.evidence,
+            "observed_distance_m": observed_distance,
+            "observed_avg_speed_kmh": observed_average,
+            "observed_max_speed_kmh": max(
+                (p.speed_kmh for p in track if p.speed_kmh is not None), default=None
+            ),
+        }
+        track = motion.track
 
         # Positions copied onto sightings when they were processed are stale the moment a
         # telemetry point behind one is rejected -- and nothing used to go back for them,
@@ -873,6 +891,10 @@ class JourneyBuilder:
             recording.gps_rejected_count = (recording.gps_rejected_count or 0) + newly_rejected
 
         journey.distance_m, journey.avg_speed_kmh = self._measure(track, min_move_m)
+        if motion.evidence["status"] != "moving":
+            # Insufficient evidence does not establish zero movement. Show unknown
+            # validated statistics and retain the observed values in the assessment.
+            journey.distance_m = journey.avg_speed_kmh = journey.max_speed_kmh = None
         journey.vehicle_count = int(counts[0] or 0)
         journey.unique_plate_count = int(counts[1] or 0)
 

@@ -137,6 +137,13 @@ export interface TelemetryQuality {
 }
 
 export interface Journey {
+  motionJson?: {
+    revision: string
+    status: 'moving' | 'unconfirmed' | 'unknown'
+    rejectedSpeedSamples: number
+    observedDistanceM: number | null
+    observedMaxSpeedKmh: number | null
+  } | null
   id: number
   title: string | null
   startedAt: string

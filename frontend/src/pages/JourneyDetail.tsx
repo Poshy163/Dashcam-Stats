@@ -107,6 +107,19 @@ export default function JourneyDetail() {
         }
       />
 
+      {journey.motionJson && journey.motionJson.status !== 'moving' && (
+        <div className="card p-4 text-sm text-content-muted">
+          <strong className="text-content">Movement not confirmed.</strong>{' '}
+          These recordings do not establish a sustained drive. GPS drift and isolated
+          speed readings are excluded from journey totals; the original footage remains available.
+        </div>
+      )}
+      {!!journey.motionJson?.rejectedSpeedSamples && (
+        <p className="text-sm text-content-muted">
+          {journey.motionJson.rejectedSpeedSamples} inconsistent speed readings excluded from these statistics.
+        </p>
+      )}
+
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
         <StatTile
           label="Distance"
@@ -140,7 +153,12 @@ export default function JourneyDetail() {
 
       <JourneyPlayer journey={journey} driveId={obd.data?.drive?.driveId} />
 
-      {journey.hasGps ? (
+      {journey.motionJson && journey.motionJson.status !== 'moving' ? (
+        <EmptyState
+          title="No confirmed driving route"
+          description="The sensor readings did not establish sustained movement, so they are not drawn as a travelled route."
+        />
+      ) : journey.hasGps ? (
         <RouteMap
           route={drawable}
           start={start}

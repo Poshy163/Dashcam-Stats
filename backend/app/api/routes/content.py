@@ -568,6 +568,14 @@ async def list_journeys(
     return await _paginate(session, stmt.order_by(order), page, JourneyOut)
 
 
+@router.get("/journeys/motion-quality")
+async def journey_motion_quality(session: SessionDep):
+    """Durable coverage of the automatic historical movement check."""
+    from app.journeys.revalidation import motion_coverage
+
+    return await motion_coverage(session)
+
+
 @router.get("/journeys/{journey_id}", response_model=JourneyDetailOut)
 async def get_journey(journey_id: RowId, session: SessionDep):
     journey = (
@@ -660,6 +668,9 @@ async def get_journey(journey_id: RowId, session: SessionDep):
             samples, tolerance_m=tolerance, breaks=[p.breaks_segment for p in path]
         )
     ]
+
+    if (journey.motion_json or {}).get("status") in {"unconfirmed", "unknown"}:
+        route = []
 
     # Validate against JourneyOut, not JourneyDetailOut. They differ by one field, and that
     # field is the whole problem: JourneyDetailOut declares `recordings`, so validating the

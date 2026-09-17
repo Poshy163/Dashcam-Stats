@@ -108,6 +108,10 @@ def is_a_drive(*, min_avg_speed_kmh: float, min_top_speed_kmh: float):
         tests.append(Journey.max_speed_kmh >= min_top_speed_kmh)
     if not tests:
         return true()
+    # NULL is a legacy row waiting for the bounded historical assessment. Unconfirmed
+    # movement is not deletion evidence; parked retention deliberately does not use this.
+    motion_status = Journey.motion_json["status"].as_string()
+    tests.append(or_(motion_status.is_(None), motion_status == "moving"))
     return and_(*tests)
 
 

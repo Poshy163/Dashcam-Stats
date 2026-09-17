@@ -22,7 +22,7 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Query
-from sqlalchemy import Float, String, distinct, func, select
+from sqlalchemy import Float, String, distinct, func, or_, select
 from sqlalchemy import cast as sa_cast
 
 from app.api.deps import SQLITE_MAX_INT, SessionDep
@@ -153,6 +153,16 @@ async def heatmap(
             TelemetryPoint.lat.is_not(None),
             TelemetryPoint.lon.is_not(None),
             _drawable_quality(),
+            # Retain raw positions for inspection, but do not draw sensor wander as a
+            # travelled route after the journey's motion check failed to establish one.
+            or_(
+                TelemetryPoint.journey_id.is_(None),
+                TelemetryPoint.journey_id.not_in(
+                    select(Journey.id).where(
+                        Journey.motion_json["status"].as_string().in_(["unconfirmed", "unknown"])
+                    )
+                ),
+            ),
         )
         .group_by(lat_cell, lon_cell)
         # Densest first, so a truncated response still shows the places most driven rather
@@ -260,6 +270,14 @@ async def routes(
             # them. Naming the quality as well keeps the intent legible and covers a row
             # that was cleared by one route and not the other.
             _drawable_quality(),
+            or_(
+                TelemetryPoint.journey_id.is_(None),
+                TelemetryPoint.journey_id.not_in(
+                    select(Journey.id).where(
+                        Journey.motion_json["status"].as_string().in_(["unconfirmed", "unknown"])
+                    )
+                ),
+            ),
             # A rear-camera-only stretch is rare and not worth a second copy of every road.
             (Camera.role == CameraRole.FRONT) | (Camera.id.is_(None)),
         )
@@ -361,6 +379,10 @@ async def coverage(session: SessionDep):
         )
         .where(
             Journey.id.in_(visible_journey_ids()),
+            or_(
+                Journey.motion_json["status"].as_string().is_(None),
+                Journey.motion_json["status"].as_string() == "moving",
+            ),
             Journey.min_lat.is_not(None),
             Journey.min_lon.is_not(None),
         )

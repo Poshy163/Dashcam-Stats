@@ -19,6 +19,7 @@ from app.core.logging import get_logger, prune_logs
 from app.core.settings_service import get_settings_service
 from app.db.session import session_scope
 from app.journeys.builder import JourneyBuilder
+from app.journeys.revalidation import revalidate_motion
 from app.pipeline.plate_repair import queue_plate_repairs
 from app.pipeline.repair import repair_durations
 from app.retention import execute as run_retention
@@ -111,6 +112,12 @@ class Scheduler:
                 enabled=lambda: _flag("plates.auto_revalidate"),
                 run=self._run_plate_revalidation,
             ),
+            TaskState(
+                name="journey-motion-revalidation",
+                interval_s=lambda: _fixed(30.0),
+                enabled=lambda: _flag("journeys.enabled"),
+                run=self._run_journey_motion_revalidation,
+            ),
         ]
 
         now = time.monotonic()
@@ -181,6 +188,9 @@ class Scheduler:
     async def _run_plate_revalidation(self) -> None:
         async with session_scope() as session:
             await queue_plate_repairs(session)
+
+    async def _run_journey_motion_revalidation(self) -> None:
+        await revalidate_motion()
 
     async def _run_scan(self) -> None:
         summary = await self._scanner.scan(trigger="scheduled")
