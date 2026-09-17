@@ -8,11 +8,15 @@ live unit, including the shapes that must be rejected rather than half-stored.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import select
 
-from app.ingest import unit_logs
+from app.db.models import UnitLogEntry, utcnow
+from app.db.session import session_scope
+from app.ingest import carplay_timing, unit_logs
 
 #: Copied verbatim from the unit, with `-v threadtime -v year -v UTC` applied.
 REAL_LINES = """--------- beginning of main
@@ -136,6 +140,79 @@ class TestDeduplicationIdentity:
         [b] = unit_logs.parse(f"2026-09-01 13:19:42.001 +0000 222 3 E CarPlayTiming: {base}")
 
         assert a.line_hash == b.line_hash
+
+
+class TestStorage:
+    @pytest.mark.parametrize("direct_first", [False, True])
+    async def test_complete_sampler_copy_survives_either_transport_order(
+        self, db_session, monkeypatch, direct_first
+    ):
+        # The unit's logcat `log` command cuts messages at 1024 characters. Put the
+        # boundary inside a number: accepting that prefix can change its meaning too.
+        stamp = utcnow().replace(microsecond=789000)
+        header = "sample=1725750000-17-frame-1 session=1725750000-17 "
+        metrics = "| layer=#103 fps=28.1 med=35.1 p95=35.1 max=88.2 late=1% ready_max=3"
+        message = header + " " * (1024 - len(header) - len(metrics)) + metrics
+        message += "0.6 ring_overlap=1 ring_gap_ms=0.0 surface_unchanged_ms=0"
+        [logcat] = unit_logs.parse(
+            f"{stamp:%Y-%m-%d %H:%M:%S}.789 +0000 713 714 E CarPlayTiming: {message[:1024]}"
+        )
+
+        async def fake_shell(*args, **kwargs):
+            return f"{stamp:%Y-%m-%dT%H:%M:%SZ} {message}"
+
+        monkeypatch.setattr(carplay_timing.adb, "shell", fake_shell)
+        if direct_first:
+            assert await carplay_timing.recover_sampler_file("unit") == (1, 0)
+            assert await unit_logs.store([logcat]) == (0, 1)
+        else:
+            assert await unit_logs.store([logcat]) == (1, 0)
+            assert await carplay_timing.recover_sampler_file("unit") == (1, 0)
+
+        # Repeated imports cannot replace the complete observation or add another.
+        assert await unit_logs.store([logcat]) == (0, 1)
+        assert await carplay_timing.recover_sampler_file("unit") == (0, 1)
+        async with session_scope() as session:
+            [saved] = (await session.scalars(select(UnitLogEntry))).all()
+        assert saved.message == message
+        assert saved.occurred_at == (stamp.replace(microsecond=0) if direct_first else stamp)
+        assert (saved.pid, saved.tid) == ((0, 0) if direct_first else (713, 714))
+        sample = carplay_timing.parse_sample(saved.occurred_at, saved.message)
+        assert sample["ready_to_present_max_ms"] == 30.6
+        assert sample["ring_overlap"] == 1
+        assert sample["ring_gap_ms"] == 0
+
+    async def test_same_sample_id_with_conflicting_content_is_not_an_upgrade(self, db_session):
+        original = unit_logs.ParsedLine(
+            occurred_at=utcnow(),
+            pid=1,
+            tid=1,
+            level="E",
+            tag="CarPlayTiming",
+            message="sample=1725750000-17-1 session=1725750000-17 | event=sampler_started",
+        )
+        conflicting = replace(original, message=original.message.replace("started", "unavailable"))
+        assert len(conflicting.message) > len(original.message)
+        assert await unit_logs.store([original, conflicting]) == (1, 1)
+        async with session_scope() as session:
+            [saved] = (await session.scalars(select(UnitLogEntry))).all()
+        assert saved.message == original.message
+
+    @pytest.mark.parametrize("tag", ["Vendor", "CarPlayTiming"])
+    async def test_lines_without_sampler_identity_stay_distinct(self, db_session, tag):
+        original = unit_logs.ParsedLine(
+            occurred_at=utcnow(),
+            pid=1,
+            tid=1,
+            level="E",
+            tag=tag,
+            message="event=started",
+        )
+        longer = replace(original, message=original.message + " extra=1")
+        assert await unit_logs.store([original, longer, original]) == (2, 1)
+        async with session_scope() as session:
+            saved = (await session.scalars(select(UnitLogEntry))).all()
+        assert {row.message for row in saved} == {original.message, longer.message}
 
 
 class TestServerSideEnforcement:

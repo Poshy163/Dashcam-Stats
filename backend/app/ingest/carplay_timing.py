@@ -520,7 +520,7 @@ def sampler_file_read_command() -> str:
 
 
 async def recover_sampler_file(address: str) -> tuple[int, int]:
-    """Recover retained direct-file observations, returning ``(new, duplicate)``."""
+    """Recover direct-file observations: ``(new or completed, duplicate)``."""
     raw = await adb.shell(address, sampler_file_read_command(), timeout=ARM_TIMEOUT_S)
     # Test fakes from older callers sometimes return the lower-level result object.
     if isinstance(raw, adb.AdbResult):

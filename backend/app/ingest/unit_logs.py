@@ -444,11 +444,12 @@ async def _prune() -> None:
 
 
 async def store(entries: list[ParsedLine]) -> tuple[int, int]:
-    """Insert unseen lines.  Returns (accepted, duplicate).
+    """Insert unseen lines or complete truncated sampler copies: (accepted, duplicate).
 
     Deduplication is left to the unique index rather than a read-then-write check: the
     parked refresh re-reads the same tail every minute, so duplicates are the common case
-    and a conflict-ignoring insert makes that free instead of quadratic.
+    and an atomic upsert avoids a lookup per line. Accepted includes enriched observations;
+    their original capture/arrival metadata and identity remain unchanged.
     """
     if not entries:
         await _prune()
@@ -471,9 +472,26 @@ async def store(entries: list[ParsedLine]) -> tuple[int, int]:
     async with session_scope() as session:
         for row in rows:
             statement = sqlite_insert(UnitLogEntry).values(**row)
-            result = await session.execute(
-                statement.on_conflict_do_nothing(index_elements=["line_hash"])
-            )
+            if row["tag"] == "CarPlayTiming":
+                # The unit's logcat transport cuts long messages at 1024 characters.
+                # A later direct-file copy shares the explicit sample identity, but can
+                # recover the lost tail. Only a strict prefix extension is trustworthy;
+                # a conflicting observation with the same ID must never overwrite it.
+                # Legacy lines hash their full message, so cannot match this condition.
+                incoming = statement.excluded.message
+                statement = statement.on_conflict_do_update(
+                    index_elements=["line_hash"],
+                    set_={"message": incoming},
+                    where=(UnitLogEntry.tag == "CarPlayTiming")
+                    & (func.length(incoming) > func.length(UnitLogEntry.message))
+                    & (
+                        func.substr(incoming, 1, func.length(UnitLogEntry.message))
+                        == UnitLogEntry.message
+                    ),
+                )
+            else:
+                statement = statement.on_conflict_do_nothing(index_elements=["line_hash"])
+            result = await session.execute(statement)
             accepted += int(result.rowcount or 0)
     await _prune()
     return accepted, len(rows) - accepted
@@ -481,7 +499,7 @@ async def store(entries: list[ParsedLine]) -> tuple[int, int]:
 
 async def _publish_status(accepted: int, total: int) -> None:
     summary = (
-        f"{total} lines read from the unit, {accepted} new"
+        f"{total} lines read from the unit, {accepted} new or completed"
         if total
         else "nothing new from the unit"
     )
