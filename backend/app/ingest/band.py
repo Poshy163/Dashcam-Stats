@@ -72,7 +72,8 @@ So the levers that remain are both outside the unit:
 * **The access point.** Disassociating the client makes it re-associate from scratch and
   pick the strongest radio. That is now implemented here — see
   :func:`_maybe_kick_to_fast_band` and :mod:`app.ingest.unifi` — bounded to one bounce per
-  visit behind a cooldown, and never able to hold up a copy.
+  visit behind a cooldown. If the unit fails to reconnect, further automatic disconnects
+  are disabled and the copy waits for a reachable unit.
 * **Band steering, or a 5 GHz-only SSID, on the router.** Steering on the existing SSID
   needs no new network and fixes it permanently at association time; a dedicated 5 GHz SSID
   is the most certain of all. Either removes the need for the bounce entirely.
@@ -170,11 +171,13 @@ KICK_COOLDOWN_S = 300.0
 
 #: When the last bounce was asked for, so the cooldown survives across gate calls.
 _last_kick_at: float | None = None
+_kick_suspended = False
 
 
 def reset_kick_cooldown_for_tests() -> None:
-    global _last_kick_at
+    global _last_kick_at, _kick_suspended
     _last_kick_at = None
+    _kick_suspended = False
 
 
 def _policy() -> str:
@@ -185,6 +188,8 @@ def _policy() -> str:
 
 
 def _kick_enabled() -> bool:
+    if _kick_suspended:
+        return False
     try:
         return bool(get_settings_service().get_nowait("ingest.unifi_enabled"))
     except Exception:
@@ -207,14 +212,15 @@ async def read_client_mac(address: str) -> str:
     return parse_mac(reply)
 
 
-async def _maybe_kick_to_fast_band(address: str, frequency: int) -> int:
+async def _maybe_kick_to_fast_band(address: str, frequency: int) -> int | None:
     """Ask the access point to bounce the unit, and report the band it came back on.
 
     Returns the frequency to act on -- unchanged when the bounce is switched off, not
-    configured, still inside its cooldown, refused, or simply did not move it. The unit
+    configured or still inside its cooldown. After asking for a disconnect, only a fresh
+    response is authoritative; None means the link did not return. The unit
     cannot be made to change band from its own shell (see :mod:`app.ingest.unifi` for the
     measurements), so this is the only lever there is; it is still only ever a courtesy,
-    and every failure path here falls through to copying on the slow band.
+    and a failed reassociation must not be mistaken for a working slow band.
     """
     global _last_kick_at
 
@@ -235,22 +241,47 @@ async def _maybe_kick_to_fast_band(address: str, frequency: int) -> int:
     asked, detail = await unifi.kick_client(mac)
     if not asked:
         log.info("could not ask the access point to move the unit to 5GHz", reason=detail)
-        return frequency
-    log.info("asked the access point to reconnect the unit so it re-picks a radio", mac=mac)
+        # A timed-out HTTP response does not prove the access point ignored the request.
+        # Re-read the link even on this path rather than trusting the pre-request band.
+        current, _ssid = await read_link(address)
+        if current is not None:
+            return current
+    else:
+        log.info("asked the access point to reconnect the unit so it re-picks a radio")
 
     deadline = time.monotonic() + KICK_SETTLE_S
-    current = frequency
+    current: int | None = None
     while time.monotonic() < deadline:
         await asyncio.sleep(KICK_POLL_S)
-        seen, _ssid = await read_link(address)
-        if seen is None:
+        current, _ssid = await read_link(address)
+        if current is None:
             # Mid-reassociation the unit has no link to report; that is the expected middle
             # of this operation, not a failure.
             continue
-        current = seen
-        if is_fast(seen):
-            return seen
+        if is_fast(current):
+            return current
+    if current is None:
+        await _disable_failed_kick()
     return current
+
+
+async def _disable_failed_kick() -> None:
+    """Stop another visit repeating a disconnect which stranded the head unit."""
+    global _kick_suspended
+    _kick_suspended = True
+    persisted = False
+    try:
+        await get_settings_service().set("ingest.unifi_enabled", False)
+        persisted = True
+        _kick_suspended = False  # The saved setting now guards this and subsequent visits.
+    except Exception:
+        # Keep the process-local guard even if settings storage is temporarily unavailable.
+        log.warning("could not save the disabled access-point reconnect setting")
+    log.warning(
+        "head unit did not reconnect after a band-change request; "
+        "disabled automatic access-point disconnects",
+        setting_persisted=persisted,
+    )
 
 
 def _nudge_enabled() -> bool:
@@ -384,6 +415,17 @@ async def gate(address: str) -> bool:
     # given this app their access point, ask it to drop the unit so it re-associates and
     # picks the strongest radio -- which at every measured parking spot is the 5 GHz one.
     frequency = await _maybe_kick_to_fast_band(address, frequency)
+    if frequency is None:
+        _publish(
+            None,
+            held=True,
+            reason=(
+                "The head unit did not reconnect after the access point was asked to change "
+                "its band. Automatic disconnects have been disabled. Waiting for home Wi-Fi "
+                "before starting the backup."
+            ),
+        )
+        return False
     if is_fast(frequency):
         _publish(frequency, held=False, reason=None)
         log.info(

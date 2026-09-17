@@ -1561,8 +1561,10 @@ SETTINGS: tuple[SettingDef, ...] = (
         "access point is far stronger. The access point can: disconnecting the unit makes it "
         "re-associate from scratch and pick the strongest radio. With this on, a backup that "
         "finds the unit on 2.4 GHz asks your UniFi console to reconnect it once, waits a few "
-        "seconds, and carries on either way — a console that is unreachable never holds up a "
-        "copy. Needs the console address below and an API key saved from the Backup page.",
+        "seconds, and copies on whichever band returns. Some head units fail to reconnect; "
+        "if that happens, this option is automatically switched off and the backup waits "
+        "for the unit to rejoin Wi-Fi. Leave this off to preserve an existing connection. "
+        "Needs the console address below and an API key saved from the Backup page.",
         requires="ingest.enabled",
     ),
     SettingDef(

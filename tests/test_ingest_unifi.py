@@ -29,6 +29,9 @@ class StubSettings:
     def get_nowait(self, key, default=None):
         return self.values.get(key, default)
 
+    async def set(self, key, value):
+        self.values[key] = value
+
 
 def _config(**overrides) -> unifi.UnifiConfig:
     base = {
@@ -181,6 +184,8 @@ class TestTheGateUsesIt:
 
         async def shell(address, command, **kwargs):
             if "cmd wifi status" in command:
+                if state["frequency"] is None:
+                    raise band.adb.AdbError("the head unit is unreachable")
                 return (
                     'Wifi is connected to "Ubiquiti Router"\n'
                     'WifiInfo: SSID: "Ubiquiti Router", BSSID: 28:70:4e:d1:07:0f, '
@@ -237,6 +242,42 @@ class TestTheGateUsesIt:
     async def test_a_unit_that_comes_back_on_24_still_copies(self, unit):
         unit["after_kick"] = 2472
 
+        assert await band.gate("u:5555")
+        assert unit["kicked"] == 1
+
+    async def test_a_failed_reassociation_never_reuses_the_old_band(self, unit):
+        from app.ingest.status import get_status
+
+        unit["after_kick"] = None
+        assert not await band.gate("u:5555")
+        assert get_status().wifi_frequency_mhz is None
+        assert get_status().wifi_band_hold
+        assert unit["settings"].values["ingest.unifi_enabled"] is False
+        # A fresh process loads the saved false setting, so another visit is not bounced.
+        band.reset_kick_cooldown_for_tests()
+        unit["frequency"] = 2472
+        assert await band.gate("u:5555")
+        assert unit["kicked"] == 1
+
+    async def test_a_lost_http_reply_can_still_have_disconnected_the_unit(self, unit, monkeypatch):
+        async def kick(_mac):
+            unit["kicked"] += 1
+            unit["frequency"] = None
+            return False, "request timed out"
+
+        monkeypatch.setattr(band.unifi, "kick_client", kick)
+        assert not await band.gate("u:5555")
+        assert unit["settings"].values["ingest.unifi_enabled"] is False
+
+    async def test_failed_settings_write_still_stops_repeated_disconnects(self, unit, monkeypatch):
+        async def fail_save(*args):
+            raise OSError("settings unavailable")
+
+        unit["after_kick"] = None
+        monkeypatch.setattr(unit["settings"], "set", fail_save)
+        assert not await band.gate("u:5555")
+        unit["frequency"] = 2472
+        monkeypatch.setattr(band, "KICK_COOLDOWN_S", 0.0)
         assert await band.gate("u:5555")
         assert unit["kicked"] == 1
 
