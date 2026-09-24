@@ -732,6 +732,8 @@ async def carplay_timing_samples(
     ]
     return {
         "hours": hours,
+        "sampler_schema": carplay_timing.SAMPLER_SCHEMA,
+        "sampler_bundle": carplay_timing.bundle_id(),
         "total": len(samples),
         "samples": samples,
         "minutes": carplay_timing.summarise(samples),

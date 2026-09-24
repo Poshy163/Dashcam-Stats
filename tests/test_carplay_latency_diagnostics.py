@@ -176,7 +176,7 @@ def test_full_sampler_pass_without_network_or_surface(tmp_path, acc):
     kind = "diagnostic_context" if acc else "sampler_started"
     context = next(e for e in events if e and e["kind"] == kind)
     assert context["hotspot_neighbour_count"] == 0
-    assert context["diagnostic_schema"] == 5
+    assert context["diagnostic_schema"] == carplay_timing.SAMPLER_SCHEMA
     assert context["zlink_tcp_sockets"] is None
     # Frame sampling runs independently; its execution is tested separately below.
 

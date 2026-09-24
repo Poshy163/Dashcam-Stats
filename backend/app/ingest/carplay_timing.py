@@ -36,9 +36,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import math
 import re
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -58,6 +60,7 @@ log = get_logger(__name__)
 REMOTE_SCRIPT = "/data/local/tmp/dashcam_carplay_timing.sh"
 REMOTE_PID = "/data/local/tmp/.dashcam_carplay_timing.pid"
 REMOTE_LOG = "/data/local/tmp/dashcam_carplay_timing.log"
+REMOTE_CODEC_SCRIPT = "/data/local/tmp/dashcam_carplay_codec.sh"
 
 # The timing sampler has its own small, rotated file as well as logcat.  Logcat is a
 # useful transport when it is quiet, but a noisy tag can evict an entire drive before the
@@ -70,6 +73,7 @@ MAX_RECOVERY_LINES = 20_000
 
 #: The logcat tag every sample carries. The unit-log collector's allow-list must name it.
 TAG = "CarPlayTiming"
+SAMPLER_SCHEMA = 6
 
 ENABLED_KEY = "ingest.carplay_timing"
 INTERVAL_KEY = "ingest.carplay_timing_interval_s"
@@ -81,7 +85,7 @@ MIN_INTERVAL_S = 5
 FRAME_INTERVAL_S = 3
 MAX_INTERVAL_S = 120
 
-ARM_TIMEOUT_S = 20.0
+ARM_TIMEOUT_S = 30.0
 
 #: Re-arming replaces the running sampler, which throws away the sample it was in the
 #: middle of and the CPU baseline it needs for the next one. The presence poll would do
@@ -89,14 +93,44 @@ ARM_TIMEOUT_S = 20.0
 ARM_DEBOUNCE_S = 300.0
 
 _SCRIPT_PATH = Path(__file__).with_name("carplay_timing.sh")
+_CODEC_SCRIPT_PATH = Path(__file__).with_name("carplay_codec.sh")
 _last_armed: dict[str, float] = {}
 _last_recovered: dict[str, float] = {}
 _tasks: set[asyncio.Task[None]] = set()
+_arm_locks: dict[str, asyncio.Lock] = {}
 
 
 def script() -> str:
     """The sampler, in the unit's own toybox sh. Shipped beside this module."""
-    return _SCRIPT_PATH.read_text(encoding="utf-8")
+    source = _SCRIPT_PATH.read_text(encoding="utf-8")
+    bundle = source + "\n" + codec_script()
+    build = hashlib.sha256(bundle.encode()).hexdigest()
+    return source.replace("__DASHCAM_SAMPLER_BUILD__", build)
+
+
+def codec_script() -> str:
+    return _CODEC_SCRIPT_PATH.read_text(encoding="utf-8")
+
+
+def bundle_id() -> str:
+    """A content fingerprint for deployment verification, unrelated to device identity."""
+    return hashlib.sha256(
+        (_SCRIPT_PATH.read_text(encoding="utf-8") + "\n" + codec_script()).encode()
+    ).hexdigest()
+
+
+def deploy_command() -> str:
+    """Stage complete scripts before replacing either live path; never truncate a reader."""
+    sampler = base64.b64encode(script().encode()).decode()
+    codec = base64.b64encode(codec_script().encode()).decode()
+    suffix = "." + uuid.uuid4().hex + ".new"
+    return (
+        f"echo {sampler} | base64 -d > {REMOTE_SCRIPT}{suffix} && "
+        f"echo {codec} | base64 -d > {REMOTE_CODEC_SCRIPT}{suffix} && "
+        f"sh -n {REMOTE_SCRIPT}{suffix} && sh -n {REMOTE_CODEC_SCRIPT}{suffix} && "
+        f"mv {REMOTE_CODEC_SCRIPT}{suffix} {REMOTE_CODEC_SCRIPT} && "
+        f"mv {REMOTE_SCRIPT}{suffix} {REMOTE_SCRIPT}"
+    )
 
 
 def _enabled() -> bool:
@@ -115,20 +149,23 @@ def interval_s() -> int:
 
 
 async def arm(address: str) -> bool:
+    async with _arm_locks.setdefault(address, asyncio.Lock()):
+        return await _arm_locked(address)
+
+
+async def _arm_locked(address: str) -> bool:
     """Deploy the sampler and start it under its own session. True when the launch landed.
 
-    Always re-deploys, for the same reason the recording watcher does: the script is four
-    kilobytes and one control call, and an updated app then never has to reason about which
-    version a unit is carrying. The script's own pid file makes the restart idempotent.
+    Always delivers the current bundle. Its content fingerprint keeps an identical live
+    sampler running, preserving baselines and preventing overlapping capture workers.
     """
     if not _enabled():
         return False
-    encoded = base64.b64encode(script().encode()).decode()
     every = interval_s()
     try:
         await adb.shell(
             address,
-            f"echo {encoded} | base64 -d > {REMOTE_SCRIPT}",
+            deploy_command(),
             timeout=ARM_TIMEOUT_S,
         )
         await adb.shell(
@@ -137,6 +174,23 @@ async def arm(address: str) -> bool:
             f"setsid sh {REMOTE_SCRIPT} {every} e {FRAME_INTERVAL_S} </dev/null >/dev/null 2>&1 &",
             timeout=ARM_TIMEOUT_S,
         )
+        verified = await adb.shell(
+            address,
+            "n=0; while [ $n -lt 100 ]; do "
+            f"p=$(cat {REMOTE_PID} 2>/dev/null); "
+            "case $p in ''|*[!0-9]*) ;; *) "
+            f'if [ "$(cat /data/local/tmp/.dashcam_carplay_timing.build 2>/dev/null)" = "{bundle_id()}:{every}:{FRAME_INTERVAL_S}" ] '
+            '&& kill -0 "$p" 2>/dev/null '
+            f"&& tr '\\000' ' ' < /proc/$p/cmdline 2>/dev/null | grep -Fq '{REMOTE_SCRIPT}'; "
+            "then echo sampler_verified; exit 0; fi ;; esac; n=$((n+1)); sleep 0.2; "
+            "done; exit 1",
+            timeout=ARM_TIMEOUT_S,
+        )
+        if isinstance(verified, adb.AdbResult):
+            verified = verified.stdout
+        if "sampler_verified" not in verified.splitlines():
+            log.warning("CarPlay sampler launch was not verified")
+            return False
     except adb.AdbError as exc:
         log.warning("could not arm the CarPlay timing sampler", error=str(exc))
         return False
@@ -197,6 +251,7 @@ async def shutdown() -> None:
 def reset_for_tests() -> None:
     _last_armed.clear()
     _last_recovered.clear()
+    _arm_locks.clear()
 
 
 # ----------------------------------------------------------------------------------------
@@ -320,6 +375,66 @@ def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
         "link_poll_gap_ms",
         "link_probe_ms",
         "link_context_age_ms",
+        "wire_peer_tcp_sockets",
+        "wire_peer_tcp4_sockets",
+        "wire_peer_tcp6_sockets",
+        "wire_peer_proc_verified_sockets",
+        "wire_peer_root_verified_sockets",
+        "wire_peer_uid_unknown_sockets",
+        "wire_peer_rx_queue_bytes",
+        "wire_peer_tx_queue_bytes",
+        "wire_peer_bytes_received_total",
+        "wire_peer_bytes_received_delta",
+        "wire_peer_delta_ms",
+        "wire_peer_topology_changed",
+        "wire_peer_tcp_rtt_max_ms",
+        "wire_peer_receive_age_min_ms",
+        "zlink_loopback_tcp_sockets",
+        "zlink_loopback_counter_sockets",
+        "zlink_loopback_rx_queue_bytes",
+        "zlink_loopback_tx_queue_bytes",
+        "zlink_loopback_bytes_received_total",
+        "zlink_loopback_bytes_received_delta",
+        "zlink_loopback_delta_ms",
+        "zlink_loopback_topology_changed",
+        "codec_capture_ms",
+        "codec_capture_start_ms",
+        "codec_capture_end_ms",
+        "codec_trace_off",
+        "codec_trace_entries",
+        "codec_trace_written",
+        "codec_trace_overwrite",
+        "codec_input_n",
+        "codec_output_n",
+        "codec_matched_n",
+        "codec_latency_med_ms",
+        "codec_latency_p95_ms",
+        "codec_latency_max_ms",
+        "codec_input_gap_max_ms",
+        "codec_output_gap_max_ms",
+        "codec_duplicate_pts_n",
+        "codec_unmatched_input_n",
+        "codec_unmatched_output_n",
+        "codec_atrace_rc",
+        "codec_instances",
+        "codec_duplicate_input_n",
+        "codec_duplicate_output_n",
+        "codec_pts_reset_n",
+        "codec_output_reorder_n",
+        "codec_negative_latency_n",
+        "codec_input_tail_n",
+        "codec_output_head_n",
+        "codec_texture_update_n",
+        "codec_texture_acquire_n",
+        "codec_texture_gap_max_ms",
+        "codec_window_acquire_n",
+        "codec_texture_counter_n",
+        "codec_texture_queue_max",
+        "codec_window_counter_n",
+        "codec_window_queue_max",
+        "codec_dequeue_output_n",
+        "codec_release_output_n",
+        "codec_render_output_n",
     ):
         names[name] = name
     result = {name: _number(fields.get(key)) for name, key in names.items()}
@@ -328,6 +443,53 @@ def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
     reported = fields.get("codec_reported_local", "")
     result["codec_reported_local"] = (
         reported if re.fullmatch(r"\d{2}-\d{2}_\d{2}:\d{2}:\d{2}\.\d{1,9}", reported) else None
+    )
+    capture_status = fields.get("codec_capture_status", "")
+    result["codec_capture_status"] = (
+        capture_status
+        if capture_status
+        in {
+            "ok",
+            "busy",
+            "unsupported",
+            "no_zlink",
+            "timeout",
+            "failed",
+            "interrupted",
+            "tracing_active",
+            "restore_failed",
+            "overflow",
+            "invalid",
+            "no_markers",
+            "process_changed",
+            "unavailable",
+            "trace_busy_or_unavailable",
+            "tool_unavailable",
+            "zlink_missing_or_ambiguous",
+            "zlink_identity_unavailable",
+            "capture_busy",
+            "pipe_failed",
+            "atrace_error",
+            "parser_error",
+            "invalid_trace",
+            "summary_missing",
+        }
+        else None
+    )
+    stats_status = fields.get("codec_stats_status", "")
+    result["codec_stats_status"] = (
+        stats_status
+        if stats_status
+        in {
+            "ok",
+            "header_missing",
+            "trace_overwrite",
+            "pts_reset",
+            "negative_latency",
+            "limit_exceeded",
+            "no_markers",
+        }
+        else None
     )
     return result
 

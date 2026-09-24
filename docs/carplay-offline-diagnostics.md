@@ -1,5 +1,49 @@
 # Offline CarPlay delay diagnostics
 
+## IPv6 transport and active codec windows (schema 6)
+
+The 24 September capture identified a high-volume root-owned IPv6 connection on
+`wlan2` and a local stream received by ZLink. The old IPv4/app-UID peer probe cannot
+observe that path. Schema 6 retains its legacy fields for comparison and adds:
+
+- `wire_peer_*`: established IPv4 and IPv6 TCP sockets matched to resolved wlan2
+  neighbours, regardless of owning UID, with receive/send queues, bytes received,
+  RTT and receive age. Root ownership is counted only when the proc socket table
+  agrees on inode and both endpoints. Missing ownership remains unknown.
+- `zlink_loopback_*`: ZLink-owned loopback sockets, including mapped IPv6, with
+  queues and received-byte progress. Byte totals sum only reported receive counters;
+  `zlink_loopback_counter_sockets` reports how many sockets provide that counter.
+  Neither group identifies the payload as video.
+  Deltas are unavailable on first observation, incomplete reads, counter resets or
+  socket membership or receive-counter availability changes. Raw addresses and
+  socket identities stay in memory.
+- `codec_capture` events: a guarded five-second graphics/video trace at most once
+  per minute while capture is active and ZLink is present. Exact ZLink video-codec
+  input and completed-work timestamps produce matched counts and median/p95/maximum
+  local latency. Monotonic capture boundaries align these windows with other
+  measurements. Skips, missing markers, overflow and failure are explicit; they
+  never become zero latency. Raw traces are streamed into an aggregate parser and
+  are not saved. An existing active tracer is left alone.
+
+These trace windows are intermittent and may miss a brief incident. Measured codec
+latency includes framework/codec buffering, and does not measure iPhone frame age
+or full phone-to-screen latency. Regular output does not establish fresh content.
+
+Both programs are bundled with the server and installed on the head unit together.
+The running sampler's content fingerprint is checked after launch. Re-arming an
+identical bundle preserves its process, counters and current capture window;
+changed bundles stop and reap their workers before replacement. The timing API
+reports `sampler_schema` and `sampler_bundle` for server-side verification. Actual
+schema-6 records prove that the head unit is running the new bundle.
+
+The same bounded on-unit files and parked recovery path carry these events home.
+Removing the diagnostic installation also requires removing
+`dashcam_carplay_codec.sh`, `.dashcam_carplay_timing.build`, and any inactive
+codec capture temporary directory in `/data/local/tmp`, after stopping its sampler.
+No radio, power, recorder or CarPlay configuration is changed by these measurements.
+
+## Earlier sampler fields
+
 Sampler schema 4 adds evidence for video that is delayed even when frame presentation is
 regular. It runs on the head unit, independently of server connectivity. The server deploys
 the script when the unit is reachable; it must reach the unit at least once after an update.

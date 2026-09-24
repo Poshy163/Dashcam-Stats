@@ -1,6 +1,7 @@
 #!/system/bin/sh
 # dashcam-stats CarPlay timing sampler. Deleting this file, its .pid and its .log removes
-# every trace. Read-only: it never changes a setting, a radio, or a process.
+# its diagnostics. It never changes radio, power, recorder or CarPlay settings.
+# Short guarded ATrace windows observe codec progress; raw trace data is not retained.
 #
 # Every INTERVAL seconds, while a WLAN2 neighbour is present, it reads the frame timing of
 # package-named Zlink application buffer layers. Window presentation timing still cannot
@@ -26,15 +27,32 @@ LOG_KIB=1024
 LOG_ROTATIONS=8
 SESSION="$(date +%s)-$(cut -d' ' -f1 /proc/uptime 2>/dev/null | tr -d .)-$$"
 SCRIPT=/data/local/tmp/dashcam_carplay_timing.sh
+CODEC_SCRIPT=/data/local/tmp/dashcam_carplay_codec.sh
+BUILD_ID=__DASHCAM_SAMPLER_BUILD__
+BUILDF=/data/local/tmp/.dashcam_carplay_timing.build
 SEQF=/data/local/tmp/.dashcam_carplay_timing.seq
 if [ -f "$PIDF" ]; then
   oldpid=$(cat "$PIDF" 2>/dev/null)
   case "$oldpid" in
     ''|*[!0-9]*) ;;
-    *) [ -r "/proc/$oldpid/cmdline" ] && tr '\000' ' ' < "/proc/$oldpid/cmdline" | grep -q "$SCRIPT" && kill "$oldpid" 2>/dev/null ;;
+    *)
+      if [ -r "/proc/$oldpid/cmdline" ] && tr '\000' ' ' < "/proc/$oldpid/cmdline" | grep -Fq "$SCRIPT"; then
+        # Presence polls should not reset timing baselines or interrupt a trace window.
+        if kill -0 "$oldpid" 2>/dev/null && [ "$(cat "$BUILDF" 2>/dev/null)" = "$BUILD_ID:$INTERVAL:$FRAME_INTERVAL" ]; then
+          exit 0
+        fi
+        kill "$oldpid" 2>/dev/null
+        attempts=0
+        while kill -0 "$oldpid" 2>/dev/null && [ "$attempts" -lt 100 ]; do
+          sleep 0.1; attempts=$((attempts+1))
+        done
+        # Never overlap the old sampler/trace cleanup with a replacement.
+        kill -0 "$oldpid" 2>/dev/null && exit 1
+      fi ;;
   esac
 fi
 echo $$ > "$PIDF"
+echo "$BUILD_ID:$INTERVAL:$FRAME_INTERVAL" > "$BUILDF"
 echo 0 > "$SEQF"
 
 prev_ticks=0; prev_t=0; prev_zpid=; prev_rx=0; prev_rx_t=0; idle_n=0; prev_drops=-1
@@ -43,7 +61,15 @@ prev_cticks=0; prev_ct=0; prev_cpid=
 slow_pid=; slow_last=0; last_active=0
 FRAME_CONTEXT=/data/local/tmp/.dashcam_cpt_context_$SESSION
 FRAME_SEQ=/data/local/tmp/.dashcam_cpt_frame_seq_$SESSION
-frame_pid=; link_pid=
+frame_pid=; link_pid=; codec_pid=; codec_start=; codec_last=0; codec_seq=0; sleep_pid=
+frame_start=; link_start_ticks=; slow_start=; sleep_start=
+process_start() { awk '{sub(/^.*\) /,"");print $20}' "/proc/$1/stat" 2>/dev/null; }
+child_alive() {
+  [ -n "$1" ] && [ -n "$2" ] && [ "$(process_start "$1")" = "$2" ] && kill -0 "$1" 2>/dev/null
+}
+codec_alive() {
+  child_alive "$codec_pid" "$codec_start"
+}
 clock_ms() { awk '{printf "%.0f",$1*1000}' /proc/uptime; }
 # Deadline scheduling subtracts work time. After an overrun, skip missed deadlines
 # instead of issuing a burst of catch-up Binder calls.
@@ -54,9 +80,17 @@ deadline_delay() {
   }'
 }
 cleanup() {
-  [ -n "$frame_pid" ] && kill "$frame_pid" 2>/dev/null
-  [ -n "$link_pid" ] && kill "$link_pid" 2>/dev/null
-  [ -n "$slow_pid" ] && kill "$slow_pid" 2>/dev/null
+  # Signal all owned children first, then reap them before a replacement can start.
+  codec_alive && kill "$codec_pid" 2>/dev/null
+  for child in "$frame_pid:$frame_start" "$link_pid:$link_start_ticks" "$slow_pid:$slow_start" "$sleep_pid:$sleep_start"; do
+    child_alive "${child%:*}" "${child#*:}" && kill "${child%:*}" 2>/dev/null
+  done
+  if [ -n "$codec_pid" ]; then
+    wait "$codec_pid" 2>/dev/null
+  fi
+  for child in "$frame_pid" "$link_pid" "$slow_pid" "$sleep_pid"; do
+    [ -n "$child" ] && wait "$child" 2>/dev/null
+  done
   rm -f "$FRAME_CONTEXT" "$FRAME_CONTEXT.new" "$FRAME_SEQ"
 }
 trap 'exit 0' TERM INT
@@ -107,7 +141,7 @@ diagnostic_context() {
     start_ticks=$(sed 's/.*) //' /proc/$zpid/stat 2>/dev/null | awk '{print $20}')
     sched="$sched zlink_start_ticks=${start_ticks:-na}"
   fi
-  diag="schema=5 wifi_country_code=${country:-na} mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
+  diag="schema=6 wifi_country_code=${country:-na} mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
 }
 tcp_summary() {
   # ss exposes TCP_INFO per socket. Match the exact app UID on the socket header,
@@ -166,6 +200,109 @@ peer_tcp_summary() {
         (valid && ar?amax:"na"),(valid && na?amin:"na"),(valid && nb?sprintf("%.0f",bytes):"na")
     }'
 }
+transport_v6_summary() {
+  # The suffix after | is private continuity state, retained only in link_loop RAM.
+  # Root ownership requires the same proc inode AND normalized endpoint tuple.
+  # A missing ss UID is unknown, never implicitly root. Byte deltas require the
+  # exact same socket membership and complete consecutive observations.
+  awk -v uid="${link_uid:-na}" -v previous="$transport_state" -v stamp="$link_start" '
+    function hex(s, v,i,c) {v=0;s=tolower(s);for(i=1;i<=length(s);i++){c=index("0123456789abcdef",substr(s,i,1))-1;if(c<0)return -1;v=v*16+c}return v}
+    function v4(s, a,n,i,out) {n=split(s,a,".");if(n!=4)return "";out="4";for(i=1;i<=4;i++){if(a[i]!~/^[0-9]+$/ || a[i]+0>255)return "";out=out sprintf("%02x",a[i])}return out}
+    function ip(s, h,l,r,n,nl,nr,z,i,x,out,p,t) {
+      gsub(/[\[\]]/,"",s);sub(/%.*/,"",s);s=tolower(s)
+      if(index(s,":")==0)return v4(s)
+      if(index(s,".")){p=0;for(i=1;i<=length(s);i++)if(substr(s,i,1)==":")p=i;t=v4(substr(s,p+1));if(t=="")return "";s=substr(s,1,p) substr(t,2,4) ":" substr(t,6,4)}
+      n=split(s,h,"::");if(n>2)return "";nl=(h[1]==""?0:split(h[1],l,":"));nr=(n==2 && h[2]!=""?split(h[2],r,":"):0)
+      z=8-nl-nr;if((n==1 && z!=0) || (n==2 && z<1))return ""
+      out="";for(i=1;i<=nl;i++){x=l[i];if(x!~/^[0-9a-f]+$/ || length(x)>4)return "";out=out sprintf("%04x",hex(x))}
+      for(i=1;i<=z;i++)out=out "0000"
+      for(i=1;i<=nr;i++){x=r[i];if(x!~/^[0-9a-f]+$/ || length(x)>4)return "";out=out sprintf("%04x",hex(x))}
+      return (substr(out,1,24)=="00000000000000000000ffff"?"4" substr(out,25):"6" out)
+    }
+    function endpoint(s, p,h,k) {p=s;sub(/^.*:/,"",p);if(p!~/^[0-9]+$/)return "";h=substr(s,1,length(s)-length(p)-1);k=ip(h);return(k!=""?k ":" p:"")}
+    function zone(s, p) {sub(/:[^:]*$/,"",s);gsub(/[\[\]]/,"",s);p=index(s,"%");return(p?substr(s,p+1):"")}
+    function proc_endpoint(s, a,h,out,i,j,k) {split(s,a,":");h=tolower(a[1]);if((length(h)!=8 && length(h)!=32) || h!~/^[0-9a-f]+$/ || a[2]!~/^[0-9a-fA-F]+$/)return "";out="";for(i=1;i<=length(h);i+=8)for(j=6;j>=0;j-=2)out=out substr(h,i+j,2);k=(length(out)==8?"4" out:(substr(out,1,24)=="00000000000000000000ffff"?"4" substr(out,25):"6" out));return k ":" hex(a[2])}
+    function loop(k, a) {split(k,a,":");return(a[1]~/^47f/ || a[1]=="600000000000000000000000000000001")}
+    function fields( i,t,a) {
+      for(i=1;i<=NF;i++) {t=$i
+        if(t~/^uid:[0-9]+$/)owner=substr(t,5)+0
+        if(t~/^ino:[0-9]+$/)inode=substr(t,5)
+        if(t~/^sk:[0-9a-fA-F]+$/)cookie=substr(t,4)
+        if(t~/^bytes_received:[0-9]+$/)received=substr(t,16)+0
+        if(t~/^rtt:[0-9.]+\/[0-9.]+$/){split(substr(t,5),a,"/");rtt=a[1]+0}
+        if(t~/^lastrcv:[0-9]+$/)age=substr(t,9)+0
+      }
+    }
+    function add(group,key, verified, i) {
+      counts[group]++;rxq[group]+=rx;txq[group]+=tx
+      if(received>=0){bytes[group]+=received;bytecounts[group]++}
+      # ss can omit the receive counter on idle/control loopback sockets. Keep
+      # its coverage explicit and invalidate subtotal deltas when it appears.
+      if(group=="l")key=key "/b" (received>=0?1:0)
+      keys[group]=keys[group] (keys[group]!=""?",":"") key
+      if(inode+0<=0 && (cookie=="" || cookie~/^0+$/))unstable[group]++
+      if(group=="w") {families[fam]++;if(verified){verified_count++;if(owner==0)root_count++}if(owner<0)unknown_count++
+        if(rtt>=0){if(!rtt_n || rtt>rtt_max)rtt_max=rtt;rtt_n++}
+        if(age>=0){if(!age_n || age<age_min)age_min=age;age_n++}
+      }
+    }
+    function flush( proc_key,verified,parts,peer,key) {
+      if(!selected)return
+      selected=0;proc_key=fam SUBSEP inode SUBSEP local_key SUBSEP remote_key
+      verified=(rc["p" fam]==0 && ph[fam] && (proc_key in owners))
+      if(verified){if(owner>=0 && owner!=owners[proc_key]){verified=0;owner=-1}else owner=owners[proc_key]}
+      if(owner==0 && !verified)owner=-1
+      key=fam "/" inode "/" cookie "/" local_key "/" remote_key "/" local_zone "/" remote_zone
+      split(remote_key,parts,":");peer=parts[1]
+      if((peer in neighbors) && (local_zone=="" || local_zone=="wlan2") && (remote_zone=="" || remote_zone=="wlan2"))add("w",key,verified)
+      if(uid~/^[0-9]+$/ && owner==uid+0 && loop(local_key) && loop(remote_key))add("l",key,verified)
+    }
+    function continuity(group,valid,oldvalid,oldbytes,oldkeys, old,i,n,key,changed) {
+      changed="na";delta[group]="na";elapsed[group]="na"
+      if(valid && oldvalid==1 && !unstable[group]) {
+        n=split(oldkeys,old,",");changed=0
+        for(i=1;i<=n;i++)if(old[i]!="-")seen[old[i]]=1
+        n=split(keys[group],nowkeys,",");for(i=1;i<=n;i++)if(nowkeys[i]!="" && !(nowkeys[i] in seen))changed=1
+        n=split(oldkeys,old,",");for(i=1;i<=n;i++)if(old[i]!="-" && index("," keys[group] ",","," old[i] ",")==0)changed=1
+        for(key in seen)delete seen[key]
+        covered=(group=="l"?(counts[group]==0 || bytecounts[group]>0):bytecounts[group]==counts[group])
+        if(!changed && covered && oldbytes!="na" && bytes[group]>=oldbytes+0 && stamp>prior[7]+0){delta[group]=sprintf("%.0f",bytes[group]-oldbytes);elapsed[group]=sprintf("%.0f",stamp-prior[7])}
+      }
+      topology[group]=changed
+    }
+    BEGIN {split(previous,prior," ");for(i=1;i<=6;i++)rc[substr("p4p6n4n6s4s6",i*2-1,2)]=-1}
+    /^@/ {flush();section=substr($1,2);rc[section]=$2+0;fam=substr(section,2,1);next}
+    section~/^p/ {
+      if($2=="local_address"){ph[fam]=1;next}
+      if(NF>=10 && $8~/^[0-9]+$/ && $10~/^[0-9]+$/ && $10+0>0){a=proc_endpoint($2);b=proc_endpoint($3);if(a!="" && b!="")owners[fam SUBSEP $10 SUBSEP a SUBSEP b]=$8+0}
+      next
+    }
+    section~/^n/ {if($0~/ lladdr / && $NF!="FAILED" && $NF!="INCOMPLETE"){a=ip($1);if(a!="")neighbors[a]=1}next}
+    section~/^s/ {
+      if($0~/^(State|Netid)[ \t]/){sh[fam]=1;next}
+      offset=($1=="tcp" || $1=="tcp6"?1:0)
+      if($(offset+1)~/^(ESTAB|LISTEN|UNCONN|SYN-SENT|SYN-RECV|FIN-WAIT-1|FIN-WAIT-2|TIME-WAIT|CLOSE|CLOSE-WAIT|LAST-ACK|CLOSING)$/) {
+        flush();if($(offset+1)!="ESTAB")next
+        rx=$(offset+2);tx=$(offset+3);local_key=endpoint($(offset+4));remote_key=endpoint($(offset+5))
+        local_zone=zone($(offset+4));remote_zone=zone($(offset+5))
+        if(rx!~/^[0-9]+$/ || tx!~/^[0-9]+$/ || local_key=="" || remote_key==""){bad[fam]++;next}
+        selected=1;owner=-1;inode="";cookie="";received=-1;rtt=-1;age=-1;fields();next
+      }
+      if(selected && /^[ \t]/){fields();next}
+      if(NF && !/^[ \t]/)bad[fam]++
+    }
+    END {
+      flush();sok=(rc["s4"]==0 && rc["s6"]==0 && sh[4] && sh[6] && !bad[4] && !bad[6]);wok=sok && rc["n4"]==0 && rc["n6"]==0;lok=sok && uid~/^[0-9]+$/
+      continuity("w",wok,prior[1],prior[2],prior[8]);continuity("l",lok,prior[4],prior[5],prior[9])
+      printf "wire_peer_tcp_sockets=%s wire_peer_tcp4_sockets=%s wire_peer_tcp6_sockets=%s wire_peer_proc_verified_sockets=%s wire_peer_root_verified_sockets=%s wire_peer_uid_unknown_sockets=%s",(wok?counts["w"]+0:"na"),(wok?families[4]+0:"na"),(wok?families[6]+0:"na"),(wok?verified_count+0:"na"),(wok?root_count+0:"na"),(wok?unknown_count+0:"na")
+      printf " wire_peer_rx_queue_bytes=%s wire_peer_tx_queue_bytes=%s wire_peer_bytes_received_total=%s wire_peer_bytes_received_delta=%s wire_peer_delta_ms=%s wire_peer_topology_changed=%s wire_peer_tcp_rtt_max_ms=%s wire_peer_receive_age_min_ms=%s",(wok?sprintf("%.0f",rxq["w"]):"na"),(wok?sprintf("%.0f",txq["w"]):"na"),(wok && bytecounts["w"]==counts["w"]?sprintf("%.0f",bytes["w"]):"na"),delta["w"],elapsed["w"],topology["w"],(wok && rtt_n?rtt_max:"na"),(wok && age_n?age_min:"na")
+      # Loopback totals are the reported-counter subtotal; absent counters are
+      # not assumed zero. Coverage and counter availability travel with it.
+      lcovered=(counts["l"]==0 || bytecounts["l"]>0)
+      printf " zlink_loopback_tcp_sockets=%s zlink_loopback_counter_sockets=%s zlink_loopback_rx_queue_bytes=%s zlink_loopback_tx_queue_bytes=%s zlink_loopback_bytes_received_total=%s zlink_loopback_bytes_received_delta=%s zlink_loopback_delta_ms=%s zlink_loopback_topology_changed=%s",(lok?counts["l"]+0:"na"),(lok?bytecounts["l"]+0:"na"),(lok?sprintf("%.0f",rxq["l"]):"na"),(lok?sprintf("%.0f",txq["l"]):"na"),(lok && lcovered?sprintf("%.0f",bytes["l"]):"na"),delta["l"],elapsed["l"],topology["l"]
+      printf "|%d %s 0 %d %s 0 %.0f %s %s",(wok && !unstable["w"]),(wok && bytecounts["w"]==counts["w"]?sprintf("%.0f",bytes["w"]):"na"),(lok && !unstable["l"]),(lok && lcovered?sprintf("%.0f",bytes["l"]):"na"),stamp,(keys["w"]!=""?keys["w"]:"-"),(keys["l"]!=""?keys["l"]:"-")
+    }'
+}
 station_summary() {
   # AP-wide station statistics, not a claim that every station is the phone.
   awk -v ok="$station_ok" '
@@ -183,7 +320,7 @@ station_summary() {
 }
 link_loop() {
   trap - EXIT
-  link_seq=0; link_previous=0; link_deadline=$(clock_ms)
+  link_seq=0; link_previous=0; link_deadline=$(clock_ms); transport_state=
   while :; do
     link_start=$(clock_ms)
     if [ -r "$FRAME_CONTEXT" ]; then
@@ -198,18 +335,34 @@ link_loop() {
         socket_rows=$(timeout 1 ss -4tine 2>/dev/null); socket_rc=$?
         link_ok=0; [ "$neighbour_rc" = 0 ] && [ "$socket_rc" = 0 ] && link_ok=1
         peer_stats=$(printf '%s\n' "$socket_rows" | peer_tcp_summary)
+        neighbour6_rows=$(timeout 1 ip -6 neigh show dev wlan2 2>/dev/null); neighbour6_rc=$?
+        socket6_rows=$(timeout 1 ss -6tine 2>/dev/null); socket6_rc=$?
+        proc4_rows=$(timeout 1 cat /proc/net/tcp 2>/dev/null); proc4_rc=$?
+        proc6_rows=$(timeout 1 cat /proc/net/tcp6 2>/dev/null); proc6_rc=$?
+        transport_result=$(printf '@p4 %s\n%s\n@p6 %s\n%s\n@n4 %s\n%s\n@n6 %s\n%s\n@s4 %s\n%s\n@s6 %s\n%s\n' \
+          "$proc4_rc" "$proc4_rows" "$proc6_rc" "$proc6_rows" \
+          "$neighbour_rc" "$neighbour_rows" "$neighbour6_rc" "$neighbour6_rows" \
+          "$socket_rc" "$socket_rows" "$socket6_rc" "$socket6_rows" | transport_v6_summary)
+        # Android mksh treats an unescaped pipe as pattern alternation here.
+        transport_stats=${transport_result%%\|*}; transport_state=${transport_result#*\|}
         station_rows=$(timeout 1 iw dev wlan2 station dump 2>/dev/null); station_rc=$?
         station_ok=0; [ "$station_rc" = 0 ] && station_ok=1
         station_stats=$(printf '%s\n' "$station_rows" | station_summary)
         link_gap=na; [ "$link_previous" -gt 0 ] && link_gap=$((link_start-link_previous))
         link_previous=$link_start; link_seq=$((link_seq+1))
-        message="sample=$SESSION-link-$link_seq $head | event=wireless_link link_poll_gap_ms=$link_gap link_probe_ms=$(($(clock_ms)-link_start)) link_context_age_ms=$((link_start-context_ms)) $peer_stats $station_stats"
+        # The full diagnostic context is emitted separately. Keep this event below
+        # the retained-message limit so its transport tail survives file recovery.
+        link_acc=$(printf '%s\n' "$head" | awk '{for(i=1;i<=NF;i++)if($i~/^acc=[01]$/){print $i;exit}}')
+        link_head="session=$SESSION schema=6 ${link_acc:-acc=na}"
+        message="sample=$SESSION-link-$link_seq $link_head | event=wireless_link link_poll_gap_ms=$link_gap link_probe_ms=$(($(clock_ms)-link_start)) link_context_age_ms=$((link_start-context_ms)) $peer_stats $station_stats $transport_stats"
         printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$message" >> "$LOG"
         log -p "$PRIO" -t "$TAG" "$message" 2>/dev/null
-        unset socket_rows neighbour_rows station_rows link_peers
+        unset socket_rows socket6_rows neighbour_rows neighbour6_rows proc4_rows proc6_rows station_rows link_peers transport_result
       else
-        link_previous=0
+        link_previous=0; transport_state=
       fi
+    else
+      link_previous=0; transport_state=
     fi
     set -- $(deadline_delay "$link_deadline" "$(clock_ms)" 3000)
     link_deadline=$1
@@ -283,6 +436,7 @@ network_summary() {
     }'
 }
 slow_diagnostics() {
+  trap - EXIT
   # Background subshell: independent IDs avoid racing the foreground pipeline counter.
   # Only one worker per sampler; each Binder dump has a two-second service timeout.
   capture=$(date +%s); slow_seq=0
@@ -301,7 +455,7 @@ slow_diagnostics() {
 }
 emit_slow() {
   slow_seq=$((slow_seq+1))
-  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=5 | $1"
+  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=6 | $1"
   printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$message" >> "$LOG"
   log -p "$PRIO" -t "$TAG" "$message" 2>/dev/null
 }
@@ -493,10 +647,10 @@ while :; do
   else
     prev_rx=0; prev_rx_t=0
   fi
-  sta=$(cmd wifi status 2>/dev/null | grep -oE 'Frequency: [0-9]+MHz|RSSI: -?[0-9]+' | head -2 | tr -d ' ' | tr '\n' '/' )
+  sta=$(timeout 2 cmd wifi status 2>/dev/null | grep -oE 'Frequency: [0-9]+MHz|RSSI: -?[0-9]+' | head -2 | tr -d ' ' | tr '\n' '/' )
   sta_mhz=$(echo "$sta" | sed -n 's/.*Frequency:\([0-9][0-9]*\)MHz.*/\1/p')
   [ -n "$sta_mhz" ] || sta_mhz=na
-  ap=$(dumpsys wifi 2>/dev/null | grep -oE 'wlan2=SoftApInfo\{[^}]*frequency= [0-9]+' | grep -oE '[0-9]+$' | head -1)
+  ap=$(dumpsys -t 2 wifi 2>/dev/null | grep -oE 'wlan2=SoftApInfo\{[^}]*frequency= [0-9]+' | grep -oE '[0-9]+$' | head -1)
   # What the hotspot link *lost*, not just what it carried. Dropped and errored frames on
   # the AP are the direct evidence of a link that stalled, which average bitrate cannot
   # show: measured across 234 samples rx_kbit correlates with late frames at r=-0.00, yet a
@@ -536,7 +690,7 @@ while :; do
   fi
   bt=$(settings get global bluetooth_on 2>/dev/null)
   zlink_proc=0; [ -n "$zpid" ] && zlink_proc=1
-  diag="schema=5"
+  diag="schema=6"
   if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
     diagnostic_context
   fi
@@ -546,9 +700,10 @@ while :; do
   # First pass recovers retained summaries, then once/minute during activity and for
   # two minutes afterwards so decoder teardown records survive an offline departure.
   if { [ "$slow_last" -eq 0 ] || [ $((now-last_active)) -le 120 ]; } && [ $((now-slow_last)) -ge 60 ]; then
-    if [ -z "$slow_pid" ] || ! kill -0 "$slow_pid" 2>/dev/null; then
+    if ! child_alive "$slow_pid" "$slow_start"; then
       slow_diagnostics &
       slow_pid=$!; slow_last=$now
+      slow_start=$(process_start "$slow_pid")
     fi
   fi
 
@@ -574,13 +729,34 @@ while :; do
   if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then active=1; else active=0; fi
   printf '%s\n%s\n%s\n' "$active" "$context_ms" "$head" > "$FRAME_CONTEXT.new"
   mv "$FRAME_CONTEXT.new" "$FRAME_CONTEXT"
-  if [ -z "$frame_pid" ] || ! kill -0 "$frame_pid" 2>/dev/null; then
+  # Independent five-second codec windows, at most once/minute. These are local elapsed
+  # codec measurements, not phone-side content age. The helper guards other tracers and
+  # reports skips/errors explicitly, with bounded cleanup on sampler replacement.
+  if [ -n "$codec_pid" ] && ! codec_alive; then
+    wait "$codec_pid" 2>/dev/null
+    codec_pid=; codec_start=
+  fi
+  if [ "$active" = 1 ] && [ -n "$zpid" ] && [ $((now-codec_last)) -ge 60 ] && [ -r "$CODEC_SCRIPT" ]; then
+    if [ -z "$codec_pid" ]; then
+      codec_seq=$((codec_seq+1)); codec_last=$now
+      sh "$CODEC_SCRIPT" "$SESSION" "$codec_seq" "$LOG" "$PRIO" &
+      codec_pid=$!
+      codec_start=$(process_start "$codec_pid")
+    fi
+  fi
+  if ! child_alive "$frame_pid" "$frame_start"; then
     frame_loop &
     frame_pid=$!
+    frame_start=$(process_start "$frame_pid")
   fi
-  if [ -z "$link_pid" ] || ! kill -0 "$link_pid" 2>/dev/null; then
+  if ! child_alive "$link_pid" "$link_start_ticks"; then
     link_loop &
     link_pid=$!
+    link_start_ticks=$(process_start "$link_pid")
   fi
-  sleep "$INTERVAL"
+  sleep "$INTERVAL" &
+  sleep_pid=$!
+  sleep_start=$(process_start "$sleep_pid")
+  wait "$sleep_pid"
+  sleep_pid=
 done

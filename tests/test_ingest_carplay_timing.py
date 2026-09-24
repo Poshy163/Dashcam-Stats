@@ -596,7 +596,7 @@ class TestArming:
 
         async def fake_shell(address, command, **kwargs):
             shells.append(command)
-            return ""
+            return "sampler_verified\n" if "echo sampler_verified" in command else ""
 
         monkeypatch.setattr(adb, "shell", fake_shell)
         monkeypatch.setattr(
@@ -626,7 +626,7 @@ class TestArming:
 
         async def fake_shell(address, command, **kwargs):
             sent.append(command)
-            return adb.AdbResult(0, "", "")
+            return adb.AdbResult(0, "sampler_verified\n", "")
 
         monkeypatch.setattr(carplay_timing.adb, "shell", fake_shell)
         monkeypatch.setattr(
