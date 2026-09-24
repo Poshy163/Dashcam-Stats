@@ -30,6 +30,9 @@ latency includes framework/codec buffering, and does not measure iPhone frame ag
 or full phone-to-screen latency. Regular output does not establish fresh content.
 
 Both programs are bundled with the server and installed on the head unit together.
+Installation sends bounded base64 chunks through separate ADB requests, checks
+the staged byte lengths and shell syntax, then replaces the live files. A failed
+chunk leaves the running installation intact and removes only its own staged files.
 The running sampler's content fingerprint is checked after launch. Re-arming an
 identical bundle preserves its process, counters and current capture window;
 changed bundles stop and reap their workers before replacement. The timing API

@@ -86,11 +86,14 @@ FRAME_INTERVAL_S = 3
 MAX_INTERVAL_S = 120
 
 ARM_TIMEOUT_S = 30.0
+DEPLOY_CHUNK_BASE64_CHARS = 4 * 1024
+DEPLOY_COMMAND_MAX_BYTES = 24 * 1024
+DEPLOY_CLEANUP_TIMEOUT_S = 5.0
 
-#: Re-arming replaces the running sampler, which throws away the sample it was in the
-#: middle of and the CPU baseline it needs for the next one. The presence poll would do
-#: that every couple of seconds; once every few minutes is plenty to catch a reboot.
+#: Matching bundles reuse the running sampler and its baselines. Avoid repeated uploads
+#: on every presence tick; periodically verify it is still running after a reboot.
 ARM_DEBOUNCE_S = 300.0
+ARM_RETRY_S = 30.0
 
 _SCRIPT_PATH = Path(__file__).with_name("carplay_timing.sh")
 _CODEC_SCRIPT_PATH = Path(__file__).with_name("carplay_codec.sh")
@@ -119,18 +122,55 @@ def bundle_id() -> str:
     ).hexdigest()
 
 
-def deploy_command() -> str:
-    """Stage complete scripts before replacing either live path; never truncate a reader."""
-    sampler = base64.b64encode(script().encode()).decode()
-    codec = base64.b64encode(codec_script().encode()).decode()
-    suffix = "." + uuid.uuid4().hex + ".new"
-    return (
-        f"echo {sampler} | base64 -d > {REMOTE_SCRIPT}{suffix} && "
-        f"echo {codec} | base64 -d > {REMOTE_CODEC_SCRIPT}{suffix} && "
-        f"sh -n {REMOTE_SCRIPT}{suffix} && sh -n {REMOTE_CODEC_SCRIPT}{suffix} && "
-        f"mv {REMOTE_CODEC_SCRIPT}{suffix} {REMOTE_CODEC_SCRIPT} && "
-        f"mv {REMOTE_SCRIPT}{suffix} {REMOTE_SCRIPT}"
+def _stage_paths(stage_id: str) -> tuple[str, str]:
+    if re.fullmatch(r"[0-9a-f]{32}", stage_id) is None:
+        raise ValueError("invalid sampler deployment stage identity")
+    return f"{REMOTE_SCRIPT}.{stage_id}.new", f"{REMOTE_CODEC_SCRIPT}.{stage_id}.new"
+
+
+def deploy_commands(*, stage_id: str | None = None) -> list[str]:
+    """Bound each ADB service request; publish only after both scripts are complete.
+
+    ADB service strings have a 16-bit size field, and Windows has a smaller command-line
+    limit. Independent 4 KiB base64 chunks also fit Windows shell wrappers with an 8 KiB
+    limit and decode at 4-byte boundaries.
+    Only unique staging files are appended; live paths are replaced by the final command.
+    """
+    stages = _stage_paths(stage_id or uuid.uuid4().hex)
+    sources = (script().encode(), codec_script().encode())
+    commands = [f": > {stages[0]} && : > {stages[1]}"]
+    for source, stage in zip(sources, stages):
+        encoded = base64.b64encode(source).decode()
+        for offset in range(0, len(encoded), DEPLOY_CHUNK_BASE64_CHARS):
+            chunk = encoded[offset : offset + DEPLOY_CHUNK_BASE64_CHARS]
+            commands.append(f"printf %s {chunk} | base64 -d >> {stage}")
+    commands.append(
+        f'test "$(wc -c < {stages[0]})" -eq {len(sources[0])} && '
+        f'test "$(wc -c < {stages[1]})" -eq {len(sources[1])} && '
+        f"sh -n {stages[0]} && sh -n {stages[1]} && "
+        f"mv {stages[1]} {REMOTE_CODEC_SCRIPT} && mv {stages[0]} {REMOTE_SCRIPT}"
     )
+    if any(len(command.encode()) > DEPLOY_COMMAND_MAX_BYTES for command in commands):
+        raise ValueError("sampler deployment command exceeds safe ADB request size")
+    return commands
+
+
+async def _deploy_bundle(address: str) -> None:
+    stage_id = uuid.uuid4().hex
+    stages = _stage_paths(stage_id)
+    try:
+        for command in deploy_commands(stage_id=stage_id):
+            await adb.shell(address, command, timeout=ARM_TIMEOUT_S)
+    except (Exception, asyncio.CancelledError):
+        # Never launch or publish after a failed chunk. Cleanup is a separate small
+        # request and names only staging files owned by this particular attempt.
+        try:
+            await adb.shell(
+                address, f"rm -f {stages[0]} {stages[1]}", timeout=DEPLOY_CLEANUP_TIMEOUT_S
+            )
+        except (adb.AdbError, asyncio.CancelledError):
+            pass
+        raise
 
 
 def _enabled() -> bool:
@@ -163,11 +203,7 @@ async def _arm_locked(address: str) -> bool:
         return False
     every = interval_s()
     try:
-        await adb.shell(
-            address,
-            deploy_command(),
-            timeout=ARM_TIMEOUT_S,
-        )
+        await _deploy_bundle(address)
         await adb.shell(
             address,
             # `e` is the logcat priority the lines are emitted at -- see the module note.
@@ -212,9 +248,19 @@ def on_unit_present(address: str) -> None:
     if last is not None and now - last < ARM_DEBOUNCE_S:
         return
     _last_armed[address] = now
-    task = asyncio.create_task(arm(address), name="ingest-carplay-timing")
+    task = asyncio.create_task(_arm_on_presence(address), name="ingest-carplay-timing")
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
+
+
+async def _arm_on_presence(address: str) -> None:
+    try:
+        armed = await arm(address)
+    except Exception:
+        _last_armed[address] = time.monotonic() - ARM_DEBOUNCE_S + ARM_RETRY_S
+        raise
+    if not armed:
+        _last_armed[address] = time.monotonic() - ARM_DEBOUNCE_S + ARM_RETRY_S
 
 
 def recover_on_unit_present(address: str) -> None:
