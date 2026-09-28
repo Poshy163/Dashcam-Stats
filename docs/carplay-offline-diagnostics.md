@@ -1,13 +1,37 @@
 # Offline CarPlay delay diagnostics
 
-## GPS acquisition and provider freshness (schema 7)
+## GPS acquisition and provider freshness (schemas 7–8)
 
 Schema 7 adds `gps_context` events to the same bounded offline log and
 `/api/unit-logs/carplay-timing` event stream. An independent worker samples immediately
 and then on 15-second deadlines, including before ZLink, CarPlay or a hotspot neighbour
 is present. It reads ignition and location mode afresh, so an old frame-context snapshot
 cannot supply their values. Slow GPS reads do not run in the frame or transport worker;
-missed deadlines are skipped rather than followed by a burst of queries.
+missed deadlines are skipped rather than followed by catch-up queries.
+
+Schema 8 temporarily requests five-second observations after a qualifying observed
+transition while ignition is known to be on: the worker's first on-state, ignition
+changing from off to on, the receiver changing from stopped to started, a previously
+fresh fix becoming stale, or an observation gap longer than 45 seconds. A polling gap
+is not proof of sleep or suspend. The initial transition may still be observed up to
+15 seconds late. The observation burst does not change the receiver's fix rate.
+
+The worker schedules no new five-second observation at or beyond 90 seconds from the
+triggering observation's start. It returns to baseline earlier after two consecutive
+fresh fixes with advancing elapsed timestamps, any unsuccessful location dump, a whole
+capture taking at least one second, or ignition becoming off or unknown. A read already
+running remains subject to the existing command timeouts. For cadence decisions only,
+fresh means an enabled, started GPS provider with fix age at most five seconds; stale
+means the same active provider with no current fix or fix age at least ten seconds.
+The triggering sample is a baseline and cannot count as acquisition progress.
+
+Episodes have a five-minute cooldown measured from their start. A stale edge suppressed
+during cooldown is consumed, not queued: persistent missing GPS does not restart bursts
+indefinitely. A new fresh-to-stale transition or observed ignition/receiver transition is
+needed. Long polling gaps discard consecutive-fix progress but preserve cooldown and
+the explicitly labelled last-known fix; elapsed-clock reversal clears all of that state.
+Worker restart starts a new observation lifetime. No state is written to the device beyond
+the existing sanitized log.
 
 The worker runs while the existing sampler survives and Android allows it to run. It
 has no wake lock or boot hook, does not prevent natural sleep, and does not create GPS
@@ -21,6 +45,11 @@ rotations, so retained history also advances between CarPlay sessions while Andr
 | `gps_capture_status`, `gps_dump_rc` | Parser result and command exit code. Status is `ok`, `dump_error`, `unsupported`, `limit`, `parser_error` or `tool_unavailable`; exit code alone does not establish a usable dump. |
 | `gps_capture_start_ms`, `gps_uptime_ms` | Elapsed milliseconds since device boot at observation start and parser completion. The latter is the reference for fix ages. The log's UTC timestamp is emission time. |
 | `gps_capture_ms`, `gps_poll_gap_ms` | Whole observation duration and start-to-start polling gap, in milliseconds. The first polling gap is unavailable. |
+| `gps_next_interval_ms` | Schema 8 requested next observation interval, either `5000` or `15000`. Actual scheduling is measured by `gps_poll_gap_ms`; no catch-up reads are issued. |
+| `gps_burst_reason`, `gps_burst_start_ms`, `gps_burst_elapsed_ms` | Schema 8 observation episode reason (`none`, `startup_on`, `ignition_on`, `receiver_start`, `fix_stale`, `poll_gap`), elapsed-clock start and observed duration in milliseconds. Closing observations retain these values; baseline observations use `none` and unavailable times. These are not acquisition/TTFF measurements. |
+| `gps_burst_end` | Schema 8 end reason: `none`, `fresh_progress`, `budget`, `read_failed`, `slow_read`, `ignition_off` or `ignition_unknown`. A long gap instead discards the earlier episode and may start a new `poll_gap` episode when cooldown permits. |
+| `gps_fix_advanced` | Schema 8 current valid GPS fix timestamp advances beyond the previously observed valid timestamp (`1`), repeats it (`0`), or cannot be compared (`na`). Missing, future or regressed fixes, the first fix and polling-gap/clock-reset boundaries are unavailable. Advancing alone does not establish freshness. |
+| `gps_last_known_fix_age_ms` | Schema 8 age of the most recent valid GPS timestamp observed in this worker lifetime, referenced to whole-capture completion (`gps_capture_start_ms + gps_capture_ms`). Can remain known when the current provider or dump is unavailable; it never substitutes for `loc_gps_age_ms`. |
 | `location_mode`, `location_enabled`, `gps_started` | Android location-mode setting (`0`–`3`), reported location-enabled flag and GNSS started flag. A setting or started receiver does not establish a valid fix. |
 | `gps_zlink_process_present`, `gps_native_process_present` | Observed presence of the ZLink app and native `z-link` process. Presence alone does not establish a CarPlay connection or a working GPS feed; process identifiers are discarded. |
 | `gnss_reports`, `gnss_ttff_reports` | Cumulative GNSS location-report and time-to-first-fix report counts from Android's retained statistics. |
@@ -56,7 +85,9 @@ Apple describes vehicle GNSS alongside iPhone sensors in its
 Provider ages also do not measure picture age or end-to-end navigation latency.
 
 Per-acquisition first-fix duration is not derived by this implementation. A new fresh fix
-between 15-second observations only bounds when it was observed; it is not exact TTFF.
+between observations only bounds when it was observed; it is not exact TTFF. The five-second
+cadence improves that observation bound during eligible episodes, without proving when
+the iPhone received or accepted a location.
 Count and mean changes can support a later analysis only when both belong to the same
 statistics lifetime, with resets and gaps excluded. Do not subtract elapsed timestamps
 across reboots or interpret the cumulative TTFF mean as one trip's value.

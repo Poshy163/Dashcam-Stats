@@ -316,11 +316,10 @@ class BundleExporter(
         val finish = Instant.parse(drive.getString("finish_time_utc"))
         var distance = 0.0
         var idle = 0.0
-        var fuel = 0.0
+        val fuelEstimate = EstimatedFuelAccumulator()
         var missing = 0.0
         var distanceIntervals = 0
         var idleEvidence = false
-        var fuelEvidence = false
         var speedSum = 0.0
         var speedCount = 0
         var maximumSpeed: Double? = null
@@ -331,6 +330,19 @@ class BundleExporter(
         var maximumLoad: Double? = null
         var previous: JSONObject? = null
         val sampleCount = database.forEachSample(drive.getString("drive_id")) { current ->
+            val quality = JSONObject(current.getString("quality_json"))
+            val missingPids = quality.optJSONArray("missing_pids")
+            val missingMaf = missingPids != null && (0 until missingPids.length()).any {
+                missingPids.optInt(it, -1) == 0x10
+            }
+            fuelEstimate.observe(
+                driveId = current.getString("drive_id"),
+                sequence = current.getLong("sequence"),
+                capturedAt = Instant.parse(current.getString("timestamp_utc")),
+                estimatedRate = if (current.isNull("estimated_fuel_rate")) null else current.optDouble("estimated_fuel_rate"),
+                invalid = current.optString("ecu_data_status") != "live" ||
+                    quality.optString("transport", "ok") != "ok" || missingMaf,
+            )
             current.number("vehicle_speed")?.let { speed ->
                 speedSum += speed
                 speedCount += 1
@@ -366,15 +378,13 @@ class BundleExporter(
                             idleEvidence = true
                             if (firstRpm > 300 && firstSpeed < 1) idle += gap
                         }
-                        first.number("estimated_fuel_rate")?.takeIf { it >= 0 }?.let {
-                            fuelEvidence = true
-                            fuel += it * gap / 3600
-                        }
                     }
                 }
             }
             previous = current
         }
+        val fuel = fuelEstimate.litres
+        val fuelEvidence = fuelEstimate.hasEvidence
         val duration = java.time.Duration.between(start, finish).toMillis().coerceAtLeast(0) / 1000.0
         val expected = maxOf(if (duration > 0) (duration / 5).toInt() + 1 else 0, sampleCount)
         val dtcs = sortedSetOf<String>()

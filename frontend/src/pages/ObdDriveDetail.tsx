@@ -6,6 +6,7 @@ import type { PointerEvent as ReactPointerEvent } from 'react'
 import Spinner from '@/components/Spinner'
 import { ObdLifecycleBadge, ObdLifecycleExplanation, ObdLifecycleReason } from '@/components/ObdLifecycle'
 import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
+import { ObdPollTiming } from '@/components/ObdPollTiming'
 import { EmptyState, ErrorState, PageHeader, StatTile } from '@/components/ui'
 import { api, type OBDBattery, type OBDSeriesSample } from '@/lib/api'
 import { formatDateTime, formatDuration, formatRelative, formatSpeed, formatTime } from '@/lib/format'
@@ -1200,7 +1201,11 @@ export default function ObdDriveDetail() {
                   </td>
                   <td className="p-2">{event.kind.replace(/_/g, ' ')}</td>
                   <td className="p-2 text-xs text-content-muted">
-                    <code>{JSON.stringify(event.payload)}</code>
+                    {event.kind === 'poll_timing' ? (
+                      <ObdPollTiming payload={event.payload} />
+                    ) : (
+                      <code>{JSON.stringify(event.payload)}</code>
+                    )}
                   </td>
                 </tr>
               ))}

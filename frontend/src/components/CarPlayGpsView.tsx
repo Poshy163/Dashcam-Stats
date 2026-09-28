@@ -8,6 +8,16 @@ const providerName = (provider: CarPlayLocationProvider) => provider === 'Gps' ?
 const yesNo = (value: boolean | null) => value == null ? 'Unknown' : value ? 'Yes' : 'No'
 const measurement = (value: number | null, unit: string) => value == null ? 'Unknown' : `${value.toFixed(1)} ${unit}`
 const age = (ms: number | null) => measurement(ms == null ? null : ms / 1000, 's')
+const burstReasons: Record<string, string> = {
+  none: 'None', startup_on: 'First observation with ignition on', ignition_on: 'Ignition turned on',
+  receiver_start: 'GPS receiver started', fix_stale: 'A previously fresh fix became stale',
+  poll_gap: 'Observation gap longer than 45 seconds',
+}
+const burstEnds: Record<string, string> = {
+  none: 'None', fresh_progress: 'Two fresh fixes with advancing timestamps', budget: 'Time limit reached',
+  read_failed: 'Location read failed', slow_read: 'Capture took at least one second',
+  ignition_off: 'Ignition turned off', ignition_unknown: 'Ignition state unavailable',
+}
 
 export default function CarPlayGpsView({ events }: { events: CarPlayTimingEvent[] }) {
   const [requestedPage, setRequestedPage] = useState<number | 'latest'>(0)
@@ -61,6 +71,21 @@ export default function CarPlayGpsView({ events }: { events: CarPlayTimingEvent[
                           <p>Location enabled: {yesNo(available ? diagnosticFlag(event.locationEnabled) : null)}.
                             {' '}GPS started: {yesNo(available ? diagnosticFlag(event.gpsStarted) : null)}.
                           </p>
+                          <div>
+                            <div className="font-medium">Observation cadence</div>
+                            <p className="mt-1">Next target: {age(event.gpsNextIntervalMs ?? null)}.
+                              {' '}Capture duration: {age(event.gpsCaptureMs ?? null)}.
+                              {' '}Actual polling gap: {age(event.gpsPollGapMs ?? null)}.
+                            </p>
+                            <p>Burst reason: {burstReasons[event.gpsBurstReason ?? ''] ?? 'Unknown'}.
+                              {' '}Elapsed: {age(event.gpsBurstElapsedMs ?? null)}.
+                              {' '}Ended: {burstEnds[event.gpsBurstEnd ?? ''] ?? 'Unknown'}.
+                            </p>
+                            <p>Fix timestamp advanced: {yesNo(available ? diagnosticFlag(event.gpsFixAdvanced) : null)}.
+                              {' '}Last-known fix age: {age(event.gpsLastKnownFixAgeMs ?? null)}.
+                            </p>
+                            <p className="mt-1 text-content-muted">Last-known age can refer to an earlier observation when the current fix is unavailable. Burst duration is observation time, not GPS acquisition time. Faster logging does not request more GPS fixes.</p>
+                          </div>
                           <div>
                             <div className="font-medium">First-fix statistics (cumulative)</div>
                             <p className="mt-1">{gpsFirstFixSummary(event)}</p>

@@ -913,6 +913,8 @@ class ObdLoggerService : Service() {
         val diagnosticScan = DiagnosticScan(elm, driveId)
         val malformedLivePids = LivePidMalformedTracker()
         val sparseDiagnosticBudget = SparseDiagnosticBudgetTracker()
+        val pollTiming = PollTiming(driveStartedElapsedMillis, SystemClock::elapsedRealtime)
+        var timingFlushReason = "drive_end"
         var sequence = 0L
         var cadenceOverrun = false
         // The vehicle bus can go silent while the adapter stays perfectly healthy: ATRV is
@@ -923,175 +925,209 @@ class ObdLoggerService : Service() {
         // consecutive fully-missing cycles is what turns that from silence into evidence.
         var busSilentCycles = 0
         var activeSupported = supported
-        while (scope.isActive) {
-            currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
-            val cycleStarted = SystemClock.elapsedRealtime()
-            val requested = ObdPollPlan.requestedPids(sequence, activeSupported)
-            val values = linkedMapOf<String, Any>()
-            val missing = mutableListOf<Int>()
-            for ((requestedIndex, pid) in requested.withIndex()) {
+        try {
+            while (scope.isActive) {
+                currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
+                val cycleStarted = SystemClock.elapsedRealtime()
+                pollTiming.startCycle()
+                val requested = ObdPollPlan.requestedPids(sequence, activeSupported)
+                val values = linkedMapOf<String, Any>()
+                val missing = mutableListOf<Int>()
+                for ((requestedIndex, pid) in requested.withIndex()) {
+                    currentQuiesceRequest(deviceRoot)?.let {
+                        persistPartialSample(
+                            driveId,
+                            sequence,
+                            values,
+                            missing + requested.drop(requestedIndex),
+                            driveClock.nowUtc(),
+                            pollTiming,
+                        )
+                        return RecordingExit.Quiesce(it)
+                    }
+                    if (!malformedLivePids.shouldPoll(pid, sequence)) {
+                        pollTiming.cooldownSkip(pid)
+                        missing += pid
+                        continue
+                    }
+                    val commandStarted = SystemClock.elapsedRealtime()
+                    val result = try {
+                        timedLivePidPoll(pid, pollTiming, elm::query)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        persistPartialSample(
+                            driveId,
+                            sequence,
+                            values,
+                            missing + requested.drop(requestedIndex),
+                            driveClock.nowUtc(),
+                            pollTiming,
+                        )
+                        throw error
+                    } finally {
+                        sparseDiagnosticBudget.observeCommand(boundedElapsedMillis(commandStarted))
+                    }
+                    when (result) {
+                        LivePidPollResult.Missing -> {
+                            malformedLivePids.recordValid(pid)
+                            missing += pid
+                        }
+                        is LivePidPollResult.Values -> {
+                            malformedLivePids.recordValid(pid)
+                            values.putAll(result.decoded)
+                        }
+                        is LivePidPollResult.Malformed -> {
+                            missing += pid
+                            recordParserFailure(result.error)
+                            val message = safeError(result.error)
+                            malformedLivePids.recordMalformed(pid, sequence)
+                            database.incrementError(driveId)
+                            database.addDiagnostic(
+                                driveId,
+                                "parser_failure",
+                                JSONObject()
+                                    .put("category", "live_pid_%02X".format(pid))
+                                    .put("message", message),
+                                driveClock.nowUtc(),
+                            )
+                        }
+                    }
+                    currentQuiesceRequest(deviceRoot)?.let {
+                        persistPartialSample(
+                            driveId,
+                            sequence,
+                            values,
+                            missing + requested.drop(requestedIndex + 1),
+                            driveClock.nowUtc(),
+                            pollTiming,
+                        )
+                        return RecordingExit.Quiesce(it)
+                    }
+                }
                 currentQuiesceRequest(deviceRoot)?.let {
-                    persistPartialSample(
-                        driveId,
-                        sequence,
-                        values,
-                        missing + requested.drop(requestedIndex),
-                        driveClock.nowUtc(),
-                    )
+                    persistPartialSample(driveId, sequence, values, missing, driveClock.nowUtc(), pollTiming)
                     return RecordingExit.Quiesce(it)
                 }
-                if (!malformedLivePids.shouldPoll(pid, sequence)) {
-                    missing += pid
-                    continue
-                }
-                val commandStarted = SystemClock.elapsedRealtime()
-                val result = try {
-                    pollLivePid(pid, elm::query)
+                val voltageStarted = SystemClock.elapsedRealtime()
+                try {
+                    elm.readVoltage()?.let { values["adapter_voltage"] = it }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Exception) {
-                    persistPartialSample(
-                        driveId,
-                        sequence,
-                        values,
-                        missing + requested.drop(requestedIndex),
-                        driveClock.nowUtc(),
-                    )
+                    persistPartialSample(driveId, sequence, values, missing, driveClock.nowUtc(), pollTiming)
                     throw error
                 } finally {
-                    sparseDiagnosticBudget.observeCommand(boundedElapsedMillis(commandStarted))
+                    sparseDiagnosticBudget.observeCommand(boundedElapsedMillis(voltageStarted))
                 }
-                when (result) {
-                    LivePidPollResult.Missing -> {
-                        malformedLivePids.recordValid(pid)
-                        missing += pid
-                    }
-                    is LivePidPollResult.Values -> {
-                        malformedLivePids.recordValid(pid)
-                        values.putAll(result.decoded)
-                    }
-                    is LivePidPollResult.Malformed -> {
-                        missing += pid
-                        recordParserFailure(result.error)
-                        val message = safeError(result.error)
-                        malformedLivePids.recordMalformed(pid, sequence)
-                        database.incrementError(driveId)
-                        database.addDiagnostic(
-                            driveId,
-                            "parser_failure",
-                            JSONObject()
-                                .put("category", "live_pid_%02X".format(pid))
-                                .put("message", message),
-                            driveClock.nowUtc(),
+                values.putAll(staticValues)
+                values.putAll(ElmProtocol.estimates(values))
+                val sampleTimestamp = driveClock.nowUtc()
+                val rowAges = pollTiming.takeRowAges()
+                val samplePersisted = persistSample(
+                    SampleRecord(
+                        driveId = driveId,
+                        sequence = sequence,
+                        timestampUtc = sampleTimestamp,
+                        values = values,
+                        parserQuality = if (missing.isEmpty()) "ok" else "partial",
+                        missingPids = missing,
+                    ),
+                )
+                if (samplePersisted) pollTiming.rowPersisted(rowAges)
+                // A cycle where every requested PID went unanswered is the bus being silent,
+                // not a slow sample. One such cycle is ordinary -- a single dropped frame, a
+                // reconnect -- so recovery waits for a run of them.
+                busSilentCycles = if (requested.isNotEmpty() && missing.size == requested.size) {
+                    busSilentCycles + 1
+                } else {
+                    0
+                }
+                if (busSilentCycles == ECU_SILENCE_RECOVERY_CYCLES) {
+                    activeSupported = recoverSilentBus(elm, driveId, deviceRoot, activeSupported)
+                    busSilentCycles = 0
+                }
+                currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
+                val liveCycleElapsed = SystemClock.elapsedRealtime() - cycleStarted
+                // At most one sparse diagnostic command is allowed after a committed sample. Its
+                // reserve comes from the worst command observed on this exact connection rather than
+                // a fixed guess. A slow response therefore defers later diagnostic work without ever
+                // cancelling an in-flight ELM command or deliberately delaying the critical PIDs.
+                val diagnosticBudgetMillis = sparseDiagnosticBudget.requiredBudgetMillis()
+                if (ObdPollPlan.mayRunSparseDiagnostic(liveCycleElapsed, diagnosticBudgetMillis)) {
+                    val diagnosticStarted = SystemClock.elapsedRealtime()
+                    try {
+                        diagnosticScan.runOne(sequence, sampleTimestamp)
+                    } finally {
+                        sparseDiagnosticBudget.observeCommand(
+                            boundedElapsedMillis(diagnosticStarted),
                         )
                     }
                 }
-                currentQuiesceRequest(deviceRoot)?.let {
-                    persistPartialSample(
-                        driveId,
-                        sequence,
-                        values,
-                        missing + requested.drop(requestedIndex + 1),
-                        driveClock.nowUtc(),
-                    )
-                    return RecordingExit.Quiesce(it)
+                currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
+                val running = lifecycle.remainsRecording(
+                    SystemClock.elapsedRealtime(),
+                    values["adapter_voltage"] as? Double,
+                    values["engine_rpm"] as? Double,
+                )
+                if (!running) {
+                    pollTiming.finishCycle(completed = samplePersisted)
+                    return RecordingExit.EngineStopped
                 }
-            }
-            currentQuiesceRequest(deviceRoot)?.let {
-                persistPartialSample(driveId, sequence, values, missing, driveClock.nowUtc())
-                return RecordingExit.Quiesce(it)
-            }
-            val voltageStarted = SystemClock.elapsedRealtime()
-            try {
-                elm.readVoltage()?.let { values["adapter_voltage"] = it }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                persistPartialSample(driveId, sequence, values, missing, driveClock.nowUtc())
-                throw error
-            } finally {
-                sparseDiagnosticBudget.observeCommand(boundedElapsedMillis(voltageStarted))
-            }
-            values.putAll(staticValues)
-            values.putAll(ElmProtocol.estimates(values))
-            val sampleTimestamp = driveClock.nowUtc()
-            persistSample(
-                SampleRecord(
-                    driveId = driveId,
-                    sequence = sequence,
-                    timestampUtc = sampleTimestamp,
-                    values = values,
-                    parserQuality = if (missing.isEmpty()) "ok" else "partial",
-                    missingPids = missing,
-                ),
-            )
-            // A cycle where every requested PID went unanswered is the bus being silent,
-            // not a slow sample. One such cycle is ordinary -- a single dropped frame, a
-            // reconnect -- so recovery waits for a run of them.
-            busSilentCycles = if (requested.isNotEmpty() && missing.size == requested.size) {
-                busSilentCycles + 1
-            } else {
-                0
-            }
-            if (busSilentCycles == ECU_SILENCE_RECOVERY_CYCLES) {
-                activeSupported = recoverSilentBus(elm, driveId, deviceRoot, activeSupported)
-                busSilentCycles = 0
-            }
-            currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
-            val liveCycleElapsed = SystemClock.elapsedRealtime() - cycleStarted
-            // At most one sparse diagnostic command is allowed after a committed sample. Its
-            // reserve comes from the worst command observed on this exact connection rather than
-            // a fixed guess. A slow response therefore defers later diagnostic work without ever
-            // cancelling an in-flight ELM command or deliberately delaying the critical PIDs.
-            val diagnosticBudgetMillis = sparseDiagnosticBudget.requiredBudgetMillis()
-            if (ObdPollPlan.mayRunSparseDiagnostic(liveCycleElapsed, diagnosticBudgetMillis)) {
-                val diagnosticStarted = SystemClock.elapsedRealtime()
-                try {
-                    diagnosticScan.runOne(sequence, sampleTimestamp)
-                } finally {
-                    sparseDiagnosticBudget.observeCommand(
-                        boundedElapsedMillis(diagnosticStarted),
+                val pollCycleMillis = boundedElapsedMillis(cycleStarted)
+                val overrun = pollCycleMillis > ObdPollPlan.TARGET_CYCLE_MILLIS
+                if (overrun != cadenceOverrun) {
+                    cadenceOverrun = overrun
+                    emitEvent(
+                        kind = "obd.poll_health",
+                        level = if (overrun) "warning" else "info",
+                        outcome = if (overrun) "observed" else "recovered",
+                        reasonCode = if (overrun) "cadence_gap" else "drive_summary",
+                        driveId = driveId,
+                        metrics = mapOf(
+                            "poll_cycle_ms" to pollCycleMillis,
+                            "polling_duty_cycle_percent" to (
+                                pollCycleMillis.toDouble() /
+                                    ObdPollPlan.TARGET_CYCLE_MILLIS.toDouble() * 100.0
+                                ).coerceIn(0.0, 100.0),
+                            "gap_count" to if (overrun) 1 else 0,
+                            "command_count" to requested.size,
+                        ),
                     )
                 }
-            }
-            currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
-            val running = lifecycle.remainsRecording(
-                SystemClock.elapsedRealtime(),
-                values["adapter_voltage"] as? Double,
-                values["engine_rpm"] as? Double,
-            )
-            if (!running) return RecordingExit.EngineStopped
-            val pollCycleMillis = boundedElapsedMillis(cycleStarted)
-            val overrun = pollCycleMillis > ObdPollPlan.TARGET_CYCLE_MILLIS
-            if (overrun != cadenceOverrun) {
-                cadenceOverrun = overrun
-                emitEvent(
-                    kind = "obd.poll_health",
-                    level = if (overrun) "warning" else "info",
-                    outcome = if (overrun) "observed" else "recovered",
-                    reasonCode = if (overrun) "cadence_gap" else "drive_summary",
-                    driveId = driveId,
-                    metrics = mapOf(
-                        "poll_cycle_ms" to pollCycleMillis,
-                        "polling_duty_cycle_percent" to (
-                            pollCycleMillis.toDouble() /
-                                ObdPollPlan.TARGET_CYCLE_MILLIS.toDouble() * 100.0
-                            ).coerceIn(0.0, 100.0),
-                        "gap_count" to if (overrun) 1 else 0,
-                        "command_count" to requested.size,
-                    ),
+                sequence += 1
+                publish("ecu_online", config)
+                pollTiming.finishCycle(completed = samplePersisted)
+                emitPollTiming(driveId, pollTiming, "periodic", driveClock)
+                delay(
+                    (
+                        ObdPollPlan.TARGET_CYCLE_MILLIS -
+                            (SystemClock.elapsedRealtime() - cycleStarted)
+                        ).coerceAtLeast(0),
                 )
             }
-            sequence += 1
-            publish("ecu_online", config)
-            delay(
-                (
-                    ObdPollPlan.TARGET_CYCLE_MILLIS -
-                        (SystemClock.elapsedRealtime() - cycleStarted)
-                    ).coerceAtLeast(0),
-            )
+            throw CancellationException("logger scope stopped")
+        } catch (error: Exception) {
+            timingFlushReason = "partial_failure"
+            throw error
+        } finally {
+            pollTiming.finishCycle()
+            emitPollTiming(driveId, pollTiming, timingFlushReason, driveClock)
         }
-        throw CancellationException("logger scope stopped")
+    }
+
+    private fun emitPollTiming(
+        driveId: String,
+        timing: PollTiming,
+        reason: String,
+        driveClock: MonotonicUtcClock,
+    ) {
+        // Diagnostics must never replace a transport/cancellation error or stop collection.
+        runCatching {
+            timing.drain(reason)?.let { payload ->
+                database.addDiagnostic(driveId, "poll_timing", payload, driveClock.nowUtc())
+            }
+        }
     }
 
     private fun persistPartialSample(
@@ -1100,17 +1136,21 @@ class ObdLoggerService : Service() {
         observedValues: Map<String, Any>,
         missingPids: List<Int>,
         timestampUtc: String,
+        pollTiming: PollTiming,
     ) {
         if (observedValues.isEmpty()) return
         val values = LinkedHashMap(observedValues)
         values.putAll(ElmProtocol.estimates(values))
+        val rowAges = pollTiming.takeRowAges()
         partialSampleAfterTransportFailure(
             driveId = driveId,
             sequence = sequence,
             timestampUtc = timestampUtc,
             values = values,
             missingPids = missingPids,
-        )?.let(::persistSample)
+        )?.let { sample ->
+            if (persistSample(sample)) pollTiming.rowPersisted(rowAges)
+        }
     }
 
     private fun persistSample(sample: SampleRecord): Boolean {

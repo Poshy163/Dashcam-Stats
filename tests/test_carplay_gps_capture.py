@@ -81,7 +81,8 @@ def function(name, following):
 
 def shell(command, timeout=5):
     return subprocess.run(
-        [executable("sh"), "-c", "PATH=/usr/bin:/bin:$PATH\n" + command],
+        [executable("sh"), "-s"],
+        input="PATH=/usr/bin:/bin:$PATH\n" + command,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -198,8 +199,9 @@ def test_unsupported_and_resource_limits(raw):
 
 def test_successful_event_fits_existing_logcat_message_budget():
     row = parse()
-    message = "sample=1790254799-54336041-32274-gps-855645000-11520 session=1790254799-54336041-32274 schema=7 acc=0 | event=gps_context gps_capture_start_ms=855645000 gps_capture_ms=636 gps_poll_gap_ms=15000 location_mode=3 gps_zlink_process_present=1 gps_native_process_present=1 "
+    message = "sample=1790254799-54336041-32274-gps-855645000-11520 session=1790254799-54336041-32274 schema=8 acc=0 | event=gps_context gps_capture_start_ms=855645000 gps_capture_ms=636 gps_poll_gap_ms=15000 location_mode=3 gps_zlink_process_present=1 gps_native_process_present=1 "
     message += " ".join(f"{key}={value}" for key, value in row.items())
+    message += " gps_next_interval_ms=5000 gps_burst_reason=receiver_start gps_burst_start_ms=855645000 gps_burst_elapsed_ms=636 gps_burst_end=none gps_fix_advanced=na gps_last_known_fix_age_ms=1175"
     assert len(message.encode()) < 2000
 
 
@@ -229,10 +231,13 @@ gps_poll
     result = shell(command)
     assert result.returncode == 0 and not result.stderr, result.stderr
     message = result.stdout.strip()
-    assert "schema=7 acc=0 | event=gps_context" in message
+    assert "schema=8 acc=0 | event=gps_context" in message
     assert "gps_capture_status=ok" in message and "loc_gps_age_ms=1175" in message
     assert "gps_zlink_process_present=1 gps_native_process_present=0" in message
     assert "gps_poll_gap_ms=na" in message
+    assert "gps_next_interval_ms=15000 gps_burst_reason=none" in message
+    assert "gps_last_known_fix_age_ms=539" in message
+    assert "|" not in message.split("event=gps_context", 1)[1]  # Private state is removed.
     assert len(message.encode()) < 2000
     assert all(
         secret not in message for secret in ("PRIVATE", "com.", "12.123456", "98.654321", "123 456")
@@ -299,6 +304,42 @@ wait "$worker"
     assert result.returncode == 0, result.stderr
 
 
+def test_worker_applies_next_cadence_without_adding_capture_time(tmp_path):
+    clock = (tmp_path / "clock").as_posix()
+    if re.match(r"^[A-Za-z]:/", clock):
+        clock = "/" + clock[0].lower() + clock[2:]
+    command = function("deadline_delay", "cleanup") + function("gps_loop", "ensure_gps_worker")
+    command += f"""
+clock_ms() {{ cat '{clock}'; }}
+gps_worker_cleanup() {{ :; }}
+process_start() {{ printf 1; }}
+child_alive() {{ [ "$iterations" -lt 3 ]; }}
+gps_poll() {{
+  iterations=$((iterations+1)); stamp=$(clock_ms)
+  printf 'sample:%s\\n' "$stamp"
+  gps_next_interval=5000; [ "$iterations" -lt 3 ] || gps_next_interval=15000
+  echo $((stamp+300)) > '{clock}'
+}}
+sleep() {{
+  printf 'delay:%s\\n' "$1"
+  increment=$(awk -v seconds="$1" 'BEGIN {{printf "%.0f",seconds*1000}}')
+  echo $(( $(clock_ms)+increment )) > '{clock}'
+}}
+echo 1000 > '{clock}'
+iterations=0; SAMPLER_PID=1; SAMPLER_START=1; gps_loop
+"""
+    result = shell(command)
+    assert result.returncode == 0 and not result.stderr, result.stderr
+    assert result.stdout.splitlines() == [
+        "sample:1000",
+        "delay:4.700",
+        "sample:6000",
+        "delay:4.700",
+        "sample:11000",
+        "delay:14.700",
+    ]
+
+
 def test_reused_sleep_pid_is_not_signalled():
     command = function("child_alive", "codec_alive") + function("gps_worker_cleanup", "gps_loop")
     command += """
@@ -360,6 +401,7 @@ def test_parent_cleanup_and_startup_include_gps_worker():
     assert '"$gps_pid:$gps_worker_start"' in cleanup and '"$gps_pid"' in cleanup
     assert "ensure_gps_worker\nwhile :; do\n  ensure_gps_worker" in SOURCE
     assert "schema=6" not in SOURCE
+    assert "schema=7" not in SOURCE
     result = subprocess.run(
         [executable("sh"), "-n", str(SCRIPT)], capture_output=True, text=True, timeout=5
     )

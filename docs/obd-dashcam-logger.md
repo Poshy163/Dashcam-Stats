@@ -290,6 +290,40 @@ Repeating either finalisation or startup reconciliation leaves those clocks and 
 unchanged. This also retries a crash after finalisation and prior export failures.
 Zero-sample crash remnants are retained in SQLite with
 `export_status=not_exportable_zero_samples`; no server-invalid empty bundle is published.
+The 0.3.3 logger adds a drive-scoped `poll_timing` diagnostic without changing the v5 poll plan,
+five-second target, BLE configuration, sample values or row timestamps. It writes at most once
+per 60 seconds while recording, plus a nonempty final or interrupted window. After 64 periodic
+windows it keeps aggregating for the final window, so a drive emits at most 65 such records.
+This caps output size rather than discarding later requests. Process death can still lose the
+current unflushed window; a failed diagnostic database write is best effort and cannot interrupt
+collection or replace the original transport error.
+
+Each version-one window reports its index, elapsed start relative to drive start, duration,
+flush reason, target cycle time, started/completed cycles, overruns, cycle work and cycle-start
+interval distributions. Work ends before the diagnostic write and cadence sleep; it includes
+live requests, voltage, sample persistence and any sparse diagnostic/recovery work. An interrupted
+cycle contributes work and an overrun if applicable, but is not completed. Completed cycles have
+a persisted full row and reach the normal cycle end. The start-interval distribution includes the
+interval crossing a window boundary. Elapsed time includes Android suspend and is clamped against
+clock regression; it does not depend on wall-clock corrections.
+
+Each observed live PID has request attempts and separate success, empty decoded result, malformed,
+timeout, transport-error, cancellation and cooldown-skip counts. Skips are not attempts. Request
+time includes existing command pacing, lock wait and parsing, so it is not pure ECU response
+latency. Only successful decoded requests receive an age at the row timestamp, measured immediately
+beside that timestamp before the database write and retained only if the row was inserted. A
+persisted partial row can retain ages for its earlier successful requests; its failed request has
+no value age. This measures completion-to-row age, not the unknown sensor measurement time. Static
+values carried forward from startup, ATRV and sparse diagnostic commands have no per-PID age entry.
+
+Every timing distribution has total count, retained count, median, nearest-rank p95, maximum and
+total milliseconds. Median and p95 describe the last 256 observations; maximum and total cover the
+whole window. Empty median/p95 are null and other empty statistics are zero. Counts saturate at
+one million, individual observations at 24 hours, and elapsed fields/totals at 10^12 milliseconds.
+No response text, sensor values, vehicle identity or addresses enter `poll_timing`. The historical
+`pipeline_metrics.polling_duty_cycle_percent` keeps its existing definition; use the new cycle work
+and cadence distributions to assess whether faster polling has measured headroom.
+
 Every terminal drive also receives a bounded `pipeline_metrics` diagnostic covering command,
 notification/fragment/frame, timeout, checksum/parser, sample/persistence/drop, BLE disconnect,
 failure-triggered reconnect and direct-path queue depth counters without raw payloads.

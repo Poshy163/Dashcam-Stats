@@ -196,6 +196,94 @@ gps_process_present() {
   elif [ "$gps_pid_rc" = 1 ] && [ -z "$gps_pids" ]; then printf 0
   else printf na; fi
 }
+gps_burst_update() {
+  # State stays in this worker's memory. A previous fix age is explicitly labelled
+  # last-known; it must never replace the current provider's missing/failed value.
+  printf '%s\n' "$gps_fields" | awk -v saved="$gps_burst_state" -v now="$gps_now" \
+    -v poll_start="$gps_poll_start" -v gap="$gps_gap" -v cost="$gps_capture_ms" -v acc="$gps_acc" '
+# BEGIN_GPS_BURST_AWK
+function numeric(v) { return v ~ /^[0-9]+$/ && length(v)<=16 }
+function output(v) { return v<0?"na":sprintf("%.0f",v) }
+BEGIN {
+  split(saved,s,",")
+  previous=-1;previous_acc=-1;previous_started=-1;last_fix=-1;stale_armed=0;seen_on=0
+  active=0;began=-1;reason="none";fresh_updates=0;cooldown=-1
+  if(length(saved)){
+    previous=s[2]+0;previous_acc=s[3]+0;previous_started=s[4]+0;last_fix=s[5]+0
+    stale_armed=s[6]+0;seen_on=s[7]+0;active=s[8]+0;began=s[9]+0
+    reason=s[10];fresh_updates=s[11]+0;cooldown=s[12]+0
+  }
+}
+{
+  for(i=1;i<=NF;i++){split($i,p,"=");f[p[1]]=p[2]}
+}
+END {
+  status=f["gps_capture_status"]
+  current_acc=(acc=="0"||acc=="1")?acc+0:-1
+  started=(status=="ok" && f["gps_started"]~/^[01]$/)?f["gps_started"]+0:-1
+  enabled=(status=="ok" && f["loc_gps_enabled"]=="1")
+  ended="none";reset=0
+  if(previous>=0 && now<previous){
+    # A reboot/clock reset invalidates every elapsed baseline, including cooldown.
+    previous_acc=-1;previous_started=-1;last_fix=-1;stale_armed=0;seen_on=0
+    active=0;began=-1;reason="none";fresh_updates=0;cooldown=-1;reset=1
+  }
+  long_gap=numeric(gap) && gap+0>45000
+  if(long_gap){
+    # A delayed observation is not proof of suspend. Do not bridge acquisition
+    # progress across it, but retain a separately labelled old-fix timestamp.
+    active=0;began=-1;reason="none";fresh_updates=0;stale_armed=0;reset=1
+    previous_acc=-1;previous_started=-1
+  }
+  fix=-1;advanced=-1;fresh=0;stale=0
+  if(status=="ok" && numeric(f["loc_gps_fix_elapsed_ms"]) && f["loc_gps_fix_elapsed_ms"]+0<=now){
+    fix=f["loc_gps_fix_elapsed_ms"]+0
+    if(last_fix>=0 && !reset && fix>=last_fix)advanced=(fix>last_fix)
+    fresh=(enabled && started==1 && now-fix<=5000)
+  }
+  if(enabled && started==1 && (fix<0 || now-fix>=10000))stale=1
+  stale_edge=stale_armed && stale
+  if(stale)stale_armed=0
+  if(fresh)stale_armed=1
+  if(fix>last_fix)last_fix=fix
+  eligible=(status=="ok" && current_acc==1 && cost>=0 && cost<1000)
+  trigger="none"
+  if(eligible){
+    if(long_gap)trigger="poll_gap"
+    else if(previous_acc==0)trigger="ignition_on"
+    else if(previous_started==0 && started==1)trigger="receiver_start"
+    else if(!seen_on)trigger="startup_on"
+    else if(stale_edge)trigger="fix_stale"
+    seen_on=1
+  }
+  new_burst=0
+  if(!active && trigger!="none" && now>=cooldown){
+    active=1;began=poll_start;reason=trigger;fresh_updates=0
+    cooldown=now+300000;new_burst=1
+  }
+  event_start=active?began:-1;elapsed=active?now-began:-1;event_reason=active?reason:"none"
+  if(active){
+    if(status!="ok")ended="read_failed"
+    else if(cost>=1000)ended="slow_read"
+    else if(current_acc==0)ended="ignition_off"
+    else if(current_acc<0)ended="ignition_unknown"
+    else if(!new_burst){
+      if(fresh && advanced==1)fresh_updates++;else fresh_updates=0
+      if(fresh_updates>=2)ended="fresh_progress"
+    }
+    # Do not schedule a five-second pass at or beyond the 90-second deadline.
+    if(ended=="none" && now+5000>=began+90000)ended="budget"
+    if(ended!="none"){active=0;began=-1;reason="none";fresh_updates=0}
+  }
+  interval=active?5000:15000
+  last_age=(last_fix>=0 && now>=last_fix)?now-last_fix:-1
+  # Prefix is private continuation state, removed before the log line is emitted.
+  printf "%d,%.0f,%d,%d,%.0f,%d,%d,%d,%.0f,%s,%d,%.0f|",interval,now,current_acc,started,last_fix,stale_armed,seen_on,active,began,reason,fresh_updates,cooldown
+  printf "gps_next_interval_ms=%d gps_burst_reason=%s gps_burst_start_ms=%s gps_burst_elapsed_ms=%s gps_burst_end=%s gps_fix_advanced=%s gps_last_known_fix_age_ms=%s\n",interval,event_reason,output(event_start),output(elapsed),ended,output(advanced),output(last_age)
+}
+# END_GPS_BURST_AWK
+  '
+}
 gps_poll() {
   gps_poll_start=$(clock_ms)
   gps_gap=na; [ "$gps_previous" -gt 0 ] && gps_gap=$((gps_poll_start-gps_previous))
@@ -213,8 +301,13 @@ gps_poll() {
   else
     gps_fields='gps_capture_status=tool_unavailable gps_dump_rc=na gps_uptime_ms=na'
   fi
+  gps_now=$(clock_ms); gps_capture_ms=$((gps_now-gps_poll_start))
+  gps_update=$(gps_burst_update)
+  gps_burst_state=${gps_update%%|*}; gps_burst_fields=${gps_update#*|}
+  gps_next_interval=${gps_burst_state%%,*}
+  case "$gps_next_interval" in 5000|15000) ;; *) gps_next_interval=15000; gps_burst_state=; gps_burst_fields=;; esac
   gps_seq=$((gps_seq+1))
-  message="sample=$SESSION-gps-$gps_token-$gps_seq session=$SESSION schema=7 acc=$gps_acc | event=gps_context gps_capture_start_ms=$gps_poll_start gps_capture_ms=$(($(clock_ms)-gps_poll_start)) gps_poll_gap_ms=$gps_gap location_mode=$gps_mode gps_zlink_process_present=$gps_zlink_present gps_native_process_present=$gps_native_present $gps_fields"
+  message="sample=$SESSION-gps-$gps_token-$gps_seq session=$SESSION schema=8 acc=$gps_acc | event=gps_context gps_capture_start_ms=$gps_poll_start gps_capture_ms=$gps_capture_ms gps_poll_gap_ms=$gps_gap location_mode=$gps_mode gps_zlink_process_present=$gps_zlink_present gps_native_process_present=$gps_native_present $gps_fields $gps_burst_fields"
   save_message "$message"
 }
 gps_worker_cleanup() {
@@ -227,11 +320,12 @@ gps_loop() {
   trap 'exit 0' TERM INT
   trap gps_worker_cleanup EXIT
   gps_seq=0; gps_previous=0; gps_token=$(clock_ms); gps_deadline=$gps_token
+  gps_burst_state=; gps_next_interval=15000
   while child_alive "$SAMPLER_PID" "$SAMPLER_START"; do
     # Foreground reads are bounded (settings/process calls and four-second dumpsys).
     # A TERM during a read is handled when that bounded command returns.
     gps_poll
-    set -- $(deadline_delay "$gps_deadline" "$(clock_ms)" 15000)
+    set -- $(deadline_delay "$gps_deadline" "$(clock_ms)" "$gps_next_interval")
     gps_deadline=$1
     sleep "$2" &
     gps_sleep_pid=$!; gps_sleep_start=$(process_start "$gps_sleep_pid")
@@ -292,7 +386,7 @@ diagnostic_context() {
     start_ticks=$(sed 's/.*) //' /proc/$zpid/stat 2>/dev/null | awk '{print $20}')
     sched="$sched zlink_start_ticks=${start_ticks:-na}"
   fi
-  diag="schema=7 wifi_country_code=${country:-na} mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
+  diag="schema=8 wifi_country_code=${country:-na} mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
 }
 tcp_summary() {
   # ss exposes TCP_INFO per socket. Match the exact app UID on the socket header,
@@ -504,7 +598,7 @@ link_loop() {
         # The full diagnostic context is emitted separately. Keep this event below
         # the retained-message limit so its transport tail survives file recovery.
         link_acc=$(printf '%s\n' "$head" | awk '{for(i=1;i<=NF;i++)if($i~/^acc=[01]$/){print $i;exit}}')
-        link_head="session=$SESSION schema=7 ${link_acc:-acc=na}"
+        link_head="session=$SESSION schema=8 ${link_acc:-acc=na}"
         message="sample=$SESSION-link-$link_seq $link_head | event=wireless_link link_poll_gap_ms=$link_gap link_probe_ms=$(($(clock_ms)-link_start)) link_context_age_ms=$((link_start-context_ms)) $peer_stats $station_stats $transport_stats"
         save_message "$message"
         unset socket_rows socket6_rows neighbour_rows neighbour6_rows proc4_rows proc6_rows station_rows link_peers transport_result
@@ -605,7 +699,7 @@ slow_diagnostics() {
 }
 emit_slow() {
   slow_seq=$((slow_seq+1))
-  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=7 | $1"
+  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=8 | $1"
   save_message "$message"
 }
 emit() {
@@ -843,7 +937,7 @@ while :; do
   fi
   bt=$(settings get global bluetooth_on 2>/dev/null)
   zlink_proc=0; [ -n "$zpid" ] && zlink_proc=1
-  diag="schema=7"
+  diag="schema=8"
   if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
     diagnostic_context
   fi

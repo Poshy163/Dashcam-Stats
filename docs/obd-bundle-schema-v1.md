@@ -141,6 +141,33 @@ telemetry fields and their same types/ranges. Value events may deduplicate uncha
 the compact completion/status events do not, so the server can preserve the newest actual
 observation timestamp without repeating full payloads.
 
+## Polling timing diagnostics
+
+App 0.3.3 adds the optional diagnostic kind `poll_timing`. Its version-1 payload contains
+exactly `schema_version`, `window_index`, `window_start_elapsed_ms`, `window_duration_ms`,
+`flush_reason`, `target_cycle_ms`, `cycles_started`, `cycles_completed`, `overrun_count`,
+`cycle_work_ms`, `cycle_start_interval_ms`, and `pids`. The target remains 5,000 ms.
+Flush reasons are `periodic`, `drive_end`, and `partial_failure`. Window offsets use a
+drive-scoped monotonic origin; they are not UTC times or ECU measurement timestamps.
+
+Each of at most 18 unique PID entries contains `pid`, `attempts`, `successes`, `missing`,
+`malformed`, `timeouts`, `transport_errors`, `cancelled`, `cooldown_skips`, `request_ms`,
+and `value_age_at_row_ms`. Outcomes sum to attempts; cooldown skips did not send a request.
+`missing` means no decoded value in a prompt-complete reply, not a confirmed sensor fault.
+Request time includes command pacing, transport and parsing. Value age runs from successful
+query completion to the saved row timestamp and is recorded only for persisted values;
+it cannot establish the age of the ECU's internal sensor measurement.
+
+Every timing distribution has exactly `count`, `retained`, `median_ms`, `p95_ms`, `max_ms`,
+and `total_ms`. Median and nearest-rank p95 cover at most the latest 256 observations;
+count, maximum and total cover the window. Empty distributions have zero counts/max/total
+and null median/p95. Counts are bounded at 1,000,000, individual durations at 86,400,000 ms,
+and totals/window times at 10^12 ms. Unknown fields, raw responses, and reading values are
+rejected. Older bundles without this diagnostic remain supported; deploy the accepting
+server before the new Android producer. Periodic windows emit no more than once per minute
+and stop after 64 windows per drive; a final bounded window covers subsequent observations.
+There are at most 65 polling-timing records per drive.
+
 ## Summary and implementation limits
 
 Legacy `summary.json` has exactly these keys: `schema_version`, `drive_id`, `start_time_utc`,

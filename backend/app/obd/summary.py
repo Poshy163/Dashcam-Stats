@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from .fuel import EstimatedFuelAccumulator
 from .schema import parse_utc, utc_text
 
 
@@ -20,11 +21,10 @@ def calculate_summary(
     duration_s = max(0.0, (finish - start).total_seconds())
     distance_km = 0.0
     idle_s = 0.0
-    fuel_l = 0.0
+    fuel_estimate = EstimatedFuelAccumulator(nominal_cycle_s=expected_interval_s)
     missing_s = 0.0
     distance_intervals = 0
     idle_evidence = False
-    fuel_evidence = False
     max_usable_gap = expected_interval_s * 3
     count = 0
     speed_sum = rpm_sum = 0.0
@@ -33,6 +33,14 @@ def calculate_summary(
     previous: dict[str, Any] | None = None
     for current in samples:
         count += 1
+        fuel_estimate.observe(
+            drive=current.get("drive_id"),
+            sequence=current.get("sequence"),
+            captured_at=parse_utc(current["timestamp_utc"]),
+            estimated_rate=current.get("estimated_fuel_rate"),
+            ecu_data_status=current.get("ecu_data_status"),
+            quality=current.get("quality"),
+        )
         speed = current.get("vehicle_speed")
         if isinstance(speed, int | float):
             speed_sum += float(speed)
@@ -68,12 +76,10 @@ def calculate_summary(
                         idle_evidence = True
                         if first_rpm > 300 and first_speed < 1:
                             idle_s += gap
-                    fuel_rate = previous.get("estimated_fuel_rate")
-                    if isinstance(fuel_rate, int | float) and fuel_rate >= 0:
-                        fuel_evidence = True
-                        fuel_l += float(fuel_rate) * gap / 3600.0
         previous = current
 
+    fuel_l = fuel_estimate.litres
+    fuel_evidence = fuel_estimate.has_evidence
     expected = max(int(duration_s // expected_interval_s) + 1 if duration_s else 0, count)
     received = min(100.0, count * 100.0 / expected) if expected else 0.0
     dtcs: set[str] = set()

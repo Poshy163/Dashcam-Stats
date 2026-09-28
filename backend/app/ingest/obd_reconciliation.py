@@ -19,11 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models import OBDBundle, OBDDiagnostic, OBDDrive, OBDSample, utcnow
 from app.db.session import get_session_factory
+from app.obd.fuel import EstimatedFuelAccumulator
 
 log = structlog.get_logger(__name__)
 
 POLL_PLAN_VERSION = 5
-PROJECTION_VERSION = 3
+PROJECTION_VERSION = 4
 NOMINAL_CYCLE_S = 5.0
 GAP_TOLERANCE = 1.5
 MAX_RECORDED_GAPS = 100
@@ -512,7 +513,7 @@ class _Rollup:
     previous_at: datetime | None = None
     previous_speed: float | None = None
     previous_rpm: float | None = None
-    previous_fuel_rate: float | None = None
+    fuel_estimate: EstimatedFuelAccumulator = field(default_factory=EstimatedFuelAccumulator)
 
     def observe(self, row: OBDSample) -> None:
         self.sample_count += 1
@@ -551,6 +552,17 @@ class _Rollup:
         if fuel_rate is not None:
             fuel_rate = float(fuel_rate)
 
+        self.fuel_estimate.observe(
+            drive=row.drive_db_id,
+            sequence=row.sequence,
+            captured_at=row.captured_at,
+            estimated_rate=fuel_rate,
+            ecu_data_status=row.ecu_data_status,
+            quality=row.quality_json,
+        )
+        self.fuel_evidence = self.fuel_estimate.has_evidence
+        self.estimated_fuel_used_l = self.fuel_estimate.litres
+
         if self.previous_at is not None:
             interval = (row.captured_at - self.previous_at).total_seconds()
             if 0 < interval <= MAX_USABLE_ROLLUP_GAP_S:
@@ -561,14 +573,10 @@ class _Rollup:
                     self.idle_evidence = True
                     if self.previous_rpm > 300 and self.previous_speed < 1:
                         self.idle_duration_s += interval
-                if self.previous_fuel_rate is not None and self.previous_fuel_rate >= 0:
-                    self.fuel_evidence = True
-                    self.estimated_fuel_used_l += self.previous_fuel_rate * interval / 3600
 
         self.previous_at = row.captured_at
         self.previous_speed = speed
         self.previous_rpm = rpm
-        self.previous_fuel_rate = fuel_rate
 
 
 def _phase_opportunities(cycles: int, every: int, phase: int) -> int:

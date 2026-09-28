@@ -478,6 +478,15 @@ export interface CarPlayGpsContext extends CarPlayLocationMeasurements, CarPlayL
   gpsCaptureStartMs?: number | null
   gpsPollGapMs?: number | null
   gpsDumpRc?: number | null
+  /** Requested next observation interval, not GPS receiver update rate. */
+  gpsNextIntervalMs?: number | null
+  gpsBurstReason?: string | null
+  gpsBurstStartMs?: number | null
+  gpsBurstElapsedMs?: number | null
+  gpsBurstEnd?: string | null
+  gpsFixAdvanced?: number | null
+  /** Age of the last fix observed by this worker, even when the current read failed. */
+  gpsLastKnownFixAgeMs?: number | null
   /** Process presence only; neither field proves a CarPlay connection or GPS forwarding. */
   gpsZlinkProcessPresent?: number | null
   gpsNativeProcessPresent?: number | null

@@ -73,7 +73,7 @@ MAX_RECOVERY_LINES = 20_000
 
 #: The logcat tag every sample carries. The unit-log collector's allow-list must name it.
 TAG = "CarPlayTiming"
-SAMPLER_SCHEMA = 7
+SAMPLER_SCHEMA = 8
 
 ENABLED_KEY = "ingest.carplay_timing"
 INTERVAL_KEY = "ingest.carplay_timing_interval_s"
@@ -381,8 +381,36 @@ def _gps_diagnostics(fields: dict[str, str]) -> dict[str, Any]:
         "gps_poll_gap_ms",
         "gps_uptime_ms",
         "gps_dump_rc",
+        "gps_burst_start_ms",
+        "gps_burst_elapsed_ms",
+        "gps_last_known_fix_age_ms",
     ):
         result[name] = nonnegative(name, integer=True)
+    cadence = fields.get("gps_next_interval_ms")
+    result["gps_next_interval_ms"] = int(cadence) if cadence in {"5000", "15000"} else None
+    reason = fields.get("gps_burst_reason")
+    result["gps_burst_reason"] = (
+        reason
+        if reason
+        in {"none", "startup_on", "ignition_on", "receiver_start", "fix_stale", "poll_gap"}
+        else None
+    )
+    ended = fields.get("gps_burst_end")
+    result["gps_burst_end"] = (
+        ended
+        if ended
+        in {
+            "none",
+            "fresh_progress",
+            "budget",
+            "read_failed",
+            "slow_read",
+            "ignition_off",
+            "ignition_unknown",
+        }
+        else None
+    )
+    result["gps_fix_advanced"] = flag("gps_fix_advanced") if status == "ok" else None
     for name in ("gps_zlink_process_present", "gps_native_process_present"):
         result[name] = flag(name)
     mode = fields.get("location_mode")

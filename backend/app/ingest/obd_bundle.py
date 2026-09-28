@@ -368,6 +368,110 @@ def _number(
     return result
 
 
+def _validate_poll_timing(payload: dict[str, Any]) -> None:
+    """Accept only bounded, value-free timing windows from the Android logger."""
+    required = {
+        "schema_version",
+        "window_index",
+        "window_start_elapsed_ms",
+        "window_duration_ms",
+        "flush_reason",
+        "target_cycle_ms",
+        "cycles_started",
+        "cycles_completed",
+        "overrun_count",
+        "cycle_work_ms",
+        "cycle_start_interval_ms",
+        "pids",
+    }
+    if set(payload) != required:
+        raise BundleError("diagnostic poll_timing fields do not match v1")
+    _integer(
+        payload["schema_version"], field_name="poll_timing.schema_version", minimum=1, maximum=1
+    )
+    _integer(
+        payload["target_cycle_ms"],
+        field_name="poll_timing.target_cycle_ms",
+        minimum=5000,
+        maximum=5000,
+    )
+    if not isinstance(payload["flush_reason"], str) or payload["flush_reason"] not in {
+        "periodic",
+        "drive_end",
+        "partial_failure",
+    }:
+        raise BundleError("diagnostic poll_timing flush reason is invalid")
+    for name in ("window_index", "cycles_started", "cycles_completed", "overrun_count"):
+        _integer(payload[name], field_name=f"poll_timing.{name}", maximum=1_000_000)
+    for name in ("window_start_elapsed_ms", "window_duration_ms"):
+        _integer(payload[name], field_name=f"poll_timing.{name}", maximum=1_000_000_000_000)
+    if any(
+        payload[name] > payload["cycles_started"] for name in ("cycles_completed", "overrun_count")
+    ):
+        raise BundleError("diagnostic poll_timing cycle counts are inconsistent")
+
+    def timing(value: Any, name: str) -> int:
+        if not isinstance(value, dict) or set(value) != {
+            "count",
+            "retained",
+            "median_ms",
+            "p95_ms",
+            "max_ms",
+            "total_ms",
+        }:
+            raise BundleError(f"diagnostic poll_timing {name} timing shape is invalid")
+        count = _integer(value["count"], field_name=f"{name}.count", maximum=1_000_000)
+        retained = _integer(value["retained"], field_name=f"{name}.retained", maximum=256)
+        maximum = _integer(value["max_ms"], field_name=f"{name}.max_ms", maximum=86_400_000)
+        total = _integer(
+            value["total_ms"], field_name=f"{name}.total_ms", maximum=1_000_000_000_000
+        )
+        if retained != min(count, 256):
+            raise BundleError(f"diagnostic poll_timing {name} retained count is inconsistent")
+        if not count:
+            if maximum or total or value["median_ms"] is not None or value["p95_ms"] is not None:
+                raise BundleError(f"diagnostic poll_timing {name} empty timing is inconsistent")
+            return count
+        median = _number(
+            value["median_ms"],
+            field_name=f"{name}.median_ms",
+            minimum=0,
+            maximum=maximum,
+            nullable=False,
+        )
+        p95 = _number(
+            value["p95_ms"], field_name=f"{name}.p95_ms", minimum=0, maximum=maximum, nullable=False
+        )
+        if median > p95 or not maximum <= total <= maximum * count:
+            raise BundleError(f"diagnostic poll_timing {name} timing bounds are inconsistent")
+        return count
+
+    for name in ("cycle_work_ms", "cycle_start_interval_ms"):
+        if timing(payload[name], name) > payload["cycles_started"]:
+            raise BundleError("diagnostic poll_timing cycle timing count is inconsistent")
+    pids = payload["pids"]
+    if not isinstance(pids, list) or len(pids) > 18:
+        raise BundleError("diagnostic poll_timing PID list exceeds its bound")
+    counts = {"successes", "missing", "malformed", "timeouts", "transport_errors", "cancelled"}
+    pid_fields = counts | {"pid", "attempts", "cooldown_skips", "request_ms", "value_age_at_row_ms"}
+    seen: set[int] = set()
+    for row in pids:
+        if not isinstance(row, dict) or set(row) != pid_fields:
+            raise BundleError("diagnostic poll_timing PID shape is invalid")
+        pid = _integer(row["pid"], field_name="poll_timing.pid", maximum=255)
+        if pid in seen:
+            raise BundleError("diagnostic poll_timing PIDs must be unique")
+        seen.add(pid)
+        for name in counts | {"attempts", "cooldown_skips"}:
+            _integer(row[name], field_name=f"poll_timing.pid.{name}", maximum=1_000_000)
+        if sum(row[name] for name in counts) != row["attempts"]:
+            raise BundleError("diagnostic poll_timing PID outcomes are inconsistent")
+        if timing(row["request_ms"], "request_ms") != row["attempts"]:
+            raise BundleError("diagnostic poll_timing request count is inconsistent")
+        if timing(row["value_age_at_row_ms"], "value_age_at_row_ms") > row["successes"]:
+            raise BundleError("diagnostic poll_timing value ages require successful reads")
+
+
 def _validate_pipeline_metrics(payload: dict[str, Any]) -> None:
     fields = frozenset(payload)
     queue_fields = {"queue_depth", "maximum_queue_depth"}
@@ -939,6 +1043,7 @@ def _validate_diagnostics(
         "connection_failure",
         "parser_failure",
         "pipeline_metrics",
+        "poll_timing",
     }
     previous_at: datetime | None = None
     dtc_scan_statuses: dict[int, str] = {}
@@ -1196,6 +1301,8 @@ def _validate_diagnostics(
             _text(payload["message"], field_name=f"diagnostic.{kind}.message", maximum=1024)
         elif kind == "pipeline_metrics":
             _validate_pipeline_metrics(payload)
+        elif kind == "poll_timing":
+            _validate_poll_timing(payload)
     return value
 
 

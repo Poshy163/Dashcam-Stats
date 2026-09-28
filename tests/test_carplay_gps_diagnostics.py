@@ -117,14 +117,26 @@ def test_complete_gps_record_fits_existing_retention_budget():
     for name in carplay_timing._gps_diagnostics(fields):
         if name != "gps_capture_status":
             fields[name] = "1234567890123" if name.endswith("_ms") else "123.456789"
+    fields.update(
+        gps_next_interval_ms="15000",
+        gps_burst_reason="receiver_start",
+        gps_burst_end="ignition_unknown",
+        gps_fix_advanced="1",
+        loc_passive_satellites="32",
+    )
     message = (
         "sample=1790567540-85610084-16652-gps-999999 session=1790567540-85610084-16652 "
-        "schema=7 acc=1 | event=gps_context "
+        "schema=8 acc=1 | event=gps_context "
         + " ".join(f"{key}={value}" for key, value in fields.items())
     )
     assert len(message) < unit_logs.MAX_MESSAGE_CHARS
     [retained] = carplay_timing.parse_sampler_file("2026-09-28T04:00:00Z " + message)
     assert retained.message == message
+    parsed = carplay_timing.parse_event(retained.occurred_at, retained.message)
+    assert parsed["gps_burst_reason"] == "receiver_start"
+    assert parsed["gps_burst_end"] == "ignition_unknown"
+    assert parsed["gps_last_known_fix_age_ms"] == 1234567890123
+    assert parsed["loc_passive_satellites"] == 32
 
 
 async def test_gps_observation_is_recovered_deduplicated_and_exposed_by_timing_api(db_session):
@@ -141,7 +153,7 @@ async def test_gps_observation_is_recovered_deduplicated_and_exposed_by_timing_a
     assert await unit_logs.store(entries) == (1, 0)
     assert await unit_logs.store(entries) == (0, 1)
     response = await carplay_timing_samples(session=db_session, hours=1)
-    assert response["sampler_schema"] == 7
+    assert response["sampler_schema"] == 8
     assert response["samples"] == []  # GPS observations never fabricate frame measurements.
     [observation] = response["events"]
     assert observation["kind"] == "gps_context"
@@ -150,3 +162,49 @@ async def test_gps_observation_is_recovered_deduplicated_and_exposed_by_timing_a
     assert observation["acc_on"] is True
     assert response["sessions"][0]["event_count"] == 1
     assert response["sessions"][0]["sample_count"] == 0
+
+
+def test_burst_metadata_survives_failed_capture_without_inventing_a_current_fix():
+    parsed = event(
+        "gps_capture_status=dump_error gps_next_interval_ms=15000 "
+        "gps_burst_reason=ignition_on gps_burst_start_ms=100000 "
+        "gps_burst_elapsed_ms=6000 gps_burst_end=read_failed "
+        "gps_fix_advanced=1 gps_last_known_fix_age_ms=9000 loc_gps_age_ms=9000"
+    )
+    assert parsed["gps_next_interval_ms"] == 15000
+    assert parsed["gps_burst_reason"] == "ignition_on"
+    assert parsed["gps_burst_start_ms"] == 100000
+    assert parsed["gps_burst_elapsed_ms"] == 6000
+    assert parsed["gps_burst_end"] == "read_failed"
+    assert parsed["gps_last_known_fix_age_ms"] == 9000
+    assert parsed["gps_fix_advanced"] is None
+    assert parsed["loc_gps_age_ms"] is None
+
+
+@pytest.mark.parametrize("value", ["na", "-1", "PRIVATE", "Infinity", "1.5"])
+def test_invalid_burst_metadata_is_not_exposed(value):
+    parsed = event(
+        f"gps_capture_status=ok gps_next_interval_ms={value} gps_burst_reason={value} "
+        f"gps_burst_end={value} gps_burst_start_ms={value} gps_burst_elapsed_ms={value} "
+        f"gps_fix_advanced={value} gps_last_known_fix_age_ms={value}"
+    )
+    for name in (
+        "gps_next_interval_ms",
+        "gps_burst_reason",
+        "gps_burst_end",
+        "gps_burst_start_ms",
+        "gps_burst_elapsed_ms",
+        "gps_fix_advanced",
+        "gps_last_known_fix_age_ms",
+    ):
+        assert parsed[name] is None
+
+
+def test_schema_seven_without_burst_fields_remains_unknown():
+    parsed = event("gps_capture_status=ok loc_gps_age_ms=0")
+    assert parsed["diagnostic_schema"] == 7
+    assert parsed["loc_gps_age_ms"] == 0
+    assert parsed["gps_next_interval_ms"] is None
+    assert parsed["gps_burst_reason"] is None
+    assert parsed["gps_fix_advanced"] is None
+    assert parsed["gps_last_known_fix_age_ms"] is None

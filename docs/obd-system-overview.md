@@ -76,6 +76,32 @@ The head unit has no battery and is reachable only while running, freshly parked
 external power. Treat build results, server storage checks, physical BLE behavior, and a
 completed real transfer as separate evidence.
 
+## Timing and accuracy
+
+The target cycle is 5 seconds; most medium signals, including MAF, are requested every
+third cycle (15 seconds). Sequential adapter requests mean a row's timestamp marks cycle
+completion, not simultaneous acquisition of every field. Sampling faster improves temporal
+resolution only if the adapter and ECU can complete the requests; it does not establish
+sensor accuracy. The bounded `poll_timing` diagnostic records per-PID request outcomes,
+request duration, age from decoded response to row creation, and cycle overruns without
+retaining responses, sensor values or vehicle identifiers. Its timing cannot establish the
+age of the ECU's underlying sensor measurement.
+
+Fuel is explicitly an estimate derived from MAF using gasoline density and a stoichiometric
+air/fuel ratio; it is not an ECU fuel counter or a calibrated fuel measurement. Earlier
+summary arithmetic counted only the first row interval after each sparse MAF reading.
+The corrected Android exporter and server/Python summary share a bounded hold rule:
+retain the last valid rate for at most 22.5 seconds, require consecutive sequences and row
+gaps no larger than 7.5 seconds, and discard the interval ending in a failed MAF read,
+failed transport, unavailable ECU, or invalid rate. A new valid rate starts a new hold;
+no estimate extends beyond the last observed row. Uncovered periods remain excluded, so
+the resulting total is still a partial estimate when data is missing.
+
+Server startup reconciliation rebuilds historical cached summaries from stored samples;
+the immutable observations and original bundle summaries remain unchanged. Projection
+version 4 identifies the corrected fuel integration. These rules do not validate sensor
+calibration or remove the fuel model's assumptions.
+
 As of 2026-08-30, the physical setup had demonstrated engine detection, drive close,
 bundle export, unattended collection, receipt-gated deletion, and retained raw-history
 charts. This dated result is historical evidence, not proof of the current deployment.

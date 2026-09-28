@@ -49,6 +49,35 @@ class BundleExporterProductionTest {
     }
 
     @Test
+    fun productionSummaryIntegratesSparseFuelAndRespectsFailedMaf() {
+        for (failedMaf in listOf(false, true)) {
+            val driveId = "sparse-fuel-$failedMaf"
+            val start = Instant.parse("2026-09-28T00:00:00Z")
+            database.startDrive(
+                DriveRecord(driveId, "car", "adapter", "logger", "test", 1,
+                    start.toString(), "UTC", "test", "test"),
+            )
+            for (sequence in 0L..6L) {
+                val hasRate = sequence % 3 == 0L && !(failedMaf && sequence == 3L)
+                database.addSample(SampleRecord(
+                    driveId, sequence, start.plusSeconds(sequence * 5).toString(),
+                    if (hasRate) mapOf("estimated_fuel_rate" to 6.0) else emptyMap(),
+                    missingPids = if (failedMaf && sequence == 3L) listOf(0x10) else emptyList(),
+                ))
+            }
+            database.finishDrive(driveId, "engine_stopped", true, start.plusSeconds(30).toString())
+            val exported = exporter.export(driveId)
+            ZipFile(exported.file).use { zip ->
+                val summary = zip.getInputStream(zip.getEntry("summary.json")).bufferedReader().use {
+                    JSONObject(it.readText())
+                }
+                val coveredSeconds = if (failedMaf) 10.0 else 30.0
+                assertEquals(6.0 * coveredSeconds / 3600, summary.getDouble("estimated_fuel_used_l"), 1e-10)
+            }
+        }
+    }
+
+    @Test
     fun productionExporterAtomicallyPublishesValidatesHashesAndRecoversExistingFinal() {
         val driveId = "atomic-drive"
         createCompletedDrive(driveId)
