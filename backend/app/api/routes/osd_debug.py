@@ -31,7 +31,7 @@ from app.db.models import OsdProfile, Recording, TelemetryPoint
 from app.hardware.ffmpeg import extract_frame, probe
 from app.media import ensure_playable
 from app.osd.engine import TelemetryExtractor
-from app.osd.glyphs import binarise, decode_line, segment_glyphs
+from app.osd.glyphs import binarise, decode_strip, segment_glyphs
 from app.osd.parser import parse_osd_text
 from app.osd.region import OsdRegion
 
@@ -107,15 +107,15 @@ async def osd_debug(
 
     glyphs = []
     mask = None
+    text, confidence = ("", 0.0)
     if frame is not None:
         gray = frame[..., 0] if frame.ndim == 3 else frame
         strip = _crop_strip(gray, crop)
-        mask = binarise(strip)
+        if extractor.templates is None:
+            mask = binarise(strip)
+        else:
+            mask, text, confidence = decode_strip(strip, extractor.templates)
         glyphs = segment_glyphs(mask)
-
-    text, confidence = ("", 0.0)
-    if mask is not None and extractor.templates is not None:
-        text, confidence = decode_line(mask, extractor.templates)
 
     settings = get_settings_service()
     reading = parse_osd_text(
@@ -218,7 +218,11 @@ async def osd_debug_image(
 
     gray = frame[..., 0] if frame.ndim == 3 else frame
     strip = _crop_strip(gray, crop)
-    mask = binarise(strip)
+    text, confidence = ("", 0.0)
+    if extractor.templates is None:
+        mask = binarise(strip)
+    else:
+        mask, text, confidence = decode_strip(strip, extractor.templates)
 
     strip_img = Image.fromarray(strip.astype(np.uint8)).convert("RGB")
     mask_img = Image.fromarray((mask * 255).astype(np.uint8)).convert("RGB")
@@ -249,10 +253,6 @@ async def osd_debug_image(
         outline=(255, 64, 64),
         width=3,
     )
-
-    text, confidence = ("", 0.0)
-    if extractor.templates is not None:
-        text, confidence = decode_line(mask, extractor.templates)
 
     # Labels are ASCII on purpose: PIL's built-in bitmap font has no glyph for an em
     # dash and draws a replacement box, which looks like a rendering fault in a view whose

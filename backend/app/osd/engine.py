@@ -37,7 +37,7 @@ from app.osd.glyphs import (
     GlyphTemplates,
     TemplateLearner,
     binarise,
-    decode_line,
+    decode_strip,
     expected_time_from_filename,
     learn_structural,
     merge_templates,
@@ -337,7 +337,7 @@ class TelemetryExtractor:
             ) as strips:
                 async for offset, frame in strips:
                     result.frames_read += 1
-                    text, confidence = decode_line(binarise(frame), self._templates)
+                    _, text, confidence = decode_strip(frame, self._templates)
                     reading = parse_osd_text(
                         text, confidence=confidence, max_speed_kmh=max_speed_kmh
                     )
@@ -417,6 +417,8 @@ class TelemetryExtractor:
         one. Time, GPS and speed may come from different frames because their parse and
         validation outcomes are independent.
         """
+        from app.osd.problems import PUNCTUATION_RECOVERY, effective_problems
+
         trusted = [reading for _at, reading in candidates if reading.confidence >= min_confidence]
         all_readings = [reading for _at, reading in candidates]
         representative = max(
@@ -476,7 +478,20 @@ class TelemetryExtractor:
 
         fields = sum(value is not None for value in (time_reading, gps_reading, speed_reading))
         status = "valid" if fields == 3 else "partial" if fields else "failed"
-        problems = list(dict.fromkeys(problem for r in trusted for problem in (r.problems or [])))
+        # Failed sibling fields do not make the successfully selected fields faulty.
+        # A selected reading may itself fail a different field supplied by another
+        # reading, so selecting whole readings' warning lists is insufficient too.
+        problems = effective_problems(
+            [
+                problem
+                for reading in trusted
+                for problem in (reading.problems or [])
+                if problem != PUNCTUATION_RECOVERY or reading is gps_reading
+            ],
+            time_valid=time_reading is not None,
+            gps_valid=gps_reading is not None,
+            speed_valid=speed_reading is not None,
+        )
         if overruled:
             problems.append(
                 "a sibling frame read the no-fix marker at least as confidently; position discarded"

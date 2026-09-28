@@ -30,6 +30,7 @@ from app.api.schemas import (
     ReprocessRequest,
     SearchResults,
     SplitRequest,
+    TelemetryGpsCoverageOut,
     TelemetryPointOut,
     TelemetryQualityOut,
     TelemetryQualityRecordingOut,
@@ -351,6 +352,19 @@ async def patch_recording_event(
 _TELEMETRY_ISSUE_LIMIT = 250
 
 
+def _telemetry_gps_incomplete():
+    # Journey validation can reject previously accepted fixes after the original gap
+    # rollup was written. Include the updated counters and coverage, not just gap runs.
+    return or_(
+        Recording.gps_gap_count > 0,
+        Recording.gps_no_fix_count > 0,
+        Recording.gps_ocr_gap_count > 0,
+        Recording.gps_rejected_count > 0,
+        func.coalesce(Recording.gps_point_count, 0)
+        < func.coalesce(Recording.telemetry_point_count, 0),
+    )
+
+
 def _telemetry_status_case():
     """The four telemetry verdicts, as one SQL expression.
 
@@ -364,7 +378,8 @@ def _telemetry_status_case():
     a stage that has not finished is *pending* whatever else the columns say; a stale
     revision is *degraded*; a recording that read points but never got a fix, and said so
     on every one of them, is *no_fix*; anything with a gap or a problem is *degraded*; the
-    rest are *healthy*.
+    rest are *healthy*. Empty analyses and subsequently rejected fixes cannot count as
+    healthy simply because their original gap/problem counters were zero.
     """
     return case(
         (Recording.telemetry_state != StageState.DONE, "pending"),
@@ -387,11 +402,39 @@ def _telemetry_status_case():
             "no_fix",
         ),
         (
-            or_(Recording.gps_gap_count > 0, Recording.telemetry_problem_count > 0),
+            or_(
+                func.coalesce(Recording.telemetry_point_count, 0) <= 0,
+                _telemetry_gps_incomplete(),
+                Recording.telemetry_problem_count > 0,
+            ),
             "degraded",
         ),
         else_="healthy",
     )
+
+
+def _telemetry_issue_reasons(row) -> list[str]:
+    if row.status == "pending":
+        return ["analysis_pending"]
+    if row.telemetry_revision != CURRENT_REVISIONS["telemetry"]:
+        return ["analysis_outdated"]
+    if not row.telemetry_point_count:
+        return ["no_samples"]
+    reasons = []
+    for field, reason in (
+        ("gps_no_fix_count", "gps_no_fix"),
+        ("gps_ocr_gap_count", "gps_unreadable"),
+        ("gps_rejected_count", "gps_rejected"),
+    ):
+        if getattr(row, field):
+            reasons.append(reason)
+    if not reasons and (
+        row.gps_gap_count or (row.gps_point_count or 0) < row.telemetry_point_count
+    ):
+        reasons.append("gps_coverage_incomplete")
+    if row.telemetry_problem_count:
+        reasons.append("telemetry_warnings")
+    return reasons
 
 
 @router.get("/telemetry/quality", response_model=TelemetryQualityOut)
@@ -421,6 +464,51 @@ async def telemetry_quality(session: SessionDep):
         total_gaps += int(gaps or 0)
         paired += int(recovered or 0)
 
+    done = Recording.telemetry_state == StageState.DONE
+    revision_current = (
+        func.coalesce(Recording.telemetry_revision, "") == CURRENT_REVISIONS["telemetry"]
+    )
+    current = and_(done, revision_current)
+    has_samples = func.coalesce(Recording.telemetry_point_count, 0) > 0
+    measured = and_(current, has_samples)
+    incomplete = _telemetry_gps_incomplete()
+    warnings = Recording.telemetry_problem_count > 0
+
+    def total_when(condition, value=1):
+        return func.coalesce(func.sum(case((condition, value), else_=0)), 0)
+
+    # Coverage and warning counts use the same current analysed population. They can
+    # overlap, and accepted positions include interpolation/repair, not just direct fixes.
+    coverage = (
+        (
+            await session.execute(
+                select(
+                    total_when(measured).label("recordings"),
+                    total_when(measured, Recording.telemetry_point_count).label("total_points"),
+                    total_when(measured, Recording.gps_point_count).label("accepted_points"),
+                    total_when(measured, Recording.gps_no_fix_count).label("no_fix_points"),
+                    total_when(measured, Recording.gps_ocr_gap_count).label(
+                        "ocr_unreadable_points"
+                    ),
+                    total_when(measured, Recording.gps_rejected_count).label("rejected_points"),
+                    total_when(and_(measured, ~incomplete)).label("full_coverage_recordings"),
+                    total_when(and_(measured, incomplete)).label("gap_recordings"),
+                    total_when(and_(measured, warnings)).label("warning_recordings"),
+                    total_when(and_(measured, ~incomplete, warnings)).label(
+                        "warning_only_recordings"
+                    ),
+                    total_when(measured, Recording.telemetry_problem_count).label(
+                        "problem_samples"
+                    ),
+                    total_when(and_(done, ~revision_current)).label("outdated_recordings"),
+                    total_when(and_(current, ~has_samples)).label("empty_recordings"),
+                ).where(*visible)
+            )
+        )
+        .mappings()
+        .one()
+    )
+
     # And one bounded column query for the table, ordered by the same key the page sorts
     # on so the limit takes the worst rows rather than an arbitrary slice.
     rows = (
@@ -429,6 +517,7 @@ async def telemetry_quality(session: SessionDep):
                 Recording.id,
                 Recording.filename,
                 Recording.started_at,
+                Recording.telemetry_revision,
                 Recording.telemetry_point_count,
                 Recording.gps_point_count,
                 Recording.gps_gap_count,
@@ -465,6 +554,7 @@ async def telemetry_quality(session: SessionDep):
             rejected=row.gps_rejected_count,
             problems=row.telemetry_problem_count,
             status=str(row.status),
+            reasons=_telemetry_issue_reasons(row),
         )
         for row in rows
     ]
@@ -473,6 +563,11 @@ async def telemetry_quality(session: SessionDep):
         **counts,
         total_gaps=total_gaps,
         paired_recoveries=paired,
+        outdated_recordings=coverage["outdated_recordings"],
+        empty_recordings=coverage["empty_recordings"],
+        gps_coverage=TelemetryGpsCoverageOut.model_validate(dict(coverage)),
+        issue_total=total - counts["healthy"],
+        issue_limit=_TELEMETRY_ISSUE_LIMIT,
         issues=issues,
     )
 

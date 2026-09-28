@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 
 from sqlalchemy import select
@@ -10,10 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
 from app.db.models import Recording, StageState, TelemetryPoint
+from app.osd.problems import effective_problems, stored_problems
 from app.osd.reasons import GpsQuality
 from app.osd.track_quality import Fix, classify
 
 log = get_logger(__name__)
+
 
 #: A "problem" the extractor used to record on every cleanly parsed sample.
 #:
@@ -25,14 +26,9 @@ log = get_logger(__name__)
 #: recomputed over them must reach the same verdict as one computed from fresh samples.
 #: Matched rather than deleted from ``quality_json``: how many frames were considered is
 #: real provenance, and it stays where it was recorded.
-_LEGACY_CANDIDATE_NOISE = re.compile(r"^selected best fields from \d+ candidate frames$")
-
-
 def real_problems(problems: object) -> list[str]:
-    """The entries in a stored ``problems`` list that describe an actual fault."""
-    if not isinstance(problems, (list, tuple)):
-        return []
-    return [str(p) for p in problems if not _LEGACY_CANDIDATE_NOISE.match(str(p))]
+    """Conservative compatibility wrapper for callers without selected-field evidence."""
+    return effective_problems(problems)
 
 
 def quality_rollup(rows: Iterable[object]) -> tuple[int, float, int, int, int, int]:
@@ -50,11 +46,15 @@ def quality_rollup(rows: Iterable[object]) -> tuple[int, float, int, int, int, i
             offset = float(row.get("t_offset_s", 0.0))
             quality = row.get("quality_json") or {}
             has_fix = bool(row.get("has_fix", False))
+            speed_kmh = row.get("speed_kmh")
         else:
             offset = float(getattr(row, "t_offset_s", 0.0))
             quality = getattr(row, "quality_json", None) or {}
             has_fix = bool(getattr(row, "has_fix", False))
-        if real_problems(quality.get("problems")) or quality.get("ocr_status") in {
+            speed_kmh = getattr(row, "speed_kmh", None)
+        if stored_problems(quality, has_fix=has_fix, speed_kmh=speed_kmh) or quality.get(
+            "ocr_status"
+        ) in {
             "failed",
             "rejected",
         }:
@@ -144,6 +144,25 @@ def _revert_implausible(target: list[TelemetryPoint], filled: list[TelemetryPoin
 _SYNTHETIC_GPS_SOURCES = frozenset({"paired_camera", "interpolated", "context_repaired"})
 
 
+def _is_unreadable_parse_failure(point: TelemetryPoint, quality: dict) -> bool:
+    """The exact reason-free OCR gap formerly blocked by the rejected column."""
+    return (
+        point.gps_quality == str(GpsQuality.REJECTED)
+        and not point.has_fix
+        and point.lat is None
+        and point.lon is None
+        and not point.breaks_segment
+        and point.gps_reason is None
+        and quality.get("gps_reason") is None
+        and quality.get("source") == "overlay_ocr"
+        and quality.get("gps_status") == "parse_failed"
+        and quality.get("gps_source") == "none"
+        and not quality.get("interpolated")
+        and quality.get("time_status") in {"valid", "parse_failed"}
+        and quality.get("time_source") in {"overlay", "timeline"}
+    )
+
+
 def _is_explicitly_unavailable(point: TelemetryPoint, quality: dict) -> bool:
     """Whether a stored row says that this camera supplied no usable position.
 
@@ -154,11 +173,18 @@ def _is_explicitly_unavailable(point: TelemetryPoint, quality: dict) -> bool:
     repudiated local observation back into an apparently ordinary gap and hides that
     distinction behind a copied coordinate.
 
+    The extractor also uses ``rejected`` for an unreadable field: there is no fifth
+    column state for an OCR gap. Only that explicit, reason-free parse failure may
+    be recovered. A rejected clock, remaining coordinate or segment break would
+    contradict the claim that this is merely an unreadable overlay.
+
     Older rows have no column, so retain the legacy JSON check for them.
     """
     verdict = point.gps_quality
-    if verdict in {str(GpsQuality.NO_FIX), str(GpsQuality.REJECTED)}:
+    if verdict == str(GpsQuality.NO_FIX):
         return True
+    if verdict == str(GpsQuality.REJECTED):
+        return not _is_unreadable_parse_failure(point, quality)
     return quality.get("gps_status") in {"no_fix", "rejected"}
 
 
@@ -175,12 +201,21 @@ def _is_independent_donor(point: TelemetryPoint) -> bool:
     )
 
 
-async def recover_from_paired_camera(session: AsyncSession, recording: Recording) -> int:
+async def recover_from_paired_camera(
+    session: AsyncSession,
+    recording: Recording,
+    *,
+    bidirectional: bool = True,
+    parse_failures_only: bool = False,
+) -> int:
     """Fill OCR-only holes from an overlapping camera, never an explicit GPS no-fix.
 
     A second camera is independent evidence only when its overlay decoded successfully.
     The camera's explicit zero-coordinate/no-fix marker is left untouched because copying
-    over it would turn genuine satellite loss into invented continuity.
+    over it would turn genuine satellite loss into invented continuity. Historical
+    maintenance sets ``bidirectional=False`` and ``parse_failures_only=True`` to modify
+    only the supplied recording's proven parse failures. Legacy missing rows retain
+    their existing treatment in the normal pipeline.
     """
     if recording.started_at is None or recording.ended_at is None:
         return 0
@@ -203,9 +238,9 @@ async def recover_from_paired_camera(session: AsyncSession, recording: Recording
         return 0
 
     recovered = 0
-    pairs = [(recording, partner) for partner in partners] + [
-        (partner, recording) for partner in partners
-    ]
+    pairs = [(recording, partner) for partner in partners]
+    if bidirectional:
+        pairs.extend((partner, recording) for partner in partners)
     for target_recording, source_recording in pairs:
         target = list(
             (
@@ -248,17 +283,20 @@ async def recover_from_paired_camera(session: AsyncSession, recording: Recording
         }
         changed = 0
         filled: list[TelemetryPoint] = []
+        original_speeds: dict[int, float | None] = {}
         for point in target:
             quality = dict(point.quality_json or {})
             if (
                 point.has_fix
                 or _is_explicitly_unavailable(point, quality)
                 or point.captured_at is None
+                or (parse_failures_only and not _is_unreadable_parse_failure(point, quality))
             ):
                 continue
             donor = by_second.get(round(point.captured_at.timestamp()))
             if donor is None:
                 continue
+            original_speeds[id(point)] = point.speed_kmh
             point.lat, point.lon, point.has_fix = donor.lat, donor.lon, True
             point.speed_kmh = point.speed_kmh if point.speed_kmh is not None else donor.speed_kmh
             point.heading_deg = donor.heading_deg
@@ -292,7 +330,11 @@ async def recover_from_paired_camera(session: AsyncSession, recording: Recording
         if filled:
             reverted = _revert_implausible(target, filled)
             changed -= reverted
-        if changed:
+            for point in filled:
+                if not point.has_fix:
+                    point.speed_kmh = original_speeds[id(point)]
+            # A refused copy changes an OCR gap into an explicit rejection, even if
+            # no copied positions survive. Its counters must describe that verdict.
             gaps, longest, problems, no_fix, ocr_gap, rejected = quality_rollup(target)
             target_recording.gps_recovered_count += changed
             target_recording.gps_point_count = sum(point.has_fix for point in target)

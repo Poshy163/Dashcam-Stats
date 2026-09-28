@@ -418,7 +418,9 @@ async def test_extraction_keeps_failed_seconds_and_best_success(monkeypatch):
 
     monkeypatch.setattr(extractor, "_iter_strips", strips)
     monkeypatch.setattr(engine_module, "probe", fake_probe)
-    monkeypatch.setattr(engine_module, "decode_line", lambda mask, templates: (next(texts), 0.95))
+    monkeypatch.setattr(
+        engine_module, "decode_strip", lambda mask, templates: (mask, next(texts), 0.95)
+    )
 
     result = await extractor.extract(
         Path("20260804174353_camera_0.ts"),

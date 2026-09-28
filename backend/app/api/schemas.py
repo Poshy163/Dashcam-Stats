@@ -502,6 +502,23 @@ class TelemetryQualityRecordingOut(BaseModel):
     rejected: int = 0
     problems: int = 0
     status: str
+    reasons: list[str] = Field(default_factory=list)
+
+
+class TelemetryGpsCoverageOut(BaseModel):
+    """Stored sample coverage for current, finished analyses that contain samples."""
+
+    recordings: int = 0
+    total_points: int = 0
+    accepted_points: int = 0
+    no_fix_points: int = 0
+    ocr_unreadable_points: int = 0
+    rejected_points: int = 0
+    full_coverage_recordings: int = 0
+    gap_recordings: int = 0
+    warning_recordings: int = 0
+    warning_only_recordings: int = 0
+    problem_samples: int = 0
 
 
 class TelemetryQualityOut(BaseModel):
@@ -512,6 +529,11 @@ class TelemetryQualityOut(BaseModel):
     pending: int = 0
     total_gaps: int = 0
     paired_recoveries: int = 0
+    outdated_recordings: int = 0
+    empty_recordings: int = 0
+    gps_coverage: TelemetryGpsCoverageOut = Field(default_factory=TelemetryGpsCoverageOut)
+    issue_total: int = 0
+    issue_limit: int = 250
     issues: list[TelemetryQualityRecordingOut] = Field(default_factory=list)
 
 

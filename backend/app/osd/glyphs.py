@@ -628,6 +628,150 @@ def decode_line(mask: np.ndarray, templates: GlyphTemplates) -> tuple[str, float
     return text, confidence
 
 
+# A fallback must contain every literal and digit, including a real gap before speed.
+# The ordinary parser intentionally tolerates damaged punctuation; using that tolerance
+# to select a new mask can swallow speed into a missing coordinate digit.
+_COMPLETE_OVERLAY_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+"
+    r"E:[+-]?\d{1,3}\.\d{4}\s+N:[+-]?\d{1,3}\.\d{4}\s+\d{1,3}\s+km/h$"
+)
+_BRIGHT_THRESHOLDS = (190, 200, 205, 210, 215, 217, 220, 225)
+
+
+def _split_fused_digits(mask: np.ndarray, templates: GlyphTemplates) -> np.ndarray | None:
+    """Separate at most two double-width runs using strong evidence on both sides.
+
+    Sunlit scene texture can bridge otherwise separate digits even after thresholding.
+    Removing a narrow low-ink gap is allowed only when both resulting full-height digits
+    match templates strongly and substantially better than the unsplit run. Normal-width
+    characters and short punctuation are never split.
+    """
+    glyphs = segment_glyphs(mask)
+    if not 35 <= len(glyphs) <= 60:
+        return None
+    height = float(np.median([g.height for g in glyphs]))
+    tall = [g for g in glyphs if abs(g.height - height) <= 2]
+    if len(tall) < 20 or height < _LINE_VOTE_MIN_HEIGHT:
+        return None
+    width = float(np.median([g.width for g in tall]))
+    wide = [g for g in tall if g.width >= 1.7 * width]
+    if len(wide) > 2 or any(g.width > 2.8 * width for g in wide):
+        return None
+    result = mask.copy()
+    for glyph in wide:
+        original_score = templates.classify(glyph.bitmap)[1]
+        by_digits: dict[str, tuple[float, float, int, int]] = {}
+        for cut in range(int(0.6 * width), glyph.width - int(0.45 * width)):
+            for gap in range(1, int(0.4 * width) + 1):
+                if glyph.bitmap[:, cut : cut + gap].sum() > 0.3 * gap * glyph.height:
+                    continue
+                trial = glyph.bitmap.copy()
+                trial[:, cut : cut + gap] = False
+                pieces = segment_glyphs(trial)
+                if len(pieces) != 2 or any(
+                    abs(piece.height - height) > 2 or not 0.45 * width <= piece.width <= 1.4 * width
+                    for piece in pieces
+                ):
+                    continue
+                classified = [templates.classify(piece.bitmap) for piece in pieces]
+                if not all(char.isdigit() for char, _ in classified):
+                    continue
+                scores = [score for _, score in classified]
+                option = (min(scores), sum(scores) / 2, cut, gap)
+                digits = "".join(char for char, _ in classified)
+                if digits not in by_digits or option > by_digits[digits]:
+                    by_digits[digits] = option
+        ranked = sorted(by_digits.values(), reverse=True)
+        best = ranked[0] if ranked else None
+        if best is None or best[0] < max(0.75, original_score + 0.12):
+            return None
+        if len(ranked) > 1 and ranked[1][0] >= best[0] - 0.08:
+            return None
+        _, _, cut, gap = best
+        result[:, glyph.x0 + cut : glyph.x0 + cut + gap] = False
+    return result
+
+
+def decode_strip(strip: np.ndarray, templates: GlyphTemplates) -> tuple[np.ndarray, str, float]:
+    """Decode normally, then conservatively retry an unreadable bright background.
+
+    Existing fixes and explicit no-fix readings are returned unchanged. A replacement
+    requires complete, strictly shaped telemetry and agreement across at least two masks;
+    conflicting candidates, weak digits and unresolved merged runs retain the original
+    failure. This changes extraction, never coordinate or track acceptance rules. Return
+    the selected mask as well so the debug image shows exactly what production decoded.
+    """
+    from app.osd.parser import parse_osd_text
+
+    mask = binarise(strip)
+    text, confidence = decode_line(mask, templates)
+    baseline = (mask, text, confidence)
+    reading = parse_osd_text(text, confidence=confidence)
+    if reading.has_fix or reading.gps_status == "no_fix":
+        return baseline
+    gray = strip[..., 0] if strip.ndim == 3 else strip
+    if gray.shape[0] > 80 or gray.shape[1] > 4096 or np.count_nonzero(gray >= 190) < 500:
+        return baseline
+
+    import cv2
+
+    agreed = None
+    candidates: list[tuple[np.ndarray, str, float]] = []
+    for threshold in _BRIGHT_THRESHOLDS:
+        _, labels, stats, _ = cv2.connectedComponentsWithStats(
+            (gray >= threshold).astype(np.uint8), connectivity=8
+        )
+        keep = stats[:, cv2.CC_STAT_AREA] >= 12
+        keep[0] = False
+        cleaned = isolate_text_band(keep[labels])
+        # Do not search cuts in masks still dominated by scene texture.
+        if decode_line(cleaned, templates)[1] < 0.88:
+            continue
+        candidate_mask = _split_fused_digits(cleaned, templates)
+        if candidate_mask is None:
+            continue
+        candidate_text, candidate_confidence = decode_line(candidate_mask, templates)
+        if candidate_confidence < max(
+            0.92, confidence + 0.05
+        ) or not _COMPLETE_OVERLAY_RE.fullmatch(candidate_text):
+            continue
+        if any(
+            score < 0.7
+            for char, score in (
+                templates.classify(g.bitmap) for g in segment_glyphs(candidate_mask)
+            )
+            if char.isdigit()
+        ):
+            continue
+        candidate = parse_osd_text(candidate_text, confidence=candidate_confidence)
+        if (
+            not (candidate.has_fix or candidate.gps_status == "no_fix")
+            or candidate.captured_at is None
+            or candidate.speed_kmh is None
+        ):
+            continue
+        if reading.captured_at is not None and candidate.captured_at != reading.captured_at:
+            continue
+        if (
+            confidence >= 0.9
+            and reading.speed_kmh is not None
+            and candidate.speed_kmh != reading.speed_kmh
+        ):
+            continue
+        key = (
+            candidate.captured_at,
+            candidate.lat,
+            candidate.lon,
+            candidate.speed_kmh,
+            candidate.gps_status,
+        )
+        if agreed is not None and key != agreed:
+            return baseline
+        agreed = key
+        candidates.append((candidate_mask, candidate_text, candidate_confidence))
+    return max(candidates, key=lambda candidate: candidate[2]) if len(candidates) >= 2 else baseline
+
+
 _FILENAME_TIME_RE = re.compile(r"(\d{14})")
 
 

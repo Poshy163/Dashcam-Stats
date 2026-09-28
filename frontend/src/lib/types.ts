@@ -317,6 +317,21 @@ export interface TelemetryQualityRecording {
   rejected: number
   problems: number
   status: 'healthy' | 'degraded' | 'no_fix' | 'pending'
+  reasons: string[]
+}
+
+export interface TelemetryGpsCoverage {
+  recordings: number
+  totalPoints: number
+  acceptedPoints: number
+  noFixPoints: number
+  ocrUnreadablePoints: number
+  rejectedPoints: number
+  fullCoverageRecordings: number
+  gapRecordings: number
+  warningRecordings: number
+  warningOnlyRecordings: number
+  problemSamples: number
 }
 
 export interface TelemetryQuality {
@@ -327,6 +342,11 @@ export interface TelemetryQuality {
   pending: number
   totalGaps: number
   pairedRecoveries: number
+  outdatedRecordings: number
+  emptyRecordings: number
+  gpsCoverage: TelemetryGpsCoverage
+  issueTotal: number
+  issueLimit: number
   issues: TelemetryQualityRecording[]
 }
 
