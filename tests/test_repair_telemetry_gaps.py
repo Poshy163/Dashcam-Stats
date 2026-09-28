@@ -255,6 +255,24 @@ async def test_exception_after_flushed_changes_rolls_back_the_recording(
     assert await _snapshot() == before
 
 
+async def test_modification_count_includes_changes_flushed_by_partner_queries(
+    db_session, paired_library, repair_module, monkeypatch
+):
+    before = await _snapshot()
+    original = repair_module.recover_from_paired_camera
+
+    async def flushed_repair(session, recording, **kwargs):
+        recovered = await original(session, recording, **kwargs)
+        await session.flush()
+        assert not session.dirty
+        return recovered
+
+    monkeypatch.setattr(repair_module, "recover_from_paired_camera", flushed_repair)
+    result = await repair_module.repair(apply=False, limit=10, after_id=0, recording_id=None)
+    assert result["changed_recordings"] == result["modified_recordings"] == 1
+    assert await _snapshot() == before
+
+
 async def test_maintenance_preserves_other_missing_rows_in_an_eligible_recording(
     db_session,
     paired_library,

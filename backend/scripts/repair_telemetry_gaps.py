@@ -82,10 +82,15 @@ async def repair(*, apply: bool, limit: int, after_id: int, recording_id: int | 
                 result["skipped"] += 1
                 await session.rollback()
             else:
+                before_changes = await session.scalar(text("SELECT total_changes()"))
                 recovered = await recover_from_paired_camera(
                     session, recording, bidirectional=False, parse_failures_only=True
                 )
-                modified = any(session.is_modified(row) for row in session.dirty)
+                # Partner queries can autoflush earlier changes and clear session.dirty.
+                # SQLite's per-connection counter includes those writes and also works
+                # in preview, where the whole transaction is rolled back below.
+                await session.flush()
+                modified = await session.scalar(text("SELECT total_changes()")) > before_changes
                 result["examined"] += 1
                 result["changed_recordings"] += bool(recovered)
                 result["modified_recordings"] += bool(modified)
