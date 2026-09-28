@@ -63,6 +63,7 @@ FRAME_CONTEXT=/data/local/tmp/.dashcam_cpt_context_$SESSION
 FRAME_SEQ=/data/local/tmp/.dashcam_cpt_frame_seq_$SESSION
 frame_pid=; link_pid=; codec_pid=; codec_start=; codec_last=0; codec_seq=0; sleep_pid=
 frame_start=; link_start_ticks=; slow_start=; sleep_start=
+gps_pid=; gps_worker_start=
 process_start() { awk '{sub(/^.*\) /,"");print $20}' "/proc/$1/stat" 2>/dev/null; }
 child_alive() {
   [ -n "$1" ] && [ -n "$2" ] && [ "$(process_start "$1")" = "$2" ] && kill -0 "$1" 2>/dev/null
@@ -82,19 +83,169 @@ deadline_delay() {
 cleanup() {
   # Signal all owned children first, then reap them before a replacement can start.
   codec_alive && kill "$codec_pid" 2>/dev/null
-  for child in "$frame_pid:$frame_start" "$link_pid:$link_start_ticks" "$slow_pid:$slow_start" "$sleep_pid:$sleep_start"; do
+  for child in "$frame_pid:$frame_start" "$link_pid:$link_start_ticks" "$gps_pid:$gps_worker_start" "$slow_pid:$slow_start" "$sleep_pid:$sleep_start"; do
     child_alive "${child%:*}" "${child#*:}" && kill "${child%:*}" 2>/dev/null
   done
   if [ -n "$codec_pid" ]; then
     wait "$codec_pid" 2>/dev/null
   fi
-  for child in "$frame_pid" "$link_pid" "$slow_pid" "$sleep_pid"; do
+  for child in "$frame_pid" "$link_pid" "$gps_pid" "$slow_pid" "$sleep_pid"; do
     [ -n "$child" ] && wait "$child" 2>/dev/null
   done
   rm -f "$FRAME_CONTEXT" "$FRAME_CONTEXT.new" "$FRAME_SEQ"
 }
 trap 'exit 0' TERM INT
 trap cleanup EXIT
+# One append per sanitized event, shared by the independent workers. Rotation remains
+# with the foreground loop; workers reopen the current path for every append.
+save_message() {
+  printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" >> "$LOG"
+  log -p "$PRIO" -t "$TAG" "$1" 2>/dev/null
+}
+# GPS observes the provider even before CarPlay or a WLAN neighbour exists. It never
+# requests a fix, changes settings, resets GNSS metrics or holds a wake lock.
+gps_summary() {
+  awk -v now_ms="${1:-live}" '
+# BEGIN_GPS_AWK
+function number(s) { return length(s)<=32 && s ~ /^[0-9]+([.][0-9]+)?$/ }
+function duration(s, total,n,u,token,rank,prior) {
+  if(s=="0")return 0
+  if(substr(s,1,1)!="+" || length(s)<2)return -1
+  s=substr(s,2);total=0;prior=6
+  while(length(s)) {
+    if(!match(s,/^[0-9]+(ms|d|h|m|s)/))return -1
+    token=substr(s,1,RLENGTH);n=token+0;u=token;sub(/^[0-9]+/,"",u)
+    rank=(u=="d"?5:u=="h"?4:u=="m"?3:u=="s"?2:1)
+    if(rank>=prior)return -1
+    prior=rank;total+=n*(u=="d"?86400000:u=="h"?3600000:u=="m"?60000:u=="s"?1000:1)
+    if(total>9007199254740991)return -1
+    s=substr(s,RLENGTH+1)
+  }
+  return total
+}
+function value(line,key, v) {
+  if(!match(line,"(^|[ {])" key "=[^ ,}]+"))return ""
+  v=substr(line,RSTART,RLENGTH);sub(/^[^=]*=/,"",v);sub(/\]+$/,"",v);return v
+}
+function emit(key,v) { printf " %s=%s",key,(v<0?"na":v) }
+function integer(v) { return v<0?"na":sprintf("%.0f",v) }
+BEGIN {
+  split("gps fused network passive",order," ")
+  for(i=1;i<=4;i++){p=order[i];seen[p]=0;enabled[p]=-1;fix[p]=-1;accuracy[p]=-1;sats[p]=-1;listener[p]=0}
+  started=-1;reports=-1;ttff_n=-1;ttff_mean=-1;ttff_sd=-1;rc=-1;setting=-1
+}
+{
+  sub(/\r$/,"");bytes+=length($0)+1
+  if(bytes>4194304 || NR>50000 || length($0)>65536){limited=1;exit}
+  # Binder/service failures can still leave dumpsys with process exit status zero.
+  if($0~/DUMP TIMEOUT|^[ ]*(Error dumping service|Permission Denial:|Permission denied|Can.t find service:)/)dump_failed=1
+  if($0~/^__GPS_DUMP_RC__=[0-9]+$/){v=$0;sub(/^__GPS_DUMP_RC__=/,"",v);rc=v+0;next}
+  if($0=="Location Manager State:")header=1
+  if($0~/^    Location Setting: (true|false)$/)setting=($NF=="true")
+  if($0~/^  Location Providers:$/){providers=1;next}
+  if(providers && $0~/^  [^ ]/){providers=0;p="";inlisteners=0}
+  # An unrecognized provider must not inherit the preceding known provider scope.
+  if(providers && $0~/^    [^ ].* provider:$/){p=$1;inlisteners=0;if(p in seen)seen[p]=1;else p="";next}
+  if(!providers || p=="")next
+  if($0~/^      listeners:$/){inlisteners=1;next}
+  if($0~/^      [^ ]/)inlisteners=0
+  if(inlisteners && $0~/^[ ]+[0-9]+\/com[.]zjinnova[.]zlink(\/|\[)/)listener[p]=1
+  if($0~/^      enabled=(true|false)$/)enabled[p]=($0~/true$/)
+  if($0~/^      last location=Location\[/){
+    fix[p]=duration(value($0,"et"));v=value($0,"hAcc");if(number(v))accuracy[p]=v
+    v=value($0,"satellites");if(length(v)<=10 && v~/^[0-9]+$/)sats[p]=v
+  }
+  if(p=="gps"){
+    if($0~/^      mStarted=(true|false)([ ]|$)/)started=($0~/mStarted=true/)
+    v=$0;sub(/^ +/,"",v)
+    if(v~/^Number of location reports: [0-9]+$/){sub(/^.*: /,"",v);if(number(v))reports=v}
+    if(v~/^Number of TTFF reports: [0-9]+$/){sub(/^.*: /,"",v);if(number(v))ttff_n=v}
+    if(v~/^TTFF mean \(sec\): /){sub(/^.*: /,"",v);if(number(v))ttff_mean=v}
+    if(v~/^TTFF standard deviation \(sec\): /){sub(/^.*: /,"",v);if(number(v))ttff_sd=v}
+  }
+}
+END {
+  if(now_ms=="live"){
+    if((getline clockline < "/proc/uptime")>0){split(clockline,cl," ");now_ms=number(cl[1])?cl[1]*1000:-1}else now_ms=-1
+    close("/proc/uptime")
+  }
+  status=limited?"limit":rc!=0||dump_failed?"dump_error":!header||!seen["gps"]?"unsupported":"ok"
+  printf "gps_capture_status=%s gps_dump_rc=%s gps_uptime_ms=%s",status,integer(rc),integer(now_ms)
+  # Failed/truncated dumps must not publish partial values as successful telemetry.
+  if(status!="ok"){printf "\n";exit}
+  emit("location_enabled",setting);emit("gps_started",started);emit("gnss_reports",reports)
+  emit("gnss_ttff_reports",ttff_n);emit("gnss_ttff_mean_s",ttff_mean);emit("gnss_ttff_sd_s",ttff_sd)
+  for(i=1;i<=4;i++){
+    p=order[i];key="loc_" p;emit(key "_present",seen[p]);emit(key "_enabled",enabled[p])
+    emit(key "_fix_elapsed_ms",integer(fix[p]))
+    age=(fix[p]>=0 && now_ms>=fix[p])?now_ms-fix[p]:-1
+    emit(key "_age_ms",integer(age));emit(key "_hacc_m",accuracy[p]);emit(key "_satellites",sats[p])
+    emit(key "_zlink_listener",seen[p]?listener[p]:-1)
+  }
+  printf "\n"
+}
+# END_GPS_AWK
+  '
+}
+gps_process_present() {
+  # Only observed process presence, never proof of a CarPlay connection or GPS feed.
+  command -v pidof >/dev/null 2>&1 || { printf na; return; }
+  gps_pids=$(timeout 1 pidof "$1" 2>/dev/null); gps_pid_rc=$?
+  if [ "$gps_pid_rc" = 0 ]; then
+    printf '%s\n' "$gps_pids" | awk 'BEGIN{ok=1} {for(i=1;i<=NF;i++){if($i!~/^[0-9]+$/)ok=0;n++}} END{printf "%s",(ok && n?1:"na")}'
+  elif [ "$gps_pid_rc" = 1 ] && [ -z "$gps_pids" ]; then printf 0
+  else printf na; fi
+}
+gps_poll() {
+  gps_poll_start=$(clock_ms)
+  gps_gap=na; [ "$gps_previous" -gt 0 ] && gps_gap=$((gps_poll_start-gps_previous))
+  gps_previous=$gps_poll_start
+  gps_acc=na; gps_mode=na; gps_zlink_present=na; gps_native_present=na
+  if command -v timeout >/dev/null 2>&1 && command -v dumpsys >/dev/null 2>&1; then
+    gps_acc=$(timeout 2 settings get global acc_status 2>/dev/null)
+    case "$gps_acc" in 0|1) ;; *) gps_acc=na;; esac
+    gps_mode=$(timeout 2 settings get secure location_mode 2>/dev/null)
+    case "$gps_mode" in 0|1|2|3) ;; *) gps_mode=na;; esac
+    gps_zlink_present=$(gps_process_present com.zjinnova.zlink)
+    gps_native_present=$(gps_process_present z-link)
+    gps_fields=$({ timeout 4 dumpsys -t 3 location 2>/dev/null; printf '\n__GPS_DUMP_RC__=%s\n' "$?"; } | gps_summary live)
+    case "$gps_fields" in gps_capture_status=*) ;; *) gps_fields='gps_capture_status=parser_error gps_dump_rc=na gps_uptime_ms=na';; esac
+  else
+    gps_fields='gps_capture_status=tool_unavailable gps_dump_rc=na gps_uptime_ms=na'
+  fi
+  gps_seq=$((gps_seq+1))
+  message="sample=$SESSION-gps-$gps_token-$gps_seq session=$SESSION schema=7 acc=$gps_acc | event=gps_context gps_capture_start_ms=$gps_poll_start gps_capture_ms=$(($(clock_ms)-gps_poll_start)) gps_poll_gap_ms=$gps_gap location_mode=$gps_mode gps_zlink_process_present=$gps_zlink_present gps_native_process_present=$gps_native_present $gps_fields"
+  save_message "$message"
+}
+gps_worker_cleanup() {
+  child_alive "$gps_sleep_pid" "$gps_sleep_start" && kill "$gps_sleep_pid" 2>/dev/null
+  [ -z "$gps_sleep_pid" ] || wait "$gps_sleep_pid" 2>/dev/null
+}
+gps_loop() {
+  trap - EXIT
+  gps_sleep_pid=; gps_sleep_start=
+  trap 'exit 0' TERM INT
+  trap gps_worker_cleanup EXIT
+  gps_seq=0; gps_previous=0; gps_token=$(clock_ms); gps_deadline=$gps_token
+  while child_alive "$SAMPLER_PID" "$SAMPLER_START"; do
+    # Foreground reads are bounded (settings/process calls and four-second dumpsys).
+    # A TERM during a read is handled when that bounded command returns.
+    gps_poll
+    set -- $(deadline_delay "$gps_deadline" "$(clock_ms)" 15000)
+    gps_deadline=$1
+    sleep "$2" &
+    gps_sleep_pid=$!; gps_sleep_start=$(process_start "$gps_sleep_pid")
+    wait "$gps_sleep_pid"
+    gps_sleep_pid=; gps_sleep_start=
+  done
+}
+ensure_gps_worker() {
+  if ! child_alive "$gps_pid" "$gps_worker_start"; then
+    [ -z "$gps_pid" ] || wait "$gps_pid" 2>/dev/null
+    gps_loop &
+    gps_pid=$!; gps_worker_start=$(process_start "$gps_pid")
+  fi
+}
 # All output is numeric aggregates. Never retain socket addresses, input events, screen
 # contents or full process/codec dumps. Missing proc access is unavailable, not zero.
 pressure() {
@@ -141,7 +292,7 @@ diagnostic_context() {
     start_ticks=$(sed 's/.*) //' /proc/$zpid/stat 2>/dev/null | awk '{print $20}')
     sched="$sched zlink_start_ticks=${start_ticks:-na}"
   fi
-  diag="schema=6 wifi_country_code=${country:-na} mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
+  diag="schema=7 wifi_country_code=${country:-na} mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
 }
 tcp_summary() {
   # ss exposes TCP_INFO per socket. Match the exact app UID on the socket header,
@@ -353,10 +504,9 @@ link_loop() {
         # The full diagnostic context is emitted separately. Keep this event below
         # the retained-message limit so its transport tail survives file recovery.
         link_acc=$(printf '%s\n' "$head" | awk '{for(i=1;i<=NF;i++)if($i~/^acc=[01]$/){print $i;exit}}')
-        link_head="session=$SESSION schema=6 ${link_acc:-acc=na}"
+        link_head="session=$SESSION schema=7 ${link_acc:-acc=na}"
         message="sample=$SESSION-link-$link_seq $link_head | event=wireless_link link_poll_gap_ms=$link_gap link_probe_ms=$(($(clock_ms)-link_start)) link_context_age_ms=$((link_start-context_ms)) $peer_stats $station_stats $transport_stats"
-        printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$message" >> "$LOG"
-        log -p "$PRIO" -t "$TAG" "$message" 2>/dev/null
+        save_message "$message"
         unset socket_rows socket6_rows neighbour_rows neighbour6_rows proc4_rows proc6_rows station_rows link_peers transport_result
       else
         link_previous=0; transport_state=
@@ -455,9 +605,8 @@ slow_diagnostics() {
 }
 emit_slow() {
   slow_seq=$((slow_seq+1))
-  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=6 | $1"
-  printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$message" >> "$LOG"
-  log -p "$PRIO" -t "$TAG" "$message" 2>/dev/null
+  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=7 | $1"
+  save_message "$message"
 }
 emit() {
   # SurfaceFlinger pipelines run their loop bodies in subshells.  Keep the counter in a
@@ -467,8 +616,7 @@ emit() {
   seq=$((seq + 1))
   echo "$seq" > "$SEQF"
   message="sample=$SESSION-$seq $1"
-  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $message" >> "$LOG"
-  log -p "$PRIO" -t "$TAG" "$message" 2>/dev/null
+  save_message "$message"
 }
 rotate_log() {
   # Keep current + eight older files, rotated before the next context pass. Do not
@@ -602,7 +750,12 @@ frame_loop() {
   done
 }
 
+# Start before any slow context probes, without depending on a CarPlay session.
+SAMPLER_PID=$$
+SAMPLER_START=$(process_start "$SAMPLER_PID")
+ensure_gps_worker
 while :; do
+  ensure_gps_worker
   rotate_log
   context_ms=$(clock_ms)
   now=$(date +%s)
@@ -690,7 +843,7 @@ while :; do
   fi
   bt=$(settings get global bluetooth_on 2>/dev/null)
   zlink_proc=0; [ -n "$zpid" ] && zlink_proc=1
-  diag="schema=6"
+  diag="schema=7"
   if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
     diagnostic_context
   fi

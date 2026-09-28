@@ -73,7 +73,7 @@ MAX_RECOVERY_LINES = 20_000
 
 #: The logcat tag every sample carries. The unit-log collector's allow-list must name it.
 TAG = "CarPlayTiming"
-SAMPLER_SCHEMA = 6
+SAMPLER_SCHEMA = 7
 
 ENABLED_KEY = "ingest.carplay_timing"
 INTERVAL_KEY = "ingest.carplay_timing_interval_s"
@@ -346,6 +346,67 @@ def _neighbour_states(value: str | None) -> dict[str, int] | None:
     return states or None
 
 
+def _gps_diagnostics(fields: dict[str, str]) -> dict[str, Any]:
+    """Fixed location metadata only; unavailable captures cannot imply a fresh fix.
+
+    Provider presence means the dump contains that provider, not that it has a fix.
+    Elapsed fix times and ages share the device's monotonic clock. First-fix counters
+    and statistics are cumulative Android KPIs, not the current drive's acquisition.
+    None of these observations establishes what location the iPhone used.
+    """
+    status = fields.get("gps_capture_status")
+    if status not in {
+        "ok",
+        "dump_error",
+        "unsupported",
+        "limit",
+        "parser_error",
+        "tool_unavailable",
+    }:
+        status = None
+
+    def nonnegative(name: str, *, integer: bool = False) -> float | None:
+        value = _number(fields.get(name))
+        if value is None or value < 0 or (integer and not value.is_integer()):
+            return None
+        return value
+
+    def flag(name: str) -> float | None:
+        return nonnegative(name) if fields.get(name) in ("0", "1") else None
+
+    result: dict[str, Any] = {"gps_capture_status": status}
+    for name in (
+        "gps_capture_ms",
+        "gps_capture_start_ms",
+        "gps_poll_gap_ms",
+        "gps_uptime_ms",
+        "gps_dump_rc",
+    ):
+        result[name] = nonnegative(name, integer=True)
+    for name in ("gps_zlink_process_present", "gps_native_process_present"):
+        result[name] = flag(name)
+    mode = fields.get("location_mode")
+    result["location_mode"] = int(mode) if mode in ("0", "1", "2", "3") else None
+    for name in ("location_enabled", "gps_started"):
+        result[name] = flag(name) if status == "ok" else None
+    for name in ("gnss_reports", "gnss_ttff_reports", "gnss_ttff_mean_s", "gnss_ttff_sd_s"):
+        result[name] = (
+            nonnegative(name, integer=name.endswith("reports")) if status == "ok" else None
+        )
+    # A zero-report KPI has no defined first-fix distribution, even if Android prints 0.
+    if not result["gnss_ttff_reports"]:
+        result["gnss_ttff_mean_s"] = result["gnss_ttff_sd_s"] = None
+    for provider in ("gps", "fused", "network", "passive"):
+        prefix = f"loc_{provider}_"
+        for suffix in ("present", "enabled", "zlink_listener"):
+            result[prefix + suffix] = flag(prefix + suffix) if status == "ok" else None
+        for suffix in ("fix_elapsed_ms", "age_ms", "hacc_m", "satellites"):
+            result[prefix + suffix] = (
+                nonnegative(prefix + suffix, integer=suffix != "hacc_m") if status == "ok" else None
+            )
+    return result
+
+
 def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
     """Optional context. Missing/denied measurements stay null on old and new logs."""
     names = {
@@ -537,6 +598,10 @@ def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
         }
         else None
     )
+    # GPS observations have their own cadence and records. Avoid duplicating dozens
+    # of null fields into every frame/link record in a multi-day timing export.
+    if fields.get("event") == "gps_context":
+        result.update(_gps_diagnostics(fields))
     return result
 
 

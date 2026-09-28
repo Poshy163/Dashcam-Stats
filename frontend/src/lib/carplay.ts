@@ -1,4 +1,4 @@
-import type { CarPlayTimingMinute } from './types'
+import type { CarPlayDiagnosticContext, CarPlayGpsContext, CarPlayLocationProvider, CarPlayTimingEvent, CarPlayTimingMinute } from './types'
 
 export type TimingPeriod = {
   id: string
@@ -72,4 +72,80 @@ export function radioObservation(ap: number | null | undefined, sta: number | nu
   return ap === sta
     ? 'Hotspot and Wi-Fi reported the same frequency.'
     : 'Hotspot and Wi-Fi reported different frequencies; this alone does not prove radio contention.'
+}
+
+/** Missing or failed captures cannot establish a fresh fix or an enabled provider. */
+export function gpsCaptureAvailable(event: CarPlayGpsContext): boolean {
+  return event.gpsCaptureStatus === 'ok'
+}
+
+export function gpsCaptureLabel(event: CarPlayGpsContext): string {
+  switch (event.gpsCaptureStatus) {
+    case 'ok': return 'Captured'
+    case 'dump_error': return 'Read failed'
+    case 'unsupported': return 'Unsupported'
+    case 'limit': return 'Capture limit reached'
+    case 'parser_error': return 'Could not read measurements'
+    case 'tool_unavailable': return 'Capture unavailable'
+    default: return 'Unknown'
+  }
+}
+
+export function diagnosticFlag(value: boolean | number | null | undefined): boolean | null {
+  if (value === true || value === 1) return true
+  if (value === false || value === 0) return false
+  return null
+}
+
+function nonnegative(value: number | null | undefined): number | null {
+  return value != null && Number.isFinite(value) && value >= 0 ? value : null
+}
+
+export function gpsProviderObservation(event: CarPlayGpsContext, provider: CarPlayLocationProvider) {
+  const available = gpsCaptureAvailable(event)
+  return {
+    present: available ? diagnosticFlag(event[`loc${provider}Present`]) : null,
+    enabled: available ? diagnosticFlag(event[`loc${provider}Enabled`]) : null,
+    ageMs: available ? nonnegative(event[`loc${provider}AgeMs`]) : null,
+    accuracyM: available ? nonnegative(event[`loc${provider}HaccM`]) : null,
+    satellites: available ? nonnegative(event[`loc${provider}Satellites`]) : null,
+    zlinkListener: available ? diagnosticFlag(event[`loc${provider}ZlinkListener`]) : null,
+  }
+}
+
+/** A missing count or zero reports must not turn a placeholder mean into a measurement. */
+export function gpsFirstFixSummary(event: CarPlayGpsContext): string {
+  if (!gpsCaptureAvailable(event)) return 'Unknown'
+  const count = nonnegative(event.gnssTtffReports)
+  if (count == null || !Number.isInteger(count)) return 'Unknown'
+  if (count === 0) return 'No first-fix reports'
+  const mean = nonnegative(event.gnssTtffMeanS)
+  return `${count} ${count === 1 ? 'report' : 'reports'} · mean ${mean == null ? 'unknown' : `${mean.toFixed(1)} s`}`
+}
+
+/** Keep startup visible by default, with every observation reachable in bounded pages. */
+export function gpsObservationPage(events: CarPlayTimingEvent[], requestedPage: number | 'latest' = 0) {
+  const captures = events.filter((event) => event.kind === 'gps_context')
+    .sort((a, b) => Date.parse(a.occurredAt) - Date.parse(b.occurredAt))
+  const pageSize = 12
+  const total = captures.length
+  const pageCount = Math.ceil(total / pageSize)
+  const lastPage = Math.max(0, pageCount - 1)
+  const requested = requestedPage === 'latest' ? lastPage : Number.isFinite(requestedPage) ? Math.trunc(requestedPage) : 0
+  const page = Math.max(0, Math.min(requested, lastPage))
+  const start = page * pageSize
+  return { page, pageCount, total, start, end: Math.min(start + pageSize, total), captures: captures.slice(start, start + pageSize) }
+}
+
+/** Newer samplers identify the actual peer path; missing data is never filled from legacy sockets. */
+export function peerTransportObservation(events: CarPlayDiagnosticContext[]) {
+  const modern = events.filter((event) => (event.diagnosticSchema ?? 0) >= 6)
+  const current = modern.length > 0
+  const selected = current ? modern : events
+  return {
+    current,
+    captures: selected.length,
+    receiveQueue: maxKnown(selected.map((event) => current ? event.wirePeerRxQueueBytes : event.peerRxQueueBytes)),
+    rtt: maxKnown(selected.map((event) => current ? event.wirePeerTcpRttMaxMs : event.peerRecentRttMaxMs)),
+  }
 }

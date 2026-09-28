@@ -342,7 +342,8 @@ def test_frame_worker_uses_cached_context_and_records_actual_poll_gaps(tmp_path)
     if not bash or not Path(bash).exists():
         pytest.skip("Bash is unavailable")
     source = carplay_timing.script()
-    worker = source[source.index("frame_loop() {") : source.index("\nwhile :; do\n  rotate_log")]
+    start = source.index("frame_loop() {")
+    worker = source[start : source.index("\n}\n", start) + 3]
     worker = worker.replace("while :; do", "for iteration in 1 2 3; do")
     delay = source[source.index("deadline_delay() {") : source.index("\ncleanup() {")]
     program = (

@@ -265,7 +265,9 @@ def test_compact_wireless_message_retains_last_numeric_field():
     script = (
         Path(carplay_timing.__file__).with_name("carplay_timing.sh").read_text(encoding="utf-8")
     )
-    assert 'link_head="session=$SESSION schema=6 ${link_acc:-acc=na}"' in script
+    assert (
+        f'link_head="session=$SESSION schema={carplay_timing.SAMPLER_SCHEMA} ${{link_acc:-acc=na}}"'
+    ) in script
     # Android mksh treats a bare pipe as pattern alternation in these patterns.
     assert r"transport_stats=${transport_result%%\|*}" in script
     assert r"transport_state=${transport_result#*\|}" in script

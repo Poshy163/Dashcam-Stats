@@ -1,5 +1,74 @@
 # Offline CarPlay delay diagnostics
 
+## GPS acquisition and provider freshness (schema 7)
+
+Schema 7 adds `gps_context` events to the same bounded offline log and
+`/api/unit-logs/carplay-timing` event stream. An independent worker samples immediately
+and then on 15-second deadlines, including before ZLink, CarPlay or a hotspot neighbour
+is present. It reads ignition and location mode afresh, so an old frame-context snapshot
+cannot supply their values. Slow GPS reads do not run in the frame or transport worker;
+missed deadlines are skipped rather than followed by a burst of queries.
+
+The worker runs while the existing sampler survives and Android allows it to run. It
+has no wake lock or boot hook, does not prevent natural sleep, and does not create GPS
+requests or keep the receiver warm between trips. A full reboot still requires the
+sampler to be started again. These production events have the sampler's normal lifecycle,
+not the separate temporary observer's 48-hour lease. GPS events share the existing log
+rotations, so retained history also advances between CarPlay sessions while Android runs.
+
+| Fields | Meaning and units |
+| --- | --- |
+| `gps_capture_status`, `gps_dump_rc` | Parser result and command exit code. Status is `ok`, `dump_error`, `unsupported`, `limit`, `parser_error` or `tool_unavailable`; exit code alone does not establish a usable dump. |
+| `gps_capture_start_ms`, `gps_uptime_ms` | Elapsed milliseconds since device boot at observation start and parser completion. The latter is the reference for fix ages. The log's UTC timestamp is emission time. |
+| `gps_capture_ms`, `gps_poll_gap_ms` | Whole observation duration and start-to-start polling gap, in milliseconds. The first polling gap is unavailable. |
+| `location_mode`, `location_enabled`, `gps_started` | Android location-mode setting (`0`–`3`), reported location-enabled flag and GNSS started flag. A setting or started receiver does not establish a valid fix. |
+| `gps_zlink_process_present`, `gps_native_process_present` | Observed presence of the ZLink app and native `z-link` process. Presence alone does not establish a CarPlay connection or a working GPS feed; process identifiers are discarded. |
+| `gnss_reports`, `gnss_ttff_reports` | Cumulative GNSS location-report and time-to-first-fix report counts from Android's retained statistics. |
+| `gnss_ttff_mean_s`, `gnss_ttff_sd_s` | Cumulative first-fix mean and standard deviation, in seconds. These are not the latest drive's acquisition time. |
+| `loc_{gps,fused,network,passive}_present`, `_enabled` | Whether that provider's section exists and its reported enabled flag. Presence does not mean a fix exists. |
+| `loc_{gps,fused,network,passive}_fix_elapsed_ms`, `_age_ms` | Last fix's elapsed timestamp and age at parser completion, in milliseconds. An unparseable or future timestamp cannot produce a known age. |
+| `loc_{gps,fused,network,passive}_hacc_m`, `_satellites` | Reported horizontal accuracy in metres and satellite count attached to the last fix. This is not a live satellite-status or sky-view measurement. |
+| `loc_{gps,fused,network,passive}_zlink_listener` | Whether the current direct provider registrations include ZLink. It does not measure native/vendor GPS forwarding or the iPhone's selected source. |
+
+Flags use numeric `0`/`1`; unavailable fields use `na` in the log and `null` in the API.
+Successful absence of a provider is distinct from an unavailable dump. Failed, truncated
+or unsupported location dumps do not publish partial provider values as healthy data.
+The separate bounded settings and process reads can still supply ignition, location mode
+or process presence when the location dump fails. The API uses camelCase field names;
+older schemas leave new fields unavailable rather than inventing historical observations.
+
+Ordinary `dumpsys location` has a three-second service timeout and a four-second outer
+timeout; each of the two settings reads is bounded to two seconds. The stream parser caps
+input at 4 MiB, 50,000 lines and 64 KiB per line. Two process-presence checks each have a
+one-second timeout, for ten seconds of total configured external-command timeouts per
+observation. It retains only the fixed numeric fields and status above. Coordinates,
+NMEA, listener identities, raw location dumps and arbitrary
+provider text are not saved. No permissions, location settings, vendor logging tags,
+GNSS statistics, radio state or thermal controls are changed. The GPS worker does not
+start a trace; schema-6 codec tracing retains its existing separate bounds.
+
+These observations can distinguish no fix, an aging cached fix and fresh head-unit GPS
+around wake or movement. They cannot identify what location reached the phone or whether
+the phone accepted it. The installed ZLink build contains native GPS-forwarding support,
+so no direct Android ZLink listener is not proof that CarPlay receives no accessory GPS.
+Apple describes vehicle GNSS alongside iPhone sensors in its
+[CarPlay systems presentation](https://developer.apple.com/videos/play/wwdc2016/722/).
+Provider ages also do not measure picture age or end-to-end navigation latency.
+
+Per-acquisition first-fix duration is not derived by this implementation. A new fresh fix
+between 15-second observations only bounds when it was observed; it is not exact TTFF.
+Count and mean changes can support a later analysis only when both belong to the same
+statistics lifetime, with resets and gaps excluded. Do not subtract elapsed timestamps
+across reboots or interpret the cumulative TTFF mean as one trip's value.
+
+For the next incident, note the approximate time and compare provider freshness with
+ignition, movement and the existing picture/transport evidence. While safely parked,
+disconnect CarPlay and compare the phone's position, following
+[Waze's CarPlay GPS troubleshooting](https://support.google.com/waze/answer/9909051?co=GENIE.Platform%3DiOS&hl=en).
+Viewing the phone while it remains connected does not isolate its internal GPS. Fresh
+Android fixes alongside a stuck map call for forwarding/phone-source evidence; they do
+not justify changing an unverified vendor setting.
+
 ## IPv6 transport and active codec windows (schema 6)
 
 The 24 September capture identified a high-volume root-owned IPv6 connection on
@@ -37,7 +106,8 @@ The running sampler's content fingerprint is checked after launch. Re-arming an
 identical bundle preserves its process, counters and current capture window;
 changed bundles stop and reap their workers before replacement. The timing API
 reports `sampler_schema` and `sampler_bundle` for server-side verification. Actual
-schema-6 records prove that the head unit is running the new bundle.
+schema-6 records confirm those measurements are being emitted; an on-unit fingerprint
+match establishes which exact bundle is running.
 
 The same bounded on-unit files and parked recovery path carry these events home.
 Removing the diagnostic installation also requires removing

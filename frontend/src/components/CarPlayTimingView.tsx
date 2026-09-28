@@ -9,11 +9,12 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
 import Spinner from '@/components/Spinner'
+import CarPlayGpsView from '@/components/CarPlayGpsView'
 import { EmptyState, ErrorState } from '@/components/ui'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { formatDateTime } from '@/lib/format'
-import { inTimingPeriod, maxKnown, meanKnown, radioObservation, timingPeriods, timingSegments } from '@/lib/carplay'
+import { inTimingPeriod, maxKnown, meanKnown, peerTransportObservation, radioObservation, timingPeriods, timingSegments } from '@/lib/carplay'
 import type { CarPlayTimingMinute } from '@/lib/types'
 
 const CHART_W = 720
@@ -141,8 +142,7 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
   const receiveQueue = maxKnown(diagnosticRows.map((s) => s.zlinkRxQueueBytes ?? null))
   const tcpRtt = maxKnown(diagnosticRows.map((s) => s.zlinkTcpRttMaxMs ?? null))
   const linkRows = events.filter((e) => e.kind === 'wireless_link')
-  const peerQueue = maxKnown(linkRows.map((e) => e.peerRxQueueBytes))
-  const recentPeerRtt = maxKnown(linkRows.map((e) => e.peerRecentRttMaxMs))
+  const peerTransport = peerTransportObservation(linkRows)
   const linkGap = maxKnown(linkRows.map((e) => e.linkPollGapMs))
   const radioSamples = linkRows.filter((e) => e.apSignalMinDbm != null).length
   const countryCodes = [...new Set(diagnosticRows.map((e) => e.wifiCountryCode).filter(Boolean))]
@@ -251,22 +251,26 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
             <div className="mt-3 border-t border-border pt-3">
               <div className="font-medium">Hotspot connection diagnostics</div>
               <p className="mt-2 text-content-muted">
-                Largest unread peer queue: {peerQueue == null ? 'unavailable' : `${(peerQueue / 1024).toFixed(1)} KiB`}.
-                {' '}Highest RTT on recently receiving connections: {recentPeerRtt == null ? 'unavailable' : `${recentPeerRtt.toFixed(1)} ms`}.
+                Largest unread peer queue: {peerTransport.receiveQueue == null ? 'unavailable' : `${(peerTransport.receiveQueue / 1024).toFixed(1)} KiB`}.
+                {' '}{peerTransport.current ? 'Highest peer RTT' : 'Highest legacy RTT on recently receiving connections'}: {peerTransport.rtt == null ? 'unavailable' : `${peerTransport.rtt.toFixed(1)} ms`}.
               </p>
               <p className="mt-2 text-xs text-content-muted">
                 Reported Wi-Fi country: {countryCodes.join(', ') || 'unavailable'}.
                 {' '}
                 {linkRows.length} captures; {radioSamples} include Wi-Fi signal measurements.
                 {' '}Longest polling interval: {linkGap == null ? 'unavailable' : `${(linkGap / 1000).toFixed(2)} s`}.
-                {' '}Peer measurements cover ZLink IPv4 TCP connections to resolved hotspot neighbours, excluding local sockets.
-                They may include control traffic and cannot measure the age of the picture from the phone.
+                {' '}{peerTransport.current
+                  ? `Peer measurements use ${peerTransport.captures} current captures and include detected IPv4/IPv6 hotspot connections and root-owned sockets, excluding local sockets.`
+                  : 'Legacy peer measurements cover ZLink IPv4 TCP connections to resolved hotspot neighbours, excluding local sockets.'}
+                {' '}They may include control traffic and cannot measure the age of the picture from the phone.
                 Radio counters, receive activity and capture durations are available in the diagnostic log.
               </p>
             </div>
           )}
         </div>
       )}
+
+      <CarPlayGpsView key={`${hours}:${selectedPeriod?.id ?? 'all'}`} events={events} />
 
       {minutes.length === 0 ? (
         <EmptyState

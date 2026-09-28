@@ -440,8 +440,40 @@ export interface UnitLogTag {
   count: number
 }
 
+export type CarPlayLocationProvider = 'Gps' | 'Fused' | 'Network' | 'Passive'
+
+type CarPlayLocationMeasurements = Partial<Record<
+  `loc${CarPlayLocationProvider}${'FixElapsedMs' | 'AgeMs' | 'HaccM' | 'Satellites'}`,
+  number | null
+>>
+type CarPlayLocationFlags = Partial<Record<
+  `loc${CarPlayLocationProvider}${'Present' | 'Enabled' | 'ZlinkListener'}`,
+  number | null
+>>
+
+/** Location-service observations from the head unit; no coordinates are collected. */
+export interface CarPlayGpsContext extends CarPlayLocationMeasurements, CarPlayLocationFlags {
+  gpsCaptureStatus?: string | null
+  gpsCaptureMs?: number | null
+  gpsCaptureStartMs?: number | null
+  gpsPollGapMs?: number | null
+  gpsDumpRc?: number | null
+  /** Process presence only; neither field proves a CarPlay connection or GPS forwarding. */
+  gpsZlinkProcessPresent?: number | null
+  gpsNativeProcessPresent?: number | null
+  locationEnabled?: number | null
+  gpsStarted?: number | null
+  gnssReports?: number | null
+  /** Cumulative GNSS statistics, not the current trip's acquisition time. */
+  gnssTtffReports?: number | null
+  gnssTtffMeanS?: number | null
+  gnssTtffSdS?: number | null
+  locationMode?: number | null
+  gpsUptimeMs?: number | null
+}
+
 /** One reading of the CarPlay video surface, sampled on the unit. */
-export interface CarPlayDiagnosticContext {
+export interface CarPlayDiagnosticContext extends CarPlayGpsContext {
   diagnosticSchema?: number | null
   memAvailableKib?: number | null
   cpuPressureAvg10?: number | null
@@ -517,6 +549,8 @@ export interface CarPlayDiagnosticContext {
   linkPollGapMs?: number | null
   linkProbeMs?: number | null
   linkContextAgeMs?: number | null
+  wirePeerRxQueueBytes?: number | null
+  wirePeerTcpRttMaxMs?: number | null
 }
 
 export interface CarPlayTimingSample extends CarPlayDiagnosticContext {
@@ -583,6 +617,7 @@ export interface CarPlayTimingMinute {
 
 export interface CarPlayTimingEvent extends CarPlayDiagnosticContext {
   occurredAt: string
+  accOn?: boolean | null
   sessionId: string | null
   kind: string
   hotspotNeighbourCount: number | null
