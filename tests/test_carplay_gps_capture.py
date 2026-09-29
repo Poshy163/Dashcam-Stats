@@ -79,9 +79,9 @@ def function(name, following):
     )
 
 
-def shell(command, timeout=5):
+def shell(command, timeout=5, *, shell_name="sh"):
     return subprocess.run(
-        [executable("sh"), "-s"],
+        [executable(shell_name), "-s"],
         input="PATH=/usr/bin:/bin:$PATH\n" + command,
         capture_output=True,
         text=True,
@@ -205,7 +205,10 @@ def test_successful_event_fits_existing_logcat_message_budget():
     assert len(message.encode()) < 2000
 
 
-def test_actual_poll_reads_only_expected_commands_and_emits_private_safe_idle_event(tmp_path):
+@pytest.mark.parametrize("shell_name", ["sh", "mksh"])
+def test_actual_poll_reads_only_expected_commands_and_emits_private_safe_idle_event(
+    tmp_path, shell_name
+):
     dump = tmp_path / "location.txt"
     dump.write_text(FIXTURE, encoding="utf-8")
     path = dump.as_posix()
@@ -228,7 +231,7 @@ gps_previous=0; gps_seq=0; gps_token=855645000; SESSION=session-1
 acc=0; phone=0; FRAME_CONTEXT=/does/not/exist
 gps_poll
 """
-    result = shell(command)
+    result = shell(command, shell_name=shell_name)
     assert result.returncode == 0 and not result.stderr, result.stderr
     message = result.stdout.strip()
     assert "schema=8 acc=0 | event=gps_context" in message
@@ -280,6 +283,44 @@ SAMPLER_PID=1; SAMPLER_START=1; gps_loop
         "sample:46000:acc=0:phone=0",
         "delay:14.000",
     ]
+
+
+@pytest.mark.parametrize("shell_name", ["sh", "mksh"])
+def test_actual_poll_preserves_burst_state_and_emits_only_public_fields(shell_name):
+    # Run the real shell wrapper as well as AWK. Android mksh interprets an
+    # unescaped pipe inside ${value%%pattern} as alternation, unlike GNU sh.
+    command = function("gps_burst_update", "gps_poll") + function("gps_poll", "gps_worker_cleanup")
+    command += """
+clock_ms() { printf '%s' "$gps_time"; }
+timeout() { shift; "$@"; }
+settings() { case "$*" in 'get global acc_status') printf 1;; 'get secure location_mode') printf 3;; *) exit 99;; esac; }
+gps_process_present() { printf 0; }
+dumpsys() { [ "$*" = '-t 3 location' ] || exit 99; }
+gps_summary() {
+  cat >/dev/null
+  printf 'gps_capture_status=ok gps_started=1 loc_gps_enabled=1 loc_gps_fix_elapsed_ms=%s\\n' "$((gps_time-1000))"
+}
+save_message() { printf '%s\\n' "$1"; }
+gps_previous=0; gps_seq=0; gps_token=100000; SESSION=fixture
+gps_burst_state=; gps_next_interval=15000
+for gps_time in 100000 105000 110000; do gps_poll; done
+printf 'next=%s\\n' "$gps_next_interval"
+"""
+    result = shell(command, shell_name=shell_name)
+    assert result.returncode == 0 and not result.stderr, result.stderr
+    *messages, cadence = result.stdout.splitlines()
+    assert len(messages) == 3
+    assert cadence == "next=15000"
+    for message in messages:
+        assert message.count("|") == 1  # Continuation state and its delimiter stay private.
+        assert "gps_burst_reason=startup_on" in message
+        assert "gps_burst_start_ms=100000" in message
+    assert "gps_next_interval_ms=5000" in messages[0]
+    assert "gps_fix_advanced=na" in messages[0]
+    assert "gps_next_interval_ms=5000" in messages[1]
+    assert "gps_fix_advanced=1" in messages[1]
+    assert "gps_next_interval_ms=15000" in messages[2]
+    assert "gps_burst_end=fresh_progress" in messages[2]
 
 
 def test_worker_term_interrupts_sleep_and_reaps_owned_child():

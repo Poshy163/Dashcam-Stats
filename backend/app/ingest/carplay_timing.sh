@@ -303,7 +303,8 @@ gps_poll() {
   fi
   gps_now=$(clock_ms); gps_capture_ms=$((gps_now-gps_poll_start))
   gps_update=$(gps_burst_update)
-  gps_burst_state=${gps_update%%|*}; gps_burst_fields=${gps_update#*|}
+  # mksh treats an unescaped | as pattern alternation; match the literal separator.
+  gps_burst_state=${gps_update%%\|*}; gps_burst_fields=${gps_update#*\|}
   gps_next_interval=${gps_burst_state%%,*}
   case "$gps_next_interval" in 5000|15000) ;; *) gps_next_interval=15000; gps_burst_state=; gps_burst_fields=;; esac
   gps_seq=$((gps_seq+1))

@@ -33,6 +33,13 @@ the explicitly labelled last-known fix; elapsed-clock reversal clears all of tha
 Worker restart starts a new observation lifetime. No state is written to the device beyond
 the existing sanitized log.
 
+The shell wrapper uses a literal escaped separator when separating private continuation
+state from public fields: Android's `mksh` treats an unescaped `|` in a parameter-removal
+pattern as alternation. Tests exercise the complete poll wrapper, not only the AWK state
+machine. CI installs and verifies `mksh`; local `mksh` cases are skipped explicitly when
+that shell is unavailable. Host GNU-shell results alone do not establish Android-shell
+compatibility.
+
 The worker runs while the existing sampler survives and Android allows it to run. It
 has no wake lock or boot hook, does not prevent natural sleep, and does not create GPS
 requests or keep the receiver warm between trips. A full reboot still requires the
