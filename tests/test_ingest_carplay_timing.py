@@ -83,6 +83,9 @@ async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off
     async def listening(_address):
         return True
 
+    async def no_radio_debt():
+        return None
+
     async def recover(address):
         recovered.append(address)
 
@@ -106,6 +109,7 @@ async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off
     monkeypatch.setattr(carplay_timing, "recover_sampler_file", recover)
     monkeypatch.setattr(carplay_timing, "arm", arm)
     monkeypatch.setattr(poller_module.adb, "is_listening", listening)
+    monkeypatch.setattr(poller_module.radio_coordinator, "pending_recovery_address", no_radio_debt)
     monkeypatch.setattr(poller_module.puller, "probe_unit", unexpected_probe)
     for module in (
         poller_module.health,

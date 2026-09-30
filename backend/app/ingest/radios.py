@@ -137,10 +137,13 @@ WATCHDOG_LEASE_RECOVERY_MARGIN_S = 90.0
 #: The vendor countdown is not ours to pause, so the last thing that happens in a backup
 #: window is the unit going quiet -- and every ADB readback after that point is gone.
 #: Firing here instead means the restore, the on-device verification *and* the report all
-#: complete while the unit is still awake and still on the network. Fifteen seconds is the
-#: work plus headroom: enabling Bluetooth, :data:`HOTSPOT_REARM_SETTLE_S` for the AP to
-#: re-arm behind it, starting the saved profile, two interface readbacks and one POST.
-WATCHDOG_SLEEP_GUARD_S = 15
+#: complete while the unit is still awake and still on the network. Reserve 60 seconds:
+#: two bounded 6-second radio commands, 6 seconds for Bluetooth re-arm, a 10-second
+#: verification window (up to 4 seconds for its final readbacks), and at most 19 seconds
+#: for three reports. The bounded courtesy screen change follows the report.
+WATCHDOG_SLEEP_GUARD_S = 60
+WATCHDOG_RADIO_COMMAND_S = 6
+WATCHDOG_VERIFY_S = 10
 
 #: The vendor property holding the sleep window's *length*, in seconds. The unit counts it
 #: down from the moment ACC drops -- the same model this app's own countdown uses (see
@@ -694,10 +697,16 @@ async def _request_saved_hotspot_start(address: str) -> bool:
     """Ask the attested controller to start Android's saved Wi-Fi tethering profile."""
 
     try:
-        await adb.shell(address, _START_VIA_HOTSPOT_CONTROLLER, timeout=RADIO_TIMEOUT_S)
+        reply = await adb.shell(
+            address,
+            f"am broadcast --user 0 -p {HOTSPOT_CONTROLLER_PACKAGE} -a {HOTSPOT_START_ACTION}",
+            timeout=RADIO_TIMEOUT_S,
+        )
     except adb.AdbError:
         return False
-    return True
+    # Delivery is not restoration: the caller still verifies the captured AP. Keep the
+    # reply private, but do not hide permission/receiver errors from this decision.
+    return _accepted(reply)
 
 
 async def _persist_marker(value: str) -> None:
@@ -835,6 +844,7 @@ def _watchdog_report_functions(
     restore_bluetooth: bool,
     hotspot_baseline: str,
     transport_host: str,
+    expected_interface: str | None = None,
 ) -> str:
     """Shell that reads both radios back on the device and posts what it found.
 
@@ -853,22 +863,58 @@ def _watchdog_report_functions(
     silence: it tells the server the watchdog ran, that the baseline is genuinely still
     wrong, and that recovery on next arrival is real work rather than a formality.
     """
-    if report is None:
-        return ""
+    if expected_interface is not None and not _AP_NAME.fullmatch(expected_interface):
+        raise ValueError("invalid expected hotspot interface")
     bluetooth_check = (
         (
-            'bt="$(/system/bin/settings get global bluetooth_on 2>/dev/null)"; '
+            'bt="$(timeout 2 /system/bin/settings get global bluetooth_on 2>/dev/null)"; '
             'case "$bt" in 1) bt=1;; *) bt=0;; esac; '
         )
         if restore_bluetooth
         else "bt=skip; "
     )
     if hotspot_baseline == "on":
-        hotspot_check = 'ap_scan; if [ -n "$ap_iface" ]; then hs=1; else hs=0; fi; '
+        hotspot_check = (
+            'ap_scan; if [ "$ap_readable" = 1 ] && [ -n "$expected_ap" ] && '
+            '[ "$ap_iface" = "$expected_ap" ]; then ap_good=1; else ap_good=0; fi; '
+        )
     elif hotspot_baseline == "off":
-        hotspot_check = 'ap_scan; if [ -n "$ap_iface" ]; then hs=0; else hs=1; fi; '
+        hotspot_check = (
+            'ap_scan; if [ "$ap_readable" = 1 ] && [ -z "$ap_iface" ]; '
+            "then ap_good=1; else ap_good=0; fi; "
+        )
     else:
-        hotspot_check = 'hs=skip; ap_iface=""; '
+        hotspot_check = 'hs=skip; ap_good=skip; ap_iface=""; '
+    verification = (
+        f"transport='{transport_host}'; expected_ap='{expected_interface or ''}'; ap_iface=\"\"; "
+        'ap_scan() { ap_iface=""; ap_readable=0; '
+        f"timeout 2 /system/bin/ip -o addr show up > '{WATCHDOG_REPORT_PARTIAL_PATH}' 2>/dev/null "
+        f"|| {{ rm -f '{WATCHDOG_REPORT_PARTIAL_PATH}'; return 0; }}; "
+        "while read -r _idx iface fam addr _rest; do "
+        '[ "$fam" = inet ] || continue; addr="${addr%%/*}"; '
+        'case "$addr" in ""|*[!0-9.]*) continue;; esac; ap_readable=1; '
+        '[ "$addr" = "$transport" ] && continue; '
+        'case "$iface" in ap*|softap*|swlan*|wlan*|wl*) '
+        '[ -n "$ap_iface" ] || ap_iface="$iface"; '
+        '[ "$iface" = "$expected_ap" ] && { ap_iface="$iface"; break; };; esac; '
+        f"done < '{WATCHDOG_REPORT_PARTIAL_PATH}'; "
+        f"rm -f '{WATCHDOG_REPORT_PARTIAL_PATH}'; return 0; }}; "
+        "verify_radios() { stable=0; checks=0; hs=0; "
+        'verify_start="$(cut -d. -f1 /proc/uptime)"; '
+        "while :; do "
+        + bluetooth_check
+        + hotspot_check
+        + 'case "$ap_good" in 1) stable=$((stable + 1)); hs=0; '
+        '[ "$stable" -ge 2 ] && hs=1;; 0) stable=0; hs=0;; esac; '
+        '[ "$bt" != 0 ] && [ "$hs" != 0 ] && return 0; '
+        'checks=$((checks + 1)); verify_now="$(cut -d. -f1 /proc/uptime)"; '
+        f'[ "$checks" -ge {WATCHDOG_VERIFY_S + 1} ] && return 0; '
+        'case "$verify_start:$verify_now" in "":*|*:""|*[!0-9:]*) return 0;; esac; '
+        f'[ "$((verify_now - verify_start))" -ge {WATCHDOG_VERIFY_S} ] && return 0; '
+        "sleep 1; done; }; "
+    )
+    if report is None:
+        return verification + "publish_report() { return 0; }; "
     # A shell double-quoted string, because four of its six values are read back from the
     # device at report time. The two that are not -- the transition and the token -- are
     # validated to hex and UUID character classes by :class:`WatchdogReport`, so neither
@@ -882,20 +928,7 @@ def _watchdog_report_functions(
         '\\"interface\\":\\"$ap_iface\\"}"'
     )
     return (
-        # Excluded by address, exactly as the server does it: if this app is itself a
-        # client of the unit's hotspot then that hotspot is the transfer's own link.
-        f"transport='{transport_host}'; ap_iface=\"\"; "
-        'ap_scan() { ap_iface=""; '
-        f"/system/bin/ip -o addr show up > '{WATCHDOG_REPORT_PARTIAL_PATH}' 2>/dev/null "
-        "|| return 0; "
-        "while read -r _idx iface fam addr _rest; do "
-        '[ "$fam" = inet ] || continue; '
-        'addr="${addr%%/*}"; '
-        '[ "$addr" = "$transport" ] && continue; '
-        'case "$iface" in ap*|softap*|swlan*|wlan*|wl*) ap_iface="$iface"; break;; esac; '
-        f"done < '{WATCHDOG_REPORT_PARTIAL_PATH}'; "
-        f"rm -f '{WATCHDOG_REPORT_PARTIAL_PATH}'; return 0; }}; "
-        "verify_radios() { " + bluetooth_check + hotspot_check + "return 0; }; "
+        verification +
         # Written before it is sent, and left behind afterwards, at a fixed path that the
         # next run overwrites. Purely for diagnosis: it is the only way to tell "the
         # watchdog never fired" from "it fired and the POST could not get out", which are
@@ -912,9 +945,9 @@ def _watchdog_report_functions(
         "Content-Type: application/json\\r\\nContent-Length: %s\\r\\n"
         "Connection: close\\r\\n\\r\\n%s' "
         f"'{report.path}' '{report.host}' '{report.port}' \"$len\" \"$body\" "
-        f"| nc -w 5 '{report.host}' '{report.port}' 2>/dev/null "
+        f"| timeout 5 nc -w 5 '{report.host}' '{report.port}' 2>/dev/null "
         "| grep -q '\"accepted\": *true'; then return 0; fi; "
-        'attempt="$((attempt + 1))"; sleep 2; done; return 1; }; '
+        'attempt="$((attempt + 1))"; [ "$attempt" -ge 3 ] || sleep 2; done; return 1; }; '
     )
 
 
@@ -1135,6 +1168,7 @@ async def _arm_watchdog(
     hotspot_baseline: str = "unknown",
     hotspot_capsule_path: str | None = None,
     hotspot_restore_mode: str | None = None,
+    expected_interface: str | None = None,
     report: WatchdogReport | None = None,
     hand_screen_back: bool = True,
 ) -> WatchdogHandle | None:
@@ -1161,8 +1195,10 @@ async def _arm_watchdog(
         hotspot_restore_mode = HOTSPOT_RESTORE_EXACT
     if hotspot_restore_mode is not None and hotspot_restore_mode not in _HOTSPOT_RESTORE_MODES:
         return None
+    if expected_interface is not None and not _AP_NAME.fullmatch(expected_interface):
+        return None
     if hotspot_baseline == "on":
-        if hotspot_capsule_path is None or hotspot_restore_mode is None:
+        if hotspot_capsule_path is None or hotspot_restore_mode is None or not expected_interface:
             return None
         if hotspot_restore_mode == HOTSPOT_RESTORE_BLUETOOTH_REARM and not restore_bluetooth:
             return None
@@ -1170,7 +1206,10 @@ async def _arm_watchdog(
     if restore_bluetooth:
         # Bluetooth's baseline is captured independently in the durable server row.  A
         # later-damaged hotspot capsule must not suppress this last-resort recovery.
-        restore_commands.append("cmd bluetooth_manager enable || svc bluetooth enable")
+        restore_commands.append(
+            f"timeout {WATCHDOG_RADIO_COMMAND_S} sh -c "
+            "'cmd bluetooth_manager enable || svc bluetooth enable'"
+        )
     if restore_bluetooth and hotspot_baseline in {"on", "off"}:
         # This vendor stack re-arms its AP a few seconds after Bluetooth is enabled. The
         # final AP action therefore follows that settle period, rather than racing the
@@ -1181,8 +1220,10 @@ async def _arm_watchdog(
         # classified an AP carrying the ADB target address as transport, and that state
         # never reaches this branch. Run both supported stop paths: the binder works on
         # the field unit; the cmd fallback covers rooted/debuggable Android builds.
-        restore_commands.append(f"({_STOP_VIA_TETHERING})")
-        restore_commands.append("cmd wifi stop-softap >/dev/null 2>&1 || true")
+        restore_commands.append(
+            f"timeout {WATCHDOG_RADIO_COMMAND_S} sh -c "
+            f"'({_STOP_VIA_TETHERING}); cmd wifi stop-softap >/dev/null 2>&1 || true'"
+        )
     elif (
         hotspot_baseline == "on"
         and hotspot_capsule_path is not None
@@ -1197,7 +1238,8 @@ async def _arm_watchdog(
             'ssid="$(sed -n \'s/.*"ssid":"\\([^"]*\\)".*/\\1/p\' "$capsule" | head -n 1)"; '
             'passphrase="$(sed -n \'s/.*"passphrase":"\\([^"]*\\)".*/\\1/p\' "$capsule" | head -n 1)"; '
             'if [ -n "$ssid" ] && [ -n "$passphrase" ]; then '
-            'cmd wifi start-softap "$ssid" wpa2 "$passphrase" >/dev/null 2>&1 || true; '
+            f"timeout {WATCHDOG_RADIO_COMMAND_S} cmd wifi start-softap "
+            '"$ssid" wpa2 "$passphrase" >/dev/null 2>&1 || true; '
             "fi"
         )
     elif (
@@ -1207,18 +1249,11 @@ async def _arm_watchdog(
     ):
         # The mode name is capsule compatibility. The attested controller action is the
         # deterministic recovery path; it starts the saved profile without credentials.
-        restore_commands.append(_START_VIA_HOTSPOT_CONTROLLER)
+        restore_commands.append(
+            f"timeout {WATCHDOG_RADIO_COMMAND_S} {_START_VIA_HOTSPOT_CONTROLLER}"
+        )
     if not restore_commands:
         return None
-    if hand_screen_back:
-        # Last, and only alongside a real restore. Turning both radios back on is not
-        # enough on this unit: the observed behaviour is that the driver's phone does not
-        # pair while the browser owns the foreground, so a car that sleeps showing the
-        # backup page wakes up without CarPlay however correct its radios are. ``monkey``
-        # rather than a resolved component because this string is fixed at arm time and has
-        # to keep working against a vendor app that may be updated between then and the
-        # moment it fires; the package is the only part of that which cannot move.
-        restore_commands.append(_HAND_SCREEN_BACK)
     lease_ttl_s = max(1, int(deadline_s))
     candidate = _new_watchdog_handle()
     script_path = candidate.script_path
@@ -1242,6 +1277,7 @@ async def _arm_watchdog(
         restore_bluetooth=restore_bluetooth,
         hotspot_baseline=hotspot_baseline,
         transport_host=address.partition(":")[0].strip(),
+        expected_interface=expected_interface,
     )
     # One expiry, two clocks. ``remaining`` is the server's lease until ``sleep_fold``
     # finds the unit's own sleep arriving sooner, and the claim below re-reads through the
@@ -1254,6 +1290,9 @@ async def _arm_watchdog(
         'remaining="$((expiry - now))"; sleep_fold; }; '
     )
     watchdog_script = (
+        # Readiness must never be published on a unit lacking the command limiter:
+        # every recovery action below depends on it. Failure leaves the radios on.
+        "timeout 1 sh -c 'exit 0' >/dev/null 2>&1 || exit 1; "
         f"umask 077; token='{candidate.token}'; "
         'reason=lease_expired; acc_off_at=""; '
         f"acc_elapsed={int(report.acc_off_elapsed_s) if report is not None else 0}; "
@@ -1295,7 +1334,8 @@ async def _arm_watchdog(
         # The report is the point of firing early. Verification runs on the device, while
         # the device is still awake, and is posted before the sleep this whole guard exists
         # to get in front of.
-        + ("; verify_radios; publish_report" if report is not None else "")
+        + "; verify_radios; publish_report"
+        + (f"; timeout {WATCHDOG_RADIO_COMMAND_S} {_HAND_SCREEN_BACK}" if hand_screen_back else "")
         + "; fi; cleanup_owned"
     )
     launcher = (
@@ -1520,6 +1560,7 @@ class RadioController:
         self._watchdog_proof = WatchdogLeaseProof()
         self._bluetooth_baseline = "unknown"
         self._hotspot_baseline = "unknown"
+        self._hotspot_interface: str | None = None
         self._hotspot_rearm_deadline: float | None = None
         self._transport_interface: str | None = None
         self._hotspot_capsule_path: str | None = None
@@ -1544,6 +1585,7 @@ class RadioController:
                 else "unknown"
             )
             self._bluetooth_baseline = bluetooth
+            self._hotspot_interface = None
             interfaces = await _ap_interfaces(self.address)
             if interfaces is None:
                 self._hotspot_baseline = "unknown"
@@ -1570,6 +1612,7 @@ class RadioController:
             except adb.AdbError as exc:
                 log.debug("could not read the hotspot configuration", error=str(exc))
             self._hotspot_baseline = "on"
+            self._hotspot_interface = iface
             return RadioSnapshot(
                 bluetooth=bluetooth,
                 hotspot="on",
@@ -1756,6 +1799,7 @@ class RadioController:
             hotspot_baseline=self._hotspot_baseline,
             hotspot_capsule_path=self._hotspot_capsule_path,
             hotspot_restore_mode=self._hotspot_restore_mode,
+            expected_interface=self._hotspot_interface,
             report=self.report,
         )
         if self._watchdog is None:
@@ -2003,18 +2047,38 @@ class RadioController:
                 # after a real transfer. The exact package-gated controller now starts the
                 # saved tethering profile explicitly; no SSID or passphrase crosses ADB.
                 if not expected_interface:
+                    log.warning(
+                        "hotspot recovery has no captured interface", stage="missing_baseline"
+                    )
                     return False
                 serving = await _serving_ap(self.address)
                 if serving is None:
+                    log.warning(
+                        "hotspot recovery interface is unreadable", stage="interface_unavailable"
+                    )
                     return False
                 if serving != expected_interface:
                     if not await supports_zlink_bluetooth_rearm(self.address):
+                        log.warning(
+                            "hotspot recovery controller was not attested",
+                            stage="attestation_failed",
+                        )
                         return False
                     if not await _request_saved_hotspot_start(self.address):
+                        log.warning(
+                            "hotspot recovery start request failed", stage="start_request_failed"
+                        )
                         return False
                     self._hotspot_rearm_deadline = time.monotonic() + HOTSPOT_REARM_SETTLE_S
                 serving = await self._wait_for_hotspot_rearm(expected_interface=expected_interface)
-                return serving == expected_interface
+                restored = serving == expected_interface
+                if restored:
+                    log.info("hotspot recovery verified the captured interface", stage="verified")
+                else:
+                    log.warning(
+                        "hotspot recovery did not observe a stable AP", stage="stable_ap_unobserved"
+                    )
+                return restored
 
             serving = await self._wait_for_hotspot_rearm(expected_interface=None)
             if serving is None:

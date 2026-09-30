@@ -66,6 +66,12 @@ APP_OWNED_SLEEP_STATUS_READ_TIMEOUT_S = 6.0
 APP_OWNED_SLEEP_STATUS_MAX_AGE_S = 30.0
 _EVENT_SYNC_AWAIT_GRACE_SECONDS = 0.25
 
+# One bounded recovery budget for normal cleanup and later reconciliation. Hotspot
+# attestation alone permits three 15-second reads; the old 30-second total could cancel
+# before sending its start request, after Bluetooth had already been restored. Leave
+# room for Bluetooth/AP verification, watchdog stand-down and the two OBD resume reads.
+RADIO_RESTORE_TIMEOUT_S = 120.0
+
 
 #: How often, while a transfer runs, the page is checked to still be in front. The vendor's
 #: CarPlay app (Zlink) raises its own dashboard over ours a short way into a backup --
@@ -252,7 +258,39 @@ async def reconcile_pending_in_awake_window(address: str) -> bool:
             seconds=INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,
         )
         return False
-    return await radio_coordinator.reconcile_pending(address=address)
+    try:
+        return await asyncio.wait_for(
+            radio_coordinator.reconcile_pending(address=address),
+            timeout=RADIO_RESTORE_TIMEOUT_S,
+        )
+    except TimeoutError:
+        # Cancellation of an adopted transition expires its durable row and releases
+        # the process fence inside RadioTransition.restore(). Keep that debt for retry.
+        log.warning(
+            "radio recovery exceeded its restore budget; restoration remains pending",
+            timeout_s=RADIO_RESTORE_TIMEOUT_S,
+        )
+        return False
+
+
+async def _restore_radio_transition(
+    transition: radio_coordinator.RadioTransition, *, error: object | None = None
+) -> bool:
+    """Bound every run-exit restore while preserving durable debt on interruption."""
+    try:
+        return await asyncio.wait_for(
+            transition.restore(error=error), timeout=RADIO_RESTORE_TIMEOUT_S
+        )
+    except BaseException as exc:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.shield(transition.require_recovery(exc))
+        if isinstance(exc, TimeoutError):
+            log.warning(
+                "radio cleanup exceeded its restore budget; restoration remains pending",
+                timeout_s=RADIO_RESTORE_TIMEOUT_S,
+            )
+            return False
+        raise
 
 
 async def reconcile_startup_in_awake_window() -> bool:
@@ -1573,7 +1611,7 @@ async def run_pull(
                         "OBD logger could not be quiesced; leaving radios on",
                         error=str(exc),
                     )
-                    restored = await radio_transition.restore(error=exc)
+                    restored = await _restore_radio_transition(radio_transition, error=exc)
                     radio_transition = None
                     if not restored:
                         # A failed restore can mean the logger is still paused even when
@@ -1640,7 +1678,7 @@ async def run_pull(
                     "OBD backup did not complete before radio shutdown; leaving radios on",
                     error=str(exc),
                 )
-                restored = await radio_transition.restore(error=exc)
+                restored = await _restore_radio_transition(radio_transition, error=exc)
                 radio_transition = None
                 if not restored:
                     result = RunResult(
@@ -1725,7 +1763,7 @@ async def run_pull(
                 log.warning(
                     "could not safely quiet radios; restoring before transfer", error=str(exc)
                 )
-                restored = await radio_transition.restore(error=exc)
+                restored = await _restore_radio_transition(radio_transition, error=exc)
                 radio_transition = None
                 if not restored:
                     result = RunResult(
@@ -1979,7 +2017,7 @@ async def run_pull(
         if radio_transition is not None:
             restored = False
             try:
-                restored = await asyncio.wait_for(radio_transition.restore(), timeout=30.0)
+                restored = await _restore_radio_transition(radio_transition)
             except (asyncio.CancelledError, Exception) as exc:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await asyncio.shield(radio_transition.require_recovery(exc))

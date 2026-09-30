@@ -1051,6 +1051,47 @@ async def test_cancelled_restore_releases_local_owner_and_expires_for_recovery(
         assert row.lease_expires_at <= datetime.now(UTC)
 
 
+async def test_puller_restore_timeout_preserves_partial_radio_debt_and_releases_fence(
+    db_session, fake_controller, monkeypatch
+):
+    from app.ingest import puller
+
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+    )
+    await transition.checkpoint(
+        bluetooth_before="on",
+        hotspot_before="on",
+        hotspot_interface="ap0",
+        hotspot_restore_ref=radio_coordinator.radios.hotspot_capsule_path(transition.transition_id),
+        bluetooth_disable_attempted=True,
+        hotspot_disable_attempted=True,
+    )
+
+    async def blocked_hotspot(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    transition.controller.restore_hotspot = blocked_hotspot
+    monkeypatch.setattr(puller, "RADIO_RESTORE_TIMEOUT_S", 0.2)
+    assert not await puller._restore_radio_transition(transition)
+    assert transition.controller.released
+    async with session_scope() as session:
+        row = await session.get(IngestRadioTransition, transition.id)
+        assert row is not None and row.active and row.recovery_required
+        assert row.bluetooth_restore_verified and not row.hotspot_restore_verified
+        assert row.lease_expires_at <= datetime.now(UTC)
+    # The timeout released the process fence, so the same transition is adoptable.
+    assert await radio_coordinator.reconcile_pending(address="unit:5555")
+    async with session_scope() as session:
+        row = await session.get(IngestRadioTransition, transition.id)
+        assert row is not None and not row.active and not row.recovery_required
+        assert row.bluetooth_restore_verified and row.hotspot_restore_verified
+
+
 async def test_radio_quieting_refuses_to_run_before_obd_durability_checkpoint(
     db_session, fake_controller
 ):

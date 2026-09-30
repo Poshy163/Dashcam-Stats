@@ -13,8 +13,11 @@ one transition.
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -55,6 +58,7 @@ async def _seed(
             transport_host="192.168.1.214",
             bluetooth_before="on",
             hotspot_before="on",
+            hotspot_interface="wlan1",
             bluetooth_disable_attempted=True,
             bluetooth_disable_verified=True,
             hotspot_disable_attempted=True,
@@ -131,6 +135,10 @@ async def test_a_report_of_failure_is_worth_more_than_silence(db_session):
 async def test_a_radio_the_watchdog_never_touched_is_left_alone(db_session):
     """``skip`` is not a claim about a readback and must not become one."""
     await _seed(db_session)
+    seeded = await _row(db_session)
+    seeded.bluetooth_disable_attempted = False
+    seeded.bluetooth_disable_verified = False
+    await db_session.commit()
 
     assert await radio_coordinator.apply_unit_report(_report(bluetooth="skip")) is True
 
@@ -229,15 +237,17 @@ async def test_a_wrong_token_is_refused_without_saying_why(client, db_session):
 # ---------------------------------------------------------------------------------------
 
 
-def _sh_available() -> bool:
-    try:
-        subprocess.run(["sh", "-c", "exit 0"], capture_output=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return True
-
-
-requires_sh = pytest.mark.skipif(not _sh_available(), reason="no POSIX shell available")
+@pytest.fixture(params=["sh", "mksh"])
+def posix_shell(request):
+    shell = shutil.which(request.param)
+    if not shell and os.name == "nt":
+        candidate = Path("C:/Program Files/Git/usr/bin") / f"{request.param}.exe"
+        shell = str(candidate) if candidate.exists() else None
+    if not shell:
+        if os.name == "nt":
+            pytest.skip(f"{request.param} unavailable on Windows")
+        pytest.fail(f"{request.param} is required for Android shell regression tests")
+    return shell
 
 
 def _report_config(**overrides) -> radios.WatchdogReport:
@@ -301,8 +311,7 @@ async def test_the_server_hands_the_watchdog_the_countdowns_age(monkeypatch):
     assert report.acc_off_elapsed_s == 5
 
 
-@requires_sh
-def test_the_sleep_guard_aims_at_the_real_sleep_not_the_arming_time(tmp_path):
+def test_the_sleep_guard_aims_at_the_real_sleep_not_the_arming_time(tmp_path, posix_shell):
     """The countdown starts at ignition-off, and arming happens well into it.
 
     A watchdog that anchored on its own start would aim sixty seconds late, which on this
@@ -321,13 +330,13 @@ def test_the_sleep_guard_aims_at_the_real_sleep_not_the_arming_time(tmp_path):
     script = (
         'reason=lease_expired; acc_off_at=""; acc_elapsed=60; ' + guard +
         # Ignition dropped 60s before this first observation, so the unit sleeps 1140s
-        # from here and the guard must fire 15s before that.
+        # from here and the guard must fire 60s before that.
         'now=1000; remaining=99999; sleep_fold; echo "$acc_off_at $remaining $reason"; '
-        'now=2124; remaining=99999; sleep_fold; echo "$remaining $reason"; '
-        'now=2125; remaining=99999; sleep_fold; echo "$remaining $reason"'
+        'now=2079; remaining=99999; sleep_fold; echo "$remaining $reason"; '
+        'now=2080; remaining=99999; sleep_fold; echo "$remaining $reason"'
     )
     result = subprocess.run(
-        ["sh", "-c", script],
+        [posix_shell, "-c", script],
         capture_output=True,
         text=True,
         env={"PATH": f"{stub}:/usr/bin:/bin"},
@@ -336,15 +345,14 @@ def test_the_sleep_guard_aims_at_the_real_sleep_not_the_arming_time(tmp_path):
 
     first, before, at = result.stdout.strip().splitlines()
     # 1000 - 60 elapsed: the countdown is anchored where it really started.
-    assert first == "940 1125 lease_expired"
+    assert first == "940 1080 lease_expired"
     assert before == "1 lease_expired"
-    # 940 + 1200 = 2140 is the sleep; 2125 is fifteen seconds in front of it.
+    # 940 + 1200 = 2140 is the sleep; 2080 gives restoration sixty seconds.
     assert at == "0 pre_sleep"
 
 
-@requires_sh
 @pytest.mark.parametrize("acc", ["1", "on", "", "null", "garbage"])
-def test_an_unreadable_ignition_never_invents_a_deadline(tmp_path, acc):
+def test_an_unreadable_ignition_never_invents_a_deadline(tmp_path, acc, posix_shell):
     """Restoring the driver's Bluetooth twenty minutes early is its own kind of damage."""
     stub = tmp_path / "bin"
     stub.mkdir()
@@ -356,7 +364,7 @@ def test_an_unreadable_ignition_never_invents_a_deadline(tmp_path, acc):
     guard = radios._watchdog_sleep_guard_functions(_report_config()).replace("/system/bin/", "")
     result = subprocess.run(
         [
-            "sh",
+            posix_shell,
             "-c",
             'reason=lease_expired; acc_off_at=""; acc_elapsed=0; '
             + guard
@@ -372,8 +380,7 @@ def test_an_unreadable_ignition_never_invents_a_deadline(tmp_path, acc):
     assert result.stdout.strip() == "500 lease_expired"
 
 
-@requires_sh
-def test_the_watchdog_reads_both_radios_back_and_posts_valid_json(tmp_path):
+def test_the_watchdog_reads_both_radios_back_and_posts_valid_json(tmp_path, posix_shell):
     """The readbacks are the server's own two, taken on the device instead of over ADB."""
     stub = tmp_path / "bin"
     stub.mkdir()
@@ -392,13 +399,18 @@ def test_the_watchdog_reads_both_radios_back_and_posts_valid_json(tmp_path):
         restore_bluetooth=True,
         hotspot_baseline="on",
         transport_host="192.168.1.214",
+        expected_interface="wlan1",
     ).replace("/system/bin/", "")
     report_file = tmp_path / "report.json"
     body = body.replace(radios.WATCHDOG_REPORT_PARTIAL_PATH, str(tmp_path / "scan"))
     body = body.replace(radios.WATCHDOG_REPORT_PATH, str(report_file))
 
     result = subprocess.run(
-        ["sh", "-c", "reason=pre_sleep; " + body + 'verify_radios; echo "$bt $hs $ap_iface"'],
+        [
+            posix_shell,
+            "-c",
+            "reason=pre_sleep; " + body + 'verify_radios; echo "$bt $hs $ap_iface"',
+        ],
         capture_output=True,
         text=True,
         env={"PATH": f"{stub}:/usr/bin:/bin"},
@@ -407,3 +419,137 @@ def test_the_watchdog_reads_both_radios_back_and_posts_valid_json(tmp_path):
 
     # The serving AP is found by the address it holds, never by being called wlan-anything.
     assert result.stdout.strip() == "1 1 wlan1"
+
+
+@pytest.mark.parametrize(
+    ("baseline", "scenario", "expected", "scans"),
+    [
+        ("on", "delayed", "1 wlan2", 4),
+        ("on", "flap", "1 wlan2", 4),
+        ("on", "wrong", "0 wlan1", 11),
+        ("on", "alongside", "1 wlan2", 2),
+        ("off", "unreadable", "0", 11),
+        ("off", "malformed", "0", 11),
+        ("off", "absent", "1", 2),
+        ("transport", "unreadable", "skip", 0),
+    ],
+)
+def test_watchdog_requires_stable_exact_ap_and_readable_absence(
+    tmp_path, posix_shell, baseline, scenario, expected, scans
+):
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    counter = tmp_path / "scans"
+    counter.write_text("0")
+    # A deterministic clock replaces only waiting, not the generated verification logic.
+    # ip/settings still execute as real child processes through timeout, as on Android.
+    (stub / "settings").write_text("#!/bin/sh\necho 1\n", newline="\n")
+    (stub / "ip").write_text(
+        "#!/bin/sh\n"
+        f"n=$(cat '{counter.as_posix()}'); n=$((n+1)); echo $n > '{counter.as_posix()}'\n"
+        + ("exit 1\n" if scenario == "unreadable" else "")
+        + ("echo 'not an interface inventory'; exit 0\n" if scenario == "malformed" else "")
+        + "echo '2: wlan0 inet 192.0.2.10/24 scope global wlan0'\n"
+        + {
+            "delayed": '[ "$n" -ge 3 ] && echo "5: wlan2 inet 192.0.2.1/24 scope global wlan2"\n',
+            "flap": '[ "$n" -ne 2 ] && echo "5: wlan2 inet 192.0.2.1/24 scope global wlan2"\n',
+            "wrong": 'echo "5: wlan1 inet 192.0.2.1/24 scope global wlan1"\n',
+            "alongside": 'echo "5: wlan1 inet 192.0.2.2/24 scope global wlan1"\n'
+            'echo "6: wlan2 inet 192.0.2.1/24 scope global wlan2"\n',
+        }.get(scenario, "")
+        + "exit 0\n",
+        newline="\n",
+    )
+    for entry in stub.iterdir():
+        entry.chmod(0o755)
+    body = radios._watchdog_report_functions(
+        _report_config(),
+        restore_bluetooth=True,
+        hotspot_baseline=baseline,
+        transport_host="192.0.2.10",
+        expected_interface="wlan2",
+    ).replace("/system/bin/", "")
+    body = body.replace(radios.WATCHDOG_REPORT_PARTIAL_PATH, (tmp_path / "scan").as_posix())
+    result = subprocess.run(
+        [
+            posix_shell,
+            "-c",
+            "ticks=0; sleep() { ticks=$((ticks+1)); }; cut() { echo $ticks; }; "
+            + body
+            + 'verify_radios; echo "$hs $ap_iface"',
+        ],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{stub.as_posix()}:/usr/bin:/bin"},
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+    assert int(counter.read_text()) == scans
+
+
+def test_expected_hotspot_interface_cannot_inject_shell():
+    with pytest.raises(ValueError, match="interface"):
+        radios._watchdog_report_functions(
+            _report_config(),
+            restore_bluetooth=True,
+            hotspot_baseline="on",
+            transport_host="192.0.2.10",
+            expected_interface="wlan2; exit 0",
+        )
+
+
+async def test_watchdog_reports_before_bounded_courtesy_screen_change(monkeypatch):
+    from tests.test_ingest_radios import _arm_and_capture_watchdog
+
+    _handle, captured = await _arm_and_capture_watchdog(
+        monkeypatch,
+        restore_bluetooth=True,
+        hotspot_baseline="on",
+        hotspot_capsule_path=f"{radios.HOTSPOT_CAPSULE_PREFIX}{TRANSITION_ID}.json",
+        hotspot_restore_mode=radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
+        expected_interface="wlan2",
+        report=_report_config(),
+    )
+    command = captured["launcher"]
+    assert command.index("action.start.tethering") < command.index("verify_radios; publish_report")
+    assert command.index("verify_radios; publish_report") < command.index("timeout 6 monkey")
+    assert "expected_ap=" in command and "wlan2" in command
+    assert radios.WATCHDOG_SLEEP_GUARD_S == 60
+
+
+async def test_watchdog_without_working_timeout_never_publishes_readiness(
+    monkeypatch, tmp_path, posix_shell
+):
+    from tests.test_ingest_radios import _arm_and_capture_watchdog
+
+    handle, captured = await _arm_and_capture_watchdog(monkeypatch)
+    script = (
+        captured["launcher"]
+        .split("<<'DASHCAM_RADIO_WATCHDOG'\n", 1)[1]
+        .split("\nDASHCAM_RADIO_WATCHDOG\n", 1)[0]
+    )
+    # Execute the actual generated script; a missing/broken timeout must stop it
+    # before ownership, readiness, or any restoration command is published.
+    script = script.replace("/sdcard/", tmp_path.as_posix() + "/")
+    result = subprocess.run(
+        [posix_shell, "-c", "timeout() { return 127; }; " + script],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 1, result.stderr
+    assert not list(tmp_path.iterdir()), handle.ready_path
+
+
+async def test_hotspot_watchdog_requires_captured_interface():
+    assert (
+        await radios._arm_watchdog(
+            "unit:5555",
+            300,
+            hotspot_baseline="on",
+            hotspot_capsule_path=f"{radios.HOTSPOT_CAPSULE_PREFIX}{TRANSITION_ID}.json",
+            hotspot_restore_mode=radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
+        )
+        is None
+    )

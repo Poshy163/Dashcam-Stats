@@ -931,11 +931,35 @@ async def apply_unit_report(report: UnitRadioReport) -> bool:
             values["bluetooth_restore_verified"] = report.bluetooth == "1"
             if report.bluetooth == "0":
                 outstanding.append("Bluetooth")
+        elif row.bluetooth_disable_attempted and not row.bluetooth_restore_verified:
+            # A skip describes an untouched radio, not proof that an existing debt
+            # was paid. Previously it could close a row whose disable was durable.
+            outstanding.append("Bluetooth")
         if report.hotspot in {"0", "1"}:
+            hotspot_verified = report.hotspot == "1"
+            if (
+                hotspot_verified
+                and row.hotspot_before == "on"
+                and row.hotspot_interface
+                and report.interface != row.hotspot_interface
+            ):
+                hotspot_verified = False
             values["hotspot_restore_attempted"] = True
-            values["hotspot_restore_verified"] = report.hotspot == "1"
-            if report.hotspot == "0":
+            values["hotspot_restore_verified"] = hotspot_verified
+            if not hotspot_verified:
                 outstanding.append("the hotspot")
+        elif (
+            row.hotspot_before != "transport"
+            and (row.bluetooth_disable_attempted or row.hotspot_disable_attempted)
+            and not row.hotspot_restore_verified
+        ):
+            # Even an originally-off hotspot needs verification after Bluetooth's
+            # delayed vendor re-arm. The transport AP is intentionally never touched.
+            outstanding.append("the hotspot")
+        if row.logger_request_id and not row.logger_resume_verified:
+            # This report contains radio evidence only; normal recovery must still
+            # resume and verify the paused logger before releasing its obligation.
+            outstanding.append("the OBD logger")
 
         owner_live = bool(row.active) and row.lease_expires_at > now
         if not owner_live:
@@ -943,8 +967,8 @@ async def apply_unit_report(report: UnitRadioReport) -> bool:
                 values["phase"] = TransitionPhase.RECOVERY_REQUIRED.value
                 values["recovery_required"] = True
                 values["last_error"] = (
-                    f"the head unit reported before sleeping that {' and '.join(outstanding)} "
-                    "could not be restored"
+                    "the head unit's radio report left restoration unverified for "
+                    + " and ".join(outstanding)
                 )
             else:
                 # The token has done its one job. Clearing it makes the report single-use
@@ -965,6 +989,7 @@ async def apply_unit_report(report: UnitRadioReport) -> bool:
         reason=report.reason,
         bluetooth=report.bluetooth,
         hotspot=report.hotspot,
+        hotspot_verified=values.get("hotspot_restore_verified", row.hotspot_restore_verified),
         owner_live=owner_live,
     )
     return True

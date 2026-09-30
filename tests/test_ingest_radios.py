@@ -820,6 +820,7 @@ class TestTheWatchdog:
             restore_bluetooth=True,
             hotspot_baseline=hotspot_baseline,
             hotspot_capsule_path=capsule,
+            expected_interface="wlan1" if capsule else None,
         )
         command = captured["launcher"]
         positions = [command.index(fragment) for fragment in expected]
@@ -833,6 +834,7 @@ class TestTheWatchdog:
             monkeypatch,
             restore_bluetooth=False,
             hotspot_capsule_path=capsule,
+            expected_interface="wlan1",
         )
         command = captured["launcher"]
         assert "start-softap" in command and capsule in command
@@ -848,6 +850,7 @@ class TestTheWatchdog:
             hotspot_baseline="on",
             hotspot_capsule_path=capsule,
             hotspot_restore_mode=radios.HOTSPOT_RESTORE_BLUETOOTH_REARM,
+            expected_interface="wlan1",
         )
         command = captured["launcher"]
         # The strategy was validated before arming. Capsule loss after the radios go down

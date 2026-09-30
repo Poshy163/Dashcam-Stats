@@ -69,6 +69,10 @@ IDLE_RECHECK_S = 30.0
 #: The budget is reset when the visit ends or a non-error result is observed.
 ERROR_RETRY_DELAYS_S = (15.0, 30.0, 60.0)
 
+# Radio recovery is a safety obligation, independent of footage retry/visit limits.
+# Space failed attempts from completion so a slow control channel cannot create a loop.
+RADIO_RECOVERY_RETRY_S = 30.0
+
 #: Do not start a top-up with less than this left on the unit's sleep countdown.
 #:
 #: A top-up no longer widens the window, so the countdown keeps running underneath it and
@@ -95,6 +99,7 @@ class IngestPoller:
         #: The unit as this visit first described it, kept only while the arrival gate is
         #: holding. See the note in :meth:`_loop`; cleared the moment the port goes quiet.
         self._visit_info: UnitInfo | None = None
+        self._radio_recovery_retry_at = 0.0
 
     async def start(self) -> None:
         if self._running:
@@ -262,6 +267,26 @@ class IngestPoller:
                 return True
         return False
 
+    async def _recover_pending_while_online(self, address: str) -> bool:
+        """Spend a recovery-only tick when a previous run still owes radio restoration.
+
+        Return whether recovery owns this tick, including during its retry cooldown.
+        Reconciliation retains its device-identity check, process fence and awake-window
+        guard. Neither a successful recovery nor a retry consumes a backup allowance.
+        """
+        if await radio_coordinator.pending_recovery_address() is None:
+            self._radio_recovery_retry_at = 0.0
+            return False
+        now = time.monotonic()
+        if now < self._radio_recovery_retry_at:
+            return True
+        self._radio_recovery_retry_at = now + RADIO_RECOVERY_RETRY_S
+        try:
+            await puller.reconcile_pending_in_awake_window(address)
+        finally:
+            self._radio_recovery_retry_at = time.monotonic() + RADIO_RECOVERY_RETRY_S
+        return True
+
     async def _arrival_ready(self, address: str) -> bool:
         """Whether an automatic pull may start, or the unit has only just booted.
 
@@ -349,6 +374,14 @@ class IngestPoller:
                     self._error_retries_started = 0
                     self._backups_this_visit = 0
                     self._visit_info = None
+                    self._radio_recovery_retry_at = 0.0
+                    await asyncio.sleep(self._interval())
+                    continue
+
+                # A PARTIAL/ERROR/CANCELLED run may have restored Bluetooth while its
+                # hotspot restore failed. Do not strand that debt behind re-drain limits
+                # while the same unit remains reachable, or start another backup first.
+                if self._was_online and await self._recover_pending_while_online(self._address()):
                     await asyncio.sleep(self._interval())
                     continue
 
