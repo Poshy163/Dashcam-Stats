@@ -24,7 +24,7 @@ from app.obd.fuel import EstimatedFuelAccumulator
 log = structlog.get_logger(__name__)
 
 POLL_PLAN_VERSION = 5
-PROJECTION_VERSION = 4
+PROJECTION_VERSION = 5
 NOMINAL_CYCLE_S = 5.0
 GAP_TOLERANCE = 1.5
 MAX_RECORDED_GAPS = 100
@@ -245,6 +245,15 @@ def specs_for_poll_plan(value: object) -> tuple[int, tuple[SignalSpec, ...]]:
     if isinstance(value, int) and not isinstance(value, bool) and value in _POLL_PLAN_SPECS:
         return value, _POLL_PLAN_SPECS[value][0]
     return 1, SIGNALS_V2
+
+
+def _signal_phase(spec: SignalSpec, phases: dict[int, int]) -> int:
+    # Fuel estimates are derived from this cycle's MAF response. They keep pid=None
+    # in the API, but share MAF's schedule rather than defaulting to phase zero.
+    source_pid = (
+        0x10 if spec.name in {"estimated_fuel_rate", "estimated_fuel_consumption"} else spec.pid
+    )
+    return phases.get(source_pid, 0)
 
 
 def vehicle_data_present(summary: dict[str, Any]) -> bool:
@@ -740,7 +749,7 @@ async def reconcile_drive_projection(
                     if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 255
                 )
             for state in signal_states.values():
-                phase = phases.get(state.spec.pid, 0)
+                phase = _signal_phase(state.spec, phases)
                 state.add(sample, phase=phase)
 
         lifecycle = lifecycle_status(
@@ -792,7 +801,7 @@ async def reconcile_drive_projection(
                 supported = spec.pid in advertised_pids
             else:
                 supported = state.cadence.count > 0 or spec.pid in missing_pids
-            phase = phases.get(spec.pid, 0)
+            phase = _signal_phase(spec, phases)
             result = state.finish(
                 supported=supported,
                 expected_cycles=expected_cycles,

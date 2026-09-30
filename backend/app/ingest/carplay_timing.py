@@ -41,6 +41,7 @@ import math
 import re
 import time
 import uuid
+import zlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -70,6 +71,12 @@ REMOTE_LOG_KIB = 1024
 REMOTE_LOG_ROTATIONS = 8
 MAX_RECOVERY_BYTES_PER_FILE = REMOTE_LOG_KIB * 1024
 MAX_RECOVERY_LINES = 20_000
+RECOVERY_TIMEOUT_S = 120.0
+RECOVERY_REQUEST_TIMEOUT_S = 10.0
+RECOVERY_CHUNK_BYTES = 64 * 1024
+RECOVERY_MIN_CHUNK_BYTES = 1024
+RECOVERY_BASE64_LIMIT = 32 * 1024
+MAX_RECOVERY_BYTES = MAX_RECOVERY_BYTES_PER_FILE * (REMOTE_LOG_ROTATIONS + 1)
 
 #: The logcat tag every sample carries. The unit-log collector's allow-list must name it.
 TAG = "CarPlayTiming"
@@ -822,16 +829,167 @@ def sampler_file_read_command() -> str:
 
 async def recover_sampler_file(address: str) -> tuple[int, int]:
     """Recover direct-file observations: ``(new or completed, duplicate)``."""
-    raw = await adb.shell(address, sampler_file_read_command(), timeout=ARM_TIMEOUT_S)
-    # Test fakes from older callers sometimes return the lower-level result object.
-    if isinstance(raw, adb.AdbResult):
-        raw = raw.stdout
+    try:
+        async with asyncio.timeout(RECOVERY_TIMEOUT_S):
+            raw = await _read_sampler_snapshot(address)
+    except TimeoutError:
+        raise adb.AdbError("CarPlay sampler recovery exceeded its total time limit") from None
     entries = parse_sampler_file(raw)
     if not entries:
         return 0, 0
     from app.ingest.unit_logs import store
 
     return await store(entries)
+
+
+def _recovery_path(generation: int) -> str:
+    if type(generation) is not int or not 0 <= generation <= REMOTE_LOG_ROTATIONS:
+        raise ValueError("invalid sampler log generation")
+    return f"{REMOTE_LOG}.{generation}" if generation else REMOTE_LOG
+
+
+def _sampler_manifest_command() -> str:
+    generations = " ".join(str(n) for n in range(REMOTE_LOG_ROTATIONS, -1, -1))
+    return (
+        f"for n in {generations}; do f={REMOTE_LOG}; "
+        '[ "$n" = 0 ] || f=$f.$n; '
+        'if [ -e "$f" ] || [ -L "$f" ]; then '
+        '[ ! -L "$f" ] && [ -f "$f" ] && [ -r "$f" ] || exit 1; '
+        'm=$(stat -c "%d:%i:%s" "$f") || exit 1; '
+        'printf "%s %s\\n" "$n" "$m"; fi; done'
+    )
+
+
+def _parse_sampler_manifest(raw: str) -> dict[int, tuple[int, int, int]]:
+    if len(raw) > 2048:
+        raise adb.AdbError("CarPlay sampler file manifest exceeds limit")
+    result = {}
+    for line in raw.splitlines():
+        match = re.fullmatch(r"([0-8]) ([0-9]{1,20}):([0-9]{1,20}):([0-9]{1,13})", line)
+        if not match:
+            raise adb.AdbError("CarPlay sampler file manifest is invalid")
+        generation, device, inode, size = map(int, match.groups())
+        if generation > REMOTE_LOG_ROTATIONS or generation in result or size > 10**12:
+            raise adb.AdbError("CarPlay sampler file manifest is invalid")
+        result[generation] = (device, inode, size)
+    return result
+
+
+def _sampler_chunk_command(
+    generation: int, metadata: tuple[int, int, int], offset: int, length: int, *, compressed: bool
+) -> str:
+    """Open and identify one fixed file before reading a bounded part of its frozen tail.
+
+    Use block-sized dd plus head/tail, supported by Android toybox, rather than byte-sized
+    dd calls or GNU-only skip_bytes/count_bytes options. The FD pins the inode for this call.
+    """
+    path = _recovery_path(generation)
+    device, inode, size = metadata
+    if (
+        any(type(n) is not int or n < 0 for n in (device, inode, size, offset, length))
+        or not 0 < length <= RECOVERY_CHUNK_BYTES
+        or offset + length > size
+    ):
+        raise ValueError("invalid sampler recovery range")
+    block = 64 * 1024
+    skip, within = divmod(offset, block)
+    blocks = (within + length + block - 1) // block
+    encoder = "gzip -c | base64" if compressed else "base64"
+    mode = "gzip" if compressed else "base64"
+    return (
+        f"exec 3<{path} || exit 1; "
+        'm=$(stat -L -c "%d:%i:%s" /proc/self/fd/3) || exit 1; '
+        f'case "$m" in {device}:{inode}:*) ;; *) echo CPR_CHANGED; exit 0;; esac; '
+        f'[ "${{m##*:}}" -ge {size} ] || {{ echo CPR_CHANGED; exit 0; }}; '
+        f"p=$(dd bs={block} skip={skip} count={blocks} <&3 2>/dev/null | "
+        f"tail -c +{within + 1} | head -c {length} | {encoder}) || exit 1; "
+        f'[ "${{#p}}" -le {RECOVERY_BASE64_LIMIT} ] || '
+        "{ echo CPR_OVERFLOW; exit 0; }; "
+        f'printf "CPR1 {mode}\\n%s\\nCPR_END\\n" "$p"'
+    )
+
+
+def _decode_sampler_chunk(raw: str, length: int, *, compressed: bool) -> bytes | None:
+    if raw == "CPR_OVERFLOW":
+        return None
+    if len(raw) > RECOVERY_BASE64_LIMIT + 64:
+        raise adb.AdbError("CarPlay sampler recovery response exceeds limit")
+    lines = raw.splitlines()
+    mode = "gzip" if compressed else "base64"
+    if not lines or lines[0] != f"CPR1 {mode}" or lines[-1] != "CPR_END":
+        raise adb.AdbError("CarPlay sampler recovery changed or returned an incomplete chunk")
+    try:
+        encoded = base64.b64decode("".join(lines[1:-1]), validate=True)
+        if compressed:
+            decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            payload = decoder.decompress(encoded, length + 1)
+            if not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+                raise ValueError("incomplete or oversized gzip stream")
+        else:
+            payload = encoded
+        if len(payload) != length:
+            raise ValueError("incorrect chunk size")
+    except (ValueError, zlib.error):
+        raise adb.AdbError("CarPlay sampler recovery chunk failed integrity validation") from None
+    return payload
+
+
+async def _recovery_shell(address: str, command: str) -> str:
+    raw = await adb.shell(address, command, timeout=RECOVERY_REQUEST_TIMEOUT_S)
+    # Older integrations sometimes return the lower-level result object.
+    if isinstance(raw, adb.AdbResult):
+        raw = raw.stdout
+    return raw.strip()
+
+
+async def _read_sampler_snapshot(address: str) -> str:
+    """Recover at most nine MiB; publish nothing until every byte and inode is verified.
+
+    Active files may append, but only their frozen prefix is read. Replacement, rotation or
+    truncation aborts the entire attempt. The next parked presence tick retries; this never
+    modifies, locks or removes the unit's logs. Missing gzip falls back to small base64 chunks.
+    """
+    capabilities = await _recovery_shell(
+        address,
+        "for t in stat dd head tail base64; do command -v $t >/dev/null 2>&1 || "
+        "{ echo CPR_UNSUPPORTED; exit 0; }; done; "
+        "if command -v gzip >/dev/null 2>&1; then echo CPR_GZIP; else echo CPR_BASE64; fi",
+    )
+    if capabilities not in {"CPR_GZIP", "CPR_BASE64"}:
+        raise adb.AdbError("CarPlay sampler recovery requires stat/dd/head/tail/base64")
+    compressed = capabilities == "CPR_GZIP"
+    manifest = _parse_sampler_manifest(await _recovery_shell(address, _sampler_manifest_command()))
+    if not manifest:
+        return ""
+    chunk_limit = RECOVERY_CHUNK_BYTES if compressed else 16 * 1024
+    combined = bytearray()
+    for generation in sorted(manifest, reverse=True):
+        metadata = manifest[generation]
+        size = metadata[2]
+        offset = max(0, size - MAX_RECOVERY_BYTES_PER_FILE)
+        while offset < size:
+            length = min(chunk_limit, size - offset)
+            command = _sampler_chunk_command(
+                generation, metadata, offset, length, compressed=compressed
+            )
+            payload = _decode_sampler_chunk(
+                await _recovery_shell(address, command), length, compressed=compressed
+            )
+            if payload is None:
+                if length <= RECOVERY_MIN_CHUNK_BYTES:
+                    raise adb.AdbError("CarPlay sampler recovery cannot fit a bounded chunk")
+                chunk_limit = max(RECOVERY_MIN_CHUNK_BYTES, length // 2)
+                continue
+            combined.extend(payload)
+            if len(combined) > MAX_RECOVERY_BYTES:
+                raise adb.AdbError("CarPlay sampler recovery exceeds total byte limit")
+            offset += length
+    final = _parse_sampler_manifest(await _recovery_shell(address, _sampler_manifest_command()))
+    if final.keys() != manifest.keys() or any(
+        final[g][:2] != before[:2] or final[g][2] < before[2] for g, before in manifest.items()
+    ):
+        raise adb.AdbError("CarPlay sampler files rotated or truncated during recovery")
+    return combined.decode("utf-8", "replace").replace("\r", "")
 
 
 async def _recover_when_parked(address: str) -> None:

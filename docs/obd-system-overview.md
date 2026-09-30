@@ -99,8 +99,11 @@ the resulting total is still a partial estimate when data is missing.
 
 Server startup reconciliation rebuilds historical cached summaries from stored samples;
 the immutable observations and original bundle summaries remain unchanged. Projection
-version 4 identifies the corrected fuel integration. These rules do not validate sensor
-calibration or remove the fuel model's assumptions.
+version 4 introduced the corrected fuel integration; version 5 also counts derived fuel
+coverage on MAF's scheduled phase. Only stored non-null derived readings count toward
+coverage: the bounded hold used for fuel totals does not create extra observations or
+fill missing readings. Derived signals remain separate from measured-signal completeness.
+These rules do not validate sensor calibration or remove the fuel model's assumptions.
 
 As of 2026-08-30, the physical setup had demonstrated engine detection, drive close,
 bundle export, unattended collection, receipt-gated deletion, and retained raw-history

@@ -158,10 +158,11 @@ class TestStorage:
             f"{stamp:%Y-%m-%d %H:%M:%S}.789 +0000 713 714 E CarPlayTiming: {message[:1024]}"
         )
 
-        async def fake_shell(*args, **kwargs):
+        async def fake_snapshot(address):
+            assert address == "unit"
             return f"{stamp:%Y-%m-%dT%H:%M:%SZ} {message}"
 
-        monkeypatch.setattr(carplay_timing.adb, "shell", fake_shell)
+        monkeypatch.setattr(carplay_timing, "_read_sampler_snapshot", fake_snapshot)
         if direct_first:
             assert await carplay_timing.recover_sampler_file("unit") == (1, 0)
             assert await unit_logs.store([logcat]) == (0, 1)

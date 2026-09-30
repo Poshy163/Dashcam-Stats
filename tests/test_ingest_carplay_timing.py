@@ -434,9 +434,8 @@ class TestSamplerObservations:
     async def test_direct_file_recovery_stores_parsed_entries(self, monkeypatch):
         stored = []
 
-        async def fake_shell(address, command, **kwargs):
+        async def fake_snapshot(address):
             assert address == "unit:5555"
-            assert command == carplay_timing.sampler_file_read_command()
             return (
                 "2026-09-08T02:00:00Z sample=1725750000-17-1 session=1725750000-17 "
                 "| event=sampler_started"
@@ -448,7 +447,7 @@ class TestSamplerObservations:
 
         from app.ingest import unit_logs
 
-        monkeypatch.setattr(carplay_timing.adb, "shell", fake_shell)
+        monkeypatch.setattr(carplay_timing, "_read_sampler_snapshot", fake_snapshot)
         monkeypatch.setattr(unit_logs, "store", fake_store)
 
         assert await carplay_timing.recover_sampler_file("unit:5555") == (1, 0)
