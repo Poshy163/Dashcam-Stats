@@ -7,7 +7,7 @@ import { EmptyState, ErrorState, JobStateBadge, PageHeader, ProgressBar, StatTil
 import { api } from '@/lib/api'
 import type { IngestStatus } from '@/lib/api'
 import { hardwareSummary } from '@/lib/hardware'
-import { backupAttention, capacityExceeded } from '@/lib/operationalStatus'
+import { backupAttention } from '@/lib/operationalStatus'
 import {
   formatBytes,
   formatDateTime,
@@ -66,8 +66,7 @@ export default function Dashboard() {
   const blockedFeatures = features?.filter((feature) => feature.blockedReason) ?? []
   const effectiveHardware = hardwareSummary(runtimeHardware.data ?? hardware)
   const backupWarnings = backupAttention(ingest.data)
-  const overCapacity = capacityExceeded(storage.usedBytes, storage.limitBytes)
-  const hasAttention = processing.failed > 0 || processing.invalid > 0 || blockedFeatures.length > 0 || effectiveHardware.notes.length > 0 || runtimeHardware.isError || ingest.isError || jobs.isError || backupWarnings.length > 0 || overCapacity
+  const hasAttention = processing.failed > 0 || processing.invalid > 0 || blockedFeatures.length > 0 || effectiveHardware.notes.length > 0 || runtimeHardware.isError || ingest.isError || jobs.isError || backupWarnings.length > 0
   const policyState = (enabled: boolean | undefined) => enabled === undefined ? 'Not reported' : enabled ? 'Enabled' : 'Disabled'
 
   const hour = new Date().getHours()
@@ -192,7 +191,6 @@ export default function Dashboard() {
             <dl className="space-y-1"><div>Automatic cleanup schedule: <strong>{policyState(storage.cleanupEnabled)}</strong></div><div>Size / age policy deletion: <strong>{storage.deletionEnabled ? 'Enabled' : 'Report only'}</strong></div><div>Static / empty clip deletion: <strong>{policyState(storage.idleDeleteEnabled)}</strong></div><div>Parked-session deletion: <strong>{policyState(storage.parkedDeleteEnabled)}</strong></div></dl>
             <p className="mt-2">The static and parked rules operate independently of size-policy deletion. Every deletion still requires its safety checks.</p>
           </div>
-          {overCapacity && <p className="mt-3 text-sm text-state-warn">Footage exceeds the configured retention cap by {formatBytes(storage.usedBytes - storage.limitBytes)}. This cap is not the physical disk capacity.</p>}
           <Link to="/settings?category=storage" className="mt-4 inline-flex items-center gap-1.5 font-mono text-xs font-bold text-accent hover:underline">
             Manage storage <ArrowIcon />
           </Link>
@@ -253,7 +251,6 @@ export default function Dashboard() {
               {blockedFeatures.map((feature) => (
                 <AttentionLink key={feature.key} to="/settings" label={`${feature.label} is unavailable`} />
               ))}
-              {overCapacity && <AttentionLink to="/settings?category=storage" label="Footage exceeds the configured retention cap" />}
               {backupWarnings.map((warning) => <AttentionLink key={warning} to="/backup" label={warning} />)}
               {ingest.isError && <ErrorState title="Could not check backup status" error={ingest.error} retry={() => void ingest.refetch()} />}
               {jobs.isError && <AttentionLink to="/queue" label="Recent processing activity could not be loaded" />}
