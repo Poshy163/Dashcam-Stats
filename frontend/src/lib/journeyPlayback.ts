@@ -59,3 +59,22 @@ export function availableFootageDurations(recordings: Recording[]): Record<strin
   }
   return durations
 }
+
+/** Resolve a camera change by capture time, including explicit nearest-footage fallback. */
+export function playbackAtTimestamp(timeline: PlayableClip[], timestampMs: number) {
+  if (!timeline.length || !Number.isFinite(timestampMs)) return null
+  let clipIndex = timeline.findIndex((clip) => timestampMs >= clip.startedAtMs && timestampMs < clip.startedAtMs + clip.durationS * 1000)
+  const exact = clipIndex >= 0
+  if (!exact) {
+    let distance = Infinity
+    timeline.forEach((clip, index) => {
+      const end = clip.startedAtMs + clip.durationS * 1000
+      const candidate = Math.max(clip.startedAtMs - timestampMs, timestampMs - end, 0)
+      // Prefer later footage in a tie, rather than the last frame before a missing span.
+      if (candidate <= distance) { distance = candidate; clipIndex = index }
+    })
+  }
+  const clip = timeline[clipIndex]!
+  const offsetS = Math.max(0, Math.min(clip.durationS - 0.001, (timestampMs - clip.startedAtMs) / 1000))
+  return { clipIndex, offsetS, elapsedS: clip.timelineStartS + offsetS, timestampMs: clip.startedAtMs + offsetS * 1000, exact }
+}

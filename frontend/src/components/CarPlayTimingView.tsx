@@ -13,7 +13,7 @@ import CarPlayGpsView from '@/components/CarPlayGpsView'
 import { EmptyState, ErrorState } from '@/components/ui'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
-import { formatDateTime } from '@/lib/format'
+import { formatDateTime, formatTime } from '@/lib/format'
 import { inTimingPeriod, maxKnown, meanKnown, peerTransportObservation, radioObservation, timingPeriods, timingSegments } from '@/lib/carplay'
 import type { CarPlayTimingMinute } from '@/lib/types'
 
@@ -71,7 +71,7 @@ function MiniChart({ minutes, series }: { minutes: CarPlayTimingMinute[]; series
         const i = Math.min(minutes.length - 1, Math.round((minutes.length - 1) * f))
         return (
           <text key={f} x={x(i)} y={CHART_H - 6} textAnchor="middle" fontSize={10} fill="currentColor" className="text-content-faint">
-            {new Date(at(i)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            {formatTime(new Date(at(i)).toISOString())}
           </text>
         )
       })}
@@ -103,7 +103,7 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
   })
 
   if (query.isLoading) return <Spinner />
-  if (query.isError) return <ErrorState error={query.error} />
+  if (query.isError) return <ErrorState error={query.error} retry={() => void query.refetch()} />
   const data = query.data
   const allMinutes = data?.minutes ?? []
   // A capture that saw no frames must still be selectable and visible as missing timing.
@@ -177,6 +177,7 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
           <button
             key={h}
             onClick={() => setHours(h)}
+            aria-pressed={hours === h}
             className={cn('rounded px-2 py-1', hours === h ? 'bg-surface text-content shadow-sm' : 'text-content-muted hover:text-content')}
           >
             {h < 48 ? `${h} h` : `${h / 24} d`}
@@ -194,7 +195,7 @@ export default function CarPlayTimingView({ live }: { live: boolean }) {
               <option value="all">All periods</option>
               {[...periods].reverse().map((p) => (
                 <option key={p.id} value={p.id}>
-                  {formatDateTime(new Date(p.start).toISOString())} – {new Date(p.end + 60_000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  {formatDateTime(new Date(p.start).toISOString())} – {formatTime(new Date(p.end + 60_000).toISOString())}
                 </option>
               ))}
             </select>

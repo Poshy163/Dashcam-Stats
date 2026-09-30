@@ -12,12 +12,14 @@ only at debug level, where nobody saw it.
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
 
-from app.db.models import JobState, ProcessingJob, Recording, RecordingState
+from app.db.models import JobKind, JobState, ProcessingJob, Recording, RecordingState
 from app.db.session import session_scope
+from app.hardware import detect as hardware_detect
 from app.pipeline.orchestrator import RunReport
 from app.workers import queue
 from app.workers.worker import ActiveJob, WorkerPool
@@ -32,6 +34,43 @@ def test_reported_decoder_prefers_any_software_fallback():
     )
 
     assert WorkerPool._decoder_from(report) == "software"
+
+
+async def test_a_cold_hardware_probe_keeps_the_event_loop_responsive(monkeypatch):
+    """A queued job can start before the background startup probe fills the cache."""
+    probe_started = threading.Event()
+    loop_responded = threading.Event()
+    responsive_during_probe: list[bool] = []
+    finished: list[int] = []
+
+    def slow_probe():
+        probe_started.set()
+        responsive_during_probe.append(loop_responded.wait(timeout=2))
+        return hardware_detect.HardwareInfo()
+
+    async def respond_while_probing():
+        assert await asyncio.to_thread(probe_started.wait, 2)
+        loop_responded.set()
+
+    async def finish(job_id, active, **kwargs):
+        finished.append(job_id)
+
+    monkeypatch.setattr(hardware_detect, "_detect", slow_probe)
+    hardware_detect._cached_detect.cache_clear()
+    pool = WorkerPool()
+    monkeypatch.setattr(pool, "_finish", finish)
+    responder = asyncio.create_task(respond_while_probing())
+    try:
+        await pool._run_job_inner(1, None, JobKind.PROCESS, None, "probe.ts")
+        await responder
+    finally:
+        loop_responded.set()
+        responder.cancel()
+        await asyncio.gather(responder, return_exceptions=True)
+        hardware_detect._cached_detect.cache_clear()
+
+    assert responsive_during_probe == [True], "hardware detection blocked the event loop"
+    assert finished == [1]
 
 
 class RecordingLog:

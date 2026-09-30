@@ -21,7 +21,7 @@ from app.damaged_policy import apply_damaged_policy
 from app.db.models import JobKind, JobState, ProcessingJob, Recording
 from app.db.retry import is_locked_error
 from app.db.session import session_scope
-from app.hardware.detect import detect_hardware
+from app.hardware.detect import detect_hardware_async
 from app.pipeline.orchestrator import RunReport, pending_stages, run_stages
 from app.pipeline.stages import StageError, StageResult, ensure_thumbnail
 from app.workers import queue
@@ -311,7 +311,7 @@ class WorkerPool:
         stages: list[str] | None,
         filename: str,
     ) -> None:
-        hardware = detect_hardware()
+        hardware = await detect_hardware_async()
         active = ActiveJob(
             job_id=job_id,
             recording_id=recording_id,

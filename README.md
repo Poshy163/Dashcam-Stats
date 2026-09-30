@@ -346,8 +346,14 @@ POST /api/auth/login              exchange a username and password for a session
 ```
 
 Settings > Advanced can download a consistent SQLite backup while analysis is running.
-A restore upload is integrity-checked and staged, then applied on the next container
-restart; the replaced database is retained in `/data/backups` as a pre-restore copy.
+Restore uploads stream to disk and are checked for integrity and compatibility with a
+supported database migration before staging. The default upload limit is 16 GiB; set
+`DASHCAM_RESTORE_MAX_BYTES` in bytes to change it. Leave enough space in `/data` for the
+uploaded database and a backup of the current database, plus at least 64 MiB headroom.
+Older supported backups migrate when restored; backups from an unknown/newer schema are
+rejected. Restart the container to apply a validated restore. The current database remains
+in place until replacement and is retained in `/data/backups` as a pre-restore copy.
+If multiple valid uploads finish, the last one published becomes the pending restore.
 That file now carries the sign-in account's password hash, so treat it accordingly.
 
 ---

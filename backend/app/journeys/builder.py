@@ -200,8 +200,8 @@ class JourneyBuilder:
             # stale, but expiring them makes the very next read of ``started_at`` a lazy
             # load, and the clusters are read after this point — under the async engine
             # that raises MissingGreenlet. Nothing reassigns those attributes in Python
-            # any more, so leaving them stale is harmless: :meth:`_attach` writes through
-            # a statement that owes nothing to what the ORM believes.
+            # any more: :meth:`_attach` explicitly writes the replacement membership and
+            # synchronizes just that field without expiring other attributes.
 
         created = 0
         for cluster in clusters:
@@ -411,7 +411,12 @@ class JourneyBuilder:
                 update(model)
                 .where(column.in_(recording_ids))
                 .values(journey_id=journey_id)
-                .execution_options(synchronize_session=False)
+                # The explicit UPDATE still runs even if SQLite reused a deleted id.
+                # Keep retained recordings current so needs_recluster and later rebuilds
+                # do not read stale membership from this session's identity map. Matching
+                # by primary key can be evaluated locally; avoid returning every child
+                # telemetry row solely to synchronize objects we do not keep loaded.
+                .execution_options(synchronize_session="evaluate" if model is Recording else False)
             )
 
     async def repair_stale(self, session: AsyncSession, *, limit: int = 200) -> int:

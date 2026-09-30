@@ -26,7 +26,7 @@ from app.api.errors import install_error_handlers
 from app.api.routes import auth, content, heatmap, ingest, media, obd_import, osd_debug, system
 from app.api.schemas import HealthOut
 from app.auth import service
-from app.auth.gate import AuthGate, request_is_https
+from app.auth.gate import AuthGate, authenticate, request_is_https
 from app.auth.service import ensure_credential_loaded, require_login_setting, reset_auth_state
 from app.config import get_config
 from app.core.logging import (
@@ -435,7 +435,14 @@ def _mount_frontend(app: FastAPI) -> None:
         # runs. Taken here rather than in middleware precisely because this route serves
         # the dashboard and nothing else: an API caller's idea of this app's address is
         # its own, and a caller's address may be a container name no car could resolve.
-        await origin.remember(request.url.scheme, request.headers.get("host", ""))
+        # The learned address receives the master API key when the head unit opens its
+        # display. A public shell request must not redirect that credential by supplying
+        # an arbitrary Host header. Keep automatic discovery for keyless, open LAN installs.
+        protected = require_login_setting() or service.api_key_enabled()
+        if not protected or await authenticate(request) is not None:
+            await origin.remember(
+                "https" if request_is_https(request) else "http", request.headers.get("host", "")
+            )
 
         redeemed = await _redeem_api_key(request, full_path)
         if redeemed is not None:

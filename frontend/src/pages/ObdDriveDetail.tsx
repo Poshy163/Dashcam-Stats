@@ -1,15 +1,15 @@
-import { useMemo, useRef, useState } from 'react'
+import { useId, useMemo, useRef, useState } from 'react'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
 import type { PointerEvent as ReactPointerEvent } from 'react'
 
 import Spinner from '@/components/Spinner'
 import { ObdLifecycleBadge, ObdLifecycleExplanation, ObdLifecycleReason } from '@/components/ObdLifecycle'
 import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
 import { ObdPollTiming } from '@/components/ObdPollTiming'
-import { EmptyState, ErrorState, PageHeader, StatTile } from '@/components/ui'
+import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/components/ui'
 import { api, type OBDBattery, type OBDSeriesSample } from '@/lib/api'
-import { formatDateTime, formatDuration, formatRelative, formatSpeed, formatTime } from '@/lib/format'
+import { formatDateTime, formatDuration, formatRelative, formatSpeed, formatTime, utcInputValue } from '@/lib/format'
 
 /** One metric drawn against elapsed drive time. */
 interface Series {
@@ -209,19 +209,19 @@ function BatteryCard({ battery }: { battery: OBDBattery }) {
 }
 
 /**
- * A drive lasts minutes and holds a few hundred samples, so the whole series is drawn
- * as-is — no windowing or downsampling. Null values split the line into segments rather
- * than being interpolated over: a gap in the data should look like a gap. Pointer moves
+ * Full-resolution windows show nulls and cadence gaps as breaks. A sampled window uses
+ * separate points because omitted readings cannot establish continuity. Pointer moves
  * (mouse or the head unit's touchscreen) pin the nearest sample and show its values;
  * `touch-action: pan-y` keeps vertical page scrolling alive while a finger scrubs.
  */
-function TimeChart({
+export function TimeChart({
   title,
   unit,
   elapsedS,
   timesIso,
   series,
   cadences,
+  downsampled,
 }: {
   title: string
   unit: string
@@ -231,9 +231,13 @@ function TimeChart({
   series: Series[]
   /** Signal name to poll cadence, straight from the drive's own `signal_metadata`. */
   cadences: Record<string, number>
+  downsampled: boolean
 }) {
+  const selectionId = useId()
   const svgRef = useRef<SVGSVGElement>(null)
   const [hover, setHover] = useState<number | null>(null)
+  const [tableOpen, setTableOpen] = useState(false)
+  const [tablePage, setTablePage] = useState(1)
 
   // The logger's cadence for this trace, or the fast-tier default when a series is drawn
   // from something the poll plan does not name (a locally derived trace, say).
@@ -277,6 +281,7 @@ function TimeChart({
       if (v != null && t != null) observed.push({ t, v })
     })
     if (observed.length === 0) return { lines: [], dots: [] }
+    if (downsampled) return { lines: [], dots: observed.map((point) => [x(point.t), y(point.v)]) }
     const bridge = cadenceOf(item) * 1.5
 
     const lines: string[] = []
@@ -373,14 +378,14 @@ function TimeChart({
           {drawn.map((s) => {
             const { min: lo, max: hi, last, lastAt } = stats(s.values)
             const stale =
-              lastAt != null && tLast - lastAt > cadenceOf(s) * 1.5
+              !downsampled && lastAt != null && tLast - lastAt > cadenceOf(s) * 1.5
             const seriesUnit = s.unit ?? unit
             return (
               <span key={s.label} className="flex items-center gap-1.5">
                 <span className={`h-0.5 w-4 rounded-full bg-current ${s.colorClass}`} />
                 {s.label}
                 <span className="tabular text-content-faint">
-                  {formatTick(lo)}–{formatTick(hi)}, last {formatTick(last)} {seriesUnit} at{' '}
+                  {downsampled ? 'shown ' : ''}{formatTick(lo)}–{formatTick(hi)}, {downsampled ? 'last shown' : 'last'} {formatTick(last)} {seriesUnit} at{' '}
                   {lastAt != null ? formatElapsed(lastAt) : '—'}
                   {stale && <span className="ml-1 text-state-warn">stale</span>}
                 </span>
@@ -514,6 +519,15 @@ function TimeChart({
           </g>
         )}
       </svg>
+      <div className="mt-3 space-y-2">
+        <label htmlFor={selectionId} className="label">Inspect {title.toLowerCase()} samples with arrow keys</label>
+        <input id={selectionId} className="w-full accent-accent" type="range" min={0} max={elapsedS.length - 1} step={1} value={hover ?? 0} onChange={(event) => setHover(Number(event.target.value))} aria-valuetext={`${formatDateTime(timesIso[hover ?? 0])}; ${drawn.map((signal) => `${signal.label}: ${signal.values[hover ?? 0] == null ? 'unavailable' : `${formatTick(signal.values[hover ?? 0]!)} ${signal.unit ?? unit}`}`).join('; ')}`} />
+        <p className="text-xs text-content-muted" aria-live="polite">{formatDateTime(timesIso[hover ?? 0])} · {drawn.map((signal) => `${signal.label}: ${signal.values[hover ?? 0] == null ? 'unavailable' : `${formatTick(signal.values[hover ?? 0]!)} ${signal.unit ?? unit}`}`).join(' · ')}</p>
+      </div>
+      <details className="mt-3" onToggle={(event) => setTableOpen(event.currentTarget.open)}>
+        <summary className="cursor-pointer text-sm font-medium">Sample values ({elapsedS.length.toLocaleString()} shown)</summary>
+        {tableOpen && <div className="overflow-x-auto"><table className="mt-2 w-full text-left text-xs"><caption className="sr-only">{title} samples; unavailable values were not measured at that instant.</caption><thead><tr><th scope="col" className="p-2">Recorded time</th>{drawn.map((signal) => <th scope="col" key={signal.label} className="p-2">{signal.label} ({signal.unit ?? unit})</th>)}</tr></thead><tbody>{timesIso.slice((Math.min(tablePage, Math.ceil(timesIso.length / 25)) - 1) * 25, Math.min(tablePage, Math.ceil(timesIso.length / 25)) * 25).map((time, offset) => { const index = (Math.min(tablePage, Math.ceil(timesIso.length / 25)) - 1) * 25 + offset; return <tr key={`${time}-${index}`} className="border-t border-border"><th scope="row" className="whitespace-nowrap p-2 font-normal">{formatDateTime(time)}</th>{drawn.map((signal) => <td key={signal.label} className="p-2">{signal.values[index] == null ? 'Unavailable' : formatTick(signal.values[index]!)}</td>)}</tr> })}</tbody></table><Pagination page={Math.min(tablePage, Math.ceil(timesIso.length / 25))} pages={Math.ceil(timesIso.length / 25)} total={timesIso.length} onChange={setTablePage} /></div>}
+      </details>
     </section>
   )
 }
@@ -653,9 +667,13 @@ function deriveStats(samples: OBDSeriesSample[], elapsedS: number[]): DerivedSta
 
 export default function ObdDriveDetail() {
   const { driveId } = useParams()
+  const [params, setParams] = useSearchParams()
+  const start = params.get('start') || undefined
+  const end = params.get('end') || undefined
+  const diagnosticPage = Math.max(1, Number(params.get('diagnostic_page')) || 1)
   const query = useQuery({
-    queryKey: ['obd-drive', driveId],
-    queryFn: () => api.obd.driveSeries(driveId ?? ''),
+    queryKey: ['obd-drive', driveId, start, end, diagnosticPage],
+    queryFn: () => api.obd.driveSeries(driveId ?? '', { start, end, maxPoints: 2000, diagnosticPage, diagnosticPageSize: 100 }),
     enabled: Boolean(driveId),
   })
   const appEvents = useInfiniteQuery({
@@ -673,13 +691,13 @@ export default function ObdDriveDetail() {
     const samples = query.data?.samples ?? []
     const first = samples[0]
     if (!first) return []
-    const t0 = Date.parse(first.t)
+    const t0 = Date.parse(query.data?.drive.startedAt ?? first.t)
     return samples.map((s) => (Date.parse(s.t) - t0) / 1000)
   }, [query.data])
 
   const derived = useMemo(
-    () => deriveStats(query.data?.samples ?? [], elapsedS),
-    [query.data, elapsedS],
+    () => deriveStats(query.data?.sampling?.downsampled || start || end ? [] : query.data?.samples ?? [], elapsedS),
+    [query.data, elapsedS, start, end],
   )
 
   // Signal name to poll cadence, taken from the drive's own metadata. This is per-drive
@@ -694,9 +712,10 @@ export default function ObdDriveDetail() {
   }, [query.data])
 
   if (query.isLoading) return <Spinner label="Loading drive…" className="py-24" />
-  if (query.isError) return <ErrorState error={query.error} retry={() => query.refetch()} />
+  if (query.isError) return <div className="space-y-4"><ErrorState error={query.error} retry={() => query.refetch()} />{(start || end || diagnosticPage > 1) && <button className="btn" onClick={() => setParams({})}>Clear drive filters</button>}</div>
   if (!query.data) return null
   const { drive, journey, samples, diagnostics, battery } = query.data
+  const downsampled = query.data.sampling?.downsampled === true
   const timesIso = samples.map((s) => s.t)
 
   // Instantaneous L/100 km is meaningless while (nearly) stopped — the divisor is the
@@ -979,6 +998,21 @@ export default function ObdDriveDetail() {
         </section>
       )}
 
+      <form className="card flex flex-wrap items-end gap-3 p-3" key={`${start ?? ''}-${end ?? ''}`} onSubmit={(event) => {
+        event.preventDefault()
+        const fields = new FormData(event.currentTarget)
+        const next = new URLSearchParams(params)
+        for (const key of ['start', 'end']) { const value = String(fields.get(key) ?? ''); if (value) next.set(key, new Date(`${value}Z`).toISOString()); else next.delete(key) }
+        next.delete('diagnostic_page')
+        setParams(next)
+      }}>
+        <label><span className="label mb-1 block">From (UTC)</span><input className="input" type="datetime-local" name="start" defaultValue={utcInputValue(start)} /></label>
+        <label><span className="label mb-1 block">To (UTC)</span><input className="input" type="datetime-local" name="end" defaultValue={utcInputValue(end)} /></label>
+        <button className="btn" type="submit">Apply time window</button>
+        <button className="btn" type="button" onClick={() => setParams({})}>Whole drive</button>
+        <p className="hint w-full">Drive totals describe the complete drive. Charts show the selected time window; displayed timestamps use the configured camera timezone.</p>
+      </form>
+      {(downsampled || start || end) && <p className="card p-3 text-sm" role="status">{downsampled ? `Showing ${samples.length.toLocaleString()} representative samples of ${query.data.sampling?.totalSampleCount.toLocaleString()}. Points preserve selected extrema, but omitted readings and gaps cannot be reconstructed from this view.` : 'Showing a time window of the drive.'} Adjacent-sample driving statistics are unavailable in this view. Download the original bundle for every sample.</p>}
       {samples.length < 2 ? (
         <EmptyState
           title="Not enough samples to chart"
@@ -993,6 +1027,7 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              downsampled={downsampled}
               series={[
                 {
                   label: 'Vehicle speed',
@@ -1008,6 +1043,7 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              downsampled={downsampled}
               series={[
                 {
                   label: 'RPM',
@@ -1023,6 +1059,7 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              downsampled={downsampled}
               series={[
                 {
                   label: 'Coolant',
@@ -1044,6 +1081,7 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              downsampled={downsampled}
               series={[
                 {
                   label: 'Voltage',
@@ -1059,6 +1097,7 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              downsampled={downsampled}
               series={[
                 {
                   label: 'Engine load',
@@ -1080,6 +1119,7 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              downsampled={downsampled}
               series={[
                 {
                   label: 'Short term',
@@ -1101,6 +1141,7 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              downsampled={downsampled}
               series={[
                 {
                   label: 'Estimated fuel rate',
@@ -1117,6 +1158,7 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              downsampled={downsampled}
               series={[
                 {
                   label: 'Est. consumption (5+ km/h)',
@@ -1133,6 +1175,7 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              downsampled={downsampled}
               series={[
                 {
                   label: 'Sensor 1',
@@ -1154,6 +1197,7 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              downsampled={downsampled}
               series={[
                 {
                   label: 'MAF',
@@ -1173,14 +1217,14 @@ export default function ObdDriveDetail() {
             />
           </div>
 
-          <div className="grid gap-4 xl:grid-cols-2">
+          {!downsampled && !start && !end && <div className="grid gap-4 xl:grid-cols-2">
             <BandBars title="Time at speed" bands={derived.speedBands} />
             <BandBars title="Time at RPM" bands={derived.rpmBands} />
-          </div>
+          </div>}
         </>
       )}
 
-      {diagnostics.length > 0 && (
+      {(diagnostics.length > 0 || (query.data.diagnosticTotal ?? 0) > 0) && (
         <div className="card overflow-x-auto">
           <div className="border-b border-border p-3">
             <h2 className="section-title">Diagnostic events</h2>
@@ -1211,6 +1255,7 @@ export default function ObdDriveDetail() {
               ))}
             </tbody>
           </table>
+          <Pagination page={query.data.diagnosticPage ?? diagnosticPage} pages={query.data.diagnosticPages ?? 1} total={query.data.diagnosticTotal ?? diagnostics.length} onChange={(page) => { const next = new URLSearchParams(params); next.set('diagnostic_page', String(page)); setParams(next) }} />
         </div>
       )}
 

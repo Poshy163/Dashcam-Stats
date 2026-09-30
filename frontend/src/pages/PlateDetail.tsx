@@ -43,7 +43,7 @@ export default function PlateDetail() {
 
   const patch = useMutation({
     mutationFn: (body: { flagged?: boolean; notes?: string; dismissed?: boolean }) => api.plates.update(plateId, body),
-    onSuccess: () => client.invalidateQueries({ queryKey: ['plate', plateId] }),
+    onSuccess: () => invalidateAnalysisQueries(client),
   })
   const correct = useMutation({
     mutationFn: () => api.plates.correct(plateId, correctedText),
@@ -119,6 +119,8 @@ export default function PlateDetail() {
         }
       />
 
+      {patch.isError && <ErrorState title="Could not update this plate" error={patch.error} retry={() => patch.variables && patch.mutate(patch.variables)} />}
+
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatTile label="First seen" value={<span className="text-base">{formatDateTime(p.firstSeenAt)}</span>} />
         <StatTile label="Last seen" value={<span className="text-base">{formatDateTime(p.lastSeenAt)}</span>} />
@@ -126,18 +128,22 @@ export default function PlateDetail() {
         <StatTile label="Journeys" value={p.journeyCount} />
       </div>
 
-      {markers.length > 0 ? (
-        <RouteMap markers={markers} className="h-80 w-full" {...maps} />
+      {observations.isError && (
+        <ErrorState title="Could not load sightings" error={observations.error} retry={() => void observations.refetch()} />
+      )}
+      {!observations.isLoading && !observations.isError && (markers.length > 0 ? (
+        maps.query.isPending ? <Spinner label="Loading map provider…" className="py-8" /> : maps.query.isError ? <ErrorState title="Could not load map settings" error={maps.query.error} retry={() => maps.query.refetch()} /> : <RouteMap markers={markers} className="h-80 w-full" {...maps} />
       ) : (
         <EmptyState
           title="No mapped sightings"
-          description="None of this plate's sightings have a GPS fix, so there is nothing to place on a map."
+          description="The sightings on this page have no GPS fix. Other pages may contain mapped sightings."
         />
-      )}
+      ))}
 
       <section className="card p-3">
-        <label className="label mb-1 block text-xs">Notes</label>
+        <label htmlFor="plate-notes" className="label mb-1 block text-xs">Notes</label>
         <textarea
+          id="plate-notes"
           className="input min-h-[4rem]"
           value={notes ?? p.notes ?? ''}
           onChange={(e) => setNotes(e.target.value)}
@@ -161,6 +167,7 @@ export default function PlateDetail() {
         </div>
         <div className="flex flex-wrap gap-2">
           <input
+            aria-label="Correct plate text"
             className="input max-w-xs font-mono uppercase"
             value={correctedText}
             onChange={(event) => setCorrectedText(event.target.value)}
@@ -172,6 +179,7 @@ export default function PlateDetail() {
         </div>
         <div className="flex flex-wrap gap-2 border-t border-border pt-3">
           <input
+            aria-label="Target plate ID for merge"
             className="input max-w-xs"
             type="number"
             min="1"
@@ -191,7 +199,7 @@ export default function PlateDetail() {
       <section>
         <h2 className="mb-2 text-sm font-semibold">Every sighting</h2>
         {observations.isLoading && <Spinner className="py-10" />}
-        {items.length === 0 && !observations.isLoading && (
+        {items.length === 0 && !observations.isLoading && !observations.isError && (
           <EmptyState title="No sightings recorded" />
         )}
 

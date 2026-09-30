@@ -37,6 +37,7 @@ import type {
   UnitLogTag,
   Vehicle,
 } from './types'
+import { apiErrorMessage, apiHeaders } from './apiTransport'
 
 export class ApiError extends Error {
   constructor(
@@ -106,12 +107,12 @@ async function request<T>(
 ): Promise<T> {
   const { query, rawKeys, ...init } = options
   const response = await fetch(`/api${path}${buildQuery(query)}`, {
-    headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) },
+    ...init,
+    headers: apiHeaders(init.headers),
     // Explicit rather than relying on the default. The session cookie is what
     // authenticates every one of these, and a silent change of default here would log
     // everyone out with no obvious cause.
     credentials: 'same-origin',
-    ...init,
   })
 
   if (response.status === 401) onUnauthorized?.()
@@ -121,9 +122,7 @@ async function request<T>(
     let message = `${response.status} ${response.statusText}`
     try {
       detail = await response.json()
-      const d = detail as { detail?: unknown; message?: string }
-      if (typeof d?.detail === 'string') message = d.detail
-      else if (typeof d?.message === 'string') message = d.message
+      message = apiErrorMessage(detail, message)
     } catch {
       /* a non-JSON error body is still an error; keep the status line */
     }
@@ -558,6 +557,10 @@ export interface OBDBattery {
 }
 
 export interface OBDDriveSeries {
+  diagnosticTotal?: number
+  diagnosticPage?: number
+  diagnosticPages?: number
+  sampling?: { totalSampleCount: number; returnedSampleCount: number; downsampled: boolean; method: string }
   drive: OBDDriveSummary
   journey: { id: number; title: string | null; overlapS: number } | null
   units: Record<string, string>
@@ -623,6 +626,7 @@ export interface OBDLoggerEvent {
 }
 
 export interface RecordingFilters extends Query {
+  availability?: 'all' | 'available' | 'missing'
   page?: number
   pageSize?: number
   cameraId?: number
@@ -767,8 +771,8 @@ export const api = {
     bundles: (query?: Query) => request<Paginated<OBDBundle>>('/obd/bundles', { query }),
     drives: (query?: Query) => request<Paginated<OBDDriveSummary>>('/obd/drives', { query }),
     drivesSummary: () => request<OBDDrivesTotals>('/obd/drives/summary'),
-    driveSeries: (driveId: string) =>
-      request<OBDDriveSeries>(`/obd/drives/${encodeURIComponent(driveId)}/series`),
+    driveSeries: (driveId: string, query?: { start?: string; end?: string; signals?: string; maxPoints?: number; diagnosticPage?: number; diagnosticPageSize?: number }) =>
+      request<OBDDriveSeries>(`/obd/drives/${encodeURIComponent(driveId)}/series`, { query }),
     driveForJourney: (journeyId: number) =>
       request<{ drive: OBDDriveSummary | null; overlapS: number | null }>(
         `/obd/drives/for-journey/${journeyId}`,
@@ -812,7 +816,7 @@ export const api = {
       post<ReprocessResult>('/reprocess', { stages, onlyFailed, onlyOutdated }),
   },
 
-  telemetryQuality: () => request<TelemetryQuality>('/telemetry/quality'),
+  telemetryQuality: (query?: { page?: number; pageSize?: number; reason?: string; dateFrom?: string; dateTo?: string }) => request<TelemetryQuality>('/telemetry/quality', { query }),
 
   retention: {
     plan: () => post<RetentionPlan>('/retention/plan'),
@@ -821,8 +825,8 @@ export const api = {
     history: (query?: Query) => request<Paginated<unknown>>('/retention/history', { query }),
   },
 
-  logs: {
-    list: (query?: Query) => request<Paginated<LogEntry>>('/logs', { query }),
+  logs: {
+    list: (query?: Query) => request<Paginated<LogEntry>>('/logs', { query }),
   },
 
   unitLogs: {
@@ -840,14 +844,10 @@ export const api = {
     database: () => request<Record<string, unknown>>('/system/database'),
     backupUrl: () => '/api/system/database/backup',
     restore: (file: File) =>
-      fetch('/api/system/database/restore', {
+      request<{ validated: boolean; restartRequired: boolean; message: string }>('/system/database/restore', {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: file,
-      }).then(async (response) => {
-        const data = await response.json()
-        if (!response.ok) throw new ApiError(data.detail ?? 'Restore failed', response.status, data)
-        return convertKeys<{ validated: boolean; restartRequired: boolean; message: string }>(data, snakeToCamel)
       }),
   },
 }

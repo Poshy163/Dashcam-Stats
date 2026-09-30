@@ -8,6 +8,7 @@ import { motion } from '@/lib/kiosk'
 import { invalidateAnalysisQueries, resetForIdentityChange } from '@/lib/queryInvalidation'
 import type { AuthState } from '@/lib/types'
 import type { Theme } from '@/lib/useTheme'
+import { ErrorState } from '@/components/ui'
 
 type IconProps = { className?: string }
 type NavItem = {
@@ -64,7 +65,7 @@ export default function Layout({
     onSuccess: () => resetForIdentityChange(client),
   })
 
-  const { data: stats } = useQuery({
+  const queue = useQuery({
     queryKey: ['queue-stats'],
     queryFn: api.jobs.stats,
     // Five seconds while there is work to watch; twenty when there is not.
@@ -81,6 +82,8 @@ export default function Layout({
       return (counts?.queued ?? 0) + (counts?.running ?? 0) > 0 ? 5_000 : 20_000
     },
   })
+  const stats = queue.data
+  const queueUnknown = queue.isPending || queue.isError
 
   const busy = (stats?.running ?? 0) > 0
   const pending = (stats?.queued ?? 0) + (stats?.running ?? 0)
@@ -266,8 +269,8 @@ export default function Layout({
         >
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-nav-content">
-              <span className={cn('h-2 w-2 rounded-full', busy ? cn('bg-cyan shadow-glow-cyan', motion('animate-pulse')) : 'bg-state-ok')} />
-              {busy ? 'Processing active' : 'Queue idle'}
+              <span className={cn('h-2 w-2 rounded-full', queueUnknown ? 'bg-state-warn' : busy ? cn('bg-cyan shadow-glow-cyan', motion('animate-pulse')) : 'bg-state-ok')} />
+              {queue.isPending ? 'Checking queue' : queue.isError ? 'Queue unavailable' : busy ? 'Processing active' : stats?.paused ? 'Queue paused' : pending > 0 ? 'Jobs waiting' : 'Queue idle'}
             </div>
             {busy && (
               <span className="font-mono text-2xs font-semibold text-cyan">
@@ -276,7 +279,7 @@ export default function Layout({
             )}
           </div>
           <div className="mt-2 font-mono text-2xs text-nav-muted">
-            {busy ? `${stats?.running ?? 0} active · ${stats?.queued ?? 0} queued` : 'No background jobs running'}
+            {queueUnknown ? 'Open Queue for status and retry' : pending > 0 ? `${stats?.running ?? 0} active · ${stats?.queued ?? 0} queued` : 'No background jobs running'}
           </div>
         </NavLink>
       </aside>
@@ -371,6 +374,7 @@ export default function Layout({
         )}
 
         <main className="mx-auto w-full max-w-[1600px] px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+          {signOut.isError && <ErrorState title="Could not sign out" error={signOut.error} retry={() => signOut.mutate()} />}
           {children}
         </main>
       </div>

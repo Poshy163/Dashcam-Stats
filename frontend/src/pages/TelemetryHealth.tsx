@@ -1,8 +1,9 @@
+import { useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 
 import Spinner from '@/components/Spinner'
-import { EmptyState, ErrorState, PageHeader, StatTile } from '@/components/ui'
+import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
 import { formatDateTime } from '@/lib/format'
 
@@ -18,13 +19,34 @@ const reasonLabels: Record<string, string> = {
 }
 
 export default function TelemetryHealth() {
+  const [params, setParams] = useSearchParams()
+  const page = Math.max(1, Number(params.get('page')) || 1)
+  const reason = params.get('reason') ?? ''
+  const dateFrom = params.get('date_from') ?? ''
+  const dateTo = params.get('date_to') ?? ''
+  const update = (key: string, value: string) => {
+    const next = new URLSearchParams(params)
+    if (value) next.set(key, value)
+    else next.delete(key)
+    if (key !== 'page') next.delete('page')
+    setParams(next)
+  }
   const query = useQuery({
-    queryKey: ['telemetry-quality'],
-    queryFn: api.telemetryQuality,
+    queryKey: ['telemetry-quality', page, reason, dateFrom, dateTo],
+    queryFn: () => api.telemetryQuality({ page, pageSize: 50, reason: reason || undefined, dateFrom: dateFrom || undefined, dateTo: dateTo || undefined }),
     refetchInterval: 10_000,
   })
+  const lastPage = query.data ? Math.max(1, query.data.issuePages) : undefined
+  useEffect(() => {
+    // Processing can resolve enough issues to remove the current page during a poll.
+    if (lastPage === undefined || page <= lastPage) return
+    const next = new URLSearchParams(params)
+    if (lastPage === 1) next.delete('page')
+    else next.set('page', String(lastPage))
+    setParams(next, { replace: true })
+  }, [lastPage, page, params, setParams])
   if (query.isLoading) return <Spinner label="Checking telemetry…" className="py-24" />
-  if (query.isError) return <ErrorState error={query.error} retry={() => query.refetch()} />
+  if (query.isError) return <div className="space-y-4"><ErrorState error={query.error} retry={() => query.refetch()} />{params.size > 0 && <button className="btn" onClick={() => setParams({})}>Clear telemetry filters</button>}</div>
   if (!query.data) return null
   const data = query.data
   const coverage = data.gpsCoverage
@@ -36,7 +58,7 @@ export default function TelemetryHealth() {
     <div className="space-y-4">
       <PageHeader
         title="Telemetry health"
-        subtitle={`${data.recordings.toLocaleString()} recordings in the visible library. Front and rear clips count separately.`}
+        subtitle={`${data.recordings.toLocaleString()} recordings in the visible library${dateFrom || dateTo ? ' within the selected dates' : ''}. Front and rear clips count separately.`}
       />
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatTile label="Healthy recordings" value={data.healthy} tone="ok" />
@@ -73,12 +95,19 @@ export default function TelemetryHealth() {
         </p>
       </div>
 
+      <div className="card flex flex-wrap items-end gap-3 p-3">
+        <label><span className="label mb-1 block">Issue reason</span><select className="input" value={reason} onChange={(e) => update('reason', e.target.value)}><option value="">All reasons</option>{Object.entries(reasonLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+        <label><span className="label mb-1 block">From</span><input type="date" className="input" value={dateFrom} onChange={(e) => update('date_from', e.target.value)} /></label>
+        <label><span className="label mb-1 block">To</span><input type="date" className="input" value={dateTo} onChange={(e) => update('date_to', e.target.value)} /></label>
+        <button className="btn" onClick={() => setParams({})}>Clear filters</button>
+        <p className="hint w-full">Dates filter the summary, coverage and issue list in the camera’s timezone. Issue reason filters only the issue list.</p>
+      </div>
       {data.issues.length === 0 ? (
-        <EmptyState title={data.recordings ? 'Telemetry looks healthy' : 'No recordings to assess'} description={data.recordings ? 'No recordings need attention.' : 'Results appear after recordings are analysed.'} />
+        <EmptyState title={data.issueTotal > 0 ? 'No issues on this page' : reason || dateFrom || dateTo ? 'No issues match these filters' : data.recordings ? 'Telemetry looks healthy' : 'No recordings to assess'} description={data.issueTotal > 0 ? 'The issue list changed. Returning to an available page.' : reason || dateFrom || dateTo ? 'Clear or adjust the filters to inspect other recordings.' : undefined} />
       ) : (
         <div className="card overflow-x-auto">
           <p className="px-3 py-3 text-xs text-content-muted">
-            Showing {data.issues.length} of {data.issueTotal.toLocaleString()} recordings needing attention (limit {data.issueLimit}), ordered by longest GPS gap, then warning count.
+            Showing {data.issues.length} of {data.issueTotal.toLocaleString()} matching recordings needing attention, ordered by longest GPS gap, then warning count.
           </p>
           <table className="w-full min-w-[52rem] text-sm">
             <thead className="border-b border-border text-left text-xs text-content-muted">
@@ -121,6 +150,7 @@ export default function TelemetryHealth() {
           </table>
         </div>
       )}
+      <Pagination page={data.issuePage} pages={data.issuePages} total={data.issueTotal} onChange={(value) => update('page', String(value))} />
     </div>
   )
 }

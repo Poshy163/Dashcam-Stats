@@ -72,6 +72,7 @@ export default function Journeys() {
               Include parked / unconfirmed
             </label>
             <select
+              aria-label="Sort journeys"
               className="input w-auto"
               value={sort}
               onChange={(e) => {
@@ -94,6 +95,9 @@ export default function Journeys() {
           </>
         }
       />
+
+      {merge.isError && <ErrorState title="Could not merge these journeys" error={merge.error} />}
+      {motion.isError && <ErrorState title="Could not load movement-check progress" error={motion.error} retry={() => void motion.refetch()} />}
 
       {motion.data && (
         <p className="text-sm text-content-muted">
@@ -127,7 +131,7 @@ export default function Journeys() {
                 {journey.motionJson && journey.motionJson.status !== 'moving' && (
                   <span className="text-xs text-content-muted">Movement not confirmed</span>
                 )}
-                <span className="font-mono text-base font-black text-white group-hover:text-accent transition-colors">{formatDate(journey.startedAt)}</span>
+                <span className="font-mono text-base font-black text-content group-hover:text-accent transition-colors">{formatDate(journey.startedAt)}</span>
                 <span className="tabular font-mono text-xs text-content-muted">
                   {formatTime(journey.startedAt)} → {formatTime(journey.endedAt)}
                 </span>
@@ -141,7 +145,7 @@ export default function Journeys() {
               <div className="tabular font-mono mt-3 flex flex-wrap gap-x-5 gap-y-1.5 text-xs text-content-muted">
                 {journey.hasGps ? (
                   <>
-                    <span className="text-white font-bold"><DerivedHint>{formatDistance(journey.distanceM)}</DerivedHint></span>
+                    <span className="text-content font-bold"><DerivedHint>{formatDistance(journey.distanceM)}</DerivedHint></span>
                     <span>avg <span className="text-content font-bold">{formatSpeed(journey.avgSpeedKmh)}</span></span>
                     <span>max <span className="text-accent font-bold">{formatSpeed(journey.maxSpeedKmh)}</span></span>
                   </>

@@ -43,7 +43,13 @@ from app.core.settings_service import (
     get_settings_service,
     local_midnight_utc,
 )
-from app.db.backup import create_backup, stage_restore
+from app.db.backup import (
+    RestoreStorageError,
+    RestoreTooLarge,
+    RestoreUpload,
+    RestoreValidationUnavailable,
+    create_backup,
+)
 from app.db.models import (
     BULK_PRIORITY,
     JobKind,
@@ -267,6 +273,9 @@ async def get_status(session: SessionDep):
         limit_bytes=limit,
         used_bytes=used,
         deletion_enabled=bool(settings.get_nowait("storage.enable_deletion")),
+        cleanup_enabled=bool(settings.get_nowait("storage.cleanup_enabled")),
+        idle_delete_enabled=bool(settings.get_nowait("storage.delete_idle")),
+        parked_delete_enabled=bool(settings.get_nowait("storage.delete_parked_journeys")),
         footage_writable=None,
     )
 
@@ -844,6 +853,7 @@ async def system_database(session: SessionDep):
         "size_bytes": size,
         "migration_revision": current_revision(),
         "row_counts": counts,
+        "restore_max_bytes": config.restore_max_bytes,
     }
 
 
@@ -857,7 +867,37 @@ async def download_database_backup():
         path = await asyncio.to_thread(create_backup)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from None
-    return FileResponse(path, media_type="application/vnd.sqlite3", filename=path.name)
+    except OSError:
+        raise HTTPException(
+            507, "The backup could not be stored; check free disk space and permissions"
+        ) from None
+    return FileResponse(
+        path,
+        media_type="application/vnd.sqlite3",
+        filename=path.name,
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+async def _restore_io(function, *args):
+    # A cancelled request must wait for its current disk operation before closing or
+    # deleting that file. Otherwise a worker thread can keep writing after cleanup.
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        owner = getattr(function, "__self__", None)
+        if isinstance(owner, RestoreUpload):
+            owner.abandoned.set()
+        try:
+            result = await task
+            if isinstance(result, RestoreUpload):
+                # Constructor cancellation happens before the caller can bind `upload`.
+                await asyncio.to_thread(result.close)
+        except Exception:
+            pass
+        finally:
+            raise
 
 
 @router.post("/system/database/restore")
@@ -867,20 +907,41 @@ async def upload_database_restore(request: Request):
         raise HTTPException(
             status.HTTP_409_CONFLICT, "Restore requires the built-in SQLite database"
         )
-    length = int(request.headers.get("content-length", "0") or 0)
-    if length > 512 * 1024 * 1024:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Backup exceeds 512 MiB")
-    data = await request.body()
-    if not data:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Backup is empty")
-    if len(data) > 512 * 1024 * 1024:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Backup exceeds 512 MiB")
+    from starlette.requests import ClientDisconnect
+
+    raw_length = request.headers.get("content-length")
     try:
-        await asyncio.to_thread(stage_restore, data)
-    except (OSError, ValueError) as exc:
+        length = int(raw_length) if raw_length is not None else None
+        if length is not None and length < 0:
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid Content-Length") from None
+    upload = None
+    try:
+        upload = await _restore_io(RestoreUpload, length)
+        async for chunk in request.stream():
+            await _restore_io(upload.write, chunk)
+        await _restore_io(upload.validate)
+        await _restore_io(upload.publish)
+    except RestoreTooLarge as exc:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, str(exc)) from None
+    except ClientDisconnect:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Backup upload was interrupted") from None
+    except RestoreValidationUnavailable as exc:
+        raise HTTPException(503, str(exc)) from None
+    except (RestoreStorageError, OSError) as exc:
+        raise HTTPException(
+            507, "The backup could not be stored; check free disk space and permissions"
+        ) from exc
+    except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from None
+    finally:
+        if upload is not None:
+            await _restore_io(upload.close)
     return {
         "validated": True,
+        "size_bytes": upload.size,
+        "migration_revision": upload.revision,
         "restart_required": True,
         "message": "Restore validated and staged. Restart the container to apply it.",
     }

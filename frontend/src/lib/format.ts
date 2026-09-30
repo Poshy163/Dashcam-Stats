@@ -112,6 +112,13 @@ export function formatTime(iso: string | null | undefined): string {
   return d.toLocaleTimeString(undefined, withZone({ hour: '2-digit', minute: '2-digit' }))
 }
 
+/** UTC input fields must normalize offset-bearing bookmarks before dropping the suffix. */
+export function utcInputValue(iso: string | null | undefined): string {
+  if (!iso) return ''
+  const date = new Date(iso)
+  return Number.isFinite(date.getTime()) ? date.toISOString().slice(0, 16) : ''
+}
+
 export function formatRelative(iso: string | null | undefined): string {
   if (!iso) return '—'
   const then = new Date(iso).getTime()

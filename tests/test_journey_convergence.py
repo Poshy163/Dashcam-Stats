@@ -180,6 +180,21 @@ class TestTheRebuildSettles:
         second = list((await db_session.execute(select(Journey.id))).scalars())
         assert len(first) == len(second) == 1, "one drive should be one journey"
 
+    async def test_rebuild_updates_recordings_retained_in_the_identity_map(self, db_session):
+        """Callers holding ORM objects must see the same membership as a fresh reader."""
+        builder = JourneyBuilder()
+        recordings = await self._library(db_session, split_on_gps=True)
+        await builder.rebuild(db_session)
+
+        stored = dict((await db_session.execute(select(Recording.id, Recording.journey_id))).all())
+        assert all(row.journey_id == stored[row.id] for row in recordings)
+        assert await builder.needs_recluster(db_session) is False
+
+        # Rebuilding reuses SQLite ids; synchronization must not suppress the actual SQL
+        # write after ON DELETE SET NULL, nor leave retained rows attached to old ids.
+        await builder.rebuild(db_session)
+        assert await builder.needs_recluster(db_session) is False
+
     async def test_a_genuine_fragment_is_still_noticed(self, db_session):
         """The check must not become blind: a drive split across two journeys is exactly
         what it exists to catch."""

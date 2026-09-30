@@ -427,7 +427,7 @@ export default function RecordingViewer() {
               Export 30s
             </a>
             <a className="btn" href={api.recordings.exportMetadataUrl(r.id)}>GPS + plate data</a>
-            <select className="input w-auto" value={stage} onChange={(e) => setStage(e.target.value)}>
+            <select aria-label="Recording analysis stages" className="input w-auto" value={stage} onChange={(e) => setStage(e.target.value)}>
               {REPROCESS_OPTIONS.map(([value, label]) => (
                 <option key={value} value={value}>{label}</option>
               ))}
@@ -438,6 +438,9 @@ export default function RecordingViewer() {
           </>
         }
       />
+
+      {updateEvent.isError && <ErrorState title="Could not update clip protection" error={updateEvent.error} />}
+      {reprocess.isError && <ErrorState title="Could not reprocess this recording" error={reprocess.error} />}
 
       {r.eventType && (
         <div className="card flex items-center gap-3 border-state-warn/40 p-3 text-sm">
@@ -501,7 +504,11 @@ export default function RecordingViewer() {
               </span>
             </div>
 
-            {tracks.length === 0 ? (
+            {detections.isLoading ? (
+              <Spinner label="Loading detections…" />
+            ) : detections.isError ? (
+              <ErrorState title="Could not load detections" error={detections.error} retry={() => void detections.refetch()} />
+            ) : tracks.length === 0 ? (
               <p className="hint">{emptyStateFor(r.detectionState, 'objects detected')}</p>
             ) : (
               <div className="space-y-2">
@@ -571,7 +578,11 @@ export default function RecordingViewer() {
               <span className="h-1.5 w-1.5 rounded-full bg-cyan animate-pulse"></span>
               Telemetry
             </div>
-            {telemetry.data && telemetry.data.length > 0 ? (
+            {telemetry.isLoading ? (
+              <Spinner label="Loading telemetry…" />
+            ) : telemetry.isError ? (
+              <ErrorState title="Could not load telemetry" error={telemetry.error} retry={() => void telemetry.refetch()} />
+            ) : telemetry.data && telemetry.data.length > 0 ? (
               <div className="space-y-3">
                 <div className="rounded-xl border border-accent/40 bg-surface-sunken/80 p-3 flex items-center justify-between shadow-inner">
                   <div>
@@ -626,7 +637,11 @@ export default function RecordingViewer() {
             <h2 className="mb-2 text-sm font-semibold">
               Licence plates {plates.data?.length ? `(${plates.data.length})` : ''}
             </h2>
-            {plates.data && plates.data.length > 0 ? (
+            {plates.isLoading ? (
+              <Spinner label="Loading plate sightings…" />
+            ) : plates.isError ? (
+              <ErrorState title="Could not load plate sightings" error={plates.error} retry={() => void plates.refetch()} />
+            ) : plates.data && plates.data.length > 0 ? (
               <ul className="space-y-2">
                 {plates.data.map((observation) => (
                   <li key={observation.id} className="flex items-center gap-2">

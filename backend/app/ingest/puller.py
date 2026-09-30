@@ -950,8 +950,9 @@ def commit(staging: Path, footage: Path, expected: dict[str, int]) -> list[str]:
 
     The size check is what makes an interrupted window safe: ``tar`` was streaming into the
     last file when the socket died, so that one is short and is discarded rather than
-    published. Everything before it is byte-complete and moves. The scanner only ever sees
-    finished files, and it never sees the staging directory at all.
+    published. Everything before it is byte-complete and moves. Only files in ``expected``
+    are touched, since a later chunk may already be arriving in the same staging directory.
+    The scanner only ever sees finished files, and never sees the staging directory at all.
 
     Two things this deliberately does *not* do.
 
@@ -979,12 +980,18 @@ def commit(staging: Path, footage: Path, expected: dict[str, int]) -> list[str]:
         return committed
 
     for path in sorted(staging.iterdir()):
+        wanted = expected.get(path.name)
+        if wanted is None:
+            # The next chunk may already be arriving while this chunk is committed.
+            # Only this inventory belongs to us: deleting another chunk's staging file
+            # can discard a complete transfer or unlink a file the receiver still writes.
+            # Stale/unrequested files are cleaned before a run starts, never mid-stream.
+            continue
         if not path.is_file():
             continue
-        wanted = expected.get(path.name)
         try:
             staged = path.stat().st_size
-            if wanted is None or staged != wanted:
+            if staged != wanted:
                 # Never silently. This check is what keeps a half-arrived file out of the
                 # library, and it is also the exact place a recording that never lands
                 # disappears without trace: the window ends, the operator sees a hole in
@@ -997,11 +1004,7 @@ def commit(staging: Path, footage: Path, expected: dict[str, int]) -> list[str]:
                     file=path.name,
                     listed_bytes=wanted,
                     staged_bytes=staged,
-                    reason=(
-                        "it was not in this run's plan"
-                        if wanted is None
-                        else "incomplete; it will be fetched again next window"
-                    ),
+                    reason="incomplete; it will be fetched again next window",
                 )
                 path.unlink()
                 continue
@@ -1019,10 +1022,8 @@ def commit(staging: Path, footage: Path, expected: dict[str, int]) -> list[str]:
                         file=path.name,
                         bytes=wanted,
                     )
-                    # Move it below a directory that commit() and _clean() both ignore.
-                    # Otherwise the next chunk's broad staging pass would treat it as an
-                    # unexpected top-level file and delete the only local copy of the new
-                    # remote bytes. The source is retained too because this name is absent
+                    # Preserve it below a directory that commit() and run-start _clean()
+                    # both ignore. The source is retained too because this name is absent
                     # from ``committed``.
                     conflict_dir = staging / ".conflicts"
                     conflict_dir.mkdir(exist_ok=True)

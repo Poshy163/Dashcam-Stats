@@ -6,6 +6,8 @@ import Spinner from '@/components/Spinner'
 import { EmptyState, ErrorState, JobStateBadge, PageHeader, ProgressBar, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
 import type { IngestStatus } from '@/lib/api'
+import { hardwareSummary } from '@/lib/hardware'
+import { backupAttention, capacityExceeded } from '@/lib/operationalStatus'
 import {
   formatBytes,
   formatDateTime,
@@ -25,6 +27,11 @@ export default function Dashboard() {
     queryKey: ['ingest-status'],
     queryFn: api.ingest.status,
     refetchInterval: (query) => (query.state.data?.state === 'running' ? 2_000 : 10_000),
+  })
+  const runtimeHardware = useQuery({
+    queryKey: ['system-hardware'],
+    queryFn: api.system.hardware,
+    refetchInterval: 30_000,
   })
   // Completed jobs, which is what the heading says. /api/jobs orders by state rank first —
   // running, then failed, then next-to-be-claimed — deliberately, for the Queue page. With
@@ -57,7 +64,11 @@ export default function Dashboard() {
   const analysedPct = processTotal ? processing.completed / processTotal : 0
   const activePct = processTotal ? processing.processing / processTotal : 0
   const blockedFeatures = features?.filter((feature) => feature.blockedReason) ?? []
-  const hasAttention = processing.failed > 0 || processing.invalid > 0 || blockedFeatures.length > 0 || hardware.notes.length > 0
+  const effectiveHardware = hardwareSummary(runtimeHardware.data ?? hardware)
+  const backupWarnings = backupAttention(ingest.data)
+  const overCapacity = capacityExceeded(storage.usedBytes, storage.limitBytes)
+  const hasAttention = processing.failed > 0 || processing.invalid > 0 || blockedFeatures.length > 0 || effectiveHardware.notes.length > 0 || runtimeHardware.isError || ingest.isError || jobs.isError || backupWarnings.length > 0 || overCapacity
+  const policyState = (enabled: boolean | undefined) => enabled === undefined ? 'Not reported' : enabled ? 'Enabled' : 'Disabled'
 
   const hour = new Date().getHours()
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening'
@@ -83,10 +94,11 @@ export default function Dashboard() {
         active={processing.processing}
         waiting={processing.pending}
         needsAttention={hasAttention}
+        checking={runtimeHardware.isPending || ingest.isPending}
       />
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4 lg:gap-4">
-        <StatTile label="Recordings" value={totals.recordings.toLocaleString()} icon={<VideoIcon />} />
+        <StatTile label="Available recordings" value={totals.recordings.toLocaleString()} hint="Footage still present on disk" icon={<VideoIcon />} />
         <StatTile label="Journeys" value={totals.journeys.toLocaleString()} icon={<JourneyIcon />} />
         <StatTile
           label="Footage"
@@ -177,14 +189,11 @@ export default function Dashboard() {
             <div className="mt-2 font-mono text-2xs text-content-muted">Capacity limit: {formatBytes(storage.limitBytes)}</div>
           </div>
           <div className="mt-6 rounded-lg border border-border bg-surface-sunken/70 p-3 text-xs font-mono leading-relaxed text-content-muted">
-            {storage.deletionEnabled ? (
-              storage.footageWritable == null ? 'Cleanup enabled; mount safety is checked before each run.' :
-                storage.footageWritable ? 'Automatic cleanup active.' : 'Cleanup enabled; footage mount is read-only.'
-            ) : (
-              <>Retention policy: <strong className="font-semibold text-content">Report-only mode</strong></>
-            )}
+            <dl className="space-y-1"><div>Automatic cleanup schedule: <strong>{policyState(storage.cleanupEnabled)}</strong></div><div>Size / age policy deletion: <strong>{storage.deletionEnabled ? 'Enabled' : 'Report only'}</strong></div><div>Static / empty clip deletion: <strong>{policyState(storage.idleDeleteEnabled)}</strong></div><div>Parked-session deletion: <strong>{policyState(storage.parkedDeleteEnabled)}</strong></div></dl>
+            <p className="mt-2">The static and parked rules operate independently of size-policy deletion. Every deletion still requires its safety checks.</p>
           </div>
-          <Link to="/settings" className="mt-4 inline-flex items-center gap-1.5 font-mono text-xs font-bold text-accent hover:underline">
+          {overCapacity && <p className="mt-3 text-sm text-state-warn">Footage exceeds the configured retention cap by {formatBytes(storage.usedBytes - storage.limitBytes)}. This cap is not the physical disk capacity.</p>}
+          <Link to="/settings?category=storage" className="mt-4 inline-flex items-center gap-1.5 font-mono text-xs font-bold text-accent hover:underline">
             Manage storage <ArrowIcon />
           </Link>
         </section>
@@ -244,8 +253,15 @@ export default function Dashboard() {
               {blockedFeatures.map((feature) => (
                 <AttentionLink key={feature.key} to="/settings" label={`${feature.label} is unavailable`} />
               ))}
-              {hardware.notes.map((note) => <div key={note} className="rounded-lg bg-state-warn/10 p-3 text-xs font-mono text-state-warn">{note}</div>)}
+              {overCapacity && <AttentionLink to="/settings?category=storage" label="Footage exceeds the configured retention cap" />}
+              {backupWarnings.map((warning) => <AttentionLink key={warning} to="/backup" label={warning} />)}
+              {ingest.isError && <ErrorState title="Could not check backup status" error={ingest.error} retry={() => void ingest.refetch()} />}
+              {jobs.isError && <AttentionLink to="/queue" label="Recent processing activity could not be loaded" />}
+              {effectiveHardware.notes.map((note) => <div key={note} className="rounded-lg bg-state-warn/10 p-3 text-xs font-mono text-state-warn">{note}</div>)}
+              {runtimeHardware.isError && <ErrorState title="Could not check the processing runtime" error={runtimeHardware.error} retry={() => void runtimeHardware.refetch()} />}
             </div>
+          ) : runtimeHardware.isPending ? (
+            <Spinner label="Checking processing runtime…" className="mt-5" />
           ) : (
             <div className="mt-5 flex items-center gap-3 rounded-lg border border-state-ok/30 bg-state-ok/10 p-4 text-xs font-mono text-state-ok">
               <CheckIcon />
@@ -259,12 +275,13 @@ export default function Dashboard() {
             </div>
             <div className="flex justify-between gap-3">
               <span>Inference</span>
-              <span className="truncate font-bold text-cyan">{hardware.gpu.name ?? 'OpenVINO Device'}</span>
+              <span className="truncate font-bold text-cyan">{effectiveHardware.inference}</span>
             </div>
             <div className="flex justify-between gap-3">
               <span>Video decoding</span>
-              <span className="font-bold text-content">{hardware.decode.hardwareDecode ? 'Hardware accelerated' : 'Software'}</span>
+              <span className="font-bold text-content">{effectiveHardware.decode}</span>
             </div>
+            {effectiveHardware.decodeReason && <p className="text-content-faint">{effectiveHardware.decodeReason}</p>}
           </div>
         </section>
       </div>
@@ -278,6 +295,7 @@ export default function Dashboard() {
           <Link to="/logs" className="text-sm font-semibold text-accent hover:underline">View all</Link>
         </div>
         {jobs.isLoading && <Spinner className="py-6" />}
+        {jobs.isError && <ErrorState title="Could not load recent activity" error={jobs.error} retry={() => void jobs.refetch()} />}
         {jobs.data && jobs.data.items.length === 0 && (
           <EmptyState title="Nothing processed yet" description="Run a scan from Settings to index your footage." />
         )}
@@ -310,7 +328,7 @@ function friendlyStage(stage: string) {
   return stage.replace(/_/g, ' ').replace(/^./, (letter) => letter.toUpperCase())
 }
 
-function SystemStatus({ active, waiting, needsAttention }: { active: number; waiting: number; needsAttention: boolean }) {
+function SystemStatus({ active, waiting, needsAttention, checking }: { active: number; waiting: number; needsAttention: boolean; checking: boolean }) {
   const healthy = !needsAttention
   return (
     <section className={`relative flex flex-wrap items-center gap-4 rounded-xl border p-4 sm:px-5 overflow-hidden ${healthy ? 'border-state-ok/40 bg-state-ok/[0.06]' : 'border-state-warn/40 bg-state-warn/[0.08]'}`}>
@@ -320,7 +338,7 @@ function SystemStatus({ active, waiting, needsAttention }: { active: number; wai
       </span>
       <div className="min-w-0 flex-1 font-mono">
         <h2 className={`text-xs sm:text-sm font-bold tracking-wider uppercase ${healthy ? 'text-state-ok' : 'text-state-warn'}`}>
-          {healthy ? (active > 0 ? 'Analysis is running' : 'All systems operational') : 'System needs attention'}
+          {needsAttention ? 'System needs attention' : checking ? 'Checking system status' : active > 0 ? 'Analysis is running' : 'All systems operational'}
         </h2>
         <p className="mt-0.5 text-xs text-content-muted">
           {active > 0 ? `${active} stream${active === 1 ? '' : 's'} running · ${waiting} clips waiting` : `${waiting} recording${waiting === 1 ? '' : 's'} queued`}

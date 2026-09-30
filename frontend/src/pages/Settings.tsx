@@ -9,6 +9,7 @@ import { cn } from '@/lib/cn'
 import { formatBytes, formatDate, formatRelative } from '@/lib/format'
 import { invalidateAnalysisQueries } from '@/lib/queryInvalidation'
 import type { RetentionPlan, SettingDef } from '@/lib/types'
+import { removeSavedDraft } from '@/lib/settingsDraft'
 
 export default function Settings() {
   const client = useQueryClient()
@@ -24,26 +25,46 @@ export default function Settings() {
   const query = useQuery({ queryKey: ['settings'], queryFn: api.settings.get })
 
   const save = useMutation({
-    mutationFn: () => api.settings.update(dirty),
-    onSuccess: () => {
-      setDirty({})
+    mutationFn: (submitted: Record<string, unknown>) => api.settings.update(submitted),
+    onSuccess: (categories, submitted) => {
+      setDirty((current) => removeSavedDraft(current, submitted))
       setErrors({})
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
-      client.invalidateQueries({ queryKey: ['settings'] })
+      client.setQueryData(['settings'], categories)
       client.invalidateQueries({ queryKey: ['status'] })
+      client.invalidateQueries({ queryKey: ['system-hardware'] })
     },
-    onError: (error: Error & { detail?: unknown }) => {
+    onError: (error: Error & { detail?: unknown }, submitted) => {
       // The API names the offending key, so surface it against that field.
       const message = error.message ?? 'Could not save settings'
-      const key = Object.keys(dirty).find((k) => message.includes(k))
+      const key = Object.keys(submitted).find((k) => message.includes(k))
       setErrors(key ? { [key]: message } : { _: message })
     },
   })
 
   const reset = useMutation({
     mutationFn: (key: string) => api.settings.reset([key]),
-    onSuccess: () => client.invalidateQueries({ queryKey: ['settings'] }),
+    onSuccess: (categories, key) => {
+      client.setQueryData(['settings'], categories)
+      // A saved default must also replace this field's unsaved draft. Otherwise the
+      // draft hides the reset and the next Save silently writes the old value back.
+      setDirty((current) => {
+        const next = { ...current }
+        delete next[key]
+        return next
+      })
+      setErrors((current) => {
+        const next = { ...current }
+        delete next[key]
+        return next
+      })
+      void client.invalidateQueries({ queryKey: ['status'] })
+      void client.invalidateQueries({ queryKey: ['system-hardware'] })
+    },
+    onError: (error, key) => {
+      setErrors((current) => ({ ...current, [key]: error.message }))
+    },
   })
 
   const refreshQueueAndAnalysis = () => {
@@ -94,6 +115,7 @@ export default function Settings() {
     queryFn: api.system.database,
     enabled: active === 'advanced',
   })
+  const systemInfo = useQuery({ queryKey: ['system-info'], queryFn: api.system.info, enabled: active === 'advanced' })
 
   if (query.isLoading) return <Spinner label="Loading settings…" className="py-24" />
   if (query.isError) return <ErrorState error={query.error} retry={() => query.refetch()} />
@@ -121,12 +143,21 @@ export default function Settings() {
         subtitle="Saved changes take effect without restarting the container."
       />
 
+      {[
+        { title: 'Could not scan footage', mutation: scanNow },
+        { title: 'Could not queue new footage', mutation: processNew },
+        { title: 'Could not reprocess footage', mutation: reprocessAll },
+        { title: 'Could not preview retention', mutation: plan },
+        { title: 'Could not run retention', mutation: runRetention },
+      ].map(({ title, mutation }) => mutation.isError && <ErrorState key={title} title={title} error={mutation.error} />)}
+
       <div className="grid gap-5 md:grid-cols-[13rem_minmax(0,1fr)]">
         <nav className="card flex h-fit gap-1 overflow-x-auto p-2 md:sticky md:top-24 md:flex-col">
           {categories.map((c) => (
             <button
               key={c.key}
               onClick={() => setActive(c.key)}
+              aria-pressed={c.key === category.key}
               className={cn(
                 'min-h-10 whitespace-nowrap rounded-lg px-3 py-2 text-left text-sm transition-colors',
                 c.key === category.key
@@ -154,9 +185,10 @@ export default function Settings() {
                   // the box is shown but not typed into — the API refuses the write anyway,
                   // and an editable field that always fails to save is worse than none.
                   disabled={
-                    setting.read_only || (setting.requires ? !valueOf(setting.requires) : false)
+                    reset.isPending || setting.read_only || (setting.requires ? !valueOf(setting.requires) : false)
                   }
                   error={errors[setting.key]}
+                  resetDisabled={save.isPending}
                   onChange={(v) => setDirty((d) => ({ ...d, [setting.key]: v }))}
                   onReset={() => reset.mutate(setting.key)}
                 />
@@ -218,6 +250,7 @@ export default function Settings() {
                 </p>
                 <div className="flex flex-wrap items-center gap-2">
                   <select
+                    aria-label="Analysis stages to reprocess"
                     className="input w-auto"
                     value={reprocessStage}
                     onChange={(e) => setReprocessStage(e.target.value)}
@@ -327,6 +360,13 @@ export default function Settings() {
           {category.key === 'advanced' && (
             <section className="card space-y-4 p-4">
               <h3 className="text-sm font-semibold">Diagnostics</h3>
+              {systemInfo.isLoading && <Spinner label="Loading version information…" />}
+              {systemInfo.isError && <ErrorState title="Could not load version information" error={systemInfo.error} retry={() => void systemInfo.refetch()} />}
+              {systemInfo.data && <dl className="grid gap-2 text-sm sm:grid-cols-2"><div><dt className="label">Version</dt><dd>{String(systemInfo.data.version ?? 'Not reported')}</dd></div><div><dt className="label">Source revision</dt><dd className="break-all font-mono">{String(systemInfo.data.sourceRevision ?? 'Not reported')}</dd></div></dl>}
+              {hardware.isLoading && <Spinner label="Loading hardware diagnostics…" />}
+              {hardware.isError && <ErrorState title="Could not load hardware diagnostics" error={hardware.error} retry={() => void hardware.refetch()} />}
+              {database.isLoading && <Spinner label="Loading database diagnostics…" />}
+              {database.isError && <ErrorState title="Could not load database diagnostics" error={database.error} retry={() => void database.refetch()} />}
               {hardware.data && (
                 <pre className="overflow-x-auto rounded bg-surface-sunken p-2 text-2xs text-content-muted">
                   {JSON.stringify(hardware.data, null, 2)}
@@ -342,6 +382,7 @@ export default function Settings() {
                 <p className="hint mt-1">
                   Backups are consistent while analysis is running. A validated restore is applied on the next container restart, and the current database is retained as a pre-restore backup.
                 </p>
+                {typeof database.data?.restoreMaxBytes === 'number' && <p className="hint">Maximum restore upload: {formatBytes(database.data.restoreMaxBytes)}.</p>}
                 <div className="mt-2 flex flex-wrap items-center gap-2">
                   <a className="btn" href={api.system.backupUrl()}>Download database backup</a>
                   <label className="btn cursor-pointer">
@@ -350,6 +391,7 @@ export default function Settings() {
                       className="sr-only"
                       type="file"
                       accept=".db,.sqlite,.sqlite3,application/vnd.sqlite3"
+                      disabled={restore.isPending}
                       onChange={(event) => {
                         const file = event.target.files?.[0]
                         if (file && window.confirm('Validate and stage this database for restore on the next restart?')) {
@@ -372,7 +414,7 @@ export default function Settings() {
       {(dirtyCount > 0 || saved) && (
         <div className="fixed inset-x-0 bottom-0 z-20 border-t border-border bg-surface-raised/95 backdrop-blur">
           <div className="mx-auto flex max-w-[1600px] items-center gap-3 px-4 py-2.5">
-            {saved ? (
+            {saved && dirtyCount === 0 ? (
               <span className="text-sm text-state-ok">Settings saved.</span>
             ) : (
               <>
@@ -384,7 +426,7 @@ export default function Settings() {
                   <button className="btn" onClick={() => { setDirty({}); setErrors({}) }}>
                     Discard
                   </button>
-                  <button className="btn btn-primary" onClick={() => save.mutate()} disabled={save.isPending}>
+                  <button className="btn btn-primary" onClick={() => save.mutate({ ...dirty })} disabled={save.isPending || reset.isPending}>
                     {save.isPending ? 'Saving…' : 'Save changes'}
                   </button>
                 </div>
@@ -401,6 +443,7 @@ function Field({
   setting,
   value,
   disabled,
+  resetDisabled,
   error,
   onChange,
   onReset,
@@ -408,6 +451,7 @@ function Field({
   setting: SettingDef
   value: unknown
   disabled: boolean
+  resetDisabled: boolean
   error?: string
   onChange: (value: unknown) => void
   onReset: () => void
@@ -433,7 +477,7 @@ function Field({
       <span className="label" id={labelId}>{setting.label}</span>
       {setting.unit && <span className="text-2xs text-content-faint">({setting.unit})</span>}
       {setting.is_default === false && (
-        <button type="button" className="text-2xs text-content-faint hover:text-accent" onClick={onReset}>
+        <button type="button" className="text-2xs text-content-faint hover:text-accent" onClick={onReset} disabled={disabled || resetDisabled}>
           reset to default
         </button>
       )}
@@ -791,6 +835,7 @@ function SecurityPanel() {
 
       {done && <p className="text-sm text-state-ok">{done}</p>}
       {error && <p className="text-sm text-state-error">{error.message}</p>}
+      {auth.isError && <ErrorState title="Could not load sign-in settings" error={auth.error} retry={() => void auth.refetch()} />}
 
       {configured && (
         <div className="border-t border-border pt-3">
@@ -809,6 +854,8 @@ function SecurityPanel() {
             password ends all of them.
           </p>
           <ul className="mt-2 space-y-1.5">
+            {sessions.isLoading && <li><Spinner label="Loading signed-in browsers…" /></li>}
+            {sessions.isError && <li><ErrorState title="Could not load signed-in browsers" error={sessions.error} retry={() => void sessions.refetch()} /></li>}
             {(sessions.data ?? []).map((session) => (
               <li
                 key={session.id}

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select, update
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import joinedload, load_only
 
 from app.api.deps import PaginationDep, RowId, SessionDep
 from app.db.models import (
@@ -224,6 +225,81 @@ def _series_sample(row: OBDSample, specs=SIGNALS) -> dict[str, object]:
     return result
 
 
+_SIGNAL_OUTPUT_ALIASES = {
+    "short_term_fuel_trim_bank_1_pct": "short_term_fuel_trim_pct",
+    "long_term_fuel_trim_bank_1_pct": "long_term_fuel_trim_pct",
+}
+
+
+def _selected_series_sample(row, specs) -> dict[str, object]:
+    result = {
+        "sample_id": row.sample_id,
+        "t": row.captured_at.isoformat(),
+        "sequence": row.sequence,
+        "ecu_data_status": row.ecu_data_status,
+        "quality": row.quality_json,
+    }
+    for spec in specs:
+        result[_SIGNAL_OUTPUT_ALIASES.get(spec.attribute, spec.attribute)] = getattr(
+            row, spec.attribute
+        )
+    result["provenance"] = {
+        spec.name: spec.provenance for spec in specs if getattr(row, spec.attribute) is not None
+    }
+    return result
+
+
+def _series_time(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        raise HTTPException(422, "Series time filters must include a timezone")
+    try:
+        return value.astimezone(UTC)
+    except (OverflowError, ValueError):
+        raise HTTPException(422, "Series time filter is outside the supported range") from None
+
+
+class _SampleBuckets:
+    """Bounded first/last/min/max sampling across every selected numeric signal."""
+
+    def __init__(self, total: int, limit: int, attributes: list[str]):
+        self.attributes = attributes
+        self.capacity = 2 + 2 * len(attributes)
+        buckets = max(1, limit // self.capacity)
+        self.width = max(1, math.ceil(total / buckets))
+        self.output = []
+        self.first = self.last = None
+        self.extrema = {}
+        self.count = 0
+
+    def add(self, row):
+        if self.count and self.count % self.width == 0:
+            self.emit()
+        if self.first is None:
+            self.first = row
+        self.last = row
+        for attribute in self.attributes:
+            value = getattr(row, attribute)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                continue
+            low, high = self.extrema.get(attribute, (row, row))
+            self.extrema[attribute] = (
+                row if value < getattr(low, attribute) else low,
+                row if value > getattr(high, attribute) else high,
+            )
+        self.count += 1
+
+    def emit(self):
+        if self.first is not None:
+            rows = {row.sequence: row for row in (self.first, self.last)}
+            for pair in self.extrema.values():
+                rows.update({row.sequence: row for row in pair})
+            self.output.extend(rows[key] for key in sorted(rows))
+        self.first = self.last = None
+        self.extrema = {}
+
+
 @router.get("/drives", summary="List stored drives with their rollups")
 async def list_drives(session: SessionDep, page: PaginationDep) -> dict[str, object]:
     total = int((await session.execute(select(func.count(OBDDrive.id)))).scalar() or 0)
@@ -280,10 +356,14 @@ async def drives_summary(session: SessionDep) -> dict[str, object]:
     # aggregate over a typed datetime column back through the driver as its raw stored
     # string, sidestepping the UtcDateTime decoder.
     first = (
-        await session.execute(select(OBDDrive.started_at).order_by(OBDDrive.started_at.asc()))
+        await session.execute(
+            select(OBDDrive.started_at).order_by(OBDDrive.started_at.asc()).limit(1)
+        )
     ).scalar()
     last = (
-        await session.execute(select(OBDDrive.finished_at).order_by(OBDDrive.finished_at.desc()))
+        await session.execute(
+            select(OBDDrive.finished_at).order_by(OBDDrive.finished_at.desc()).limit(1)
+        )
     ).scalar()
     total_distance = float(distance or 0.0)
     total_fuel = float(fuel or 0.0)
@@ -375,7 +455,19 @@ async def _journey_for_drive(session, drive: OBDDrive) -> dict[str, object] | No
     "/drives/{drive_id}/series",
     summary="Full-resolution samples and diagnostic events for one drive",
 )
-async def drive_series(drive_id: str, session: SessionDep) -> dict[str, object]:
+async def drive_series(
+    drive_id: str,
+    session: SessionDep,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    signals: str | None = Query(None, max_length=2048),
+    max_points: int | None = Query(None, ge=64, le=100_000),
+    diagnostic_page: int = Query(1, ge=1, le=1_000_000_000),
+    diagnostic_page_size: int = Query(500, ge=1, le=1000),
+) -> dict[str, object]:
+    start, end = _series_time(start), _series_time(end)
+    if start is not None and end is not None and end < start:
+        raise HTTPException(422, "Series end must be at or after start")
     drive = (
         (
             await session.execute(
@@ -395,23 +487,81 @@ async def drive_series(drive_id: str, session: SessionDep) -> dict[str, object]:
         else None
     )
     _poll_plan_version, specs = specs_for_poll_plan(raw_poll_plan)
-    samples = (
-        (
-            await session.execute(
-                select(OBDSample)
-                .where(OBDSample.drive_db_id == drive.id)
-                .order_by(OBDSample.sequence.asc())
-            )
+    if signals is not None:
+        names = {name.strip() for name in signals.split(",") if name.strip()}
+        known = {spec.name for spec in specs}
+        if not names or names - known:
+            raise HTTPException(422, "Select valid signal names from signal_metadata")
+        specs = tuple(spec for spec in specs if spec.name in names)
+    sample_filters = [OBDSample.drive_db_id == drive.id]
+    diagnostic_filters = [OBDDiagnostic.drive_db_id == drive.id]
+    if start is not None:
+        sample_filters.append(OBDSample.captured_at >= start)
+        diagnostic_filters.append(OBDDiagnostic.observed_at >= start)
+    if end is not None:
+        sample_filters.append(OBDSample.captured_at <= end)
+        diagnostic_filters.append(OBDDiagnostic.observed_at <= end)
+    total_samples = int(
+        await session.scalar(select(func.count()).select_from(OBDSample).where(*sample_filters))
+        or 0
+    )
+    attributes = [spec.attribute for spec in specs]
+    # No raw_json: chart points use typed columns, so loading each complete producer
+    # document wastes most of the allocation before downsampling can discard it.
+    columns = {
+        "sample_id",
+        "sequence",
+        "captured_at",
+        "ecu_data_status",
+        "quality_json",
+        "adapter_voltage_v",
+        "engine_rpm",
+        "mil_on",
+        "dtc_count",
+        *attributes,
+    }
+    if signals is None:
+        columns.update(spec.attribute for spec in SIGNALS)
+    query = (
+        select(OBDSample)
+        .options(load_only(*(getattr(OBDSample, name) for name in columns)))
+        .where(*sample_filters)
+        .order_by(OBDSample.sequence.asc())
+    )
+    sampled = max_points is not None and total_samples > max_points
+    sampler = _SampleBuckets(total_samples, max_points, attributes) if sampled else None
+    samples = []
+    voltages = []
+    result = await session.stream_scalars(query.execution_options(yield_per=512))
+    try:
+        async for row in result:
+            if row.adapter_voltage_v is not None:
+                voltages.append(
+                    battery.VoltageSample(row.captured_at, row.adapter_voltage_v, row.engine_rpm)
+                )
+            if sampler is not None:
+                sampler.add(row)
+            else:
+                samples.append(row)
+    finally:
+        await result.close()
+    if sampler is not None:
+        sampler.emit()
+        samples = sampler.output
+    diagnostic_total = int(
+        await session.scalar(
+            select(func.count()).select_from(OBDDiagnostic).where(*diagnostic_filters)
         )
-        .scalars()
-        .all()
+        or 0
     )
     diagnostics = (
         (
             await session.execute(
                 select(OBDDiagnostic)
-                .where(OBDDiagnostic.drive_db_id == drive.id)
+                .where(*diagnostic_filters)
                 .order_by(OBDDiagnostic.observed_at.asc(), OBDDiagnostic.id.asc())
+                .offset((diagnostic_page - 1) * diagnostic_page_size)
+                .limit(diagnostic_page_size)
             )
         )
         .scalars()
@@ -436,8 +586,24 @@ async def drive_series(drive_id: str, session: SessionDep) -> dict[str, object]:
         # Two readings out of one number: what the alternator was doing while the engine
         # ran, and -- only if it stopped inside this drive -- what the battery's own
         # resting voltage implies. See :mod:`app.obd.battery` for why they cannot be mixed.
-        "battery": battery.estimate(battery.samples_from_rows(samples)),
-        "samples": [_series_sample(row, specs) for row in samples],
+        "battery": await asyncio.to_thread(battery.estimate, voltages),
+        "samples": [
+            (
+                _selected_series_sample(row, specs)
+                if signals is not None
+                else _series_sample(row, specs)
+            )
+            for row in samples
+        ],
+        "sampling": {
+            "total_sample_count": total_samples,
+            "returned_sample_count": len(samples),
+            "downsampled": sampled,
+            "method": "minmax-per-bucket" if sampled else "full-resolution",
+        },
+        "diagnostic_total": diagnostic_total,
+        "diagnostic_page": diagnostic_page,
+        "diagnostic_pages": max(1, -(-diagnostic_total // diagnostic_page_size)),
         "diagnostics": [
             {
                 "observed_at": row.observed_at.isoformat() if row.observed_at else None,

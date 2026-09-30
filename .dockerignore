@@ -10,6 +10,7 @@
 **/venv
 **/node_modules
 frontend/dist
+frontend/tests/.*-test-*/
 **/.vite
 
 # Never bake anyone's footage, database or credentials into a published image.

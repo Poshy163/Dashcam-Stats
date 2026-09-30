@@ -1,20 +1,7 @@
-"""The image's build stamp must not sit above the layers that cost minutes to build.
+"""Keep frequently changing build metadata below expensive Docker layers.
 
-CI builds this image twice on every push to main: once inside ci.yml to test it, and once
-in release.yml to publish it. The two pass different build arguments -- ``ci-<sha>`` against
-``main``, plus a ``BUILD_DATE`` that is a fresh timestamp every run -- so wherever those
-values are consumed, that layer and every layer beneath it miss the cache.
-
-They used to be consumed at the top of the runtime stage. The publish build therefore shared
-no cached layer with the test build that had just finished: it re-ran the apt install,
-re-fetched the Intel compute runtime and rebuilt the virtualenv, about ninety seconds of
-work already done minutes earlier, on the critical path every single time. ``BUILD_DATE``
-alone also guaranteed a miss on the second instruction of every build, so no run ever reused
-the previous one's cache either.
-
-Labels and environment do not care where they are declared. The cache does. These tests pin
-that, because the fix is one an ordinary edit would undo without anything looking wrong --
-moving a LABEL back to the top of a Dockerfile reads as tidying.
+CI builds and tests one image; release promotes that exact artifact. Stable base and
+Python dependency layers should also remain reusable between source revisions.
 """
 
 from __future__ import annotations
@@ -97,13 +84,14 @@ class TestTheBuildStampIsLast:
             assert _index(lines, rf"ARG {arg}\b") > runtime
 
 
-class TestBothBuildsShareOneCache:
-    """The layer order only pays off if the two builds actually read the same cache."""
+class TestTheBuildCacheIsReused:
+    """CI builds once; publishing promotes the tested artifact rather than rebuilding."""
 
-    def test_the_ci_build_and_the_publish_build_both_use_it(self):
+    def test_ci_reuses_the_cache_and_release_does_not_rebuild(self):
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
-        for name, text in (("ci.yml", ci), ("release.yml", release)):
-            assert "cache-from: type=gha" in text, f"{name} does not read the shared cache"
-            assert "cache-to: type=gha,mode=max" in text, f"{name} does not write it"
+        assert "cache-from: type=gha" in ci
+        assert "cache-to: type=gha,mode=max" in ci
+        assert "docker/build-push-action" not in release
+        assert "docker load --input" in release

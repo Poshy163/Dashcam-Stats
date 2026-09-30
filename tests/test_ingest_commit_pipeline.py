@@ -19,7 +19,7 @@ import contextlib
 
 import pytest
 
-from app.ingest.puller import COMMIT_QUEUE_DEPTH, _CommitPipeline
+from app.ingest.puller import COMMIT_QUEUE_DEPTH, _clean, _CommitPipeline, commit
 
 
 def _chunk(name: str) -> list[str]:
@@ -233,3 +233,55 @@ async def test_closing_twice_is_harmless():
     await pipeline.submit(_chunk("a"))
     await pipeline.close()
     await pipeline.close()
+
+
+@pytest.mark.parametrize("next_chunk_bytes", [40, 100])
+async def test_commit_preserves_the_next_chunk_already_in_shared_staging(
+    tmp_path, next_chunk_bytes
+):
+    """Exercise real files while a completed chunk overlaps the next transfer."""
+    footage = tmp_path / "footage"
+    staging = footage / ".ingest_staging"
+    staging.mkdir(parents=True)
+    (staging / "a.ts").write_bytes(b"a" * 100)
+    # Run-start cleanup owns unrelated files. Chunk commits cannot tell these apart
+    # from the next receive's files, so neither may be deleted during the transfer.
+    (staging / "old.ts").write_bytes(b"old")
+    first_started = asyncio.Event()
+    first_released = asyncio.Event()
+    first_finished = asyncio.Event()
+    committed: list[str] = []
+
+    async def handler(chunk):
+        name = chunk[0]
+        if name == "a.ts":
+            first_started.set()
+            await first_released.wait()
+        committed.extend(await asyncio.to_thread(commit, staging, footage, {name: 100}))
+        if name == "a.ts":
+            first_finished.set()
+
+    pipeline = _CommitPipeline(handler, depth=2)
+    pipeline.start()
+    try:
+        await pipeline.submit(_chunk("a.ts"))
+        await asyncio.wait_for(first_started.wait(), timeout=2)
+        next_file = staging / "b.ts"
+        next_file.write_bytes(b"b" * next_chunk_bytes)
+        first_released.set()
+        await asyncio.wait_for(first_finished.wait(), timeout=2)
+        assert next_file.read_bytes() == b"b" * next_chunk_bytes
+        assert (staging / "old.ts").read_bytes() == b"old"
+        with next_file.open("ab") as handle:
+            handle.write(b"b" * (100 - next_chunk_bytes))
+        await pipeline.submit(_chunk("b.ts"))
+        await pipeline.close()
+    finally:
+        await pipeline.close(discard=True)
+
+    assert committed == ["a.ts", "b.ts"]
+    assert (footage / "a.ts").read_bytes() == b"a" * 100
+    assert (footage / "b.ts").read_bytes() == b"b" * 100
+    assert not (footage / "old.ts").exists()
+    _clean(staging)
+    assert list(staging.iterdir()) == []

@@ -34,6 +34,7 @@ export default function Recordings() {
   const filters: RecordingFilters = {
     page,
     pageSize: 24,
+    availability: params.get('availability') === 'available' ? 'available' : params.get('availability') === 'missing' ? 'missing' : 'all',
     state: params.get('state') || undefined,
     search: params.get('search') || undefined,
     journeyId: params.get('journey_id') ? Number(params.get('journey_id')) : undefined,
@@ -85,12 +86,14 @@ export default function Recordings() {
             <button
               className={cn('btn', view === 'grid' && 'bg-surface-sunken')}
               onClick={() => setView_('grid')}
+              aria-pressed={view === 'grid'}
             >
               Grid
             </button>
             <button
               className={cn('btn', view === 'table' && 'bg-surface-sunken')}
               onClick={() => setView_('table')}
+              aria-pressed={view === 'table'}
             >
               Table
             </button>
@@ -114,6 +117,14 @@ export default function Recordings() {
             onBlur={(e) => update('search', e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && update('search', e.currentTarget.value)}
           />
+        </label>
+        <label>
+          <span className="label mb-1 block text-xs">Footage availability</span>
+          <select className="input" value={filters.availability} onChange={(e) => update('availability', e.target.value)}>
+            <option value="all">All history</option>
+            <option value="available">Available on disk</option>
+            <option value="missing">Missing / removed footage</option>
+          </select>
         </label>
         <label>
           <span className="label mb-1 block text-xs">State</span>
@@ -158,6 +169,7 @@ export default function Recordings() {
       </section>
 
       {query.isLoading && <Spinner label="Loading recordings…" className="py-20" />}
+      <p className="hint">History includes recordings whose footage has been removed. Choose “Available on disk” to show recordings with retained footage.</p>
       {query.isError && <ErrorState error={query.error} retry={() => query.refetch()} />}
       {query.data?.items.length === 0 && (
         <EmptyState
@@ -224,6 +236,7 @@ function Meta({ recording }: { recording: Recording }) {
     <div className="tabular flex flex-wrap items-center gap-x-2 gap-y-0.5 text-2xs text-content-faint">
       <span>{formatDuration(recording.durationS)}</span>
       <span>{formatBytes(recording.sizeBytes)}</span>
+      {recording.fileMissing && <span className="font-semibold text-state-warn">Footage unavailable</span>}
       {recording.width && <span>{recording.width}×{recording.height}</span>}
       {recording.hasGps && <span className="text-state-ok">GPS</span>}
       {recording.vehicleCount > 0 && <span>{recording.vehicleCount} vehicles</span>}
@@ -278,6 +291,7 @@ function Table({ items }: { items: Recording[] }) {
             <tr key={r.id} className="hover:bg-surface-sunken">
               <td className="p-2">
                 <Link to={`/recordings/${r.id}`} className="hover:text-accent">{r.filename}</Link>
+                {r.fileMissing && <span className="block text-xs text-state-warn">Footage unavailable</span>}
               </td>
               <td className="p-2 text-content-muted">{r.camera?.name ?? '—'}</td>
               <td className="tabular p-2 text-content-muted">{formatDateTime(r.startedAt)}</td>

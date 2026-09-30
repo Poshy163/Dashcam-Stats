@@ -105,6 +105,7 @@ export default function Logs() {
                 <button
                   key={option.value}
                   onClick={() => setSource(option.value)}
+                  aria-pressed={source === option.value}
                   className={cn(
                     'rounded px-2 py-1',
                     source === option.value

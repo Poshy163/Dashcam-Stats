@@ -29,6 +29,9 @@ export default function Plates() {
 
   // Debounced so typing a plate does not fire a request per keystroke.
   useEffect(() => {
+    // A bookmark or Back navigation already has the right search term. Only editing
+    // the term should reset pagination; mounting /plates?page=2 must retain page 2.
+    if (term === q) return
     const timer = setTimeout(() => {
       const next = new URLSearchParams(params)
       if (term) next.set('q', term)
@@ -37,8 +40,7 @@ export default function Plates() {
       if (next.toString() !== params.toString()) setParams(next, { replace: true })
     }, 250)
     return () => clearTimeout(timer)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [term])
+  }, [term, q, params, setParams])
 
   const query = useQuery({
     queryKey: ['plates', q, page, sort, flagged],
@@ -79,6 +81,7 @@ export default function Plates() {
         title="Licence plates"
         subtitle={query.data ? `${query.data.total} plates on record` : undefined}
       />
+      {quality.isError && <ErrorState title="Could not check plate validation progress" error={quality.error} retry={() => void quality.refetch()} />}
 
       {quality.data && remaining > 0 && (
         <div className="card space-y-1 p-3 text-sm" role="status">

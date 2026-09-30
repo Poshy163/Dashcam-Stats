@@ -25,6 +25,7 @@ from app.api.schemas import (
 from app.auth import gate, ratelimit, service
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
+from app.ingest import origin
 
 log = get_logger(__name__)
 
@@ -41,6 +42,12 @@ async def auth_state(request: Request) -> AuthStateOut:
     """Whether sign-in is on, and whether this browser has done it."""
     required = await service.sign_in_required()
     principal = await gate.authenticate(request)
+    # SPA sign-in does not reload the shell. Its authenticated state refresh is the first
+    # trustworthy chance to learn the address after a public login-page navigation.
+    if principal is not None:
+        await origin.remember(
+            "https" if gate.request_is_https(request) else "http", request.headers.get("host", "")
+        )
     entitled = principal is not None or not required
     return AuthStateOut(
         required=required,

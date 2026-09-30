@@ -32,6 +32,8 @@ export default function ObdDrives() {
         title="OBD drives"
         subtitle="Every recorded drive, kept locally at the logger's full sample resolution."
       />
+      {totals.isLoading && <Spinner label="Loading drive totals…" />}
+      {totals.isError && <ErrorState title="Could not load drive totals" error={totals.error} retry={() => void totals.refetch()} />}
 
       {totals.data && totals.data.driveCount > 0 && (
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-6">

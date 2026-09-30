@@ -10,7 +10,9 @@ OpenVINO version bundled in ONNX Runtime's provider wheel.
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -140,7 +142,9 @@ def disable_gpu_backend(reason: str, *, durable: bool = False) -> bool:
                 "disable; recording it so the next start does not re-arm the chip",
                 reason=reason,
             )
-        _persist_gpu_failure(reason)
+        if not _persist_gpu_failure(reason):
+            with _gpu_state_lock:
+                _gpu_failure_persisted = False
     return first
 
 
@@ -160,30 +164,44 @@ def _gpu_failure_marker_path():
     return get_config().data_dir / GPU_FAILURE_MARKER
 
 
-def _persist_gpu_failure(reason: str) -> None:
+def _persist_gpu_failure(reason: str) -> bool:
     import json as _json
     from datetime import UTC, datetime
 
+    temporary: Path | None = None
     try:
         path = _gpu_failure_marker_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        existing = {}
-        if path.is_file():
-            with contextlib.suppress(Exception):
-                existing = _json.loads(path.read_text("utf-8"))
-        path.write_text(
-            _json.dumps(
-                {
-                    "reason": reason[:500],
-                    "failures": int(existing.get("failures", 0)) + 1,
-                    "last_failed_at": datetime.now(UTC).isoformat(),
-                },
-                indent=1,
-            ),
-            "utf-8",
-        )
+        existing = read_gpu_failure_marker() or {}
+        payload = {
+            "reason": reason[:500],
+            "failures": int(existing.get("failures") or 0) + 1,
+            "last_failed_at": datetime.now(UTC).isoformat(),
+        }
+        # Never truncate the previous verdict: a native abort can kill the process at
+        # any instruction, and an incomplete marker must not re-arm a failed GPU.
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            _json.dump(payload, handle, indent=1)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        return True
     except Exception as exc:
         log.warning("could not record the GPU failure", error=f"{type(exc).__name__}: {exc}")
+        return False
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
 
 
 def restore_gpu_failure_state() -> str | None:
@@ -194,14 +212,8 @@ def restore_gpu_failure_state() -> str | None:
     aborts again. That is the loop the deployment was stuck in.
     """
     global _gpu_disabled_reason
-    import json as _json
-
-    try:
-        path = _gpu_failure_marker_path()
-        if not path.is_file():
-            return None
-        data = _json.loads(path.read_text("utf-8"))
-    except Exception:
+    data = read_gpu_failure_marker()
+    if data is None:
         return None
 
     reason = str(data.get("reason") or "the iGPU aborted during a previous run")
@@ -228,36 +240,41 @@ def read_gpu_failure_marker() -> dict[str, object] | None:
     """
     import json as _json
 
+    invalid = {
+        "reason": "The saved GPU failure marker is unreadable; retry after checking the driver.",
+        "failures": None,
+        "last_failed_at": None,
+    }
     try:
-        path = _gpu_failure_marker_path()
-        if not path.is_file():
-            return None
-        data = _json.loads(path.read_text("utf-8"))
-    except Exception:
+        data = _json.loads(_gpu_failure_marker_path().read_text("utf-8"))
+    except FileNotFoundError:
         return None
+    except (OSError, ValueError):
+        return invalid
     if not isinstance(data, dict):
-        return None
+        return invalid
+    try:
+        failures = int(data.get("failures") or 0)
+    except (TypeError, ValueError, OverflowError):
+        failures = None
     return {
         "reason": str(data.get("reason") or "")[:500],
-        "failures": int(data.get("failures") or 0),
+        "failures": max(0, failures) if failures is not None else None,
         "last_failed_at": data.get("last_failed_at"),
     }
 
 
 def clear_gpu_failure_state() -> bool:
-    """Forget the durable verdict, so the iGPU is tried again after a driver change."""
-    global _gpu_disabled_reason, _gpu_failure_persisted
-    with _gpu_state_lock:
-        _gpu_disabled_reason = None
-        # Cleared with the reason, or the *next* abort in this same process would find the
-        # marker already "written", skip persisting it, and leave nothing on disk for the
-        # restart to read -- re-arming a chip that has just aborted twice.
-        _gpu_failure_persisted = False
-    _clear_device_cache()
+    """Forget the saved verdict while keeping this process's failed GPU disabled."""
+    global _gpu_failure_persisted
     try:
         _gpu_failure_marker_path().unlink(missing_ok=True)
     except Exception:
         return False
+    with _gpu_state_lock:
+        # A late native error from an already-running request may still need to persist
+        # a fresh verdict. Runtime state and device caches remain disabled until restart.
+        _gpu_failure_persisted = False
     return True
 
 

@@ -1,9 +1,9 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 # ---------------------------------------------------------------------------------------
 # Stage 1 — build the web UI
 # ---------------------------------------------------------------------------------------
-FROM node:22-bookworm-slim AS frontend
+FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS frontend
 
 WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json ./
@@ -25,24 +25,22 @@ RUN npm run build
 # Built separately so the (large, slow) wheel installation is not invalidated every time
 # application code changes.
 # ---------------------------------------------------------------------------------------
-FROM python:3.12-slim-bookworm AS pydeps
+FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e AS pydeps
 
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY backend/requirements.txt /tmp/requirements.txt
+COPY backend/requirements-linux-py312.lock /tmp/requirements.lock
+COPY backend/requirements-build.lock /tmp/bootstrap.lock
 RUN python -m venv /opt/venv \
-    && /opt/venv/bin/pip install --upgrade pip wheel \
-    && /opt/venv/bin/pip install -r /tmp/requirements.txt
+    && /opt/venv/bin/pip install --require-hashes --only-binary=:all: -r /tmp/bootstrap.lock \
+    && /opt/venv/bin/pip install --require-hashes --only-binary=:all: -r /tmp/requirements.lock \
+    && /opt/venv/bin/pip check
 
 
 # ---------------------------------------------------------------------------------------
 # Stage 3 — runtime
 # ---------------------------------------------------------------------------------------
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e AS runtime
 
 # The build stamp -- VERSION, VCS_REF, BUILD_DATE -- is deliberately NOT declared here.
 # It lives at the very end of this stage instead. See the note above the LABEL there:
@@ -154,6 +152,8 @@ RUN set -eu; \
     fi; \
     rm -rf /var/lib/apt/lists/*
 
+COPY backend/requirements-build.lock /tmp/bootstrap.lock
+RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: -r /tmp/bootstrap.lock
 COPY --from=pydeps /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
@@ -200,20 +200,9 @@ RUN useradd --system --create-home --uid 1000 --shell /usr/sbin/nologin dashcam 
 
 ENV PYTHONPATH=/app/backend
 
-# The build stamp, last, because it is the only thing in this file that changes on every
-# build -- and a layer that changes invalidates every layer beneath it.
-#
-# It used to sit at the top of this stage. CI builds the image twice, once to test it and
-# once to publish it, and the two pass different values: `ci-<sha>` against `main`, plus a
-# BUILD_DATE that is a fresh timestamp every run. So the publish build shared no cached
-# layer with the test build that had just finished -- it re-ran the apt install, re-fetched
-# the Intel compute runtime, and rebuilt the venv, about ninety seconds of work that had
-# been done minutes earlier. It also meant no build ever reused the previous one's cache,
-# because BUILD_DATE alone guaranteed a miss on the second instruction.
-#
-# Down here the same three values land after everything expensive, so changing them costs
-# one metadata layer. Labels and environment do not care where they are declared; the
-# cache does.
+# Keep per-revision metadata below the expensive layers so source revisions can reuse
+# their dependency cache. CI stamps the commit time and publishes the exact tested image;
+# release promotion does not rebuild or alter these labels.
 ARG VERSION=dev
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown

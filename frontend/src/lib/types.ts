@@ -347,6 +347,8 @@ export interface TelemetryQuality {
   gpsCoverage: TelemetryGpsCoverage
   issueTotal: number
   issueLimit: number
+  issuePage: number
+  issuePages: number
   issues: TelemetryQualityRecording[]
 }
 
@@ -367,6 +369,19 @@ export interface HardwareInfo {
     openvinoDevices: string[]
     preferredDevice: string
     backendName?: string
+    backend?: {
+      available: boolean
+      engine: string | null
+      using: string | null
+      device: string | null
+      accelerated: boolean
+    }
+  }
+  /** The effective processing choice; the fields above describe detected capabilities. */
+  policy?: {
+    decode: string
+    decodeReason: string | null
+    gpuInferenceDisabled: string | null
   }
   cpu: { model: string | null; cores: number }
   ffmpeg: { version: string | null }
@@ -419,6 +434,9 @@ export interface Status {
     limitBytes: number
     usedBytes: number
     deletionEnabled: boolean
+    cleanupEnabled: boolean
+    idleDeleteEnabled: boolean
+    parkedDeleteEnabled: boolean
     footageWritable: boolean | null
   }
   latestJourney: Journey | null

@@ -18,7 +18,7 @@ import { api } from './api'
  */
 export function useMapSettings() {
   const settings = useQuery({ queryKey: ['settings'], queryFn: api.settings.get })
-  return useMemo(() => {
+  const props = useMemo(() => {
     const maps = settings.data?.find((c) => c.key === 'maps')
     const value = (key: string) => maps?.settings.find((s) => s.key === key)?.value
     return {
@@ -27,4 +27,5 @@ export function useMapSettings() {
       maxZoom: (value('maps.max_zoom') as number) || undefined,
     }
   }, [settings.data])
+  return { ...props, query: settings }
 }

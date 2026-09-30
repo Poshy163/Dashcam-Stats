@@ -127,13 +127,14 @@ export default function UnitLogView({ live }: { live: boolean }) {
           />
         </label>
       </div>
+      {tags.isError && <ErrorState title="Could not load log tags" error={tags.error} retry={() => void tags.refetch()} />}
 
       {query.isLoading && <Spinner className="py-16" />}
       {query.isError && <ErrorState error={query.error} retry={() => query.refetch()} />}
       {query.data?.items.length === 0 && (
         <EmptyState
-          title="Nothing collected from the head unit yet"
-          description="The unit ships with Android logging switched off. It is turned back on and a filtered capture is started the next time the car is seen; whatever it recorded arrives on the following visit."
+          title={level || tag || search ? 'No head-unit logs match these filters' : 'Nothing collected from the head unit yet'}
+          description={level || tag || search ? 'Try a different level, tag or search term.' : 'Collected logs appear after the head unit connects and its capture has been transferred.'}
         />
       )}
 

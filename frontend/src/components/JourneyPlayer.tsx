@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
 import { api, type OBDSeriesSample } from '@/lib/api'
 import { formatClock, formatDateTime, formatDuration, formatSpeed } from '@/lib/format'
-import { buildPlayableTimeline } from '@/lib/journeyPlayback'
+import { buildPlayableTimeline, playbackAtTimestamp } from '@/lib/journeyPlayback'
+import { ErrorState } from '@/components/ui'
 import type { JourneyDetail, Recording } from '@/lib/types'
 
 function sampleAt(samples: OBDSeriesSample[], timestampMs: number): OBDSeriesSample | null {
@@ -50,13 +51,19 @@ export default function JourneyPlayer({ journey, driveId }: { journey: JourneyDe
   const [elapsed, setElapsed] = useState(0)
   const [absoluteTimestampMs, setAbsoluteTimestampMs] = useState(timeline[0]?.startedAtMs ?? 0)
   const [continuePlaying, setContinuePlaying] = useState(false)
+  const [cameraNotice, setCameraNotice] = useState<string | null>(null)
+  const [playbackError, setPlaybackError] = useState(false)
   const segment = timeline[clipIndex]
   const clip = segment?.recording
+  // Keep the exact samples needed for this clip and the 10-second lookback used by
+  // sampleAt. Fetching a whole multi-hour drive for each player wastes memory and time.
+  const windowStart = segment ? new Date(segment.startedAtMs - 10_000).toISOString() : undefined
+  const windowEnd = segment ? new Date(segment.startedAtMs + segment.durationS * 1000).toISOString() : undefined
 
   const series = useQuery({
-    queryKey: ['obd-series', driveId],
-    queryFn: () => api.obd.driveSeries(driveId!),
-    enabled: Boolean(driveId),
+    queryKey: ['obd-series', driveId, windowStart, windowEnd],
+    queryFn: () => api.obd.driveSeries(driveId!, { start: windowStart, end: windowEnd, signals: 'vehicle_speed,engine_rpm,engine_load', diagnosticPageSize: 1 }),
+    enabled: Boolean(driveId && segment),
     staleTime: 300_000,
   })
   const obd = useMemo(
@@ -82,14 +89,20 @@ export default function JourneyPlayer({ journey, driveId }: { journey: JourneyDe
     }
   }, [clipIndex, duration, timeline])
 
-  useEffect(() => {
-    setClipIndex(0)
-    seekFootage(Math.min(elapsed, duration), false)
-    // Retain the same position in the combined footage while switching camera angles.
-    // Paired front/rear files normally have identical boundaries; clamping handles a
-    // camera that was absent for part of the drive.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [camera])
+  const switchCamera = (role: typeof camera) => {
+    if (role === camera) return
+    const captureTime = segment && video.current ? segment.startedAtMs + Math.min(segment.durationS, video.current.currentTime) * 1000 : absoluteTimestampMs
+    const target = playbackAtTimestamp(buildPlayableTimeline(journey.recordings, role), captureTime)
+    if (!target) return
+    setContinuePlaying(target.exact && video.current?.paused === false)
+    pendingOffset.current = target.offsetS
+    setCamera(role)
+    setClipIndex(target.clipIndex)
+    setElapsed(target.elapsedS)
+    setAbsoluteTimestampMs(target.timestampMs)
+    setPlaybackError(false)
+    setCameraNotice(target.exact ? null : `This angle has no footage at ${formatDateTime(new Date(captureTime).toISOString())}. Paused at the nearest available moment: ${formatDateTime(new Date(target.timestampMs).toISOString())}.`)
+  }
 
   if (!clip || !segment) return null
 
@@ -105,13 +118,16 @@ export default function JourneyPlayer({ journey, driveId }: { journey: JourneyDe
         {cameras.length > 1 && (
           <div className="flex rounded-lg bg-surface-sunken p-1" aria-label="Camera angle">
             {cameras.map((role) => (
-              <button key={role} className={`rounded-md px-3 py-1.5 text-xs font-semibold ${camera === role ? 'bg-surface-raised shadow-sm' : 'text-content-muted'}`} onClick={() => setCamera(role)}>
+              <button key={role} aria-pressed={camera === role} className={`rounded-md px-3 py-1.5 text-xs font-semibold ${camera === role ? 'bg-surface-raised shadow-sm' : 'text-content-muted'}`} onClick={() => switchCamera(role)}>
                 {roleName(journey.recordings.find((r) => (r.camera?.role ?? 'other') === role)!)}
               </button>
             ))}
           </div>
         )}
       </div>
+      {cameraNotice && <p className="border-b border-border p-3 text-sm text-state-warn" role="status">{cameraNotice}</p>}
+      {series.isError && <ErrorState title="Could not load the playback telemetry" error={series.error} retry={() => void series.refetch()} />}
+      {playbackError && <ErrorState title="Could not play this clip" error={new Error('The video could not be loaded or decoded. Try the recording detail or another camera angle.')} retry={() => { setPlaybackError(false); video.current?.load() }} />}
       <div className="relative bg-black">
         <video
           ref={video}
@@ -122,9 +138,11 @@ export default function JourneyPlayer({ journey, driveId }: { journey: JourneyDe
           preload="metadata"
           playsInline
           onLoadedMetadata={(event) => {
+            setPlaybackError(false)
             event.currentTarget.currentTime = Math.min(pendingOffset.current, event.currentTarget.duration)
             if (continuePlaying) void event.currentTarget.play().catch(() => undefined)
           }}
+          onError={() => setPlaybackError(true)}
           onTimeUpdate={(event) => {
             const offset = Math.min(segment.durationS, event.currentTarget.currentTime)
             setElapsed(Math.min(duration, segment.timelineStartS + offset))
@@ -146,7 +164,7 @@ export default function JourneyPlayer({ journey, driveId }: { journey: JourneyDe
           <div className="absolute bottom-14 right-3 min-w-36 rounded-xl border border-white/20 bg-black/80 p-3 text-white backdrop-blur-sm">
             <div className="text-3xl font-bold tabular">{obd?.vehicleSpeedKmh != null ? formatSpeed(obd.vehicleSpeedKmh) : '—'}</div>
             <div className="mt-1 flex gap-3 text-xs text-white/70">
-              <span>{obd?.engineRpm != null ? `${Math.round(obd.engineRpm).toLocaleString()} rpm` : 'No live OBD sample'}</span>
+              <span>{series.isLoading ? 'Loading OBD…' : obd?.engineRpm != null ? `${Math.round(obd.engineRpm).toLocaleString()} rpm` : 'No live OBD sample'}</span>
               {obd?.engineLoadPct != null && <span>{Math.round(obd.engineLoadPct)}% load</span>}
             </div>
           </div>
@@ -161,7 +179,7 @@ export default function JourneyPlayer({ journey, driveId }: { journey: JourneyDe
           step={0.1}
           value={elapsed}
           aria-label="Journey timeline"
-          onChange={(event) => seekFootage(Number(event.target.value), false)}
+          onChange={(event) => { setCameraNotice(null); seekFootage(Number(event.target.value), video.current?.paused === false) }}
         />
         <div className="flex justify-between text-xs text-content-muted">
           <span className="tabular">{formatClock(elapsed)} / {formatClock(duration)}</span>

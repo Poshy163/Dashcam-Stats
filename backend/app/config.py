@@ -33,6 +33,8 @@ class AppConfig(BaseSettings):
 
     #: Escape hatch for tests and unusual deployments; normally left alone.
     database_url: str | None = None
+    #: Streaming restore ceiling; 16 GiB supports libraries larger than the old 512 MiB cap.
+    restore_max_bytes: int = Field(default=16 * 1024**3, ge=1024, le=1024**4)
 
     #: Atomic exports published by the companion logger.  Kept off the footage path so a
     #: missing/unmounted media share can never make OBD validation delete or overwrite

@@ -47,29 +47,81 @@ class TestReadingTheVerdict:
         assert "CL_OUT_OF_RESOURCES" in str(marker["reason"])
         assert marker["last_failed_at"] == "2026-09-01T13:00:00+00:00"
 
-    def test_a_corrupt_marker_is_not_a_crash(self, tmp_path):
+    @pytest.mark.parametrize("contents", ["{not json", "[]", "null", '"text"'])
+    def test_a_corrupt_marker_is_not_a_crash(self, tmp_path, contents):
         """A half-written marker must not take down the status endpoint that exists to
         explain why the GPU is off."""
-        (tmp_path / "gpu.json").write_text("{not json", "utf-8")
-        assert openvino_session.read_gpu_failure_marker() is None
+        (tmp_path / "gpu.json").write_text(contents, "utf-8")
+        marker = openvino_session.read_gpu_failure_marker()
+        assert marker is not None
+        assert marker["failures"] is None
+        assert openvino_session.restore_gpu_failure_state()
+        assert openvino_session.gpu_backend_disabled() is not None
+
+    @pytest.mark.parametrize("count", ["invalid", [], {}, float("inf")])
+    def test_invalid_failure_count_does_not_break_status_or_startup(self, tmp_path, count):
+        (tmp_path / "gpu.json").write_text(
+            json.dumps({"reason": "previous failure", "failures": count}), "utf-8"
+        )
+        assert openvino_session.read_gpu_failure_marker() is not None
+        assert openvino_session.restore_gpu_failure_state() == "previous failure"
+
+
+class TestPersistingTheVerdict:
+    def test_failed_publication_preserves_previous_marker_and_can_retry(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "gpu.json"
+        previous = json.dumps({"reason": "first", "failures": 3})
+        path.write_text(previous, "utf-8")
+        replace = openvino_session.os.replace
+
+        def fail_replace(source, target):
+            assert path.read_text("utf-8") == previous
+            assert json.loads(source.read_text("utf-8"))["failures"] == 4
+            raise OSError("storage temporarily unavailable")
+
+        monkeypatch.setattr(openvino_session.os, "replace", fail_replace)
+        openvino_session.disable_gpu_backend("second", durable=True)
+        assert path.read_text("utf-8") == previous
+        assert list(tmp_path.iterdir()) == [path]
+        monkeypatch.setattr(openvino_session.os, "replace", replace)
+        openvino_session.disable_gpu_backend("second", durable=True)
+        assert json.loads(path.read_text("utf-8"))["failures"] == 4
+
+    def test_a_new_failure_can_replace_a_corrupt_marker(self, tmp_path):
+        (tmp_path / "gpu.json").write_text("[]", "utf-8")
+        openvino_session.disable_gpu_backend("new failure", durable=True)
+        assert openvino_session.read_gpu_failure_marker()["reason"] == "new failure"
 
 
 class TestClearingTheVerdict:
-    def test_clearing_removes_the_marker_and_the_reason(self, tmp_path):
+    def test_clearing_removes_only_the_marker_until_restart(self, tmp_path, monkeypatch):
         openvino_session.disable_gpu_backend("CL_OUT_OF_RESOURCES", durable=True)
         assert openvino_session.gpu_backend_disabled() is not None
-        assert openvino_session.clear_gpu_failure_state() is True
-        assert openvino_session.gpu_backend_disabled() is None
+
+        def must_not_probe_or_clear():
+            pytest.fail("retry must not clear or re-enumerate a poisoned runtime")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(openvino_session, "_clear_device_cache", must_not_probe_or_clear)
+            assert openvino_session.clear_gpu_failure_state() is True
+        assert openvino_session.gpu_backend_disabled() == "CL_OUT_OF_RESOURCES"
         assert openvino_session.read_gpu_failure_marker() is None
 
     def test_clearing_rearms_persistence_for_the_next_abort(self, tmp_path):
-        """The reason and the persisted flag are cleared together on purpose. If the flag
-        survived, the next abort in this same process would find itself already 'written',
-        skip the marker, and leave the restart nothing to read -- re-arming a chip that
-        just aborted twice."""
+        """An in-flight native request can fail after a retry was requested."""
         openvino_session.disable_gpu_backend("first", durable=True)
         openvino_session.clear_gpu_failure_state()
         openvino_session.disable_gpu_backend("second", durable=True)
         marker = openvino_session.read_gpu_failure_marker()
         assert marker is not None, "a post-clear abort must still be recorded durably"
         assert marker["failures"] == 1
+
+    async def test_retry_endpoint_keeps_gpu_disabled_until_restart(self, client):
+        openvino_session.disable_gpu_backend("failed native context", durable=True)
+        response = await client.post("/api/system/gpu/retry")
+        assert response.status_code == 200
+        assert response.json()["restart_required"] is True
+        assert openvino_session.gpu_backend_disabled() == "failed native context"
+        assert openvino_session.read_gpu_failure_marker() is None

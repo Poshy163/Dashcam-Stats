@@ -95,7 +95,7 @@ export default function JourneyDetail() {
         subtitle={`${formatTime(journey.startedAt)} → ${formatTime(journey.endedAt)} · Footage available: ${footageSummary || 'none'}`}
         actions={
           <>
-            <select className="input w-auto" value={stage} onChange={(e) => setStage(e.target.value)}>
+            <select aria-label="Journey analysis stages" className="input w-auto" value={stage} onChange={(e) => setStage(e.target.value)}>
               {REPROCESS_OPTIONS.map(([value, label]) => (
                 <option key={value} value={value}>{label}</option>
               ))}
@@ -106,6 +106,9 @@ export default function JourneyDetail() {
           </>
         }
       />
+
+      {reprocess.isError && <ErrorState title="Could not reprocess this journey" error={reprocess.error} />}
+      {obd.isError && <ErrorState title="Could not find matching engine telemetry" error={obd.error} retry={() => void obd.refetch()} />}
 
       {journey.motionJson && journey.motionJson.status !== 'moving' && (
         <div className="card p-4 text-sm text-content-muted">
@@ -159,6 +162,7 @@ export default function JourneyDetail() {
           description="The sensor readings did not establish sustained movement, so they are not drawn as a travelled route."
         />
       ) : journey.hasGps ? (
+        mapSettings.query.isPending ? <Spinner label="Loading map provider…" className="py-8" /> : mapSettings.query.isError ? <ErrorState title="Could not load map settings" error={mapSettings.query.error} retry={() => mapSettings.query.refetch()} /> :
         <RouteMap
           route={drawable}
           start={start}

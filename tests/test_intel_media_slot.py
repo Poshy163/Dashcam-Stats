@@ -730,9 +730,12 @@ class TestAPoisonedGpuContextIsFatalToTheGpu:
             assert gpu_backend_disabled(), "a fresh process re-armed a chip that aborts"
             assert openvino.gpu_inference_engaged() is False
 
-            # And an operator can put it back after a driver change.
+            # An operator can retry after a driver change and a process restart.
             assert clear_gpu_failure_state()
             assert not marker.exists()
+            assert gpu_backend_disabled(), "clearing the marker re-armed a poisoned process"
+            reset_gpu_backend_for_tests()
+            assert restore_gpu_failure_state() is None
             assert not gpu_backend_disabled()
         finally:
             reset_gpu_backend_for_tests()

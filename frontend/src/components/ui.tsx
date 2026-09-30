@@ -203,11 +203,11 @@ export function EmptyState({
   )
 }
 
-export function ErrorState({ error, retry }: { error: unknown; retry?: () => void }) {
+export function ErrorState({ error, retry, title = 'Could not load this page' }: { error: unknown; retry?: () => void; title?: string }) {
   const message = error instanceof Error ? error.message : 'Something went wrong'
   return (
     <div className="card w-full border-state-error/40 px-6 py-10 text-center" role="alert">
-      <div className="text-sm font-medium text-state-error">Could not load this page</div>
+      <div className="text-sm font-medium text-state-error">{title}</div>
       <div className="mt-1 text-sm text-content-muted">{message}</div>
       {retry && (
         <button className="btn mt-3" onClick={retry}>
@@ -229,16 +229,16 @@ export function Pagination({
   total: number
   onChange: (page: number) => void
 }) {
-  if (pages <= 1) {
+  if (pages <= 1 && page <= 1) {
     return <div className="tabular py-3 text-xs text-content-faint">{total} results</div>
   }
   return (
     <nav className="flex flex-wrap items-center justify-between gap-3 py-3" aria-label="Pagination">
       <div className="tabular text-xs text-content-faint">
-        Page {page} of {pages} · {total} results
+        Page {page} of {Math.max(1, pages)} · {total} results
       </div>
       <div className="flex gap-1.5">
-        <button className="btn" disabled={page <= 1} onClick={() => onChange(page - 1)}>
+        <button className="btn" disabled={page <= 1} onClick={() => onChange(Math.min(Math.max(1, pages), page - 1))}>
           Previous
         </button>
         <button className="btn" disabled={page >= pages} onClick={() => onChange(page + 1)}>

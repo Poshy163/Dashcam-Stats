@@ -159,7 +159,7 @@ export default function Vehicles() {
                   <div className="text-xs text-content-faint">No plate read</div>
                 )}
                 <div className="tabular text-2xs text-content-faint">
-                  Seen {vehicle.observationCount}× · last {formatDateTime(vehicle.lastSeenAt)}
+                  Detected in {vehicle.observationCount} sampled frames · last {formatDateTime(vehicle.lastSeenAt)}
                 </div>
                 {source && (
                   <Link to={source} className="block text-2xs text-accent hover:underline">

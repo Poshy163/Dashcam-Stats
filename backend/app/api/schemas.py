@@ -534,6 +534,8 @@ class TelemetryQualityOut(BaseModel):
     gps_coverage: TelemetryGpsCoverageOut = Field(default_factory=TelemetryGpsCoverageOut)
     issue_total: int = 0
     issue_limit: int = 250
+    issue_page: int = 1
+    issue_pages: int = 1
     issues: list[TelemetryQualityRecordingOut] = Field(default_factory=list)
 
 
@@ -685,6 +687,9 @@ class StatusStorage(BaseModel):
     limit_bytes: int = 0
     used_bytes: int = 0
     deletion_enabled: bool = False
+    cleanup_enabled: bool = False
+    idle_delete_enabled: bool = False
+    parked_delete_enabled: bool = False
     #: Unknown on read-only status queries; retention verifies this before deleting.
     footage_writable: bool | None = None
 

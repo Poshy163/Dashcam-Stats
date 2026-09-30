@@ -92,7 +92,7 @@ export default function Queue() {
                 Resume queue
               </button>
             ) : (
-              <button className="btn" onClick={() => pause.mutate()} disabled={pause.isPending}>
+              <button className="btn" onClick={() => pause.mutate()} disabled={pause.isPending || !stats.data || stats.isError}>
                 Pause queue
               </button>
             )}
@@ -106,24 +106,37 @@ export default function Queue() {
           </>
         }
       />
+      {stats.isLoading && <Spinner label="Loading queue status…" />}
+      {stats.isError && <ErrorState title="Could not load queue status" error={stats.error} retry={() => void stats.refetch()} />}
+      {activeJobs.isError && <ErrorState title="Could not load active jobs" error={activeJobs.error} retry={() => void activeJobs.refetch()} />}
+
+      {[
+        { action: 'pause the queue', mutation: pause },
+        { action: 'resume the queue', mutation: resume },
+        { action: 'retry failed jobs', mutation: retryAll },
+        { action: 'retry the job', mutation: retryOne },
+        { action: 'cancel the job', mutation: cancel },
+      ].map(({ action, mutation }) => mutation.isError && (
+        <ErrorState key={action} title={`Could not ${action}`} error={mutation.error} />
+      ))}
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatTile
           label="Queued"
-          value={stats.data?.queued ?? 0}
+          value={stats.data?.queued ?? '—'}
           hint={
             thumbnails > 0
               ? `${thumbnails} waiting on a thumbnail, not on analysis`
               : undefined
           }
         />
-        <StatTile label="Running" value={stats.data?.running ?? 0} tone={running ? 'busy' : 'default'} />
+        <StatTile label="Running" value={stats.data?.running ?? '—'} tone={running ? 'busy' : 'default'} />
         <StatTile
           label="Failed"
-          value={stats.data?.failed ?? 0}
+          value={stats.data?.failed ?? '—'}
           tone={stats.data?.failed ? 'error' : 'default'}
         />
-        <StatTile label="Completed today" value={stats.data?.completedToday ?? 0} tone="ok" />
+        <StatTile label="Completed today" value={stats.data?.completedToday ?? '—'} tone="ok" />
       </div>
 
       {/* A queue full of thumbnail jobs is not a queue full of analyses, and the count on
@@ -197,6 +210,7 @@ export default function Queue() {
       <div className="flex items-center gap-2">
         <span className="label text-xs">Filter</span>
         <select
+          aria-label="Filter jobs by state"
           className="input w-auto"
           value={state}
           onChange={(e) => {
@@ -255,12 +269,12 @@ export default function Queue() {
                   <td className="p-2">
                     <div className="flex gap-1">
                       {(job.state === 'failed' || job.state === 'cancelled') && (
-                        <button className="btn px-2 py-1 text-xs" onClick={() => retryOne.mutate(job.id)}>
+                        <button className="btn px-2 py-1 text-xs" disabled={retryOne.isPending} onClick={() => retryOne.mutate(job.id)}>
                           Retry
                         </button>
                       )}
                       {(job.state === 'queued' || job.state === 'running') && (
-                        <button className="btn px-2 py-1 text-xs" onClick={() => cancel.mutate(job.id)}>
+                        <button className="btn px-2 py-1 text-xs" disabled={cancel.isPending} onClick={() => cancel.mutate(job.id)}>
                           Cancel
                         </button>
                       )}

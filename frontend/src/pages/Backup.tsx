@@ -439,6 +439,14 @@ export default function Backup() {
           </>
         }
       />
+      {status.isLoading && <Spinner label="Loading backup status…" />}
+
+      {(pullNow.isError || cancel.isError) && (
+        <div className="mb-6 space-y-3">
+          {pullNow.isError && <ErrorState title="Could not start the backup" error={pullNow.error} />}
+          {cancel.isError && <ErrorState title="Could not cancel the backup" error={cancel.error} />}
+        </div>
+      )}
 
       {showTest.isSuccess && (
         <div className="card mb-6 border-state-ok/40 px-5 py-4 text-sm">
@@ -986,6 +994,8 @@ export default function Backup() {
           </div>
         </div>
       )}
+      {obdBundles.isLoading && <Spinner label="Loading stored OBD bundles…" />}
+      {obdBundles.isError && <ErrorState title="Could not load stored OBD bundles" error={obdBundles.error} retry={() => void obdBundles.refetch()} />}
 
       {obdBundles.data?.items.length ? (
         <div className="card mb-8 overflow-x-auto">

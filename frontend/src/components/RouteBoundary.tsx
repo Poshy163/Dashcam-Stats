@@ -21,24 +21,7 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react'
 
 import { ErrorState } from '@/components/ui'
-
-/** Survives the reload it guards, and only that. Cleared as soon as a page renders. */
-const RELOAD_FLAG = 'dashcam:chunk-reloaded'
-
-/**
- * Whether this is a chunk that is no longer on the server.
- *
- * Matched on the message because that is all there is: browsers disagree on the wording
- * and none of them give it a stable `name`. Chrome says "Failed to fetch dynamically
- * imported module", Firefox "error loading dynamically imported module", Safari
- * "Importing a module script failed", and bundler-level wrappers say "ChunkLoadError".
- */
-function isStaleChunk(error: unknown): boolean {
-  const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error ?? '')
-  return /dynamically imported module|module script failed|ChunkLoadError|Loading chunk \S+ failed/i.test(
-    message,
-  )
-}
+import { claimChunkReload, clearChunkReload, isStaleChunk } from '@/lib/chunkRecovery'
 
 interface Props {
   children: ReactNode
@@ -55,15 +38,8 @@ export default class RouteBoundary extends Component<Props, State> {
     return { error }
   }
 
-  componentDidMount(): void {
-    // Children mounted, so whatever the last reload was for is resolved. Clearing it here
-    // rather than never means the *next* deployment gets its one reload too.
-    sessionStorage.removeItem(RELOAD_FLAG)
-  }
-
   componentDidCatch(error: unknown, info: ErrorInfo): void {
-    if (isStaleChunk(error) && sessionStorage.getItem(RELOAD_FLAG) === null) {
-      sessionStorage.setItem(RELOAD_FLAG, '1')
+    if (isStaleChunk(error) && claimChunkReload()) {
       window.location.reload()
       return
     }
@@ -79,7 +55,7 @@ export default class RouteBoundary extends Component<Props, State> {
         <ErrorState
           error={new Error('This page was updated while the tab was open, and could not reload.')}
           retry={() => {
-            sessionStorage.removeItem(RELOAD_FLAG)
+            clearChunkReload()
             window.location.reload()
           }}
         />

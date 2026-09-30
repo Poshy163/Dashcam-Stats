@@ -53,7 +53,7 @@ const LAYERS = [
 
 type Layer = (typeof LAYERS)[number]['value']
 
-function FitToData({ points }: { points: [number, number, number][] }) {
+function FitToData({ points }: { points: [number, number][] }) {
   const map = useMap()
   useEffect(() => {
     if (points.length === 0) return
@@ -95,6 +95,11 @@ export default function HeatmapPage() {
     () => points.map(([lat, lon, weight]) => ({ lat, lon, weight })),
     [points],
   )
+  const mapPoints = useMemo<[number, number][]>(() => {
+    const heat = layer === 'routes' ? [] : points.map(([lat, lon]) => [lat, lon] as [number, number])
+    const lines = layer === 'heat' ? [] : (routes.data?.lines ?? []).flat().filter(([lat, lon]) => Number.isFinite(lat) && Number.isFinite(lon)).map(([lat, lon]) => [lat!, lon!] as [number, number])
+    return [...heat, ...lines]
+  }, [layer, points, routes.data])
 
   const mode = MODES.find((m) => m.value === minSpeedKmh) ?? MODES[0]!
 
@@ -148,8 +153,12 @@ export default function HeatmapPage() {
       {query.isError && <ErrorState error={query.error} retry={() => query.refetch()} />}
 
       {query.isLoading && <Spinner label="Aggregating GPS fixes…" className="py-24" />}
+      {layer !== 'heat' && routes.isLoading && <Spinner label="Loading traced routes…" className="py-8" />}
+      {layer !== 'heat' && routes.isError && <ErrorState title="Could not load traced routes" error={routes.error} retry={() => routes.refetch()} />}
+      {maps.query.isPending && <Spinner label="Loading map provider…" className="py-8" />}
+      {maps.query.isError && <ErrorState title="Could not load map settings" error={maps.query.error} retry={() => maps.query.refetch()} />}
 
-      {data && points.length === 0 && !query.isLoading && (
+      {data && mapPoints.length === 0 && !query.isLoading && (layer === 'heat' || routes.isSuccess) && (
         <EmptyState
           title="No GPS data yet"
           description={
@@ -160,7 +169,7 @@ export default function HeatmapPage() {
         />
       )}
 
-      {data && points.length > 0 && (
+      {data && (
         <>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <StatTile label="Grid cells" value={data.cells.toLocaleString()} />
@@ -180,15 +189,18 @@ export default function HeatmapPage() {
             />
           </div>
 
-          <div className="overflow-hidden rounded-lg border border-border">
-            <MapContainer center={[points[0]![0], points[0]![1]]} zoom={12} scrollWheelZoom className="h-[70vh] w-full">
+        </>
+      )}
+
+      {mapPoints.length > 0 && maps.query.isSuccess && <div className="overflow-hidden rounded-lg border border-border">
+            <MapContainer center={mapPoints[0]!} zoom={12} scrollWheelZoom className="h-[70vh] w-full">
               <TileLayer
                 url={maps.tileUrl ?? TILES}
                 attribution={maps.attribution ?? ATTRIBUTION}
                 maxZoom={maps.maxZoom ?? 19}
               />
-              <FitToData points={points} />
-              {layer !== 'routes' && (
+              <FitToData points={mapPoints} />
+              {layer !== 'routes' && data && (
                 <HeatLayer
                   points={heatPoints}
                   maxWeight={data.maxWeight}
@@ -197,11 +209,12 @@ export default function HeatmapPage() {
               )}
               {layer !== 'heat' && routes.data && <RouteLines lines={routes.data.lines} />}
             </MapContainer>
-          </div>
+          </div>}
 
           <DerivedHint>
-            {mode.hint} Colour is scaled logarithmically, so a road driven twice stays
-            visible next to a driveway parked in for hours.
+            {layer !== 'routes' && <>{mode.hint} Colour is scaled logarithmically, so a road driven twice stays
+            visible next to a driveway parked in for hours. </>}
+            {layer === 'routes' && 'Routes show traced roads independently of the heat grid and speed filters. '}
             {layer !== 'heat' && routes.data && (
               <>
                 {' '}
@@ -211,10 +224,8 @@ export default function HeatmapPage() {
                 {routes.data.truncated && ' Not all of them fit; some are not shown.'}
               </>
             )}
-            {data.truncated && ' Showing the densest cells only — zoom the grid out for full coverage.'}
+            {layer !== 'routes' && data?.truncated && ' Showing the densest cells only — zoom the grid out for full coverage.'}
           </DerivedHint>
-        </>
-      )}
     </div>
   )
 }

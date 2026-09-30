@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+import re
+from datetime import UTC, date, datetime, timedelta
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from fastapi.encoders import jsonable_encoder
+from pydantic import BeforeValidator
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import aliased, selectinload
 
 from app.ai.normalise_au import normalise
-from app.api.deps import PaginationDep, RowId, RowIdFilter, SessionDep
+from app.api.deps import MAX_PAGE, PaginationDep, RowId, RowIdFilter, SessionDep
 from app.api.geometry import build_polyline_indices
 from app.api.schemas import (
     JobOut,
@@ -72,11 +75,18 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/api", tags=["content"])
 
 
-def _is_date_only(value: datetime) -> bool:
-    return (value.hour, value.minute, value.second, value.microsecond) == (0, 0, 0, 0)
+def _parse_date_filter(value):
+    # Preserve the distinction before Pydantic turns a bare date into midnight. A full
+    # timestamp at midnight is still an instant and must not expand into a whole day.
+    if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return date.fromisoformat(value)
+    return value
 
 
-def _day_start(value: datetime) -> datetime:
+DateFilter = Annotated[datetime | date, BeforeValidator(_parse_date_filter)]
+
+
+def _day_start(value: date | datetime) -> datetime:
     """Interpret a bare date as local midnight, in UTC.
 
     ``started_at`` is stored in UTC while the picker speaks the user's local time, and for
@@ -90,8 +100,10 @@ def _day_start(value: datetime) -> datetime:
     ``ValueError`` handler and returned 500. ``date_from=0001-01-01`` is not an attack; it
     is what a date picker sends when someone holds the up arrow.
     """
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=local_zone() if _is_date_only(value) else UTC)
+    if not isinstance(value, datetime):
+        value = datetime.combine(value, datetime.min.time(), tzinfo=local_zone())
+    elif value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
     try:
         return value.astimezone(UTC)
     except (OverflowError, OSError, ValueError):
@@ -101,7 +113,7 @@ def _day_start(value: datetime) -> datetime:
         ) from None
 
 
-def _before_end_of(column, value: datetime):
+def _before_end_of(column, value: date | datetime):
     """Upper-bound condition for a date filter.
 
     A bare date means the whole of that day, so the bound becomes the start of the day
@@ -113,14 +125,15 @@ def _before_end_of(column, value: datetime):
     instant meant that instant, and silently widening it to the end of the day would be a
     different bug in the other direction.
     """
-    if _is_date_only(value):
+    if not isinstance(value, datetime):
         try:
-            return column < _day_start(value) + timedelta(days=1)
+            # Advance the calendar date before converting to UTC: daylight-saving days
+            # contain 23 or 25 hours, so adding 24 hours in UTC shifts the boundary.
+            return column < _day_start(value + timedelta(days=1))
         except OverflowError:
             # The other end of the calendar: 9999-12-31 has no day after it.
             raise ValueError(
-                f"{value.date().isoformat()} is outside the range of dates this "
-                "application can represent."
+                f"{value.isoformat()} is outside the range of dates this application can represent."
             ) from None
     return column <= _day_start(value)
 
@@ -161,8 +174,9 @@ async def list_recordings(
     state: str | None = None,
     has_gps: bool | None = None,
     has_detections: bool | None = None,
-    date_from: datetime | None = None,
-    date_to: datetime | None = None,
+    availability: Literal["all", "available", "missing"] = "all",
+    date_from: DateFilter | None = None,
+    date_to: DateFilter | None = None,
     search: str | None = None,
     sort: str = Query("started_desc"),
 ):
@@ -184,6 +198,8 @@ async def list_recordings(
         stmt = stmt.where(Recording.state == state)
     if has_gps is not None:
         stmt = stmt.where(Recording.has_gps.is_(has_gps))
+    if availability != "all":
+        stmt = stmt.where(Recording.file_missing.is_(availability == "missing"))
     if has_detections is not None:
         condition = (Recording.vehicle_count > 0) | (Recording.plate_count > 0)
         stmt = stmt.where(condition if has_detections else ~condition)
@@ -438,8 +454,29 @@ def _telemetry_issue_reasons(row) -> list[str]:
 
 
 @router.get("/telemetry/quality", response_model=TelemetryQualityOut)
-async def telemetry_quality(session: SessionDep):
-    visible = (Recording.ignored.is_(False), Recording.file_missing.is_(False))
+async def telemetry_quality(
+    session: SessionDep,
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(_TELEMETRY_ISSUE_LIMIT, ge=1, le=_TELEMETRY_ISSUE_LIMIT),
+    reason: Literal[
+        "analysis_pending",
+        "analysis_outdated",
+        "no_samples",
+        "gps_no_fix",
+        "gps_unreadable",
+        "gps_rejected",
+        "gps_coverage_incomplete",
+        "telemetry_warnings",
+    ]
+    | None = None,
+    date_from: DateFilter | None = None,
+    date_to: DateFilter | None = None,
+):
+    visible = [Recording.ignored.is_(False), Recording.file_missing.is_(False)]
+    if date_from is not None:
+        visible.append(Recording.started_at >= _day_start(date_from))
+    if date_to is not None:
+        visible.append(_before_end_of(Recording.started_at, date_to))
     status_case = _telemetry_status_case()
 
     # One aggregate query for the tiles: no rows come back, only the tallies.
@@ -473,6 +510,28 @@ async def telemetry_quality(session: SessionDep):
     measured = and_(current, has_samples)
     incomplete = _telemetry_gps_incomplete()
     warnings = Recording.telemetry_problem_count > 0
+    issue_filters = [*visible, status_case != "healthy"]
+    if reason is not None:
+        reason_conditions = {
+            "analysis_pending": ~done,
+            "analysis_outdated": and_(done, ~revision_current),
+            "no_samples": and_(current, ~has_samples),
+            "gps_no_fix": and_(measured, Recording.gps_no_fix_count > 0),
+            "gps_unreadable": and_(measured, Recording.gps_ocr_gap_count > 0),
+            "gps_rejected": and_(measured, Recording.gps_rejected_count > 0),
+            "gps_coverage_incomplete": and_(
+                measured,
+                Recording.gps_no_fix_count == 0,
+                Recording.gps_ocr_gap_count == 0,
+                Recording.gps_rejected_count == 0,
+                incomplete,
+            ),
+            "telemetry_warnings": and_(measured, warnings),
+        }
+        issue_filters.append(reason_conditions[reason])
+    issue_total = int(
+        await session.scalar(select(func.count(Recording.id)).where(*issue_filters)) or 0
+    )
 
     def total_when(condition, value=1):
         return func.coalesce(func.sum(case((condition, value), else_=0)), 0)
@@ -529,13 +588,15 @@ async def telemetry_quality(session: SessionDep):
                 Recording.telemetry_problem_count,
                 status_case.label("status"),
             )
-            .where(*visible, status_case != "healthy")
+            .where(*issue_filters)
             .order_by(
                 Recording.gps_longest_gap_s.desc(),
                 Recording.telemetry_problem_count.desc(),
                 Recording.telemetry_point_count.desc(),
+                Recording.id.desc(),
             )
-            .limit(_TELEMETRY_ISSUE_LIMIT)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
         )
     ).all()
 
@@ -566,15 +627,17 @@ async def telemetry_quality(session: SessionDep):
         outdated_recordings=coverage["outdated_recordings"],
         empty_recordings=coverage["empty_recordings"],
         gps_coverage=TelemetryGpsCoverageOut.model_validate(dict(coverage)),
-        issue_total=total - counts["healthy"],
-        issue_limit=_TELEMETRY_ISSUE_LIMIT,
+        issue_total=issue_total,
+        issue_limit=page_size,
+        issue_page=page,
+        issue_pages=max(1, -(-issue_total // page_size)),
         issues=issues,
     )
 
 
 @router.get("/recordings/{recording_id}/export.json", response_model=None)
 async def export_recording_metadata(recording_id: RowId, session: SessionDep) -> Response:
-    recording = await session.get(Recording, recording_id)
+    recording = await session.get(Recording, recording_id, options=[selectinload(Recording.camera)])
     if recording is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording not found")
     telemetry = list(
@@ -603,7 +666,7 @@ async def export_recording_metadata(recording_id: RowId, session: SessionDep) ->
         "recording": RecordingOut.model_validate(recording).model_dump(),
         "telemetry": [
             TelemetryPointOut.model_validate(point)
-            .model_copy(update={"quality": point.quality_json or {}})
+            .model_copy(update={"quality": telemetry_quality_view(point)})
             .model_dump()
             for point in telemetry
         ],
@@ -626,8 +689,8 @@ async def export_recording_metadata(recording_id: RowId, session: SessionDep) ->
 async def list_journeys(
     session: SessionDep,
     page: PaginationDep,
-    date_from: datetime | None = None,
-    date_to: datetime | None = None,
+    date_from: DateFilter | None = None,
+    date_to: DateFilter | None = None,
     has_gps: bool | None = None,
     sort: str = Query("started_desc"),
     include_parked: bool = Query(
@@ -832,7 +895,7 @@ async def reprocess_journey(journey_id: RowId, body: ReprocessRequest, session: 
 # --------------------------------------------------------------------------------------
 
 
-def _plate_has_visible_observation():
+def _plate_has_visible_observation(min_confidence: float | None = None):
     """A plate the current analysis still stands behind.
 
     Lifted out of ``list_plates`` because ``/api/search`` was answering a different
@@ -840,7 +903,7 @@ def _plate_has_visible_observation():
     dismissed, or one hidden by an active reanalysis, came back from search while being
     absent from the Plates page it links to.
     """
-    return (
+    query = (
         select(PlateObservation.id)
         .join(Recording, Recording.id == PlateObservation.recording_id)
         .where(
@@ -851,8 +914,10 @@ def _plate_has_visible_observation():
             # hidden.
             visible_revision(Recording.plate_revision),
         )
-        .exists()
     )
+    if min_confidence is not None:
+        query = query.where(PlateObservation.ocr_confidence >= min_confidence)
+    return query.exists()
 
 
 @router.get("/plates/quality")
@@ -955,7 +1020,14 @@ async def list_plates(
     min_confidence: float | None = None,
     sort: str = Query("last_seen_desc"),
 ):
-    stmt = select(Plate).where(Plate.dismissed.is_(False), _plate_has_visible_observation())
+    rollups = _visible_plate_rollups().subquery()
+    stmt = (
+        select(Plate)
+        .join(rollups, rollups.c.plate_id == Plate.id)
+        .where(Plate.dismissed.is_(False))
+    )
+    if min_confidence is not None:
+        stmt = stmt.where(rollups.c.confidence >= min_confidence)
     if q:
         # Partial matching is the point: "ABC" must find "ABC123". Both the normalised
         # and the display text are searched, since a plate that failed normalisation is
@@ -966,18 +1038,15 @@ async def list_plates(
         )
     if flagged is not None:
         stmt = stmt.where(Plate.flagged.is_(flagged))
-    if min_confidence is not None:
-        stmt = stmt.where(Plate.best_confidence >= min_confidence)
-
     order = {
-        "last_seen_desc": Plate.last_seen_at.desc().nullslast(),
-        "first_seen_desc": Plate.first_seen_at.desc().nullslast(),
-        "observations_desc": Plate.observation_count.desc(),
-        "confidence_desc": Plate.best_confidence.desc(),
+        "last_seen_desc": rollups.c.last_seen.desc().nullslast(),
+        "first_seen_desc": rollups.c.first_seen.desc().nullslast(),
+        "observations_desc": rollups.c.observations.desc(),
+        "confidence_desc": rollups.c.confidence.desc(),
         "alpha": Plate.normalised_text.asc(),
-    }.get(sort, Plate.last_seen_at.desc().nullslast())
+    }.get(sort, rollups.c.last_seen.desc().nullslast())
 
-    page_out = await _paginate(session, stmt.order_by(order), page, PlateOut)
+    page_out = await _paginate(session, stmt.order_by(order, Plate.id.desc()), page, PlateOut)
     # The crops live on the observations, not on the plate, so the generic paginator
     # cannot know about them: it validates the ORM row and stops. Without this the Plates
     # grid showed "no vehicle image" under every card while the images sat on disk and
@@ -1009,11 +1078,7 @@ async def _best_observations(session, plate_ids: list[int]) -> dict[int, PlateOb
         )
         .join(Recording, Recording.id == PlateObservation.recording_id)
         .where(PlateObservation.plate_id.in_(plate_ids))
-        .where(
-            or_(
-                Recording.plate_revision.is_(None), Recording.plate_revision != INVALIDATED_REVISION
-            )
-        )
+        .where(visible_revision(Recording.plate_revision))
         .subquery()
     )
     observations = (
@@ -1034,20 +1099,7 @@ async def _with_representative(session, items: list[PlateOut]) -> list[PlateOut]
         row.plate_id: row
         for row in (
             await session.execute(
-                select(
-                    PlateObservation.plate_id,
-                    func.count(PlateObservation.id).label("observations"),
-                    func.count(func.distinct(PlateObservation.journey_id)).label("journeys"),
-                    func.min(PlateObservation.captured_at).label("first_seen"),
-                    func.max(PlateObservation.captured_at).label("last_seen"),
-                    func.max(PlateObservation.ocr_confidence).label("confidence"),
-                )
-                .join(Recording, Recording.id == PlateObservation.recording_id)
-                .where(
-                    PlateObservation.plate_id.in_(plate_ids),
-                    visible_revision(Recording.plate_revision),
-                )
-                .group_by(PlateObservation.plate_id)
+                _visible_plate_rollups().where(PlateObservation.plate_id.in_(plate_ids))
             )
         ).all()
     }
@@ -1064,6 +1116,23 @@ async def _with_representative(session, items: list[PlateOut]) -> list[PlateOut]
             item.last_seen_at = rollup.last_seen
             item.best_confidence = float(rollup.confidence or 0.0)
     return items
+
+
+def _visible_plate_rollups():
+    """The same visible population for list filters, ordering, and displayed totals."""
+    return (
+        select(
+            PlateObservation.plate_id,
+            func.count(PlateObservation.id).label("observations"),
+            func.count(func.distinct(PlateObservation.journey_id)).label("journeys"),
+            func.min(PlateObservation.captured_at).label("first_seen"),
+            func.max(PlateObservation.captured_at).label("last_seen"),
+            func.max(PlateObservation.ocr_confidence).label("confidence"),
+        )
+        .join(Recording, Recording.id == PlateObservation.recording_id)
+        .where(visible_revision(Recording.plate_revision))
+        .group_by(PlateObservation.plate_id)
+    )
 
 
 async def _attach_representative(session, plate: Plate) -> PlateOut:
@@ -1307,8 +1376,8 @@ async def list_vehicles(
     session: SessionDep,
     page: PaginationDep,
     class_label: str | None = None,
-    date_from: datetime | None = None,
-    date_to: datetime | None = None,
+    date_from: DateFilter | None = None,
+    date_to: DateFilter | None = None,
     has_plate: bool | None = None,
 ):
     """Vehicles actually seen, which live in ``tracked_objects``.
@@ -1629,7 +1698,10 @@ async def search(session: SessionDep, q: str = Query(..., min_length=1)):
         # Added to the base statement, not a fresh one: replacing it dropped the
         # `visible_journey_ids()` restriction the title branch keeps, so searching a date
         # was the one way to reach journeys every other route hides.
-        journey_stmt = journey_stmt.where(func.date(Journey.started_at) == day.date())
+        journey_stmt = journey_stmt.where(
+            Journey.started_at >= _day_start(day.date()),
+            _before_end_of(Journey.started_at, day.date()),
+        )
         break
     else:
         journey_stmt = journey_stmt.where(Journey.title.ilike(f"%{term}%"))
