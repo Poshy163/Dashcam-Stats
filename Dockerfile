@@ -104,7 +104,7 @@ COPY docker/install-intel-runtime.py /tmp/install-intel-runtime.py
 COPY backend/scripts/check_intel_runtime.py /tmp/check_intel_runtime.py
 RUN apt-get update \
     && python /tmp/install-intel-runtime.py /usr/local/share/dashcam/intel-runtime.json "${INTEL_COMPUTE_RUNTIME}" \
-    && python /tmp/check_intel_runtime.py \
+    && python /tmp/check_intel_runtime.py --cache-key-output /usr/local/share/dashcam/intel-runtime-cache-key \
     && rm -rf /var/lib/apt/lists/* /tmp/install-intel-runtime.py /tmp/check_intel_runtime.py
 
 COPY backend/requirements-build.lock /tmp/bootstrap.lock

@@ -21,7 +21,9 @@ import contextlib
 import json
 import math
 import shutil
+import tempfile
 import weakref
+from collections import deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -666,6 +668,9 @@ async def _run(
         # stay outside: they hold nothing the driver cares about, and serialising a
         # fifteen-minute decode behind this slot would stall every other worker.
         async with _vaapi_decode_lock():
+            reason = software_decode_reason()
+            if reason is not None:
+                raise DecodeError(f"hardware decode was withheld before launch: {reason}")
             return await _run_process(cmd, timeout, stdin, gated=True)
     return await _run_process(cmd, timeout, stdin)
 
@@ -1058,8 +1063,9 @@ def select_hwaccel(preference: str, codec: str | None) -> tuple[list[str], str]:
         if hw.vaapi_available and hw.vaapi_device:
             if codec and hw.vaapi_decode_codecs and codec not in hw.vaapi_decode_codecs:
                 return [], "software"
-            # Output is downloaded back to system memory: every consumer here is numpy or
-            # an ffmpeg filter, so keeping frames on the GPU would only add a copy.
+            # Require hardware surfaces here and download them in build_filter_chain.
+            # Requesting nv12 directly permits FFmpeg to silently decode in software,
+            # which previously made a CPU frame count as proof that VAAPI worked.
             return (
                 [
                     "-hwaccel",
@@ -1067,7 +1073,7 @@ def select_hwaccel(preference: str, codec: str | None) -> tuple[list[str], str]:
                     "-vaapi_device",
                     hw.vaapi_device,
                     "-hwaccel_output_format",
-                    "nv12",
+                    "vaapi",
                 ],
                 "vaapi",
             )
@@ -1097,13 +1103,12 @@ def build_filter_chain(
     pix_fmt: str = "bgr24",
 ) -> str:
     filters: list[str] = []
-    # Deliberately no `hwdownload` here. `select_hwaccel` passes
-    # `-hwaccel_output_format nv12`, which already hands frames back in system memory, so
-    # adding hwdownload gives that filter software input it cannot accept and the graph
-    # fails to configure -- turning every hardware-accelerated decode into an error. The
-    # two settings have to agree: either output vaapi surfaces and download in the graph,
-    # or download at the decoder and filter normally. Everything downstream here is numpy
-    # or a CPU filter, so downloading at the decoder is the cheaper half of that choice.
+    # This must match select_hwaccel's vaapi output: hwdownload only accepts hardware
+    # surfaces. The old nv12 decoder output plus hwdownload was invalid; vaapi output
+    # plus hwdownload is deliberate, so an implicit CPU fallback fails before any frame
+    # can be labelled hardware-decoded. iter_frames then retries with a software graph.
+    if hwaccel_label == "vaapi":
+        filters.extend(("hwdownload", "format=nv12"))
     if fps:
         # A sparse replay must retain a selected view in the last partial interval.
         # Default end rounding can omit t=9 from a 9.28-second clip at 1 fps, even
@@ -1132,9 +1137,12 @@ async def _decode_frames(
     codec: str | None = None,
     grayscale: bool = False,
     timeout: float = DEFAULT_DECODE_TIMEOUT,
+    on_decoder: Callable[[str], None] | None = None,
 ) -> AsyncIterator[tuple[float, np.ndarray]]:
     """One decode attempt. Callers should use :func:`iter_frames`, which adds fallback."""
     hw_args, label = select_hwaccel(hwaccel, codec)
+    if on_decoder:
+        on_decoder(label)
     pix_fmt = "gray" if grayscale else "bgr24"
     channels = 1 if grayscale else 3
 
@@ -1166,7 +1174,8 @@ async def _decode_frames(
         ffmpeg_path(),
         "-hide_banner",
         "-v",
-        "error",
+        "level+verbose" if label != "software" else "error",
+        "-nostats",
         "-nostdin",
         # FFmpeg otherwise creates one filter thread per available CPU for every worker.
         # With two jobs this host had forty runnable filter threads before OpenCV or ONNX
@@ -1196,7 +1205,7 @@ async def _decode_frames(
     assert proc.stdout is not None
     child = _register_child(proc, Path(path).name, gated=label != "software")
 
-    stderr_chunks: list[bytes] = []
+    stderr_chunks: deque[bytes] = deque(maxlen=64)
 
     async def _drain_stderr() -> None:
         # Left unread, a decoder that logs heavily on damaged files fills the pipe
@@ -1245,7 +1254,7 @@ async def _decode_frames(
             await drainer
         await _close_child(proc, child, graceful=finished)
 
-    stderr = b"".join(stderr_chunks).decode("utf-8", "replace")
+    stderr = _decode_error_diagnostics(b"".join(stderr_chunks).decode("utf-8", "replace"))
     if index == 0:
         raise DecodeError(
             f"no frames decoded from {Path(path).name}",
@@ -1332,6 +1341,14 @@ async def iter_frames(
     failure: FFmpegError | None = None
     for attempt in range(3):
         yielded = 0
+        actual_label = label
+
+        def launched_decoder(decoder: str) -> None:
+            nonlocal actual_label
+            actual_label = decoder
+            if decoder != label and on_decoder:
+                on_decoder(decoder)
+
         try:
             guard = _vaapi_decode_lock() if label == "vaapi" else contextlib.nullcontext()
             waited_for_decoder = label == "vaapi" and guard.locked()
@@ -1359,11 +1376,11 @@ async def iter_frames(
                 # here puts the child's death back inside the critical section where the
                 # rest of this function assumes it always was.
                 async with contextlib.aclosing(
-                    _decode_frames(path, hwaccel=hwaccel, **kwargs)
+                    _decode_frames(path, hwaccel=hwaccel, on_decoder=launched_decoder, **kwargs)
                 ) as frames:
                     async for item in frames:
                         yielded += 1
-                        if yielded == 1 and label != "software":
+                        if yielded == 1 and actual_label != "software":
                             # This file and this GPU demonstrably work together. Remember it.
                             _remember_hwaccel_success(path)
                         yield item
@@ -1371,7 +1388,7 @@ async def iter_frames(
         except FFmpegError as exc:
             # Retrying is only safe before anything reached the caller; mid-stream the
             # consumer has already seen frames and would receive them twice.
-            if label == "software" or yielded:
+            if actual_label == "software" or yielded:
                 raise
             if is_empty_window(exc):
                 # ffmpeg ran to completion and simply found nothing in the window asked for.
@@ -1455,8 +1472,42 @@ _TRANSIENT_HWACCEL_MARKERS = (
 )
 
 
+_UNSUPPORTED_HWACCEL_MARKERS = ("not supported for hardware decode", "unsupported profile")
+
+
+def _decode_error_diagnostics(stderr: str) -> str:
+    """Keep errors and the verbose profile rejection, without benign VAAPI setup logs.
+
+    FFmpeg reports profile support at verbose level, then emits only a generic error.
+    Keeping unrelated verbose device messages would misclassify a clean empty seek as a
+    hardware failure in is_empty_window. Input capture is bounded to 512 KiB.
+    """
+    lines = [
+        line
+        for line in stderr.splitlines()
+        if any(marker in line.lower() for marker in _UNSUPPORTED_HWACCEL_MARKERS)
+        or not any(
+            f"[{level}]" in line for level in ("warning", "info", "verbose", "debug", "trace")
+        )
+    ]
+    tail = "\n".join(lines)[-1600:]
+    profile = next(
+        (
+            line
+            for line in lines
+            if any(marker in line.lower() for marker in _UNSUPPORTED_HWACCEL_MARKERS)
+        ),
+        "",
+    )
+    return (profile[:350] + "\n" + tail) if profile and profile not in tail else tail
+
+
 def _is_transient_hwaccel_failure(exc: FFmpegError) -> bool:
     stderr = (getattr(exc, "stderr", "") or "").lower()
+    if any(marker in stderr for marker in _UNSUPPORTED_HWACCEL_MARKERS):
+        # FFmpeg follows its permanent profile rejection with the generic initialisation
+        # error below. Repeating that stream cannot make the profile supported.
+        return False
     return any(marker in stderr for marker in _TRANSIENT_HWACCEL_MARKERS)
 
 
@@ -1561,35 +1612,52 @@ async def write_thumbnail(
     """Write a JPEG thumbnail. Returns False rather than raising on unreadable input."""
     out.parent.mkdir(parents=True, exist_ok=True)
     hw_args, label = select_hwaccel(hwaccel, None)
-    chain = build_filter_chain(scale=(width, -2), hwaccel_label=label, pix_fmt="yuvj420p")
-
-    cmd = [
-        ffmpeg_path(),
-        "-hide_banner",
-        "-v",
-        "error",
-        "-nostdin",
-        "-y",
-        "-ss",
-        f"{t:g}",
-        *hw_args,
-        "-i",
-        str(path),
-        "-frames:v",
-        "1",
-        "-vf",
-        chain,
-        "-q:v",
-        str(max(2, min(31, int(31 - (quality / 100) * 29)))),
-        str(out),
-    ]
+    if str(path) in _hwaccel_refused:
+        hw_args, label = [], "software"
+    attempts = [(hw_args, label)]
+    if label != "software":
+        attempts.append(([], "software"))
     try:
-        code, _, err = await _run(cmd, DEFAULT_PROBE_TIMEOUT)
+        executable = ffmpeg_path()
     except FFmpegError:
         return False
-    if code != 0 or not out.exists() or out.stat().st_size == 0:
-        log.debug("thumbnail failed", file=Path(path).name, stderr=err.decode()[-300:])
-        with contextlib.suppress(OSError):
-            out.unlink()
-        return False
-    return True
+    for args, decoder in attempts:
+        with tempfile.NamedTemporaryFile(
+            dir=out.parent, prefix=f".{out.stem}-", suffix=out.suffix, delete=False
+        ) as temporary:
+            staged = Path(temporary.name)
+        chain = build_filter_chain(scale=(width, -2), hwaccel_label=decoder, pix_fmt="yuvj420p")
+        cmd = [
+            executable,
+            "-hide_banner",
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-ss",
+            f"{t:g}",
+            *args,
+            "-i",
+            str(path),
+            "-frames:v",
+            "1",
+            "-vf",
+            chain,
+            "-q:v",
+            str(max(2, min(31, int(31 - (quality / 100) * 29)))),
+            str(staged),
+        ]
+        try:
+            try:
+                code, _, err = await _run(cmd, DEFAULT_PROBE_TIMEOUT)
+            except FFmpegError as exc:
+                log.debug("thumbnail decode failed", file=Path(path).name, error=str(exc))
+            else:
+                if code == 0 and staged.exists() and staged.stat().st_size > 0:
+                    staged.replace(out)
+                    return True
+                log.debug("thumbnail failed", file=Path(path).name, stderr=err.decode()[-300:])
+        finally:
+            with contextlib.suppress(OSError):
+                staged.unlink()
+    return False

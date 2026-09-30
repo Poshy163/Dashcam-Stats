@@ -537,6 +537,42 @@ def _runtime_version() -> str:
     return "".join(ch if ch.isalnum() or ch == "." else "_" for ch in head)
 
 
+_INTEL_RUNTIME_CACHE_KEY = Path("/usr/local/share/dashcam/intel-runtime-cache-key")
+
+
+def _model_cache_options(device: str) -> dict[str, str]:
+    """Partition GPU blobs by the verified image's installed Intel runtime packages.
+
+    Missing keys preserve non-Docker behavior. An unreadable or malformed present key
+    disables disk caching, rather than reusing an unverified legacy GPU cache directory.
+    This reads only the build-generated file; it never queries a native GPU property.
+    """
+    try:
+        from app.config import get_config
+
+        name = f"openvino_cache_{_runtime_version()}"
+        if device.upper().startswith("GPU"):
+            try:
+                with _INTEL_RUNTIME_CACHE_KEY.open("rb") as stream:
+                    fingerprint = stream.read(66)
+            except FileNotFoundError:
+                pass
+            else:
+                if len(fingerprint) == 65 and fingerprint.endswith(b"\n"):
+                    fingerprint = fingerprint[:-1]
+                if len(fingerprint) != 64 or any(
+                    value not in b"0123456789abcdef" for value in fingerprint
+                ):
+                    raise ValueError("invalid Intel runtime cache fingerprint")
+                name += f"_intel_{fingerprint.decode('ascii')}"
+        directory = get_config().data_dir / name
+        directory.mkdir(parents=True, exist_ok=True)
+        return {"CACHE_DIR": str(directory)}
+    except Exception as exc:
+        log.debug("could not prepare OpenVINO cache", error=str(exc))
+        return {}
+
+
 def _port_name(port: Any, fallback: str) -> str:
     try:
         return str(port.get_any_name())
@@ -593,22 +629,7 @@ class OpenVINOSession:
         config: dict[str, str] = {"PERFORMANCE_HINT": performance_hint}
         if target.upper().startswith("CPU"):
             config["INFERENCE_NUM_THREADS"] = str(cpu_inference_threads())
-        try:
-            from app.config import get_config
-
-            # Keyed on the runtime version rather than hard-coded.
-            #
-            # These are compiled device blobs, and feeding one runtime a blob another
-            # produced is a good way to reach exactly the kind of native abort this
-            # deployment has been chasing. The directory survives in /data across image
-            # rebuilds, so an OpenVINO change would otherwise silently inherit the previous
-            # version's cache -- and pinning the runtime back, which is a thing that
-            # happens, is precisely when that would bite.
-            cache_dir = get_config().data_dir / f"openvino_cache_{_runtime_version()}"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            config["CACHE_DIR"] = str(cache_dir)
-        except Exception as exc:
-            log.debug("could not prepare OpenVINO cache", error=str(exc))
+        config.update(_model_cache_options(target))
 
         started = time.monotonic()
         with _gpu_inference_lock:
@@ -634,6 +655,8 @@ class OpenVINOSession:
                 performance_hint = selected_performance_hint(target)
                 config["PERFORMANCE_HINT"] = performance_hint
                 config["INFERENCE_NUM_THREADS"] = str(cpu_inference_threads())
+                config.pop("CACHE_DIR", None)
+                config.update(_model_cache_options(target))
                 compiled = core.compile_model(model, target, config)
 
         self.device = target

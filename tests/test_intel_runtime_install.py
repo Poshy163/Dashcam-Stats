@@ -152,3 +152,56 @@ def test_manifest_keeps_the_matched_runtime_compiler_and_gmm_set():
     for package in manifest["packages"]:
         assert len(bytes.fromhex(package["sha256"])) == 32
         assert package["url"].endswith("_amd64.deb")
+
+
+def test_cache_fingerprint_tracks_actual_installed_versions(checker, monkeypatch, tmp_path):
+    versions = {
+        "intel-opencl-icd": "22.43.24595.41-1",
+        "libigc1": "1.0.12504.6-1+deb12u1",
+        "libigdfcl1": "1.0.12504.6-1+deb12u1",
+        "libigdgmm12": "22.3.3+ds1-1",
+    }
+    monkeypatch.setattr(
+        checker.subprocess,
+        "check_output",
+        lambda command, **kw: "" if command[0] == "dpkg" else f"installed {versions[command[-1]]}",
+    )
+    icd = tmp_path / "intel.icd"
+    icd.write_text("libigdrcl.so\n")
+    monkeypatch.setattr(checker, "INTEL_ICD", icd)
+    monkeypatch.setattr(checker.ctypes, "CDLL", lambda *a, **kw: None)
+    first = checker.check({}, "debian")
+    assert first == checker.check({}, "debian")
+    assert len(first) == 64 and set(first) <= set("0123456789abcdef")
+    versions["intel-opencl-icd"] = "25.13.33276.16"
+    assert first != checker.check({}, "debian")
+
+
+def test_checker_only_writes_a_fingerprint_when_explicitly_requested(
+    checker, monkeypatch, tmp_path
+):
+    manifest = tmp_path / "intel-runtime.json"
+    manifest.write_text("{}")
+    manifest.with_name("intel-runtime-source").write_text("pinned\n")
+    output = tmp_path / "intel-runtime-cache-key"
+    monkeypatch.setattr(checker, "check", lambda *a: "a" * 64)
+    checker.main([str(manifest)])
+    assert not output.exists()
+    checker.main([str(manifest), "--cache-key-output", str(output)])
+    assert output.read_bytes() == b"a" * 64 + b"\n"
+
+
+def test_failed_abi_check_cannot_replace_the_cache_fingerprint(checker, monkeypatch, tmp_path):
+    manifest = tmp_path / "intel-runtime.json"
+    manifest.write_text("{}")
+    manifest.with_name("intel-runtime-source").write_text("pinned\n")
+    output = tmp_path / "intel-runtime-cache-key"
+    output.write_text("previous fingerprint\n")
+
+    def fail(*args):
+        raise OSError("missing driver symbol")
+
+    monkeypatch.setattr(checker, "check", fail)
+    with pytest.raises(OSError, match="missing driver symbol"):
+        checker.main([str(manifest), "--cache-key-output", str(output)])
+    assert output.read_text() == "previous fingerprint\n"

@@ -74,6 +74,15 @@ successful package configuration and shared-library checks; unknown selector val
 fail the build. The former opt-in `=1` value is no longer accepted. This selector changes
 container userspace packages, not the host kernel driver.
 
+After successful package and ABI checks, the image build records a deterministic
+SHA256 fingerprint of the selected source and actual installed NEO/IGC/GMM versions
+in `/usr/local/share/dashcam/intel-runtime-cache-key`. GPU model caches use that key
+alongside the OpenVINO version, so driver/compiler changes start a fresh cache without
+deleting the previous cache. Normal verification remains read-only. OpenVINO 2025.4.1
+intentionally permits compatible ZeBin cache reuse across driver versions; this extra
+namespace ensures new compiler versions are exercised and does not imply those older
+blobs are inherently invalid.
+
 Upstream sources: [NEO 25.13 release](https://github.com/intel/compute-runtime/releases/tag/25.13.33276.16)
 and [IGC 2.10.8 release](https://github.com/intel/intel-graphics-compiler/releases/tag/v2.10.8).
 The package compatibility checks do not establish successful VAAPI decode or

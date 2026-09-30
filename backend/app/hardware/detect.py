@@ -299,16 +299,31 @@ def _probe_vaapi(info: HardwareInfo) -> None:
                         "-hide_banner",
                         "-v",
                         "error",
+                        "-nostdin",
+                        "-filter_threads",
+                        "1",
                         "-hwaccel",
                         "vaapi",
                         "-vaapi_device",
                         node,
+                        "-hwaccel_output_format",
+                        "vaapi",
+                        "-threads",
+                        "1",
                         "-f",
                         "mpegts",
                         "-i",
                         "pipe:0",
+                        "-map",
+                        "0:v:0",
+                        "-frames:v",
+                        "1",
+                        "-vf",
+                        "hwdownload,format=nv12",
                         "-f",
-                        "null",
+                        "rawvideo",
+                        "-pix_fmt",
+                        "nv12",
                         "-",
                     ],
                     input=make.stdout,
@@ -316,7 +331,10 @@ def _probe_vaapi(info: HardwareInfo) -> None:
                     timeout=PROBE_TIMEOUT_S,
                     check=False,
                 )
-                if probe.returncode == 0:
+                # Exit zero alone permits FFmpeg's implicit software fallback (or no
+                # decoded frames). A complete frame through hwdownload proves that this
+                # tested stream actually produced a VAAPI surface on this render node.
+                if probe.returncode == 0 and len(probe.stdout) == 320 * 240 * 3 // 2:
                     working.append(codec)
             except (OSError, subprocess.SubprocessError):
                 continue

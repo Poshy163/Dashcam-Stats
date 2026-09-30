@@ -165,3 +165,50 @@ Before updating Dockge, a consistent database backup was created at `/data/backu
 | OBD samples | 15,350 |
 
 This delivery supersedes the initial local-only validation boundary above. GPU recovery work follows separately; this first update retained the saved CPU fallback.
+
+## GPU runtime repair and hardware investigation
+
+Commit `05487af06974065dece23fd996c1f21656f22c41` replaces the old Debian OpenCL runtime with checksum-pinned Intel NEO `25.13.33276.16`, IGC `2.10.8` and GMM `22.7.0`. These packages fit the retained Bookworm userspace; the previously attempted NEO 26.27 packages require newer GLIBC/GLIBCXX symbols. Installation now fails on incomplete packages, and CI eagerly loads the compiler, OpenCL ICD, GMM and iHD libraries. A `debian` build option remains for older GPU generations.
+
+The application now guards GPU compilation, property access and inference against a failed native context. CPU recovery uses an independent ONNX Runtime CPU session instead of re-entering the poisoned OpenVINO core. A separate probe supervises each model in a disposable process with temporary caches, finite-output validation and a hard timeout. A native abort that occurs inside the application's own process remains outside Python exception containment.
+
+Validation for this commit:
+
+- Windows full suite: **2,344 passed, 26 skipped**; Ruff and formatting passed.
+- [Release run 36673916546](https://github.com/Poshy163/Dashcam-Stats/actions/runs/36673916546): Linux **2,349 passed, 21 skipped**, frontend, Android, Docker, dependency audits and exact-image publication passed.
+- Published `main` and `sha-05487af` resolve to `sha256:ed0edb46c3a4d06e0b3e6335e16b0a9fae9c3467db4f1c06766667f48fdecb42` with the expected source revision.
+- The updated live container reported that exact revision and successfully loaded all pinned Intel libraries as UID 1000. The saved failure marker was retained while isolated hardware tests ran, and the previously idle queue was paused.
+
+The actual host has an Intel i9-13900H / Raptor Lake GPU (`8086:a7a0`), i915 and kernel `7.0.14-15-pve`. Its request timeout is 20,000 ms, hangcheck is enabled and `enable_guc=-1` means automatic selection. The container has no cgroup memory limit and initially reported no OOM events. The readable DRM error state reported no collected error; kernel logs were not accessible from the container.
+
+A read-only application-wrapper baseline used six frames from existing recording 11908, repeated ten times. All **60 CPU model calls** succeeded with finite raw outputs, recorded frame hashes and stable detections; the median after the first six calls was **568.86 ms**. Diagnostics use temporary data/cache directories, pre-existing models and a read-only database connection; no recordings or stored detections are reprocessed by these probes.
+
+### Actual GPU results
+
+All five installed models passed **100 changing-input GPU inferences plus three warmup calls each**, in fresh supervised processes. Each reported `GPU.0` execution and finite outputs:
+
+| Model | Median inference time |
+| --- | ---: |
+| RF-DETR medium | 179.06 ms |
+| RF-DETR small | 102.58 ms |
+| RF-DETR nano | 55.52 ms |
+| Plate detector | 13.34 ms |
+| Plate OCR | 7.88 ms |
+
+The application's own detector wrapper separately passed **60 real-frame GPU calls**, with exact CPU/GPU frame hashes, shapes and decoded timestamps. Repeated outputs were stable on each device. The GPU median was **187.60 ms**, versus **568.86 ms** on CPU (about 3.03 times faster for this sequential inference workload; not a recording-throughput benchmark).
+
+All 33 CPU detections had same-class GPU matches, with intersection-over-union at least 0.9556. Most confidence differences were below 0.014; one was 0.0644. The GPU returned three additional detections at confidence 0.4054–0.4187, just above the 0.4 cutoff. This establishes useful output agreement, not bitwise or exact detection-count parity.
+
+A subsequent **600-call real-frame GPU soak** passed with stable first/last detections, finite outputs and `GPU.0` throughout. Its median was 130.72 ms (78.76 seconds of measured calls). The separate runs are not a controlled thermal/power benchmark. The DRM error state still reported no collected error and all cgroup OOM counters remained zero. Together these probes exercised **1,175 successful GPU calls**, including the 15 model warmups, before re-enabling production GPU selection. This is bounded hardware validation, not a guarantee of indefinite stability.
+
+After those tests, the previous failure marker was preserved at `/data/backups/gpu-inference-failed-before-05487af.json`, and the old compiled cache was renamed to `/data/openvino_cache_2025.4.1-before-05487af`. The application retry function cleared the active marker, and Dockge restarted the container. The authenticated overview then showed **OpenVINO · GPU** with software video decoding; health remained healthy. No probe/decoder child remained, and the five database table counts above were unchanged.
+
+### Separate video-decoding finding
+
+The current camera clip is H.264 Baseline profile 66, full-range 8-bit 4:2:0 at 1920×1080. The iHD driver loads successfully, but FFmpeg reports `Codec h264 profile 66 not supported for hardware decode`. With the application's NV12 output flags, FFmpeg silently falls back to CPU and returns success; forcing actual VAAPI surfaces and downloading them makes the unsupported path fail explicitly. A successful FFmpeg exit alone therefore does not prove hardware decoding. Software decoding remains the intended policy while GPU inference is active.
+
+A bounded diagnostic inspected the stream headers (Baseline 66, constraint-set-1 flag 0, no slice groups or redundant-picture flag in the inspected headers), then explicitly allowed a profile mismatch for one disposable FFmpeg process. It decoded 120 output frames through real VAAPI surfaces and `hwdownload` successfully in 0.44 seconds. FFmpeg selected profile 100 and warned of possible incompatibility. This establishes that the new Intel media stack can decode this tested stream section; it does not justify enabling a profile override globally, and no such override was added to production settings.
+
+The resulting decoder follow-up requires VAAPI surfaces paired with `hwdownload,format=nv12`, both in frame extraction and the device capability probe. The probe also requires one complete output frame. Unsupported profiles now receive an explicit software retry, and the decoder actually launched is reported even if media policy changes while waiting. Thumbnail retries write a temporary image and only replace an existing thumbnail after success. Bounded diagnostics retain FFmpeg's profile rejection without treating benign setup messages as errors. Local focused validation passed **129 tests**; an independent review passed **116 tests** and found no remaining blockers.
+
+The follow-up also makes the clean-cache behavior automatic: after validating installed packages and shared libraries, Docker records a deterministic fingerprint of the actual NEO/IGC/GMM versions. GPU cache directories include that fingerprint and the OpenVINO version. CPU and non-Docker behavior remain unchanged; a malformed or unreadable present fingerprint disables persistent GPU caching. OpenVINO deliberately permits compatible ZeBin reuse across driver versions, so this extra separation ensures recompilation after an Intel stack change rather than asserting that all older blobs are invalid. The combined cache, GPU recovery and media regression suite passed **150 tests**; the build-checker suite passed **25 tests**.

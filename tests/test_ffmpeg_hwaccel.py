@@ -3,8 +3,8 @@
 This exists because they once did not, and the result was silent. `select_hwaccel` asked
 the decoder to hand frames back in system memory (`-hwaccel_output_format nv12`) while
 `build_filter_chain` prepended `hwdownload`, a filter that only accepts *hardware* frames.
-The graph failed to configure, every accelerated decode raised, and the telemetry stage
-recorded zero points across an entire library while every other stage reported success.
+That pair was invalid. We now require VAAPI surfaces plus an explicit download, which
+also rejects FFmpeg's implicit software fallback before it can be labelled hardware.
 
 Nothing caught it: the bug only appears when VAAPI genuinely works, so a development
 machine with no /dev/dri and a CI runner with no GPU both sail past. These tests assert
@@ -65,29 +65,29 @@ class TestFilterChainContract:
         assert await offsets(False) == [0.0]
         assert await offsets(True) == [0.0, 1.0]
 
-    @pytest.mark.parametrize("label", ["vaapi", "qsv", "software"])
-    def test_chain_never_downloads_frames_itself(self, label):
-        """`hwdownload` must not appear while the decoder already downloads.
-
-        Whichever half changes, the other has to change with it -- this is the assertion
-        that makes that impossible to forget.
-        """
+    @pytest.mark.parametrize("label", ["qsv", "software"])
+    def test_software_output_is_not_downloaded_twice(self, label):
         chain = build_filter_chain(fps=1.0, hwaccel_label=label, pix_fmt="gray")
-        assert "hwdownload" not in chain, (
-            f"{label} chain injects hwdownload while -hwaccel_output_format already "
-            "returns software frames; the graph will fail to configure"
-        )
+        assert "hwdownload" not in chain
 
-    def test_hwaccel_args_request_a_software_output_format(self):
-        """If this ever emits vaapi surfaces, the chain must download them again."""
-        args, label = select_hwaccel("auto", "h264")
-        if label == "software":
-            pytest.skip("no VAAPI on this machine; the contract is asserted above")
+    def test_vaapi_output_and_download_filter_are_paired(self, monkeypatch):
+        from app.hardware import ffmpeg
+        from app.hardware.detect import HardwareInfo
+
+        monkeypatch.setattr(ffmpeg, "software_decode_reason", lambda: None)
+        monkeypatch.setattr(
+            ffmpeg,
+            "detect_hardware",
+            lambda: HardwareInfo(vaapi_available=True, vaapi_device="/dev/dri/renderD128"),
+        )
+        args, label = select_hwaccel("vaapi", "h264")
+        assert label == "vaapi"
         assert "-hwaccel_output_format" in args
         fmt = args[args.index("-hwaccel_output_format") + 1]
-        assert fmt != "vaapi", (
-            "decoder is emitting GPU surfaces, so build_filter_chain must hwdownload them"
-        )
+        assert fmt == "vaapi"
+        chain = build_filter_chain(fps=1.0, hwaccel_label=label, pix_fmt="gray")
+        assert chain.startswith("hwdownload,format=nv12,")
+        assert chain.endswith("format=gray")
 
     def test_cpu_preference_never_requests_hardware(self):
         args, label = select_hwaccel("cpu", "h264")
