@@ -948,6 +948,8 @@ async def _read_sampler_snapshot(address: str) -> str:
     Active files may append, but only their frozen prefix is read. Replacement, rotation or
     truncation aborts the entire attempt. The next parked presence tick retries; this never
     modifies, locks or removes the unit's logs. Missing gzip falls back to small base64 chunks.
+    Each generation contributes only complete newline-terminated rows. A nonzero tail offset
+    has no proven line boundary, so its first row is conservatively omitted even if complete.
     """
     capabilities = await _recovery_shell(
         address,
@@ -963,10 +965,13 @@ async def _read_sampler_snapshot(address: str) -> str:
         return ""
     chunk_limit = RECOVERY_CHUNK_BYTES if compressed else 16 * 1024
     combined = bytearray()
+    transferred = 0
     for generation in sorted(manifest, reverse=True):
         metadata = manifest[generation]
         size = metadata[2]
         offset = max(0, size - MAX_RECOVERY_BYTES_PER_FILE)
+        leading_cut = offset > 0
+        file_data = bytearray()
         while offset < size:
             length = min(chunk_limit, size - offset)
             command = _sampler_chunk_command(
@@ -980,10 +985,16 @@ async def _read_sampler_snapshot(address: str) -> str:
                     raise adb.AdbError("CarPlay sampler recovery cannot fit a bounded chunk")
                 chunk_limit = max(RECOVERY_MIN_CHUNK_BYTES, length // 2)
                 continue
-            combined.extend(payload)
-            if len(combined) > MAX_RECOVERY_BYTES:
+            transferred += len(payload)
+            if transferred > MAX_RECOVERY_BYTES:
                 raise adb.AdbError("CarPlay sampler recovery exceeds total byte limit")
+            file_data.extend(payload)
             offset += length
+        # A snapshot can end halfway through an append. Never parse that suffix or join
+        # it to the next generation's first timestamp; it can be recovered on a later visit.
+        start = file_data.find(b"\n") + 1 if leading_cut else 0
+        end = file_data.rfind(b"\n") + 1
+        combined.extend(file_data[start:end])
     final = _parse_sampler_manifest(await _recovery_shell(address, _sampler_manifest_command()))
     if final.keys() != manifest.keys() or any(
         final[g][:2] != before[:2] or final[g][2] < before[2] for g, before in manifest.items()

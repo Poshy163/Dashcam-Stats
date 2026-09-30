@@ -112,6 +112,47 @@ async def test_overflow_reduces_chunks_and_base64_fallback_remains_bounded(
     assert remote.chunks < 25
 
 
+async def test_active_snapshot_drops_mid_append_prefix_until_next_complete_recovery(
+    monkeypatch, stored
+):
+    second = line(1)
+    prefix = second[:-4]
+    remote = Remote({0: line(0) + prefix})
+
+    async def shell(address, command, **kwargs):
+        result = await remote.shell(address, command, **kwargs)
+        if command == timing._sampler_manifest_command() and remote.manifests == 1:
+            # The writer finishes after the frozen size is captured but before transfer.
+            remote.content[0] += second[len(prefix) :]
+        return result
+
+    monkeypatch.setattr(timing.adb, "shell", shell)
+    assert await timing.recover_sampler_file("unit") == (1, 0)
+    assert stored[0] == timing.parse_sampler_file(line(0).decode())
+    assert await timing.recover_sampler_file("unit") == (2, 0)
+    assert stored[1] == timing.parse_sampler_file((line(0) + line(1)).decode())
+
+
+async def test_unterminated_generation_suffix_cannot_swallow_next_generation(monkeypatch, stored):
+    remote = Remote({3: line(0) + line(1)[:-4], 0: line(2)})
+    monkeypatch.setattr(timing.adb, "shell", remote.shell)
+    assert await timing.recover_sampler_file("unit") == (2, 0)
+    assert stored[0] == timing.parse_sampler_file((line(0) + line(2)).decode())
+
+
+@pytest.mark.parametrize("cut_fragment", [True, False], ids=["mid-row", "exact-boundary"])
+async def test_nonzero_tail_offset_discards_unproven_first_row(monkeypatch, stored, cut_fragment):
+    raw = line(0) + line(1) + line(2)
+    retained = len(line(1) + line(2)) + (20 if cut_fragment else 0)
+    remote = Remote({0: raw})
+    monkeypatch.setattr(timing, "MAX_RECOVERY_BYTES_PER_FILE", retained)
+    monkeypatch.setattr(timing.adb, "shell", remote.shell)
+    # Without lookbehind, an exact boundary is deliberately conservative too.
+    expected = line(1) + line(2) if cut_fragment else line(2)
+    assert await timing.recover_sampler_file("unit") == (2 if cut_fragment else 1, 0)
+    assert stored[0] == timing.parse_sampler_file(expected.decode())
+
+
 @pytest.mark.parametrize("failure", ["corrupt", "rotation", "cancel", "disconnect"])
 async def test_incomplete_attempt_never_stores_earlier_good_chunks(monkeypatch, stored, failure):
     remote = Remote({0: b"".join(line(n) for n in range(1000))})
@@ -172,22 +213,22 @@ def test_manifest_is_numeric_unique_and_fixed_generation_only(manifest):
         timing._parse_sampler_manifest(manifest)
 
 
-def posix_shell():
-    shell = shutil.which("sh")
+def posix_shell(name):
+    shell = shutil.which(name)
     if not shell and os.name == "nt":
-        candidate = Path(r"C:\Program Files\Git\usr\bin\sh.exe")
+        candidate = Path(r"C:\Program Files\Git\usr\bin") / f"{name}.exe"
         shell = str(candidate) if candidate.exists() else None
     # Linux CI must have a shell; missing it is a test failure, not a skipped safety check.
     if not shell:
         if os.name == "nt":
-            pytest.skip("POSIX test shell unavailable on Windows")
-        pytest.fail("POSIX shell required")
+            pytest.skip(f"{name} test shell unavailable on Windows")
+        pytest.fail(f"{name} shell required on Linux CI")
     return shell
 
 
-def run_shell(command):
+def run_shell(command, shell_name):
     result = subprocess.run(
-        [posix_shell(), "-c", "PATH=/usr/bin:/bin:$PATH; " + command],
+        [posix_shell(shell_name), "-c", "PATH=/usr/bin:/bin:$PATH; " + command],
         capture_output=True,
         text=True,
         timeout=5,
@@ -196,46 +237,57 @@ def run_shell(command):
     return result.stdout.strip()
 
 
-def test_real_shell_manifest_fd_guards_unaligned_chunks_and_compression(tmp_path, monkeypatch):
+@pytest.mark.parametrize("shell_name", ["sh", "mksh"])
+def test_real_shell_manifest_fd_guards_unaligned_chunks_and_compression(
+    tmp_path, monkeypatch, shell_name
+):
     path = tmp_path / "sampler.log"
     payload = os.urandom(180_000)
     path.write_bytes(payload)
     monkeypatch.setattr(timing, "REMOTE_LOG", path.as_posix())
-    manifest = timing._parse_sampler_manifest(run_shell(timing._sampler_manifest_command()))
+    manifest = timing._parse_sampler_manifest(
+        run_shell(timing._sampler_manifest_command(), shell_name)
+    )
     metadata = manifest[0]
     for compressed, length in [(True, 8192), (False, 8192)]:
         raw = run_shell(
-            timing._sampler_chunk_command(0, metadata, 65_537, length, compressed=compressed)
+            timing._sampler_chunk_command(0, metadata, 65_537, length, compressed=compressed),
+            shell_name,
         )
         assert (
             timing._decode_sampler_chunk(raw, length, compressed=compressed)
             == payload[65_537 : 65_537 + length]
         )
     # Incompressible64KiB cannot become a giant ADB reply; host retries a smaller range.
-    raw = run_shell(timing._sampler_chunk_command(0, metadata, 0, 65_536, compressed=True))
+    raw = run_shell(
+        timing._sampler_chunk_command(0, metadata, 0, 65_536, compressed=True), shell_name
+    )
     assert raw == "CPR_OVERFLOW"
     path.rename(tmp_path / "old.log")
     path.write_bytes(payload)
     assert (
-        run_shell(timing._sampler_chunk_command(0, metadata, 0, 100, compressed=True))
+        run_shell(timing._sampler_chunk_command(0, metadata, 0, 100, compressed=True), shell_name)
         == "CPR_CHANGED"
     )
 
 
-def test_real_shell_truncation_and_symlinks_are_not_read(tmp_path, monkeypatch):
+@pytest.mark.parametrize("shell_name", ["sh", "mksh"])
+def test_real_shell_truncation_and_symlinks_are_not_read(tmp_path, monkeypatch, shell_name):
     path = tmp_path / "sampler.log"
     path.write_bytes(b"x" * 1000)
     monkeypatch.setattr(timing, "REMOTE_LOG", path.as_posix())
-    metadata = timing._parse_sampler_manifest(run_shell(timing._sampler_manifest_command()))[0]
+    metadata = timing._parse_sampler_manifest(
+        run_shell(timing._sampler_manifest_command(), shell_name)
+    )[0]
     path.write_bytes(b"x" * 10)
     assert (
-        run_shell(timing._sampler_chunk_command(0, metadata, 0, 100, compressed=True))
+        run_shell(timing._sampler_chunk_command(0, metadata, 0, 100, compressed=True), shell_name)
         == "CPR_CHANGED"
     )
     if os.name != "nt":
         path.unlink()
         path.symlink_to(tmp_path / "unrelated")
         result = subprocess.run(
-            [posix_shell(), "-c", timing._sampler_manifest_command()], capture_output=True
+            [posix_shell(shell_name), "-c", timing._sampler_manifest_command()], capture_output=True
         )
         assert result.returncode != 0
