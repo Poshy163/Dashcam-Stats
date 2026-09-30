@@ -2,7 +2,7 @@
 
 This sweep reviewed the API, all 19 frontend page modules and their shared components, authentication, media delivery, ingestion, OBD storage, processing, retention, recovery, dependencies, and release configuration. It combined source inspection, isolated regression tests, and a signed-in walkthrough of `http://192.168.1.16:8199/`.
 
-The initial sweep produced local fixes and a prioritized backlog. The follow-up implements that backlog and additional issues found during integration. **These changes have not been committed, pushed, or deployed.** Existing investigation documents and the pre-existing OBD test change were left alone.
+The initial sweep produced local fixes and a prioritized backlog. The follow-up implements that backlog and additional issues found during integration. Initial validation was local; the subsequent authorized delivery of commit `abd4816` is recorded below. Existing investigation documents and the pre-existing OBD test change were left alone.
 
 ## Evidence and coverage
 
@@ -149,3 +149,19 @@ npm run build
 ```
 
 The Python suite still reports upstream deprecation warnings, especially under Python 3.14; CI targets Python 3.12. Local Linux container checks supplement the Windows suite, but do not establish physical GPU/driver or head-unit behavior. No new GitHub CI run, Android APK build, deployment, production restore/reprocess, or physical head-unit test was performed. Normal CI and deployment verification are still required before these local fixes can be treated as live behavior. The retained GPU driver failure and the absent vehicle observed on the live server were not changed.
+
+## Authorized delivery after the audit
+
+The user subsequently requested a commit, application update and GPU/driver repair. Commit `abd4816af72a6f000a5496bfd741532a169d883a` was pushed to `main` without sign-off or co-author trailers. [Release run 36671742328](https://github.com/Poshy163/Dashcam-Stats/actions/runs/36671742328) passed all checks: Linux Python 3.12 reported **2,318 passed, 21 skipped**, the frontend passed, Android tests/lint/APKs passed, and the image passed inference, startup, privilege and dependency checks. The exact tested image was published as `main` and `sha-abd4816`, both with registry digest `sha256:3222fc271167ef504f9b1fd25da2e679e9a100cf32dc2a1165ec63070e4da49a`.
+
+Before updating Dockge, a consistent database backup was created at `/data/backups/dashcam-20260930-050732.db`. The existing stack's mounts, port, environment and data volumes were retained. After restart, the container reported source revision `abd4816af72a6f000a5496bfd741532a169d883a`, and the authenticated UI loaded the new build. Migration `0024` and these counts were unchanged across the update:
+
+| Table | Before / after |
+| --- | ---: |
+| Recordings | 11,909 |
+| Journeys | 365 |
+| Plates | 2,631 |
+| OBD drives | 156 |
+| OBD samples | 15,350 |
+
+This delivery supersedes the initial local-only validation boundary above. GPU recovery work follows separately; this first update retained the saved CPU fallback.

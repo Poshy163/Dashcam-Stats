@@ -119,10 +119,10 @@ jobs:
       - name: Ruff
         run: |
           ruff --version
-          ruff check backend/app backend/scripts tests
+          ruff check backend/app backend/scripts tests docker/install-intel-runtime.py
 
       - name: Ruff format check
-        run: ruff format --check backend/app backend/scripts tests
+        run: ruff format --check backend/app backend/scripts tests docker/install-intel-runtime.py
 
       - name: Generate test fixtures
         run: python backend/scripts/make_fixtures.py --out tests/fixtures
@@ -348,25 +348,10 @@ jobs:
           print("OpenVINO", ov.__version__, "direct inference OK", hardware.openvino_devices)
           '
 
-      # Both Intel drivers, together. They are a matched set through gmmlib, and upgrading
-      # only the compute runtime on the deployment replaced the gmmlib that Bookworm's iHD
-      # media driver was built against -- which took VAAPI out entirely, vaapi_available
-      # going true to false, while not bringing the OpenCL device back either. So this
-      # reports both and fails only on the media driver going missing, which is the one
-      # that silently turns every decode into software.
-      - name: Report the Intel graphics stack in the image
-        run: |
-          docker run --rm --entrypoint sh dashcam-analyser:ci -c '
-            dpkg-query -W intel-opencl-icd libigdgmm12 intel-media-va-driver-non-free \
-              intel-media-va-driver 2>/dev/null || true
-            for d in /usr/lib/x86_64-linux-gnu/dri/*_drv_video.so; do
-              [ -e "$d" ] && echo "va driver: $d"
-            done
-            test -e /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so || {
-              echo "::error::the iHD media driver is missing; every decode falls back to software"
-              exit 1
-            }
-          '
+      # Link the compiler, OpenCL runtime and VAAPI media driver eagerly, even without
+      # a physical GPU. File-presence checks miss unsupported GLIBC/GLIBCXX requirements.
+      - name: Verify the Intel graphics stack in the image
+        run: docker run --rm --entrypoint python dashcam-analyser:ci /app/backend/scripts/check_intel_runtime.py
 
       # A container that starts but cannot serve /health is a broken release, and that
       # is not something the unit tests can catch.

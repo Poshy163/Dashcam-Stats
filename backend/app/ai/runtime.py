@@ -12,6 +12,7 @@ from functools import cache
 from app.ai.openvino_session import (
     available_devices,
     gpu_backend_disabled,
+    gpu_context_failed,
     selected_device,
     selected_performance_hint,
 )
@@ -91,7 +92,7 @@ def onnx_providers() -> tuple[str, ...]:
 def describe_runtime() -> dict[str, object]:
     """The engine and physical device that new model sessions will use."""
     devices = available_devices()
-    device = _openvino_device()
+    device = None if gpu_context_failed() else _openvino_device()
     if device is not None:
         try:
             import openvino as ov
@@ -107,7 +108,7 @@ def describe_runtime() -> dict[str, object]:
             "using": "OpenVINO",
             "device": device,
             "accelerated": device.startswith(("GPU", "NPU")),
-            "performance_hint": selected_performance_hint(),
+            "performance_hint": selected_performance_hint(device),
         }
 
     fallback = onnx_providers()

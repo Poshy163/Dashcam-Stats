@@ -265,12 +265,13 @@ SETTINGS: tuple[SettingDef, ...] = (
     ),
     SettingDef(
         "processing.hardware_acceleration",
-        "Use hardware acceleration",
+        "Use hardware video decoding",
         "bool",
         True,
         "processing",
-        "Use the iGPU via VAAPI for decoding and OpenVINO for inference where available. "
-        "Falls back to CPU automatically when unavailable.",
+        "Allow GPU video decoding when available. Falls back to software decoding when "
+        "unavailable or when GPU inference needs exclusive access. AI inference is "
+        "configured separately using the AI inference device setting.",
     ),
     SettingDef(
         "processing.decoder_preference",

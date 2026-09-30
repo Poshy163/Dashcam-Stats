@@ -1,0 +1,30 @@
+{
+  "architecture": "amd64",
+  "release": "https://github.com/intel/compute-runtime/releases/tag/25.13.33276.16",
+  "packages": [
+    {
+      "name": "intel-igc-core-2",
+      "version": "2.10.8",
+      "url": "https://github.com/intel/intel-graphics-compiler/releases/download/v2.10.8/intel-igc-core-2_2.10.8+18926_amd64.deb",
+      "sha256": "85bb185f5c9f0700321c6ce9362a4aa85b6cdf02f74a7b8685424d0be024fb0e"
+    },
+    {
+      "name": "intel-igc-opencl-2",
+      "version": "2.10.8",
+      "url": "https://github.com/intel/intel-graphics-compiler/releases/download/v2.10.8/intel-igc-opencl-2_2.10.8+18926_amd64.deb",
+      "sha256": "21e5ee9f0b5798335d82a88f98e80bccd9539380782e60893d6d050eb801d322"
+    },
+    {
+      "name": "libigdgmm12",
+      "version": "22.7.0",
+      "url": "https://github.com/intel/compute-runtime/releases/download/25.13.33276.16/libigdgmm12_22.7.0_amd64.deb",
+      "sha256": "1c20bcbfbc3cc293e3a2ef7f8876ae771e0b9458f95a13bc80d2d69cf0bbef23"
+    },
+    {
+      "name": "intel-opencl-icd",
+      "version": "25.13.33276.16",
+      "url": "https://github.com/intel/compute-runtime/releases/download/25.13.33276.16/intel-opencl-icd_25.13.33276.16_amd64.deb",
+      "sha256": "db5245e061a2eb043af655f298b045a4ead5973b8e5d8f385a1d2887deb309b0"
+    }
+  ]
+}

@@ -44,7 +44,7 @@ class TestTheBuildStampIsLast:
         # The three that dominate the build: the runtime apt install, the Intel compute
         # runtime download, and copying in the virtualenv built by the pydeps stage.
         apt_install = _index(lines, r"RUN set -eux;")
-        intel_runtime = _index(lines, r"ARG INTEL_COMPUTE_RUNTIME")
+        intel_runtime = _index(lines, r"COPY docker/intel-runtime.json")
         venv_copy = _index(lines, r"COPY --from=pydeps /opt/venv /opt/venv")
 
         assert declared > apt_install, f"{arg} invalidates the runtime apt install"

@@ -37,7 +37,44 @@ _core: Any | None = None
 # aborted the entire process. One GPU request at a time is still substantially faster than
 # CPU inference and lets the second worker overlap decode, telemetry and database work.
 # CPU/NPU sessions remain concurrent.
-_gpu_inference_lock = threading.Lock()
+_gpu_inference_lock = threading.RLock()
+_native_condition = threading.Condition(_gpu_inference_lock)
+_native_writers = 0
+_active_cpu_inference = 0
+
+
+@contextlib.contextmanager
+def _exclusive_native_lane():
+    """GPU/native model changes exclude CPU calls; healthy CPU inference stays parallel."""
+    global _native_writers
+    with _native_condition:
+        _native_writers += 1
+        try:
+            while _active_cpu_inference:
+                _native_condition.wait()
+            yield
+        finally:
+            _native_writers -= 1
+            _native_condition.notify_all()
+
+
+@contextlib.contextmanager
+def _cpu_native_lane():
+    global _active_cpu_inference
+    with _native_condition:
+        while _native_writers:
+            _native_condition.wait()
+        usable = not gpu_context_failed()
+        if usable:
+            _active_cpu_inference += 1
+    try:
+        yield usable
+    finally:
+        if usable:
+            with _native_condition:
+                _active_cpu_inference -= 1
+                _native_condition.notify_all()
+
 
 #: Substrings that mean the GPU *context* has failed, not that this one request was bad.
 #:
@@ -58,6 +95,9 @@ _GPU_CONTEXT_FAILURE_MARKERS = (
 
 #: Set once the iGPU has failed in this process; never cleared without a restart.
 _gpu_disabled_reason: str | None = None
+# A previous process's saved verdict disables GPU selection, but its new Core can still
+# compile CPU models. A native failure in this process forbids re-entering this Core.
+_gpu_context_failed = False
 
 #: Whether the durable marker has already been written in this process. Tracked apart from
 #: ``_gpu_disabled_reason`` because a *transient* disable sets that first and would
@@ -77,6 +117,11 @@ def gpu_backend_disabled() -> str | None:
     return _gpu_disabled_reason
 
 
+def gpu_context_failed() -> bool:
+    """Whether this process's OpenVINO context has suffered a native GPU failure."""
+    return _gpu_context_failed
+
+
 def disable_gpu_backend(reason: str, *, durable: bool = False) -> bool:
     """Take the iGPU out of service for inference. Returns True on the first caller.
 
@@ -92,7 +137,10 @@ def disable_gpu_backend(reason: str, *, durable: bool = False) -> bool:
     on the next job would simply reproduce that.
     """
     global _gpu_disabled_reason, _devices_cache, _device_cache, _gpu_failure_persisted
+    global _gpu_context_failed
     with _gpu_state_lock:
+        if durable:
+            _gpu_context_failed = True
         first = _gpu_disabled_reason is None
         if first:
             _gpu_disabled_reason = reason
@@ -292,12 +340,13 @@ def gpu_inference_engaged() -> bool:
 
 def reset_gpu_backend_for_tests() -> None:
     """Clear the one-way disable. Intended for isolated tests."""
-    global _gpu_disabled_reason, _gpu_failure_persisted
+    global _gpu_disabled_reason, _gpu_failure_persisted, _gpu_context_failed
     with _gpu_state_lock:
         _gpu_disabled_reason = None
         # Tracked separately from the reason, so it has to be cleared separately too --
         # otherwise one test's durable disable decides whether the next one's is written.
         _gpu_failure_persisted = False
+        _gpu_context_failed = False
     _clear_device_cache()
 
 
@@ -524,6 +573,14 @@ class OpenVINOSession:
     """
 
     def __init__(self, model_path: str | Path, *, device: str | None = None) -> None:
+        # Reading metadata and querying compiled-model properties are native calls too.
+        # A model load queued behind a failed inference must stop before any of them.
+        with _exclusive_native_lane():
+            self._initialize(model_path, device=device)
+
+    def _initialize(self, model_path: str | Path, *, device: str | None = None) -> None:
+        if gpu_context_failed():
+            raise RuntimeError("OpenVINO is disabled after a native GPU context failure")
         core = _get_core()
         requested = device or selected_device()
         if requested is None:
@@ -554,26 +611,38 @@ class OpenVINOSession:
             log.debug("could not prepare OpenVINO cache", error=str(exc))
 
         started = time.monotonic()
-        try:
-            compiled = core.compile_model(model, target, config)
-        except Exception as exc:
-            if target == "CPU":
-                raise
-            log.warning(
-                "OpenVINO model could not compile on requested device; using CPU",
-                model=model_path.name,
-                requested=target,
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            target = "CPU"
-            performance_hint = selected_performance_hint(target)
-            config["PERFORMANCE_HINT"] = performance_hint
-            compiled = core.compile_model(model, target, config)
+        with _gpu_inference_lock:
+            if gpu_context_failed() or (
+                target.upper().startswith("GPU") and gpu_backend_disabled() is not None
+            ):
+                raise RuntimeError("OpenVINO GPU is disabled; create a fresh CPU runtime")
+            try:
+                compiled = core.compile_model(model, target, config)
+            except Exception as exc:
+                if target.upper().startswith("GPU") and is_gpu_context_failure(exc):
+                    disable_gpu_backend(f"{type(exc).__name__}: {exc}"[:500], durable=True)
+                    raise
+                if target == "CPU":
+                    raise
+                log.warning(
+                    "OpenVINO model could not compile on requested device; using CPU",
+                    model=model_path.name,
+                    requested=target,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                target = "CPU"
+                performance_hint = selected_performance_hint(target)
+                config["PERFORMANCE_HINT"] = performance_hint
+                config["INFERENCE_NUM_THREADS"] = str(cpu_inference_threads())
+                compiled = core.compile_model(model, target, config)
 
         self.device = target
         self._compiled = compiled
         self._local = threading.local()
-        # Kept so the session can rebuild itself on the CPU if the GPU context dies.
+        self._cpu_session = None
+        self._model_path = str(model_path)
+        # Retain these objects after a GPU fault: destroying them can itself enter the
+        # failed driver. Recovery uses a separate plain ONNX Runtime CPU session.
         self._model = model
         self._model_name = model_path.name
         self._config = config
@@ -592,7 +661,10 @@ class OpenVINOSession:
 
         try:
             requests = int(compiled.get_property("OPTIMAL_NUMBER_OF_INFER_REQUESTS"))
-        except Exception:
+        except Exception as exc:
+            if target.upper().startswith("GPU") and is_gpu_context_failure(exc):
+                disable_gpu_backend(f"{type(exc).__name__}: {exc}"[:500], durable=True)
+                raise
             requests = None
         log.info(
             "OpenVINO model compiled",
@@ -610,6 +682,8 @@ class OpenVINOSession:
         return list(self._outputs)
 
     def get_providers(self) -> list[str]:
+        if self._cpu_session is not None:
+            return self._cpu_session.get_providers()
         return [f"OpenVINO:{self.device}"]
 
     def _request(self) -> Any:
@@ -620,30 +694,24 @@ class OpenVINOSession:
         return request
 
     def _move_to_cpu(self, reason: str) -> None:
-        """Recompile this session on the CPU after the GPU context has failed.
-
-        Done in place, because the caller is an upstream model helper that owns the object
-        and would otherwise never learn anything had changed. Recompiling costs seconds
-        once; the alternative is what the deployment actually did -- return no detections
-        for every remaining frame while reporting the job complete.
-        """
+        """Recover through plain ONNX Runtime without touching the failed OpenVINO core."""
         with self._rebuild_lock:
-            if not self.device.upper().startswith("GPU"):
+            if getattr(self, "_cpu_session", None) is not None:
                 return  # another thread rebuilt it while this one waited
-            config = {
-                **self._config,
-                "PERFORMANCE_HINT": selected_performance_hint("CPU"),
-                "INFERENCE_NUM_THREADS": str(cpu_inference_threads()),
-            }
-            compiled = _get_core().compile_model(self._model, "CPU", config)
-            self._compiled = compiled
-            self._local = threading.local()
-            self._output_ports = {
-                info.name: port for info, port in zip(self._outputs, compiled.outputs, strict=True)
-            }
+            if not self.device.upper().startswith("GPU") and not gpu_context_failed():
+                return
+            import onnxruntime as ort
+
+            from app.core.resources import onnx_session_options
+
+            self._cpu_session = ort.InferenceSession(
+                self._model_path,
+                sess_options=onnx_session_options(),
+                providers=["CPUExecutionProvider"],
+            )
             self.device = "CPU"
         log.warning(
-            "inference session rebuilt on the CPU after a GPU driver failure",
+            "inference session recovered with ONNX Runtime CPU",
             model=self._model_name,
             reason=reason,
         )
@@ -655,7 +723,9 @@ class OpenVINOSession:
         chip is unsafe to touch -- an ffmpeg child that will not die holds exactly the
         resources OpenVINO is about to ask for.
         """
-        if not self.device.upper().startswith("GPU"):
+        if getattr(self, "_cpu_session", None) is not None:
+            return False
+        if not self.device.upper().startswith("GPU") and not gpu_context_failed():
             return False
         disable_gpu_backend(reason)
         self._move_to_cpu(reason)
@@ -666,27 +736,40 @@ class OpenVINOSession:
         output_names: Sequence[str] | None,
         input_feed: dict[str, np.ndarray],
     ) -> list[np.ndarray]:
+        cpu_session = getattr(self, "_cpu_session", None)
+        if cpu_session is not None:
+            return cpu_session.run(output_names, input_feed)
         if self.device.upper().startswith("GPU"):
-            try:
-                with _gpu_inference_lock:
+            with _exclusive_native_lane():
+                # A caller may have queued before another request disabled the device.
+                # Recheck under the same lock that publishes native-failure verdicts.
+                cpu_session = getattr(self, "_cpu_session", None)
+                if cpu_session is not None:
+                    return cpu_session.run(output_names, input_feed)
+                if gpu_backend_disabled() is not None:
+                    raise RuntimeError("OpenVINO GPU is disabled after an earlier failure")
+                try:
                     result = self._request().infer(input_feed)
-            except Exception as exc:
-                if not is_gpu_context_failure(exc):
+                except Exception as exc:
+                    if is_gpu_context_failure(exc):
+                        # Persist while holding the inference lane, before a waiting
+                        # request can enter native code. Recovery uses plain ORT later.
+                        disable_gpu_backend(f"{type(exc).__name__}: {exc}"[:500], durable=True)
                     raise
-                # Record the verdict and get out. Do NOT recompile here.
-                #
-                # The tempting thing is to rebuild on the CPU and answer the request that
-                # was asked, and that is what this used to do. But compiling a model calls
-                # back into the very runtime that has just failed, and on the live
-                # deployment the driver had *already* called abort() by this point: the
-                # log shows the native abort, then this handler, then a second abort, then
-                # the process gone. Recovery has to happen in a process that is still
-                # entitled to exist, which means the next one -- see the durable marker
-                # written by `disable_gpu_backend`.
-                disable_gpu_backend(f"{type(exc).__name__}: {exc}".strip()[:500], durable=True)
-                raise
         else:
-            result = self._request().infer(input_feed)
+            # The CPU fallback is published before `device` changes. Re-read it here:
+            # another thread may have demoted this GPU session since our first snapshot.
+            cpu_session = getattr(self, "_cpu_session", None)
+            if cpu_session is not None:
+                return cpu_session.run(output_names, input_feed)
+            with _cpu_native_lane() as usable:
+                if usable:
+                    result = self._request().infer(input_feed)
+            if not usable:
+                # A model that was already on OpenVINO CPU/NPU shares the failed Core.
+                # Continue through plain ORT instead of issuing another native OV call.
+                self._move_to_cpu("another model failed in the shared OpenVINO context")
+                return self._cpu_session.run(output_names, input_feed)
         wanted = list(output_names) if output_names else [item.name for item in self._outputs]
         arrays: list[np.ndarray] = []
         for name in wanted:

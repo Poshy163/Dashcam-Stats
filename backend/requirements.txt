@@ -46,10 +46,10 @@ Pillow>=12.3.0,<13
 #     ...intel_gpu/src/runtime/ocl/ocl_stream.cpp:369      (2026.3 reported :388)
 #
 # Different line, same abort, so it is genuinely the older runtime failing rather than a
-# stale image. The OpenVINO version is not what decides this. What remains untested is the
-# layer the abort actually names -- ``os_interface/linux/drm_buffer_object.cpp`` belongs to
-# intel/compute-runtime (NEO), and Bookworm ships NEO from 2022. If GPU inference is ever
-# wanted here, that driver is the thing to move.
+# stale image. The abort names ``os_interface/linux/drm_buffer_object.cpp`` in Intel's
+# compute-runtime (NEO). That investigation used Bookworm's 2022 driver. The image now
+# installs the matched NEO 25.13/IGC/GMM set in docker/intel-runtime.json; retain this
+# OpenVINO pin while qualifying that driver on physical hardware.
 #
 # The pin stays anyway: 2025.4.1 is now the version this deployment has actually run, it
 # does the CPU work it is asked for, and there is nothing to gain from churning it. The app

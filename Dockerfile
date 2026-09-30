@@ -56,10 +56,8 @@ FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e6
 # "Conflicting values set for option Signed-By" before it installs anything. Both source
 # formats are handled so the build does not depend on which one the base image ships.
 #
-# The Intel media driver is installed separately and allowed to fail: it is preferred on
-# Intel hardware, but on an AMD iGPU or a host with no GPU at all mesa-va-drivers already
-# covers decode, and failing the whole image build over a driver the machine may never use
-# would be the wrong trade.
+# Install both Intel and Mesa media drivers. CI checks that the Intel stack links, even
+# without a GPU device, so a broken media dependency cannot silently ship.
 #
 # android-tools-adb is the control channel for the head-unit backup, and only that:
 # connect, list the card, start a listener. The recordings themselves never pass through
@@ -82,7 +80,6 @@ RUN set -eux; \
         vainfo \
         i965-va-driver \
         mesa-va-drivers \
-        intel-opencl-icd \
         ocl-icd-libopencl1 \
         clinfo \
         libgl1 \
@@ -92,65 +89,23 @@ RUN set -eux; \
         gosu \
         curl \
         android-tools-adb; \
-    apt-get install -y --no-install-recommends intel-media-va-driver-non-free \
-        || apt-get install -y --no-install-recommends intel-media-va-driver \
-        || echo 'WARNING: no Intel media driver available; VAAPI will fall back to Mesa'; \
+    apt-get install -y --no-install-recommends intel-media-va-driver-non-free; \
     rm -rf /var/lib/apt/lists/*
 
-# Intel's own compute-runtime, off by default -- because it was tried, and it lost VAAPI.
-#
-# The reasoning for trying it was sound. The deployment's iGPU aborts inside
-# ``shared/source/os_interface/linux/drm_buffer_object.cpp``, which belongs to
-# intel/compute-runtime, and Bookworm ships that from 2022 against a Raptor Lake chip.
-# Every other variable had been changed without effect: VAAPI separated from OpenVINO,
-# concurrency cut to one worker, OpenVINO pinned back from 2026.3 to 2025.4.1. All three
-# still produced the identical ``clFlush -5 CL_OUT_OF_RESOURCES``.
-#
-# Measured on the deployment with NEO 26.27.39122.11 and IGC 2.38.2 installed:
-#
-#     openvino_devices : ["CPU"]        (GPU gone entirely)
-#     vaapi_available  : false          (was true)
-#     hardware_decode  : false          (was true)
-#
-# The render node and i915 were untouched, so this is not the hardware disappearing. NEO
-# 26.27 requires gmmlib 22.10, and ``dpkg -i`` of Intel's ``libigdgmm12`` replaces the one
-# Bookworm's iHD media driver was built against -- so the media driver stops loading and
-# VAAPI goes with it. The OpenCL device did not come back either. Strictly worse than the
-# old driver, which at least decoded.
-#
-# Left here because the diagnosis still points at this layer, and because doing it properly
-# means bringing the *media* driver forward at the same time rather than half of a matched
-# set. Enable with --build-arg INTEL_COMPUTE_RUNTIME=1 once that is worked out; leave it
-# off and Bookworm's driver stays, which is the configuration that decodes.
-ARG INTEL_COMPUTE_RUNTIME=
-ARG NEO_VERSION=26.27.39122.11
-ARG IGC_VERSION=2.38.2
-# The IGC filenames carry a build number after a '+', which has to be %2B in the URL.
-ARG IGC_BUILD=22051
-ARG GMMLIB_VERSION=22.10.0
-RUN set -eu; \
-    if [ -z "${INTEL_COMPUTE_RUNTIME}" ]; then \
-        echo "keeping Debian's Intel driver (INTEL_COMPUTE_RUNTIME unset)"; \
-    else \
-        neo="https://github.com/intel/compute-runtime/releases/download/${NEO_VERSION}"; \
-        igc="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION}"; \
-        ver="${IGC_VERSION}%2B${IGC_BUILD}"; \
-        tmp="$(mktemp -d)"; \
-        if cd "$tmp" \
-            && curl -fsSL -o igc-core.deb "${igc}/intel-igc-core-2_${ver}_amd64.deb" \
-            && curl -fsSL -o igc-opencl.deb "${igc}/intel-igc-opencl-2_${ver}_amd64.deb" \
-            && curl -fsSL -o gmmlib.deb "${neo}/libigdgmm12_${GMMLIB_VERSION}_amd64.deb" \
-            && curl -fsSL -o icd.deb "${neo}/intel-opencl-icd_${NEO_VERSION}-0_amd64.deb" \
-            && dpkg -i gmmlib.deb igc-core.deb igc-opencl.deb icd.deb; \
-        then \
-            echo "installed Intel compute-runtime ${NEO_VERSION} with IGC ${IGC_VERSION}"; \
-        else \
-            echo "WARNING: could not install Intel compute-runtime ${NEO_VERSION}"; \
-            dpkg --configure -a || true; \
-        fi; \
-        rm -rf "$tmp"; \
-    fi; \
-    rm -rf /var/lib/apt/lists/*
+# A complete, hash-pinned Intel OpenCL stack compatible with Bookworm's libc/libstdc++.
+# NEO 25.13 is the last upstream series built for Ubuntu 22.04; newer Ubuntu 24.04
+# binaries require symbols Bookworm cannot provide. Keep its matched IGC/GMM versions
+# together and check eager linking of both OpenCL and the existing iHD media driver.
+# An unavailable archive, checksum mismatch or broken package must fail the build.
+# Legacy Intel GPUs can explicitly retain Debian's older OpenCL package set.
+ARG INTEL_COMPUTE_RUNTIME=pinned
+COPY docker/intel-runtime.json /usr/local/share/dashcam/intel-runtime.json
+COPY docker/install-intel-runtime.py /tmp/install-intel-runtime.py
+COPY backend/scripts/check_intel_runtime.py /tmp/check_intel_runtime.py
+RUN apt-get update \
+    && python /tmp/install-intel-runtime.py /usr/local/share/dashcam/intel-runtime.json "${INTEL_COMPUTE_RUNTIME}" \
+    && python /tmp/check_intel_runtime.py \
+    && rm -rf /var/lib/apt/lists/* /tmp/install-intel-runtime.py /tmp/check_intel_runtime.py
 
 COPY backend/requirements-build.lock /tmp/bootstrap.lock
 RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: -r /tmp/bootstrap.lock

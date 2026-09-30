@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 
 from app.ai.models import DEFAULT_DETECTION_MODEL, REGISTRY, ROAD_CLASSES, ensure_model
-from app.ai.openvino_session import gpu_backend_disabled, use_openvino_session
+from app.ai.openvino_session import gpu_backend_disabled, gpu_context_failed, use_openvino_session
 from app.core.logging import get_logger
 from app.core.resources import configure_opencv_threads, onnx_session_options
 from app.core.settings_service import get_settings_service
@@ -229,8 +229,9 @@ class ObjectDetector:
         model = getattr(self._detector, "model", None)
         ensure_cpu = getattr(model, "ensure_cpu", None)
         if callable(ensure_cpu):
-            with contextlib.suppress(Exception):
-                ensure_cpu(reason)
+            # A failed CPU recovery is an inference failure, not an empty detection.
+            # Let the recording retry instead of silently submitting to a disabled GPU.
+            ensure_cpu(reason)
 
     async def detect(
         self, frame: np.ndarray, *, classes: frozenset[str] | None = None
@@ -248,7 +249,7 @@ class ObjectDetector:
             return []
 
         device = (self.device or "").upper()
-        if "GPU" in device:
+        if "GPU" in device or gpu_context_failed():
             # Two independent reasons to get off this chip, and only one of them used to be
             # asked about.
             #
@@ -264,9 +265,10 @@ class ObjectDetector:
             # from an ordinary call site rather than from inside the driver's failing stack,
             # which is the thing the session's own comment rules out.
             failure = gpu_backend_disabled()
-            if failure or not intel_media_lock().gpu_safe():
-                self._demote_to_cpu(
-                    failure or intel_media_lock().unhealthy or "the Intel media slot is unhealthy"
+            if failure or gpu_context_failed() or not intel_media_lock().gpu_safe():
+                await asyncio.to_thread(
+                    self._demote_to_cpu,
+                    failure or intel_media_lock().unhealthy or "the Intel media slot is unhealthy",
                 )
                 device = (self.device or "").upper()
 

@@ -50,6 +50,37 @@ Docker build after an upgrade. CI audits both Python locks and the packages inst
 the built image. `pip-audit` covers Python advisories; it does not constitute a Debian
 package or physical GPU certification.
 
+## Intel GPU runtime
+
+The image installs the complete Intel OpenCL package set recorded in
+`docker/intel-runtime.json`: NEO 25.13.33276.16, IGC 2.10.8 (archive build 18926),
+and GMM 22.7.0. The Debian Bookworm base and its iHD media driver are retained.
+NEO 25.13 is the last series built for Ubuntu 22.04; later upstream binaries can
+require libc and libstdc++ symbols unavailable on Bookworm. This replaces the
+optional 26.27 installation that could leave partially configured packages after
+an ignored failure.
+
+Package URLs, installed versions and SHA256 values are pinned together. Every
+archive must verify before apt runs; download, checksum, dependency and package
+configuration errors fail the build. Build and CI checks eagerly load the compiler,
+OpenCL ICD, GMM and iHD shared libraries, catching missing ABI symbols even on a
+runner without a GPU. Level Zero is not needed for this OpenCL workload.
+
+The default `INTEL_COMPUTE_RUNTIME=pinned` build targets supported modern Intel GPUs,
+including Raptor Lake. Older Intel generations removed from the newer upstream runtime
+can retain Debian's OpenCL packages with
+`docker build --build-arg INTEL_COMPUTE_RUNTIME=debian .`. That branch also requires
+successful package configuration and shared-library checks; unknown selector values
+fail the build. The former opt-in `=1` value is no longer accepted. This selector changes
+container userspace packages, not the host kernel driver.
+
+Upstream sources: [NEO 25.13 release](https://github.com/intel/compute-runtime/releases/tag/25.13.33276.16)
+and [IGC 2.10.8 release](https://github.com/intel/intel-graphics-compiler/releases/tag/v2.10.8).
+The package compatibility checks do not establish successful VAAPI decode or
+sustained inference on physical hardware. Preserve the durable GPU-disable marker
+through an image update; clear it only after separate device probes and stress
+testing succeed. The application remains protected by its CPU fallback meanwhile.
+
 ## Publishing exactly what passed
 
 `release.yml` calls the complete reusable CI workflow and cannot publish until backend,

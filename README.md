@@ -74,6 +74,11 @@ degrades gracefully at every level. There is no CUDA dependency anywhere.
 * **Decode** — FFmpeg VAAPI on the render node, falling back to software decode.
 * **Inference** — OpenVINO on the iGPU, falling back to OpenVINO CPU, then ONNX Runtime.
 
+The default image includes a pinned Intel OpenCL stack for modern GPUs, including
+Raptor Lake. Older Intel generations can retain Debian's driver using the documented
+`INTEL_COMPUTE_RUNTIME=debian` build option; see the
+[Intel runtime build notes](docs/dependency-and-release-process.md#intel-gpu-runtime).
+
 The **Settings → Advanced** page shows exactly what was detected: GPU name and driver,
 which decoder is in use, which inference device is active, and the realtime factor the
 current job is achieving.
