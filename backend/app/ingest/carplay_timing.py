@@ -898,7 +898,9 @@ def _sampler_chunk_command(
     mode = "gzip" if compressed else "base64"
     return (
         f"exec 3<{path} || exit 1; "
-        'm=$(stat -L -c "%d:%i:%s" /proc/self/fd/3) || exit 1; '
+        # mksh closes extra descriptors on external exec; explicitly duplicate the pinned
+        # descriptor onto stdin so stat observes the same inode dd will subsequently read.
+        'm=$(stat -L -c "%d:%i:%s" /proc/self/fd/0 <&3) || exit 1; '
         f'case "$m" in {device}:{inode}:*) ;; *) echo CPR_CHANGED; exit 0;; esac; '
         f'[ "${{m##*:}}" -ge {size} ] || {{ echo CPR_CHANGED; exit 0; }}; '
         f"p=$(dd bs={block} skip={skip} count={blocks} <&3 2>/dev/null | "
