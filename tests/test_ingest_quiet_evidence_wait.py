@@ -9,12 +9,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from test_ingest_preparation_lifecycle import isolated_mirror as _isolated_mirror
+from test_ingest_preparation_lifecycle import prepared_unit as _prepared_unit
 
 from app.ingest import adb, puller
 from app.ingest.models import RunState
 from app.ingest.status import get_status, reset_status_for_tests
-from tests.test_ingest_preparation_lifecycle import isolated_mirror as _isolated_mirror
-from tests.test_ingest_preparation_lifecycle import prepared_unit as _prepared_unit
 
 isolated_mirror = _isolated_mirror
 prepared_unit = _prepared_unit
