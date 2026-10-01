@@ -3,10 +3,10 @@
 import subprocess
 
 import pytest
+from test_ingest_radio_unit_report import _report_config
+from test_ingest_radio_unit_report import posix_shell as _posix_shell
 
 from app.ingest import radios
-from tests.test_ingest_radio_unit_report import _report_config
-from tests.test_ingest_radio_unit_report import posix_shell as _posix_shell
 
 posix_shell = _posix_shell
 
