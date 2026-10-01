@@ -9,13 +9,19 @@ window they describe is over in two minutes.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import deque
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from app.core.logging import get_logger
-from app.ingest.adb import RUNTIME_OBSERVATION_TIMEOUT_S, RuntimeObservation
+from app.ingest.adb import (
+    RUNTIME_OBSERVATION_TIMEOUT_S,
+    SLEEP_DEADLINE_EVIDENCE_TTL_S,
+    RuntimeObservation,
+)
 from app.ingest.models import DeltaPlan, Phase, RunResult, RunState
 
 log = get_logger(__name__)
@@ -41,6 +47,16 @@ RADIO_QUIET_MIN_REMAINING_S = 60.0
 # ACC could have fallen immediately after the preceding on observation. Include a
 # bounded control-read interval as well as the largest accepted observation gap.
 RADIO_QUIET_OBSERVATION_MARGIN_S = UNIT_OBSERVATION_TTL_S + RUNTIME_OBSERVATION_TIMEOUT_S
+
+
+@dataclass(frozen=True)
+class _Countdown:
+    remaining_s: float | None
+    source: str
+    reason: str
+    evidence_source: str | None = None
+    valid_for_s: float | None = None
+    off_at: datetime | None = None
 
 
 class IngestStatus:
@@ -90,6 +106,12 @@ class IngestStatus:
         #: Cleared when the unit leaves, because the reading describes a boot that is over.
         self.unit_uptime_s: float | None = None
         self._unit_boot_id: str | None = None
+        self._unit_boot_count: int | None = None
+        self._unit_deadline_monotonic: float | None = None
+        self._unit_deadline_fresh_until: float | None = None
+        self._unit_edge_wall: datetime | None = None
+        self._operational_deadline_monotonic: float | None = None
+        self._unit_edge_bounds: tuple[int, int] | None = None
         self._unit_observed_at: datetime | None = None
         self._unit_observed_monotonic: float | None = None
         self._unit_observation_failed = False
@@ -285,12 +307,13 @@ class IngestStatus:
                 self.unit_observation_failed()
             self.unit_online = online
 
-    def _unit_observation_fresh(self) -> bool:
+    def _unit_observation_fresh(self, *, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
         return (
             self.unit_online
             and not self._unit_observation_failed
             and self._unit_observed_monotonic is not None
-            and time.monotonic() - self._unit_observed_monotonic <= UNIT_OBSERVATION_TTL_S
+            and now - self._unit_observed_monotonic <= UNIT_OBSERVATION_TTL_S
         )
 
     def unit_observation_failed(self) -> None:
@@ -304,24 +327,43 @@ class IngestStatus:
             self._observed_off_wall = None
             self._observed_off_window_s = None
             self._observed_off_quiet_window_s = None
+            self._unit_deadline_monotonic = None
+            self._unit_deadline_fresh_until = None
+            self._unit_edge_wall = None
 
     def observe_unit_runtime(self, observation: RuntimeObservation) -> bool:
         """Publish current power state; return whether a different boot was observed.
 
-        An already-off first observation cannot locate ignition-off. Only a fresh on→off
-        pair on the same boot anchors the public estimate. Later property writes do not
-        prove a restart of the vendor's latched timer and cannot extend that estimate.
+        An already-off arrival needs fresh boot-bound evidence recorded on the unit.
+        Otherwise only a fresh on→off pair on the same boot anchors the estimate. Later
+        property writes do not prove a native timer restart and cannot extend it.
         """
         with self._lock:
             now = time.monotonic()
             changed_boot = (
-                self._unit_boot_id is not None and self._unit_boot_id != observation.boot_id
-            ) or (
-                self._unit_boot_id is None
-                and self.unit_uptime_s is not None
-                and observation.uptime_s + 5 < self.unit_uptime_s
+                (
+                    self._unit_boot_id is not None
+                    and self._unit_boot_id != observation.boot_id
+                    and observation.boot_id is not None
+                )
+                or (
+                    self._unit_boot_count is not None
+                    and observation.boot_count is not None
+                    and self._unit_boot_count != observation.boot_count
+                )
+                or (
+                    self._unit_boot_id is None
+                    and self.unit_uptime_s is not None
+                    and observation.uptime_s + 5 < self.unit_uptime_s
+                )
             )
-            same_boot = self._unit_boot_id == observation.boot_id
+            same_boot = not changed_boot and (
+                (self._unit_boot_id is not None and self._unit_boot_id == observation.boot_id)
+                or (
+                    self._unit_boot_count is not None
+                    and self._unit_boot_count == observation.boot_count
+                )
+            )
             previous_fresh = self._unit_observation_fresh()
             previous_state = self._observed_ignition_state
             previous_window = self._observed_window_s
@@ -334,6 +376,8 @@ class IngestStatus:
                 self.ignition_off_monotonic = None
                 self.ignition_off_wall = None
                 self.sleep_window_started_monotonic = None
+                self._operational_deadline_monotonic = None
+                self._unit_edge_bounds = None
             if changed_boot:
                 self._online_since = now
                 self.backlog_known = False
@@ -349,12 +393,16 @@ class IngestStatus:
                 self.cancel()
             self.set_unit_online(True)
             self._unit_boot_id = observation.boot_id
+            self._unit_boot_count = observation.boot_count
             self._unit_observed_at = datetime.now(UTC)
             self._unit_observed_monotonic = now
             self._unit_observation_failed = False
             self._observed_uptime_s = self.unit_uptime_s = observation.uptime_s
             self._observed_ignition_state = self.ignition_state = observation.ignition_state
             self._observed_window_s = observation.sleep_window_s
+            self._unit_deadline_monotonic = None
+            self._unit_deadline_fresh_until = None
+            self._unit_edge_wall = None
             if observation.sleep_window_s is not None:
                 self.sleep_window_s = observation.sleep_window_s
             if observation.ignition_state == "off":
@@ -373,6 +421,35 @@ class IngestStatus:
                     )
                     self.ignition_off_monotonic = now
                     self.ignition_off_wall = self._unit_observed_at
+                evidence = observation.validated_sleep_deadline()
+                if evidence is not None and self._unit_edge_bounds is not None:
+                    bounds = (evidence.off_lower_elapsed_ms, evidence.off_upper_elapsed_ms)
+                    if bounds != self._unit_edge_bounds:
+                        if bounds[0] > self._unit_edge_bounds[1]:
+                            # Hibernation preserves boot identity. A newly witnessed
+                            # local ON→OFF identifies the next trip's separate timer.
+                            self._operational_deadline_monotonic = None
+                            self._observed_off_monotonic = None
+                            self._observed_off_wall = None
+                            self._observed_off_window_s = None
+                            self._observed_off_quiet_window_s = None
+                        else:
+                            evidence = None  # Overlap/regression cannot prove a new timer.
+                if evidence is not None:
+                    self._unit_edge_bounds = (
+                        evidence.off_lower_elapsed_ms,
+                        evidence.off_upper_elapsed_ms,
+                    )
+                    elapsed = observation.uptime_s - evidence.off_lower_elapsed_ms / 1000
+                    self._unit_deadline_monotonic = (
+                        now
+                        + min(evidence.window_s, observation.sleep_window_s)
+                        - elapsed
+                        - RUNTIME_OBSERVATION_TIMEOUT_S
+                    )
+                    age = observation.uptime_s - evidence.observed_elapsed_ms / 1000
+                    self._unit_deadline_fresh_until = now + SLEEP_DEADLINE_EVIDENCE_TTL_S - age
+                    self._unit_edge_wall = self._unit_observed_at - timedelta(seconds=elapsed)
             else:
                 self._observed_off_monotonic = None
                 self._observed_off_wall = None
@@ -381,21 +458,93 @@ class IngestStatus:
                 self.ignition_off_monotonic = None
                 self.ignition_off_wall = None
                 self.sleep_window_started_monotonic = None
+                self._operational_deadline_monotonic = None
+            credible = self._credible_countdown_remaining()
+            if credible is not None:
+                deadline = now + credible
+                self._operational_deadline_monotonic = (
+                    min(self._operational_deadline_monotonic, deadline)
+                    if self._operational_deadline_monotonic is not None
+                    else deadline
+                )
             return changed_boot
 
-    def _observed_countdown(self) -> tuple[float | None, str, str | None]:
-        if not self._unit_observation_fresh():
-            return None, "unknown", "Waiting for a fresh head-unit power observation"
+    def _unit_countdown_remaining(self, *, now: float | None = None) -> float | None:
+        now = time.monotonic() if now is None else now
+        if (
+            self._unit_deadline_monotonic is None
+            or self._unit_deadline_fresh_until is None
+            or now >= self._unit_deadline_fresh_until
+        ):
+            return None
+        return max(0.0, self._unit_deadline_monotonic - now)
+
+    def _credible_countdown_remaining(self, *, now: float | None = None) -> float | None:
+        """Conservative budget for admission; never resurrect cached logger evidence."""
+        now = time.monotonic() if now is None else now
+        if not self._unit_observation_fresh(now=now) or self._observed_ignition_state != "off":
+            return None
+        candidates = []
+        unit_remaining = self._unit_countdown_remaining(now=now)
+        if unit_remaining is not None:
+            candidates.append(unit_remaining)
+        if (
+            self._observed_off_monotonic is not None
+            and self._observed_off_quiet_window_s is not None
+        ):
+            candidates.append(
+                max(
+                    0.0,
+                    self._observed_off_monotonic
+                    + self._observed_off_quiet_window_s
+                    - now
+                    - RADIO_QUIET_OBSERVATION_MARGIN_S,
+                )
+            )
+        if candidates and self._operational_deadline_monotonic is not None:
+            candidates.append(max(0.0, self._operational_deadline_monotonic - now))
+        return min(candidates) if candidates else None
+
+    def _countdown(self) -> _Countdown:
+        now = time.monotonic()
+        if not self._unit_observation_fresh(now=now):
+            return _Countdown(None, "unknown", "Waiting for a fresh head-unit power observation")
         if self._observed_ignition_state == "on":
-            return None, "not_running", "Ignition is on"
+            return _Countdown(None, "not_running", "Ignition is on")
         if self._observed_ignition_state != "off":
-            return None, "unknown", "Head-unit ignition state is unknown"
-        if self._observed_off_monotonic is None or self._observed_off_window_s is None:
-            return None, "unknown", "Ignition was already off when observed; sleep deadline unknown"
-        remaining = max(
-            0.0, self._observed_off_window_s - (time.monotonic() - self._observed_off_monotonic)
+            return _Countdown(None, "unknown", "Head-unit ignition state is unknown")
+        unit_remaining = self._unit_countdown_remaining(now=now)
+        server_remaining = (
+            max(0.0, self._observed_off_monotonic + self._observed_off_window_s - now)
+            if self._observed_off_monotonic is not None and self._observed_off_window_s is not None
+            else None
         )
-        return remaining, "estimated", "Estimated from an observed ignition-off transition"
+        from_unit = unit_remaining is not None and (
+            server_remaining is None or unit_remaining <= server_remaining
+        )
+        remaining = unit_remaining if from_unit else server_remaining
+        if remaining is None:
+            return _Countdown(
+                None, "unknown", "Ignition was already off when observed; sleep deadline unknown"
+            )
+        credible = self._credible_countdown_remaining(now=now)
+        validity = max(0.0, UNIT_OBSERVATION_TTL_S - (now - self._unit_observed_monotonic))
+        if from_unit:
+            validity = min(validity, max(0.0, self._unit_deadline_fresh_until - now))
+        return _Countdown(
+            min(remaining, credible) if credible is not None else remaining,
+            "estimated",
+            "Estimated from head-unit ignition-off evidence; its timer can differ"
+            if from_unit
+            else "Estimated from an observed ignition-off transition",
+            "unit" if from_unit else "server",
+            validity,
+            self._unit_edge_wall if from_unit else self._observed_off_wall,
+        )
+
+    def _observed_countdown(self) -> tuple[float | None, str, str | None]:
+        countdown = self._countdown()
+        return countdown.remaining_s, countdown.source, countdown.reason
 
     def radio_quieting_allowed(self) -> bool:
         """Require a fresh, conservatively long-enough estimate before NEW quieting.
@@ -404,16 +553,10 @@ class IngestStatus:
         rewrite must not manufacture a full sleep window. Restoration never calls this.
         """
         with self._lock:
-            remaining, source, _reason = self._observed_countdown()
-            if remaining is not None and self._observed_off_quiet_window_s is not None:
-                remaining -= (self._observed_off_window_s or 0) - self._observed_off_quiet_window_s
-            if (
-                source != "estimated"
-                or remaining is None
-                or self._observed_off_quiet_window_s is None
-            ):
+            remaining = self._credible_countdown_remaining()
+            if remaining is None:
                 reason = "Radios left unchanged: the remaining head-unit sleep time is unknown."
-            elif remaining - RADIO_QUIET_OBSERVATION_MARGIN_S <= RADIO_QUIET_MIN_REMAINING_S:
+            elif remaining <= RADIO_QUIET_MIN_REMAINING_S:
                 reason = (
                     "Radios left unchanged: at most one minute remains before sleep after allowing "
                     "for observation uncertainty."
@@ -600,17 +743,37 @@ class IngestStatus:
         return anchor
 
     def sleep_countdown_elapsed_s(self) -> int:
-        """Elapsed operational watchdog estimate, retained for radio recovery policy.
-
-        This is not a read of the vendor timer. Public reporting uses observed ACC edges
-        instead; changing the watchdog's restoration policy requires separate validation.
-        """
+        """Encode the earliest credible deadline, falling back to legacy recovery state."""
         if self.ignition_state != "off":
             return 0
+        if self._operational_deadline_monotonic is not None:
+            # The detached watchdog subtracts elapsed from the current property. Encode
+            # the earlier credible deadline even when a later write enlarged that property.
+            remaining = max(0.0, self._operational_deadline_monotonic - time.monotonic())
+            return max(0, math.ceil(self.sleep_window_s - remaining))
         anchor = self._countdown_anchor()
         if anchor is None:
             return 0
         return int(max(0.0, time.monotonic() - anchor))
+
+    def sleep_deadline_uptime_s(self) -> int | None:
+        """A frozen device elapsed-time ceiling for the detached recovery watchdog."""
+        with self._lock:
+            if (
+                self._credible_countdown_remaining() is None
+                or self._operational_deadline_monotonic is None
+                or self._unit_observed_monotonic is None
+                or self._observed_uptime_s is None
+            ):
+                return None
+            return max(
+                0,
+                math.floor(
+                    self._observed_uptime_s
+                    + self._operational_deadline_monotonic
+                    - self._unit_observed_monotonic
+                ),
+            )
 
     def sleep_countdown_remaining_s(self) -> float | None:
         """Remaining seconds before the head unit sleeps, or None if unknown/offline."""
@@ -619,6 +782,8 @@ class IngestStatus:
         if self.ignition_state == "on":
             return float(self.sleep_window_s)
         if self.ignition_state == "off":
+            if self._operational_deadline_monotonic is not None:
+                return max(0.0, self._operational_deadline_monotonic - time.monotonic())
             anchor = self._countdown_anchor()
             if anchor is not None:
                 elapsed = time.monotonic() - anchor
@@ -697,7 +862,7 @@ class IngestStatus:
         """
         with self._lock:
             fresh = self._unit_observation_fresh()
-            countdown, countdown_source, countdown_reason = self._observed_countdown()
+            countdown = self._countdown()
             prediction = self.sleep_window_prediction(observed_only=True)
             return {
                 "state": self.state.value,
@@ -741,16 +906,14 @@ class IngestStatus:
                 ),
                 "sleep_window_seconds": self.sleep_window_s,
                 "sleep_countdown_remaining_s": (
-                    round(countdown, 1) if countdown is not None else None
+                    round(countdown.remaining_s, 1) if countdown.remaining_s is not None else None
                 ),
-                "sleep_countdown_source": countdown_source,
-                "sleep_countdown_reason": countdown_reason,
+                "sleep_countdown_source": countdown.source,
+                "sleep_countdown_reason": countdown.reason,
+                "sleep_countdown_valid_for_s": countdown.valid_for_s,
+                "sleep_countdown_evidence_source": countdown.evidence_source,
                 "ignition_state": self._observed_ignition_state if fresh else "unknown",
-                "ignition_off_at": (
-                    self._observed_off_wall.isoformat()
-                    if fresh and self._observed_off_wall
-                    else None
-                ),
+                "ignition_off_at": (countdown.off_at.isoformat() if countdown.off_at else None),
                 "sleep_window_prediction": prediction,
                 "recorder_health": self.recorder_health,
                 "recorder_health_ok": self.recorder_health_ok,

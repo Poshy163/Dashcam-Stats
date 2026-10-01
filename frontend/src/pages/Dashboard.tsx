@@ -430,6 +430,7 @@ export function DashcamStatusBanner({ status, receivedAt, requestFailed = false 
             )}
             {liveCountdown !== null ? (
               <span
+                title={countdown.hint}
                 className={`badge ${
                   prediction?.willPass
                     ? 'bg-state-ok/15 text-state-ok'

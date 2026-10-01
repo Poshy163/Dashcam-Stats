@@ -221,6 +221,10 @@ export interface IngestStatus {
   unitObservationAgeS?: number | null
   unitObservationTtlS?: number
   sleepCountdownSource?: 'estimated' | 'unknown' | 'not_running'
+  /** Where ignition-off timing was observed; neither source reads the native timer. */
+  sleepCountdownEvidenceSource?: 'unit' | 'server' | null
+  /** Remaining evidence validity when this response was produced, independent of the estimated sleep time. */
+  sleepCountdownValidForS?: number | null
   sleepCountdownReason?: string | null
   ignitionState: 'on' | 'off' | 'unknown'
   ignitionOffAt: string | null

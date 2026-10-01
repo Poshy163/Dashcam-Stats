@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import time
 
+from app.config import get_config
 from app.core.logging import get_logger
 from app.ingest import (
     adb,
@@ -346,7 +347,9 @@ class IngestPoller:
         self._runtime_observation_due = now + RUNTIME_OBSERVATION_INTERVAL_S
         status = get_status()
         try:
-            observation = await adb.runtime_observation(address)
+            observation = await adb.runtime_observation(
+                address, logger_status_path=get_config().obd_remote_status_file
+            )
         except asyncio.CancelledError:
             raise
         except Exception:

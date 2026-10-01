@@ -1798,12 +1798,18 @@ class ObdLoggerService : Service() {
             sleepWindowObservedSeconds = sleepWindow.observedSeconds,
             sleepWindowVerified = sleepWindow.verified,
             sleepWindowError = sleepWindow.error,
+            sleepDeadlineEvidence = sleepWindow.deadline,
             lastError = error,
             lastErrorAtUtc = error?.let { Instant.now().toString() },
         )
         scheduleEventProjectionRetry()
         val signature = durableStatusSignature(status)
-        if (!statusWriteGate.shouldWrite(signature, SystemClock.elapsedRealtime())) return
+        if (!statusWriteGate.shouldWrite(
+                signature,
+                SystemClock.elapsedRealtime(),
+                heartbeatOverrideMillis = status.sleepDeadlineEvidence?.windowSeconds
+                    ?.let { DEADLINE_STATUS_HEARTBEAT_MS },
+            )) return
         runCatching {
             StatusPublisher.publish(this, status)
         }.onFailure {
@@ -1893,6 +1899,7 @@ class ObdLoggerService : Service() {
 
     private fun recordSleepWindowObservation(value: SleepWindowControllerObservation) {
         when (value) {
+            SleepWindowControllerObservation.DeadlineUpdated -> scheduleSleepStatusPublish()
             is SleepWindowControllerObservation.Wifi -> emitEvent(
                 kind = "network.wifi",
                 level = "info",

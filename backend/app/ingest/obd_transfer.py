@@ -12,7 +12,7 @@ import shutil
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -223,6 +223,7 @@ _LOGGER_KEYS = frozenset(
         "ingestion_sleep_hold",
         "ingestion_sleep_hold_known",
         "sleep_window_policy",
+        "sleep_deadline_evidence",
         "sleep_window_target_s",
         "sleep_window_observed_s",
         "sleep_window_verified",
@@ -498,6 +499,12 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
         elif key == "head_unit_state":
             if item in {"awake", "sleep_requested", "asleep", "unknown"}:
                 clean[key] = item
+        elif key == "sleep_deadline_evidence":
+            # Structure is safe to display; only a separate live runtime observation
+            # may bind these fields to the current boot, uptime and ACC state.
+            evidence = adb.parse_sleep_deadline_evidence(item)
+            if evidence is not None:
+                clean[key] = asdict(evidence)
         elif key == "sleep_window_policy":
             if isinstance(item, str) and item in _LOGGER_SLEEP_WINDOW_POLICIES:
                 clean[key] = item
@@ -908,12 +915,64 @@ async def verified_bundle_matches(filename: str, bundle_sha256: str) -> bool:
     return size == row.size_bytes and digest == row.bundle_hash
 
 
+@dataclass
+class _TransferOwnership:
+    cancel_event: threading.Event
+    listener: asyncio.subprocess.Process | None = None
+    stopping: asyncio.Task | None = None
+
+    def request_cancel(self) -> None:
+        self.cancel_event.set()
+        # Closing the listener also releases a receiver waiting in a socket read.
+        # Keep the task owned until the transfer's final cleanup has joined it.
+        if self.listener is not None and self.stopping is None:
+            self.stopping = asyncio.create_task(adb.stop_listener(self.listener))
+
+    async def stop_listener(self) -> None:
+        if self.listener is not None and self.stopping is None:
+            self.stopping = asyncio.create_task(adb.stop_listener(self.listener))
+        if self.stopping is not None:
+            await self.stopping
+
+
 async def sync_remote_bundles(
     info: UnitInfo,
     *,
     ingest_status: IngestStatus | None = None,
     remote: list[RemoteFile] | None = None,
     config: AppConfig | None = None,
+) -> OBDTransferResult:
+    """Retain transfer ownership until noncancellable filesystem/socket workers settle."""
+    ownership = _TransferOwnership(
+        ingest_status.cancel_event if ingest_status is not None else threading.Event()
+    )
+    task = asyncio.create_task(
+        _sync_remote_bundles(
+            info, ingest_status=ingest_status, remote=remote, config=config, ownership=ownership
+        ),
+        name="obd-bundle-transfer",
+    )
+    cancelled = False
+    try:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+                ownership.request_cancel()
+        return task.result()
+    finally:
+        if cancelled:
+            raise asyncio.CancelledError
+
+
+async def _sync_remote_bundles(
+    info: UnitInfo,
+    *,
+    ingest_status: IngestStatus | None = None,
+    remote: list[RemoteFile] | None = None,
+    config: AppConfig | None = None,
+    ownership: _TransferOwnership,
 ) -> OBDTransferResult:
     """Copy, validate and queue bundles.  Never called as a condition of footage success."""
     cfg = config or get_config()
@@ -922,6 +981,14 @@ async def sync_remote_bundles(
     state = get_obd_transfer_status()
     transfer_dir: Path | None = None
     process_lock: ProcessFileLock | None = None
+    logger_task: asyncio.Task | None = None
+
+    def cancelled() -> bool:
+        if ownership.cancel_event.is_set():
+            result.complete = False
+            result.error = "OBD transfer cancelled; remaining originals retained on the unit"
+            return True
+        return False
 
     try:
         # ``try_acquire`` is a single non-blocking OS call. Keeping it on this task also
@@ -947,10 +1014,14 @@ async def sync_remote_bundles(
         return result
 
     try:
+        if cancelled():
+            return result
         source = _safe_remote_path(cfg.obd_remote_ready_dir)
         # A process-lifetime file lock is now held. Any matching directory is therefore
         # known to be an orphan from a dead process rather than another live transfer.
         await asyncio.to_thread(_clean_staging, cfg)
+        if cancelled():
+            return result
         logger_task = asyncio.create_task(
             read_logger_status(info.address, cfg.obd_remote_status_file)
         )
@@ -959,12 +1030,18 @@ async def sync_remote_bundles(
         state.set_logger(await logger_task)
         result.discovered = len(remote)
         state.set_inventory(len(remote))
+        if cancelled():
+            return result
         if not remote:
             return result
 
         pending: list[RemoteFile] = []
         for item in remote:
+            if cancelled():
+                return result
             existing = await _already_verified(item, cfg)
+            if cancelled():
+                return result
             if existing is not None:
                 try:
                     remote_hash = await _remote_bundle_sha256(info.address, source, item)
@@ -997,6 +1074,8 @@ async def sync_remote_bundles(
                         state=existing.state,
                     )
                     continue
+                if cancelled():
+                    return result
                 try:
                     await write_verification_receipt(
                         info.address,
@@ -1013,6 +1092,8 @@ async def sync_remote_bundles(
                         error=result.error,
                     )
                     continue
+                if cancelled():
+                    return result
                 try:
                     await _delete_remote_if_hash(
                         info.address,
@@ -1033,6 +1114,8 @@ async def sync_remote_bundles(
                     result.removed_from_unit += 1
                 continue
             rejected = await _already_rejected(item, cfg)
+            if cancelled():
+                return result
             if rejected is not None:
                 try:
                     remote_hash = await _remote_bundle_sha256(info.address, source, item)
@@ -1056,6 +1139,8 @@ async def sync_remote_bundles(
                 break
         if not pending:
             return result
+        if cancelled():
+            return result
         # False until every item in the authoritative pending inventory has crossed the
         # hash/validation/database durability boundary below.
         result.complete = False
@@ -1074,13 +1159,17 @@ async def sync_remote_bundles(
             int(ingest_setting("listen_timeout_s", 180)),
         )
         await adb.clear_listener(info.address)
-        proc = await adb.launch_listener(
+        if cancelled():
+            return result
+        ownership.listener = await adb.launch_listener(
             info.address,
             source,
             [item.name for item in pending],
             port=port,
             timeout_s=timeout_s,
         )
+        if cancelled():
+            return result
         received = await asyncio.to_thread(
             transport.receive,
             host,
@@ -1100,13 +1189,15 @@ async def sync_remote_bundles(
                 lambda name: ingest_status.file_done(name) if ingest_status is not None else None
             ),
             on_bytes=(ingest_status.add_bytes if ingest_status is not None else None),
-            cancel=(ingest_status.cancel_event if ingest_status is not None else None),
+            cancel=ownership.cancel_event,
         )
-        await adb.stop_listener(proc)
+        await ownership.stop_listener()
 
         expected = {item.name: item for item in pending}
         durable_names: set[str] = set()
         for name in received.files:
+            if cancelled():
+                return result
             item = expected.get(name)
             staged = transfer_dir / name
             target: Path | None = None
@@ -1259,6 +1350,8 @@ async def sync_remote_bundles(
                     state=row.state,
                 )
                 continue
+            if cancelled():
+                return result
             try:
                 await write_verification_receipt(
                     info.address,
@@ -1275,6 +1368,8 @@ async def sync_remote_bundles(
                     error=result.error,
                 )
                 continue
+            if cancelled():
+                return result
             try:
                 await _delete_remote_if_hash(
                     info.address,
@@ -1310,6 +1405,13 @@ async def sync_remote_bundles(
         log.warning("OBD backup stage failed without affecting footage", error=result.error)
     finally:
         try:
+            await ownership.stop_listener()
+            if logger_task is not None:
+                # Join reads too, including a failure completed before inventory failed.
+                if not logger_task.done():
+                    logger_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await logger_task
             result.seconds = time.monotonic() - started
             state.finish(result)
             # Orphan sweeping happens once at entry under the process fence. At exit,

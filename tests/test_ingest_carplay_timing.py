@@ -83,7 +83,7 @@ async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off
     async def listening(_address):
         return True
 
-    async def current_power(_address):
+    async def current_power(_address, *, logger_status_path):
         return poller_module.adb.RuntimeObservation(
             "01234567-1234-1234-1234-012345678901", 100.0, ignition, 1200
         )

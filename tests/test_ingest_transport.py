@@ -1760,6 +1760,206 @@ class TestARunEndToEnd:
         assert result.bytes == landed_footage_bytes + 1_000_000
         assert get_status().backlog_bytes == expected_footage_backlog
 
+    async def test_late_drive_bundle_is_copied_when_deadline_guard_keeps_radios_on(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        from app.ingest import puller, radios
+        from app.ingest.models import RunState
+        from app.ingest.obd_transfer import OBDTransferResult, get_obd_transfer_status
+        from app.ingest.status import get_status
+
+        events = []
+        inventory_count = 0
+
+        async def inventory(_address, source):
+            nonlocal inventory_count
+            inventory_count += 1
+            events.append(f"inventory:{inventory_count}")
+            if inventory_count == 1:
+                return []
+            assert list(app_config.footage_dir.glob("*.ts"))
+            return [RemoteFile("return-drive.obd2.zip", 321, 0, source)]
+
+        async def sync(_info, *, ingest_status, remote):
+            assert not ingest_status.cancel_event.is_set()
+            assert [item.name for item in remote] == ["return-drive.obd2.zip"]
+            events.append("late-copy")
+            return OBDTransferResult(
+                discovered=1, copied=1, removed_from_unit=1, bytes=321, seconds=0.2
+            )
+
+        async def forbidden_transition(**_kwargs):
+            raise AssertionError("catch-up must not start a radio transition")
+
+        monkeypatch.setattr(puller, "inventory_remote_bundles", inventory)
+        monkeypatch.setattr(puller, "sync_remote_bundles", sync)
+        monkeypatch.setattr(radios, "new_quieting_allowed", lambda: False)
+        monkeypatch.setattr(puller.radio_coordinator, "begin", forbidden_transition)
+        await self._enable(**{"ingest.quiet_radios": True})
+
+        result = await puller.run_pull(trigger="manual")
+
+        assert result.state is RunState.OK
+        assert result.files == len(unit.payload) + 1
+        assert result.bytes == sum(map(len, unit.payload.values())) + 321
+        assert events == ["inventory:1", "inventory:2", "late-copy"]
+        assert get_obd_transfer_status().snapshot()["waiting_on_unit"] == 0
+        assert get_status().backlog_bytes == 0
+
+    async def test_late_obd_catch_up_retains_earlier_exports_without_double_counting(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        from app.ingest import puller
+        from app.ingest.models import RunState
+        from app.ingest.obd_transfer import OBDTransferResult, get_obd_transfer_status
+
+        inventories = 0
+        copied_names = []
+        close_requests = []
+
+        async def inventory(_address, source):
+            nonlocal inventories
+            inventories += 1
+            names = ["outbound.obd2.zip"]
+            if inventories > 1:
+                names.append("return.obd2.zip")
+            return [RemoteFile(name, 100, 0, source) for name in names]
+
+        async def sync(_info, *, ingest_status, remote):
+            names = [item.name for item in remote]
+            copied_names.append(names)
+            return OBDTransferResult(
+                discovered=1,
+                copied=1,
+                bytes=100,
+                seconds=0.1,
+                removed_from_unit=int(names == ["return.obd2.zip"]),
+            )
+
+        async def close(_address, *, drained):
+            close_requests.append(drained)
+
+        monkeypatch.setattr(puller, "inventory_remote_bundles", inventory)
+        monkeypatch.setattr(puller, "sync_remote_bundles", sync)
+        monkeypatch.setattr(puller, "close_sleep_window", close)
+        await self._enable()
+
+        result = await puller.run_pull(trigger="manual")
+
+        assert result.state is RunState.OK
+        assert copied_names == [["outbound.obd2.zip"], ["return.obd2.zip"]]
+        assert result.files == len(unit.payload) + 2
+        assert result.bytes == sum(map(len, unit.payload.values())) + 200
+        assert get_obd_transfer_status().snapshot()["waiting_on_unit"] == 1
+        assert close_requests == [False]
+
+    @pytest.mark.parametrize("failure", ["inventory", "transfer"])
+    async def test_late_obd_failure_keeps_footage_success_and_sleep_window_open(
+        self, db_session, unit, app_config, monkeypatch, failure
+    ):
+        from app.ingest import puller
+        from app.ingest.models import RunState
+        from app.ingest.obd_transfer import OBDTransferResult
+
+        inventory_count = 0
+        close_requests = []
+
+        async def inventory(_address, source):
+            nonlocal inventory_count
+            inventory_count += 1
+            if inventory_count == 1:
+                return []
+            if failure == "inventory":
+                raise TimeoutError("unit slept before final inventory")
+            return [RemoteFile("return.obd2.zip", 100, 0, source)]
+
+        async def sync(_info, **_kwargs):
+            return OBDTransferResult(failed=1, complete=False, error="interrupted telemetry copy")
+
+        async def close(_address, *, drained):
+            close_requests.append(drained)
+
+        monkeypatch.setattr(puller, "inventory_remote_bundles", inventory)
+        monkeypatch.setattr(puller, "sync_remote_bundles", sync)
+        monkeypatch.setattr(puller, "close_sleep_window", close)
+        await self._enable()
+
+        result = await puller.run_pull(trigger="manual")
+
+        assert result.state is RunState.OK
+        assert result.files == len(unit.payload)
+        assert len(list(app_config.footage_dir.glob("*.ts"))) == len(unit.payload)
+        assert close_requests == [False]
+
+    async def test_cancellation_during_late_inventory_does_not_start_another_copy(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        from app.ingest import puller
+        from app.ingest.models import RunState
+        from app.ingest.status import get_status
+
+        inventory_count = 0
+
+        async def inventory(_address, source):
+            nonlocal inventory_count
+            inventory_count += 1
+            if inventory_count == 1:
+                return []
+            get_status().cancel()
+            return [RemoteFile("return.obd2.zip", 100, 0, source)]
+
+        async def forbidden_copy(*_args, **_kwargs):
+            raise AssertionError("cancelled catch-up must not start a listener")
+
+        monkeypatch.setattr(puller, "inventory_remote_bundles", inventory)
+        monkeypatch.setattr(puller, "sync_remote_bundles", forbidden_copy)
+        await self._enable()
+
+        result = await puller.run_pull(trigger="manual")
+
+        assert result.state is RunState.CANCELLED
+        assert len(list(app_config.footage_dir.glob("*.ts"))) == len(unit.payload)
+
+    async def test_task_cancellation_during_late_inventory_preserves_durable_totals(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from app.ingest import puller
+        from app.ingest.models import RunState
+
+        inventory_count = 0
+        reached_inventory = asyncio.Event()
+        release_inventory = asyncio.Event()
+
+        async def inventory(_address, _source):
+            nonlocal inventory_count
+            inventory_count += 1
+            if inventory_count == 1:
+                return []
+            reached_inventory.set()
+            await release_inventory.wait()
+            return []
+
+        recorded = AsyncMock()
+        monkeypatch.setattr(puller, "inventory_remote_bundles", inventory)
+        monkeypatch.setattr(puller, "_record_run_completion", recorded)
+        await self._enable()
+
+        task = asyncio.create_task(puller.run_pull(trigger="manual"))
+        await asyncio.wait_for(reached_inventory.wait(), timeout=10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        recorded.assert_awaited_once()
+        result = recorded.await_args.args[0]
+        assert result.state is RunState.CANCELLED
+        assert result.files == len(unit.payload)
+        assert result.bytes == sum(map(len, unit.payload.values()))
+        assert len(list(app_config.footage_dir.glob("*.ts"))) == len(unit.payload)
+
     async def test_an_unmounted_share_stops_the_run_before_anything_moves(
         self, db_session, unit, app_config
     ):
@@ -2055,6 +2255,7 @@ class TestARunEndToEnd:
         assert events.index("bundle-verified") < events.index("obd-durable")
         assert events.index("obd-durable") < events.index("radios-quiet")
         assert events.index("radios-quiet") < events.index("footage-copy")
+        assert inventories == 2, "checkpointed logger must not delay restoration with a catch-up"
         assert events[-2:] == ["radios-restored", "screen-cleanup"]
 
     async def test_lease_loss_after_commit_cancels_pull_before_card_reclaim(

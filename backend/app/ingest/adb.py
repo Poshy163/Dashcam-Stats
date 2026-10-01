@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import math
 import re
 import shutil
@@ -376,14 +377,91 @@ async def uptime(address: str) -> float | None:
     return None
 
 
+SLEEP_DEADLINE_EVIDENCE_TTL_S = 20.0
+SLEEP_DEADLINE_EDGE_MAX_MS = 21_000
+MAX_RUNTIME_STATUS_BYTES = 64 * 1024
+_BOOT_ID_RE = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+
+@dataclass(frozen=True)
+class SleepDeadlineEvidence:
+    schema_version: int
+    boot_id: str | None
+    boot_count: int | None
+    observed_elapsed_ms: int
+    ignition_on: bool
+    off_lower_elapsed_ms: int | None
+    off_upper_elapsed_ms: int | None
+    window_s: int | None
+
+
+def parse_sleep_deadline_evidence(value: object) -> SleepDeadlineEvidence | None:
+    """Validate structure only; a cached logger response never proves a live deadline."""
+    if not isinstance(value, dict) or type(value.get("schema_version")) is not int:
+        return None
+    if value["schema_version"] != 1 or type(value.get("ignition_on")) is not bool:
+        return None
+    boot_id, boot_count = value.get("boot_id"), value.get("boot_count")
+    if boot_id is not None and (not isinstance(boot_id, str) or not _BOOT_ID_RE.fullmatch(boot_id)):
+        return None
+    if boot_count is not None and (type(boot_count) is not int or not 0 <= boot_count <= 2**31 - 1):
+        return None
+    if boot_id is None and boot_count is None:
+        return None
+    observed = value.get("observed_elapsed_ms")
+    if type(observed) is not int or not 0 <= observed <= 2**53 - 1:
+        return None
+    lower, upper, window = (
+        value.get(key) for key in ("off_lower_elapsed_ms", "off_upper_elapsed_ms", "window_s")
+    )
+    if any(item is not None for item in (lower, upper, window)):
+        if (
+            any(type(item) is not int for item in (lower, upper, window))
+            or value["ignition_on"]
+            or not 0 <= lower <= upper <= observed
+            or upper - lower > SLEEP_DEADLINE_EDGE_MAX_MS
+            or not 1 <= window <= 3600
+        ):
+            return None
+    return SleepDeadlineEvidence(
+        1,
+        boot_id.lower() if boot_id else None,
+        boot_count,
+        observed,
+        value["ignition_on"],
+        lower,
+        upper,
+        window,
+    )
+
+
 @dataclass(frozen=True)
 class RuntimeObservation:
     """One read-only power snapshot, bounded by the same kernel boot identity."""
 
-    boot_id: str
+    boot_id: str | None
     uptime_s: float
     ignition_state: str
     sleep_window_s: int | None
+    boot_count: int | None = None
+    sleep_deadline_evidence: SleepDeadlineEvidence | None = None
+
+    def validated_sleep_deadline(self) -> SleepDeadlineEvidence | None:
+        evidence = self.sleep_deadline_evidence
+        if evidence is None or self.ignition_state != "off" or evidence.ignition_on:
+            return None
+        if evidence.boot_id is not None and evidence.boot_id != self.boot_id:
+            return None
+        if evidence.boot_count is not None and evidence.boot_count != self.boot_count:
+            return None
+        age_ms = self.uptime_s * 1000 - evidence.observed_elapsed_ms
+        if not 0 <= age_ms <= SLEEP_DEADLINE_EVIDENCE_TTL_S * 1000:
+            return None
+        if evidence.off_lower_elapsed_ms is None or evidence.window_s is None:
+            return None
+        if self.sleep_window_s is None or not 1 <= self.sleep_window_s <= 3600:
+            return None
+        return evidence
 
 
 RUNTIME_OBSERVATION_TIMEOUT_S = 3.0
@@ -394,7 +472,67 @@ _RUNTIME_OBSERVATION_COMMAND = (
 )
 
 
-async def runtime_observation(address: str) -> RuntimeObservation | None:
+def _runtime_status_command(path: str) -> str:
+    if not re.fullmatch(r"/[A-Za-z0-9._/-]{1,511}", path) or ".." in path.split("/"):
+        raise ValueError("unsafe logger status path")
+    return (
+        "printf '%s\\n' \"$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\"; settings get global boot_count; "
+        "cat /proc/uptime; settings get global acc_status; "
+        "getprop persist.sys.sleep.countdown.time; printf '__DASHCAM_STATUS_START__\\n'; "
+        f"if [ -f '{path}' ] && [ -r '{path}' ]; then head -c {MAX_RUNTIME_STATUS_BYTES + 1} "
+        f"'{path}' 2>/dev/null; fi; printf '\\n__DASHCAM_STATUS_END__\\n'; "
+        "cat /proc/uptime; settings get global acc_status; settings get global boot_count; "
+        "printf '%s\\n' \"$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\""
+    )
+
+
+def _parse_extended_runtime(reply: str) -> RuntimeObservation | None:
+    try:
+        before, status_and_after = reply.split("__DASHCAM_STATUS_START__\n")
+        raw, after = status_and_after.split("\n__DASHCAM_STATUS_END__\n")
+        boot, count, uptime_line, acc, window = before.splitlines()
+        final_uptime, final_acc, final_count, final_boot = after.splitlines()
+        before_uptime_s = float(uptime_line.split()[0])
+        uptime_s = float(final_uptime.split()[0])
+    except (ValueError, IndexError):
+        return None
+    boot, final_boot = boot.strip().lower(), final_boot.strip().lower()
+    count, final_count = count.strip(), final_count.strip()
+    if boot != final_boot or count != final_count or acc.strip() != final_acc.strip():
+        return None
+    if boot and not _BOOT_ID_RE.fullmatch(boot):
+        return None
+    boot_count = int(count) if re.fullmatch(r"[0-9]{1,10}", count) else None
+    if boot_count is not None and boot_count > 2**31 - 1:
+        return None
+    if not boot and boot_count is None:
+        return None
+    if not (math.isfinite(uptime_s) and 0 <= before_uptime_s <= uptime_s):
+        return None
+    if uptime_s - before_uptime_s > RUNTIME_OBSERVATION_TIMEOUT_S:
+        return None
+    evidence = None
+    if len(raw.encode("utf-8")) <= MAX_RUNTIME_STATUS_BYTES:
+        try:
+            status = json.loads(raw)
+            if isinstance(status, dict):
+                evidence = parse_sleep_deadline_evidence(status.get("sleep_deadline_evidence"))
+        except (ValueError, RecursionError):
+            pass
+    seconds = int(window.strip()) if re.fullmatch(r"[0-9]{1,6}", window.strip()) else 0
+    return RuntimeObservation(
+        boot or None,
+        uptime_s,
+        {"1": "on", "0": "off"}.get(final_acc.strip(), "unknown"),
+        seconds if seconds > 0 else None,
+        boot_count,
+        evidence,
+    )
+
+
+async def runtime_observation(
+    address: str, *, logger_status_path: str | None = None
+) -> RuntimeObservation | None:
     """Read power state without reconnecting ADB, gaining root, or changing the unit.
 
     Reading the boot ID on both sides rejects a mixed snapshot across a reboot. The
@@ -403,10 +541,16 @@ async def runtime_observation(address: str) -> RuntimeObservation | None:
     """
     try:
         reply = await shell(
-            address, _RUNTIME_OBSERVATION_COMMAND, timeout=RUNTIME_OBSERVATION_TIMEOUT_S
+            address,
+            _runtime_status_command(logger_status_path)
+            if logger_status_path
+            else _RUNTIME_OBSERVATION_COMMAND,
+            timeout=RUNTIME_OBSERVATION_TIMEOUT_S,
         )
-    except AdbError:
+    except (AdbError, ValueError):
         return None
+    if logger_status_path:
+        return _parse_extended_runtime(reply)
     lines = reply.strip().splitlines()
     if len(lines) != 5:
         return None

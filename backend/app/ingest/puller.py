@@ -43,6 +43,7 @@ from app.ingest.obd_events import (
     sync_remote_events,
 )
 from app.ingest.obd_transfer import (
+    OBDTransferResult,
     get_obd_transfer_status,
     inventory_remote_bundles,
     read_logger_status,
@@ -2106,6 +2107,86 @@ async def _run_pull_started(
                 else RunState.ERROR
             )
         )
+        if state is RunState.OK and radio_transition is None:
+            # Preserve already durable footage if task cancellation lands in the
+            # optional final inventory/telemetry stage instead of its cooperative flag.
+            result = RunResult(
+                state=state,
+                files=len(committed)
+                + (obd_result.copied + obd_result.duplicates if obd_result else 0),
+                bytes=sum(expected[name] for name in committed)
+                + (obd_result.bytes if obd_result else 0),
+                seconds=transferred.seconds + (obd_result.seconds if obd_result else 0),
+            )
+            # Without a logger checkpoint, ignition-off finalisation can publish its
+            # immutable bundle just after the arrival inventory. Take one last look
+            # under this run's ownership; do not wait for a second driveway visit.
+            # A quieted logger was already checkpointed and must get its radios back
+            # promptly, so that path needs no extra inventory or transfer here.
+            late_inventory = None
+            late_result = None
+            try:
+                late_inventory = await inventory_remote_bundles(
+                    info.address, get_config().obd_remote_ready_dir
+                )
+                get_obd_transfer_status().set_inventory(len(late_inventory))
+                observed_logger = await read_logger_status(
+                    info.address, get_config().obd_remote_status_file
+                )
+                if observed_logger is not None:
+                    get_obd_transfer_status().set_logger(observed_logger)
+                # Earlier retained/rejected bundles belong to the next retry, not a
+                # second attempt (and double-counted result) in this same run.
+                earlier_names = {item.name for item in remote_obd}
+                late_bundles = [item for item in late_inventory if item.name not in earlier_names]
+                if late_bundles and not status.cancel_event.is_set():
+                    late_result = await sync_remote_bundles(
+                        info, ingest_status=status, remote=late_bundles
+                    )
+                    if obd_result is None:
+                        obd_result = late_result
+                    else:
+                        for field in (
+                            "discovered",
+                            "copied",
+                            "duplicates",
+                            "failed",
+                            "missing",
+                            "removed_from_unit",
+                            "bytes",
+                            "seconds",
+                        ):
+                            setattr(
+                                obd_result,
+                                field,
+                                getattr(obd_result, field) + getattr(late_result, field),
+                            )
+                        obd_result.complete = obd_result.complete and late_result.complete
+                        obd_result.error = obd_result.error or late_result.error
+            except Exception as exc:
+                obd_inventory_ok = False
+                obd_transfer_error = exc
+                get_obd_transfer_status().finish(
+                    OBDTransferResult(
+                        failed=1,
+                        complete=False,
+                        error="Could not finish checking newly completed OBD bundles",
+                    )
+                )
+                log.warning("late OBD catch-up failed without affecting footage", error=str(exc))
+            finally:
+                if late_inventory is not None:
+                    # sync_remote_bundles sees only new names. Preserve older retained
+                    # exports in the full pending count so sleep cannot close over them.
+                    get_obd_transfer_status().set_inventory(
+                        max(
+                            0,
+                            len(late_inventory)
+                            - (late_result.removed_from_unit if late_result else 0),
+                        )
+                    )
+            if status.cancel_event.is_set():
+                state = RunState.CANCELLED
         committed_footage_bytes = sum(expected[name] for name in committed)
         result = RunResult(
             state=state,
@@ -2128,7 +2209,8 @@ async def _run_pull_started(
             throughput_mbs=result.throughput_mbs,
         )
     except asyncio.CancelledError:
-        result = RunResult(state=RunState.CANCELLED, error="backup cancelled")
+        result.state = RunState.CANCELLED
+        result.error = "backup cancelled"
         raise
     except adb.AdbError as exc:
         salvage_plan = locals().get("plan")
@@ -2218,7 +2300,12 @@ async def _run_pull_started(
         # Numeric zero is not a drained card until this run actually inventoried it, and a
         # durable active/recovery row means the radios or logger are still owed an exact
         # restore. Both conditions fail closed: an unknown state keeps the long window.
-        recovery_clear = await _sleep_window_may_close(result)
+        recovery_clear = (
+            obd_inventory_ok
+            and obd_transfer_error is None
+            and (obd_result is None or (obd_result.complete and not obd_result.failed))
+            and await _sleep_window_may_close(result)
+        )
         with contextlib.suppress(Exception):
             await close_sleep_window(
                 info.address if info else "",

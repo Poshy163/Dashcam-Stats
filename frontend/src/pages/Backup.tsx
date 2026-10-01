@@ -624,9 +624,7 @@ export default function Backup() {
             !data?.unitOnline
               ? 'Car is not here'
               : data.wifiFrequencyMhz
-                ? data.wifiFrequencyMhz >= 4900
-                  ? `${data.wifiFrequencyMhz} MHz • Fast link`
-                  : `${data.wifiFrequencyMhz} MHz • Slow link`
+                ? `${data.wifiFrequencyMhz} MHz • Observed frequency`
                 : 'Reading frequency…'
           }
           tone={
@@ -717,7 +715,7 @@ export default function Backup() {
                         ? 'bg-state-warn/15 text-state-warn'
                         : 'bg-surface-sunken text-content-muted'
                   }`}
-                  title={`Estimate from reported settings. The head unit's running countdown can differ. ${prediction?.summary ?? ''}`}
+                  title={`${countdown.hint} ${prediction?.summary ?? ''}`.trim()}
                 >
                   ⏱️ Estimated sleep in {formatDuration(liveCountdown)}
                   {prediction &&

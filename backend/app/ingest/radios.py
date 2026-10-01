@@ -828,18 +828,11 @@ class WatchdogReport:
     guard_s: int = WATCHDOG_SLEEP_GUARD_S
     #: Seconds of the unit's sleep countdown already spent when the watchdog is armed.
     #:
-    #: Measured from when the countdown last *restarted*, which is the later of ignition-off
-    #: and the most recent write of the window property -- every such write restarts it.
-    #: Arming happens some way into the countdown (the webhook, the probe, the card
-    #: inventory and the radio capture all land first), so a watchdog anchoring at its own
-    #: start would aim too late and fire after the unit had slept. But handing it the time
-    #: since *ignition-off* is the opposite mistake, and it was made: a top-up run twenty
-    #: minutes into a park was told the countdown was twenty minutes gone, decided sleep
-    #: was already behind it, and fired on its first poll mid-transfer -- which the server
-    #: read as its watchdog vanishing and aborted a healthy run over. The value carried
-    #: here has to be the countdown's own age.
+    #: Legacy recovery estimate. A property write does not restart the vendor timer;
+    #: current observed evidence also provides a fixed ceiling that writes cannot extend.
     acc_off_elapsed_s: int = 0
     path: str = WATCHDOG_REPORT_ENDPOINT
+    sleep_deadline_uptime_s: int | None = None
 
     def __post_init__(self) -> None:
         if not _REPORT_HOST.fullmatch(self.host):
@@ -856,6 +849,11 @@ class WatchdogReport:
             raise ValueError("invalid watchdog ignition-off elapsed time")
         if self.path != WATCHDOG_REPORT_ENDPOINT:
             raise ValueError("invalid watchdog report path")
+        if self.sleep_deadline_uptime_s is not None and (
+            type(self.sleep_deadline_uptime_s) is not int
+            or not 0 <= self.sleep_deadline_uptime_s <= 2**53 - 1
+        ):
+            raise ValueError("invalid watchdog device deadline")
 
 
 def new_report_token() -> str:
@@ -976,7 +974,9 @@ def _watchdog_report_functions(
     )
 
 
-def _watchdog_sleep_guard_functions(report: WatchdogReport | None) -> str:
+def _watchdog_sleep_guard_functions(
+    report: WatchdogReport | None, *, sleep_deadline_uptime_s: int | None = None
+) -> str:
     """Shell that folds the unit's own sleep deadline into the watchdog's expiry.
 
     Two clocks can end a backup window and only one of them was ever watched. The lease is
@@ -984,19 +984,32 @@ def _watchdog_sleep_guard_functions(report: WatchdogReport | None) -> str:
     out of range. The *sleep* is the vendor's, it is the ordinary ending, and it arrives
     with no warning at all on the wire: the unit simply stops answering.
 
-    So the deadline used here is the earlier of the two. Sleep is derived exactly as the
-    server derives it -- ACC-off plus the window length -- but read on the device, which is
-    the only place both values are still available once the link is gone.
-
-    Every read fails closed to "no sleep deadline". An unreadable ACC or a missing property
-    must never manufacture an early restore: the lease alone still bounds the window, and
-    restoring the driver's Bluetooth a quarter of an hour early is its own kind of damage.
+    A validated absolute elapsed-time ceiling cannot move later when the property is
+    rewritten. The legacy ACC/property estimate may shorten it, as may the server lease.
+    Without any observed ceiling, unreadable inputs leave only the lease in force.
     """
-    if report is None or report.guard_s <= 0:
+    ceilings = [
+        value
+        for value in (sleep_deadline_uptime_s, report.sleep_deadline_uptime_s if report else None)
+        if value is not None
+    ]
+    if any(type(value) is not int or not 0 <= value <= 2**53 - 1 for value in ceilings):
+        raise ValueError("invalid watchdog device deadline")
+    deadline = min(ceilings) if ceilings else None
+    guard_s = report.guard_s if report else WATCHDOG_SLEEP_GUARD_S
+    if (report is None and deadline is None) or (guard_s <= 0 and deadline is None):
         return "sleep_fold() { return 0; }; "
+    ceiling = (
+        f'left="$(({deadline} - {int(guard_s)} - now))"; '
+        '[ "$left" -lt "$remaining" ] && { remaining="$left"; '
+        '[ "$left" -gt 0 ] || reason=pre_sleep; }; '
+        if deadline is not None
+        else ""
+    )
     return (
         "sleep_fold() { "
-        f'window="$(/system/bin/getprop {SLEEP_COUNTDOWN_PROPERTY} 2>/dev/null)"; '
+        + ceiling
+        + f'window="$(/system/bin/getprop {SLEEP_COUNTDOWN_PROPERTY} 2>/dev/null)"; '
         'case "$window" in ""|*[!0-9]*) acc_off_at=""; return 0;; esac; '
         '[ "$window" -gt 0 ] || { acc_off_at=""; return 0; }; '
         f'acc="$(/system/bin/settings get global {ACC_STATUS_SETTING} 2>/dev/null)"; '
@@ -1005,7 +1018,7 @@ def _watchdog_sleep_guard_functions(report: WatchdogReport | None) -> str:
         # Consumed exactly once. If the driver comes back and the ignition cycles, the
         # second countdown genuinely does start from the moment this loop observes it.
         '[ -n "$acc_off_at" ] || { acc_off_at="$((now - acc_elapsed))"; acc_elapsed=0; }; '
-        f'left="$((acc_off_at + window - {int(report.guard_s)} - now))"; '
+        f'left="$((acc_off_at + window - {int(guard_s)} - now))"; '
         '[ "$left" -lt "$remaining" ] && { remaining="$left"; '
         '[ "$left" -gt 0 ] || reason=pre_sleep; }; return 0; }; '
     )
@@ -1296,7 +1309,12 @@ async def _arm_watchdog(
         f"'{ready_path}' '{lease_path}' '{lease_partial_path}' "
         f"'{expiry_claim_path}' '{script_path}' '{script_partial_path}'; fi; }}; "
     )
-    guard_functions = _watchdog_sleep_guard_functions(report)
+    from app.ingest.status import get_status
+
+    # Reporting is optional (for example an HTTPS-only origin), recovery timing is not.
+    guard_functions = _watchdog_sleep_guard_functions(
+        report, sleep_deadline_uptime_s=get_status().sleep_deadline_uptime_s()
+    )
     report_functions = _watchdog_report_functions(
         report,
         restore_bluetooth=restore_bluetooth,

@@ -72,11 +72,12 @@ data class PublicStatus(
     val sleepWindowObservedSeconds: Int? = null,
     val sleepWindowVerified: Boolean = false,
     val sleepWindowError: String? = null,
+    val sleepDeadlineEvidence: SleepDeadlineEvidence? = null,
     val lastError: String? = null,
     val lastErrorAtUtc: String? = null,
 )
 
-internal const val PUBLIC_STATUS_SCHEMA_VERSION = 6
+internal const val PUBLIC_STATUS_SCHEMA_VERSION = 7
 
 object StatusPublisher {
     fun publish(context: Context, status: PublicStatus) {
@@ -130,6 +131,7 @@ object StatusPublisher {
                         "adaptive_sleep_window_v1",
                         "adaptive_sleep_window_v2",
                         "app_event_stream_v1",
+                        "sleep_deadline_evidence_v1",
                     ),
                 ),
             )
@@ -166,6 +168,17 @@ object StatusPublisher {
             .put("sleep_window_observed_s", status.sleepWindowObservedSeconds ?: JSONObject.NULL)
             .put("sleep_window_verified", status.sleepWindowVerified)
             .put("sleep_window_error", status.sleepWindowError ?: JSONObject.NULL)
+            .put("sleep_deadline_evidence", status.sleepDeadlineEvidence?.let { value ->
+                JSONObject()
+                    .put("schema_version", 1)
+                    .put("boot_id", value.bootId ?: JSONObject.NULL)
+                    .put("boot_count", value.bootCount ?: JSONObject.NULL)
+                    .put("observed_elapsed_ms", value.observedElapsedMillis)
+                    .put("ignition_on", value.ignitionOn)
+                    .put("off_lower_elapsed_ms", value.offLowerElapsedMillis ?: JSONObject.NULL)
+                    .put("off_upper_elapsed_ms", value.offUpperElapsedMillis ?: JSONObject.NULL)
+                    .put("window_s", value.windowSeconds ?: JSONObject.NULL)
+            } ?: JSONObject.NULL)
             .put("updated_at_utc", Instant.now().toString())
             .put("last_error", status.lastError ?: JSONObject.NULL)
             .put("last_error_at_utc", status.lastErrorAtUtc ?: JSONObject.NULL)

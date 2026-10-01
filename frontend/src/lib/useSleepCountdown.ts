@@ -39,11 +39,18 @@ export function sleepCountdown(
       status.sleepCountdownRemainingS === null || !Number.isFinite(status.sleepCountdownRemainingS)) {
     return { state: 'unknown', remainingS: null, hint: status.sleepCountdownReason || 'The current sleep time is not known' }
   }
+  const validForS = status.sleepCountdownValidForS
+  // Unit evidence can expire sooner than the live power observation. Older servers
+  // without this field expose only server-observed estimates and keep the TTL above.
+  if ((validForS !== undefined || status.sleepCountdownEvidenceSource === 'unit') &&
+      (typeof validForS !== 'number' || !Number.isFinite(validForS) || validForS <= elapsedS)) {
+    return { state: 'stale', remainingS: null, hint: 'Waiting for fresh sleep timing from the dashcam' }
+  }
   const remainingS = Math.max(0, status.sleepCountdownRemainingS - elapsedS)
   return {
     state: 'estimated', remainingS,
     hint: remainingS > 0
-      ? 'Estimated from ignition off and the reported sleep window; the unit’s timer can differ'
+      ? status.sleepCountdownReason || 'Estimated from ignition off and the reported sleep window; the unit’s timer can differ'
       : 'Estimated window elapsed; the dashcam is still connected',
   }
 }

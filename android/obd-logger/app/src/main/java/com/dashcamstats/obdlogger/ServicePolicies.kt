@@ -104,11 +104,16 @@ class StatusWriteGate(private val heartbeatMillis: Long = 60_000) {
     private var lastSignature: String? = null
     private var lastWriteAt: Long? = null
 
-    fun shouldWrite(signature: String, nowMillis: Long): Boolean {
+    fun shouldWrite(
+        signature: String,
+        nowMillis: Long,
+        heartbeatOverrideMillis: Long? = null,
+    ): Boolean {
+        val heartbeat = heartbeatOverrideMillis ?: heartbeatMillis
         val previousAt = lastWriteAt
         if (
             signature == lastSignature && previousAt != null &&
-            nowMillis - previousAt < heartbeatMillis
+            nowMillis - previousAt < heartbeat
         ) {
             return false
         }
@@ -350,6 +355,17 @@ internal fun durableStatusSignature(status: PublicStatus): String = listOf(
     status.sleepWindowObservedSeconds?.toString().orEmpty(),
     status.sleepWindowVerified.toString(),
     status.sleepWindowError.orEmpty(),
+    status.sleepDeadlineEvidence?.let {
+        // Observation timestamps get the bounded heartbeat, not an fsync every ACC poll.
+        listOf(
+            it.bootId,
+            it.bootCount,
+            it.ignitionOn,
+            it.offLowerElapsedMillis,
+            it.offUpperElapsedMillis,
+            it.windowSeconds,
+        ).joinToString(":")
+    }.orEmpty(),
     status.currentDriveId.orEmpty(),
     status.lastDriveId.orEmpty(),
     status.lastDriveFinishedAtUtc.orEmpty(),

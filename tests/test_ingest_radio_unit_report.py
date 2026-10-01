@@ -302,6 +302,9 @@ async def test_the_server_hands_the_watchdog_the_countdowns_age(monkeypatch):
         def ignition_off_elapsed_s(self):
             return 1100
 
+        def sleep_deadline_uptime_s(self):
+            return None
+
     monkeypatch.setattr(radio_coordinator, "get_status", lambda: Status())
     monkeypatch.setattr(origin, "callback_endpoint", lambda: ("192.168.1.16", 8199))
 

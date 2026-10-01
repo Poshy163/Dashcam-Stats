@@ -94,13 +94,13 @@ def test_observed_edge_estimate_does_not_extend_on_property_rewrite(clock):
     assert status.snapshot()["sleep_countdown_remaining_s"] is None
     clock[0] += 15
     status.observe_unit_runtime(observation(uptime=115))
-    assert status.snapshot()["sleep_countdown_remaining_s"] == 1200
+    assert status.snapshot()["sleep_countdown_remaining_s"] == 1167
     clock[0] += 10
     status.set_sleep_window(300, restarted=True)
     status.observe_unit_runtime(observation(uptime=125, window=300))
     snapshot = status.snapshot()
     assert snapshot["sleep_countdown_source"] == "estimated"
-    assert snapshot["sleep_countdown_remaining_s"] == 1190
+    assert snapshot["sleep_countdown_remaining_s"] == 1157
     assert snapshot["sleep_window_seconds"] == 300
     assert snapshot["ignition_off_at"] is not None
 
@@ -195,7 +195,9 @@ async def test_poller_observes_running_reboot_and_resets_visit_not_radio_ownersh
 
     monkeypatch.setattr(poller_module.asyncio, "sleep", stop)
     await poller._loop()
-    reader.assert_awaited_once_with("unit")
+    reader.assert_awaited_once_with(
+        "unit", logger_status_path=poller_module.get_config().obd_remote_status_file
+    )
     forbidden.assert_not_called()
     assert status.running and status.cancel_event.is_set()
     assert not poller._was_online

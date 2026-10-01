@@ -33,6 +33,7 @@ function status(overrides = {}) {
     sleepWindowSeconds: 1200, sleepCountdownRemainingS: 120, ignitionState: 'off', ignitionOffAt: null,
     unitObservedAt: new Date(observedAt).toISOString(), unitObservationFresh: true,
     unitObservationAgeS: 0, unitObservationTtlS: 30, sleepCountdownSource: 'estimated', sleepCountdownReason: null,
+    sleepCountdownValidForS: 30,
     sleepWindowPrediction: null, recorderHealth: null, recorderHealthOk: null, recorderHealthAt: null,
     startedAt: null, lastSuccessTs: null, lastError: null, ...overrides,
   }
@@ -64,6 +65,32 @@ test('an elapsed estimate says the unit is still connected rather than claiming 
   const result = sleepCountdown(status({ sleepCountdownRemainingS: 4 }), observedAt, observedAt + 5_000)
   assert.equal(result.remainingS, 0)
   assert.match(result.hint, /Estimated window elapsed.*still connected/)
+})
+
+test('head-unit evidence explains an estimate without overriding freshness or expiry', () => {
+  const reason = 'Estimated from ignition-off timing recorded by the dashcam; its timer can differ.'
+  const data = status({ sleepCountdownEvidenceSource: 'unit', sleepCountdownReason: reason })
+  assert.equal(sleepCountdown(data, observedAt, observedAt + 5_000).hint, reason)
+  assert.equal(sleepCountdown(data, observedAt, observedAt + 5_000).remainingS, 115)
+  const stale = sleepCountdown(data, observedAt, observedAt + 30_001)
+  assert.equal(stale.remainingS, null)
+  assert.match(stale.hint, /fresh reading/)
+  const expired = sleepCountdown({ ...data, sleepCountdownRemainingS: 4 }, observedAt, observedAt + 5_000)
+  assert.match(expired.hint, /Estimated window elapsed.*still connected/)
+})
+
+test('unit evidence expires before the power observation even while the cached API response stays available', () => {
+  const data = status({ sleepCountdownEvidenceSource: 'unit', sleepCountdownValidForS: 1 })
+  assert.equal(sleepCountdown(data, observedAt, observedAt + 500).remainingS, 119.5)
+  const expired = sleepCountdown(data, observedAt, observedAt + 1_000)
+  assert.equal(expired.state, 'stale')
+  assert.equal(expired.remainingS, null)
+  assert.match(expired.hint, /fresh sleep timing/)
+  for (const validity of [0, -1, null, undefined, NaN, Infinity]) {
+    assert.equal(sleepCountdown({ ...data, sleepCountdownValidForS: validity }, observedAt, observedAt).remainingS, null)
+  }
+  assert.equal(sleepCountdown(status({ sleepCountdownValidForS: undefined }), observedAt, observedAt + 5_000).remainingS, 115, 'older server observations still use their runtime TTL')
+  assert.equal(sleepCountdown(status({ sleepCountdownValidForS: 100 }), observedAt, observedAt + 30_001).remainingS, null, 'a longer evidence budget never extends the runtime TTL')
 })
 
 test('the shared hook measures delayed callbacks, refreshes identical values, and expires cached observations', async t => {
@@ -112,6 +139,33 @@ async function mountBackup(t, data, radio) {
   t.after(async () => { await act(async () => root.unmount()); client.clear() })
   return root
 }
+
+test('Wi-Fi reports observed band and frequency without claiming transfer speed', async t => {
+  for (const [frequency, band] of [[5560, '5 GHz'], [2412, '2.4 GHz']]) {
+    const root = await mountBackup(t, status({ wifiFrequencyMhz: frequency }))
+    const tile = root.root.findByProps({ label: 'Wi-Fi' })
+    assert.equal(tile.props.value, band)
+    assert.equal(tile.props.hint, `${frequency} MHz • Observed frequency`)
+    assert.doesNotMatch(JSON.stringify(root.toJSON()), /Fast link|Slow link/)
+  }
+})
+
+test('Backup displays the on-unit estimate reason and preserves the one-minute quieting warning', async t => {
+  const reason = 'Estimated from ignition-off timing recorded by the dashcam; its timer can differ.'
+  const root = await mountBackup(t, status({
+    state: 'running', phase: 'transferring', sleepCountdownRemainingS: 60,
+    sleepCountdownEvidenceSource: 'unit', sleepCountdownReason: reason,
+    radioQuietingHold: true,
+    radioQuietingHoldReason: 'At most one minute remains in the estimated sleep window.',
+  }), { quietingEnabled: true, transition: null })
+  assert.equal(root.root.findByProps({ label: 'Estimated sleep' }).props.hint, reason)
+  assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Copying')
+  const text = JSON.stringify(root.toJSON())
+  assert.match(text, /At most one minute remains/)
+  assert.match(text, /Radios left unchanged/)
+  assert.match(text, /Backup can continue/)
+  assert.ok(root.root.findAllByType('span').some(span => span.props.title?.startsWith(reason)), 'active countdown tooltip uses the same evidence explanation')
+})
 
 test('a startup hold with unknown inventory is Waiting, keeps manual pull available, and shows unknown sleep', async t => {
   const root = await mountBackup(t, status({ arrivalHold: true, arrivalHoldReason: 'Waiting for minimum uptime', sleepCountdownSource: 'unknown', sleepCountdownRemainingS: null }))

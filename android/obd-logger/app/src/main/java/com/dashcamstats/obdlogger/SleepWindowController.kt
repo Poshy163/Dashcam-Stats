@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.os.SystemClock
 import android.provider.Settings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -113,6 +114,7 @@ internal data class SleepWindowEvidence(
     val observedSeconds: Int? = null,
     val verified: Boolean = false,
     val error: String? = null,
+    val deadline: SleepDeadlineEvidence? = null,
 )
 
 internal interface SleepWindowPropertyAccessor {
@@ -126,6 +128,7 @@ internal interface AccStateAccessor {
 }
 
 internal sealed interface SleepWindowControllerObservation {
+    data object DeadlineUpdated : SleepWindowControllerObservation
     data class Wifi(val connected: Boolean) : SleepWindowControllerObservation
 
     data class Acc(val on: Boolean) : SleepWindowControllerObservation
@@ -195,6 +198,9 @@ internal fun parseAccState(value: String): Boolean? = when (value.trim().lowerca
 /** Pure, synchronously testable policy application used only from the controller's IO worker. */
 internal class SleepWindowReconciler(
     private val property: SleepWindowPropertyAccessor,
+    private val transactionLock: Any = Any(),
+    private val observeBeforeTransaction: () -> Unit = {},
+    private val observeAfterTransaction: () -> Unit = {},
 ) {
     fun reconcile(
         wifiConnected: Boolean,
@@ -203,7 +209,8 @@ internal class SleepWindowReconciler(
         command: SleepWindowCommand,
         accStateKnown: Boolean = false,
         accOn: Boolean = false,
-    ): SleepWindowEvidence {
+    ): SleepWindowEvidence = synchronized(transactionLock) {
+        observeBeforeTransaction()
         val target = command.targetSeconds
         var observed = runCatching(property::readSeconds).getOrNull()
         var writeAccepted = true
@@ -219,7 +226,7 @@ internal class SleepWindowReconciler(
             observed == null -> "sleep countdown readback was unavailable"
             else -> "sleep countdown readback did not match the requested value"
         }
-        return SleepWindowEvidence(
+        SleepWindowEvidence(
             wifiConnected = wifiConnected,
             accStateKnown = accStateKnown,
             accOn = accOn,
@@ -230,7 +237,7 @@ internal class SleepWindowReconciler(
             observedSeconds = observed,
             verified = verified,
             error = error,
-        )
+        ).also { observeAfterTransaction() }
     }
 }
 
@@ -311,12 +318,21 @@ internal class SleepWindowRetryer(
 internal class AdaptiveSleepWindowController(
     private val context: Context,
     private val scope: CoroutineScope,
-    property: SleepWindowPropertyAccessor = AndroidSleepWindowPropertyAccessor(),
+    private val property: SleepWindowPropertyAccessor = AndroidSleepWindowPropertyAccessor(),
     private val accState: AccStateAccessor = AndroidAccStateAccessor(context),
     private val observation: (SleepWindowControllerObservation) -> Unit = {},
+    private val elapsedMillis: () -> Long = SystemClock::elapsedRealtime,
+    private val bootIdentity: () -> SleepBootIdentity = { readSleepBootIdentity(context) },
 ) {
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
-    private val reconciler = SleepWindowReconciler(property)
+    private val transactionLock = Any()
+    private val deadlineTracker = SleepDeadlineTracker()
+    private val reconciler = SleepWindowReconciler(
+        property,
+        transactionLock,
+        observeBeforeTransaction = ::refreshAccState,
+        observeAfterTransaction = ::refreshAccState,
+    )
     private val retryer = SleepWindowRetryer(reconciler)
     private val changes = Channel<SleepWindowEvent>(Channel.UNLIMITED)
     private val stateLock = Any()
@@ -514,7 +530,21 @@ internal class AdaptiveSleepWindowController(
     )
 
     private fun refreshAccState() {
-        val observed = runCatching(accState::readAccOn).getOrNull() ?: return
+        // The same monitor covers policy transactions. The first OFF property read must
+        // precede any ACC-off policy write; retries cannot interleave with this snapshot.
+        val observed = synchronized(transactionLock) {
+            val started = elapsedMillis()
+            val boot = runCatching(bootIdentity).getOrNull() ?: SleepBootIdentity(null, null)
+            val on = runCatching(accState::readAccOn).getOrNull()
+            val window = runCatching(property::readSeconds).getOrNull()
+            deadlineTracker.observe(boot, started, elapsedMillis(), on, window)
+            on
+        }
+        reportObservation(SleepWindowControllerObservation.DeadlineUpdated)
+        if (observed == null) {
+            synchronized(stateLock) { accStateKnown = false }
+            return
+        }
         val event = synchronized(stateLock) {
             val changed = !accStateKnown || accOn != observed
             accStateKnown = true
@@ -533,7 +563,9 @@ internal class AdaptiveSleepWindowController(
         }
     }
 
-    fun snapshot(): SleepWindowEvidence = evidence
+    fun snapshot(): SleepWindowEvidence = evidence.copy(
+        deadline = deadlineTracker.snapshot(elapsedMillis()),
+    )
 
     private fun reportObservation(value: SleepWindowControllerObservation) {
         runCatching { observation(value) }
