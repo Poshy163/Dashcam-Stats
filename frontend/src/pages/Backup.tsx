@@ -13,7 +13,7 @@ import type {
   OBDBundle,
 } from '@/lib/api'
 import { formatBytes, formatDateTime, formatDuration, formatRelative } from '@/lib/format'
-import { backupHold, backupIdleLabel, radioQuietingNotice } from '@/lib/backupPresentation'
+import { backupHold, backupIdleLabel, backupRecoveryNotice, radioQuietingNotice, unverifiedRadioRestores } from '@/lib/backupPresentation'
 import { useSleepCountdown } from '@/lib/useSleepCountdown'
 
 /** How the state reads to a person, and how alarming it should look. */
@@ -54,21 +54,24 @@ function radioSummary(status: IngestRadioStatus, backupRunning: boolean): {
   tone: RadioTone
 } {
   const transition = status.transition
+  const recovery = backupRecoveryNotice(transition)
+  if (recovery) return { title: recovery.label, detail: recovery.detail, tone: 'busy' }
+  const unverified = unverifiedRadioRestores(transition)
   // Durable recovery wins over the current setting. A user may switch quieting off after
   // an interrupted run, but that does not cancel the obligation to restore what it changed.
   if (transition?.recoveryRequired) {
     // Name the radios that are actually still off, rather than saying "Bluetooth or the
     // hotspot" and leaving the reader to work out which from two lines of evidence below.
-    const stillOff = [
-      transition.bluetooth.disableAttempted && !transition.bluetooth.restoreVerified
-        ? 'Bluetooth'
-        : null,
-      transition.hotspot.disableAttempted && !transition.hotspot.restoreVerified
-        ? 'the hotspot'
-        : null,
-    ].filter(Boolean) as string[]
+    const stillOff = unverified.map((name) => name === 'bluetooth' ? 'Bluetooth' : 'the hotspot')
     const names = stillOff.length ? stillOff.join(' and ') : 'a radio'
     const subject = stillOff.length === 1 ? `${names} is` : `${names} are`
+    if (unverified.some((name) => !transition[name].disableAttempted || transition[name].baseline !== 'on')) {
+      return {
+        title: 'Radio restoration is not confirmed',
+        detail: `The app has not yet confirmed that ${names} returned to ${stillOff.length === 1 ? 'its' : 'their'} original state. New backups wait until recovery is confirmed.`,
+        tone: 'error',
+      }
+    }
 
     // Three different things used to render as one screen. The dashcam saying "I tried and
     // it did not come back" is a real fault; the dashcam saying nothing because it fell
@@ -88,10 +91,7 @@ function radioSummary(status: IngestRadioStatus, backupRunning: boolean): {
   }
   const changed =
     transition?.bluetooth.disableAttempted || transition?.hotspot.disableAttempted || false
-  const restored =
-    !!transition &&
-    (!transition.bluetooth.disableAttempted || transition.bluetooth.restoreVerified) &&
-    (!transition.hotspot.disableAttempted || transition.hotspot.restoreVerified)
+  const restored = !!transition && unverified.length === 0
   const quietVerified =
     !!transition && transition.bluetooth.disableVerified && transition.hotspot.disableVerified
   if (transition?.active) {
@@ -332,14 +332,21 @@ export default function Backup() {
   const eventSequenceGap = obdStatus.data?.eventStream?.sequenceGap ?? 0
   const running = data?.state === 'running'
   const transition = radioStatus.data?.transition
+  const recovery = backupRecoveryNotice(transition)
+  const restoreOriginalState = transition && unverifiedRadioRestores(transition).some((name) =>
+    !transition[name].disableAttempted || transition[name].baseline !== 'on')
   const recoveryBlocked = !running && transition?.recoveryRequired === true
   const transitionBusy = !running && transition?.active === true
   const descriptor = recoveryBlocked
-    ? { label: 'Radios need switching back on', tone: 'error' as const }
+    ? recovery
+      ? { label: recovery.label, tone: 'busy' as const }
+      : { label: restoreOriginalState ? 'Radio restoration not confirmed' : 'Radios need switching back on', tone: 'error' as const }
     : transitionBusy
-      ? ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
-        ? { label: 'Restoring radios', tone: 'busy' as const }
-        : { label: 'Preparing backup', tone: 'busy' as const }
+      ? recovery
+        ? { label: recovery.label, tone: 'busy' as const }
+        : ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
+          ? { label: 'Restoring radios', tone: 'busy' as const }
+          : { label: 'Preparing backup', tone: 'busy' as const }
       : hold
         ? { label: hold.label, tone: 'warn' as const }
         : data
@@ -350,17 +357,21 @@ export default function Backup() {
   const statusHint = running && data
     ? PHASES[data.phase]
     : recoveryBlocked
-      ? 'No backup will start until the car is back and they are on'
+      ? recovery
+        ? 'New backups wait until recovery is confirmed'
+        : 'No backup will start until radio restoration is confirmed'
       : transitionBusy
-        ? ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
-          ? 'Verifying the original radio state'
-          : 'Making the radio transition safe'
+        ? recovery
+          ? 'Confirming recovery and logger operation'
+          : ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
+            ? 'Verifying the original radio state'
+            : 'Making the radio transition safe'
         : hold?.reason
   const backlogKnown = data?.backlogKnown === true
   const backlogHint = backlogKnown && data
     ? `${data.backlogFiles} file${data.backlogFiles === 1 ? '' : 's'}`
     : recoveryBlocked
-      ? 'Not checked; waiting for radio recovery'
+      ? recovery ? 'Not checked; waiting for backup recovery' : 'Not checked; waiting for radio recovery'
       : 'Not checked yet'
   // Clamped: the byte counter meters the socket, so it also carries the tar headers and
   // padding that the file sizes it is measured against do not. That is a few kilobytes on

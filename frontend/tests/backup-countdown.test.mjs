@@ -181,3 +181,87 @@ test('recovery and active transitions outrank skipped-quieting notices; finished
     assert.match(text, expected)
   }
 })
+
+function recoveryTransition(overrides = {}) {
+  const radio = { baseline: 'on', disableAttempted: true, disableVerified: true, restoreAttempted: true, restoreVerified: true }
+  return {
+    phase: 'resuming_obd', active: true, recoveryRequired: true, bluetooth: radio, hotspot: radio,
+    obdLogger: { quiesceCapable: true, quiesceAttempted: true, quiesceVerified: true, resumeAttempted: true, resumeVerified: false },
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), restoreEvidenceSource: 'server',
+    unitReportedAt: null, unitSleepReportedAt: null, ...overrides,
+  }
+}
+
+test('confirmed radios with logger recovery pending never claim a radio is off or the car has left', async t => {
+  for (const restoreEvidenceSource of ['server', 'unit', null]) {
+    const root = await mountBackup(t, status({ backlogKnown: true }), { quietingEnabled: true, transition: recoveryTransition({ restoreEvidenceSource }) })
+    const statusTile = root.root.findByProps({ label: 'Status' })
+    assert.equal(statusTile.props.value, 'Finishing backup recovery')
+    assert.equal(statusTile.props.hint, 'New backups wait until recovery is confirmed')
+    const text = JSON.stringify(root.toJSON())
+    assert.match(text, /Radio restoration is confirmed/)
+    assert.match(text, /confirming recovery and that the logger has resumed/)
+    assert.doesNotMatch(text, /may still be off|could not switch|Radios need switching back on|until the car is back|went off the network|Up to date/)
+  }
+})
+
+test('active recovery with restored radios gets recovery wording even without a recovery-required flag', async t => {
+  for (const state of ['idle', 'running']) {
+    const root = await mountBackup(t, status({ state }), { quietingEnabled: true, transition: recoveryTransition({ recoveryRequired: false }) })
+    assert.equal(root.root.findByProps({ label: 'Status' }).props.value, state === 'running' ? 'Copying' : 'Finishing backup recovery')
+    const text = JSON.stringify(root.toJSON())
+    assert.match(text, /Finishing backup recovery/)
+    assert.doesNotMatch(text, /Restoring the original radio state|Backup continuing while radios recover/)
+  }
+})
+
+test('a genuinely unverified radio retains the warning ahead of logger recovery', async t => {
+  const transition = recoveryTransition()
+  transition.hotspot = { ...transition.hotspot, restoreVerified: false }
+  const root = await mountBackup(t, status(), { quietingEnabled: true, transition })
+  assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Radios need switching back on')
+  const text = JSON.stringify(root.toJSON())
+  assert.match(text, /The hotspot may still be off/)
+  assert.doesNotMatch(text, /Finishing backup recovery|Radio restoration is confirmed/)
+})
+
+test('logger-only recovery distinguishes untouched radios and already-resumed logger checks', async t => {
+  const transition = recoveryTransition()
+  const untouched = { baseline: 'off', disableAttempted: false, disableVerified: true, restoreAttempted: false, restoreVerified: false }
+  transition.bluetooth = untouched
+  transition.hotspot = untouched
+  transition.obdLogger = { ...transition.obdLogger, resumeVerified: true }
+  const root = await mountBackup(t, status(), { quietingEnabled: false, transition })
+  const text = JSON.stringify(root.toJSON())
+  assert.match(text, /Finishing backup recovery/)
+  assert.match(text, /The radios did not need restoring/)
+  assert.match(text, /completing the remaining recovery checks/)
+  assert.doesNotMatch(text, /may still be off|that the logger has resumed|Radio quieting is off/)
+})
+
+test('Bluetooth restoration still requires verification of an originally off hotspot baseline', async t => {
+  for (const restoreVerified of [false, true]) {
+    const transition = recoveryTransition({ hotspot: { baseline: 'off', disableAttempted: false, disableVerified: true, restoreAttempted: false, restoreVerified } })
+    const root = await mountBackup(t, status(), { quietingEnabled: true, transition })
+    const text = JSON.stringify(root.toJSON())
+    if (restoreVerified) {
+      assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Finishing backup recovery')
+      assert.match(text, /Radio restoration is confirmed/)
+    } else {
+      assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Radio restoration not confirmed')
+      assert.match(text, /not yet confirmed that the hotspot returned to its original state/)
+      assert.doesNotMatch(text, /Finishing backup recovery|Radio restoration is confirmed|may still be off|switching back on/)
+    }
+  }
+})
+
+test('an explicit unverified restore attempt remains pending without a disable attempt', async t => {
+  for (const name of ['bluetooth', 'hotspot']) {
+    const untouched = { baseline: 'off', disableAttempted: false, disableVerified: true, restoreAttempted: false, restoreVerified: false }
+    const transition = recoveryTransition({ bluetooth: untouched, hotspot: untouched })
+    transition[name] = { ...untouched, restoreAttempted: true }
+    const root = await mountBackup(t, status(), { quietingEnabled: true, transition })
+    assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Radio restoration not confirmed')
+    assert.doesNotMatch(JSON.stringify(root.toJSON()), /Finishing backup recovery|Radio restoration is confirmed/)
+  }
+})

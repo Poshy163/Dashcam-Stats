@@ -354,18 +354,52 @@ async def renew_quiesce(
     return ack
 
 
-async def _remove_files(address: str, paths: ControlPaths) -> bool:
-    await adb.shell(
-        address,
-        f"rm -f '{paths.request}' '{paths.ack}'; sync '{paths.directory}' 2>/dev/null || sync",
-        timeout=6.0,
+def _control_absence_command(paths: ControlPaths) -> str:
+    """Prove absence in accessible storage, not an unmounted/unsearchable directory."""
+    parent = paths.directory.rsplit("/", 1)[0]
+    return (
+        f"[ -d '{parent}' ] && [ -r '{parent}' ] && [ -x '{parent}' ] && "
+        f"ls -a '{parent}' >/dev/null 2>&1 && "
+        f"if [ -d '{paths.directory}' ] && [ ! -L '{paths.directory}' ]; then "
+        f"[ -r '{paths.directory}' ] && [ -x '{paths.directory}' ] && "
+        f"ls -a '{paths.directory}' >/dev/null 2>&1 && "
+        f"[ ! -e '{paths.request}' ] && [ ! -L '{paths.request}' ] && "
+        f"[ ! -e '{paths.ack}' ] && [ ! -L '{paths.ack}' ] && printf resumed; "
+        f"elif [ ! -e '{paths.directory}' ] && [ ! -L '{paths.directory}' ]; "
+        "then printf resumed; fi; exit 0"
     )
+
+
+async def _control_files_absent(address: str, paths: ControlPaths) -> bool:
     reply = await adb.shell(
         address,
-        f"[ ! -e '{paths.request}' ] && [ ! -e '{paths.ack}' ] && printf resumed; exit 0",
+        _control_absence_command(paths),
         timeout=6.0,
     )
     return reply.strip() == "resumed"
+
+
+async def _remove_files(address: str, paths: ControlPaths) -> bool:
+    # On-device expiry or an earlier lost reply may have already resumed Android. Do
+    # not perform another global filesystem flush merely to acknowledge that state.
+    try:
+        if await _control_files_absent(address, paths):
+            return True
+    except adb.AdbError:
+        pass
+    try:
+        await adb.shell(
+            address,
+            f"[ -d '{paths.directory}' ] && [ ! -L '{paths.directory}' ] && "
+            f"rm -f '{paths.request}' '{paths.ack}' && "
+            f"(sync '{paths.directory}' 2>/dev/null || sync)",
+            timeout=6.0,
+        )
+    except adb.AdbError:
+        # rm may have succeeded before a slow sync or lost ADB reply. A fresh, positive
+        # absence read is the resume evidence; command failure alone cannot decide it.
+        pass
+    return await _control_files_absent(address, paths)
 
 
 async def resume_logger(address: str, status_path: str) -> bool:
@@ -418,7 +452,8 @@ async def request_quiesce(
 
     # Clear a stale prior handshake before publishing the new request.  The target is a
     # same-directory rename and both path and content are allowlisted.
-    await _remove_files(address, paths)
+    if not await _remove_files(address, paths):
+        raise LoggerControlError("prior logger handshake could not be cleared")
     partial = f"{paths.request}.partial"
     command = (
         f"if [ -e '{paths.directory}' ] || [ -L '{paths.directory}' ]; then "
