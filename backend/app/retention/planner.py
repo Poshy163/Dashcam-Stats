@@ -268,7 +268,11 @@ async def execute(
     dry_run: bool = True,
     trigger: str = "scheduled",
 ) -> RetentionRun:
-    """Record the plan and, only if everything permits it, carry it out."""
+    """Record the plan and, only if everything permits it, carry it out.
+
+    This operation commits its audit checkpoints: filesystem removal cannot roll back,
+    and no SQLite writer may remain held while the footage share is being accessed.
+    """
     settings = get_settings_service()
     if retention_plan is None:
         retention_plan = await plan(session)
@@ -291,10 +295,10 @@ async def execute(
         plan=[c.as_dict() for c in retention_plan.candidates],
     )
     session.add(run)
-    await session.flush()
 
     if not really_delete:
         run.finished_at = datetime.now(UTC)
+        await session.commit()
         log.info(
             "retention evaluated (report only)",
             trigger=trigger,
@@ -305,51 +309,77 @@ async def execute(
         )
         return run
 
+    # Persist intent before irreversible IO, releasing the writer first. A flush alone
+    # held SQLite's only writer through every network-mount stat/unlink, preventing the
+    # radio safety heartbeat from renewing its lease. An interrupted removal now also
+    # leaves a durable, unfinished audit instead of losing the plan on rollback.
+    await session.commit()
     root = await settings.footage_dir()
 
-    def unlink_all() -> tuple[list[int], int]:
-        """Validate and remove every candidate. **Blocking**, so it runs in a thread.
+    def unlink_candidate(candidate: RetentionCandidate) -> int | None:
+        """Validate the path again and remove it without blocking the event loop."""
+        try:
+            target = safe_join(root, candidate.rel_path)
+        except PathTraversalError as exc:
+            log.error(
+                "refusing to delete a path outside the footage root",
+                rel_path=candidate.rel_path,
+                error=str(exc),
+            )
+            return None
+        if not target.is_file():
+            return None
+        try:
+            size = target.stat().st_size
+            target.unlink()
+        except OSError as exc:
+            log.warning("could not delete recording", file=candidate.filename, error=str(exc))
+            return None
+        return size
 
-        Six syscalls per candidate against what is usually a network mount -- two
-        ``resolve`` calls inside ``safe_join``, an ``is_file``, a ``stat`` and an
-        ``unlink`` -- and all of it used to happen on the event loop, inside the single
-        SQLite write transaction the scheduler wraps the whole retention pass in. Nothing
-        else in the process could be served for the duration, and one slow share turned a
-        cleanup into a stall.
-
-        Returns the ids actually removed and the bytes they held.
-        """
-        removed: list[int] = []
-        freed = 0
-        for candidate in retention_plan.candidates:
-            # Re-validated immediately before unlinking rather than trusting the path
-            # recorded when the plan was built: the settings could have changed, and a
-            # symlink could have appeared, between planning and execution.
-            try:
-                target = safe_join(root, candidate.rel_path)
-            except PathTraversalError as exc:
-                log.error(
-                    "refusing to delete a path outside the footage root",
-                    rel_path=candidate.rel_path,
-                    error=str(exc),
-                )
-                continue
-
-            if not target.is_file():
-                continue
-
-            try:
-                size = target.stat().st_size
-                target.unlink()
-            except OSError as exc:
-                log.warning("could not delete recording", file=candidate.filename, error=str(exc))
-                continue
-
-            removed.append(candidate.recording_id)
-            freed += size
-        return removed, freed
-
-    removed_ids, deleted_bytes = await asyncio.to_thread(unlink_all)
+    removed_ids: list[int] = []
+    deleted_bytes = 0
+    spare_events = retention_plan.exclude_from_stats or bool(
+        settings.get_nowait("storage.keep_events")
+    )
+    for candidate in retention_plan.candidates:
+        # Another request can now protect/reprocess a later candidate while the first
+        # file is being removed. Re-read scalars before each unlink; ORM instances or a
+        # single batch snapshot could hide those newly committed changes.
+        active_job = (
+            select(ProcessingJob.id)
+            .where(
+                ProcessingJob.recording_id == Recording.id,
+                ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),
+            )
+            .exists()
+        )
+        current = (
+            await session.execute(
+                select(
+                    Recording.rel_path,
+                    Recording.state,
+                    Recording.file_missing,
+                    Recording.protected,
+                    Recording.event_type,
+                    active_job.label("active_job"),
+                ).where(Recording.id == candidate.recording_id)
+            )
+        ).one_or_none()
+        await session.commit()
+        if (
+            current is None
+            or current.rel_path != candidate.rel_path
+            or current.file_missing
+            or current.state in (RecordingState.DELETED, RecordingState.PROCESSING)
+            or current.active_job
+            or (spare_events and _is_event(current))
+        ):
+            continue
+        size = await asyncio.to_thread(unlink_candidate, candidate)
+        if size is not None:
+            removed_ids.append(candidate.recording_id)
+            deleted_bytes += size
     deleted_count = len(removed_ids)
 
     # One statement rather than a `session.get` per candidate. The file is gone but
@@ -382,6 +412,9 @@ async def execute(
     run.deleted_count = deleted_count
     run.deleted_bytes = deleted_bytes
     run.finished_at = datetime.now(UTC)
+    # Callers run size, idle and parked cleanup back-to-back in this session. Release
+    # this pass before the next plan starts reading the share or walking telemetry.
+    await session.commit()
     if deleted_count:
         # The share is not what it was measured to be a moment ago. Cheaper and more honest
         # than waiting out the TTL, which would leave the storage bar reporting the bytes

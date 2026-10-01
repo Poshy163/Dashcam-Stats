@@ -246,6 +246,43 @@ function recoveryTransition(overrides = {}) {
   }
 }
 
+test('pending radio capture reports awaiting or reading instead of a completed failed read', async t => {
+  const unknown = { baseline: 'unknown', disableAttempted: false, disableVerified: false, restoreAttempted: false, restoreVerified: false }
+  for (const phase of ['preparing', 'finalising_obd', 'transferring_obd', 'capturing_radio_state']) {
+    const transition = recoveryTransition({ phase, recoveryRequired: false, bluetooth: unknown, hotspot: unknown })
+    const root = await mountBackup(t, status({ state: 'running', phase: 'preparing' }), { quietingEnabled: true, transition })
+    const text = JSON.stringify(root.toJSON())
+    assert.match(text, /Preparing a safe radio transition/)
+    assert.match(text, new RegExp(`${phase === 'capturing_radio_state' ? 'Reading' : 'Awaiting'} Bluetooth`))
+    assert.match(text, new RegExp(`${phase === 'capturing_radio_state' ? 'Reading' : 'Awaiting'} Hotspot`))
+    assert.doesNotMatch(text, /could not be read|left untouched|did not need to change/)
+  }
+})
+
+test('captured state during preparation does not prematurely claim the radio was left unchanged', async t => {
+  const on = { baseline: 'on', disableAttempted: false, disableVerified: false, restoreAttempted: false, restoreVerified: false }
+  for (const phase of ['capturing_radio_state', 'disabling_radios']) {
+    const transition = recoveryTransition({ phase, recoveryRequired: false, bluetooth: on, hotspot: { ...on, baseline: 'transport' } })
+    const root = await mountBackup(t, status({ state: 'running' }), { quietingEnabled: true, transition })
+    const text = JSON.stringify(root.toJSON())
+    assert.match(text, /Bluetooth was on when checked/)
+    assert.match(text, /Hotspot is carrying the transfer connection/)
+    if (phase === 'disabling_radios') assert.match(text, /Applying the radio changes using the captured starting state/)
+    assert.doesNotMatch(text, /left it alone|did not need to change|left untouched/)
+  }
+})
+
+test('a finished unsuccessful radio capture retains its conclusive explanation', async t => {
+  const unknown = { baseline: 'unknown', disableAttempted: false, disableVerified: false, restoreAttempted: false, restoreVerified: false }
+  const transition = recoveryTransition({ phase: 'failed', active: false, recoveryRequired: false, bluetooth: unknown, hotspot: unknown })
+  const root = await mountBackup(t, status(), { quietingEnabled: true, transition })
+  const text = JSON.stringify(root.toJSON())
+  assert.match(text, /Radio quieting could not start/)
+  assert.match(text, /Bluetooth could not be read before the backup, so it was left untouched/)
+  assert.match(text, /Hotspot could not be read before the backup, so it was left untouched/)
+  assert.doesNotMatch(text, /Awaiting Bluetooth|Reading Bluetooth/)
+})
+
 test('confirmed radios with logger recovery pending never claim a radio is off or the car has left', async t => {
   for (const restoreEvidenceSource of ['server', 'unit', null]) {
     const root = await mountBackup(t, status({ backlogKnown: true }), { quietingEnabled: true, transition: recoveryTransition({ restoreEvidenceSource }) })

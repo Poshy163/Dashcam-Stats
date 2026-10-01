@@ -65,6 +65,12 @@ DISPLAY_RETRY_DELAYS_S = (0.0, 3.0, 10.0)
 APP_OWNED_SLEEP_WINDOW_CAPABILITY = "adaptive_sleep_window_v2"
 APP_OWNED_SLEEP_STATUS_READ_TIMEOUT_S = 6.0
 APP_OWNED_SLEEP_STATUS_MAX_AGE_S = 30.0
+QUIET_EVIDENCE_CAPABILITY = "sleep_deadline_evidence_v1"
+QUIET_EVIDENCE_WAIT_S = 15.0
+QUIET_EVIDENCE_RETRY_S = 2.0
+# read_logger_status has a five-second ADB timeout; the parallel runtime read takes
+# at most three. Do not start either when its normal bound would exceed the grace.
+_QUIET_EVIDENCE_PROBE_BUDGET_S = 5.0
 _EVENT_SYNC_AWAIT_GRACE_SECONDS = 0.25
 
 # One bounded recovery budget for normal cleanup and later reconciliation. Hotspot
@@ -212,6 +218,66 @@ def _obd_logger_status_is_authoritative(logger_status: object) -> bool:
     return logger_status is None or (
         isinstance(logger_status, dict) and isinstance(logger_status.get("ownership_enabled"), bool)
     )
+
+
+async def _await_quieting_evidence(address: str, logger_status: dict | None) -> dict | None:
+    """Allow one logger heartbeat to establish a newly observed OFF edge.
+
+    ACC can reach the server before the logger publishes its boot-bound deadline.
+    Only that fresh-OFF/unknown case gets this read-only grace; neither a known short
+    timer nor an older logger delays copying. No radio or logger control is attempted.
+    """
+    capabilities = logger_status.get("capabilities") if isinstance(logger_status, dict) else None
+    if not isinstance(capabilities, list) or QUIET_EVIDENCE_CAPABILITY not in capabilities:
+        return logger_status
+    ownership_observed = _obd_logger_owns_bluetooth(logger_status)
+    status = get_status()
+
+    def waiting_for_edge() -> bool:
+        snapshot = status.snapshot()
+        return (
+            snapshot["unit_observation_fresh"] is True
+            and snapshot["ignition_state"] == "off"
+            and snapshot["sleep_countdown_source"] == "unknown"
+            and not status.cancel_event.is_set()
+        )
+
+    if not waiting_for_edge():
+        return logger_status
+    log.info("briefly waiting for the logger's ignition-off evidence before radio preparation")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + QUIET_EVIDENCE_WAIT_S
+    path = get_config().obd_remote_status_file
+    while waiting_for_edge() and deadline - loop.time() >= _QUIET_EVIDENCE_PROBE_BUDGET_S:
+        # Refresh both authorities. A newer ownership/quiesce result must accompany
+        # the deadline, rather than retaining the snapshot taken before preparation.
+        observation, latest_logger = await asyncio.gather(
+            adb.runtime_observation(address, logger_status_path=path),
+            read_logger_status(address, path),
+            return_exceptions=True,
+        )
+        if isinstance(latest_logger, BaseException) or (
+            latest_logger is None and ownership_observed
+        ):
+            # A transient disappearance cannot undo positively observed ownership.
+            # Fail the later authority check rather than skipping logger quiescence.
+            logger_status = {"state": "status_unavailable"}
+        else:
+            logger_status = latest_logger
+        ownership_observed = ownership_observed or _obd_logger_owns_bluetooth(latest_logger)
+        if status.cancel_event.is_set():
+            return logger_status
+        if observation is None or isinstance(observation, BaseException):
+            status.unit_observation_failed()
+            return logger_status
+        if status.observe_unit_runtime(observation) or not waiting_for_edge():
+            return logger_status
+        retry_at = min(deadline, loop.time() + QUIET_EVIDENCE_RETRY_S)
+        # Stop requests are a threading.Event; short async sleeps avoid adding a
+        # non-cancellable waiter thread solely for this small preparation grace.
+        while waiting_for_edge() and loop.time() < retry_at:
+            await asyncio.sleep(min(0.1, retry_at - loop.time()))
+    return logger_status
 
 
 async def widen_sleep_window(address: str) -> bool:
@@ -1688,6 +1754,11 @@ async def _run_pull_started(
             return result
 
         quiet_requested = bool(_get("quiet_radios", False)) and bool(plan.files)
+        if quiet_requested:
+            observed_logger = await _await_quieting_evidence(info.address, observed_logger)
+            if status.cancel_event.is_set():
+                result = RunResult(state=RunState.CANCELLED)
+                return result
         if quiet_requested and not radios.new_quieting_allowed():
             # Footage can still be copied with the radios unchanged. Do not pause the
             # logger or claim a new radio transition when sleep may be imminent.

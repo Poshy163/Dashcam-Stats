@@ -9,6 +9,7 @@ import { api } from '@/lib/api'
 import type {
   IngestRadioDeviceState,
   IngestRadioStatus,
+  IngestRadioTransitionStatus,
   IngestStatus,
   OBDBundle,
 } from '@/lib/api'
@@ -134,7 +135,11 @@ function radioSummary(status: IngestRadioStatus, backupRunning: boolean): {
     }
     return {
       title: 'Preparing a safe radio transition',
-      detail: 'The starting state is captured before Bluetooth or the hotspot can be changed.',
+      detail: transition.phase === 'capturing_radio_state'
+        ? 'Reading the starting state before changing Bluetooth or the hotspot.'
+        : transition.phase === 'disabling_radios'
+          ? 'Applying the radio changes using the captured starting state.'
+          : 'The app will read each radio’s starting state before making any changes.',
       tone: 'busy',
     }
   }
@@ -223,10 +228,22 @@ function radioSummary(status: IngestRadioStatus, backupRunning: boolean): {
 function radioEvidence(
   label: string,
   radio: IngestRadioDeviceState,
-  active: boolean,
-  evidenceSource: 'server' | 'unit' | null = null,
+  transition: IngestRadioTransitionStatus,
 ): string {
+  const { active, phase, recoveryRequired, restoreEvidenceSource: evidenceSource } = transition
+  const capturePending = ['preparing', 'finalising_obd', 'transferring_obd', 'capturing_radio_state'].includes(phase)
   if (!radio.disableAttempted) {
+    if (active && !recoveryRequired && !radio.restoreAttempted &&
+        (capturePending || (phase === 'disabling_radios' && radio.baseline !== 'unknown'))) {
+      if (radio.baseline === 'unknown') {
+        return phase === 'capturing_radio_state'
+          ? `Reading ${label}’s starting state before any radio changes.`
+          : `Awaiting ${label}’s starting state before any radio changes.`
+      }
+      return radio.baseline === 'transport'
+        ? `${label} is carrying the transfer connection.`
+        : `${label} was ${radio.baseline} when checked.`
+    }
     if (radio.baseline === 'off') return `${label} was already off, so the backup left it alone.`
     if (radio.baseline === 'transport') {
       return `${label} was carrying the transfer itself, so the backup left it alone.`
@@ -544,16 +561,14 @@ export default function Backup() {
                 {radioEvidence(
                   'Bluetooth',
                   radioStatus.data.transition.bluetooth,
-                  radioStatus.data.transition.active,
-                  radioStatus.data.transition.restoreEvidenceSource,
+                  radioStatus.data.transition,
                 )}
               </div>
               <div>
                 {radioEvidence(
                   'Hotspot',
                   radioStatus.data.transition.hotspot,
-                  radioStatus.data.transition.active,
-                  radioStatus.data.transition.restoreEvidenceSource,
+                  radioStatus.data.transition,
                 )}
               </div>
               {radioStatus.data.transition.unitReportedAt && (

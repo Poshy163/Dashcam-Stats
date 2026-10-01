@@ -19,14 +19,15 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 from app.config import get_config
 from app.core.logging import get_logger
 from app.core.process_lock import ProcessFileLock, try_acquire
 from app.db.models import IngestRadioTransition
-from app.db.session import session_scope
+from app.db.retry import is_locked_error
+from app.db.session import get_engine, session_scope
 from app.ingest import adb, obd_control, origin, radios
 from app.ingest.obd_storage import redact
 from app.ingest.status import get_status
@@ -38,6 +39,12 @@ log = get_logger(__name__)
 # a device command.
 LEASE_TTL_S = 45.0
 HEARTBEAT_INTERVAL_S = 10.0
+# Wait in short transactions within the already-proven lease, leaving time to stop
+# transfer and restore. Contention cannot extend ownership or resurrect an expired row.
+CHECKPOINT_BUSY_TIMEOUT_MS = 1_000
+CHECKPOINT_LOCK_RETRY_S = 0.1
+CHECKPOINT_MAX_RETRY_S = 25.0
+CHECKPOINT_RECOVERY_HEADROOM_S = 10.0
 LOGGER_QUIESCE_RENEW_INTERVAL_S = 20.0
 LOGGER_QUIESCE_HEADROOM_S = 90.0
 LOGGER_RADIO_RECOVERY_MARGIN_S = 30.0
@@ -110,6 +117,8 @@ class RadioTransition:
     _logger_renew_after: float | None = field(default=None, repr=False)
     _logger_valid_until: float | None = field(default=None, repr=False)
     _logger_resumed: bool = field(default=False, repr=False)
+    _lease_valid_until: float | None = field(default=None, repr=False)
+    _restoring_task: asyncio.Task[Any] | None = field(default=None, repr=False)
 
     @property
     def lease_lost(self) -> bool:
@@ -253,25 +262,102 @@ class RadioTransition:
         phase: TransitionPhase | str | None = None,
         **values: Any,
     ) -> None:
-        now = _now()
         if phase is not None:
             values["phase"] = str(phase)
-        values.update(updated_at=now, heartbeat_at=now)
-        values.setdefault("lease_expires_at", _lease_deadline())
-        async with session_scope() as session:
-            result = await session.execute(
-                update(IngestRadioTransition)
-                .where(
+        loop = asyncio.get_running_loop()
+        explicit_expiry = values.get("lease_expires_at")
+        cleanup = self._restoring_task is asyncio.current_task() or (
+            isinstance(explicit_expiry, datetime) and explicit_expiry <= _now()
+        )
+        retry_until = loop.time() + CHECKPOINT_MAX_RETRY_S
+        if not cleanup:
+            retry_until = min(
+                retry_until, (self._lease_valid_until or 0.0) - CHECKPOINT_RECOVERY_HEADROOM_S
+            )
+        last_error: Exception | None = None
+        while True:
+            remaining = retry_until - loop.time()
+            if remaining <= 0:
+                error = last_error or RadioTransitionError(
+                    "the proven ingest radio lease has insufficient renewal headroom"
+                )
+                if not cleanup:
+                    self._signal_lease_loss(error)
+                raise error
+            try:
+                await self._checkpoint_once(
+                    values,
+                    retry_until=retry_until,
+                    allow_expired=cleanup,
+                )
+                return
+            except Exception as exc:
+                if isinstance(exc, TimeoutError) and not cleanup:
+                    self._signal_lease_loss(exc)
+                if not is_locked_error(exc):
+                    raise
+                last_error = exc
+                await asyncio.sleep(min(CHECKPOINT_LOCK_RETRY_S, max(0, retry_until - loop.time())))
+
+    async def _checkpoint_once(
+        self, values: dict[str, Any], *, retry_until: float, allow_expired: bool
+    ) -> None:
+        engine = get_engine()
+        loop = asyncio.get_running_loop()
+        async with contextlib.AsyncExitStack() as stack:
+            # Pool checkout can itself wait30s; cap it before any SQL is issued.
+            async with asyncio.timeout(max(0, retry_until - loop.time())):
+                connection = await stack.enter_async_context(engine.connect())
+            sqlite = connection.dialect.name == "sqlite"
+            previous_timeout = None
+            try:
+                if sqlite:
+                    previous_timeout = int(await connection.scalar(text("PRAGMA busy_timeout")))
+                    busy_timeout_ms = max(
+                        1, min(CHECKPOINT_BUSY_TIMEOUT_MS, int((retry_until - loop.time()) * 1000))
+                    )
+                    await connection.exec_driver_sql(f"PRAGMA busy_timeout={busy_timeout_ms}")
+                    # This scope contains only one UPDATE, never device/filesystem IO.
+                    # Take the writer first so successful renewal timestamps cannot be
+                    # aged by the lock wait before they are even committed.
+                    await connection.exec_driver_sql("BEGIN IMMEDIATE")
+                if loop.time() >= retry_until:
+                    raise TimeoutError("the proven radio lease checkpoint budget was exhausted")
+                lease_started = asyncio.get_running_loop().time()
+                now = _now()
+                fresh_values = dict(values, updated_at=now, heartbeat_at=now)
+                fresh_values.setdefault("lease_expires_at", now + timedelta(seconds=LEASE_TTL_S))
+                statement = update(IngestRadioTransition).where(
                     IngestRadioTransition.id == self.id,
                     IngestRadioTransition.active.is_(True),
                     IngestRadioTransition.lease_owner == self.lease_owner,
                 )
-                .values(**values)
-            )
-            if result.rowcount != 1:
-                error = RadioTransitionError("the ingest radio lease is no longer owned")
-                self._signal_lease_loss(error)
-                raise error
+                if not allow_expired:
+                    statement = statement.where(IngestRadioTransition.lease_expires_at > now)
+                result = await connection.execute(statement.values(**fresh_values))
+                if result.rowcount != 1:
+                    error = RadioTransitionError(
+                        "the ingest radio lease is no longer owned or expired"
+                    )
+                    self._signal_lease_loss(error)
+                    raise error
+                await connection.commit()
+                confirmed_until = lease_started + max(
+                    0.0, (fresh_values["lease_expires_at"] - now).total_seconds()
+                )
+                self._lease_valid_until = (
+                    confirmed_until
+                    if "lease_expires_at" in values
+                    else max(self._lease_valid_until or 0.0, confirmed_until)
+                )
+            except BaseException:
+                await connection.rollback()
+                raise
+            finally:
+                # busy_timeout belongs to the pooled connection, not the transaction.
+                # Restore it before returning this connection to unrelated DB callers.
+                if previous_timeout is not None:
+                    await connection.exec_driver_sql(f"PRAGMA busy_timeout={previous_timeout}")
 
     async def _row(self) -> IngestRadioTransition:
         async with session_scope() as session:
@@ -452,6 +538,7 @@ class RadioTransition:
                 # failed before assigning its cached result.
                 self._restore_result = False
                 return False
+            self._restoring_task = asyncio.current_task()
             try:
                 effective_error = error or self._lease_loss_error
                 result = await self._restore(error=effective_error)
@@ -474,6 +561,7 @@ class RadioTransition:
                     )
                 raise
             finally:
+                self._restoring_task = None
                 await self.close()
 
     async def _unit_already_verified(self, radio: str) -> bool:
@@ -789,6 +877,7 @@ async def begin(
             raise RadioTransitionError(
                 "device boot identity could not be verified; radios were left on"
             )
+        lease_started = asyncio.get_running_loop().time()
         row = IngestRadioTransition(
             transition_id=transition_id,
             trigger=trigger[:32],
@@ -831,6 +920,7 @@ async def begin(
         process_fence=process_fence,
         allow_zlink_rearm=allow_zlink_rearm,
         lease_loss_callback=lease_loss_callback,
+        _lease_valid_until=lease_started + LEASE_TTL_S,
     )
     transition.start_heartbeat()
     return transition
@@ -1016,6 +1106,7 @@ async def _adopt_expired(
         return None
     owner = str(uuid.uuid4())
     now = _now()
+    lease_started = asyncio.get_running_loop().time()
     try:
         async with session_scope() as session:
             result = await session.execute(
@@ -1052,6 +1143,7 @@ async def _adopt_expired(
         controller=controller,
         watchdog_deadline_s=120,
         process_fence=process_fence,
+        _lease_valid_until=lease_started + LEASE_TTL_S,
     )
     transition.start_heartbeat()
     return transition

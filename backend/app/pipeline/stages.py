@@ -16,13 +16,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import itertools
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import numpy as np
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.detector import Detection2D, ObjectDetector
@@ -240,7 +241,7 @@ def _save_jpeg(image: np.ndarray, path: Path, quality: int = 85) -> str | None:
     try:
         import cv2
 
-        # `_media_path` has already created the directory for every path this is given;
+        # The caller has already created the directory for every path this is given;
         # doing it again is one stat per crop for nothing.
         if cv2.imwrite(str(path), image, [int(cv2.IMWRITE_JPEG_QUALITY), quality]):
             return relative_to_media(path)
@@ -2090,40 +2091,7 @@ async def stage_plates(
     fixes = await _fix_track(session, recording.id)
     placed = [(hit, fixes.at(float(hit.vote.best.offset_s))) for hit in hits]
 
-    # Everything below writes, and only what is below. One observation per plate per
-    # tracked vehicle, so reprocessing replaces rather than accumulates.
-    #
-    # The plates that are about to lose an observation are collected first. Rollups were
-    # refreshed only for plates still present after the rewrite, so a plate that this
-    # recording no longer sees kept a count that included the observation just deleted --
-    # and reprocessing a recording whose reads improved left the old plate claiming
-    # sightings that no longer exist anywhere.
-    touched_plate_ids = set(
-        (
-            await session.execute(
-                select(PlateObservation.plate_id.distinct()).where(
-                    PlateObservation.recording_id == recording.id
-                )
-            )
-        ).scalars()
-    )
-
-    # Filled by the write phase, emptied after it has committed. A retry re-runs the
-    # whole phase, so the list is reset each attempt and only the surviving run's
-    # directories are removed.
-    orphaned_media: list[Path] = []
-
-    async def write() -> None:
-        orphaned_media.clear()
-        await session.execute(
-            delete(PlateObservation).where(PlateObservation.recording_id == recording.id)
-        )
-        await _write_observations(session, recording, placed, touched_plate_ids, camera)
-        await session.flush()
-        await _refresh_plate_rollups(session, touched_plate_ids, orphaned_media)
-
-    await write_with_retry(session, write, what=f"store plates for {recording.filename}")
-    await _remove_media_dirs(orphaned_media)
+    await _write_observations(session, recording, placed, set(), camera)
 
     stored = len(hits)
     recording.plate_count = stored
@@ -2161,6 +2129,71 @@ async def stage_plates(
     )
 
 
+async def _settle_plate_io(operation):
+    """Join filesystem work even if the stage is cancelled repeatedly."""
+    task = asyncio.create_task(operation)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            break
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+def _plate_generation_dirs(recording_id: int, paths: list[str | None]) -> list[Path]:
+    """Recognise only this recording's new, uniquely owned crop directories."""
+    generations: set[str] = set()
+    for path in paths:
+        if not path:
+            continue
+        parts = PurePosixPath(path).parts
+        if (
+            len(parts) == 4
+            and parts[:2] == ("plates", f"recording_{recording_id:08d}")
+            and len(parts[2]) == 32
+            and all(char in "0123456789abcdef" for char in parts[2])
+        ):
+            generations.add(parts[2])
+    return [
+        _media_dir("plates", f"recording_{recording_id:08d}", generation)
+        for generation in sorted(generations)
+    ]
+
+
+async def _prepare_plate_crops(
+    placed: list, directory: Path
+) -> list[tuple[str | None, str | None]]:
+    settings = get_settings_service()
+    paths: list[list[str | None]] = [[None, None] for _ in placed]
+    if not bool(settings.get_nowait("plates.save_crops")):
+        return [tuple(pair) for pair in paths]
+    batch: list[tuple[np.ndarray, Path]] = []
+    destinations: list[tuple[int, int]] = []
+    for index, (hit, _located) in enumerate(placed):
+        for slot, image in enumerate((hit.vote.best.crop, hit.vehicle_crop)):
+            preview = _readable(image, hit.vote.best.mirrored)
+            if preview is not None:
+                batch.append((preview, directory / f"{index:04d}_{slot}.jpg"))
+                destinations.append((index, slot))
+    if batch:
+        # No Plate ID is needed: both directory creation and all encoding/writes finish
+        # before DELETE/upsert takes SQLite's writer lock. Unique names preserve old
+        # previews until the replacement transaction has actually committed.
+        await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
+        written = await _save_jpegs(batch, int(settings.get_nowait("general.thumbnail_quality")))
+        for (index, slot), path in zip(destinations, written, strict=True):
+            paths[index][slot] = path
+        if not any(path for pair in paths for path in pair):
+            await _remove_media_dirs([directory])
+    return [tuple(pair) for pair in paths]
+
+
 async def _write_observations(
     session: AsyncSession,
     recording: Recording,
@@ -2168,55 +2201,92 @@ async def _write_observations(
     touched_plate_ids: set[int],
     camera: Camera | None,
 ) -> None:
-    """Turn confirmed readings into rows. Split out so the write phase is one callable.
+    """Prepare images, then atomically replace the observations without filesystem I/O."""
+    recording_id = recording.id
+    directory = _media_dir("plates", f"recording_{recording_id:08d}", uuid.uuid4().hex)
+    committed = False
+    database_started = False
+    orphaned_media: list[Path] = []
+    retired_media: list[Path] = []
+    crop_paths: list[tuple[str | None, str | None]] = []
+    try:
+        crop_paths = await _settle_plate_io(_prepare_plate_crops(placed, directory))
 
-    Everything it needs was decided before the transaction opened, so re-running it after
-    a lock collision produces the same rows -- which is what makes the retry safe.
-    """
-    settings = get_settings_service()
-    save_crops = bool(settings.get_nowait("plates.save_crops"))
-    quality = int(settings.get_nowait("general.thumbnail_quality"))
+        async def write() -> None:
+            # A database retry rolls back and expires ORM attributes. Reload them through
+            # async queries before using them again; crop files are already complete.
+            for row in [recording, camera, *(hit.track for hit, _ in placed)]:
+                if row is not None and inspect(row).expired:
+                    await session.refresh(row)
+            # Refresh this list on retry; never delete an old generation before commit.
+            old = (
+                await session.execute(
+                    select(
+                        PlateObservation.plate_id,
+                        PlateObservation.plate_crop_path,
+                        PlateObservation.vehicle_crop_path,
+                    ).where(PlateObservation.recording_id == recording_id)
+                )
+            ).all()
+            touched_plate_ids.update(row[0] for row in old)
+            retired_media[:] = _plate_generation_dirs(
+                recording_id, [path for row in old for path in row[1:]]
+            )
+            orphaned_media.clear()
+            await session.execute(
+                delete(PlateObservation).where(PlateObservation.recording_id == recording_id)
+            )
+            await _insert_observations(
+                session, recording, placed, touched_plate_ids, camera, crop_paths
+            )
+            await session.flush()
+            await _refresh_plate_rollups(session, touched_plate_ids, orphaned_media)
 
-    for hit, located in placed:
+        database_started = True
+        await write_with_retry(session, write, what=f"store plates for {recording.filename}")
+        committed = True
+        await _settle_plate_io(_remove_media_dirs(orphaned_media + retired_media))
+    finally:
+        if not committed:
+            safe_to_remove = not database_started
+            if database_started:
+                # A cancellation/connection error around commit has an uncertain outcome.
+                # Settle rollback, then positively check the DB before deleting new files.
+                # A failed verification preserves them for any rows that may have committed.
+                try:
+                    await _settle_plate_io(session.rollback())
+                    prefix = relative_to_media(directory) + "/%"
+                    referenced = await session.scalar(
+                        select(PlateObservation.id)
+                        .where(
+                            PlateObservation.plate_crop_path.like(prefix)
+                            | PlateObservation.vehicle_crop_path.like(prefix)
+                        )
+                        .limit(1)
+                    )
+                    safe_to_remove = referenced is None
+                except BaseException:
+                    safe_to_remove = False
+            if safe_to_remove:
+                await _settle_plate_io(_remove_media_dirs([directory]))
+
+
+async def _insert_observations(
+    session: AsyncSession,
+    recording: Recording,
+    placed: list,
+    touched_plate_ids: set[int],
+    camera: Camera | None,
+    crop_paths: list[tuple[str | None, str | None]],
+) -> None:
+    """The database-only portion of the retryable observation replacement."""
+    for (hit, located), (plate_crop_path, vehicle_crop_path) in zip(
+        placed, crop_paths, strict=True
+    ):
         track, vote, result = hit.track, hit.vote, hit.result
         mirrored = vote.best.mirrored
         plate = await _upsert_plate(session, result, vote.ocr_confidence)
         touched_plate_ids.add(plate.id)
-
-        plate_crop_path = vehicle_crop_path = None
-        if save_crops:
-            # Both crops in one thread hop, so the write transaction this runs inside is
-            # not also holding SQLite's write lock across two JPEG encodes per observation.
-            batch: list[tuple[np.ndarray, Path]] = []
-            preview = _readable(vote.best.crop, mirrored)
-            if preview is not None:
-                batch.append(
-                    (
-                        preview,
-                        _media_path(
-                            "plates",
-                            f"{plate.id:08d}",
-                            f"{recording.id:08d}_{track.track_key:04d}.jpg",
-                        ),
-                    )
-                )
-            vehicle_preview = _readable(hit.vehicle_crop, mirrored)
-            if vehicle_preview is not None:
-                batch.append(
-                    (
-                        vehicle_preview,
-                        _media_path(
-                            "plates",
-                            f"{plate.id:08d}",
-                            f"{recording.id:08d}_{track.track_key:04d}_vehicle.jpg",
-                        ),
-                    )
-                )
-            paths = await _save_jpegs(batch, quality)
-            if preview is not None:
-                plate_crop_path = paths[0]
-            if vehicle_preview is not None:
-                vehicle_crop_path = paths[-1]
 
         offset = float(vote.best.offset_s)
         session.add(
@@ -2321,31 +2391,7 @@ async def _clear_plate_observations(session: AsyncSession, recording: Recording)
     to put back. Kept together so "reprocessing replaces rather than accumulates" is true
     of every exit from the stage rather than only the busy one.
     """
-    touched = set(
-        (
-            await session.execute(
-                select(PlateObservation.plate_id.distinct()).where(
-                    PlateObservation.recording_id == recording.id
-                )
-            )
-        ).scalars()
-    )
-    if not touched:
-        recording.plate_count = 0
-        return
-
-    orphaned_media: list[Path] = []
-
-    async def write() -> None:
-        orphaned_media.clear()
-        await session.execute(
-            delete(PlateObservation).where(PlateObservation.recording_id == recording.id)
-        )
-        await session.flush()
-        await _refresh_plate_rollups(session, touched, orphaned_media)
-
-    await write_with_retry(session, write, what=f"clear plates for {recording.filename}")
-    await _remove_media_dirs(orphaned_media)
+    await _write_observations(session, recording, [], set(), None)
     recording.plate_count = 0
 
 
