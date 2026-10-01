@@ -1831,6 +1831,7 @@ class TestARunEndToEnd:
         from app.ingest.models import RunState
 
         monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        monkeypatch.setattr(radios, "new_quieting_allowed", lambda: True)
         commands: list[str] = []
         bluetooth_on = True
 
@@ -1884,6 +1885,7 @@ class TestARunEndToEnd:
         from app.ingest.obd_transfer import get_obd_transfer_status
 
         monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        monkeypatch.setattr(radios, "new_quieting_allowed", lambda: True)
         commands: list[str] = []
         observed: dict[str, str] = {}
 
@@ -1920,6 +1922,7 @@ class TestARunEndToEnd:
         from app.ingest.obd_transfer import get_obd_transfer_status
 
         monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        monkeypatch.setattr(radios, "new_quieting_allowed", lambda: True)
         commands: list[str] = []
 
         async def shell(address, command, **kwargs):
@@ -2025,6 +2028,7 @@ class TestARunEndToEnd:
             raise TimeoutError("launcher did not answer")
 
         monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        monkeypatch.setattr(radios, "new_quieting_allowed", lambda: True)
         monkeypatch.setattr(puller, "read_logger_status", logger_status)
         monkeypatch.setattr(puller, "inventory_remote_bundles", obd_inventory)
         monkeypatch.setattr(puller, "sync_remote_bundles", obd_sync)
@@ -2102,6 +2106,7 @@ class TestARunEndToEnd:
             return committed
 
         monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        monkeypatch.setattr(radios, "new_quieting_allowed", lambda: True)
         monkeypatch.setattr(puller, "read_logger_status", no_logger)
         monkeypatch.setattr(puller, "inventory_remote_bundles", no_obd)
         monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
@@ -2161,6 +2166,7 @@ class TestARunEndToEnd:
             return await real_move(*args, **kwargs)
 
         monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        monkeypatch.setattr(radios, "new_quieting_allowed", lambda: True)
         monkeypatch.setattr(puller, "read_logger_status", logger_status)
         monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
         monkeypatch.setattr(puller, "_move", move)
@@ -2179,6 +2185,7 @@ class TestARunEndToEnd:
         from app.ingest.models import RunState
 
         monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        monkeypatch.setattr(radios, "new_quieting_allowed", lambda: True)
         commands: list[str] = []
 
         async def shell(address, command, **kwargs):

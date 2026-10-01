@@ -13,7 +13,7 @@ import type {
   OBDBundle,
 } from '@/lib/api'
 import { formatBytes, formatDateTime, formatDuration, formatRelative } from '@/lib/format'
-import { backupHold, backupIdleLabel } from '@/lib/backupPresentation'
+import { backupHold, backupIdleLabel, radioQuietingNotice } from '@/lib/backupPresentation'
 import { useSleepCountdown } from '@/lib/useSleepCountdown'
 
 /** How the state reads to a person, and how alarming it should look. */
@@ -367,7 +367,14 @@ export default function Backup() {
   // a full card — invisible, until it renders as 100.01% and a bar overshooting its track.
   const fraction =
     data && data.bytesTotal > 0 ? Math.min(1, data.bytesDone / data.bytesTotal) : 0
-  const radio = radioStatus.data ? radioSummary(radioStatus.data, running) : null
+  const quietingNotice = radioQuietingNotice(data, transition)
+  const radio = quietingNotice
+    ? {
+      title: 'Radios left unchanged',
+      detail: `${quietingNotice} Backup can continue without switching Bluetooth or the hotspot off.`,
+      tone: 'default' as const,
+    }
+    : radioStatus.data ? radioSummary(radioStatus.data, running) : null
   const radioToneClass =
     radio?.tone === 'error'
       ? 'border-state-error/50'
@@ -520,7 +527,7 @@ export default function Backup() {
         <div className={`card mb-6 px-5 py-4 text-sm ${radioToneClass}`}>
           <div className={`font-medium ${radioTitleClass}`}>{radio.title}</div>
           <div className="mt-1 text-content-muted">{radio.detail}</div>
-          {radioStatus.data?.transition && (
+          {radioStatus.data?.transition && !quietingNotice && (
             <div className="mt-2 space-y-0.5 text-xs text-content-faint">
               <div>
                 {radioEvidence(

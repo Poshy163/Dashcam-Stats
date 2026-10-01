@@ -210,6 +210,9 @@ export interface IngestStatus {
   ignitionHold: boolean
   /** Why it is being held for the ignition. Null unless held. */
   ignitionHoldReason: string | null
+  /** Quieting was skipped; this does not hold the backup itself. */
+  radioQuietingHold?: boolean
+  radioQuietingHoldReason?: string | null
   sleepWindowSeconds: number | null
   sleepCountdownRemainingS: number | null
   /** A recent server response may still contain an old head-unit observation. */

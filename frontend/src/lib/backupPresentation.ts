@@ -1,4 +1,10 @@
-import type { IngestStatus } from './api'
+import type { IngestRadioStatus, IngestStatus } from './api'
+
+export function radioQuietingNotice(status: IngestStatus | undefined, transition: IngestRadioStatus['transition'] | undefined): string | null {
+  if (!status?.unitOnline || status.state !== 'running' || !status.radioQuietingHold ||
+      transition?.recoveryRequired || transition?.active) return null
+  return status.radioQuietingHoldReason || 'The remaining awake time is too short or not known.'
+}
 
 export function backupHold(status: IngestStatus | undefined): { label: string; reason: string } | null {
   if (!status?.unitOnline || status.state === 'running' || status.state === 'disabled') return null

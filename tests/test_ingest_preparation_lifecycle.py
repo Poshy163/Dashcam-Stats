@@ -80,6 +80,7 @@ def prepared_unit(monkeypatch, tmp_path, isolated_mirror):
 
     monkeypatch.setattr(puller, "_move", move)
     return SimpleNamespace(
+        options=options,
         info=UnitInfo("unit:5555", UnitState.DEVICE, "/card"),
         settings=settings,
         inventory=inventory,
@@ -87,6 +88,38 @@ def prepared_unit(monkeypatch, tmp_path, isolated_mirror):
         payload=payload,
         transferred=transferred,
     )
+
+
+@pytest.mark.parametrize("sleep_window", [None, 60])
+async def test_unsafe_sleep_budget_copies_without_claiming_or_quiescing(
+    prepared_unit, monkeypatch, sleep_window
+):
+    from app.ingest.adb import RuntimeObservation
+
+    prepared_unit.options["quiet_radios"] = True
+    status = get_status()
+    if sleep_window is not None:
+        status.observe_unit_runtime(RuntimeObservation("boot", 100, "on", sleep_window))
+        status.observe_unit_runtime(RuntimeObservation("boot", 101, "off", sleep_window))
+    begin = AsyncMock(side_effect=AssertionError("must not claim radios"))
+    monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
+    monkeypatch.setattr(
+        puller,
+        "read_logger_status",
+        AsyncMock(
+            return_value={
+                "state": "ecu_online",
+                "ownership_enabled": True,
+                "capabilities": [puller.obd_control.CAPABILITY],
+            }
+        ),
+    )
+    result = await asyncio.wait_for(puller.run_pull(info=prepared_unit.info), timeout=1)
+    assert result.state is RunState.OK
+    assert prepared_unit.path.read_bytes() == prepared_unit.payload
+    begin.assert_not_awaited()
+    assert status.radio_quieting_hold
+    assert "Radios left unchanged" in status.radio_quieting_hold_reason
 
 
 async def test_slow_mirror_cleanup_never_blocks_footage_or_starts_another_mirror(

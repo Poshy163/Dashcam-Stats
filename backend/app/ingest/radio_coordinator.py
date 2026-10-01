@@ -283,6 +283,8 @@ class RadioTransition:
     async def prepare_logger(
         self, *, timeout_s: float = obd_control.DEFAULT_TIMEOUT_S
     ) -> obd_control.LoggerAck:
+        if not radios.new_quieting_allowed():
+            raise RadioTransitionError("sleep deadline does not leave time for radio quieting")
         if not self.logger_status_path:
             raise RadioTransitionError("logger status path is unavailable")
         request_id = str(uuid.uuid4())
@@ -291,6 +293,8 @@ class RadioTransition:
             logger_request_id=request_id,
             logger_quiesce_requested_at=_now(),
         )
+        if not radios.new_quieting_allowed():
+            raise RadioTransitionError("sleep deadline does not leave time for radio quieting")
         request_started = asyncio.get_running_loop().time()
         try:
             ack = await obd_control.request_quiesce(
@@ -323,6 +327,8 @@ class RadioTransition:
         # This method is deliberately self-defending rather than relying on the puller's
         # call order.  A future caller must not be able to take BLE away from the logger
         # until its immutable export has been transferred, verified and checkpointed.
+        if not radios.new_quieting_allowed():
+            raise RadioTransitionError("sleep deadline does not leave time for radio quieting")
         row = await self._row()
         if not row.obd_transfer_complete:
             raise RadioTransitionError(
@@ -756,6 +762,8 @@ async def begin(
     lease_loss_callback: Callable[[], object] | None = None,
 ) -> RadioTransition:
     """Atomically claim the only active transition across all server processes."""
+    if not radios.new_quieting_allowed():
+        raise RadioTransitionError("sleep deadline does not leave time for radio quieting")
     watchdog_deadline_s = max(60, min(int(watchdog_deadline_s), MAX_WATCHDOG_DEADLINE_S))
     process_fence = try_acquire(_process_fence_path())
     if process_fence is None:

@@ -9,6 +9,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import update
@@ -440,6 +441,9 @@ class FakeController:
 
 @pytest.fixture
 def fake_controller(monkeypatch):
+    # These tests exercise ownership and recovery independently of admission policy.
+    # The denied-admission cases below explicitly remove this available-time budget.
+    monkeypatch.setattr(radio_coordinator.radios, "new_quieting_allowed", lambda: True)
     FakeController.instances = []
     FakeController.bluetooth_ok = True
     FakeController.hotspot_ok = True
@@ -458,6 +462,94 @@ def fake_controller(monkeypatch):
 
     monkeypatch.setattr(radio_coordinator.radios, "read_device_boot_id", boot_id)
     return FakeController
+
+
+async def test_insufficient_sleep_budget_never_claims_radios(
+    db_session, fake_controller, monkeypatch
+):
+    monkeypatch.setattr(radio_coordinator.radios, "new_quieting_allowed", lambda: False)
+    with pytest.raises(radio_coordinator.RadioTransitionError, match="sleep deadline"):
+        await radio_coordinator.begin(
+            trigger="auto",
+            address="unit:5555",
+            logger_status=None,
+            logger_status_path="/safe/status.json",
+            watchdog_deadline_s=120,
+        )
+    assert fake_controller.instances == []
+    assert await radio_coordinator.pending_recovery_address() is None
+
+
+async def test_budget_expiring_after_claim_skips_logger_and_radio_changes(
+    db_session, fake_controller, monkeypatch
+):
+    transition = await radio_coordinator.begin(
+        trigger="auto",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+    )
+    request = AsyncMock()
+    monkeypatch.setattr(radio_coordinator.obd_control, "request_quiesce", request)
+    monkeypatch.setattr(radio_coordinator.radios, "new_quieting_allowed", lambda: False)
+    try:
+        with pytest.raises(radio_coordinator.RadioTransitionError, match="sleep deadline"):
+            await transition.prepare_logger()
+        with pytest.raises(radio_coordinator.RadioTransitionError, match="sleep deadline"):
+            await transition.capture_and_quiet()
+        request.assert_not_awaited()
+        assert transition.controller.calls == ["claim"]
+    finally:
+        assert await transition.restore()
+
+
+async def test_pending_recovery_ignores_new_quieting_budget(
+    db_session, fake_controller, monkeypatch
+):
+    transition = await radio_coordinator.begin(
+        trigger="auto",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+    )
+    await transition.checkpoint(bluetooth_before="on", bluetooth_disable_attempted=True)
+    await transition.require_recovery("unit slept during restoration")
+    monkeypatch.setattr(radio_coordinator.radios, "new_quieting_allowed", lambda: False)
+    assert await radio_coordinator.reconcile_pending(address="unit:5555")
+    assert "bluetooth:on" in fake_controller.instances[-1].calls
+    assert await radio_coordinator.pending_recovery_address() is None
+
+
+async def test_slow_checkpoint_cannot_pause_logger_past_sleep_budget(
+    db_session, fake_controller, monkeypatch
+):
+    transition = await radio_coordinator.begin(
+        trigger="auto",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+    )
+    checkpoint = radio_coordinator.RadioTransition.checkpoint
+
+    async def expire_budget(self, *args, **kwargs):
+        await checkpoint(self, *args, **kwargs)
+        monkeypatch.setattr(radio_coordinator.radios, "new_quieting_allowed", lambda: False)
+
+    request = AsyncMock()
+    resume = AsyncMock(return_value=True)
+    monkeypatch.setattr(radio_coordinator.RadioTransition, "checkpoint", expire_budget)
+    monkeypatch.setattr(radio_coordinator.obd_control, "request_quiesce", request)
+    monkeypatch.setattr(radio_coordinator.obd_control, "resume_logger", resume)
+    try:
+        with pytest.raises(radio_coordinator.RadioTransitionError, match="sleep deadline"):
+            await transition.prepare_logger()
+        request.assert_not_awaited()
+    finally:
+        assert await transition.restore()
+    resume.assert_awaited_once()
 
 
 async def test_logger_lease_keeps_bounded_radio_recovery_headroom(

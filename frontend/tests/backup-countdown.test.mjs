@@ -103,9 +103,10 @@ test('the shared hook measures delayed callbacks, refreshes identical values, an
   assert.equal(result().state, 'stale', 'mounting a cached query cannot restart its countdown')
 })
 
-async function mountBackup(t, data) {
+async function mountBackup(t, data, radio) {
   const client = new QueryClient({ defaultOptions: { queries: { enabled: false, retry: false, gcTime: Infinity } } })
   client.setQueryData(['ingest-status'], data)
+  if (radio) client.setQueryData(['ingest-radio-status'], radio)
   let root
   await act(async () => { root = create(React.createElement(QueryClientProvider, { client }, React.createElement(MemoryRouter, null, React.createElement(Backup)))) })
   t.after(async () => { await act(async () => root.unmount()); client.clear() })
@@ -148,4 +149,35 @@ test('dashboard hold reasons outrank optimistic predictions and stale data never
   await act(async () => root.update(render({ requestFailed: true })))
   assert.match(JSON.stringify(root.toJSON()), /Sleep time unknown/)
   assert.doesNotMatch(JSON.stringify(root.toJSON()), /Estimated sleep:/)
+})
+
+test('skipped quieting explains unchanged radios while backup stays Copying', async t => {
+  const reason = 'The remaining sleep window is not known.'
+  const root = await mountBackup(t, status({ state: 'running', phase: 'transferring', radioQuietingHold: true, radioQuietingHoldReason: reason }), { quietingEnabled: true, transition: null })
+  assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Copying')
+  const text = JSON.stringify(root.toJSON())
+  assert.match(text, /Radios left unchanged/)
+  assert.match(text, /The remaining sleep window is not known/)
+  assert.match(text, /Backup can continue without switching Bluetooth or the hotspot off/)
+  assert.doesNotMatch(text, /Radio quieting is ready|Waiting for backup/)
+})
+
+test('recovery and active transitions outrank skipped-quieting notices; finished and offline runs hide them', async t => {
+  const radio = { baseline: 'on', disableAttempted: true, disableVerified: true, restoreAttempted: false, restoreVerified: false }
+  const transition = {
+    phase: 'ingesting', active: true, recoveryRequired: false, bluetooth: radio, hotspot: radio,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), restoreEvidenceSource: null,
+    unitReportedAt: null, unitSleepReportedAt: null,
+  }
+  for (const [overrides, evidence, expected] of [
+    [{}, { ...transition, active: false, recoveryRequired: true }, /may still be off/],
+    [{}, transition, /Backup radio window active/],
+    [{ state: 'ok' }, null, /Radio quieting is ready/],
+    [{ unitOnline: false }, null, /Radio quieting is ready/],
+  ]) {
+    const root = await mountBackup(t, status({ state: 'running', radioQuietingHold: true, radioQuietingHoldReason: 'Sleep deadline unknown.', ...overrides }), { quietingEnabled: true, transition: evidence })
+    const text = JSON.stringify(root.toJSON())
+    assert.doesNotMatch(text, /Radios left unchanged|Sleep deadline unknown/)
+    assert.match(text, expected)
+  }
 })

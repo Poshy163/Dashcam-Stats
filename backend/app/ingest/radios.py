@@ -97,6 +97,18 @@ log = get_logger(__name__)
 #: nobody.
 QUIET_AFTER_ONLINE_S = 10.0
 
+
+def new_quieting_allowed() -> bool:
+    """Gate new radio disruption, never restoration of an existing baseline."""
+    from app.ingest.status import get_status
+
+    status = get_status()
+    allowed = status.radio_quieting_allowed()
+    if not allowed:
+        log.info("leaving radios unchanged", reason=status.radio_quieting_hold_reason)
+    return allowed
+
+
 #: The flag the on-unit watchdog gates on, removed by whichever restore happens first.
 #:
 #: ``/data/local/tmp`` because it is the one place the ``shell`` user can write on an
@@ -484,7 +496,12 @@ async def _confirm_bluetooth_on(address: str) -> bool:
         await asyncio.sleep(CONFIRM_INTERVAL_S)
 
 
-async def _set_bluetooth(address: str, *, enable: bool) -> bool:
+async def _set_bluetooth(
+    address: str,
+    *,
+    enable: bool,
+    before_attempt: Callable[[], bool] | None = None,
+) -> bool:
     """Issue the toggle, newest interface first. True once something accepted it.
 
     ``cmd bluetooth_manager`` is the Android 12+ door; ``svc bluetooth`` the one older
@@ -494,6 +511,8 @@ async def _set_bluetooth(address: str, *, enable: bool) -> bool:
     """
     verb = "enable" if enable else "disable"
     for command in (f"cmd bluetooth_manager {verb}", f"svc bluetooth {verb}"):
+        if before_attempt is not None and not before_attempt():
+            return False
         try:
             reply = await adb.shell(address, command, timeout=RADIO_TIMEOUT_S)
         except adb.AdbError:
@@ -656,7 +675,9 @@ async def _stop_took_effect(address: str) -> bool:
         await asyncio.sleep(STOP_SETTLE_POLL_S)
 
 
-async def _stop_hotspot(address: str) -> tuple[bool, str]:
+async def _stop_hotspot(
+    address: str, *, before_attempt: Callable[[], bool] | None = None
+) -> tuple[bool, str]:
     """Stop a serving soft AP. Returns (stopped, what the unit said when it would not).
 
     Success is not a zero exit status; it is :func:`_serving_ap` no longer finding the
@@ -670,6 +691,8 @@ async def _stop_hotspot(address: str) -> tuple[bool, str]:
     # The tethering binder first: the one lever an unrooted shell has. Fired for effect,
     # never for its reply — the null result listener makes the callback NPE after the
     # teardown, so only _stop_took_effect can tell whether it actually worked.
+    if before_attempt is not None and not before_attempt():
+        return False, "new radio quieting is unsafe near an unknown or imminent sleep deadline"
     with contextlib.suppress(adb.AdbError):
         await adb.shell(address, _STOP_VIA_TETHERING, timeout=RADIO_TIMEOUT_S)
     if await _stop_took_effect(address):
@@ -678,6 +701,8 @@ async def _stop_hotspot(address: str) -> tuple[bool, str]:
 
     # Then the wifi command, for a rooted/debuggable unit where stopSoftAp is reachable.
     for command in _STOP_COMMANDS:
+        if before_attempt is not None and not before_attempt():
+            return False, "new radio quieting is unsafe near an unknown or imminent sleep deadline"
         try:
             reply = await adb.shell(address, command, timeout=RADIO_TIMEOUT_S)
         except adb.AdbError as exc:
@@ -1888,6 +1913,8 @@ class RadioController:
     ) -> bool:
         """Disable and positively verify Bluetooth, with all legacy recovery guards."""
         async with _lock:
+            if not new_quieting_allowed():
+                return False
             # The remote process must acknowledge that it is alive before Bluetooth is
             # touched. Merely creating a local ``adb`` child is not proof that its shell
             # reached the unit; an immediate transport failure would otherwise leave no
@@ -1900,7 +1927,11 @@ class RadioController:
             # no unbounded work between that proof and the first radio side effect.
             if before_change is not None:
                 await before_change()
-            accepted = await _set_bluetooth(self.address, enable=False)
+            if not new_quieting_allowed():
+                return False
+            accepted = await _set_bluetooth(
+                self.address, enable=False, before_attempt=new_quieting_allowed
+            )
             verified = accepted and await _confirm_bluetooth_off(self.address)
             if verified:
                 log.info("turned the unit's Bluetooth off for the transfer")
@@ -1915,6 +1946,8 @@ class RadioController:
     ) -> bool:
         """Stop a separate serving AP and verify its interface disappeared."""
         async with _lock:
+            if not new_quieting_allowed():
+                return False
             if self._hotspot_capsule_path is None:
                 log.warning("hotspot recovery capsule is unavailable; leaving the hotspot on")
                 return False
@@ -1922,7 +1955,9 @@ class RadioController:
                 return False
             if before_change is not None:
                 await before_change()
-            stopped, why = await _stop_hotspot(self.address)
+            if not new_quieting_allowed():
+                return False
+            stopped, why = await _stop_hotspot(self.address, before_attempt=new_quieting_allowed)
             if stopped:
                 await _persist_refusal("")
                 log.info("stopped the unit's hotspot for the transfer")
@@ -2219,8 +2254,18 @@ class RadioQuiet:
         # `cmd bluetooth_manager enable` is observed to drive the hotspot up). Stopping
         # the AP while Bluetooth is still on therefore never sticks; taking Bluetooth down
         # first removes the thing that turns it back on. Confirmed on the live unit.
+        if not new_quieting_allowed():
+            return
         await self._quiet_bluetooth()
         await self._quiet_hotspot()
+        if not new_quieting_allowed():
+            # A legacy caller can cross the boundary between its two radio operations.
+            # Restore any partial quieting now, rather than waiting for its copy to end.
+            if self.bluetooth_off:
+                await self._restore_bluetooth()
+            if self.hotspot_restore:
+                await self._restore_hotspot()
+            await self._stop_watchdog_renewal()
 
     async def _quiet_bluetooth(self) -> None:
         state = await _bluetooth_is_on(self.address)
@@ -2229,23 +2274,33 @@ class RadioQuiet:
             return
         if not state:
             return
+        if not new_quieting_allowed():
+            return
         self.bluetooth_off = True
         # Marker and flag first, act second: a crash between the disable and the
         # bookkeeping must read as "still off", never the reverse.
         await _persist_marker("bluetooth")
         with contextlib.suppress(adb.AdbError):
             await adb.shell(self.address, f"touch '{FLAG_PATH}'", timeout=RADIO_TIMEOUT_S)
-        if await _set_bluetooth(self.address, enable=False):
+        if not new_quieting_allowed():
+            return
+        if await _set_bluetooth(self.address, enable=False, before_attempt=new_quieting_allowed):
             log.info("turned the unit's Bluetooth off for the transfer")
             self._watchdog = await _arm_watchdog(self.address, self.watchdog_deadline_s)
             self._start_watchdog_renewal()
         else:
+            if not new_quieting_allowed():
+                # The first attempt may have reached Android before its reply was lost.
+                # Keep restoration armed when a retry was refused by the time guard.
+                return
             # Nothing accepted the toggle, so nothing needs restoring.
             self.bluetooth_off = False
             await _persist_marker("")
             log.warning("the unit did not accept a Bluetooth disable; leaving it on")
 
     async def _quiet_hotspot(self) -> None:
+        if not new_quieting_allowed():
+            return
         iface = await _serving_ap(self.address)
         if iface is None:
             log.warning("could not read the unit's hotspot state; leaving it alone")
@@ -2266,8 +2321,15 @@ class RadioQuiet:
         except adb.AdbError as exc:
             log.debug("could not read the hotspot configuration", error=str(exc))
 
-        stopped, why = await _stop_hotspot(self.address)
+        if not new_quieting_allowed():
+            return
+        stopped, why = await _stop_hotspot(self.address, before_attempt=new_quieting_allowed)
         if not stopped:
+            if not new_quieting_allowed():
+                # A timed-out stop may still have taken effect; preserve the original
+                # ON baseline for immediate partial-quiet recovery in _quiet().
+                self.hotspot_restore = config
+                return
             log.warning(
                 "the head unit will not stop its hotspot, so it is still sharing the "
                 "radio with the transfer. Android only lets uid 0 stop a soft AP and "

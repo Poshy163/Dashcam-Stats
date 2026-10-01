@@ -15,7 +15,7 @@ from collections import deque
 from datetime import UTC, datetime
 
 from app.core.logging import get_logger
-from app.ingest.adb import RuntimeObservation
+from app.ingest.adb import RUNTIME_OBSERVATION_TIMEOUT_S, RuntimeObservation
 from app.ingest.models import DeltaPlan, Phase, RunResult, RunState
 
 log = get_logger(__name__)
@@ -36,6 +36,11 @@ _SAMPLE_INTERVAL_S = 0.25
 # The poller samples every 15 seconds. Snapshots expire independently of that loop,
 # including when a control request or the poller itself becomes stuck.
 UNIT_OBSERVATION_TTL_S = 30.0
+
+RADIO_QUIET_MIN_REMAINING_S = 60.0
+# ACC could have fallen immediately after the preceding on observation. Include a
+# bounded control-read interval as well as the largest accepted observation gap.
+RADIO_QUIET_OBSERVATION_MARGIN_S = UNIT_OBSERVATION_TTL_S + RUNTIME_OBSERVATION_TIMEOUT_S
 
 
 class IngestStatus:
@@ -89,16 +94,20 @@ class IngestStatus:
         self._unit_observed_monotonic: float | None = None
         self._unit_observation_failed = False
         self._observed_ignition_state = "unknown"
+        self._observed_window_s: int | None = None
         self._observed_uptime_s: float | None = None
         self._observed_off_monotonic: float | None = None
         self._observed_off_wall: datetime | None = None
         self._observed_off_window_s: int | None = None
+        self._observed_off_quiet_window_s: int | None = None
         self.arrival_hold: bool = False
         self.arrival_hold_reason: str | None = None
         #: Held because the ignition is on: the car is in use, and a backup would turn its
         #: Bluetooth off and drop the hotspot that wireless CarPlay runs over.
         self.ignition_hold: bool = False
         self.ignition_hold_reason: str | None = None
+        self.radio_quieting_hold = False
+        self.radio_quieting_hold_reason: str | None = None
         #: Current sleep window in seconds (e.g. 1200 for active Wi-Fi backup, 300 for idle).
         self.sleep_window_s: int = 1200
         #: Ignition state: "on", "off", or "unknown".
@@ -170,6 +179,8 @@ class IngestStatus:
             self.wifi_band_hold_reason = None
             self.ignition_hold = False
             self.ignition_hold_reason = None
+            self.radio_quieting_hold = False
+            self.radio_quieting_hold_reason = None
             self._samples.clear()
             self._started_at = time.monotonic()
             self._started_wall = datetime.now(UTC)
@@ -292,6 +303,7 @@ class IngestStatus:
             self._observed_off_monotonic = None
             self._observed_off_wall = None
             self._observed_off_window_s = None
+            self._observed_off_quiet_window_s = None
 
     def observe_unit_runtime(self, observation: RuntimeObservation) -> bool:
         """Publish current power state; return whether a different boot was observed.
@@ -312,10 +324,12 @@ class IngestStatus:
             same_boot = self._unit_boot_id == observation.boot_id
             previous_fresh = self._unit_observation_fresh()
             previous_state = self._observed_ignition_state
+            previous_window = self._observed_window_s
             if not same_boot or not previous_fresh:
                 self._observed_off_monotonic = None
                 self._observed_off_wall = None
                 self._observed_off_window_s = None
+                self._observed_off_quiet_window_s = None
             if not same_boot:
                 self.ignition_off_monotonic = None
                 self.ignition_off_wall = None
@@ -340,6 +354,7 @@ class IngestStatus:
             self._unit_observation_failed = False
             self._observed_uptime_s = self.unit_uptime_s = observation.uptime_s
             self._observed_ignition_state = self.ignition_state = observation.ignition_state
+            self._observed_window_s = observation.sleep_window_s
             if observation.sleep_window_s is not None:
                 self.sleep_window_s = observation.sleep_window_s
             if observation.ignition_state == "off":
@@ -349,12 +364,20 @@ class IngestStatus:
                     self._observed_off_monotonic = now
                     self._observed_off_wall = self._unit_observed_at
                     self._observed_off_window_s = observation.sleep_window_s
+                    # A property update between samples could land on either side of
+                    # the native latch. Quieting uses the smaller known duration.
+                    self._observed_off_quiet_window_s = (
+                        min(previous_window, observation.sleep_window_s)
+                        if previous_window is not None and observation.sleep_window_s is not None
+                        else None
+                    )
                     self.ignition_off_monotonic = now
                     self.ignition_off_wall = self._unit_observed_at
             else:
                 self._observed_off_monotonic = None
                 self._observed_off_wall = None
                 self._observed_off_window_s = None
+                self._observed_off_quiet_window_s = None
                 self.ignition_off_monotonic = None
                 self.ignition_off_wall = None
                 self.sleep_window_started_monotonic = None
@@ -373,6 +396,33 @@ class IngestStatus:
             0.0, self._observed_off_window_s - (time.monotonic() - self._observed_off_monotonic)
         )
         return remaining, "estimated", "Estimated from an observed ignition-off transition"
+
+    def radio_quieting_allowed(self) -> bool:
+        """Require a fresh, conservatively long-enough estimate before NEW quieting.
+
+        An unreadable deadline, a server restart while already parked, or a property
+        rewrite must not manufacture a full sleep window. Restoration never calls this.
+        """
+        with self._lock:
+            remaining, source, _reason = self._observed_countdown()
+            if remaining is not None and self._observed_off_quiet_window_s is not None:
+                remaining -= (self._observed_off_window_s or 0) - self._observed_off_quiet_window_s
+            if (
+                source != "estimated"
+                or remaining is None
+                or self._observed_off_quiet_window_s is None
+            ):
+                reason = "Radios left unchanged: the remaining head-unit sleep time is unknown."
+            elif remaining - RADIO_QUIET_OBSERVATION_MARGIN_S <= RADIO_QUIET_MIN_REMAINING_S:
+                reason = (
+                    "Radios left unchanged: at most one minute remains before sleep after allowing "
+                    "for observation uncertainty."
+                )
+            else:
+                reason = None
+            self.radio_quieting_hold = reason is not None
+            self.radio_quieting_hold_reason = reason
+            return reason is None
 
     def set_wifi(self, frequency_mhz: int | None, *, held: bool, reason: str | None) -> None:
         with self._lock:
@@ -683,6 +733,12 @@ class IngestStatus:
                 "arrival_hold_reason": self.arrival_hold_reason,
                 "ignition_hold": self.ignition_hold,
                 "ignition_hold_reason": self.ignition_hold_reason,
+                "radio_quieting_hold": (
+                    self.radio_quieting_hold and self._running and self.unit_online
+                ),
+                "radio_quieting_hold_reason": (
+                    self.radio_quieting_hold_reason if self._running and self.unit_online else None
+                ),
                 "sleep_window_seconds": self.sleep_window_s,
                 "sleep_countdown_remaining_s": (
                     round(countdown, 1) if countdown is not None else None

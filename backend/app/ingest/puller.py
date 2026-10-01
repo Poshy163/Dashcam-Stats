@@ -1687,6 +1687,10 @@ async def _run_pull_started(
             return result
 
         quiet_requested = bool(_get("quiet_radios", False)) and bool(plan.files)
+        if quiet_requested and not radios.new_quieting_allowed():
+            # Footage can still be copied with the radios unchanged. Do not pause the
+            # logger or claim a new radio transition when sleep may be imminent.
+            quiet_requested = False
         logger_owns_bluetooth = _obd_logger_owns_bluetooth(observed_logger)
         logger_can_quiesce = obd_control.supports_quiesce(observed_logger)
         logger_status_authoritative = _obd_logger_status_is_authoritative(observed_logger)

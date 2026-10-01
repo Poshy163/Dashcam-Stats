@@ -401,12 +401,21 @@ async def test_bluetooth_rearm_capsule_is_credential_free_and_versioned():
 
 
 @pytest.fixture(autouse=True)
-def clean_module_state():
+def clean_module_state(monkeypatch):
     """The claim counter and the restore tasks are module globals; no test may inherit
     another's. A leaked claim would silently disable the arrival restore for the rest of
     the session, which is exactly the failure these tests exist to catch."""
     radios._active = 0
     radios._tasks.clear()
+    # Existing radio/watchdog tests start inside a known-safe parked window. The
+    # separate quieting-deadline suite exercises unknown, stale and short windows.
+    from app.ingest import status as status_module
+
+    status = status_module.IngestStatus()
+    boot_id = "01234567-1234-1234-1234-012345678901"
+    status.observe_unit_runtime(adb.RuntimeObservation(boot_id, 100.0, "on", 1200))
+    status.observe_unit_runtime(adb.RuntimeObservation(boot_id, 101.0, "off", 1200))
+    monkeypatch.setattr(status_module, "get_status", lambda: status)
     yield
     radios._active = 0
     radios._tasks.clear()
