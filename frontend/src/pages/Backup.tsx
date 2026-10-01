@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 
@@ -14,11 +13,13 @@ import type {
   OBDBundle,
 } from '@/lib/api'
 import { formatBytes, formatDateTime, formatDuration, formatRelative } from '@/lib/format'
+import { backupHold, backupIdleLabel } from '@/lib/backupPresentation'
+import { useSleepCountdown } from '@/lib/useSleepCountdown'
 
 /** How the state reads to a person, and how alarming it should look. */
 const STATES: Record<IngestStatus['state'], { label: string; tone: 'default' | 'ok' | 'warn' | 'error' | 'busy' }> = {
   disabled: { label: 'Off', tone: 'default' },
-  idle: { label: 'Up to date', tone: 'ok' },
+  idle: { label: 'Waiting for backup', tone: 'default' },
   running: { label: 'Copying', tone: 'busy' },
   ok: { label: 'Up to date', tone: 'ok' },
   partial: { label: 'Partly copied', tone: 'warn' },
@@ -321,34 +322,13 @@ export default function Backup() {
   const rebuildObdStorage = useMutation({ mutationFn: api.obd.rebuildStorage, onSuccess: invalidate })
 
   const data = status.data
-  const [countdownOffset, setCountdownOffset] = useState<number>(0)
-
-  useEffect(() => {
-    setCountdownOffset(0)
-  }, [data?.sleepCountdownRemainingS, data?.ignitionState])
-
-  useEffect(() => {
-    if (
-      !data?.unitOnline ||
-      data?.ignitionState === 'on' ||
-      data?.sleepCountdownRemainingS === null ||
-      data?.sleepCountdownRemainingS === undefined
-    ) {
-      return
-    }
-    const timer = setInterval(() => {
-      setCountdownOffset((prev) => prev + 1)
-    }, 1000)
-    return () => clearInterval(timer)
-  }, [data?.unitOnline, data?.ignitionState, data?.sleepCountdownRemainingS])
+  const countdown = useSleepCountdown(data, status.dataUpdatedAt, status.isError)
 
   if (status.isError) return <ErrorState error={status.error} retry={() => status.refetch()} />
 
-  const liveCountdown =
-    data?.sleepCountdownRemainingS !== null && data?.sleepCountdownRemainingS !== undefined
-      ? Math.max(0, data.sleepCountdownRemainingS - countdownOffset)
-      : null
-  const prediction = data?.sleepWindowPrediction
+  const liveCountdown = countdown.remainingS
+  const hold = backupHold(data)
+  const prediction = liveCountdown !== null && !hold ? data?.sleepWindowPrediction : null
   const eventSequenceGap = obdStatus.data?.eventStream?.sequenceGap ?? 0
   const running = data?.state === 'running'
   const transition = radioStatus.data?.transition
@@ -360,9 +340,13 @@ export default function Backup() {
       ? ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
         ? { label: 'Restoring radios', tone: 'busy' as const }
         : { label: 'Preparing backup', tone: 'busy' as const }
-      : data
-        ? STATES[data.state] ?? STATES.idle
-        : { label: 'Checking', tone: 'busy' as const }
+      : hold
+        ? { label: hold.label, tone: 'warn' as const }
+        : data
+          ? ['idle', 'ok'].includes(data.state)
+            ? { label: backupIdleLabel(data), tone: data.backlogKnown && data.backlogFiles === 0 ? 'ok' as const : 'default' as const }
+            : STATES[data.state] ?? STATES.idle
+          : { label: 'Checking', tone: 'busy' as const }
   const statusHint = running && data
     ? PHASES[data.phase]
     : recoveryBlocked
@@ -371,7 +355,7 @@ export default function Backup() {
         ? ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
           ? 'Verifying the original radio state'
           : 'Making the radio transition safe'
-        : undefined
+        : hold?.reason
   const backlogKnown = data?.backlogKnown === true
   const backlogHint = backlogKnown && data
     ? `${data.backlogFiles} file${data.backlogFiles === 1 ? '' : 's'}`
@@ -492,17 +476,17 @@ export default function Backup() {
 
       {data?.arrivalHold && data.state !== 'disabled' && (
         <div className="card mb-6 border-state-warn/40 px-5 py-4 text-sm">
-          <div className="font-medium text-state-warn">Waiting until you&rsquo;re home</div>
+          <div className="font-medium text-state-warn">Waiting after startup</div>
           <div className="mt-1 text-content-muted">
             {data.arrivalHoldReason ??
-              'The dashcam has only just powered on, which usually means the car is setting off. The backup waits until it has been running a while — so footage is pulled when you arrive rather than as you leave — and re-checks every few seconds while the car is here.'}
+              'Automatic backup waits until the dashcam has been running long enough, then re-checks while it is connected. Pull now can request a backup sooner; the ignition must still be off.'}
           </div>
         </div>
       )}
 
       {data?.ignitionHold && data.state !== 'disabled' && (
         <div className="card mb-6 border-state-warn/40 px-5 py-4 text-sm">
-          <div className="font-medium text-state-warn">Waiting for the ignition to go off</div>
+          <div className="font-medium text-state-warn">{data.ignitionState === 'on' ? 'Waiting for the ignition to go off' : 'Waiting for ignition status'}</div>
           <div className="mt-1 text-content-muted">
             {data.ignitionHoldReason ??
               'A backup turns the dashcam’s Bluetooth off and drops its hotspot, and wireless CarPlay runs over both. So while the car is switched on nothing is touched; the copy runs in the window after the ignition goes off, and is re-checked every half minute while the car is here.'}
@@ -638,34 +622,21 @@ export default function Backup() {
           }
         />
         <StatTile
-          label="Sleep countdown"
+          label="Estimated sleep"
           value={
             !data?.unitOnline
               ? '—'
-              : data.ignitionState === 'on'
-                ? 'Engine on'
-                : liveCountdown !== null && liveCountdown !== undefined
+              : countdown.state === 'not_running'
+                ? 'Ignition on'
+                : liveCountdown !== null
                   ? formatDuration(liveCountdown)
-                  : data.sleepCountdownRemainingS !== null && data.sleepCountdownRemainingS !== undefined
-                    ? formatDuration(data.sleepCountdownRemainingS)
-                    : data.sleepWindowSeconds
-                      ? formatDuration(data.sleepWindowSeconds)
-                      : '—'
+                  : 'Unknown'
           }
-          hint={
-            !data?.unitOnline
-              ? 'Car is not here'
-              : data.ignitionState === 'on'
-                ? `${formatDuration(data.sleepWindowSeconds ?? 1200)} window ready`
-                : prediction?.summary ??
-                  (liveCountdown !== null && liveCountdown !== undefined && liveCountdown > 0
-                    ? 'Counting down to sleep'
-                    : 'Awake window ended')
-          }
+          hint={countdown.hint}
           tone={
             !data?.unitOnline
               ? 'default'
-              : data.ignitionState === 'on'
+              : countdown.state !== 'estimated'
                 ? 'default'
                 : prediction
                   ? prediction.willPass

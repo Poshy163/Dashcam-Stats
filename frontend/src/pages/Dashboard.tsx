@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 
@@ -8,6 +7,8 @@ import { api } from '@/lib/api'
 import type { IngestStatus } from '@/lib/api'
 import { hardwareSummary } from '@/lib/hardware'
 import { backupAttention } from '@/lib/operationalStatus'
+import { backupHold } from '@/lib/backupPresentation'
+import { useSleepCountdown } from '@/lib/useSleepCountdown'
 import {
   formatBytes,
   formatDateTime,
@@ -86,7 +87,7 @@ export default function Dashboard() {
       />
 
       {ingest.data && (ingest.data.unitOnline || ingest.data.state === 'running') && (
-        <DashcamStatusBanner status={ingest.data} />
+        <DashcamStatusBanner status={ingest.data} receivedAt={ingest.dataUpdatedAt} requestFailed={ingest.isError} />
       )}
 
       <SystemStatus
@@ -394,33 +395,15 @@ function CarIcon({ className = iconClass }: IconProps) {
   )
 }
 
-function DashcamStatusBanner({ status }: { status: IngestStatus }) {
-  const [countdownOffset, setCountdownOffset] = useState<number>(0)
-
-  useEffect(() => {
-    setCountdownOffset(0)
-  }, [status.sleepCountdownRemainingS, status.ignitionState])
-
-  useEffect(() => {
-    if (
-      !status.unitOnline ||
-      status.ignitionState === 'on' ||
-      status.sleepCountdownRemainingS === null ||
-      status.sleepCountdownRemainingS === undefined
-    ) {
-      return
-    }
-    const timer = setInterval(() => {
-      setCountdownOffset((prev) => prev + 1)
-    }, 1000)
-    return () => clearInterval(timer)
-  }, [status.unitOnline, status.ignitionState, status.sleepCountdownRemainingS])
-
-  const liveCountdown =
-    status.sleepCountdownRemainingS !== null && status.sleepCountdownRemainingS !== undefined
-      ? Math.max(0, status.sleepCountdownRemainingS - countdownOffset)
-      : null
-  const prediction = status.sleepWindowPrediction
+export function DashcamStatusBanner({ status, receivedAt, requestFailed = false }: {
+  status: IngestStatus
+  receivedAt: number
+  requestFailed?: boolean
+}) {
+  const countdown = useSleepCountdown(status, receivedAt, requestFailed)
+  const liveCountdown = countdown.remainingS
+  const hold = backupHold(status)
+  const prediction = liveCountdown !== null && !hold ? status.sleepWindowPrediction : null
   const running = status.state === 'running'
 
   return (
@@ -432,7 +415,7 @@ function DashcamStatusBanner({ status }: { status: IngestStatus }) {
         <div>
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-sm font-bold tracking-tight text-content">
-              {running ? 'Dashcam backup in progress' : 'Dashcam connected'}
+              {!status.unitOnline ? 'Dashcam not connected' : running ? 'Dashcam backup in progress' : hold?.label ?? 'Dashcam connected'}
             </h3>
             {status.wifiFrequencyMhz && (
               <span
@@ -445,7 +428,7 @@ function DashcamStatusBanner({ status }: { status: IngestStatus }) {
                 {status.wifiFrequencyMhz >= 4900 ? '5 GHz' : '2.4 GHz'} ({status.wifiFrequencyMhz} MHz)
               </span>
             )}
-            {liveCountdown !== null && liveCountdown !== undefined && (
+            {liveCountdown !== null ? (
               <span
                 className={`badge ${
                   prediction?.willPass
@@ -455,18 +438,22 @@ function DashcamStatusBanner({ status }: { status: IngestStatus }) {
                       : 'bg-surface-sunken text-content-muted'
                 }`}
               >
-                ⏱️ Sleep countdown: {formatDuration(liveCountdown)}
+                ⏱️ Estimated sleep: {formatDuration(liveCountdown)}
+              </span>
+            ) : (
+              <span className="badge bg-surface-sunken text-content-muted">
+                {countdown.state === 'not_running' ? 'Ignition on' : 'Sleep time unknown'}
               </span>
             )}
           </div>
           <p className="mt-1 text-xs text-content-muted">
-            {prediction
-              ? prediction.summary
-              : status.ignitionState === 'on'
-                ? `Ignition is ON • ${formatDuration(status.sleepWindowSeconds ?? 1200)} countdown will start when parked`
+            {hold?.reason ?? (countdown.state !== 'estimated'
+              ? countdown.hint
+              : prediction
+                ? prediction.summary
                 : running
                   ? `${status.filesDone} of ${status.filesTotal} files • ${formatBytes(status.bytesDone)} of ${formatBytes(status.bytesTotal)}`
-                  : 'Ready on your local network'}
+                  : countdown.hint)}
           </p>
         </div>
       </div>

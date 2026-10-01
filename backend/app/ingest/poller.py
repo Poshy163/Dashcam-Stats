@@ -83,6 +83,9 @@ RADIO_RECOVERY_RETRY_S = 30.0
 #: radio capture and restore either side of it.
 REDRAIN_MIN_COUNTDOWN_S = 90.0
 
+# A small, read-only shell snapshot must continue even while copying or visit-capped.
+RUNTIME_OBSERVATION_INTERVAL_S = 15.0
+
 
 class IngestPoller:
     def __init__(self) -> None:
@@ -100,6 +103,8 @@ class IngestPoller:
         #: holding. See the note in :meth:`_loop`; cleared the moment the port goes quiet.
         self._visit_info: UnitInfo | None = None
         self._radio_recovery_retry_at = 0.0
+        self._runtime_observation_due = 0.0
+        self._runtime_observation_address: str | None = None
 
     async def start(self) -> None:
         if self._running:
@@ -332,6 +337,35 @@ class IngestPoller:
             )
         return False
 
+    async def _observe_unit_runtime(self, address: str) -> None:
+        """Refresh power truth without reconnecting or interrupting an active transport."""
+        now = time.monotonic()
+        if self._runtime_observation_address == address and now < self._runtime_observation_due:
+            return
+        self._runtime_observation_address = address
+        self._runtime_observation_due = now + RUNTIME_OBSERVATION_INTERVAL_S
+        status = get_status()
+        try:
+            observation = await adb.runtime_observation(address)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            observation = None
+        finally:
+            # Space attempts from completion, including failed/time-limited ADB calls.
+            self._runtime_observation_due = time.monotonic() + RUNTIME_OBSERVATION_INTERVAL_S
+        if observation is None:
+            status.unit_observation_failed()
+            return
+        if status.observe_unit_runtime(observation):
+            self._was_online = False
+            self._idle_since = 0.0
+            self._error_retries_started = 0
+            self._backups_this_visit = 0
+            self._visit_info = None
+            self._radio_recovery_retry_at = 0.0
+            log.info("head-unit reboot observed; clearing the previous visit's power estimates")
+
     async def _loop(self) -> None:
         status = get_status()
         while self._running:
@@ -341,6 +375,7 @@ class IngestPoller:
                 # rewrote the live state to "disabled" -- which hid the Cancel button on
                 # the very transfer someone had just decided to stop.
                 if status.running:
+                    await self._observe_unit_runtime(self._address())
                     # Read-only and independently throttled, with an ignition-off gate.
                     # A long footage copy must not hide the drive's retained timing log.
                     carplay_timing.recover_on_unit_present(self._address())
@@ -375,8 +410,13 @@ class IngestPoller:
                     self._backups_this_visit = 0
                     self._visit_info = None
                     self._radio_recovery_retry_at = 0.0
+                    self._runtime_observation_due = 0.0
                     await asyncio.sleep(self._interval())
                     continue
+
+                # Check before capped/retry/recovery branches: same-IP reboot need not
+                # include an observed offline tick, and invalidates their visit context.
+                await self._observe_unit_runtime(self._address())
 
                 # A PARTIAL/ERROR/CANCELLED run may have restored Bluetooth while its
                 # hotspot restore failed. Do not strand that debt behind re-drain limits

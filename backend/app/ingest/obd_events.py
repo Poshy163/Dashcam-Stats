@@ -605,8 +605,9 @@ async def sync_remote_events(
     started = time.monotonic()
     result = EventSyncResult()
     try:
-        # This is deliberately one deadline around the *whole* mirror. Per-command
-        # ADB timeouts do not cover a wedged validator, database write or prune.
+        # One cancellation budget covers the whole mirror. Database cancellation
+        # cleanup can outlast it; the puller bounds its wait separately and keeps
+        # one retained mirror task until cleanup finishes, without blocking footage.
         async with asyncio.timeout(timeout_seconds):
             raw = await read_remote_event_snapshot(address, path)
             if raw is None:

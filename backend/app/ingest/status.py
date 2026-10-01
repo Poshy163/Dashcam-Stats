@@ -15,6 +15,7 @@ from collections import deque
 from datetime import UTC, datetime
 
 from app.core.logging import get_logger
+from app.ingest.adb import RuntimeObservation
 from app.ingest.models import DeltaPlan, Phase, RunResult, RunState
 
 log = get_logger(__name__)
@@ -31,6 +32,10 @@ _SPEED_WINDOW_S = 5.0
 #: Sampling floor. ``add_bytes`` fires for every socket read -- tens of times a second at
 #: full rate -- and a sample per read would be pure churn for a number rendered every 1.5s.
 _SAMPLE_INTERVAL_S = 0.25
+
+# The poller samples every 15 seconds. Snapshots expire independently of that loop,
+# including when a control request or the poller itself becomes stuck.
+UNIT_OBSERVATION_TTL_S = 30.0
 
 
 class IngestStatus:
@@ -79,6 +84,15 @@ class IngestStatus:
         #: report a problem from the moment the car left until the next time somebody drove.
         #: Cleared when the unit leaves, because the reading describes a boot that is over.
         self.unit_uptime_s: float | None = None
+        self._unit_boot_id: str | None = None
+        self._unit_observed_at: datetime | None = None
+        self._unit_observed_monotonic: float | None = None
+        self._unit_observation_failed = False
+        self._observed_ignition_state = "unknown"
+        self._observed_uptime_s: float | None = None
+        self._observed_off_monotonic: float | None = None
+        self._observed_off_wall: datetime | None = None
+        self._observed_off_window_s: int | None = None
         self.arrival_hold: bool = False
         self.arrival_hold_reason: str | None = None
         #: Held because the ignition is on: the car is in use, and a backup would turn its
@@ -92,14 +106,9 @@ class IngestStatus:
         #: When ignition went off (monotonic and wall-clock).
         self.ignition_off_monotonic: float | None = None
         self.ignition_off_wall: datetime | None = None
-        #: When the unit's own countdown last restarted, which is when the vendor property
-        #: was last *written* -- not when the ignition went off.
-        #:
-        #: Kept apart from ``ignition_off_monotonic`` deliberately. That one anchors the
-        #: real ignition-off instant and is what :meth:`ignition_off_elapsed_s` hands the
-        #: detached watchdog so it can aim at the true sleep moment; re-anchoring it here
-        #: would quietly make the watchdog fire late, which is the failure it exists to
-        #: prevent.
+        #: Operational anchor used by the existing radio-recovery watchdog. A property
+        #: write does not prove that the vendor restarted its timer. The public sleep
+        #: estimate therefore has a separate boot-scoped, observed ignition-off anchor.
         self.sleep_window_started_monotonic: float | None = None
         #: The recording watcher's most recent verdict — a human summary, whether it was
         #: clean, and when it was collected. Unlike the holds above this is NOT cleared when
@@ -258,7 +267,112 @@ class IngestStatus:
                 self.ignition_state = "unknown"
                 self.ignition_off_monotonic = None
                 self.ignition_off_wall = None
+                self.sleep_window_started_monotonic = None
+                self.ignition_hold = False
+                self.ignition_hold_reason = None
+                self.backlog_known = False
+                self.unit_observation_failed()
             self.unit_online = online
+
+    def _unit_observation_fresh(self) -> bool:
+        return (
+            self.unit_online
+            and not self._unit_observation_failed
+            and self._unit_observed_monotonic is not None
+            and time.monotonic() - self._unit_observed_monotonic <= UNIT_OBSERVATION_TTL_S
+        )
+
+    def unit_observation_failed(self) -> None:
+        """Keep the last-success time visible, but invalidate its power/deadline claims."""
+        with self._lock:
+            self._unit_observation_failed = True
+            self.unit_uptime_s = None
+            self.ignition_state = "unknown"
+            self._observed_ignition_state = "unknown"
+            self._observed_off_monotonic = None
+            self._observed_off_wall = None
+            self._observed_off_window_s = None
+
+    def observe_unit_runtime(self, observation: RuntimeObservation) -> bool:
+        """Publish current power state; return whether a different boot was observed.
+
+        An already-off first observation cannot locate ignition-off. Only a fresh on→off
+        pair on the same boot anchors the public estimate. Later property writes do not
+        prove a restart of the vendor's latched timer and cannot extend that estimate.
+        """
+        with self._lock:
+            now = time.monotonic()
+            changed_boot = (
+                self._unit_boot_id is not None and self._unit_boot_id != observation.boot_id
+            ) or (
+                self._unit_boot_id is None
+                and self.unit_uptime_s is not None
+                and observation.uptime_s + 5 < self.unit_uptime_s
+            )
+            same_boot = self._unit_boot_id == observation.boot_id
+            previous_fresh = self._unit_observation_fresh()
+            previous_state = self._observed_ignition_state
+            if not same_boot or not previous_fresh:
+                self._observed_off_monotonic = None
+                self._observed_off_wall = None
+                self._observed_off_window_s = None
+            if not same_boot:
+                self.ignition_off_monotonic = None
+                self.ignition_off_wall = None
+                self.sleep_window_started_monotonic = None
+            if changed_boot:
+                self._online_since = now
+                self.backlog_known = False
+                self.arrival_hold = False
+                self.arrival_hold_reason = None
+                self.wifi_frequency_mhz = None
+                self.wifi_band_hold = False
+                self.wifi_band_hold_reason = None
+                self.ignition_hold = False
+                self.ignition_hold_reason = None
+                # Cancellation is cooperative: the pull retains ownership until its
+                # socket/filesystem workers and radio restoration have completed.
+                self.cancel()
+            self.set_unit_online(True)
+            self._unit_boot_id = observation.boot_id
+            self._unit_observed_at = datetime.now(UTC)
+            self._unit_observed_monotonic = now
+            self._unit_observation_failed = False
+            self._observed_uptime_s = self.unit_uptime_s = observation.uptime_s
+            self._observed_ignition_state = self.ignition_state = observation.ignition_state
+            if observation.sleep_window_s is not None:
+                self.sleep_window_s = observation.sleep_window_s
+            if observation.ignition_state == "off":
+                self.ignition_hold = False
+                self.ignition_hold_reason = None
+                if same_boot and previous_fresh and previous_state == "on":
+                    self._observed_off_monotonic = now
+                    self._observed_off_wall = self._unit_observed_at
+                    self._observed_off_window_s = observation.sleep_window_s
+                    self.ignition_off_monotonic = now
+                    self.ignition_off_wall = self._unit_observed_at
+            else:
+                self._observed_off_monotonic = None
+                self._observed_off_wall = None
+                self._observed_off_window_s = None
+                self.ignition_off_monotonic = None
+                self.ignition_off_wall = None
+                self.sleep_window_started_monotonic = None
+            return changed_boot
+
+    def _observed_countdown(self) -> tuple[float | None, str, str | None]:
+        if not self._unit_observation_fresh():
+            return None, "unknown", "Waiting for a fresh head-unit power observation"
+        if self._observed_ignition_state == "on":
+            return None, "not_running", "Ignition is on"
+        if self._observed_ignition_state != "off":
+            return None, "unknown", "Head-unit ignition state is unknown"
+        if self._observed_off_monotonic is None or self._observed_off_window_s is None:
+            return None, "unknown", "Ignition was already off when observed; sleep deadline unknown"
+        remaining = max(
+            0.0, self._observed_off_window_s - (time.monotonic() - self._observed_off_monotonic)
+        )
+        return remaining, "estimated", "Estimated from an observed ignition-off transition"
 
     def set_wifi(self, frequency_mhz: int | None, *, held: bool, reason: str | None) -> None:
         with self._lock:
@@ -313,22 +427,12 @@ class IngestStatus:
                 self.sleep_window_started_monotonic = None
 
     def set_sleep_window(self, seconds: int, *, restarted: bool = False) -> None:
-        """Record the unit's sleep window. ``restarted`` when we just wrote the property.
+        """Record the configured window and existing watchdog's operational write anchor.
 
-        Writing it restarts the unit's own countdown from that moment, so the app has to
-        move its reference point too. Without this the countdown kept measuring from
-        ignition-off while the unit measured from the write, and every backup produced the
-        same symptom: the window is widened to 1200 s for the transfer, restored to 300 s
-        when it finishes, and by then more than 300 s has passed since the ignition went
-        off -- so the dashboard showed ``0s`` and stayed there while the unit still had its
-        full five minutes left.
-
-        A *change* in the value re-anchors too, whoever made it. The on-unit OBD app owns
-        this property as well and writes it without telling us when; all that reaches here
-        is the value it observed. But a window that is not what it was is a window somebody
-        rewrote, and rewriting it is what restarts the countdown -- so the change itself is
-        the evidence. Reading back the same value proves only that nothing happened, and
-        must not move the reference.
+        ``restarted`` means a caller wrote the property; it is not proof that the vendor
+        countdown restarted. Reading a changed value cannot identify when it was written,
+        and reading the same value cannot exclude a rewrite. Public countdowns never use
+        this anchor: they require a fresh, same-boot observed ignition-off transition.
         """
         with self._lock:
             seconds = max(1, int(seconds))
@@ -437,15 +541,7 @@ class IngestStatus:
         return int(max(0.0, time.monotonic() - self.ignition_off_monotonic))
 
     def _countdown_anchor(self) -> float | None:
-        """When the unit's countdown last (re)started, in monotonic seconds.
-
-        Whichever came *last* of the ignition going off and the window being rewritten. A
-        window written while the engine was still running does not start a countdown;
-        ignition-off does. And a write after ignition-off restarts it -- which is the fact
-        the whole model turns on, and the one that was got wrong twice: once for the
-        dashboard, which floored at zero, and once for the on-unit watchdog, which fired
-        early. Both now read this one function.
-        """
+        """Legacy radio-watchdog estimate; not a verified native sleep deadline."""
         anchor = self.sleep_window_started_monotonic
         if anchor is None or (
             self.ignition_off_monotonic is not None and self.ignition_off_monotonic > anchor
@@ -454,15 +550,10 @@ class IngestStatus:
         return anchor
 
     def sleep_countdown_elapsed_s(self) -> int:
-        """Seconds the unit's countdown has already run, or ``0`` if not known.
+        """Elapsed operational watchdog estimate, retained for radio recovery policy.
 
-        This -- not :meth:`ignition_off_elapsed_s` -- is what the detached watchdog must be
-        handed. It aims its pre-sleep restore at ``anchor + window``, and the anchor moves
-        every time the window is written. Handed ignition-off instead, a top-up run twenty
-        minutes into a park was told the countdown was twenty minutes gone, concluded the
-        unit had already slept, and fired on its first poll in the middle of a healthy
-        transfer; the server then found its watchdog missing and aborted the run. Six
-        times in fifteen minutes, on the live unit.
+        This is not a read of the vendor timer. Public reporting uses observed ACC edges
+        instead; changing the watchdog's restoration policy requires separate validation.
         """
         if self.ignition_state != "off":
             return 0
@@ -491,12 +582,14 @@ class IngestStatus:
             return max(0.0, float(self.sleep_window_s) - elapsed)
         return float(self.sleep_window_s)
 
-    def sleep_window_prediction(self) -> dict[str, object] | None:
+    def sleep_window_prediction(self, *, observed_only: bool = False) -> dict[str, object] | None:
         """Predict whether the transfer will complete before sleep, and by how long."""
         if not self.unit_online:
             return None
 
-        remaining = self.sleep_countdown_remaining_s()
+        remaining = (
+            self._observed_countdown()[0] if observed_only else self.sleep_countdown_remaining_s()
+        )
         if remaining is None:
             return None
 
@@ -553,8 +646,9 @@ class IngestStatus:
         refining it, so an existing automation cannot be broken by this file.
         """
         with self._lock:
-            countdown = self.sleep_countdown_remaining_s()
-            prediction = self.sleep_window_prediction()
+            fresh = self._unit_observation_fresh()
+            countdown, countdown_source, countdown_reason = self._observed_countdown()
+            prediction = self.sleep_window_prediction(observed_only=True)
             return {
                 "state": self.state.value,
                 "phase": self.phase.value,
@@ -574,7 +668,17 @@ class IngestStatus:
                 "wifi_frequency_mhz": self.wifi_frequency_mhz,
                 "wifi_band_hold": self.wifi_band_hold,
                 "wifi_band_hold_reason": self.wifi_band_hold_reason,
-                "unit_uptime_s": self.unit_uptime_s,
+                "unit_uptime_s": self._observed_uptime_s if fresh else None,
+                "unit_observed_at": (
+                    self._unit_observed_at.isoformat() if self._unit_observed_at else None
+                ),
+                "unit_observation_fresh": fresh,
+                "unit_observation_age_s": (
+                    round(max(0.0, time.monotonic() - self._unit_observed_monotonic), 1)
+                    if self._unit_observed_monotonic is not None
+                    else None
+                ),
+                "unit_observation_ttl_s": UNIT_OBSERVATION_TTL_S,
                 "arrival_hold": self.arrival_hold,
                 "arrival_hold_reason": self.arrival_hold_reason,
                 "ignition_hold": self.ignition_hold,
@@ -583,9 +687,13 @@ class IngestStatus:
                 "sleep_countdown_remaining_s": (
                     round(countdown, 1) if countdown is not None else None
                 ),
-                "ignition_state": self.ignition_state,
+                "sleep_countdown_source": countdown_source,
+                "sleep_countdown_reason": countdown_reason,
+                "ignition_state": self._observed_ignition_state if fresh else "unknown",
                 "ignition_off_at": (
-                    self.ignition_off_wall.isoformat() if self.ignition_off_wall else None
+                    self._observed_off_wall.isoformat()
+                    if fresh and self._observed_off_wall
+                    else None
                 ),
                 "sleep_window_prediction": prediction,
                 "recorder_health": self.recorder_health,

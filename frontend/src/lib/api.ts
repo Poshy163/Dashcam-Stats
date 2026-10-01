@@ -212,6 +212,13 @@ export interface IngestStatus {
   ignitionHoldReason: string | null
   sleepWindowSeconds: number | null
   sleepCountdownRemainingS: number | null
+  /** A recent server response may still contain an old head-unit observation. */
+  unitObservedAt?: string | null
+  unitObservationFresh?: boolean
+  unitObservationAgeS?: number | null
+  unitObservationTtlS?: number
+  sleepCountdownSource?: 'estimated' | 'unknown' | 'not_running'
+  sleepCountdownReason?: string | null
   ignitionState: 'on' | 'off' | 'unknown'
   ignitionOffAt: string | null
   sleepWindowPrediction: {

@@ -3163,9 +3163,12 @@ class TestSleepCountdownAndPrediction:
 
             snapshot = status.snapshot()
             assert snapshot["sleep_window_seconds"] == 1200
-            assert snapshot["sleep_countdown_remaining_s"] is not None
-            assert snapshot["ignition_state"] == "off"
-            assert snapshot["sleep_window_prediction"] == pred
+            # An internal watchdog estimate is not evidence of a current vendor timer.
+            # Public prediction requires a fresh same-boot ACC edge (covered separately).
+            assert snapshot["sleep_countdown_remaining_s"] is None
+            assert snapshot["ignition_state"] == "unknown"
+            assert snapshot["sleep_countdown_source"] == "unknown"
+            assert snapshot["sleep_window_prediction"] is None
         finally:
             reset_status_for_tests()
 

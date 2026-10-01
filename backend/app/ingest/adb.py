@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import re
 import shutil
 import time
@@ -373,6 +374,63 @@ async def uptime(address: str) -> float | None:
         except ValueError:
             continue
     return None
+
+
+@dataclass(frozen=True)
+class RuntimeObservation:
+    """One read-only power snapshot, bounded by the same kernel boot identity."""
+
+    boot_id: str
+    uptime_s: float
+    ignition_state: str
+    sleep_window_s: int | None
+
+
+RUNTIME_OBSERVATION_TIMEOUT_S = 3.0
+_RUNTIME_OBSERVATION_COMMAND = (
+    "cat /proc/sys/kernel/random/boot_id; cat /proc/uptime; "
+    "settings get global acc_status; getprop persist.sys.sleep.countdown.time; "
+    "cat /proc/sys/kernel/random/boot_id"
+)
+
+
+async def runtime_observation(address: str) -> RuntimeObservation | None:
+    """Read power state without reconnecting ADB, gaining root, or changing the unit.
+
+    Reading the boot ID on both sides rejects a mixed snapshot across a reboot. The
+    property is the configured duration, not a query for the vendor's remaining timer.
+    Unknown ACC/property values stay unknown rather than becoming parked or a deadline.
+    """
+    try:
+        reply = await shell(
+            address, _RUNTIME_OBSERVATION_COMMAND, timeout=RUNTIME_OBSERVATION_TIMEOUT_S
+        )
+    except AdbError:
+        return None
+    lines = reply.strip().splitlines()
+    if len(lines) != 5:
+        return None
+    boot, uptime_line, acc, window, final_boot = (line.strip() for line in lines)
+    if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", boot):
+        return None
+    if boot.lower() != final_boot.lower():
+        return None
+    try:
+        uptime_s = float(uptime_line.split()[0])
+    except (ValueError, IndexError):
+        return None
+    if not math.isfinite(uptime_s) or uptime_s < 0:
+        return None
+    try:
+        seconds = int(window)
+    except ValueError:
+        seconds = 0
+    return RuntimeObservation(
+        boot_id=boot.lower(),
+        uptime_s=uptime_s,
+        ignition_state={"1": "on", "0": "off"}.get(acc, "unknown"),
+        sleep_window_s=seconds if seconds > 0 else None,
+    )
 
 
 async def inventory(address: str, source: str) -> list[RemoteFile]:

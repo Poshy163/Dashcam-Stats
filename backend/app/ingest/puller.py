@@ -1194,6 +1194,11 @@ _current: asyncio.Task[RunResult] | None = None
 #: running task, so one that is not stored somewhere can be collected mid-flight.
 _side_tasks: set[asyncio.Task] = set()
 
+# Event mirroring is read-only on the unit and idempotent in the database. Its
+# cancellation may still be draining an aiosqlite operation after its deadline.
+# Keep exactly one such task alive, independently of a footage run's cleanup.
+_event_mirror_task: asyncio.Task[EventSyncResult] | None = None
+
 
 def _fire_and_forget(coro) -> None:
     task = asyncio.create_task(coro)
@@ -1214,17 +1219,59 @@ def _preflight(tracked: list[asyncio.Task], coro) -> asyncio.Task:
     return task
 
 
-async def _await_event_mirror(task: asyncio.Task[EventSyncResult], *, deadline: float) -> None:
+def _collect_event_mirror(task: asyncio.Task[EventSyncResult]) -> None:
+    global _event_mirror_task
+    if _event_mirror_task is task:
+        _event_mirror_task = None
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        task.result()
+
+
+def _start_event_mirror(address: str, path: str) -> asyncio.Task[EventSyncResult] | None:
+    global _event_mirror_task
+    if _event_mirror_task is not None and not _event_mirror_task.done():
+        log.debug("skipping app event mirror while the previous mirror is still cleaning up")
+        return None
+    task = asyncio.create_task(sync_remote_events(address, path), name="ingest-event-mirror")
+    _event_mirror_task = task
+    task.add_done_callback(_collect_event_mirror)
+    return task
+
+
+def _cancel_event_mirror(task: asyncio.Task[EventSyncResult] | None) -> None:
+    # The mirror has its own timeout. Do not inject a second CancelledError into
+    # database rollback/connection termination already started by that timeout.
+    if task is not None and not task.done() and not task.cancelling():
+        task.cancel()
+
+
+async def _await_event_mirror(
+    task: asyncio.Task[EventSyncResult] | None, *, deadline: float
+) -> None:
     """Collect event mirroring without allowing observability to gate a backup."""
+    if task is None:
+        return
     try:
-        # The deadline is captured when the preflight starts, rather than granting a
-        # fresh timeout here after card inventory and logger status have completed.
-        async with asyncio.timeout_at(deadline):
-            await task
-    except TimeoutError:
+        # Unlike timeout()/wait_for(), wait() does not wait for the child's
+        # cancellation cleanup. SQLite may still be finishing an operation there.
+        done, _ = await asyncio.wait(
+            (task,), timeout=max(0.0, deadline - asyncio.get_running_loop().time())
+        )
+    except asyncio.CancelledError:
+        _cancel_event_mirror(task)
+        raise
+    if not done:
+        _cancel_event_mirror(task)
         log.warning(
             "could not mirror OBD app events; backup will continue",
             error="event mirror deadline exceeded",
+        )
+        return
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        log.warning(
+            "could not mirror OBD app events; backup will continue", error="mirror cancelled"
         )
     except Exception:
         # The consumer handles expected ADB, validation and storage failures itself.
@@ -1233,6 +1280,22 @@ async def _await_event_mirror(task: asyncio.Task[EventSyncResult], *, deadline: 
             "could not mirror OBD app events; backup will continue",
             error="unexpected event mirror failure",
         )
+
+
+async def _join_staging_cleanup(task: asyncio.Task[None]) -> None:
+    """Keep run ownership until the uninterruptible staging deletion thread exits."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    # Retrieve any filesystem failure even when cancellation is being propagated.
+    try:
+        task.result()
+    finally:
+        if cancelled:
+            raise asyncio.CancelledError
 
 
 def start_run(
@@ -1257,6 +1320,28 @@ def start_run(
 
 
 async def shutdown() -> None:
+    """Drain transfer and observability ownership before the database is disposed."""
+    try:
+        await _shutdown_pull()
+    finally:
+        task = _event_mirror_task
+        if task is not None:
+            _cancel_event_mirror(task)
+            cancelled = False
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    cancelled |= current is not None and bool(current.cancelling())
+                except Exception:
+                    break
+            _collect_event_mirror(task)
+            if cancelled:
+                raise asyncio.CancelledError
+
+
+async def _shutdown_pull() -> None:
     """Stop an in-flight transfer before the application goes away.
 
     The receive loop runs on a worker thread, and ``asyncio.to_thread`` cannot be
@@ -1313,6 +1398,53 @@ async def run_pull(
         return RunResult(state=RunState.RUNNING, error="already running")
 
     started = time.monotonic()
+    result = RunResult(state=RunState.ERROR, error="backup cleanup did not complete")
+    staging_cleanup_tasks: list[asyncio.Task[None]] = []
+    try:
+        result = await _run_pull_started(
+            trigger=trigger,
+            info=info,
+            continuation=continuation,
+            staging_cleanup_tasks=staging_cleanup_tasks,
+        )
+        return result
+    except asyncio.CancelledError:
+        result = RunResult(state=RunState.CANCELLED, error="backup cancelled")
+        raise
+    except Exception as exc:
+        result = RunResult(state=RunState.ERROR, error=f"{type(exc).__name__}: {exc}")
+        log.exception("the ingest run could not finish", error=str(exc))
+        return result
+    finally:
+        try:
+            # A cancellation in the main cleanup must not release ownership while
+            # this thread can still delete a subsequent run's staged arrivals.
+            for task in staging_cleanup_tasks:
+                with contextlib.suppress(Exception):
+                    await _join_staging_cleanup(task)
+        finally:
+            # Includes settings/path initialization before the inner try, and
+            # cancellation or failure during its awaited cleanup. Normal runs
+            # already publish their richer result before history/sleep handling.
+            if status.running:
+                result.seconds = time.monotonic() - started
+                status.finish(result)
+                # Initialization and failed cleanup are material attempts too.
+                # The inner path records normal results after finishing status;
+                # only this fallback owns history when it never got that far.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _record_run_completion(result, trigger, continuation=continuation)
+
+
+async def _run_pull_started(
+    *,
+    trigger: str,
+    info: UnitInfo | None,
+    continuation: bool,
+    staging_cleanup_tasks: list[asyncio.Task[None]],
+) -> RunResult:
+    status = get_status()
+    started = time.monotonic()
     result = RunResult(state=RunState.ERROR)
     footage = Path(str(await get_settings_service().footage_dir()))
     staging = footage / STAGING_DIRNAME
@@ -1323,6 +1455,7 @@ async def run_pull(
     obd_ack: obd_control.LoggerAck | None = None
     obd_inventory_ok = True
     obd_transfer_error: Exception | None = None
+    obd_events: asyncio.Task[EventSyncResult] | None = None
 
     try:
         # Only if nobody has already looked. The presence poll describes the unit
@@ -1405,7 +1538,10 @@ async def run_pull(
         # that series is worth hundreds of milliseconds -- which is footage, at 34 MB/s.
         removed = _preflight(preflight, _deliberately_removed())
         safety = _preflight(preflight, _footage_is_safe_to_write(footage))
-        cleaned = _preflight(preflight, asyncio.to_thread(_clean, staging))
+        cleaned = asyncio.create_task(
+            asyncio.to_thread(_clean, staging), name="ingest-staging-clean"
+        )
+        staging_cleanup_tasks.append(cleaned)
         # Asked here so it overlaps the card listing rather than adding a round trip to
         # the critical path. What it answers -- how far the unit's clock is from this
         # one -- is what makes the active-segment guard mean anything at all.
@@ -1429,10 +1565,7 @@ async def run_pull(
         # The Android app owns a transition-only event ring. Mirror its bounded public
         # projection on every visit, including an otherwise idle one, so boot/reconnect
         # evidence does not depend on footage or a completed drive being present.
-        obd_events = _preflight(
-            preflight,
-            sync_remote_events(info.address, get_config().obd_remote_events_file),
-        )
+        obd_events = _start_event_mirror(info.address, get_config().obd_remote_events_file)
         obd_events_deadline = (
             asyncio.get_running_loop().time()
             + EVENT_SYNC_TIMEOUT_SECONDS
@@ -1506,6 +1639,10 @@ async def run_pull(
             get_obd_transfer_status().set_logger(None)
         await _await_event_mirror(obd_events, deadline=obd_events_deadline)
 
+        if status.cancel_event.is_set():
+            result = RunResult(state=RunState.CANCELLED)
+            return result
+
         if not plan.files and not remote_obd:
             result = RunResult(state=RunState.IDLE)
             return result
@@ -1543,6 +1680,10 @@ async def run_pull(
             # cooldown inside `elevate` stops that retry restarting the daemon again, so
             # the second run simply transfers without root.
             result = RunResult(state=RunState.IDLE)
+            return result
+
+        if status.cancel_event.is_set():
+            result = RunResult(state=RunState.CANCELLED)
             return result
 
         quiet_requested = bool(_get("quiet_radios", False)) and bool(plan.files)
@@ -1629,6 +1770,9 @@ async def run_pull(
         # The stage owns its own temp directory, hashes, validation and DB transaction;
         # all failures stay on its queue/status and are deliberately excluded from the
         # footage result below.
+        if status.cancel_event.is_set():
+            result = RunResult(state=RunState.CANCELLED)
+            return result
         if remote_obd:
             status.set_phase(Phase.TRANSFERRING)
             try:
@@ -1746,7 +1890,10 @@ async def run_pull(
                     "Open the dashboard once, or set the address in Settings > Backup / Ingest."
                 )
 
-        await cleaned
+        await asyncio.shield(cleaned)
+        if status.cancel_event.is_set():
+            result = RunResult(state=RunState.CANCELLED)
+            return result
         port = int(_get("data_port", 9000))
         host = info.address.split(":", 1)[0]
         timeout_s = int(_get("listen_timeout_s", 180))
@@ -1976,6 +2123,9 @@ async def run_pull(
             megabytes=round(result.bytes / 1e6),
             throughput_mbs=result.throughput_mbs,
         )
+    except asyncio.CancelledError:
+        result = RunResult(state=RunState.CANCELLED, error="backup cancelled")
+        raise
     except adb.AdbError as exc:
         salvage_plan = locals().get("plan")
         salvage_committed = locals().get("committed", [])
@@ -2005,6 +2155,9 @@ async def run_pull(
         result = RunResult(state=RunState.ERROR, error=f"{type(exc).__name__}: {exc}")
         log.exception("the ingest run failed", error=str(exc))
     finally:
+        # This task alone is optional observability: its database cleanup may
+        # outlive the run, with the single retained slot preventing accumulation.
+        _cancel_event_mirror(obd_events)
         # The dashboard is relevant only while this run owns the transfer.  Do not let a
         # delayed retry take the screen over after the car has gone or a later run has begun.
         if display_task is not None:
@@ -2044,6 +2197,8 @@ async def run_pull(
             task.cancel()
         if preflight:
             await asyncio.gather(*preflight, return_exceptions=True)
+        for task in staging_cleanup_tasks:
+            await _join_staging_cleanup(task)
 
         if result.seconds <= 0:
             result.seconds = time.monotonic() - started

@@ -379,5 +379,7 @@ async def test_puller_event_await_uses_the_original_preflight_deadline() -> None
     )
 
     assert time.monotonic() - started < 0.5
+    # The transfer wait ends at its deadline; cancellation cleanup is independent.
+    await asyncio.wait_for(cancelled.wait(), timeout=0.5)
     assert cancelled.is_set()
     assert task.cancelled()
