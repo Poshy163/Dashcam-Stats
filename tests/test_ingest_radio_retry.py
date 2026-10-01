@@ -120,6 +120,7 @@ async def test_active_backup_retains_radio_ownership(monkeypatch):
     monkeypatch.setattr(poller, "_observe_unit_runtime", AsyncMock())
     monkeypatch.setattr(poller, "_recover_pending_while_online", recover)
     monkeypatch.setattr(poller_module.carplay_timing, "recover_on_unit_present", Mock())
+    monkeypatch.setattr(poller_module.band, "on_unit_present", Mock())
     monkeypatch.setattr(poller_module.asyncio, "sleep", stop)
     await poller._loop()
     recover.assert_not_called()

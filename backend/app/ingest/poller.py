@@ -376,6 +376,9 @@ class IngestPoller:
                 # the very transfer someone had just decided to stop.
                 if status.running:
                     await self._observe_unit_runtime(self._address())
+                    # Observe roaming during the copy without invoking the band gate,
+                    # selection nudges, or access-point disconnects.
+                    band.on_unit_present(self._address())
                     # Read-only and independently throttled, with an ignition-off gate.
                     # A long footage copy must not hide the drive's retained timing log.
                     carplay_timing.recover_on_unit_present(self._address())

@@ -186,6 +186,7 @@ async def test_poller_observes_running_reboot_and_resets_visit_not_radio_ownersh
     monkeypatch.setattr(poller, "_address", lambda: "unit")
     monkeypatch.setattr(poller, "_interval", lambda: 1)
     monkeypatch.setattr(poller_module.carplay_timing, "recover_on_unit_present", Mock())
+    monkeypatch.setattr(poller_module.band, "on_unit_present", Mock())
     monkeypatch.setattr(poller_module.puller, "probe_unit", forbidden)
     monkeypatch.setattr(poller, "_recover_pending_while_online", forbidden)
 

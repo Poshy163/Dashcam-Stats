@@ -88,8 +88,9 @@ def unit_shell(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def clean_module_state():
+def clean_module_state(monkeypatch):
     reset_status_for_tests()
+    monkeypatch.setattr(band, "_last_link_refresh_at", None)
     yield
     reset_status_for_tests()
 
