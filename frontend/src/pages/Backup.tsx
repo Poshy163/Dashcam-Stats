@@ -15,7 +15,7 @@ import type {
 } from '@/lib/api'
 import { formatBytes, formatDateTime, formatDuration, formatRelative } from '@/lib/format'
 import { backupHold, backupIdleLabel, backupRecoveryNotice, radioQuietingNotice, unverifiedRadioRestores } from '@/lib/backupPresentation'
-import { useSleepCountdown } from '@/lib/useSleepCountdown'
+import { sleepStatusRefetchInterval, useSleepCountdown } from '@/lib/useSleepCountdown'
 
 /** How the state reads to a person, and how alarming it should look. */
 const STATES: Record<IngestStatus['state'], { label: string; tone: 'default' | 'ok' | 'warn' | 'error' | 'busy' }> = {
@@ -279,9 +279,7 @@ export default function Backup() {
   const status = useQuery({
     queryKey: ['ingest-status'],
     queryFn: api.ingest.status,
-    // The window is only a minute or two, so track it closely while it is open and stop
-    // hammering the endpoint the rest of the day.
-    refetchInterval: (query) => (query.state.data?.state === 'running' ? 1_500 : 15_000),
+    refetchInterval: (query) => sleepStatusRefetchInterval(query.state.data, 1_500, 15_000),
   })
 
   const history = useQuery({
@@ -345,7 +343,7 @@ export default function Backup() {
 
   const liveCountdown = countdown.remainingS
   const hold = backupHold(data)
-  const prediction = liveCountdown !== null && !hold ? data?.sleepWindowPrediction : null
+  const prediction = countdown.state === 'estimated' && !hold ? data?.sleepWindowPrediction : null
   const eventSequenceGap = obdStatus.data?.eventStream?.sequenceGap ?? 0
   const running = data?.state === 'running'
   const transition = radioStatus.data?.transition
@@ -659,9 +657,11 @@ export default function Backup() {
               ? '—'
               : countdown.state === 'not_running'
                 ? 'Ignition on'
-                : liveCountdown !== null
-                  ? formatDuration(liveCountdown)
-                  : 'Unknown'
+                : countdown.state === 'elapsed'
+                  ? 'Awaiting sleep'
+                  : liveCountdown !== null
+                    ? formatDuration(Math.ceil(liveCountdown))
+                    : 'Unknown'
           }
           hint={countdown.hint}
           tone={
@@ -732,7 +732,7 @@ export default function Backup() {
                   }`}
                   title={`${countdown.hint} ${prediction?.summary ?? ''}`.trim()}
                 >
-                  ⏱️ Estimated sleep in {formatDuration(liveCountdown)}
+                  ⏱️ {countdown.state === 'elapsed' ? 'Awaiting sleep' : `Estimated sleep in ${formatDuration(Math.ceil(liveCountdown))}`}
                   {prediction &&
                     (prediction.willPass
                       ? ` • Likely fits (+${formatDuration(prediction.headroomS)})`

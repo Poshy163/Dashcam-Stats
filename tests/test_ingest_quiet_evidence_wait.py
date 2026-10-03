@@ -150,17 +150,43 @@ async def test_cancel_interrupts_retry_without_another_probe(grace, monkeypatch,
     assert read.await_count == 1
 
 
-@pytest.mark.parametrize("case", ["old_logger", "failed_observation", "ignition_on"])
-async def test_unrelated_unknown_cases_skip_grace(grace, monkeypatch, case):
-    logger = LOGGER if case != "old_logger" else {**LOGGER, "capabilities": []}
+async def test_old_logger_skips_evidence_grace(grace, monkeypatch):
+    logger = {**LOGGER, "capabilities": []}
+    read = AsyncMock(side_effect=AssertionError("older logger cannot supply evidence"))
+    monkeypatch.setattr(puller.adb, "runtime_observation", read)
+    await puller._await_quieting_evidence("unit", logger)
+    read.assert_not_awaited()
+
+
+@pytest.mark.parametrize("case", ["failed_observation", "ignition_on", "stale"])
+async def test_unknown_admission_refreshes_even_when_cached_power_is_not_fresh_off(
+    grace, monkeypatch, case
+):
     if case == "failed_observation":
         grace.unit_observation_failed()
     elif case == "ignition_on":
         grace.observe_unit_runtime(replace(power(), ignition_state="on"))
-    read = AsyncMock(side_effect=AssertionError("no eligible fresh OFF edge"))
+        # The ordinary parked gate already proved OFF, but must not manufacture a
+        # full timer or allow this older runtime snapshot to suppress the refresh.
+        grace.set_ignition(held=False, reason=None, state="off")
+    else:
+        grace._unit_observed_monotonic -= 31
+    read = AsyncMock(return_value=power(evidence=True))
     monkeypatch.setattr(puller.adb, "runtime_observation", read)
-    await puller._await_quieting_evidence("unit", logger)
-    read.assert_not_awaited()
+    latest = {**LOGGER, "ownership_enabled": False}
+    puller.read_logger_status.return_value = latest
+    assert await puller._await_quieting_evidence("unit", LOGGER) == latest
+    read.assert_awaited_once()
+    assert grace.radio_quieting_allowed()
+
+
+async def test_fresh_read_still_on_does_not_wait_or_authorize_quieting(grace, monkeypatch):
+    grace.observe_unit_runtime(replace(power(), ignition_state="on"))
+    read = AsyncMock(return_value=replace(power(), ignition_state="on"))
+    monkeypatch.setattr(puller.adb, "runtime_observation", read)
+    await puller._await_quieting_evidence("unit", LOGGER)
+    read.assert_awaited_once()
+    assert not grace.radio_quieting_allowed()
 
 
 async def test_automatic_run_waits_before_claim_and_uses_refreshed_ownership(

@@ -13,14 +13,14 @@ const directory = await mkdtemp(fileURLToPath(new URL('../node_modules/.backup-t
 after(() => rm(directory, { recursive: true, force: true }))
 await build({
   stdin: {
-    contents: `export { sleepCountdown, useSleepCountdown } from '@/lib/useSleepCountdown'; export { default as Backup } from '@/pages/Backup'; export { DashcamStatusBanner } from '@/pages/Dashboard';`,
+    contents: `export { sleepCountdown, sleepStatusRefetchInterval, useSleepCountdown } from '@/lib/useSleepCountdown'; export { default as Backup } from '@/pages/Backup'; export { DashcamStatusBanner } from '@/pages/Dashboard';`,
     resolveDir: fileURLToPath(new URL('..', import.meta.url)), loader: 'tsx',
   },
   outfile: path.join(directory, 'components.mjs'), bundle: true, format: 'esm', platform: 'node', jsx: 'automatic',
   external: ['react', 'react/*', 'react-router-dom', '@tanstack/react-query'],
   alias: { '@': fileURLToPath(new URL('../src', import.meta.url)) },
 })
-const { sleepCountdown, useSleepCountdown, Backup, DashcamStatusBanner } = await import(pathToFileURL(path.join(directory, 'components.mjs')).href)
+const { sleepCountdown, sleepStatusRefetchInterval, useSleepCountdown, Backup, DashcamStatusBanner } = await import(pathToFileURL(path.join(directory, 'components.mjs')).href)
 
 const observedAt = Date.parse('2026-10-01T03:36:57Z')
 function status(overrides = {}) {
@@ -61,10 +61,36 @@ test('known ignition-on and reboot-with-ACC-off do not invent the configured win
   assert.match(reboot.hint, /already parked/)
 })
 
+test('a changed sleep policy never replaces or caps the active cycle estimate', () => {
+  for (const policy of [300, 1200, null]) {
+    const result = sleepCountdown(status({ sleepWindowSeconds: policy, sleepCountdownRemainingS: 720 }), observedAt, observedAt + 5_000)
+    assert.equal(result.remainingS, 715)
+    assert.equal(result.state, 'estimated')
+  }
+})
+
 test('an elapsed estimate says the unit is still connected rather than claiming it slept', () => {
   const result = sleepCountdown(status({ sleepCountdownRemainingS: 4 }), observedAt, observedAt + 5_000)
+  assert.equal(result.state, 'elapsed')
   assert.equal(result.remainingS, 0)
   assert.match(result.hint, /Estimated window elapsed.*still connected/)
+  assert.equal(sleepCountdown(status({ sleepCountdownRemainingS: 0 }), observedAt, observedAt).state, 'elapsed')
+  assert.equal(sleepCountdown(status({ sleepCountdownRemainingS: 0 }), observedAt, observedAt + 31_000).state, 'stale', 'elapsed estimates still require fresh evidence that the unit is connected')
+})
+
+test('parked polling respects the shorter evidence budget and stays bounded when readings expire', () => {
+  for (const [runningInterval, idleInterval] of [[1_500, 15_000], [2_000, 10_000]]) {
+    const interval = data => sleepStatusRefetchInterval(data, runningInterval, idleInterval)
+    assert.equal(interval(status({ sleepCountdownValidForS: 8.23 })), 4_115, 'refresh before the live snapshot expires instead of waiting ten or fifteen seconds')
+    assert.equal(interval(status({ unitObservationAgeS: 28 })), 1_000, 'runtime freshness can be shorter than the evidence TTL')
+    assert.equal(interval(status({ sleepCountdownValidForS: 0 })), 1_000)
+    assert.equal(interval(status({ sleepCountdownValidForS: 0.1 })), 1_000, 'near-expiry values cannot create a polling loop')
+    assert.equal(interval(status({ sleepCountdownSource: 'unknown', sleepCountdownValidForS: null })), 5_000, 'parked uncertainty is rechecked promptly')
+    assert.equal(interval(status({ state: 'running' })), runningInterval)
+    assert.equal(interval(status({ unitOnline: false })), idleInterval)
+    assert.equal(interval(status({ ignitionState: 'on' })), idleInterval)
+    assert.equal(interval(undefined), idleInterval)
+  }
 })
 
 test('head-unit evidence explains an estimate without overriding freshness or expiry', () => {
@@ -165,6 +191,36 @@ test('Backup displays the on-unit estimate reason and preserves the one-minute q
   assert.match(text, /Radios left unchanged/)
   assert.match(text, /Backup can continue/)
   assert.ok(root.root.findAllByType('span').some(span => span.props.title?.startsWith(reason)), 'active countdown tooltip uses the same evidence explanation')
+})
+
+test('Backup and Dashboard label a fresh elapsed estimate without a zero timer or obsolete fit prediction', async t => {
+  const data = status({
+    state: 'running', phase: 'transferring', sleepCountdownRemainingS: 0,
+    sleepWindowPrediction: { willPass: true, headroomS: 90, estimatedDurationS: 30, summary: 'Will complete with headroom' },
+  })
+  const backup = await mountBackup(t, data)
+  assert.equal(backup.root.findByProps({ label: 'Estimated sleep' }).props.value, 'Awaiting sleep')
+  assert.match(backup.root.findByProps({ label: 'Estimated sleep' }).props.hint, /Estimated window elapsed.*still connected/)
+  let dashboard
+  await act(async () => {
+    dashboard = create(React.createElement(MemoryRouter, null, React.createElement(DashcamStatusBanner, { status: data, receivedAt: Date.now() })))
+  })
+  t.after(async () => act(async () => dashboard.unmount()))
+  for (const view of [backup, dashboard]) {
+    const text = JSON.stringify(view.toJSON())
+    assert.match(text, /Awaiting sleep/)
+    assert.doesNotMatch(text, /Estimated sleep in|Estimated sleep:|Likely fits|Will complete with headroom|Sleep time unknown/)
+  }
+  await act(async () => dashboard.update(React.createElement(MemoryRouter, null, React.createElement(DashcamStatusBanner, {
+    status: data, receivedAt: Date.now(), requestFailed: true,
+  }))))
+  assert.match(JSON.stringify(dashboard.toJSON()), /Sleep time unknown/)
+  assert.doesNotMatch(JSON.stringify(dashboard.toJSON()), /Awaiting sleep/)
+})
+
+test('a positive fraction of a second does not round into a zero-second timer', async t => {
+  const root = await mountBackup(t, status({ sleepCountdownRemainingS: 0.49 }))
+  assert.equal(root.root.findByProps({ label: 'Estimated sleep' }).props.value, '1s')
 })
 
 test('a startup hold with unknown inventory is Waiting, keeps manual pull available, and shows unknown sleep', async t => {

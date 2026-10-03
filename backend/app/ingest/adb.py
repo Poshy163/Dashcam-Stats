@@ -459,8 +459,9 @@ class RuntimeObservation:
             return None
         if evidence.off_lower_elapsed_ms is None or evidence.window_s is None:
             return None
-        if self.sleep_window_s is None or not 1 <= self.sleep_window_s <= 3600:
-            return None
+        # The firmware latches this duration at OFF. The live property describes
+        # policy for the next timer and can already have changed (1200 -> 300).
+        # Its absence or later value cannot rewrite the tracker's witnessed edge.
         return evidence
 
 

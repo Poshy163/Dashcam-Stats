@@ -39,7 +39,7 @@ _SPEED_WINDOW_S = 5.0
 #: full rate -- and a sample per read would be pure churn for a number rendered every 1.5s.
 _SAMPLE_INTERVAL_S = 0.25
 
-# The poller samples every 15 seconds. Snapshots expire independently of that loop,
+# The poller samples at most every few seconds. Snapshots expire independently of it,
 # including when a control request or the poller itself becomes stuck.
 UNIT_OBSERVATION_TTL_S = 30.0
 
@@ -111,7 +111,9 @@ class IngestStatus:
         self._unit_deadline_fresh_until: float | None = None
         self._unit_edge_wall: datetime | None = None
         self._operational_deadline_monotonic: float | None = None
+        self._operational_deadline_from_unit = False
         self._unit_edge_bounds: tuple[int, int] | None = None
+        self._last_observed_on_uptime_s: float | None = None
         self._unit_observed_at: datetime | None = None
         self._unit_observed_monotonic: float | None = None
         self._unit_observation_failed = False
@@ -130,7 +132,8 @@ class IngestStatus:
         self.ignition_hold_reason: str | None = None
         self.radio_quieting_hold = False
         self.radio_quieting_hold_reason: str | None = None
-        #: Current sleep window in seconds (e.g. 1200 for active Wi-Fi backup, 300 for idle).
+        #: Configured duration for the next OFF timer (1200 active / 300 idle).
+        #: The running timer uses the duration witnessed at its ignition-off edge.
         self.sleep_window_s: int = 1200
         #: Ignition state: "on", "off", or "unknown".
         self.ignition_state: str = "unknown"
@@ -377,7 +380,9 @@ class IngestStatus:
                 self.ignition_off_wall = None
                 self.sleep_window_started_monotonic = None
                 self._operational_deadline_monotonic = None
+                self._operational_deadline_from_unit = False
                 self._unit_edge_bounds = None
+                self._last_observed_on_uptime_s = None
             if changed_boot:
                 self._online_since = now
                 self.backlog_known = False
@@ -422,6 +427,15 @@ class IngestStatus:
                     self.ignition_off_monotonic = now
                     self.ignition_off_wall = self._unit_observed_at
                 evidence = observation.validated_sleep_deadline()
+                if (
+                    evidence is not None
+                    and self._last_observed_on_uptime_s is not None
+                    and evidence.off_upper_elapsed_ms / 1000 <= self._last_observed_on_uptime_s
+                ):
+                    # A freshly published document can still carry the preceding
+                    # trip's edge while the logger observes this ON→OFF cycle.
+                    # A bracket straddling our last ON is valid and conservative.
+                    evidence = None
                 if evidence is not None and self._unit_edge_bounds is not None:
                     bounds = (evidence.off_lower_elapsed_ms, evidence.off_upper_elapsed_ms)
                     if bounds != self._unit_edge_bounds:
@@ -429,6 +443,7 @@ class IngestStatus:
                             # Hibernation preserves boot identity. A newly witnessed
                             # local ON→OFF identifies the next trip's separate timer.
                             self._operational_deadline_monotonic = None
+                            self._operational_deadline_from_unit = False
                             self._observed_off_monotonic = None
                             self._observed_off_wall = None
                             self._observed_off_window_s = None
@@ -436,21 +451,35 @@ class IngestStatus:
                         else:
                             evidence = None  # Overlap/regression cannot prove a new timer.
                 if evidence is not None:
+                    if not self._operational_deadline_from_unit:
+                        # The local tracker brackets OFF and captures the duration
+                        # before policy rewrites. That is stronger than an earlier
+                        # server sample of the configurable duration, which may have
+                        # changed before the native timer latched it at OFF.
+                        self._operational_deadline_monotonic = None
+                        self._operational_deadline_from_unit = True
+                    # Retire the weaker server edge. If local proof later expires,
+                    # it must not fall back to a different property's guessed timer.
+                    self._observed_off_monotonic = None
+                    self._observed_off_wall = None
+                    self._observed_off_window_s = None
+                    self._observed_off_quiet_window_s = None
                     self._unit_edge_bounds = (
                         evidence.off_lower_elapsed_ms,
                         evidence.off_upper_elapsed_ms,
                     )
                     elapsed = observation.uptime_s - evidence.off_lower_elapsed_ms / 1000
                     self._unit_deadline_monotonic = (
-                        now
-                        + min(evidence.window_s, observation.sleep_window_s)
-                        - elapsed
-                        - RUNTIME_OBSERVATION_TIMEOUT_S
+                        now + evidence.window_s - elapsed - RUNTIME_OBSERVATION_TIMEOUT_S
                     )
                     age = observation.uptime_s - evidence.observed_elapsed_ms / 1000
                     self._unit_deadline_fresh_until = now + SLEEP_DEADLINE_EVIDENCE_TTL_S - age
                     self._unit_edge_wall = self._unit_observed_at - timedelta(seconds=elapsed)
             else:
+                if observation.ignition_state == "on":
+                    self._last_observed_on_uptime_s = max(
+                        observation.uptime_s, self._last_observed_on_uptime_s or 0
+                    )
                 self._observed_off_monotonic = None
                 self._observed_off_wall = None
                 self._observed_off_window_s = None
@@ -458,7 +487,12 @@ class IngestStatus:
                 self.ignition_off_monotonic = None
                 self.ignition_off_wall = None
                 self.sleep_window_started_monotonic = None
-                self._operational_deadline_monotonic = None
+                if observation.ignition_state == "on" or not self._operational_deadline_from_unit:
+                    # An unreadable ACC sample is not a new timer. Keep its accepted
+                    # unit ceiling for recovery and same-edge revalidation; current
+                    # public/admission proof was already cleared above.
+                    self._operational_deadline_monotonic = None
+                    self._operational_deadline_from_unit = False
             credible = self._credible_countdown_remaining()
             if credible is not None:
                 deadline = now + credible
@@ -904,7 +938,7 @@ class IngestStatus:
                 "radio_quieting_hold_reason": (
                     self.radio_quieting_hold_reason if self._running and self.unit_online else None
                 ),
-                "sleep_window_seconds": self.sleep_window_s,
+                "sleep_window_seconds": self.sleep_window_s,  # Next-timer policy, not time left.
                 "sleep_countdown_remaining_s": (
                     round(countdown.remaining_s, 1) if countdown.remaining_s is not None else None
                 ),

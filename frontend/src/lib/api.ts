@@ -213,7 +213,9 @@ export interface IngestStatus {
   /** Quieting was skipped; this does not hold the backup itself. */
   radioQuietingHold?: boolean
   radioQuietingHoldReason?: string | null
+  /** Current configured policy; the active ignition-off timer may have latched a different duration. */
   sleepWindowSeconds: number | null
+  /** Server-estimated remaining time for this ignition-off cycle, not the current policy value. */
   sleepCountdownRemainingS: number | null
   /** A recent server response may still contain an old head-unit observation. */
   unitObservedAt?: string | null

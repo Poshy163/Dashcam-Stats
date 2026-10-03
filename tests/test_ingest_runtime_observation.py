@@ -251,15 +251,56 @@ async def test_runtime_reads_throttle_failures_and_expire_independently(monkeypa
     monkeypatch.setattr(poller_module, "get_status", lambda: status)
     monkeypatch.setattr(poller_module.adb, "runtime_observation", reader)
     await poller._observe_unit_runtime("unit")
-    clock[0] += 14
+    clock[0] += poller_module.RUNTIME_OBSERVATION_INTERVAL_S - 1
     await poller._observe_unit_runtime("unit")
     assert reader.await_count == 1
     clock[0] += 1
     await poller._observe_unit_runtime("unit")
     assert reader.await_count == 2
     assert not status.snapshot()["unit_observation_fresh"]
-    clock[0] += 15
+    clock[0] += poller_module.RUNTIME_OBSERVATION_INTERVAL_S
     await poller._observe_unit_runtime("unit")
     assert status.snapshot()["sleep_countdown_remaining_s"] is None
     clock[0] += 31
     assert not status.snapshot()["unit_observation_fresh"]
+
+
+def test_slow_presence_setting_cannot_postpone_power_refresh(monkeypatch, clock):
+    poller = poller_module.IngestPoller()
+    monkeypatch.setattr(poller, "_interval", lambda: 60)
+    poller._runtime_observation_due = clock[0] + poller_module.RUNTIME_OBSERVATION_INTERVAL_S
+    assert poller._online_interval() == 5
+    clock[0] += 4
+    assert poller._online_interval() == 1
+
+
+async def test_normal_logger_age_and_bounded_read_do_not_create_countdown_gaps(monkeypatch, clock):
+    status = IngestStatus()
+    poller = poller_module.IngestPoller()
+    monkeypatch.setattr(poller_module, "get_status", lambda: status)
+
+    async def reader(*_args, **_kwargs):
+        clock[0] += adb.RUNTIME_OBSERVATION_TIMEOUT_S
+        uptime = clock[0]
+        return adb.RuntimeObservation(
+            BOOT_A,
+            uptime,
+            "off",
+            300,
+            1,
+            adb.SleepDeadlineEvidence(
+                1, BOOT_A, 1, int((uptime - 7) * 1000), False, 70_000, 75_000, 1200
+            ),
+        )
+
+    monkeypatch.setattr(poller_module.adb, "runtime_observation", reader)
+    await poller._observe_unit_runtime("unit")
+    for _ in range(6):
+        # Five seconds until refresh plus a worst-case three-second read still
+        # fits the evidence's remaining lease; no stale allowance is introduced.
+        clock[0] += poller_module.RUNTIME_OBSERVATION_INTERVAL_S
+        before = status.snapshot()["sleep_countdown_remaining_s"]
+        assert before is not None
+        await poller._observe_unit_runtime("unit")
+        after = status.snapshot()["sleep_countdown_remaining_s"]
+        assert after == before - adb.RUNTIME_OBSERVATION_TIMEOUT_S

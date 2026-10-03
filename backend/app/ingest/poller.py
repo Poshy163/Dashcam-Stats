@@ -84,8 +84,10 @@ RADIO_RECOVERY_RETRY_S = 30.0
 #: radio capture and restore either side of it.
 REDRAIN_MIN_COUNTDOWN_S = 90.0
 
-# A small, read-only shell snapshot must continue even while copying or visit-capped.
-RUNTIME_OBSERVATION_INTERVAL_S = 15.0
+# The logger publishes every 10s and its evidence expires after 20s. A 15s delay
+# after a read already aged 5-7s caused routine gaps, even on a healthy connection.
+# Reserve room for the bounded 3s shell read without relaxing evidence freshness.
+RUNTIME_OBSERVATION_INTERVAL_S = 5.0
 
 
 class IngestPoller:
@@ -145,6 +147,13 @@ class IngestPoller:
 
     def _interval(self) -> float:
         return max(MIN_POLL_S, float(ingest_setting("poll_interval_s")))
+
+    def _online_interval(self) -> float:
+        """A slower presence setting must not postpone a due power refresh."""
+        return min(
+            self._interval(),
+            max(MIN_POLL_S, self._runtime_observation_due - time.monotonic()),
+        )
 
     def _enabled(self) -> bool:
         return bool(ingest_setting("enabled"))
@@ -385,7 +394,7 @@ class IngestPoller:
                     # Read-only and independently throttled, with an ignition-off gate.
                     # A long footage copy must not hide the drive's retained timing log.
                     carplay_timing.recover_on_unit_present(self._address())
-                    await asyncio.sleep(self._interval())
+                    await asyncio.sleep(self._online_interval())
                     continue
 
                 if not self._enabled():
@@ -428,7 +437,7 @@ class IngestPoller:
                 # hotspot restore failed. Do not strand that debt behind re-drain limits
                 # while the same unit remains reachable, or start another backup first.
                 if self._was_online and await self._recover_pending_while_online(self._address()):
-                    await asyncio.sleep(self._interval())
+                    await asyncio.sleep(self._online_interval())
                     continue
 
                 # A tick that cannot start anything must not pay for a describe.
@@ -469,7 +478,7 @@ class IngestPoller:
                     carplay_timing.on_unit_present(self._address())
                     wifi_startup.on_unit_present(self._address())
                     band.on_unit_present(self._address())
-                    await asyncio.sleep(self._interval())
+                    await asyncio.sleep(self._online_interval())
                     continue
 
                 # During an arrival hold the only thing that changes tick to tick is the
@@ -507,7 +516,7 @@ class IngestPoller:
                             status.set_state(RunState.IDLE)
                             if info.source and not info.card_error:
                                 self._visit_info = info
-                            await asyncio.sleep(self._interval())
+                            await asyncio.sleep(self._online_interval())
                             continue
                         radios.restore_if_pending(info.address)
                         # Collect what the recording watcher saw while the car was away,
@@ -614,7 +623,7 @@ class IngestPoller:
                 # restore and the health collect.
                 self._visit_info = None
 
-            await asyncio.sleep(self._interval())
+            await asyncio.sleep(self._online_interval() if status.unit_online else self._interval())
 
 
 _poller: IngestPoller | None = None

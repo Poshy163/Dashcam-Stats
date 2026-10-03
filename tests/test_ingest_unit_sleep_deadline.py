@@ -175,10 +175,12 @@ def test_later_property_and_cached_logger_cannot_extend_valid_deadline(clock):
     assert status.sleep_countdown_elapsed_s() == 1103
 
 
-def test_current_property_reduction_then_increase_never_enlarges_budget(clock):
+@pytest.mark.parametrize("current_window", [300, 60, None])
+def test_current_policy_property_does_not_replace_latched_off_window(clock, current_window):
     status = IngestStatus()
-    status.observe_unit_runtime(observation(sleep_window_s=300))
-    assert status.snapshot()["sleep_countdown_remaining_s"] == 97
+    status.observe_unit_runtime(observation(sleep_window_s=current_window))
+    assert status.snapshot()["sleep_countdown_remaining_s"] == 997
+    assert status.radio_quieting_allowed()
     clock[0] += 5
     status.observe_unit_runtime(
         observation(
@@ -187,22 +189,31 @@ def test_current_property_reduction_then_increase_never_enlarges_budget(clock):
             sleep_window_s=1200,
         )
     )
-    assert status.snapshot()["sleep_countdown_remaining_s"] == 92
-    assert status.sleep_deadline_uptime_s() == 1097
+    assert status.snapshot()["sleep_countdown_remaining_s"] == 992
+    assert status.sleep_deadline_uptime_s() == 1997
 
 
-def test_earlier_unit_bound_caps_fresh_server_fallback_when_unit_evidence_disappears(clock):
+def test_missing_unit_evidence_cannot_reactivate_retired_server_timer(clock):
     status = IngestStatus()
     status.observe_unit_runtime(observation(ignition_state="on", sleep_deadline_evidence=None))
     clock[0] += 15
     status.observe_unit_runtime(
-        observation(evidence(window_s=300, observed_elapsed_ms=1010_000), uptime_s=1015)
+        observation(
+            evidence(
+                window_s=100,
+                off_lower_elapsed_ms=1000_000,
+                off_upper_elapsed_ms=1006_000,
+                observed_elapsed_ms=1010_000,
+            ),
+            uptime_s=1015,
+        )
     )
     assert status.snapshot()["sleep_countdown_remaining_s"] == 82
     clock[0] += 10
     status.observe_unit_runtime(observation(uptime_s=1025, sleep_deadline_evidence=None))
-    assert status.snapshot()["sleep_countdown_remaining_s"] == 72
-    assert status.radio_quieting_allowed()
+    assert status.snapshot()["sleep_countdown_remaining_s"] is None
+    assert not status.radio_quieting_allowed()
+    assert status.sleep_countdown_remaining_s() == 72  # Restoration keeps its frozen ceiling.
     clock[0] += 12
     assert not status.radio_quieting_allowed()
 
@@ -260,11 +271,67 @@ def test_next_trip_on_same_boot_replaces_expired_previous_trip_ceiling(clock):
 
 def test_same_edge_cannot_extend_after_transient_disconnect(clock):
     status = IngestStatus()
-    status.observe_unit_runtime(observation(sleep_window_s=300))
+    status.observe_unit_runtime(observation(evidence(window_s=300)))
     status.set_unit_online(False)
     clock[0] += 5
     status.observe_unit_runtime(observation(evidence(observed_elapsed_ms=1004_000), uptime_s=1005))
     assert status.snapshot()["sleep_countdown_remaining_s"] == 92
+
+
+def test_unknown_acc_cannot_erase_accepted_ceiling_and_extend_same_edge(clock):
+    status = IngestStatus()
+    status.observe_unit_runtime(observation(evidence(window_s=300)))
+    assert status.snapshot()["sleep_countdown_remaining_s"] == 97
+    clock[0] += 5
+    status.observe_unit_runtime(observation(ignition_state="unknown", uptime_s=1005))
+    assert status.snapshot()["sleep_countdown_remaining_s"] is None
+    assert not status.radio_quieting_allowed()
+    clock[0] += 5
+    status.observe_unit_runtime(observation(evidence(observed_elapsed_ms=1009_000), uptime_s=1010))
+    assert status.snapshot()["sleep_countdown_remaining_s"] == 87
+    assert status.sleep_deadline_uptime_s() == 1097
+
+
+@pytest.mark.parametrize("interrupt", [None, "unknown", "offline"])
+def test_recent_previous_trip_document_cannot_override_new_observed_on(clock, interrupt):
+    status = IngestStatus()
+    status.observe_unit_runtime(observation())
+    clock[0] += 5
+    status.observe_unit_runtime(observation(ignition_state="on", uptime_s=1005, sleep_window_s=300))
+    if interrupt == "unknown":
+        status.observe_unit_runtime(observation(ignition_state="unknown", uptime_s=1006))
+    elif interrupt == "offline":
+        status.set_unit_online(False)
+    clock[0] += 5
+    status.observe_unit_runtime(
+        observation(evidence(observed_elapsed_ms=1004_000), uptime_s=1010, sleep_window_s=300)
+    )
+    snapshot = status.snapshot()
+    if interrupt is None:
+        assert snapshot["sleep_countdown_remaining_s"] == 267
+        assert snapshot["sleep_countdown_evidence_source"] == "server"
+    else:
+        assert snapshot["sleep_countdown_remaining_s"] is None
+        assert not status.radio_quieting_allowed()
+
+
+def test_new_local_off_bracket_can_straddle_latest_server_on(clock):
+    status = IngestStatus()
+    status.observe_unit_runtime(observation(ignition_state="on", uptime_s=1005, sleep_window_s=300))
+    clock[0] += 10
+    status.observe_unit_runtime(
+        observation(
+            evidence(
+                off_lower_elapsed_ms=1000_000,
+                off_upper_elapsed_ms=1010_000,
+                observed_elapsed_ms=1014_000,
+            ),
+            uptime_s=1015,
+            sleep_window_s=300,
+        )
+    )
+    assert status.snapshot()["sleep_countdown_remaining_s"] == 1182
+    assert status.snapshot()["sleep_countdown_evidence_source"] == "unit"
 
 
 def test_overlapping_changed_bounds_cannot_manufacture_new_timer(clock):
@@ -312,7 +379,7 @@ def test_selected_source_and_lease_are_structural_not_derived_from_reason(clock)
     assert snapshot["sleep_countdown_valid_for_s"] == countdown.valid_for_s
 
 
-def test_selected_server_source_keeps_its_own_edge_timestamp(clock):
+def test_unit_edge_replaces_weaker_server_timestamp_and_property_window(clock):
     status = IngestStatus()
     status.observe_unit_runtime(
         observation(ignition_state="on", sleep_deadline_evidence=None, sleep_window_s=300)
@@ -336,12 +403,12 @@ def test_selected_server_source_keeps_its_own_edge_timestamp(clock):
         )
     )
     snapshot = status.snapshot()
-    assert snapshot["sleep_countdown_evidence_source"] == "server"
-    assert snapshot["ignition_off_at"] == server_edge
-    assert snapshot["sleep_countdown_valid_for_s"] == 30
+    assert snapshot["sleep_countdown_evidence_source"] == "unit"
+    assert snapshot["ignition_off_at"] != server_edge
+    assert snapshot["sleep_countdown_valid_for_s"] == 20
 
 
-def test_server_fallback_still_works_and_earlier_independent_deadline_wins(clock):
+def test_first_unit_proof_supersedes_conservative_server_property_bound(clock):
     status = IngestStatus()
     status.observe_unit_runtime(
         observation(sleep_deadline_evidence=None, ignition_state="on", sleep_window_s=300)
@@ -358,8 +425,38 @@ def test_server_fallback_still_works_and_earlier_independent_deadline_wins(clock
         )
     )
     assert status.radio_quieting_allowed()
-    # The preceding server observation saw a300-second window, so its bound wins.
-    assert status.sleep_countdown_remaining_s() == 267
+    # The local recorder witnessed the actual OFF window after the last server ON
+    # observation. Its immutable edge supersedes the earlier sampled property.
+    assert status.sleep_countdown_remaining_s() == 1182
+
+
+def test_join_wifi_wait_then_off_uses_off_edge_not_arrival_or_later_idle_policy(clock):
+    status = IngestStatus()
+    for elapsed in range(0, 301, 15):
+        clock[0] = 5000 + elapsed
+        status.observe_unit_runtime(
+            observation(ignition_state="on", uptime_s=1000 + elapsed, sleep_deadline_evidence=None)
+        )
+        assert status.snapshot()["sleep_countdown_remaining_s"] is None
+    clock[0] += 10
+    local_edge = evidence(
+        off_lower_elapsed_ms=1304_000,
+        off_upper_elapsed_ms=1309_000,
+        observed_elapsed_ms=1309_000,
+    )
+    status.observe_unit_runtime(observation(local_edge, uptime_s=1310, sleep_window_s=300))
+    assert status.snapshot()["sleep_countdown_remaining_s"] == 1191
+    assert status.sleep_deadline_uptime_s() == 2501
+    # Still awake nine minutes later: idle policy300 is for the next countdown.
+    clock[0] += 540
+    status.observe_unit_runtime(
+        observation(
+            {**local_edge, "observed_elapsed_ms": 1849_000}, uptime_s=1850, sleep_window_s=300
+        )
+    )
+    assert status.snapshot()["sleep_countdown_remaining_s"] == 651
+    assert status.radio_quieting_allowed()
+    assert status.sleep_deadline_uptime_s() == 2501
 
 
 async def test_fresh_small_file_is_read_in_same_bounded_identity_bracket(monkeypatch):

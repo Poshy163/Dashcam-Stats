@@ -36,9 +36,12 @@ def test_fixed_device_ceiling_survives_property_growth_missing_reads_and_acc_cha
     assert result.stdout.splitlines() == ["340", "240", "140", "0 pre_sleep"]
 
 
-def test_shorter_property_or_lease_still_wins(posix_shell):
+@pytest.mark.parametrize("fixed_deadline", [None, 1400])
+def test_later_property_cannot_shorten_fixed_deadline_but_lease_still_wins(
+    posix_shell, fixed_deadline
+):
     guard = radios._watchdog_sleep_guard_functions(
-        _report_config(sleep_deadline_uptime_s=1400)
+        _report_config(sleep_deadline_uptime_s=fixed_deadline)
     ).replace("/system/bin/", "")
     script = (
         "getprop() { echo 120; }; settings() { echo 0; }; "
@@ -49,7 +52,7 @@ def test_shorter_property_or_lease_still_wins(posix_shell):
     )
     result = subprocess.run([posix_shell, "-c", script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["60", "10"]
+    assert result.stdout.splitlines() == (["60", "10"] if fixed_deadline is None else ["340", "10"])
 
 
 @pytest.mark.parametrize("value", [True, -1, "$(id)", float("nan"), 2**53])

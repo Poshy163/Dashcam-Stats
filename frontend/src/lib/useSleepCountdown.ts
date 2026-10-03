@@ -2,12 +2,32 @@ import { useEffect, useReducer } from 'react'
 
 import type { IngestStatus } from './api'
 
-type SleepState = 'offline' | 'unknown' | 'stale' | 'not_running' | 'estimated'
+type SleepState = 'offline' | 'unknown' | 'stale' | 'not_running' | 'estimated' | 'elapsed'
 
 export interface SleepCountdown {
   state: SleepState
   remainingS: number | null
   hint: string
+}
+
+/** Refresh parked estimates before their evidence expires, without extending its TTL. */
+export function sleepStatusRefetchInterval(
+  status: IngestStatus | undefined,
+  runningInterval: number,
+  idleInterval: number,
+): number {
+  const normal = status?.state === 'running' ? runningInterval : idleInterval
+  if (!status?.unitOnline || status.ignitionState === 'on') return normal
+  let interval = Math.min(normal, 5_000)
+  const runtimeBudget = typeof status.unitObservationTtlS === 'number' &&
+    typeof status.unitObservationAgeS === 'number'
+    ? status.unitObservationTtlS - status.unitObservationAgeS : undefined
+  for (const budget of [runtimeBudget, status.sleepCountdownValidForS]) {
+    if (typeof budget === 'number' && Number.isFinite(budget)) {
+      interval = Math.min(interval, Math.max(1_000, budget * 500))
+    }
+  }
+  return interval
 }
 
 /** The server estimates the timer; a fresh API response alone is not a fresh unit read. */
@@ -48,7 +68,7 @@ export function sleepCountdown(
   }
   const remainingS = Math.max(0, status.sleepCountdownRemainingS - elapsedS)
   return {
-    state: 'estimated', remainingS,
+    state: remainingS > 0 ? 'estimated' : 'elapsed', remainingS,
     hint: remainingS > 0
       ? status.sleepCountdownReason || 'Estimated from ignition off and the reported sleep window; the unit’s timer can differ'
       : 'Estimated window elapsed; the dashcam is still connected',

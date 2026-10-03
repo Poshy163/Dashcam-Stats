@@ -8,7 +8,7 @@ import type { IngestStatus } from '@/lib/api'
 import { hardwareSummary } from '@/lib/hardware'
 import { backupAttention } from '@/lib/operationalStatus'
 import { backupHold } from '@/lib/backupPresentation'
-import { useSleepCountdown } from '@/lib/useSleepCountdown'
+import { sleepStatusRefetchInterval, useSleepCountdown } from '@/lib/useSleepCountdown'
 import {
   formatBytes,
   formatDateTime,
@@ -27,7 +27,7 @@ export default function Dashboard() {
   const ingest = useQuery({
     queryKey: ['ingest-status'],
     queryFn: api.ingest.status,
-    refetchInterval: (query) => (query.state.data?.state === 'running' ? 2_000 : 10_000),
+    refetchInterval: (query) => sleepStatusRefetchInterval(query.state.data, 2_000, 10_000),
   })
   const runtimeHardware = useQuery({
     queryKey: ['system-hardware'],
@@ -403,7 +403,7 @@ export function DashcamStatusBanner({ status, receivedAt, requestFailed = false 
   const countdown = useSleepCountdown(status, receivedAt, requestFailed)
   const liveCountdown = countdown.remainingS
   const hold = backupHold(status)
-  const prediction = liveCountdown !== null && !hold ? status.sleepWindowPrediction : null
+  const prediction = countdown.state === 'estimated' && !hold ? status.sleepWindowPrediction : null
   const running = status.state === 'running'
 
   return (
@@ -439,7 +439,7 @@ export function DashcamStatusBanner({ status, receivedAt, requestFailed = false 
                       : 'bg-surface-sunken text-content-muted'
                 }`}
               >
-                ⏱️ Estimated sleep: {formatDuration(liveCountdown)}
+                ⏱️ {countdown.state === 'elapsed' ? 'Awaiting sleep' : `Estimated sleep: ${formatDuration(Math.ceil(liveCountdown))}`}
               </span>
             ) : (
               <span className="badge bg-surface-sunken text-content-muted">

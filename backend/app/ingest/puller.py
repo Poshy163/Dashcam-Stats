@@ -224,8 +224,10 @@ async def _await_quieting_evidence(address: str, logger_status: dict | None) -> 
     """Allow one logger heartbeat to establish a newly observed OFF edge.
 
     ACC can reach the server before the logger publishes its boot-bound deadline.
-    Only that fresh-OFF/unknown case gets this read-only grace; neither a known short
-    timer nor an older logger delays copying. No radio or logger control is attempted.
+    Refresh unknown/stale power before deciding whether this grace applies: the parked
+    gate may have read OFF while the prior runtime snapshot still says ON. Only a newly
+    confirmed OFF/unknown case retries; known timers and older loggers do not wait.
+    No radio or logger control is attempted.
     """
     capabilities = logger_status.get("capabilities") if isinstance(logger_status, dict) else None
     if not isinstance(capabilities, list) or QUIET_EVIDENCE_CAPABILITY not in capabilities:
@@ -242,13 +244,16 @@ async def _await_quieting_evidence(address: str, logger_status: dict | None) -> 
             and not status.cancel_event.is_set()
         )
 
-    if not waiting_for_edge():
+    if status.cancel_event.is_set() or status.snapshot()["sleep_countdown_source"] == "estimated":
         return logger_status
-    log.info("briefly waiting for the logger's ignition-off evidence before radio preparation")
     loop = asyncio.get_running_loop()
     deadline = loop.time() + QUIET_EVIDENCE_WAIT_S
     path = get_config().obd_remote_status_file
-    while waiting_for_edge() and deadline - loop.time() >= _QUIET_EVIDENCE_PROBE_BUDGET_S:
+    announced_wait = False
+    while (
+        not status.cancel_event.is_set()
+        and deadline - loop.time() >= _QUIET_EVIDENCE_PROBE_BUDGET_S
+    ):
         # Refresh both authorities. A newer ownership/quiesce result must accompany
         # the deadline, rather than retaining the snapshot taken before preparation.
         observation, latest_logger = await asyncio.gather(
@@ -272,6 +277,11 @@ async def _await_quieting_evidence(address: str, logger_status: dict | None) -> 
             return logger_status
         if status.observe_unit_runtime(observation) or not waiting_for_edge():
             return logger_status
+        if not announced_wait:
+            log.info(
+                "briefly waiting for the logger's ignition-off evidence before radio preparation"
+            )
+            announced_wait = True
         retry_at = min(deadline, loop.time() + QUIET_EVIDENCE_RETRY_S)
         # Stop requests are a threading.Event; short async sleeps avoid adding a
         # non-cancellable waiter thread solely for this small preparation grace.
@@ -302,9 +312,8 @@ async def widen_sleep_window(address: str) -> bool:
         return True
     if await adb.set_sleep_countdown(address, wanted):
         log.info("widened the head unit's ignition-off window", seconds=wanted)
-        # The write restarts the unit's own countdown, so the app's reference point moves
-        # with it. The read-back branch above deliberately does not: finding the property
-        # already correct changed nothing on the unit.
+        # This configures the next native OFF countdown; it does not restart a timer
+        # already latched by SystemUI. Only witnessed OFF evidence anchors that timer.
         get_status().set_sleep_window(wanted, restarted=True)
         return True
     return False

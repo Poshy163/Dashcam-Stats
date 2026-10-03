@@ -984,9 +984,10 @@ def _watchdog_sleep_guard_functions(
     out of range. The *sleep* is the vendor's, it is the ordinary ending, and it arrives
     with no warning at all on the wire: the unit simply stops answering.
 
-    A validated absolute elapsed-time ceiling cannot move later when the property is
-    rewritten. The legacy ACC/property estimate may shorten it, as may the server lease.
-    Without any observed ceiling, unreadable inputs leave only the lease in force.
+    A validated absolute elapsed-time ceiling freezes the witnessed OFF window. Later
+    property rewrites configure the next timer, not the countdown already running. The
+    server lease can still end recovery sooner. Without an observed ceiling, retain the
+    legacy ACC/property estimate; unreadable inputs leave only the lease in force.
     """
     ceilings = [
         value
@@ -1006,9 +1007,10 @@ def _watchdog_sleep_guard_functions(
         if deadline is not None
         else ""
     )
+    if deadline is not None:
+        return "sleep_fold() { " + ceiling + "return 0; }; "
     return (
         "sleep_fold() { "
-        + ceiling
         + f'window="$(/system/bin/getprop {SLEEP_COUNTDOWN_PROPERTY} 2>/dev/null)"; '
         'case "$window" in ""|*[!0-9]*) acc_off_at=""; return 0;; esac; '
         '[ "$window" -gt 0 ] || { acc_off_at=""; return 0; }; '
