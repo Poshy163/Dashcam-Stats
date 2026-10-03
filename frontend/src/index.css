@@ -1,11 +1,33 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss' source(none);
+@config '../tailwind.config.js';
+
+/* Keep the v3 scales used by existing components while the security upgrade removes
+   the old glob dependency chain. Content paths and semantic tokens stay in @config. */
+@theme {
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --radius-sm: 0.125rem;
+  --blur-sm: 4px;
+  --default-ring-width: 3px;
+  --default-ring-color: #3b82f6;
+}
 
 /* Theme tokens are raw RGB triplets so Tailwind's `<alpha-value>` syntax works against
    them (see tailwind.config.js). Light is the base definition; dark overrides only the
    values, never the names, so no component ever needs to know which theme is active. */
 @layer base {
+  *,
+  ::before,
+  ::after,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: #e5e7eb;
+  }
+
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+
   :root {
     --surface: 243 245 249;
     --surface-raised: 255 255 255;
@@ -152,7 +174,7 @@
   .input {
     @apply min-h-10 w-full rounded-lg border border-border bg-surface-raised px-3 py-2 text-sm
            text-content placeholder:text-content-faint
-           shadow-sm transition-all focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20;
+           shadow-sm transition-all focus:border-accent focus:outline-hidden focus:ring-2 focus:ring-accent/20;
   }
 
   .label {
