@@ -210,7 +210,7 @@ export interface IngestStatus {
   ignitionHold: boolean
   /** Why it is being held for the ignition. Null unless held. */
   ignitionHoldReason: string | null
-  /** Quieting was skipped; this does not hold the backup itself. */
+  /** Footage copying is held until required radio shutdown can be verified; idle retries retain the reason. */
   radioQuietingHold?: boolean
   radioQuietingHoldReason?: string | null
   /** Current configured policy; the active ignition-off timer may have latched a different duration. */

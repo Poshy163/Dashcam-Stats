@@ -421,6 +421,9 @@ class FakeController:
         self.calls.append("watchdog-health")
         return type(self).watchdog_ok
 
+    async def quiet_state_verified(self) -> bool:
+        return True
+
     async def disable_bluetooth(self, *, before_change=None) -> bool:
         self.calls.append("watchdog-bluetooth")
         if before_change is not None:
@@ -1208,6 +1211,107 @@ async def test_radio_quieting_refuses_to_run_before_obd_durability_checkpoint(
         assert not row.obd_transfer_complete
         assert not row.bluetooth_disable_attempted and not row.hotspot_disable_attempted
     assert await transition.restore(error="quieting refused")
+
+
+async def test_already_off_radios_are_verified_without_new_disable(db_session, fake_controller):
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path=None,
+        watchdog_deadline_s=120,
+    )
+    transition.controller.capture = AsyncMock(
+        return_value=radio_coordinator.radios.RadioSnapshot(bluetooth="off", hotspot="off")
+    )
+    proof = AsyncMock(return_value=True)
+    transition.controller.quiet_state_verified = proof
+    try:
+        await transition.mark_obd_transfer_complete()
+        await transition.capture_and_quiet()
+        await transition.verify_footage_quiet()
+        assert proof.await_count == 2
+        assert "disable-bluetooth" not in transition.controller.calls
+        assert "disable-hotspot" not in transition.controller.calls
+        assert await transition.restore()
+    finally:
+        await transition.close()
+
+
+@pytest.mark.parametrize("proof_failure", [False, radio_coordinator.adb.AdbError("unreadable")])
+async def test_heartbeat_quiet_proof_loss_cancels_active_copy(
+    db_session, fake_controller, monkeypatch, proof_failure
+):
+    cancelled = asyncio.Event()
+    monkeypatch.setattr(radio_coordinator, "HEARTBEAT_INTERVAL_S", 0.001)
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path=None,
+        watchdog_deadline_s=120,
+        lease_loss_callback=cancelled.set,
+    )
+    proof = AsyncMock(
+        side_effect=proof_failure if isinstance(proof_failure, Exception) else None,
+        return_value=proof_failure,
+    )
+    transition.controller.quiet_state_verified = proof
+    transition._radios_quiet = True
+    try:
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        assert transition.lease_lost
+        with pytest.raises(radio_coordinator.RadioTransitionError, match="lease was lost"):
+            await transition.verify_footage_quiet()
+        assert not transition.controller.released, "ownership remains held until cleanup"
+        assert await transition.restore()
+    finally:
+        await transition.close()
+
+
+async def test_heartbeat_does_not_misclassify_deliberate_restore_as_proof_loss(
+    db_session, fake_controller, monkeypatch
+):
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    renewed = asyncio.Event()
+    cancelled = asyncio.Event()
+    monkeypatch.setattr(radio_coordinator, "HEARTBEAT_INTERVAL_S", 0.001)
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path=None,
+        watchdog_deadline_s=120,
+        lease_loss_callback=cancelled.set,
+    )
+
+    async def read():
+        read_started.set()
+        await release_read.wait()
+        return False
+
+    async def renew():
+        renewed.set()
+
+    transition.controller.quiet_state_verified = read
+    transition._radios_quiet = True
+    monkeypatch.setattr(
+        radio_coordinator.RadioTransition, "_renew_logger_quiesce", lambda _self: renew()
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=1)
+        # restore() clears this before issuing baseline commands, even while a
+        # heartbeat's already-running read is still waiting on the controller.
+        transition._radios_quiet = False
+        release_read.set()
+        await asyncio.wait_for(renewed.wait(), timeout=1)
+        assert not cancelled.is_set()
+        assert not transition.lease_lost
+        assert await transition.restore()
+    finally:
+        release_read.set()
+        await transition.close()
 
 
 async def test_radio_quieting_revalidates_obd_lease_after_watchdog_and_checkpoints(

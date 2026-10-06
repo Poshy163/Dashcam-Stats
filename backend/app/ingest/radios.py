@@ -109,6 +109,35 @@ def new_quieting_allowed() -> bool:
     return allowed
 
 
+async def refresh_quieting_admission(address: str) -> bool:
+    """Recheck a late proof gap without changing the unit's timer or radios.
+
+    Logger finalisation and watchdog preparation can outlive the observation that
+    admitted the transition. One bounded live read may renew that evidence; an
+    unknown deadline, changed boot or cancellation still forbids a new disruption.
+    """
+    from app.config import get_config
+    from app.ingest.status import get_status
+
+    status = get_status()
+    if status.cancel_event.is_set():
+        return False
+    if new_quieting_allowed():
+        return True
+    if status.snapshot()["sleep_countdown_source"] != "unknown":
+        # A known short window (or definite ignition ON) is a refusal, not a
+        # missing observation. Do not replace that reason with an ADB failure.
+        return False
+    observation = await adb.runtime_observation(
+        address, logger_status_path=get_config().obd_remote_status_file
+    )
+    if observation is None:
+        status.unit_observation_failed()
+    elif status.observe_unit_runtime(observation):
+        return False
+    return not status.cancel_event.is_set() and new_quieting_allowed()
+
+
 #: The flag the on-unit watchdog gates on, removed by whichever restore happens first.
 #:
 #: ``/data/local/tmp`` because it is the one place the ``shell`` user can write on an
@@ -591,6 +620,28 @@ async def _ap_interfaces(address: str) -> tuple[str, str] | None:
         elif not separate:
             separate = iface
     return (separate, transport) if parsed_inventory else None
+
+
+async def _transport_is_wifi_station(address: str) -> bool:
+    """Prove the target address belongs to a connected client, not a serving AP."""
+    host = address.partition(":")[0].strip()
+    try:
+        reply = await adb.shell(address, "cmd wifi status", timeout=RADIO_TIMEOUT_S)
+    except adb.AdbError:
+        return False
+    if len(reply) > 16_384:
+        return False
+    for line in reply.splitlines():
+        if not line.strip().startswith("WifiInfo:"):
+            continue
+        # Network names are display data, not station-state fields. Never let text
+        # inside a quoted SSID supply a matching IP or COMPLETED state.
+        fields = re.sub(r'"(?:\\.|[^"\\])*"', '""', line)
+        if re.search(rf",\s*IP:\s*/?{re.escape(host)}(?:,|$)", fields) and re.search(
+            r",\s*Supplicant state:\s*COMPLETED(?:,|$)", fields
+        ):
+            return True
+    return False
 
 
 #: How a soft AP is asked to stop from an unrooted shell — the lever that actually works.
@@ -1926,6 +1977,26 @@ class RadioController:
             )
             return False
 
+    async def quiet_state_verified(self) -> bool:
+        """Read actual radio state without issuing any control command.
+
+        Keep the interface carrying ADB intact, but do not mistake a serving AP for
+        the normal Wi-Fi station. All separate APs must be absent, a Wi-Fi transport
+        must positively be a connected station, and Bluetooth must be off.
+        """
+        async with _lock:
+            bluetooth_on, interfaces, station_transport = await asyncio.gather(
+                _bluetooth_is_on(self.address),
+                _ap_interfaces(self.address),
+                _transport_is_wifi_station(self.address),
+            )
+            return (
+                bluetooth_on is False
+                and interfaces is not None
+                and interfaces[0] == ""
+                and (interfaces[1] == "" or station_transport)
+            )
+
     async def disable_bluetooth(
         self,
         *,
@@ -1933,7 +2004,7 @@ class RadioController:
     ) -> bool:
         """Disable and positively verify Bluetooth, with all legacy recovery guards."""
         async with _lock:
-            if not new_quieting_allowed():
+            if not await refresh_quieting_admission(self.address):
                 return False
             # The remote process must acknowledge that it is alive before Bluetooth is
             # touched. Merely creating a local ``adb`` child is not proof that its shell
@@ -1947,7 +2018,7 @@ class RadioController:
             # no unbounded work between that proof and the first radio side effect.
             if before_change is not None:
                 await before_change()
-            if not new_quieting_allowed():
+            if not await refresh_quieting_admission(self.address):
                 return False
             accepted = await _set_bluetooth(
                 self.address, enable=False, before_attempt=new_quieting_allowed
@@ -1966,7 +2037,7 @@ class RadioController:
     ) -> bool:
         """Stop a separate serving AP and verify its interface disappeared."""
         async with _lock:
-            if not new_quieting_allowed():
+            if not await refresh_quieting_admission(self.address):
                 return False
             if self._hotspot_capsule_path is None:
                 log.warning("hotspot recovery capsule is unavailable; leaving the hotspot on")
@@ -1975,7 +2046,7 @@ class RadioController:
                 return False
             if before_change is not None:
                 await before_change()
-            if not new_quieting_allowed():
+            if not await refresh_quieting_admission(self.address):
                 return False
             stopped, why = await _stop_hotspot(self.address, before_attempt=new_quieting_allowed)
             if stopped:

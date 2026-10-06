@@ -91,7 +91,7 @@ def prepared_unit(monkeypatch, tmp_path, isolated_mirror):
 
 
 @pytest.mark.parametrize("sleep_window", [None, 60])
-async def test_unsafe_sleep_budget_copies_without_claiming_or_quiescing(
+async def test_unsafe_sleep_budget_holds_without_copying_claiming_or_quiescing(
     prepared_unit, monkeypatch, sleep_window
 ):
     from app.ingest.adb import RuntimeObservation
@@ -115,11 +115,11 @@ async def test_unsafe_sleep_budget_copies_without_claiming_or_quiescing(
         ),
     )
     result = await asyncio.wait_for(puller.run_pull(info=prepared_unit.info), timeout=1)
-    assert result.state is RunState.OK
-    assert prepared_unit.path.read_bytes() == prepared_unit.payload
+    assert result.state is RunState.IDLE
+    assert not prepared_unit.path.exists()
     begin.assert_not_awaited()
     assert status.radio_quieting_hold
-    assert "Radios left unchanged" in status.radio_quieting_hold_reason
+    assert "Waiting for radio shutdown" in status.radio_quieting_hold_reason
 
 
 async def test_slow_mirror_cleanup_never_blocks_footage_or_starts_another_mirror(

@@ -49,7 +49,7 @@ const PHASES: Record<IngestStatus['phase'], string> = {
 
 type RadioTone = 'default' | 'ok' | 'warn' | 'error' | 'busy'
 
-function radioSummary(status: IngestRadioStatus, backupRunning: boolean): {
+function radioSummary(status: IngestRadioStatus): {
   title: string
   detail: string
   tone: RadioTone
@@ -97,39 +97,30 @@ function radioSummary(status: IngestRadioStatus, backupRunning: boolean): {
     !!transition && transition.bluetooth.disableVerified && transition.hotspot.disableVerified
   if (transition?.active) {
     if (['restoring_radios', 'resuming_obd'].includes(transition.phase)) {
-      if (backupRunning) {
-        return {
-          title: 'Backup continuing while radios recover',
-          detail:
-            'The quiet-radio safety window ended before the copy did. The remaining files are still transferring while the original radio state is restored and verified.',
-          tone: 'warn',
-        }
-      }
       return {
         title: 'Restoring the original radio state',
-        detail: 'The backup has finished using the quiet-radio window and is verifying recovery.',
+        detail: 'The app is verifying radio restoration before another footage transfer.',
         tone: 'busy',
       }
     }
     if (transition.phase === 'ingesting') {
-      if (changed && restored) {
+      if ((changed && restored) || transition.bluetooth.restoreAttempted || transition.hotspot.restoreAttempted) {
         return {
-          title: 'Backup continuing with radios restored',
-          detail:
-            'The safety deadline restored the radios while the remaining files finish copying.',
+          title: 'Radio window has ended',
+          detail: `${restored ? 'The original radio state has been restored.' : 'Radio restoration has been requested.'} Footage copying requires a new verified radio shutdown.`,
           tone: 'warn',
         }
       }
-      if (!changed && quietVerified) {
+      if (quietVerified) {
         return {
-          title: 'Backup transfer active',
-          detail: 'The radios were already in a safe state, so no change was needed.',
+          title: 'Backup radio window active',
+          detail: 'Bluetooth and the hotspot were verified off before footage copying.',
           tone: 'busy',
         }
       }
       return {
-        title: 'Backup radio window active',
-        detail: 'Any radio changed by the app will be returned to its captured starting state.',
+        title: 'Radio shutdown not confirmed',
+        detail: 'Footage copying requires verified radio shutdown. Waiting for the latest transition evidence.',
         tone: 'busy',
       }
     }
@@ -343,15 +334,20 @@ export default function Backup() {
 
   const liveCountdown = countdown.remainingS
   const hold = backupHold(data)
-  const prediction = countdown.state === 'estimated' && !hold ? data?.sleepWindowPrediction : null
   const eventSequenceGap = obdStatus.data?.eventStream?.sequenceGap ?? 0
   const running = data?.state === 'running'
   const transition = radioStatus.data?.transition
   const recovery = backupRecoveryNotice(transition)
   const restoreOriginalState = transition && unverifiedRadioRestores(transition).some((name) =>
     !transition[name].disableAttempted || transition[name].baseline !== 'on')
-  const recoveryBlocked = !running && transition?.recoveryRequired === true
-  const transitionBusy = !running && transition?.active === true
+  const recoveryBlocked = transition?.recoveryRequired === true
+  const radioWindowEnded = transition?.active === true && transition.phase === 'ingesting' &&
+    (transition.bluetooth.restoreAttempted || transition.hotspot.restoreAttempted)
+  const radioShutdownPending = transition?.active === true && transition.phase === 'ingesting' &&
+    (!transition.bluetooth.disableVerified || !transition.hotspot.disableVerified)
+  const transitionBusy = transition?.active === true && (!running || transition.phase !== 'ingesting' || radioWindowEnded || radioShutdownPending)
+  const copying = running && data?.phase === 'transferring' && !hold && !recoveryBlocked && !transitionBusy
+  const prediction = countdown.state === 'estimated' && !hold && !recoveryBlocked && !transitionBusy ? data?.sleepWindowPrediction : null
   const descriptor = recoveryBlocked
     ? recovery
       ? { label: recovery.label, tone: 'busy' as const }
@@ -359,29 +355,37 @@ export default function Backup() {
     : transitionBusy
       ? recovery
         ? { label: recovery.label, tone: 'busy' as const }
-        : ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
-          ? { label: 'Restoring radios', tone: 'busy' as const }
-          : { label: 'Preparing backup', tone: 'busy' as const }
+        : radioWindowEnded
+          ? { label: 'Ending backup', tone: 'busy' as const }
+          : radioShutdownPending
+            ? { label: 'Waiting for radio shutdown', tone: 'busy' as const }
+            : ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
+              ? { label: 'Restoring radios', tone: 'busy' as const }
+              : { label: 'Preparing backup', tone: 'busy' as const }
       : hold
         ? { label: hold.label, tone: 'warn' as const }
         : data
           ? ['idle', 'ok'].includes(data.state)
             ? { label: backupIdleLabel(data), tone: data.backlogKnown && data.backlogFiles === 0 ? 'ok' as const : 'default' as const }
-            : STATES[data.state] ?? STATES.idle
+            : running
+              ? { label: data.phase === 'idle' ? 'Preparing backup' : PHASES[data.phase], tone: 'busy' as const }
+              : STATES[data.state] ?? STATES.idle
           : { label: 'Checking', tone: 'busy' as const }
-  const statusHint = running && data
-    ? PHASES[data.phase]
-    : recoveryBlocked
+  const statusHint = recoveryBlocked
+    ? recovery
+      ? 'New backups wait until recovery is confirmed'
+      : 'No backup will start until radio restoration is confirmed'
+    : transitionBusy
       ? recovery
-        ? 'New backups wait until recovery is confirmed'
-        : 'No backup will start until radio restoration is confirmed'
-      : transitionBusy
-        ? recovery
-          ? 'Confirming recovery and logger operation'
-          : ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
-            ? 'Verifying the original radio state'
-            : 'Making the radio transition safe'
-        : hold?.reason
+        ? 'Confirming recovery and logger operation'
+        : radioWindowEnded
+          ? 'The radio window has ended; finishing backup cleanup'
+          : radioShutdownPending
+            ? 'Waiting for the latest radio shutdown evidence'
+            : ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
+              ? 'Verifying the original radio state'
+              : 'Making the radio transition safe'
+      : hold?.reason ?? (running && data ? PHASES[data.phase] : undefined)
   const backlogKnown = data?.backlogKnown === true
   const backlogHint = backlogKnown && data
     ? `${data.backlogFiles} file${data.backlogFiles === 1 ? '' : 's'}`
@@ -396,11 +400,11 @@ export default function Backup() {
   const quietingNotice = radioQuietingNotice(data, transition)
   const radio = quietingNotice
     ? {
-      title: 'Radios left unchanged',
-      detail: `${quietingNotice} Backup can continue without switching Bluetooth or the hotspot off.`,
-      tone: 'default' as const,
+      title: 'Waiting for radio shutdown',
+      detail: `${quietingNotice} Footage copying waits until radio shutdown is verified. The app will retry while the dashcam remains connected.`,
+      tone: 'warn' as const,
     }
-    : radioStatus.data ? radioSummary(radioStatus.data, running) : null
+    : radioStatus.data ? radioSummary(radioStatus.data) : null
   const radioToneClass =
     radio?.tone === 'error'
       ? 'border-state-error/50'
@@ -612,15 +616,15 @@ export default function Backup() {
         />
         <StatTile
           label="Speed"
-          value={running ? `${(data?.speedMbsRecent ?? 0).toFixed(1)} MB/s` : '—'}
+          value={copying ? `${(data?.speedMbsRecent ?? 0).toFixed(1)} MB/s` : '—'}
           hint={
-            running
+            copying
               ? data?.etaSeconds
                 ? `${formatDuration(data.etaSeconds)} left`
                 : 'off the head unit'
               : undefined
           }
-          tone={running ? 'busy' : 'default'}
+          tone={copying ? 'busy' : 'default'}
         />
         <StatTile
           label="Wi-Fi"
@@ -704,7 +708,7 @@ export default function Backup() {
         <div className="card mb-6 px-5 py-4">
           <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
-              <span>{PHASES[data.phase]}</span>
+              <span>{hold || recoveryBlocked || transitionBusy ? descriptor.label : PHASES[data.phase]}</span>
               {data.filesTotal > 0 && (
                 <span className="font-normal text-content-muted">
                   {data.filesDone} of {data.filesTotal} files
@@ -766,7 +770,7 @@ export default function Backup() {
         </div>
       )}
 
-      {data?.lastError && !running && !data.wifiBandHold && (
+      {data?.lastError && !running && !data.wifiBandHold && !(data.state === 'idle' && data.radioQuietingHold) && (
         <div className="card mb-6 px-5 py-4 text-sm">
           <div className="font-medium text-state-warn">Last attempt reported a problem</div>
           <div className="mt-1 break-words text-content-muted">{data.lastError}</div>

@@ -179,17 +179,17 @@ test('Wi-Fi reports observed band and frequency without claiming transfer speed'
 test('Backup displays the on-unit estimate reason and preserves the one-minute quieting warning', async t => {
   const reason = 'Estimated from ignition-off timing recorded by the dashcam; its timer can differ.'
   const root = await mountBackup(t, status({
-    state: 'running', phase: 'transferring', sleepCountdownRemainingS: 60,
+    state: 'running', phase: 'preparing', sleepCountdownRemainingS: 60,
     sleepCountdownEvidenceSource: 'unit', sleepCountdownReason: reason,
     radioQuietingHold: true,
     radioQuietingHoldReason: 'At most one minute remains in the estimated sleep window.',
   }), { quietingEnabled: true, transition: null })
   assert.equal(root.root.findByProps({ label: 'Estimated sleep' }).props.hint, reason)
-  assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Copying')
+  assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Waiting for radio shutdown')
   const text = JSON.stringify(root.toJSON())
   assert.match(text, /At most one minute remains/)
-  assert.match(text, /Radios left unchanged/)
-  assert.match(text, /Backup can continue/)
+  assert.match(text, /Footage copying waits until radio shutdown is verified/)
+  assert.doesNotMatch(text, /Backup can continue/)
   assert.ok(root.root.findAllByType('span').some(span => span.props.title?.startsWith(reason)), 'active countdown tooltip uses the same evidence explanation')
 })
 
@@ -261,18 +261,32 @@ test('dashboard hold reasons outrank optimistic predictions and stale data never
   assert.doesNotMatch(JSON.stringify(root.toJSON()), /Estimated sleep:/)
 })
 
-test('skipped quieting explains unchanged radios while backup stays Copying', async t => {
-  const reason = 'The remaining sleep window is not known.'
-  const root = await mountBackup(t, status({ state: 'running', phase: 'transferring', radioQuietingHold: true, radioQuietingHoldReason: reason }), { quietingEnabled: true, transition: null })
-  assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Copying')
-  const text = JSON.stringify(root.toJSON())
-  assert.match(text, /Radios left unchanged/)
-  assert.match(text, /The remaining sleep window is not known/)
-  assert.match(text, /Backup can continue without switching Bluetooth or the hotspot off/)
-  assert.doesNotMatch(text, /Radio quieting is ready|Waiting for backup/)
+test('radio admission holds stay Waiting through idle retry and suppress error and fit claims on both pages', async t => {
+  const reason = 'Waiting for radio shutdown: the remaining sleep window is not known.'
+  for (const state of ['running', 'idle']) {
+    const data = status({ state, phase: state === 'running' ? 'preparing' : 'idle',
+      backlogKnown: true, radioQuietingHold: true, radioQuietingHoldReason: reason, lastError: reason,
+      sleepWindowPrediction: { willPass: true, headroomS: 90, estimatedDurationS: 30, summary: 'Will complete with headroom' },
+    })
+    const root = await mountBackup(t, data, { quietingEnabled: true, transition: null })
+    assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Waiting for radio shutdown')
+    assert.equal(root.root.findByProps({ label: 'Status' }).props.hint, reason)
+    assert.equal(root.root.findByProps({ label: 'Speed' }).props.value, '—')
+    const text = JSON.stringify(root.toJSON())
+    assert.match(text, /Footage copying waits until radio shutdown is verified/)
+    assert.match(text, /will retry while the dashcam remains connected/)
+    assert.doesNotMatch(text, /Backup can continue|Last attempt reported a problem|Radio quieting is ready|Up to date|Will complete with headroom|Likely fits|verified off/)
+    let dashboard
+    await act(async () => { dashboard = create(React.createElement(MemoryRouter, null, React.createElement(DashcamStatusBanner, { status: data, receivedAt: Date.now() }))) })
+    t.after(async () => act(async () => dashboard.unmount()))
+    const banner = JSON.stringify(dashboard.toJSON())
+    assert.match(banner, /Waiting for radio shutdown/)
+    assert.match(banner, /remaining sleep window is not known/)
+    assert.doesNotMatch(banner, /Dashcam backup in progress|Will complete with headroom/)
+  }
 })
 
-test('recovery and active transitions outrank skipped-quieting notices; finished and offline runs hide them', async t => {
+test('recovery and active transitions outrank radio holds; finished and offline runs hide them', async t => {
   const radio = { baseline: 'on', disableAttempted: true, disableVerified: true, restoreAttempted: false, restoreVerified: false }
   const transition = {
     phase: 'ingesting', active: true, recoveryRequired: false, bluetooth: radio, hotspot: radio,
@@ -283,12 +297,16 @@ test('recovery and active transitions outrank skipped-quieting notices; finished
     [{}, { ...transition, active: false, recoveryRequired: true }, /may still be off/],
     [{}, transition, /Backup radio window active/],
     [{ state: 'ok' }, null, /Radio quieting is ready/],
+    [{ state: 'error' }, null, /Radio quieting is ready/],
+    [{ state: 'cancelled' }, null, /Radio quieting is ready/],
     [{ unitOnline: false }, null, /Radio quieting is ready/],
   ]) {
     const root = await mountBackup(t, status({ state: 'running', radioQuietingHold: true, radioQuietingHoldReason: 'Sleep deadline unknown.', ...overrides }), { quietingEnabled: true, transition: evidence })
     const text = JSON.stringify(root.toJSON())
-    assert.doesNotMatch(text, /Radios left unchanged|Sleep deadline unknown/)
+    // The radio card keeps active recovery evidence instead of replacing it with the hold.
+    assert.doesNotMatch(text, /Footage copying waits until radio shutdown is verified/)
     assert.match(text, expected)
+    if (overrides.state || overrides.unitOnline === false) assert.doesNotMatch(text, /Sleep deadline unknown/)
   }
 })
 
@@ -308,11 +326,38 @@ test('pending radio capture reports awaiting or reading instead of a completed f
     const transition = recoveryTransition({ phase, recoveryRequired: false, bluetooth: unknown, hotspot: unknown })
     const root = await mountBackup(t, status({ state: 'running', phase: 'preparing' }), { quietingEnabled: true, transition })
     const text = JSON.stringify(root.toJSON())
+    assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Preparing backup')
+    assert.equal(root.root.findByProps({ label: 'Speed' }).props.value, '—')
     assert.match(text, /Preparing a safe radio transition/)
     assert.match(text, new RegExp(`${phase === 'capturing_radio_state' ? 'Reading' : 'Awaiting'} Bluetooth`))
     assert.match(text, new RegExp(`${phase === 'capturing_radio_state' ? 'Reading' : 'Awaiting'} Hotspot`))
     assert.doesNotMatch(text, /could not be read|left untouched|did not need to change/)
   }
+})
+
+test('an unverified shutdown cannot claim the radios are off, and restoration never claims copying continues', async t => {
+  const off = { baseline: 'on', disableAttempted: true, disableVerified: true, restoreAttempted: false, restoreVerified: false }
+  for (const [phase, hotspot, label, expected] of [
+    ['ingesting', { ...off, disableVerified: false }, 'Waiting for radio shutdown', /Radio shutdown not confirmed/],
+    ['restoring_radios', { ...off, restoreAttempted: true }, 'Restoring radios', /Restoring the original radio state/],
+    ['ingesting', { ...off, restoreAttempted: true, restoreVerified: true }, 'Ending backup', /Radio window has ended/],
+  ]) {
+    const transition = recoveryTransition({ phase, recoveryRequired: false, bluetooth: off, hotspot })
+    const root = await mountBackup(t, status({ state: 'running', phase: 'transferring' }), { quietingEnabled: true, transition })
+    assert.equal(root.root.findByProps({ label: 'Status' }).props.value, label)
+    assert.equal(root.root.findByProps({ label: 'Speed' }).props.value, '—')
+    const text = JSON.stringify(root.toJSON())
+    assert.match(text, expected)
+    assert.doesNotMatch(text, /Backup continuing|remaining files.*still transferring|Bluetooth and the hotspot were verified off/)
+  }
+})
+
+test('disabled radio quieting leaves normal transfer presentation unchanged', async t => {
+  const root = await mountBackup(t, status({ state: 'running', phase: 'transferring', speedMbsRecent: 6 }), { quietingEnabled: false, transition: null })
+  assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Copying')
+  assert.equal(root.root.findByProps({ label: 'Speed' }).props.value, '6.0 MB/s')
+  assert.match(JSON.stringify(root.toJSON()), /Radio quieting is off/)
+  assert.doesNotMatch(JSON.stringify(root.toJSON()), /Waiting for radio shutdown|verified off/)
 })
 
 test('captured state during preparation does not prematurely claim the radio was left unchanged', async t => {
@@ -355,7 +400,7 @@ test('confirmed radios with logger recovery pending never claim a radio is off o
 test('active recovery with restored radios gets recovery wording even without a recovery-required flag', async t => {
   for (const state of ['idle', 'running']) {
     const root = await mountBackup(t, status({ state }), { quietingEnabled: true, transition: recoveryTransition({ recoveryRequired: false }) })
-    assert.equal(root.root.findByProps({ label: 'Status' }).props.value, state === 'running' ? 'Copying' : 'Finishing backup recovery')
+    assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Finishing backup recovery')
     const text = JSON.stringify(root.toJSON())
     assert.match(text, /Finishing backup recovery/)
     assert.doesNotMatch(text, /Restoring the original radio state|Backup continuing while radios recover/)

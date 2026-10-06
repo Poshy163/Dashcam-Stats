@@ -30,22 +30,25 @@ export function backupRecoveryNotice(transition: IngestRadioStatus['transition']
 }
 
 export function radioQuietingNotice(status: IngestStatus | undefined, transition: IngestRadioStatus['transition'] | undefined): string | null {
-  if (!status?.unitOnline || status.state !== 'running' || !status.radioQuietingHold ||
+  if (!status?.unitOnline || !['idle', 'running'].includes(status.state) || !status.radioQuietingHold ||
       transition?.recoveryRequired || transition?.active) return null
-  return status.radioQuietingHoldReason || 'The remaining awake time is too short or not known.'
+  return status.radioQuietingHoldReason || 'Waiting for fresh sleep timing and verified radio shutdown before copying footage.'
 }
 
 export function backupHold(status: IngestStatus | undefined): { label: string; reason: string } | null {
-  if (!status?.unitOnline || status.state === 'running' || status.state === 'disabled') return null
-  if (status.ignitionHold) {
+  if (!status?.unitOnline || status.state === 'disabled') return null
+  if (status.state !== 'running' && status.ignitionHold) {
     return {
       label: status.ignitionState === 'on' ? 'Waiting for ignition off' : 'Waiting for ignition status',
       reason: status.ignitionHoldReason || 'Backup waits until the dashcam confirms the ignition is off.',
     }
   }
-  if (status.wifiBandHold) {
+  if (status.state !== 'running' && status.wifiBandHold) {
     return { label: 'Waiting for 5 GHz WiFi', reason: status.wifiBandHoldReason || 'Backup is waiting for a 5 GHz connection.' }
   }
+  const radioReason = radioQuietingNotice(status, null)
+  if (radioReason) return { label: 'Waiting for radio shutdown', reason: radioReason }
+  if (status.state === 'running') return null
   if (status.arrivalHold) {
     return { label: 'Waiting after startup', reason: status.arrivalHoldReason || 'Automatic backup waits until the dashcam has been running long enough.' }
   }

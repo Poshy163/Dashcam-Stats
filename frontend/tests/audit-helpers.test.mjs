@@ -72,6 +72,10 @@ test('operational warnings distinguish an offline car from failed or stale backu
   assert.equal(backupAttention({ ...normal, backlogFiles: 3, lastSuccessTs: '2026-09-28T12:00:00Z' }, now).length, 1)
   assert.equal(backupAttention({ ...normal, backlogFiles: 3, lastSuccessTs: '2026-09-30T11:00:00Z' }, now).length, 0)
   assert.equal(backupAttention({ ...normal, state: 'running', lastError: 'previous failure' }, now).length, 0)
+  const radioHold = { ...normal, state: 'idle', radioQuietingHold: true, lastError: 'Waiting for radio shutdown: sleep timing unknown' }
+  assert.deepEqual(backupAttention(radioHold, now), [], 'an admission hold is not a failed backup')
+  assert.equal(backupAttention({ ...radioHold, backlogFiles: 3, lastSuccessTs: '2026-09-28T12:00:00Z' }, now).length, 1, 'a radio hold does not hide stale backlog')
+  assert.equal(backupAttention({ ...radioHold, state: 'error' }, now).length, 1, 'a stale hold flag cannot hide a terminal error')
   assert.equal(capacityExceeded(459, 200), true)
   assert.equal(capacityExceeded(459, 0), false)
   assert.equal(capacityExceeded(NaN, 200), false)

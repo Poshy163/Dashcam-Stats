@@ -213,9 +213,10 @@ async def test_automatic_run_waits_before_claim_and_uses_refreshed_ownership(
     begin = AsyncMock(side_effect=claim)
     monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
     result = await asyncio.wait_for(puller.run_pull(info=prepared_unit.info), 1)
-    assert result.state is RunState.OK
+    assert result.state is RunState.IDLE
     begin.assert_awaited_once()
-    assert prepared_unit.path.read_bytes() == prepared_unit.payload
+    assert not prepared_unit.path.exists()
+    assert not prepared_unit.transferred.is_set()
 
 
 async def test_pending_recovery_precedes_first_evidence_wait(prepared_unit, monkeypatch):
@@ -255,8 +256,8 @@ async def test_unresolved_grace_never_claims_radios_and_respects_stop(
     begin = AsyncMock(side_effect=AssertionError("no usable deadline"))
     monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
     result = await asyncio.wait_for(puller.run_pull(info=prepared_unit.info), 1)
-    assert result.state is (RunState.CANCELLED if cancel else RunState.OK)
-    assert prepared_unit.transferred.is_set() is (not cancel)
+    assert result.state is (RunState.CANCELLED if cancel else RunState.IDLE)
+    assert not prepared_unit.transferred.is_set()
     assert status.radio_quieting_hold is (not cancel)
     assert read.await_count >= 1
     begin.assert_not_awaited()

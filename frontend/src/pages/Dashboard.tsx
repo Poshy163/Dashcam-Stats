@@ -415,7 +415,7 @@ export function DashcamStatusBanner({ status, receivedAt, requestFailed = false 
         <div>
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-sm font-bold tracking-tight text-content">
-              {!status.unitOnline ? 'Dashcam not connected' : running ? 'Dashcam backup in progress' : hold?.label ?? 'Dashcam connected'}
+              {!status.unitOnline ? 'Dashcam not connected' : hold?.label ?? (running ? 'Dashcam backup in progress' : 'Dashcam connected')}
             </h3>
             {status.wifiFrequencyMhz && (
               <span

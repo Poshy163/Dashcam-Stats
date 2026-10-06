@@ -205,7 +205,10 @@ async def test_lost_lease_prevents_recovery(monkeypatch, tmp_path, status):
             host="unit",
             port=9000,
             timeout_s=60,
-            lease=SimpleNamespace(raise_if_lease_lost=check),
+            lease=SimpleNamespace(
+                raise_if_lease_lost=check,
+                verify_footage_quiet=AsyncMock(),
+            ),
         )
     probe.assert_not_called()
 

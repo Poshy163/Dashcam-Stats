@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 
 import pytest
 
@@ -178,22 +179,73 @@ async def test_a_failure_reaches_the_transfer_at_the_next_chunk():
 
 
 async def test_discard_abandons_the_queue_without_raising():
-    """The window shut. The second commit pass is what picks those files up."""
+    """Drop queued work while preserving ownership of the active handler."""
     release = asyncio.Event()
+    started = asyncio.Event()
     handled: list[str] = []
 
     async def handler(chunk):
+        started.set()
         await release.wait()
         handled.append(chunk[0])
 
     pipeline = _CommitPipeline(handler, depth=3)
     pipeline.start()
     await pipeline.submit(_chunk("a"))
+    await asyncio.wait_for(started.wait(), timeout=1)
     await pipeline.submit(_chunk("b"))
 
-    # Returns rather than waiting on a handler that a dead link will never finish.
-    await asyncio.wait_for(pipeline.close(discard=True), timeout=2)
-    assert handled == []
+    closing = asyncio.create_task(pipeline.close(discard=True))
+    try:
+        await asyncio.sleep(0)
+        assert not closing.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(closing, timeout=2)
+    assert handled == ["a"]
+
+
+@pytest.mark.parametrize("cancellations", [1, 2])
+async def test_cancelled_discard_waits_for_active_filesystem_thread(tmp_path, cancellations):
+    """Caller cancellation cannot release shared staging while a commit still runs."""
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    handled = []
+    target = tmp_path / "committed.ts"
+
+    def slow_commit():
+        started.set()
+        assert release.wait(3), "test did not release the filesystem worker"
+        target.write_bytes(b"complete")
+        finished.set()
+
+    async def handler(chunk):
+        await asyncio.to_thread(slow_commit)
+        handled.append(chunk[0])
+
+    pipeline = _CommitPipeline(handler, depth=2)
+    pipeline.start()
+    await pipeline.submit(_chunk("active"))
+    assert await asyncio.to_thread(started.wait, 1)
+    await pipeline.submit(_chunk("queued"))
+    closing = asyncio.create_task(pipeline.close(discard=True))
+    try:
+        await asyncio.sleep(0)
+        for _ in range(cancellations):
+            closing.cancel()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert not closing.done(), "cleanup escaped before the filesystem worker settled"
+            assert not finished.is_set()
+            assert not target.exists()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert await asyncio.to_thread(finished.wait, 1)
+    assert handled == ["active"], "queued work must remain discarded"
+    assert target.read_bytes() == b"complete"
 
 
 async def test_discard_swallows_a_failure_that_was_already_recorded():

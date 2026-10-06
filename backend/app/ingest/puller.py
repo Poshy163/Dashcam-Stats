@@ -290,6 +290,20 @@ async def _await_quieting_evidence(address: str, logger_status: dict | None) -> 
     return logger_status
 
 
+def _radio_shutdown_hold(reason: object) -> RunResult:
+    """Keep requested quieting mandatory while allowing the poller's safe retry."""
+    status = get_status()
+    if status.cancel_event.is_set():
+        return RunResult(state=RunState.CANCELLED, error="the transfer was cancelled")
+    text = str(reason or "").strip()[:1000] or "radio state could not be verified"
+    text = text.removeprefix("Radios left unchanged: ")
+    if not text.startswith("Waiting for radio shutdown:"):
+        text = f"Waiting for radio shutdown: {text}"
+    status.set_radio_quieting_hold(text)
+    log.info("holding footage until radio shutdown is verified", reason=text)
+    return RunResult(state=RunState.IDLE)
+
+
 async def widen_sleep_window(address: str) -> bool:
     """Give the unit a long ignition-off window, because the app is here to use it.
 
@@ -688,13 +702,33 @@ class _CommitPipeline:
         self._worker = None
         if worker is None:
             return
-        try:
-            if not discard:
-                await self._queue.join()
-        finally:
+        if discard:
+            # Drop only work that has not started. The current handler may be
+            # inside an uninterruptible commit thread; let it settle before
+            # salvage or restoration releases this run's ownership.
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                self._queue.task_done()
+
+        async def settle() -> None:
+            await self._queue.join()
             worker.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await worker
+
+        settling = asyncio.create_task(settle(), name="ingest-commit-settle")
+        cancelled = False
+        while not settling.done():
+            try:
+                await asyncio.shield(settling)
+            except asyncio.CancelledError:
+                cancelled = True
+        settling.result()
+        if cancelled:
+            raise asyncio.CancelledError
         if not discard:
             self._raise_if_failed()
 
@@ -751,6 +785,10 @@ async def _move(
     first lot was moving.
     """
     status = get_status()
+    if files and bool(_get("quiet_radios", False)) and lease is None:
+        raise radio_coordinator.RadioTransitionError(
+            "requested radio shutdown has not been verified for footage transfer"
+        )
     # Seeded complete; `_absorb` ANDs each batch onto it.
     transferred = transport.TransferResult(complete=True)
     # One recovery per pass, never one per chunk. A bad link must not consume the
@@ -776,6 +814,12 @@ async def _move(
                 # Only restart this tar listener. Disconnect/root would also tear down
                 # other ADB work and must never be part of in-flight recovery.
                 await adb.clear_listener(info.address)
+                if lease is not None:
+                    await lease.verify_footage_quiet()
+                if status.cancel_event.is_set():
+                    batch_result.complete = False
+                    batch_result.error = "the transfer was cancelled"
+                    break
                 listener = await adb.launch_listener(
                     info.address,
                     directory,
@@ -854,6 +898,7 @@ async def _rescue_partials(
     timeout_s: int,
     unit_now: int,
     already_seen: set[str] | None = None,
+    lease: radio_coordinator.RadioTransition | None = None,
 ) -> tuple[list[RemoteFile], list[str], dict[str, int]]:
     """Recover cut-short recordings the camera never finished. Best-effort by contract.
 
@@ -903,7 +948,9 @@ async def _rescue_partials(
         megabytes=round(sum(item.size for item in candidates) / 1e6),
     )
     get_status().extend_plan(DeltaPlan(files=candidates))
-    await _move(info, candidates, staging=staging, host=host, port=port, timeout_s=timeout_s)
+    await _move(
+        info, candidates, staging=staging, host=host, port=port, timeout_s=timeout_s, lease=lease
+    )
 
     expected: dict[str, int] = {}
     by_target: dict[str, RemoteFile] = {}
@@ -928,7 +975,9 @@ async def _rescue_partials(
             names=committed[:5],
         )
         if bool(_get("delete_after_verify", False)):
-            await _reclaim(info, [by_target[name] for name in committed if name in by_target])
+            await _reclaim(
+                info, [by_target[name] for name in committed if name in by_target], lease=lease
+            )
     rescued = [by_target[name] for name in committed if name in by_target]
     return rescued, committed, {name: expected[name] for name in committed if name in expected}
 
@@ -1532,6 +1581,10 @@ async def _run_pull_started(
     obd_inventory_ok = True
     obd_transfer_error: Exception | None = None
     obd_events: asyncio.Task[EventSyncResult] | None = None
+    committed: list[str] = []
+    expected: dict[str, int] = {}
+    initial_backlog_sizes: dict[str, int] = {}
+    interrupted_error: str | None = None
 
     try:
         # Only if nobody has already looked. The presence poll describes the unit
@@ -1683,6 +1736,9 @@ async def _run_pull_started(
             newest_first=str(_get("transfer_order", "oldest_first")) == "newest_first",
             now=time.time() + skew,
         )
+        # Growth filtering removes candidates but leaves their backlog intact.
+        # Remember them first so a later sweep cannot count the same file twice.
+        initial_backlog_sizes = {item.name: item.size for item in plan.files}
         # A second opinion on which files are still open, from two sizes rather than one
         # timestamp. Only when there is something to fetch, so an idle window still costs
         # exactly one listing.
@@ -1769,9 +1825,8 @@ async def _run_pull_started(
                 result = RunResult(state=RunState.CANCELLED)
                 return result
         if quiet_requested and not radios.new_quieting_allowed():
-            # Footage can still be copied with the radios unchanged. Do not pause the
-            # logger or claim a new radio transition when sleep may be imminent.
-            quiet_requested = False
+            result = _radio_shutdown_hold(status.radio_quieting_hold_reason)
+            return result
         logger_owns_bluetooth = _obd_logger_owns_bluetooth(observed_logger)
         logger_can_quiesce = obd_control.supports_quiesce(observed_logger)
         logger_status_authoritative = _obd_logger_status_is_authoritative(observed_logger)
@@ -1785,12 +1840,16 @@ async def _run_pull_started(
                 "leaving the unit's radios on because OBD logger ownership could not be read",
                 logger_state=(observed_logger or {}).get("state"),
             )
+            result = _radio_shutdown_hold("OBD logger ownership could not be read")
+            return result
         elif quiet_requested and logger_owns_bluetooth and not logger_can_quiesce:
             log.info(
                 "leaving the unit's radios on because the OBD logger owns Bluetooth "
                 "and does not support ingestion quiescence",
                 logger_state=(observed_logger or {}).get("state"),
             )
+            result = _radio_shutdown_hold("the OBD logger cannot safely pause Bluetooth")
+            return result
         elif quiet_requested:
             delay = max(0.0, radios.QUIET_AFTER_ONLINE_S - status.online_for())
             if delay:
@@ -1809,13 +1868,15 @@ async def _run_pull_started(
                 # A second process must not inventory/copy/delete the same card while the
                 # first owns radio state. IDLE keeps this visit retryable after recovery.
                 log.warning("another ingest owns the device radios; postponing this pull")
-                result = RunResult(state=RunState.IDLE, error=str(exc))
+                result = _radio_shutdown_hold(exc)
                 return result
             except radio_coordinator.RadioTransitionError as exc:
                 log.warning(
                     "could not establish crash-safe radio ownership; leaving radios on",
                     error=str(exc),
                 )
+                result = _radio_shutdown_hold(exc)
+                return result
 
             if radio_transition is not None and logger_owns_bluetooth:
                 try:
@@ -1840,15 +1901,12 @@ async def _run_pull_started(
                     )
                     restored = await _restore_radio_transition(radio_transition, error=exc)
                     radio_transition = None
-                    if not restored:
-                        # A failed restore can mean the logger is still paused even when
-                        # no radio command was attempted.  Do not start a large transfer
-                        # while the durable transition is explicitly awaiting recovery.
-                        result = RunResult(
-                            state=RunState.IDLE,
-                            error="OBD logger/radio recovery could not be verified",
-                        )
-                        return result
+                    result = _radio_shutdown_hold(
+                        f"logger preparation failed: {exc}"
+                        if restored
+                        else "OBD logger/radio recovery could not be verified"
+                    )
+                    return result
 
         # Small immutable OBD archives go first so the drive survives even if the unit's
         # short post-ignition window closes partway through the much larger footage set.
@@ -1910,12 +1968,12 @@ async def _run_pull_started(
                 )
                 restored = await _restore_radio_transition(radio_transition, error=exc)
                 radio_transition = None
-                if not restored:
-                    result = RunResult(
-                        state=RunState.IDLE,
-                        error="OBD backup recovery could not be verified",
-                    )
-                    return result
+                result = _radio_shutdown_hold(
+                    f"OBD backup must complete before shutdown: {exc}"
+                    if restored
+                    else "OBD backup recovery could not be verified"
+                )
+                return result
 
         if not plan.files:
             if obd_result is not None and (obd_result.copied or obd_result.duplicates):
@@ -1949,14 +2007,6 @@ async def _run_pull_started(
             log.error("refusing to transfer into an unsafe footage directory", reason=why)
             return result
 
-        # Fired, not awaited. This is an httpx POST with a ten-second timeout standing
-        # between a decided transfer and its first byte, and the one failure it has in
-        # practice -- an unreachable webhook host -- is precisely the one that takes the
-        # full ten seconds. At 34 MB/s that is 340 MB of footage left on the card so a
-        # notification could go out marginally sooner. Nothing downstream reads its result.
-        if not continuation:
-            _fire_and_forget(report_event("started", plan=plan))
-
         # Only the first pull of a visit may take the screen over.  The actual launch is
         # deferred until immediately before the transfer starts, after the OBD/radio gates;
         # that way a safety refusal does not show a misleading copying screen.
@@ -1982,7 +2032,7 @@ async def _run_pull_started(
         port = int(_get("data_port", 9000))
         host = info.address.split(":", 1)[0]
         timeout_s = int(_get("listen_timeout_s", 180))
-        status.set_phase(Phase.TRANSFERRING)
+        status.set_phase(Phase.PREPARING)
 
         # Awaited, and only after logger finalisation plus OBD bundle backup.  The previous
         # background task raced this first bulk read and could still be in its ten-second
@@ -1996,14 +2046,25 @@ async def _run_pull_started(
                 log.warning(
                     "could not safely quiet radios; restoring before transfer", error=str(exc)
                 )
+                reason = status.radio_quieting_hold_reason or str(exc)
                 restored = await _restore_radio_transition(radio_transition, error=exc)
                 radio_transition = None
-                if not restored:
-                    result = RunResult(
-                        state=RunState.IDLE,
-                        error="radio recovery could not be verified before transfer",
-                    )
-                    return result
+                result = _radio_shutdown_hold(
+                    reason if restored else "radio recovery could not be verified before transfer"
+                )
+                return result
+
+        if quiet_requested and radio_transition is None:
+            result = _radio_shutdown_hold("radio shutdown has not been verified")
+            return result
+        if status.cancel_event.is_set():
+            result = RunResult(state=RunState.CANCELLED)
+            return result
+        status.set_phase(Phase.TRANSFERRING)
+        if not continuation:
+            # A radio hold is not a started copy. Notifications remain asynchronous
+            # and are emitted only after every footage admission check succeeds.
+            _fire_and_forget(report_event("started", plan=plan))
 
         if display:
             display_task = asyncio.create_task(
@@ -2012,8 +2073,7 @@ async def _run_pull_started(
             )
 
         chunk_size = int(_get("chunk_size", 5))
-        committed: list[str] = []
-        expected: dict[str, int] = {item.name: item.size for item in plan.files}
+        expected = {item.name: item.size for item in plan.files}
         wanted = list(plan.files)
 
         async def _commit_and_reclaim_chunk(chunk: list[RemoteFile]) -> None:
@@ -2112,6 +2172,11 @@ async def _run_pull_started(
             )
             status.extend_plan(more)
             status.set_phase(Phase.TRANSFERRING)
+            more_expected = {item.name: item.size for item in more.files}
+            # Keep this inventory before receiving: a quiet-state failure between
+            # chunks must still salvage complete files from the current sweep.
+            expected.update(more_expected)
+            wanted.extend(more.files)
             part = await _move(
                 info,
                 more.files,
@@ -2125,7 +2190,6 @@ async def _run_pull_started(
             )
             _absorb(transferred, part)
             status.set_phase(Phase.VERIFYING)
-            more_expected = {item.name: item.size for item in more.files}
             remaining_more = {
                 name: size for name, size in more_expected.items() if name not in set(committed)
             }
@@ -2140,8 +2204,6 @@ async def _run_pull_started(
                         to_reclaim = [by_name[name] for name in more_committed if name in by_name]
                         if to_reclaim:
                             await _reclaim(info, to_reclaim, lease=radio_transition)
-            expected.update(more_expected)
-            wanted.extend(more.files)
 
         # The rescue: cut-short recordings stranded outside Video by a power cut. After
         # the sweeps, while the link is still proven good, and only on a run that has not
@@ -2164,6 +2226,7 @@ async def _run_pull_started(
                     timeout_s=timeout_s,
                     unit_now=int(time.time() + skew),
                     already_seen=await removed,
+                    lease=radio_transition,
                 )
                 if radio_transition is not None:
                     radio_transition.raise_if_lease_lost()
@@ -2293,32 +2356,12 @@ async def _run_pull_started(
         result.error = "backup cancelled"
         raise
     except adb.AdbError as exc:
-        salvage_plan = locals().get("plan")
-        salvage_committed = locals().get("committed", [])
-        if salvage_plan is not None and getattr(salvage_plan, "files", None) and staging.is_dir():
-            remaining_expected = {
-                item.name: item.size
-                for item in salvage_plan.files
-                if item.name not in set(salvage_committed)
-            }
-            if remaining_expected:
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(commit, staging, footage, remaining_expected)
-        result = RunResult(state=RunState.ERROR, error=str(exc))
+        interrupted_error = str(exc)
+        result = RunResult(state=RunState.ERROR, error=interrupted_error)
         log.warning("the control channel failed during a pull", error=str(exc))
     except Exception as exc:
-        salvage_plan = locals().get("plan")
-        salvage_committed = locals().get("committed", [])
-        if salvage_plan is not None and getattr(salvage_plan, "files", None) and staging.is_dir():
-            remaining_expected = {
-                item.name: item.size
-                for item in salvage_plan.files
-                if item.name not in set(salvage_committed)
-            }
-            if remaining_expected:
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(commit, staging, footage, remaining_expected)
-        result = RunResult(state=RunState.ERROR, error=f"{type(exc).__name__}: {exc}")
+        interrupted_error = f"{type(exc).__name__}: {exc}"
+        result = RunResult(state=RunState.ERROR, error=interrupted_error)
         log.exception("the ingest run failed", error=str(exc))
     finally:
         # This task alone is optional observability: its database cleanup may
@@ -2348,6 +2391,43 @@ async def _run_pull_started(
                     bytes=result.bytes,
                     seconds=result.seconds,
                     error="radio restoration remains pending and will be retried",
+                )
+
+        if interrupted_error is not None:
+            # Restore the driver's radios first. Then preserve and count every
+            # complete local arrival, including a sweep interrupted by quiet-state
+            # loss. Recovery must not erase progress already committed/reclaimed.
+            remaining_expected = {
+                name: size for name, size in expected.items() if name not in set(committed)
+            }
+            if remaining_expected and staging.is_dir():
+                with contextlib.suppress(Exception):
+                    committed.extend(
+                        await asyncio.to_thread(commit, staging, footage, remaining_expected)
+                    )
+            committed = list(dict.fromkeys(committed))
+            saved_bytes = sum(expected[name] for name in committed)
+            saved_files = len(committed)
+            if obd_result is not None:
+                saved_files += obd_result.copied + obd_result.duplicates
+            result = RunResult(
+                state=RunState.PARTIAL if saved_files else RunState.ERROR,
+                files=saved_files,
+                bytes=saved_bytes + (obd_result.bytes if obd_result is not None else 0),
+                seconds=time.monotonic() - started,
+                error=interrupted_error,
+            )
+            if expected:
+                initial_plan = locals().get("plan")
+                extra_names = set(expected) - set(initial_backlog_sizes)
+                backlog_files = (initial_plan.backlog_files if initial_plan else 0) + len(
+                    extra_names
+                )
+                backlog_bytes = (initial_plan.backlog_bytes if initial_plan else 0) + sum(
+                    size - initial_backlog_sizes.get(name, 0) for name, size in expected.items()
+                )
+                status.set_backlog(
+                    max(0, backlog_files - len(committed)), max(0, backlog_bytes - saved_bytes)
                 )
 
         # Restoring the driver's radios/logger outranks a courtesy screen change. An

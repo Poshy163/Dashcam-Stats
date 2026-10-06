@@ -1760,7 +1760,7 @@ class TestARunEndToEnd:
         assert result.bytes == landed_footage_bytes + 1_000_000
         assert get_status().backlog_bytes == expected_footage_backlog
 
-    async def test_late_drive_bundle_is_copied_when_deadline_guard_keeps_radios_on(
+    async def test_late_drive_bundle_is_copied_with_explicit_radio_quieting_opt_out(
         self, db_session, unit, app_config, monkeypatch
     ):
         from app.ingest import puller, radios
@@ -1795,7 +1795,7 @@ class TestARunEndToEnd:
         monkeypatch.setattr(puller, "sync_remote_bundles", sync)
         monkeypatch.setattr(radios, "new_quieting_allowed", lambda: False)
         monkeypatch.setattr(puller.radio_coordinator, "begin", forbidden_transition)
-        await self._enable(**{"ingest.quiet_radios": True})
+        await self._enable(**{"ingest.quiet_radios": False})
 
         result = await puller.run_pull(trigger="manual")
 
@@ -2079,7 +2079,7 @@ class TestARunEndToEnd:
     async def test_an_obd_owner_keeps_bluetooth_and_hotspot_on(
         self, db_session, unit, app_config, monkeypatch
     ):
-        """Footage still moves, but radio quieting yields to the live logger owner."""
+        """Footage waits when the live logger owner cannot safely yield Bluetooth."""
         from app.ingest import adb, puller, radios
         from app.ingest.models import RunState
         from app.ingest.obd_transfer import get_obd_transfer_status
@@ -2101,7 +2101,9 @@ class TestARunEndToEnd:
         monkeypatch.setattr(puller, "read_logger_status", logger_status)
         await self._enable(**{"ingest.quiet_radios": True})
 
-        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+        assert (await puller.run_pull(trigger="manual")).state is RunState.IDLE
+        assert unit.served["names"] is None
+        assert not list(app_config.footage_dir.glob("*.ts"))
 
         assert observed["address"] == "127.0.0.1:5555"
         assert observed["path"] == app_config.obd_remote_status_file
@@ -2137,7 +2139,9 @@ class TestARunEndToEnd:
         monkeypatch.setattr(puller, "read_logger_status", missing_status)
         await self._enable(**{"ingest.quiet_radios": True})
 
-        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+        assert (await puller.run_pull(trigger="manual")).state is RunState.IDLE
+        assert unit.served["names"] is None
+        assert not list(app_config.footage_dir.glob("*.ts"))
         assert not any("bluetooth_manager disable" in command for command in commands)
         assert get_obd_transfer_status().snapshot()["logger"] == {
             "ownership_enabled": True,
@@ -2205,6 +2209,9 @@ class TestARunEndToEnd:
 
             async def capture_and_quiet(self):
                 events.append("radios-quiet")
+
+            async def verify_footage_quiet(self):
+                self.raise_if_lease_lost()
 
             async def restore(self, **_kwargs):
                 events.append("radios-restored")
@@ -2282,6 +2289,9 @@ class TestARunEndToEnd:
             async def capture_and_quiet(self):
                 return None
 
+            async def verify_footage_quiet(self):
+                self.raise_if_lease_lost()
+
             async def restore(self, **_kwargs):
                 self.restored = True
                 return True
@@ -2321,12 +2331,104 @@ class TestARunEndToEnd:
 
         result = await puller.run_pull(trigger="manual")
 
-        assert result.state is RunState.ERROR
+        assert result.state is RunState.PARTIAL
+        assert result.files == len(unit.payload)
+        assert result.bytes == sum(map(len, unit.payload.values()))
         assert "lease lost" in (result.error or "")
         assert unit.deleted == []
         assert holder["transition"].restored
 
-    async def test_quiesce_failure_leaves_radios_on_and_still_copies_footage(
+    @pytest.mark.parametrize(
+        "during_sweep,initially_growing", [(False, False), (True, False), (True, True)]
+    )
+    async def test_lost_quiet_proof_preserves_previously_committed_and_reclaimed_counts(
+        self, db_session, unit, app_config, monkeypatch, during_sweep, initially_growing
+    ):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from app.ingest import puller, radios
+        from app.ingest.models import RunState
+
+        names = list(unit.payload)
+        if during_sweep:
+            third = "20260812120200_camera_0.ts"
+            unit.payload[third] = b"c" * 4096
+            names.append(third)
+        expected_names = names[:-1]
+        reclaimed = asyncio.Event()
+        checks = 0
+
+        async def verify():
+            nonlocal checks
+            checks += 1
+            if checks == len(names):
+                await asyncio.wait_for(reclaimed.wait(), 1)
+                raise puller.radio_coordinator.RadioTransitionError("quiet proof lost")
+
+        transition = SimpleNamespace(
+            raise_if_lease_lost=lambda: None,
+            mark_obd_transfer_complete=AsyncMock(),
+            capture_and_quiet=AsyncMock(),
+            verify_footage_quiet=verify,
+            restore=AsyncMock(return_value=True),
+        )
+        real_delete = puller.adb.delete_if_unchanged
+
+        async def delete(*args):
+            count = await real_delete(*args)
+            if len(unit.deleted) == len(expected_names):
+                reclaimed.set()
+            return count
+
+        async def inventory(_address, source):
+            visible = (
+                names[:1]
+                if during_sweep and not initially_growing and unit.served["names"] is None
+                else names
+            )
+            return [RemoteFile(name, len(unit.payload[name]), 0, source) for name in visible]
+
+        async def drop_growing(_info, plan, _sources):
+            if initially_growing and unit.served["names"] is None:
+                # The second size check removes growing files from the transfer,
+                # but those files are already included in the initial backlog.
+                assert plan.backlog_files == len(names)
+                plan.files[:] = [item for item in plan.files if item.name == names[0]]
+                plan.active_skipped += len(names) - 1
+
+        monkeypatch.setattr(radios, "QUIET_AFTER_ONLINE_S", 0.0)
+        monkeypatch.setattr(radios, "new_quieting_allowed", lambda: True)
+        monkeypatch.setattr(puller, "read_logger_status", AsyncMock(return_value=None))
+        monkeypatch.setattr(puller, "inventory_remote_bundles", AsyncMock(return_value=[]))
+        monkeypatch.setattr(puller, "_drop_still_growing", drop_growing)
+        monkeypatch.setattr(puller.adb, "inventory", inventory)
+        monkeypatch.setattr(puller.adb, "delete_if_unchanged", delete)
+        monkeypatch.setattr(puller.radio_coordinator, "begin", AsyncMock(return_value=transition))
+        await self._enable(
+            **{
+                "ingest.quiet_radios": True,
+                "ingest.delete_after_verify": True,
+                "ingest.chunk_size": 1,
+                "ingest.sweep_passes": int(during_sweep),
+                "ingest.rescue_partials": False,
+            }
+        )
+        result = await puller.run_pull(trigger="manual")
+        assert result.state is RunState.PARTIAL
+        assert "quiet proof lost" in result.error
+        assert result.files == len(expected_names)
+        assert result.bytes == sum(len(unit.payload[name]) for name in expected_names)
+        assert unit.deleted == expected_names
+        assert unit.served["names"] == expected_names[-1:]
+        assert not (app_config.footage_dir / names[-1]).exists()
+        for name in expected_names:
+            assert (app_config.footage_dir / name).read_bytes() == unit.payload[name]
+        assert puller.get_status().backlog_files == 1
+        assert puller.get_status().backlog_bytes == len(unit.payload[names[-1]])
+        transition.restore.assert_awaited_once()
+
+    async def test_quiesce_failure_restores_logger_and_holds_footage(
         self, db_session, unit, app_config, monkeypatch
     ):
         from app.ingest import obd_control, puller, radios
@@ -2373,8 +2475,9 @@ class TestARunEndToEnd:
         monkeypatch.setattr(puller, "_move", move)
         await self._enable(**{"ingest.quiet_radios": True})
 
-        assert (await puller.run_pull(trigger="manual")).state is RunState.OK
-        assert events == ["quiesce-failed", "request-cleared", "footage-copy"]
+        assert (await puller.run_pull(trigger="manual")).state is RunState.IDLE
+        assert unit.served["names"] is None
+        assert events == ["quiesce-failed", "request-cleared"]
 
     async def test_an_idle_window_never_touches_the_radios(
         self, db_session, unit, app_config, monkeypatch
@@ -2399,9 +2502,10 @@ class TestARunEndToEnd:
             return None
 
         monkeypatch.setattr(radios, "_arm_watchdog", no_watchdog)
-        await self._enable(**{"ingest.quiet_radios": True})
+        await self._enable(**{"ingest.quiet_radios": False})
 
         assert (await puller.run_pull(trigger="manual")).state is RunState.OK
+        await self._enable(**{"ingest.quiet_radios": True})
         commands.clear()
 
         assert (await puller.run_pull(trigger="manual")).state is RunState.IDLE
@@ -4358,8 +4462,8 @@ class TestOneAnnouncementPerVisit:
         from app.ingest import poller
 
         src = inspect.getsource(poller.IngestPoller._loop)
-        assert 'start_run(trigger="auto", info=info, continuation=True)' in src
-        assert 'start_run(trigger="auto", info=info)' in src, "arrival must still announce"
+        assert "_start_auto_pull(info, continuation=True)" in src
+        assert "_start_auto_pull(info)" in src, "arrival must still announce"
 
 
 class TestTheSleepWindowIsManagedNotLeftWide:

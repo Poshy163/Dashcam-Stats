@@ -589,10 +589,12 @@ class IngestStatus:
         with self._lock:
             remaining = self._credible_countdown_remaining()
             if remaining is None:
-                reason = "Radios left unchanged: the remaining head-unit sleep time is unknown."
+                reason = (
+                    "Waiting for radio shutdown: the remaining head-unit sleep time is unknown."
+                )
             elif remaining <= RADIO_QUIET_MIN_REMAINING_S:
                 reason = (
-                    "Radios left unchanged: at most one minute remains before sleep after allowing "
+                    "Waiting for radio shutdown: at most one minute remains before sleep after allowing "
                     "for observation uncertainty."
                 )
             else:
@@ -600,6 +602,12 @@ class IngestStatus:
             self.radio_quieting_hold = reason is not None
             self.radio_quieting_hold_reason = reason
             return reason is None
+
+    def set_radio_quieting_hold(self, reason: str | None) -> None:
+        """Explain a postponed copy until the requested radio shutdown is verified."""
+        with self._lock:
+            self.radio_quieting_hold = reason is not None
+            self.radio_quieting_hold_reason = reason
 
     def set_wifi(self, frequency_mhz: int | None, *, held: bool, reason: str | None) -> None:
         with self._lock:
@@ -933,10 +941,14 @@ class IngestStatus:
                 "ignition_hold": self.ignition_hold,
                 "ignition_hold_reason": self.ignition_hold_reason,
                 "radio_quieting_hold": (
-                    self.radio_quieting_hold and self._running and self.unit_online
+                    self.radio_quieting_hold
+                    and (self._running or self.state is RunState.IDLE)
+                    and self.unit_online
                 ),
                 "radio_quieting_hold_reason": (
-                    self.radio_quieting_hold_reason if self._running and self.unit_online else None
+                    self.radio_quieting_hold_reason
+                    if (self._running or self.state is RunState.IDLE) and self.unit_online
+                    else None
                 ),
                 "sleep_window_seconds": self.sleep_window_s,  # Next-timer policy, not time left.
                 "sleep_countdown_remaining_s": (

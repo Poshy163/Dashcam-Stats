@@ -119,6 +119,7 @@ class RadioTransition:
     _logger_resumed: bool = field(default=False, repr=False)
     _lease_valid_until: float | None = field(default=None, repr=False)
     _restoring_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    _radios_quiet: bool = field(default=False, repr=False)
 
     @property
     def lease_lost(self) -> bool:
@@ -183,6 +184,17 @@ class RadioTransition:
                 self._signal_lease_loss(exc)
                 log.error("radio watchdog health proof failed", error=_error_text(exc))
                 return
+            try:
+                if self._radios_quiet and not await self.controller.quiet_state_verified():
+                    # Restoration can start while this read waits for the controller's
+                    # lock. Its deliberate return to baseline is not a new failure.
+                    if self._radios_quiet:
+                        raise RadioTransitionError("radio shutdown could no longer be verified")
+            except Exception as exc:
+                if self._radios_quiet:
+                    self._signal_lease_loss(exc)
+                    log.error("radio shutdown proof failed during transfer", error=_error_text(exc))
+                    return
             try:
                 await self._renew_logger_quiesce()
             except adb.AdbError as exc:
@@ -413,8 +425,11 @@ class RadioTransition:
         # This method is deliberately self-defending rather than relying on the puller's
         # call order.  A future caller must not be able to take BLE away from the logger
         # until its immutable export has been transferred, verified and checkpointed.
-        if not radios.new_quieting_allowed():
-            raise RadioTransitionError("sleep deadline does not leave time for radio quieting")
+        if not await radios.refresh_quieting_admission(self.address):
+            raise RadioTransitionError(
+                get_status().radio_quieting_hold_reason
+                or "sleep deadline does not leave time for radio quieting"
+            )
         row = await self._row()
         if not row.obd_transfer_complete:
             raise RadioTransitionError(
@@ -510,7 +525,10 @@ class RadioTransition:
         if snapshot.bluetooth == "on":
             await self.checkpoint(bluetooth_disable_attempted=True)
             if not await self.controller.disable_bluetooth(before_change=final_radio_guard):
-                raise RadioTransitionError("Bluetooth disable could not be verified")
+                raise RadioTransitionError(
+                    get_status().radio_quieting_hold_reason
+                    or "Bluetooth disable could not be verified"
+                )
             await self.checkpoint(bluetooth_disable_verified=True)
         else:
             await self.checkpoint(bluetooth_disable_verified=True)
@@ -519,13 +537,28 @@ class RadioTransition:
             await self.checkpoint(hotspot_disable_attempted=True)
             hotspot_guard = final_radio_guard if snapshot.bluetooth != "on" else None
             if not await self.controller.disable_hotspot(before_change=hotspot_guard):
-                raise RadioTransitionError("hotspot disable could not be verified")
+                raise RadioTransitionError(
+                    get_status().radio_quieting_hold_reason
+                    or "hotspot disable could not be verified"
+                )
             await self.checkpoint(hotspot_disable_verified=True)
         else:
             # OFF is already quiet; TRANSPORT is intentionally retained because taking
             # it down would destroy the ADB/TCP data path.
             await self.checkpoint(hotspot_disable_verified=True)
+        if not await self.controller.quiet_state_verified():
+            raise RadioTransitionError("radio shutdown could not be positively verified")
         await self.checkpoint(TransitionPhase.INGESTING)
+        self._radios_quiet = True
+
+    async def verify_footage_quiet(self) -> None:
+        """Require live quiet-state proof before each footage chunk or retry."""
+        self.raise_if_lease_lost()
+        if self._closed or self._restoring_task is not None or not self._radios_quiet:
+            raise RadioTransitionError("radio shutdown has not been verified for footage transfer")
+        if not await self.controller.quiet_state_verified():
+            self._signal_lease_loss("radio shutdown could no longer be verified")
+        self.raise_if_lease_lost()
 
     async def restore(self, *, error: object | None = None) -> bool:
         """Restore with process-local ownership released even if the caller cancels."""
@@ -538,6 +571,7 @@ class RadioTransition:
                 # failed before assigning its cached result.
                 self._restore_result = False
                 return False
+            self._radios_quiet = False
             self._restoring_task = asyncio.current_task()
             try:
                 effective_error = error or self._lease_loss_error

@@ -38,7 +38,7 @@ from app.ingest import (
     unit_logs,
     wifi_startup,
 )
-from app.ingest.models import RunState, UnitInfo, UnitState, ingest_setting
+from app.ingest.models import RunResult, RunState, UnitInfo, UnitState, ingest_setting
 from app.ingest.status import get_status
 
 log = get_logger(__name__)
@@ -102,6 +102,7 @@ class IngestPoller:
         #: Footage-copying passes started during this visit. Reset wherever the visit ends,
         #: beside the error budget, because both are allowances that a visit spends.
         self._backups_this_visit = 0
+        self._backup_visit_token = object()
         #: The unit as this visit first described it, kept only while the arrival gate is
         #: holding. See the note in :meth:`_loop`; cleared the moment the port goes quiet.
         self._visit_info: UnitInfo | None = None
@@ -157,6 +158,27 @@ class IngestPoller:
 
     def _enabled(self) -> bool:
         return bool(ingest_setting("enabled"))
+
+    def _start_auto_pull(self, info: UnitInfo, *, continuation: bool = False) -> None:
+        """Reserve a visit pass, returning it if preparation postponed all copying."""
+        task = puller.start_run(trigger="auto", info=info, continuation=continuation)
+        self._backups_this_visit += 1
+        visit = self._backup_visit_token
+
+        def completed(finished: asyncio.Task[RunResult]) -> None:
+            if visit is not self._backup_visit_token or finished.cancelled():
+                return
+            try:
+                result = finished.result()
+            except Exception:
+                return
+            if result.state is RunState.IDLE and not result.files and not result.bytes:
+                self._backups_this_visit = max(0, self._backups_this_visit - 1)
+                # Retry from completion, not from an earlier idle check, so slow
+                # preparation cannot cause immediate repeated radio transitions.
+                self._idle_since = time.monotonic()
+
+        task.add_done_callback(completed)
 
     def _should_drain_again(self, status) -> bool:
         """Whether to start another pull at a unit that is already here.
@@ -374,6 +396,7 @@ class IngestPoller:
             self._idle_since = 0.0
             self._error_retries_started = 0
             self._backups_this_visit = 0
+            self._backup_visit_token = object()
             self._visit_info = None
             self._radio_recovery_retry_at = 0.0
             log.info("head-unit reboot observed; clearing the previous visit's power estimates")
@@ -406,6 +429,7 @@ class IngestPoller:
                     self._was_online = False
                     self._error_retries_started = 0
                     self._backups_this_visit = 0
+                    self._backup_visit_token = object()
                     self._visit_info = None
                     await asyncio.sleep(max(MIN_POLL_S, 15.0))
                     continue
@@ -423,6 +447,7 @@ class IngestPoller:
                     self._was_online = False
                     self._error_retries_started = 0
                     self._backups_this_visit = 0
+                    self._backup_visit_token = object()
                     self._visit_info = None
                     self._radio_recovery_retry_at = 0.0
                     self._runtime_observation_due = 0.0
@@ -499,6 +524,7 @@ class IngestPoller:
                     self._was_online = False
                     self._error_retries_started = 0
                     self._backups_this_visit = 0
+                    self._backup_visit_token = object()
                 else:
                     if not self._was_online:
                         # If a previous window ended with the unit's radios still off --
@@ -550,6 +576,7 @@ class IngestPoller:
                             self._idle_since = 0.0
                             self._error_retries_started = 0
                             self._backups_this_visit = 0
+                            self._backup_visit_token = object()
                             # Not awaited: a pull runs for as long as the window lasts and
                             # the poll has to keep ticking underneath it. `start_run` keeps
                             # the reference so the task cannot be collected and shutdown can
@@ -560,8 +587,7 @@ class IngestPoller:
                             # above; doing it again inside the run tore down the link it had
                             # only just proven good, and paid for the round trip twice at
                             # the most expensive moment of the day.
-                            puller.start_run(trigger="auto", info=info)
-                            self._backups_this_visit += 1
+                            self._start_auto_pull(info)
                             self._was_online = True
                         else:
                             # Held for the arrival gate. IDLE like the band hold: not a
@@ -592,8 +618,7 @@ class IngestPoller:
                             )
                         else:
                             log.info("the head unit is still here; looking for more to copy")
-                        puller.start_run(trigger="auto", info=info, continuation=True)
-                        self._backups_this_visit += 1
+                        self._start_auto_pull(info, continuation=True)
                     # `_was_online` is set the moment a pull actually starts (above), not
                     # merely because the unit is present -- otherwise the arrival gate's
                     # hold would be mistaken for a window already under way, and the next
@@ -616,6 +641,7 @@ class IngestPoller:
                 self._was_online = False
                 self._error_retries_started = 0
                 self._backups_this_visit = 0
+                self._backup_visit_token = object()
                 # Cleared wherever `_was_online` is, because the two together are what
                 # decides whether the next tick reuses a describe. Left armed on this path,
                 # a transient adb failure -- or the feature being switched off and back on

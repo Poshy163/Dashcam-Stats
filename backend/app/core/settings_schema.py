@@ -1339,18 +1339,18 @@ SETTINGS: tuple[SettingDef, ...] = (
         "bool",
         False,
         "ingest",
-        "The head unit's WiFi is a single-stream chip shared with its Bluetooth and its "
-        "own hotspot, and the transfer already runs at that radio's measured ceiling — "
-        "anything else using it is paid for in footage left on the card. This turns them "
-        "off while recordings are moving, then restores each one to the exact state it "
-        "had before the run. It waits until "
+        "Requires Bluetooth and the hotspot to be confirmed off before footage is copied, "
+        "then restores each one to its previous state. If shutdown or safe recovery cannot "
+        "be verified, footage waits and retries; it does not copy with the hotspot left on. "
+        "The WiFi connection to your home network stays on. New shutdown attempts require "
+        "more than one minute of verified sleep headroom. It also waits until "
         "the unit has been on the network for ten seconds, so a car that is only turning "
         "around keeps its phone connection. If the engine stops mid-transfer, a watchdog "
         "left on the unit turns Bluetooth back on by itself, and anything still off is "
         "restored the moment the unit is next seen. Bluetooth is turned off first on "
         "purpose: some units re-arm their hotspot within seconds while Bluetooth is on. "
-        "If your unit still refuses to stop its hotspot, the refusal is shown below in "
-        "the unit's own words and nothing else changes.",
+        "If the unit refuses to stop its hotspot, the Backup page explains why copying "
+        "is waiting.",
         requires="ingest.enabled",
     ),
     SettingDef(
