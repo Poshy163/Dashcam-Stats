@@ -15,8 +15,10 @@ Two details matter more than they look:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from weakref import WeakKeyDictionary
 
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,6 +49,10 @@ from app.osd.track_quality import MAX_ROAD_SPEED_MS
 from app.osd.validate import is_plausible_step
 
 log = get_logger(__name__)
+
+# The scheduler and a requested rebuild share one writer plan. Keying by event loop
+# avoids retaining a lock bound to a closed test/application loop after it restarts.
+_REBUILD_LOCKS: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
 
 #: Ceiling on a single leg of a journey's distance measurement.
 #:
@@ -146,6 +152,16 @@ class JourneyBuilder:
 
     async def rebuild(self, session: AsyncSession, *, since: datetime | None = None) -> int:
         """Recluster recordings into journeys. Returns the number of journeys touched."""
+        lock = _REBUILD_LOCKS.setdefault(asyncio.get_running_loop(), asyncio.Lock())
+        async with lock:
+            try:
+                return await self._rebuild(session, since=since)
+            except BaseException:
+                # Preparation can fail before the first cluster transaction as well.
+                await session.rollback()
+                raise
+
+    async def _rebuild(self, session: AsyncSession, *, since: datetime | None = None) -> int:
         settings = get_settings_service()
         if not bool(settings.get_nowait("journeys.enabled")):
             return 0
@@ -184,53 +200,246 @@ class JourneyBuilder:
         # rebuild has to run again to settle. Recomputing first collapses that to one pass
         # and, more importantly, makes the result a function of the telemetry rather than
         # of whatever the last run happened to leave behind.
-        await self._refresh_start_positions(session, movable)
+        # Preparing coordinates must not hold the writer across the whole library either.
+        # These small commits change no journey membership, so readers keep the previous
+        # library while the replacement grouping is calculated.
+        for start in range(0, len(movable), _ID_CHUNK):
+            await self._refresh_start_positions(session, movable[start : start + _ID_CHUNK])
+            await commit_with_retry(session, what="prepare journey positions")
 
         clusters = self._cluster(movable, gap, use_gps, max_jump_m)
+        # Keep every old membership until its replacement commits. Deleting the library
+        # before the first per-journey commit published an almost empty library and left
+        # the remaining recordings orphaned if the rebuild stopped. Reusing a row also
+        # keeps unchanged journey links and titles stable.
+        #
+        # When splitting, reuse the source only for its last cluster. Earlier clusters
+        # move to new rows while the old row still holds the remainder. Refreshing an old
+        # row with two known-separated drives would spatially validate that temporary
+        # mixture and could reject perfectly good telemetry.
+        last_cluster: dict[int, int] = {}
+        expected = {}
+        for index, cluster in enumerate(clusters):
+            for recording in cluster.recordings:
+                expected[recording.id] = (
+                    recording.journey_id,
+                    as_utc(recording.started_at),
+                    as_utc(recording.ended_at),
+                    recording.start_lat,
+                    recording.start_lon,
+                )
+                if recording.journey_id is not None:
+                    last_cluster[recording.journey_id] = index
 
-        # Automatic journeys are rebuilt from scratch; the alternative is trying to
-        # reconcile old and new boundaries, which produces stale half-journeys.
-        stale_ids = {r.journey_id for r in movable if r.journey_id is not None} - manual_ids
-        if stale_ids:
-            await session.execute(
-                delete(Journey).where(Journey.id.in_(stale_ids), Journey.manual.is_(False))
-            )
-            # Deliberately no ``expire_all()`` here. The DELETE has cascaded through
-            # ``ondelete="SET NULL"`` and the in-memory ``journey_id`` values are now
-            # stale, but expiring them makes the very next read of ``started_at`` a lazy
-            # load, and the clusters are read after this point — under the async engine
-            # that raises MissingGreenlet. Nothing reassigns those attributes in Python
-            # any more: :meth:`_attach` explicitly writes the replacement membership and
-            # synchronizes just that field without expiring other attributes.
+        used_ids: set[int] = set()
+        source_ids: set[int] = set()
+        deferred_ids: set[int] = set()
+        rebuilt = 0
+        for index, cluster in enumerate(clusters):
+            recording_ids = [r.id for r in cluster.recordings]
+            try:
+                # SQLite defers BEGIN until the first write. Reserve its writer for this
+                # cluster before re-reading eligibility: a SELECT followed by an
+                # unconditional attach could overwrite a concurrent manual merge.
+                for start in range(0, len(recording_ids), _ID_CHUNK):
+                    await session.execute(
+                        update(Recording)
+                        .where(
+                            Recording.id.in_(recording_ids[start : start + _ID_CHUNK]),
+                            Recording.ignored.is_(False),
+                            _journey_ready_recording(),
+                            or_(
+                                Recording.journey_id.is_(None),
+                                Recording.journey_id.notin_(
+                                    select(Journey.id).where(Journey.manual.is_(True))
+                                ),
+                            ),
+                        )
+                        .values(journey_id=Recording.journey_id)
+                        .execution_options(synchronize_session=False)
+                    )
+                current = []
+                for start in range(0, len(recording_ids), _ID_CHUNK):
+                    current.extend(
+                        (
+                            await session.scalars(
+                                select(Recording)
+                                .where(
+                                    Recording.id.in_(recording_ids[start : start + _ID_CHUNK]),
+                                    Recording.ignored.is_(False),
+                                    _journey_ready_recording(),
+                                    or_(
+                                        Recording.journey_id.is_(None),
+                                        Recording.journey_id.notin_(
+                                            select(Journey.id).where(Journey.manual.is_(True))
+                                        ),
+                                    ),
+                                )
+                                .execution_options(populate_existing=True)
+                            )
+                        ).all()
+                    )
+                if len(current) != len(recording_ids) or any(
+                    expected[r.id]
+                    != (
+                        r.journey_id,
+                        as_utc(r.started_at),
+                        as_utc(r.ended_at),
+                        r.start_lat,
+                        r.start_lon,
+                    )
+                    for r in current
+                ):
+                    # A worker or a user changed the plan while previous clusters were
+                    # being published. Keep this cluster intact for the next scan.
+                    deferred_ids.update(
+                        expected[row_id][0]
+                        for row_id in recording_ids
+                        if expected[row_id][0] is not None
+                    )
+                    await commit_with_retry(session, what="defer changed journey cluster")
+                    continue
 
-        created = 0
-        for cluster in clusters:
-            if len(cluster.recordings) < min_recordings:
-                await self._attach(session, [r.id for r in cluster.recordings], None)
-                continue
-            journey = Journey(started_at=cluster.started_at, ended_at=cluster.ended_at)
-            session.add(journey)
-            await session.flush()
-            # Only the recordings: `refresh` finds its members through
-            # `Recording.journey_id` and re-points every denormalised copy itself on the way
-            # out, so writing them here as well rewrote `telemetry_points` twice per rebuild.
-            await self._attach(
-                session, [r.id for r in cluster.recordings], journey.id, recordings_only=True
-            )
-            await self.refresh(session, journey)
-            created += 1
-            # One journey, one transaction. Forty-five journeys' worth of refreshing in a
-            # single transaction is minutes of held write lock, and everything else that
-            # writes -- both workers, the scheduler, the log sink -- waits behind it and
-            # then fails on its busy timeout. Committing per journey also means a rebuild
-            # interrupted halfway leaves the journeys it finished intact rather than
-            # discarding all of them.
-            await commit_with_retry(session, what="rebuild journey")
+                old_ids = {r.journey_id for r in current if r.journey_id is not None}
+                source_ids.update(old_ids)
+                if len(current) < min_recordings:
+                    outside_member = None
+                    if since is not None and old_ids:
+                        outside_member = await session.scalar(
+                            select(Recording.id)
+                            .where(
+                                Recording.journey_id.in_(old_ids),
+                                Recording.started_at < since,
+                                Recording.ignored.is_(False),
+                                _journey_ready_recording(),
+                            )
+                            .limit(1)
+                        )
+                    if outside_member is not None:
+                        # The cutoff can turn a valid existing journey into a short
+                        # tail. Its incomplete window cannot authorise detaching it.
+                        deferred_ids.update(old_ids)
+                        await commit_with_retry(session, what="keep partial journey tail")
+                        continue
+                    await self._attach(session, recording_ids, None)
+                    await commit_with_retry(session, what="detach short journey cluster")
+                    continue
 
-        await session.flush()
-        removed = await self._drop_empty(session)
-        log.info("rebuilt journeys", journeys=created, recordings=len(movable), removed=removed)
-        return created
+                journey = None
+                candidates = list(
+                    (
+                        await session.scalars(
+                            select(Journey)
+                            .where(Journey.id.in_(old_ids), Journey.manual.is_(False))
+                            .order_by(Journey.title.is_(None), Journey.id)
+                            .execution_options(populate_existing=True)
+                        )
+                    ).all()
+                )
+                members = set(recording_ids)
+                for candidate in candidates:
+                    if candidate.id in used_ids or last_cluster.get(candidate.id) != index:
+                        continue
+                    remaining = set(
+                        (
+                            await session.scalars(
+                                select(Recording.id).where(
+                                    Recording.journey_id == candidate.id,
+                                    Recording.ignored.is_(False),
+                                    _journey_ready_recording(),
+                                )
+                            )
+                        ).all()
+                    )
+                    # This also protects records outside a partial rebuild and new
+                    # members attached by a worker since the initial planning read.
+                    if remaining <= members:
+                        journey = candidate
+                        break
+                if journey is None:
+                    journey = Journey(started_at=cluster.started_at, ended_at=cluster.ended_at)
+                    session.add(journey)
+                    await session.flush()
+                used_ids.add(journey.id)
+                await self._attach(session, recording_ids, journey.id, recordings_only=True)
+                await self.refresh(session, journey)
+                await commit_with_retry(session, what="rebuild journey")
+                rebuilt += 1
+            except BaseException:
+                # The caller may keep using its session after an interrupted rebuild.
+                # Never leave a half-published attach or failed flush waiting to commit.
+                await session.rollback()
+                raise
+
+        # Recompute only donors whose final membership has settled. Keep manual rows,
+        # named snapshots and rows referenced by ignored/invalidated/retired data. There
+        # is no whole-library orphan sweep and no cascading deletion of useful pointers.
+        removed = 0
+        for journey_id in sorted(source_ids - used_ids - deferred_ids):
+            try:
+                await session.execute(
+                    update(Journey)
+                    .where(Journey.id == journey_id, Journey.manual.is_(False))
+                    .values(updated_at=Journey.updated_at)
+                    .execution_options(synchronize_session=False)
+                )
+                journey = await session.scalar(
+                    select(Journey)
+                    .where(Journey.id == journey_id, Journey.manual.is_(False))
+                    .execution_options(populate_existing=True)
+                )
+                if journey is not None:
+                    ready_member = await session.scalar(
+                        select(Recording.id)
+                        .where(
+                            Recording.journey_id == journey_id,
+                            Recording.ignored.is_(False),
+                            _journey_ready_recording(),
+                        )
+                        .limit(1)
+                    )
+                    if ready_member is not None:
+                        outside_member = None
+                        if since is not None:
+                            outside_member = await session.scalar(
+                                select(Recording.id)
+                                .where(
+                                    Recording.journey_id == journey_id,
+                                    Recording.started_at < since,
+                                    Recording.ignored.is_(False),
+                                    _journey_ready_recording(),
+                                )
+                                .limit(1)
+                            )
+                        # Keep the previous snapshot for untouched older history. A
+                        # partial window must not spatially assess a residual mixture
+                        # of older drives outside the grouping it actually planned.
+                        if outside_member is None:
+                            await self.refresh(session, journey)
+                    elif journey.title is None:
+                        result = await session.execute(
+                            delete(Journey).where(
+                                Journey.id == journey_id,
+                                Journey.manual.is_(False),
+                                Journey.title.is_(None),
+                                *(
+                                    ~select(model.id).where(model.journey_id == Journey.id).exists()
+                                    for model in (
+                                        Recording,
+                                        TelemetryPoint,
+                                        TrackedObject,
+                                        PlateObservation,
+                                    )
+                                ),
+                            )
+                        )
+                        removed += result.rowcount
+                await commit_with_retry(session, what="finish journey source")
+            except BaseException:
+                await session.rollback()
+                raise
+        log.info("rebuilt journeys", journeys=rebuilt, recordings=len(movable), removed=removed)
+        return rebuilt
 
     async def repair_start_positions(self, session: AsyncSession) -> int:
         """Re-derive every recording's start position, whether or not anything reclusters.
@@ -407,17 +616,16 @@ class JourneyBuilder:
         )
         for model in models:
             column = Recording.id if model is Recording else model.recording_id
-            await session.execute(
-                update(model)
-                .where(column.in_(recording_ids))
-                .values(journey_id=journey_id)
-                # The explicit UPDATE still runs even if SQLite reused a deleted id.
-                # Keep retained recordings current so needs_recluster and later rebuilds
-                # do not read stale membership from this session's identity map. Matching
-                # by primary key can be evaluated locally; avoid returning every child
-                # telemetry row solely to synchronize objects we do not keep loaded.
-                .execution_options(synchronize_session="evaluate" if model is Recording else False)
-            )
+            for start in range(0, len(recording_ids), _ID_CHUNK):
+                await session.execute(
+                    update(model)
+                    .where(column.in_(recording_ids[start : start + _ID_CHUNK]))
+                    .values(journey_id=journey_id)
+                    # Keep retained recordings current without fetching every child row.
+                    .execution_options(
+                        synchronize_session="evaluate" if model is Recording else False
+                    )
+                )
 
     async def repair_stale(self, session: AsyncSession, *, limit: int = 200) -> int:
         """Recompute journeys whose rollups are unset but whose telemetry says otherwise.

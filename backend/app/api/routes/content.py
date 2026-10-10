@@ -734,6 +734,21 @@ async def journey_motion_quality(session: SessionDep):
     return await motion_coverage(session)
 
 
+@router.post("/journeys/rebuild")
+async def rebuild_journeys(session: SessionDep):
+    """Reconcile journey membership from retained analysis without scanning footage."""
+    touched = await JourneyBuilder().rebuild(session)
+    await session.flush()
+    total = await session.scalar(select(func.count(Journey.id)))
+    visible = select(func.count(Journey.id)).where(Journey.id.in_(visible_journey_ids()))
+    return {
+        "journeys_touched": touched,
+        "total_journeys": int(total or 0),
+        "visible_journeys": int(await session.scalar(visible) or 0),
+        "visible_drives": int(await session.scalar(visible.where(drive_filter())) or 0),
+    }
+
+
 @router.get("/journeys/{journey_id}", response_model=JourneyDetailOut)
 async def get_journey(journey_id: RowId, session: SessionDep):
     journey = (
