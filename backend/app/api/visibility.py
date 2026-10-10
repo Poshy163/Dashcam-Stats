@@ -20,9 +20,20 @@ def visible_revision(column):
     the recording's derived views are internally consistent yet: the summarise stage still
     has to rebuild its journey and rollups.  Publishing results before the recording is
     completed is what revived retained journey rows with their old membership mid-run.
+
+    Size retention removes the video and marks its recording DELETED while keeping the
+    analysis. The successful summarise timestamp distinguishes that history from a file
+    removed before analysis finished; retirement must not hide established journeys or
+    publish unfinished stage output.
     """
     return and_(
-        Recording.state == RecordingState.COMPLETED,
+        or_(
+            Recording.state == RecordingState.COMPLETED,
+            and_(
+                Recording.state == RecordingState.DELETED,
+                Recording.processed_at.is_not(None),
+            ),
+        ),
         # Hidden means hidden, on the maps too.
         #
         # `ignored` is the application's one "take this out of every view" flag -- the
@@ -133,8 +144,9 @@ def visible_journey_ids():
     """Journey ids backed by at least one fully rebuilt recording.
 
     ``NULL`` remains visible for databases created before analysis revisions existed.
-    Missing footage is intentionally included because retention leaves an already analysed
-    recording in the completed state while marking the file separately as missing.
+    Missing footage is intentionally included: size retention marks an analysed recording
+    deleted, but keeps its finalised analysis and history. Ignored discard tombstones and
+    unfinished recordings still fail the shared visibility rule.
     """
     return (
         select(Recording.journey_id)

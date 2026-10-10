@@ -231,18 +231,80 @@ class TestTheJourneyRefreshDoesNotHoldTheLockAcrossItsReads:
             f"SQLite's single write lock -- is held across it: {issued}"
         )
 
-    async def test_a_rebuild_commits_between_journeys(self, db_session):
+    async def test_a_rebuild_commits_between_journeys(self, db_session, monkeypatch):
         """Forty-five journeys refreshed inside one transaction is minutes of held lock.
         Committing per journey also means an interrupted rebuild keeps what it finished."""
-        import inspect
-
+        from app.api.visibility import visible_journey_ids
+        from app.db.models import RecordingState
+        from app.db.session import get_session_factory
         from app.journeys.builder import JourneyBuilder
 
-        source = inspect.getsource(JourneyBuilder.rebuild)
-        assert "commit_with_retry" in source, (
-            "the rebuild loop no longer commits per journey; it will hold the write lock "
-            "for the whole pass and every other writer will fail on its busy timeout"
-        )
+        journeys = []
+        memberships = {}
+        for index in range(3):
+            start = BASE + timedelta(minutes=index * 30)
+            journey = Journey(
+                started_at=start,
+                ended_at=start + timedelta(seconds=120),
+                recording_count=0,
+            )
+            db_session.add(journey)
+            await db_session.flush()
+            recording = Recording(
+                rel_path=f"commit_{index}.ts",
+                filename=f"commit_{index}.ts",
+                journey_id=journey.id,
+                started_at=start,
+                ended_at=start + timedelta(seconds=120),
+                duration_s=120,
+                state=RecordingState.COMPLETED,
+            )
+            db_session.add(recording)
+            await db_session.flush()
+            journeys.append(journey.id)
+            memberships[recording.id] = journey.id
+        await db_session.commit()
+
+        published: set[int] = set()
+        snapshots: list[set[int]] = []
+        real_commit = db_session.commit
+
+        async def observe_commit():
+            await real_commit()
+            assert not db_session.in_transaction(), "the write transaction remains open"
+            async with get_session_factory()() as reader:
+                counts = dict(
+                    (await reader.execute(select(Journey.id, Journey.recording_count))).all()
+                )
+                assert (
+                    dict((await reader.execute(select(Recording.id, Recording.journey_id))).all())
+                    == memberships
+                ), "a reader lost an existing recording's membership"
+                assert set((await reader.scalars(visible_journey_ids())).all()) == set(journeys), (
+                    "the library disappeared between journey commits"
+                )
+
+            refreshed = {journey_id for journey_id, count in counts.items() if count == 1}
+            assert published <= refreshed, "an already published journey was rolled back"
+            newly_refreshed = refreshed - published
+            assert len(newly_refreshed) <= 1, (
+                "multiple journeys were refreshed in one write transaction"
+            )
+            if newly_refreshed:
+                # A real second writer must acquire SQLite's writer between clusters;
+                # observing commit calls alone would not prove the lock was released.
+                async with session_scope() as worker:
+                    await worker.execute(
+                        update(Recording)
+                        .where(Recording.id == next(iter(memberships)))
+                        .values(vehicle_count=Recording.vehicle_count + 1)
+                    )
+                published.update(newly_refreshed)
+                snapshots.append(set(published))
+
+        monkeypatch.setattr(db_session, "commit", observe_commit)
+        assert await JourneyBuilder().rebuild(db_session) == 3
+        assert snapshots == [set(journeys[:end]) for end in range(1, 4)]
 
 
 class TestConcurrentWritersUnderAJourneyRebuild:
