@@ -233,6 +233,10 @@ _POLL_PLAN_SPECS: dict[int, tuple[tuple[SignalSpec, ...], dict[int, int]]] = {
     3: (SIGNALS, POLL_PHASES_V3),
     4: (SIGNALS_V4, POLL_PHASES_V4),
     5: (SIGNALS_V4, POLL_PHASES_V5),
+    # v6 keeps the nominal v5 cadence and reserves occasional cycles for read-only
+    # diagnostics. Deliberately deferred observations remain missing in coverage;
+    # neither their timestamps nor values are fabricated by the projection.
+    6: (SIGNALS_V4, POLL_PHASES_V5),
 }
 
 

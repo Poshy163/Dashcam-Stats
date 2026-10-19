@@ -521,6 +521,8 @@ export interface OBDSeriesSample {
   longTermFuelTrimPct: number | null
   oxygenSensor1VoltageV: number | null
   oxygenSensor2VoltageV: number | null
+  milOn: boolean | null
+  dtcCount: number | null
   adapterVoltageV: number | null
   estimatedFuelRateLH: number | null
   estimatedFuelConsumptionL100km: number | null

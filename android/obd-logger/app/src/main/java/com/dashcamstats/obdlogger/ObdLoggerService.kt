@@ -913,6 +913,7 @@ class ObdLoggerService : Service() {
         val diagnosticScan = DiagnosticScan(elm, driveId)
         val malformedLivePids = LivePidMalformedTracker()
         val sparseDiagnosticBudget = SparseDiagnosticBudgetTracker()
+        val diagnosticScheduler = SparseDiagnosticScheduler()
         val pollTiming = PollTiming(driveStartedElapsedMillis, SystemClock::elapsedRealtime)
         var timingFlushReason = "drive_end"
         var sequence = 0L
@@ -930,7 +931,12 @@ class ObdLoggerService : Service() {
                 currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
                 val cycleStarted = SystemClock.elapsedRealtime()
                 pollTiming.startCycle()
-                val requested = ObdPollPlan.requestedPids(sequence, activeSupported)
+                val diagnosticReserved = diagnosticScheduler.reserveCycle(
+                    sequence, diagnosticScan.prepareCycle(sequence),
+                )
+                val requested = ObdPollPlan.requestedPids(
+                    sequence, activeSupported, diagnosticReserved,
+                )
                 val values = linkedMapOf<String, Any>()
                 val missing = mutableListOf<Int>()
                 for ((requestedIndex, pid) in requested.withIndex()) {
@@ -1049,15 +1055,21 @@ class ObdLoggerService : Service() {
                 }
                 currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
                 val liveCycleElapsed = SystemClock.elapsedRealtime() - cycleStarted
-                // At most one sparse diagnostic command is allowed after a committed sample. Its
-                // reserve comes from the worst command observed on this exact connection rather than
-                // a fixed guess. A slow response therefore defers later diagnostic work without ever
-                // cancelling an in-flight ELM command or deliberately delaying the critical PIDs.
+                // Persist the primary sample before any diagnostic work. Normal cycles need their
+                // learned spare budget; a rare reservation has already omitted the rotating PIDs.
+                // One bounded step can then progress even if its conservative reserve exceeds the
+                // five-second target. The primary work must still finish within that target.
                 val diagnosticBudgetMillis = sparseDiagnosticBudget.requiredBudgetMillis()
-                if (ObdPollPlan.mayRunSparseDiagnostic(liveCycleElapsed, diagnosticBudgetMillis)) {
+                val diagnosticAllowed = samplePersisted && busSilentCycles == 0 &&
+                    ObdPollPlan.mayRunSparseDiagnostic(
+                        liveCycleElapsed, diagnosticBudgetMillis, diagnosticReserved,
+                    )
+                if (diagnosticAllowed) {
                     val diagnosticStarted = SystemClock.elapsedRealtime()
                     try {
-                        diagnosticScan.runOne(sequence, sampleTimestamp)
+                        if (diagnosticScan.runOne(sequence, sampleTimestamp)) {
+                            diagnosticScheduler.observeAttempt(sequence)
+                        }
                     } finally {
                         sparseDiagnosticBudget.observeCommand(
                             boundedElapsedMillis(diagnosticStarted),
@@ -1362,9 +1374,14 @@ class ObdLoggerService : Service() {
             enqueueScan()
         }
 
-        suspend fun runOne(cycle: Long, observedAtUtc: String) {
+        fun prepareCycle(cycle: Long): Boolean {
             if (steps.isEmpty && cycle >= nextScanAt) enqueueScan()
-            val step = steps.take(cycle) ?: return
+            return !steps.isEmpty
+        }
+
+        suspend fun runOne(cycle: Long, observedAtUtc: String): Boolean {
+            prepareCycle(cycle)
+            val step = steps.take(cycle) ?: return false
             try {
                 step.operation(observedAtUtc)
             } catch (cancelled: CancellationException) {
@@ -1396,6 +1413,7 @@ class ObdLoggerService : Service() {
                 database.incrementError(driveId)
             }
             if (steps.isEmpty) nextScanAt = cycle + 30
+            return true
         }
 
         private fun enqueueScan() {

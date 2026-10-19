@@ -519,7 +519,7 @@ object RemovableStoragePolicy {
 }
 
 object ObdPollPlan {
-    const val VERSION = 5
+    const val VERSION = 6
     const val TARGET_CYCLE_MILLIS = 5_000L
 
     // ISO 9141 has to serialize every request.  Six fast PIDs plus the rotating work
@@ -541,8 +541,15 @@ object ObdPollPlan {
     /** Constant for the life of a drive: polled once after the ECU proof, carried into every sample. */
     val staticOnce = listOf(0x13, 0x1C)
 
-    fun requestedPids(sequence: Long, supported: Set<Int>): List<Int> = buildList {
+    fun requestedPids(
+        sequence: Long,
+        supported: Set<Int>,
+        diagnosticReserved: Boolean = false,
+    ): List<Int> = buildList {
         addAll(fast)
+        // A rare diagnostic reservation replaces the rotating work; it never replaces
+        // speed/RPM/load or adds another full live cycle's worth of ECU commands.
+        if (diagnosticReserved) return@buildList
         // Preserve the 3-cycle cadence for every non-critical live PID without letting one
         // cycle issue the whole schedule. The slow PIDs retain their 12-cycle cadence and use
         // separated phases.
@@ -572,22 +579,60 @@ object ObdPollPlan {
 
     /**
      * Optional diagnostic work may only consume the command budget learned from this live ELM
-     * session. This is deliberately not a fixed guess: ISO 9141 response time changes between
-     * adapters and a slow command disables sparse work for the rest of the drive.
+     * session. Reserved cycles have already omitted the rotating PIDs. They may spend one
+     * bounded command after the primary sample, even when the conservative reserve would
+     * exceed the five-second target, but never after the primary work itself overruns.
      */
     fun mayRunSparseDiagnostic(
         liveCycleElapsedMillis: Long,
         requiredCommandBudgetMillis: Long,
+        diagnosticReserved: Boolean = false,
     ): Boolean =
-        requiredCommandBudgetMillis in 1..TARGET_CYCLE_MILLIS &&
-            liveCycleElapsedMillis <= TARGET_CYCLE_MILLIS - requiredCommandBudgetMillis
+        if (diagnosticReserved) {
+            liveCycleElapsedMillis in 0..TARGET_CYCLE_MILLIS &&
+                requiredCommandBudgetMillis in 1..SparseDiagnosticScheduler.MAXIMUM_COMMAND_BUDGET_MILLIS
+        } else {
+            requiredCommandBudgetMillis in 1..TARGET_CYCLE_MILLIS &&
+                liveCycleElapsedMillis in 0..(TARGET_CYCLE_MILLIS - requiredCommandBudgetMillis)
+        }
+}
+
+/**
+ * Prevent a busy ISO bus from starving the queued read-only fault scan forever. Reserve
+ * one cycle after the first three samples, then at most once per 13 cycles. Thirteen is
+ * coprime to both rotating tiers (3/12), so the same live PIDs are not always deferred.
+ * Attempts consume their slot even if the primary sample is too slow to permit a scan.
+ */
+internal class SparseDiagnosticScheduler {
+    private var nextReservationCycle = FIRST_RESERVATION_CYCLE
+
+    fun reserveCycle(cycle: Long, workPending: Boolean): Boolean {
+        if (!workPending || cycle < nextReservationCycle) return false
+        observeAttempt(cycle)
+        return true
+    }
+
+    fun observeAttempt(cycle: Long) {
+        nextReservationCycle = if (cycle > Long.MAX_VALUE - RESERVATION_INTERVAL_CYCLES) {
+            Long.MAX_VALUE
+        } else {
+            cycle + RESERVATION_INTERVAL_CYCLES
+        }
+    }
+
+    companion object {
+        const val FIRST_RESERVATION_CYCLE = 3L
+        const val RESERVATION_INTERVAL_CYCLES = 13L
+        const val MAXIMUM_COMMAND_BUDGET_MILLIS = 6_000L
+    }
 }
 
 /**
  * Conservative, connection-local budget for one optional ELM command. Live and diagnostic
  * command timings feed the same high-water mark. A two-times multiplier plus a fixed margin
  * accounts for larger multi-frame diagnostic replies without cancelling an in-flight command.
- * Once a command is slow enough, optional work remains deferred until reconnect.
+ * A slow command keeps opportunistic work deferred; the scheduler separately reserves a
+ * bounded slot so that this conservative high-water mark cannot suppress all fault reads.
  */
 internal class SparseDiagnosticBudgetTracker(
     private val minimumBudgetMillis: Long = 2_000L,

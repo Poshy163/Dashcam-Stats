@@ -17,9 +17,11 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.io.File
 import java.time.Instant
+import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.GZIPInputStream
 import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 
 @RunWith(RobolectricTestRunner::class)
 class BundleExporterProductionTest {
@@ -125,6 +127,66 @@ class BundleExporterProductionTest {
         val recovered = exporter.export(driveId)
         assertEquals(exported.sha256, recovered.sha256)
         assertArrayEquals(firstBytes, recovered.file.readBytes())
+    }
+
+    @Test
+    fun upgradedExporterAcceptsOlderImmutablePollPlansWithoutRewritingThem() {
+        for (plan in 2 until ObdPollPlan.VERSION) {
+            val driveId = "older-plan-$plan"
+            createCompletedDrive(driveId)
+            val archive = exporter.export(driveId).file
+            rewriteManifest(archive) { it.put("poll_plan_version", plan) }
+            val original = archive.readBytes()
+
+            val recovered = exporter.export(driveId)
+
+            assertArrayEquals(original, recovered.file.readBytes())
+            assertEquals(sha256(original), recovered.sha256)
+            assertEquals(recovered.sha256, database.drive(driveId).getString("bundle_sha256"))
+        }
+    }
+
+    @Test
+    fun exporterRejectsMalformedOrUnknownFuturePollPlansWithoutChangingTheirArchives() {
+        val invalidPlans: List<Any> = listOf(ObdPollPlan.VERSION + 1, 5.5, 6.5, true, "5")
+        for ((index, plan) in invalidPlans.withIndex()) {
+            val driveId = "invalid-plan-$index"
+            createCompletedDrive(driveId)
+            val archive = exporter.export(driveId).file
+            rewriteManifest(archive) { it.put("poll_plan_version", plan) }
+            val original = archive.readBytes()
+
+            assertThrows(IllegalStateException::class.java) { exporter.export(driveId) }
+
+            assertArrayEquals(original, archive.readBytes())
+        }
+    }
+
+    private fun rewriteManifest(archive: File, change: (JSONObject) -> Unit) {
+        val entries = ZipFile(archive).use { zip ->
+            zip.entries().toList().map { entry ->
+                var body = zip.getInputStream(entry).use { it.readBytes() }
+                if (entry.name == "manifest.json") {
+                    val manifest = JSONObject(body.toString(Charsets.UTF_8))
+                    change(manifest)
+                    body = manifest.toString().toByteArray(Charsets.UTF_8)
+                }
+                entry.name to body
+            }
+        }
+        ZipOutputStream(archive.outputStream()).use { output ->
+            for ((name, bytes) in entries) {
+                val entry = ZipEntry(name).apply {
+                    method = ZipEntry.STORED
+                    size = bytes.size.toLong()
+                    compressedSize = size
+                    crc = CRC32().apply { update(bytes) }.value
+                }
+                output.putNextEntry(entry)
+                output.write(bytes)
+                output.closeEntry()
+            }
+        }
     }
 
     @Test

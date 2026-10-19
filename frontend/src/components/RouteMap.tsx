@@ -1,5 +1,5 @@
-import { useEffect, useMemo } from 'react'
-import { MapContainer, Marker, Polyline, Popup, TileLayer, useMap } from 'react-leaflet'
+import { useMemo } from 'react'
+import { MapContainer, Marker, Polyline, Popup, TileLayer } from 'react-leaflet'
 import L from 'leaflet'
 // Imported beside the library rather than in main.tsx, so the ~14 kB of Leaflet CSS
 // is emitted with the lazily-loaded map chunk instead of the stylesheet every page
@@ -7,6 +7,7 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 
 import { cn } from '@/lib/cn'
+import FitMapToData from '@/components/FitMapToData'
 
 export interface MapMarker {
   lat: number
@@ -56,19 +57,6 @@ const ICONS = {
   vehicle: dot('#a855f7'),
   recording: dot('#ff6b00'),
   event: dot('#ff3b30'),
-}
-
-function FitBounds({ points }: { points: [number, number][] }) {
-  const map = useMap()
-  useEffect(() => {
-    if (points.length === 0) return
-    if (points.length === 1) {
-      map.setView(points[0]!, 16)
-      return
-    }
-    map.fitBounds(L.latLngBounds(points), { padding: [24, 24] })
-  }, [map, points])
-  return null
 }
 
 /**
@@ -152,7 +140,7 @@ export default function RouteMap({
       className={cn('rounded-lg', className)}
     >
       <TileLayer url={tileUrl} attribution={attribution} maxZoom={maxZoom} />
-      <FitBounds points={allPoints} />
+      <FitMapToData points={allPoints} padding={24} singlePointZoom={16} />
 
       {cleanSegments.map((segment, segmentIndex) =>
         segment.length > 1 ? (

@@ -21,6 +21,7 @@ import {
   formatSpeed,
 } from '@/lib/format'
 import type { StageState, TelemetryPoint } from '@/lib/types'
+import { rowIdFilter } from '@/lib/listFilters'
 
 const REPROCESS_OPTIONS = [
   ['everything', 'Everything'],
@@ -293,7 +294,17 @@ function OsdDebugPanel({
 
 export default function RecordingViewer() {
   const { id } = useParams()
-  const recordingId = Number(id)
+  const recordingId = rowIdFilter(id ?? null)
+  if (recordingId === undefined) return (
+    <div className="space-y-4">
+      <ErrorState title="Invalid recording ID" error={new Error('Choose a recording with a valid positive whole-number ID.')} />
+      <Link to="/recordings" className="btn">Back to recordings</Link>
+    </div>
+  )
+  return <RecordingViewerContent key={recordingId} recordingId={recordingId} />
+}
+
+function RecordingViewerContent({ recordingId }: { recordingId: number }) {
   const [params] = useSearchParams()
   const navigate = useNavigate()
   const client = useQueryClient()

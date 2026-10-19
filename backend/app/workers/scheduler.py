@@ -25,7 +25,7 @@ from app.pipeline.repair import repair_durations
 from app.retention import execute as run_retention
 from app.retention import plan as plan_retention
 from app.retention import plan_idle, plan_parked
-from app.scanner.discovery import Scanner, queue_unprocessed
+from app.scanner.discovery import Scanner, ScanSummary, queue_unprocessed
 from app.workers import queue
 
 log = get_logger(__name__)
@@ -39,6 +39,11 @@ _POST_PROCESS_IDLE_DEBOUNCE_S = 30.0
 _POST_PROCESS_IDLE_MIN_INTERVAL_S = 5 * 60.0
 _POST_PROCESS_IDLE_BATCH_SIZE = 64
 _POST_PROCESS_IDLE_QUEUE_LIMIT = 512
+
+# A newly copied file can need a second stable observation after the normal scan.
+# Bound the extra full share walks even when a camera continues changing one file.
+_SETTLING_SCAN_LIMIT = 3
+_SETTLING_SCAN_MIN_DELAY_S = 30.0
 
 
 @dataclass(slots=True)
@@ -74,6 +79,9 @@ class Scheduler:
         self._post_process_idle_due_at: float | None = None
         self._last_idle_cleanup_at = 0.0
         self._idle_cleanup_overflow_reported = False
+        self._settling_scan_due_at: float | None = None
+        self._settling_scan_remaining = 0
+        self._settling_scan_generation = 0
 
     async def start(self) -> None:
         if self._running:
@@ -171,6 +179,15 @@ class Scheduler:
                         interval = 300.0
                     task.next_run = time.monotonic() + interval
 
+            # This independent deadline survives the TaskState.finally assignment above,
+            # including manual scans requested while another scheduled task was running.
+            try:
+                await self._run_due_settling_scan()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("settling follow-up scan failed", error=str(exc))
+
             # Worker completions are coalesced here, after periodic work. There is only
             # one scheduler loop, so this cannot race the scheduled retention pass or
             # turn N workers into N simultaneous deletion runs.
@@ -193,19 +210,96 @@ class Scheduler:
         await revalidate_motion()
 
     async def _run_scan(self) -> None:
-        summary = await self._scanner.scan(trigger="scheduled")
+        await self._scan_with_followup(trigger="scheduled")
+
+    async def _scan_with_followup(
+        self, *, trigger: str, generation: int | None = None
+    ) -> ScanSummary:
+        summary = await self._scanner.scan(trigger=trigger)
+        earlier_due = None
+        if generation is None:
+            # A real scheduled/manual scan starts a new bounded chain. Register before
+            # any further awaits so an older follow-up cannot overwrite its deadline.
+            # A regular walk already supplied the next observation. Start its wait
+            # again, so a short configured interval does not gain extra scans forever.
+            earlier_due = self._settling_scan_due_at if trigger == "manual" else None
+            self._settling_scan_generation += 1
+            generation = self._settling_scan_generation
+            self._settling_scan_remaining = _SETTLING_SCAN_LIMIT
+            self._settling_scan_due_at = None
         settings = get_settings_service()
+        auto_process = await settings.auto_process()
+        await self._schedule_settling_scan(summary, generation, earlier_due, auto_process)
         # Unconditional, because every attempt to predict when there is nothing to queue
         # has been wrong. Gating on `new` alone stranded files the camera rewrote; gating
         # on `new or changed` still strands a file that left the settle window on a scan
         # where its stat did not move, and a recording whose job was cancelled or lost.
         # `queue_unprocessed` is one indexed query that normally matches nothing, so the
         # gate was buying nothing and costing correctness.
-        if await settings.auto_process():
+        if auto_process:
             async with session_scope() as session:
                 summary.queued = await queue_unprocessed(session)
 
         await self._post_scan_maintenance(summary)
+        return summary
+
+    async def _schedule_settling_scan(
+        self,
+        summary: ScanSummary,
+        generation: int,
+        earlier_due: float | None,
+        auto_process: bool,
+    ) -> None:
+        enabled = await get_settings_service().scan_enabled()
+        delay = max(_SETTLING_SCAN_MIN_DELAY_S, await get_settings_service().settle_seconds())
+        if generation != self._settling_scan_generation:
+            return
+        if (
+            not enabled
+            or not auto_process
+            or not summary.unsettled
+            or summary.errors
+            or summary.error_message
+            or self._settling_scan_remaining <= 0
+        ):
+            self._settling_scan_due_at = None
+            self._settling_scan_remaining = 0
+            return
+        due = time.monotonic() + delay
+        self._settling_scan_due_at = min(earlier_due, due) if earlier_due is not None else due
+
+    async def _run_due_settling_scan(self, now: float | None = None) -> bool:
+        moment = time.monotonic() if now is None else now
+        due = self._settling_scan_due_at
+        if due is None or moment < due:
+            return False
+        generation = self._settling_scan_generation
+        settings = get_settings_service()
+        # Consume before any awaited setting read, too. A failed settings lookup must
+        # not leave an overdue request retried on every one-second scheduler tick.
+        self._settling_scan_due_at = None
+        try:
+            enabled = await settings.scan_enabled()
+            auto_process = await settings.auto_process()
+        except BaseException:
+            if generation == self._settling_scan_generation:
+                self._settling_scan_remaining = 0
+            raise
+        if generation != self._settling_scan_generation:
+            return False
+        # Consume before awaiting the walk: failures never create a rapid retry loop.
+        if not enabled or not auto_process or self._settling_scan_remaining <= 0:
+            self._settling_scan_remaining = 0
+            return False
+        self._settling_scan_remaining -= 1
+        try:
+            await self._scan_with_followup(trigger="scheduled", generation=generation)
+        except BaseException:
+            if generation == self._settling_scan_generation:
+                self._settling_scan_due_at = None
+                self._settling_scan_remaining = 0
+            raise
+        return True
 
     async def _post_scan_maintenance(self, summary) -> None:
         """Everything that has to happen after a walk, whoever asked for the walk.
@@ -406,12 +500,7 @@ class Scheduler:
     # -- manual triggers ---------------------------------------------------------------
 
     async def scan_now(self) -> object:
-        summary = await self._scanner.scan(trigger="manual")
-        if await get_settings_service().auto_process():
-            async with session_scope() as session:
-                summary.queued = await queue_unprocessed(session)
-        await self._post_scan_maintenance(summary)
-        return summary
+        return await self._scan_with_followup(trigger="manual")
 
     async def process_new(self) -> int:
         async with session_scope() as session:
@@ -422,7 +511,14 @@ class Scheduler:
         return self._running and self._task is not None and not self._task.done()
 
     def describe(self) -> list[dict[str, object]]:
-        return [task.as_dict() for task in self._tasks]
+        descriptions = [task.as_dict() for task in self._tasks]
+        for item in descriptions:
+            if item["name"] == "scan" and self._settling_scan_due_at is not None:
+                item["seconds_until_next"] = min(
+                    item["seconds_until_next"],
+                    max(0.0, round(self._settling_scan_due_at - time.monotonic(), 1)),
+                )
+        return descriptions
 
 
 async def _flag(key: str) -> bool:

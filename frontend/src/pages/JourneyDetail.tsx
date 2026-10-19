@@ -8,6 +8,7 @@ import Spinner from '@/components/Spinner'
 import { DerivedHint, EmptyState, ErrorState, PageHeader, StatTile, StateBadge } from '@/components/ui'
 import { api } from '@/lib/api'
 import { availableFootageDurations } from '@/lib/journeyPlayback'
+import { rowIdFilter } from '@/lib/listFilters'
 import { useMapSettings } from '@/lib/useMapSettings'
 import {
   formatDate,
@@ -30,7 +31,17 @@ const CAMERA_ORDER = ['front', 'rear', 'cabin', 'other']
 
 export default function JourneyDetail() {
   const { id } = useParams()
-  const journeyId = Number(id)
+  const journeyId = rowIdFilter(id ?? null)
+  if (journeyId === undefined) return (
+    <div className="space-y-4">
+      <ErrorState title="Invalid journey ID" error={new Error('Choose a journey with a valid positive whole-number ID.')} />
+      <Link to="/journeys" className="btn">Back to journeys</Link>
+    </div>
+  )
+  return <JourneyDetailContent key={journeyId} journeyId={journeyId} />
+}
+
+function JourneyDetailContent({ journeyId }: { journeyId: number }) {
   const navigate = useNavigate()
   const client = useQueryClient()
   const [stage, setStage] = useState<string>('everything')

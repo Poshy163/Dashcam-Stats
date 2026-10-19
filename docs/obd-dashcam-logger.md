@@ -258,11 +258,18 @@ Only transport-level faults (missing prompt, overflow, failed write, disconnect)
 reconnect, and a fatal fault mid-cycle first persists the partial sample already gathered, marked
 `failed_after_partial`/`partial`, so observed values survive the reconnect.
 The scan is interleaved at no more than one diagnostic command after each committed fast sample.
-It starts only when at least two seconds remain in that cycle's five-second budget; otherwise the
-step stays queued for a later cycle instead of making an existing cadence gap worse. The serial
-adapter can still take longer than that reserve, but an in-flight ELM command is never cancelled
+Ordinary cycles require the connection's learned command reserve to fit in the remaining
+five-second budget. That reserve can grow to six seconds, which previously starved all queued
+diagnostics on a busy bus. Version 0.3.5 / poll plan v6 reserves cycle 3 and then at most one cycle
+per 13 cycles for primary speed/RPM/load plus one read-only diagnostic step. It defers the rotating
+PIDs on those cycles and starts the diagnostic only after a persisted sample, no bus-silence
+condition, and primary work finishing within five seconds. Ordinary diagnostic progress postpones
+the next reservation. The existing command timeout still bounds the diagnostic; a reserved cycle
+can exceed the sample target. Coverage counts deferred observations as missing. The serial adapter
+can still take longer than the learned reserve, but an in-flight ELM command is never cancelled
 because doing so would taint prompt ownership and require a reconnect. The scans never send Mode
-04/08 or clear DTCs.
+04/08 or clear DTCs. These changes require an APK update; refreshing server-managed Wi-Fi helper
+scripts does not replace the companion APK.
 
 ## Local data and bundle v1
 
@@ -274,6 +281,11 @@ power-loss durability boundary. Each connection captures one UTC anchor and adva
 only from Android elapsed realtime, so NTP or manual wall-clock changes cannot regress a drive's
 sequence timestamps. Recovery clamps later lifecycle clocks to the final sequence sample when the
 wall clock was corrected backward, and bundle creation is likewise ordered after finalisation.
+Database version 5 adds a nullable producer `poll_plan_version` per drive. New drives record v6;
+an additive migration assigns only Git-verified historical release mappings. Unknown legacy
+producers retain no asserted plan and export the supported legacy v1 manifest/summary shape.
+Delayed exports use the recorded producer's plan, and valid ready archives for supported plans
+2–6 remain immutable when the APK changes.
 Diagnostics deduplicate only an unchanged consecutive value of the same kind; a real
 `A → B → A` transition keeps all three observations and timestamps. Startup recovery closes an
 orphaned `recording` or `finalising` drive at its final persisted sample timestamp (not at the

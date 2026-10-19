@@ -14,6 +14,8 @@ import contextlib
 import os
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -54,6 +56,17 @@ from app.ingest.obd_transfer import (
 from app.ingest.status import get_status
 
 log = get_logger(__name__)
+
+
+@dataclass(slots=True)
+class _RunLifecycle:
+    started_at: datetime
+    released: bool = False
+
+
+# Status clears its start and can admit a successor before history writes finish.
+# Keep the timestamp and release state with the task that claimed this run.
+_run_lifecycle: ContextVar[_RunLifecycle | None] = ContextVar("ingest_run_lifecycle", default=None)
 
 #: Staged arrivals live here until they are whole. A dot-directory so the scanner's walk
 #: skips it -- see `app.scanner.discovery`.
@@ -1529,6 +1542,8 @@ async def run_pull(
         log.info("a pull is already running; ignoring the trigger", trigger=trigger)
         return RunResult(state=RunState.RUNNING, error="already running")
 
+    lifecycle = _RunLifecycle(started_at=datetime.now(UTC))
+    lifecycle_token = _run_lifecycle.set(lifecycle)
     started = time.monotonic()
     result = RunResult(state=RunState.ERROR, error="backup cleanup did not complete")
     staging_cleanup_tasks: list[asyncio.Task[None]] = []
@@ -1555,17 +1570,21 @@ async def run_pull(
                 with contextlib.suppress(Exception):
                     await _join_staging_cleanup(task)
         finally:
-            # Includes settings/path initialization before the inner try, and
-            # cancellation or failure during its awaited cleanup. Normal runs
-            # already publish their richer result before history/sleep handling.
-            if status.running:
-                result.seconds = time.monotonic() - started
-                status.finish(result)
-                # Initialization and failed cleanup are material attempts too.
-                # The inner path records normal results after finishing status;
-                # only this fallback owns history when it never got that far.
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await _record_run_completion(result, trigger, continuation=continuation)
+            try:
+                # Includes settings/path initialization before the inner try, and
+                # cancellation or failure during its awaited cleanup. Normal runs
+                # already publish their richer result before history/sleep handling.
+                if not lifecycle.released and status.running:
+                    result.seconds = time.monotonic() - started
+                    status.finish(result)
+                    lifecycle.released = True
+                    # Initialization and failed cleanup are material attempts too.
+                    # The inner path records normal results after finishing status;
+                    # only this fallback owns history when it never got that far.
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await _record_run_completion(result, trigger, continuation=continuation)
+            finally:
+                _run_lifecycle.reset(lifecycle_token)
 
 
 async def _run_pull_started(
@@ -2455,7 +2474,10 @@ async def _run_pull_started(
 
         if result.seconds <= 0:
             result.seconds = time.monotonic() - started
+        lifecycle = _run_lifecycle.get()
         status.finish(result)
+        if lifecycle is not None:
+            lifecycle.released = True
         # A run that found nothing to do, or found no car, is not an event. Recording and
         # announcing those would put a row in the table and a notification on somebody's
         # phone every single time the engine started -- and, because anything that is not
@@ -2579,11 +2601,13 @@ async def _persist(result: RunResult, trigger: str) -> None:
     from app.db.models import IngestRun
     from app.db.session import session_scope
 
+    finished_at = datetime.now(UTC)
+    lifecycle = _run_lifecycle.get()
     async with session_scope() as session:
         session.add(
             IngestRun(
-                started_at=datetime.now(UTC),
-                finished_at=datetime.now(UTC),
+                started_at=lifecycle.started_at if lifecycle is not None else finished_at,
+                finished_at=finished_at,
                 trigger=trigger,
                 state=result.state.value,
                 files_transferred=result.files,

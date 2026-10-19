@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 
@@ -15,19 +15,37 @@ import {
 } from '@/components/ui'
 import { api, mediaUrl } from '@/lib/api'
 import { formatCoords, formatDateTime } from '@/lib/format'
+import { rowIdFilter } from '@/lib/listFilters'
 import { invalidateAnalysisQueries } from '@/lib/queryInvalidation'
 import { useMapSettings } from '@/lib/useMapSettings'
 
 export default function PlateDetail() {
-  const maps = useMapSettings()
   const { id } = useParams()
-  const plateId = Number(id)
+  const plateId = rowIdFilter(id ?? null)
+  if (plateId === undefined) return (
+    <div className="space-y-4">
+      <ErrorState title="Invalid plate ID" error={new Error('Choose a plate with a valid positive whole-number ID.')} />
+      <Link to="/plates" className="btn">Back to plates</Link>
+    </div>
+  )
+  return <PlateDetailContent key={plateId} plateId={plateId} />
+}
+
+function PlateDetailContent({ plateId }: { plateId: number }) {
+  const maps = useMapSettings()
   const client = useQueryClient()
   const navigate = useNavigate()
   const [page, setPage] = useState(1)
   const [notes, setNotes] = useState<string | null>(null)
   const [correctedText, setCorrectedText] = useState('')
   const [mergeTarget, setMergeTarget] = useState('')
+  // A mutation may finish after this editor unmounts. Its cache update is still valid,
+  // but navigation must not discard an editor the user opened in the meantime.
+  const editorActive = useRef(true)
+  useEffect(() => {
+    editorActive.current = true
+    return () => { editorActive.current = false }
+  }, [])
 
   const plate = useQuery({
     queryKey: ['plate', plateId],
@@ -47,24 +65,26 @@ export default function PlateDetail() {
   })
   const correct = useMutation({
     mutationFn: () => api.plates.correct(plateId, correctedText),
-    onSuccess: (updated) => {
+    onSuccess: async (updated) => {
       client.invalidateQueries({ queryKey: ['plates'] })
-      // The sightings below carry the plate's text too. When a correction does not change
-      // the plate id there is no navigation to remount them, so without this the list kept
-      // showing the pre-correction rows.
-      client.invalidateQueries({ queryKey: ['plate-observations', plateId] })
-      navigate(`/plates/${updated.id}`, { replace: updated.id !== plateId })
+      // Corrections can merge into an already-open target. Cancel older reads before
+      // refreshing both sides so pre-correction responses cannot replace fresh sightings.
+      const affectedIds = [...new Set([plateId, updated.id])]
+      await Promise.all(affectedIds.map(id => client.cancelQueries({ queryKey: ['plate-observations', id] })))
+      for (const id of affectedIds) void client.invalidateQueries({ queryKey: ['plate-observations', id] })
       client.setQueryData(['plate', updated.id], updated)
+      if (editorActive.current) navigate(`/plates/${updated.id}`, { replace: updated.id !== plateId })
     },
   })
   const merge = useMutation({
     mutationFn: () => api.plates.merge(plateId, Number(mergeTarget)),
-    onSuccess: (updated) => {
+    onSuccess: async (updated) => {
       // A merge moves observations between plates and deletes one of them, so the absorbed
       // plate's own detail and sightings queries are stale rather than merely out of date —
       // pressing Back re-rendered a plate that no longer exists straight from cache.
+      await Promise.all([...new Set([plateId, updated.id])].map(id => client.cancelQueries({ queryKey: ['plate-observations', id] })))
       void invalidateAnalysisQueries(client)
-      navigate(`/plates/${updated.id}`, { replace: true })
+      if (editorActive.current) navigate(`/plates/${updated.id}`, { replace: true })
     },
   })
 

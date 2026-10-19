@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Any
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
+from app.db.retry import is_locked_error
 from app.ingest import adb
 from app.ingest.status import get_status
 
@@ -108,6 +109,9 @@ _last_armed: dict[str, float] = {}
 _last_recovered: dict[str, float] = {}
 _tasks: set[asyncio.Task[None]] = set()
 _arm_locks: dict[str, asyncio.Lock] = {}
+_arm_tasks: dict[str, asyncio.Task[None]] = {}
+_recovery_tasks: dict[str, asyncio.Task[None]] = {}
+_shutting_down = False
 
 
 def script() -> str:
@@ -235,7 +239,11 @@ async def _arm_locked(address: str) -> bool:
             log.warning("CarPlay sampler launch was not verified")
             return False
     except adb.AdbError as exc:
-        log.warning("could not arm the CarPlay timing sampler", error=str(exc))
+        log.warning(
+            "could not arm the CarPlay timing sampler",
+            category=_failure_category(exc),
+            error_type=type(exc).__name__,
+        )
         return False
     log.info(
         "armed the CarPlay timing sampler on the unit",
@@ -247,17 +255,18 @@ async def _arm_locked(address: str) -> bool:
 
 def on_unit_present(address: str) -> None:
     """Arm cheaply whenever present; recover retained diagnostics only when parked."""
-    if not _enabled():
+    if _shutting_down or not _enabled():
         return
     recover_on_unit_present(address)
+    if address in _arm_tasks and not _arm_tasks[address].done():
+        return
     now = time.monotonic()
     last = _last_armed.get(address)
     if last is not None and now - last < ARM_DEBOUNCE_S:
         return
     _last_armed[address] = now
     task = asyncio.create_task(_arm_on_presence(address), name="ingest-carplay-timing")
-    _tasks.add(task)
-    task.add_done_callback(_tasks.discard)
+    _track_presence_task(address, task, _arm_tasks, "arm")
 
 
 async def _arm_on_presence(address: str) -> None:
@@ -268,11 +277,64 @@ async def _arm_on_presence(address: str) -> None:
         raise
     if not armed:
         _last_armed[address] = time.monotonic() - ARM_DEBOUNCE_S + ARM_RETRY_S
+    else:
+        _last_armed[address] = time.monotonic()
+
+
+def _failure_category(exc: Exception) -> str:
+    if is_locked_error(exc):
+        return "storage_busy"
+    if isinstance(exc, adb.AdbError):
+        message = str(exc).lower()
+        if "error: closed" in message:
+            return "transport_closed"
+        if "total time limit" in message or "timed out" in message:
+            return "timeout"
+        if "rotated or truncated" in message:
+            return "snapshot_changed"
+        if "integrity validation" in message or "incomplete chunk" in message:
+            return "snapshot_invalid"
+        return "device_unavailable"
+    return "internal_error"
+
+
+def _track_presence_task(
+    address: str,
+    task: asyncio.Task[None],
+    slots: dict[str, asyncio.Task[None]],
+    operation: str,
+) -> None:
+    _tasks.add(task)
+    slots[address] = task
+
+    def finished(done: asyncio.Task[None]) -> None:
+        _tasks.discard(done)
+        if slots.get(address) is done:
+            slots.pop(address, None)
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            # Database exceptions can include full sampler rows. Retrieve the failure
+            # without reflecting their payload into a second diagnostic stream.
+            log.warning(
+                "CarPlay background operation failed",
+                operation=operation,
+                category=_failure_category(exc),
+                error_type=type(exc).__name__,
+            )
+
+    task.add_done_callback(finished)
 
 
 def recover_on_unit_present(address: str) -> None:
     """Recover parked evidence even during a long backup, without restarting capture."""
-    if not _enabled() or adb.optional_requests_deferred(address):
+    if _shutting_down or not _enabled() or adb.optional_requests_deferred(address):
+        return
+    # The time budget may have expired while SQLite is still settling rollback. Keep
+    # ownership until that exact task finishes; a new visit must not add another writer.
+    if address in _recovery_tasks and not _recovery_tasks[address].done():
         return
     now = time.monotonic()
     # File recovery can read several MiB.  The sampler is also armed at departure, where
@@ -286,25 +348,42 @@ def recover_on_unit_present(address: str) -> None:
             task = asyncio.create_task(
                 _recover_when_parked(address), name="ingest-carplay-timing-recover"
             )
-            _tasks.add(task)
-            task.add_done_callback(_tasks.discard)
+            _track_presence_task(address, task, _recovery_tasks, "recovery")
 
 
 async def shutdown() -> None:
-    for task in list(_tasks):
-        task.cancel()
-    for task in list(_tasks):
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
-    _tasks.clear()
+    global _shutting_down
+    _shutting_down = True
+    cancelled = False
+    try:
+        tasks = list(_tasks)
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        for task in tasks:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    cancelled |= current is not None and bool(current.cancelling())
+                except Exception:
+                    break
+        _tasks.clear()
+        _arm_tasks.clear()
+        _recovery_tasks.clear()
+    finally:
+        _shutting_down = False
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 def reset_for_tests() -> None:
     _last_armed.clear()
     _last_recovered.clear()
     _arm_locks.clear()
+    _arm_tasks.clear()
+    _recovery_tasks.clear()
 
 
 # ----------------------------------------------------------------------------------------
@@ -832,14 +911,14 @@ async def recover_sampler_file(address: str) -> tuple[int, int]:
     try:
         async with asyncio.timeout(RECOVERY_TIMEOUT_S):
             raw = await _read_sampler_snapshot(address)
+            entries = parse_sampler_file(raw)
+            if not entries:
+                return 0, 0
+            from app.ingest.unit_logs import store
+
+            return await store(entries)
     except TimeoutError:
         raise adb.AdbError("CarPlay sampler recovery exceeded its total time limit") from None
-    entries = parse_sampler_file(raw)
-    if not entries:
-        return 0, 0
-    from app.ingest.unit_logs import store
-
-    return await store(entries)
 
 
 def _recovery_path(generation: int) -> str:
@@ -1008,11 +1087,19 @@ async def _read_sampler_snapshot(address: str) -> str:
 async def _recover_when_parked(address: str) -> None:
     """Best-effort direct-file recovery after a known ignition-off transition."""
     try:
-        await recover_sampler_file(address)
+        accepted, duplicates = await recover_sampler_file(address)
     except Exception as exc:
         # Recovery is diagnostic only.  A full database or malformed historical file must
         # not stop the later sampling/ingest work.
-        log.warning("could not recover the CarPlay timing sampler file", error=str(exc))
+        _last_recovered[address] = time.monotonic() - ARM_DEBOUNCE_S + ARM_RETRY_S
+        log.warning(
+            "could not recover the CarPlay timing sampler file",
+            category=_failure_category(exc),
+            error_type=type(exc).__name__,
+        )
+    else:
+        _last_recovered[address] = time.monotonic()
+        log.info("CarPlay timing file recovery complete", accepted=accepted, duplicates=duplicates)
 
 
 def sessions(samples: list[dict[str, Any]], events: list[dict[str, Any]]) -> list[dict[str, Any]]:

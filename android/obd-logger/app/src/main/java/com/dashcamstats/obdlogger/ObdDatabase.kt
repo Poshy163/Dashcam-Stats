@@ -30,6 +30,7 @@ data class DriveRecord(
     val originalTimezone: String,
     val startReason: String,
     val obdProtocol: String,
+    val pollPlanVersion: Int = ObdPollPlan.VERSION,
 )
 
 data class SampleRecord(
@@ -129,6 +130,7 @@ class ObdDatabase(
                     "upgraded OBD database failed its integrity check"
                 }
                 retireMigrationBackup(databaseFile, migrationBackup)
+                cleanupRetiredMigrationBackups(databaseFile)
             }
             return database
         } catch (error: Throwable) {
@@ -180,6 +182,7 @@ class ObdDatabase(
               drive_id TEXT PRIMARY KEY, vehicle_id TEXT NOT NULL, adapter_id TEXT,
               logger_id TEXT NOT NULL, logger_version TEXT NOT NULL,
               schema_version INTEGER NOT NULL DEFAULT 1,
+              poll_plan_version INTEGER,
               start_time_utc TEXT NOT NULL, finish_time_utc TEXT, original_timezone TEXT,
               start_reason TEXT NOT NULL, stop_reason TEXT, obd_protocol TEXT,
               status TEXT NOT NULL, export_status TEXT NOT NULL DEFAULT 'waiting_for_backup',
@@ -270,6 +273,22 @@ class ObdDatabase(
             db.execSQL("ALTER TABLE samples ADD COLUMN mil_on INTEGER")
             db.execSQL("ALTER TABLE samples ADD COLUMN dtc_count INTEGER")
         }
+        if (oldVersion < 5 && newVersion >= 5) {
+            // The plan belongs to the producer that recorded a drive, not the APK that
+            // eventually exports it. These producer releases have verified cadence
+            // contracts in Git history; unknown/pre-versioned producers stay unknown.
+            db.execSQL("ALTER TABLE drives ADD COLUMN poll_plan_version INTEGER")
+            db.execSQL(
+                """
+                UPDATE drives SET poll_plan_version=CASE
+                  WHEN logger_version IN ('0.2.1','0.2.2') THEN 2
+                  WHEN logger_version IN ('0.2.3','0.2.4','0.2.5','0.2.6') THEN 3
+                  WHEN logger_version='0.2.8' THEN 4
+                  WHEN logger_version IN ('0.2.9','0.3.0','0.3.1','0.3.2','0.3.3','0.3.4') THEN 5
+                  ELSE NULL END
+                """.trimIndent(),
+            )
+        }
         upgradeFailureForTest?.invoke()
         if (oldVersion !in 1 until newVersion || newVersion > DATABASE_VERSION) {
             throw IllegalStateException("unsupported OBD database upgrade $oldVersion -> $newVersion")
@@ -278,7 +297,7 @@ class ObdDatabase(
 
     companion object {
         private const val DATABASE_NAME = "obd_drives.db"
-        private const val DATABASE_VERSION = 4
+        private const val DATABASE_VERSION = 5
         private const val BACKUP_READY_NAME = "READY.json"
         private const val BACKUP_STAGING_NAME = ".obd-migration-v3.partial"
         private const val RESTORE_MARKER_SUFFIX = ".migration-restore.pending"
@@ -310,12 +329,60 @@ class ObdDatabase(
             failureForTest: ((String) -> Unit)?,
         ): File? {
             databaseFile.parentFile?.mkdirs()
-            val backup = migrationBackupDirectory(databaseFile)
             val marker = restoreMarker(databaseFile)
+            var live = inspectDatabase(databaseFile, readWrite = false)
+            val candidates = (2..DATABASE_VERSION).map { target ->
+                target to migrationBackupDirectory(databaseFile, target)
+            }
+            // A validated current database wins without a pending restore. Only retire
+            // bounded, validated snapshots; leave unexpected artifacts for recovery.
+            if (!marker.isFile && live?.version == DATABASE_VERSION) {
+                for ((target, directory) in candidates) {
+                    val validated = validateMigrationBackup(directory)
+                    if (validated != null && validated.sourceVersion < target) {
+                        retireMigrationBackup(databaseFile, directory)
+                    }
+                }
+                cleanupRetiredMigrationBackups(databaseFile)
+                Files.deleteIfExists(restoreStaging(databaseFile).toPath())
+                Files.deleteIfExists(File(marker.parentFile, "${marker.name}.partial").toPath())
+                return null
+            }
+            var retained = candidates.filter { (_, directory) -> directory.exists() }.map { (target, directory) ->
+                val validated = checkNotNull(validateMigrationBackup(directory)) {
+                    "retained OBD migration backup is invalid"
+                }
+                check(validated.sourceVersion < target) { "OBD migration backup has an invalid target version" }
+                Triple(target, directory, validated)
+            }
+            // A power loss can interrupt the handoff below after publishing the new
+            // snapshot but before retiring the stale one. Resolve only that provable
+            // two-snapshot state: healthy live bytes must match the new snapshot exactly.
+            val handoffLiveVersion = live?.version
+            if (retained.size == 2 && !marker.isFile && handoffLiveVersion != null) {
+                val current = retained.singleOrNull { it.first == DATABASE_VERSION && it.third.sourceVersion == handoffLiveVersion }
+                val older = retained.singleOrNull { it.first < DATABASE_VERSION && it.first <= handoffLiveVersion }
+                if (current != null && older != null) {
+                    val checkpointed = checkpointAndInspect(databaseFile)
+                    if (checkpointed.version == handoffLiveVersion &&
+                        databaseFile.length() == current.third.sizeBytes &&
+                        hashFile(databaseFile) == current.third.sha256
+                    ) {
+                        retireMigrationBackup(databaseFile, older.second)
+                        retained = listOf(current)
+                    }
+                }
+            }
+            check(retained.size <= 1) { "multiple retained OBD migration backups require recovery" }
+            val selected = retained.singleOrNull()
+            val backup = selected?.second ?: migrationBackupDirectory(databaseFile)
             var restoredFromBackup = false
             if (marker.isFile) {
-                check(validateMigrationBackup(backup) != null) {
+                val validated = checkNotNull(selected?.third) {
                     "OBD migration restore is pending but its validated backup is missing"
+                }
+                check(restoreMarkerMatches(marker, validated)) {
+                    "OBD migration restore marker does not match its backup"
                 }
                 restoreMigrationBackup(databaseFile, backup, failureForTest)
                 restoredFromBackup = true
@@ -324,7 +391,7 @@ class ObdDatabase(
                 Files.deleteIfExists(File(marker.parentFile, "${marker.name}.partial").toPath())
             }
 
-            var live = inspectDatabase(databaseFile, readWrite = false)
+            live = inspectDatabase(databaseFile, readWrite = false)
             val existingBackup = validateMigrationBackup(backup)
             if (live == null && existingBackup != null) {
                 restoreMigrationBackup(databaseFile, backup, failureForTest)
@@ -337,6 +404,19 @@ class ObdDatabase(
             }
             if (live == null || live.version !in 1 until DATABASE_VERSION) return null
             if (existingBackup != null) {
+                if (selected != null && selected.first < DATABASE_VERSION && live.version >= selected.first) {
+                    // The older APK already completed its target migration, then wrote
+                    // more samples. Snapshot that healthy live database before retiring
+                    // the stale older snapshot; never roll those newer samples back.
+                    val checkpointed = checkpointAndInspect(databaseFile)
+                    check(checkpointed.version == live.version)
+                    val currentBackup = createMigrationBackup(
+                        databaseFile, migrationBackupDirectory(databaseFile), checkpointed.version,
+                    )
+                    failureForTest?.invoke("after_migration_backup_handoff")
+                    retireMigrationBackup(databaseFile, backup, failureForTest)
+                    return currentBackup
+                }
                 check(existingBackup.sourceVersion == live.version) {
                     "existing OBD migration backup is for a different database version"
                 }
@@ -354,6 +434,16 @@ class ObdDatabase(
             }
             return createMigrationBackup(databaseFile, backup, checkpointed.version)
         }
+
+        private fun restoreMarkerMatches(marker: File, backup: ValidatedMigrationBackup): Boolean = runCatching {
+            check(Files.isRegularFile(marker.toPath(), LinkOption.NOFOLLOW_LINKS) && marker.length() in 1..4_096)
+            val metadata = JSONObject(marker.readText(Charsets.UTF_8))
+            metadata.keys().asSequence().toSet() == backupMetadataKeys &&
+                metadata.getInt("schema_version") == 1 &&
+                metadata.getInt("source_database_version") == backup.sourceVersion &&
+                metadata.getLong("main_size_bytes") == backup.sizeBytes &&
+                metadata.getString("main_sha256") == backup.sha256
+        }.getOrDefault(false)
 
         /**
          * Restore uses one checkpointed main database; WAL is never copied and SHM is never
@@ -528,14 +618,52 @@ class ObdDatabase(
                 cursor.count == 1 && cursor.moveToFirst() && cursor.getString(0) == "ok"
             }
 
-        private fun retireMigrationBackup(databaseFile: File, backup: File) {
-            backup.deleteRecursively()
+        private fun retireMigrationBackup(
+            databaseFile: File,
+            backup: File,
+            failureForTest: ((String) -> Unit)? = null,
+        ) {
+            val retired = File(backup.parentFile, backup.name + ".retired")
+            if (Files.exists(backup.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                check(validateMigrationBackup(backup) != null) { "refusing to retire an invalid OBD migration backup" }
+                cleanupRetiredMigrationBackup(retired)
+                // A previous cleanup can be incomplete or contain unexpected artifacts.
+                // Preserve them and the still-valid canonical snapshot for a later retry.
+                if (Files.exists(retired.toPath(), LinkOption.NOFOLLOW_LINKS)) return
+                Files.move(backup.toPath(), retired.toPath(), StandardCopyOption.ATOMIC_MOVE)
+                syncDirectory(checkNotNull(backup.parentFile))
+                failureForTest?.invoke("after_migration_backup_retirement_rename")
+            }
+            cleanupRetiredMigrationBackup(retired)
             backupStaging(databaseFile).deleteRecursively()
             Files.deleteIfExists(restoreStaging(databaseFile).toPath())
             val marker = restoreMarker(databaseFile)
             Files.deleteIfExists(marker.toPath())
             Files.deleteIfExists(File(marker.parentFile, "${marker.name}.partial").toPath())
             syncDirectory(checkNotNull(databaseFile.parentFile))
+        }
+
+        private fun cleanupRetiredMigrationBackups(databaseFile: File) {
+            for (target in 2..DATABASE_VERSION) {
+                val backup = migrationBackupDirectory(databaseFile, target)
+                cleanupRetiredMigrationBackup(File(backup.parentFile, backup.name + ".retired"))
+            }
+        }
+
+        private fun cleanupRetiredMigrationBackup(retired: File) {
+            // Retired snapshots contain only these two regular files. A partially
+            // completed cleanup is safe to resume; unknown files/links stay untouched.
+            if (!Files.isDirectory(retired.toPath(), LinkOption.NOFOLLOW_LINKS)) return
+            val files = retired.listFiles() ?: return
+            if (files.any {
+                    it.name !in setOf("main", BACKUP_READY_NAME) ||
+                        !Files.isRegularFile(it.toPath(), LinkOption.NOFOLLOW_LINKS)
+                }) return
+            runCatching {
+                for (file in files) Files.deleteIfExists(file.toPath())
+                Files.deleteIfExists(retired.toPath())
+                syncDirectory(checkNotNull(retired.parentFile))
+            }
         }
 
         private fun copySynced(source: File, target: File) {
@@ -609,9 +737,9 @@ class ObdDatabase(
             }
         }
 
-        private fun migrationBackupDirectory(databaseFile: File): File = File(
+        private fun migrationBackupDirectory(databaseFile: File, targetVersion: Int = DATABASE_VERSION): File = File(
             databaseFile.parentFile,
-            "${databaseFile.name}.migration-backup-v1-to-v$DATABASE_VERSION",
+            "${databaseFile.name}.migration-backup-v1-to-v$targetVersion",
         )
 
         private fun backupStaging(databaseFile: File): File =
@@ -623,8 +751,8 @@ class ObdDatabase(
         private fun restoreStaging(databaseFile: File): File =
             File(databaseFile.parentFile, databaseFile.name + RESTORE_STAGING_SUFFIX)
 
-        internal fun migrationBackupDirectory(context: Context): File =
-            migrationBackupDirectory(context.getDatabasePath(DATABASE_NAME))
+        internal fun migrationBackupDirectory(context: Context, targetVersion: Int = DATABASE_VERSION): File =
+            migrationBackupDirectory(context.getDatabasePath(DATABASE_NAME), targetVersion)
 
         internal fun migrationRestoreMarker(context: Context): File =
             restoreMarker(context.getDatabasePath(DATABASE_NAME))
@@ -646,6 +774,7 @@ class ObdDatabase(
         }
 
     fun startDrive(record: DriveRecord) {
+        require(record.pollPlanVersion in 2..ObdPollPlan.VERSION) { "unsupported recording poll plan" }
         val values = ContentValues().apply {
             put("drive_id", record.driveId)
             put("vehicle_id", record.vehicleId)
@@ -653,6 +782,7 @@ class ObdDatabase(
             put("logger_id", record.loggerId)
             put("logger_version", record.loggerVersion)
             put("schema_version", record.schemaVersion)
+            put("poll_plan_version", record.pollPlanVersion)
             put("start_time_utc", record.startedAtUtc)
             put("original_timezone", record.originalTimezone)
             put("start_reason", record.startReason)

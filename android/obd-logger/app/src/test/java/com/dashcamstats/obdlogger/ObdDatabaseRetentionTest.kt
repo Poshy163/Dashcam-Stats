@@ -494,7 +494,7 @@ class ObdDatabaseRetentionTest {
             assertTrue(column, sample.isNull(column))
         }
         assertEquals(
-            4,
+            5,
             database.readableDatabase.rawQuery("PRAGMA user_version", null).use { cursor ->
                 cursor.moveToFirst()
                 cursor.getInt(0)

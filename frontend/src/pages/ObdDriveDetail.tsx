@@ -7,6 +7,7 @@ import Spinner from '@/components/Spinner'
 import { ObdLifecycleBadge, ObdLifecycleExplanation, ObdLifecycleReason } from '@/components/ObdLifecycle'
 import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
 import { ObdPollTiming } from '@/components/ObdPollTiming'
+import ObdFaultSummary from '@/components/ObdFaultSummary'
 import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/components/ui'
 import { api, type OBDBattery, type OBDSeriesSample } from '@/lib/api'
 import { formatDateTime, formatDuration, formatRelative, formatSpeed, formatTime, utcInputValue } from '@/lib/format'
@@ -834,6 +835,8 @@ export default function ObdDriveDetail() {
           </div>
         )}
       </section>
+
+      <ObdFaultSummary data={query.data} filtered={Boolean(start || end)} />
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-6">
         <StatTile label="Duration" value={formatDuration(drive.durationS)} />

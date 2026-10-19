@@ -144,7 +144,7 @@ export default function ObdDrives() {
                     {drive.dtcsObserved.length > 0 ? (
                       <span className="text-state-warn">{drive.dtcsObserved.join(', ')}</span>
                     ) : (
-                      <span className="text-content-faint">none</span>
+                      <span className="text-content-faint">Not recorded</span>
                     )}
                   </td>
                 </tr>

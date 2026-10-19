@@ -98,6 +98,7 @@ class BundleExporter(
         val work = File(workRoot, "obd-export-$driveId-${System.nanoTime()}").apply { mkdirs() }
         try {
             val drive = database.drive(driveId)
+            val pollPlanVersion = if (drive.isNull("poll_plan_version")) null else drive.getInt("poll_plan_version")
             check(drive.getString("status") in TERMINAL_DRIVE_STATUSES) {
                 "only terminal drives can be exported"
             }
@@ -131,7 +132,13 @@ class BundleExporter(
                     .put("events", JSONArray(diagnostics)),
             )
             val summaryFile = File(work, "summary.json")
-            writeSynced(summaryFile, summary(drive, diagnostics))
+            val summaryPayload = summary(drive, diagnostics)
+            if (pollPlanVersion == null) {
+                // Migrated producers without a verified plan retain the supported legacy
+                // shape instead of falsely claiming the running APK's cadence contract.
+                for (key in HARDENED_SUMMARY_FIELDS - LEGACY_SUMMARY_FIELDS) summaryPayload.remove(key)
+            }
+            writeSynced(summaryFile, summaryPayload)
 
             val counts = mapOf(
                 "samples.ndjson.gz" to sampleCount,
@@ -158,7 +165,7 @@ class BundleExporter(
                 .put("adapter_id", drive.optNullable("adapter_id"))
                 .put("logger_id", drive.getString("logger_id"))
                 .put("logger_version", drive.getString("logger_version"))
-                .put("poll_plan_version", ObdPollPlan.VERSION)
+                .put("poll_plan_version", pollPlanVersion ?: JSONObject.NULL)
                 .put("start_time_utc", drive.getString("start_time_utc"))
                 .put("finish_time_utc", drive.getString("finish_time_utc"))
                 .put("last_sample_at_utc", drive.optNullable("last_sample_at_utc"))
@@ -191,6 +198,9 @@ class BundleExporter(
                 .put("included_filenames", JSONArray(members))
                 .put("units", JSONObject(units as Map<*, *>))
                 .put("files", files)
+            if (pollPlanVersion == null) {
+                for (key in HARDENED_MANIFEST_FIELDS - LEGACY_MANIFEST_FIELDS) manifest.remove(key)
+            }
             writeSynced(File(work, "manifest.json"), manifest)
 
             if (partial.exists() && !partial.delete()) error("could not clear stale partial bundle")
@@ -501,10 +511,11 @@ class BundleExporter(
         val finish = Instant.parse(manifest.getString("finish_time_utc"))
         check(!finish.isBefore(start)) { "manifest drive time range is reversed" }
         if (!hardened) return
+        val pollPlan = manifest.get("poll_plan_version")
         check(
-            manifest.get("poll_plan_version") is Number &&
-                manifest.getInt("poll_plan_version") == ObdPollPlan.VERSION,
-        )
+            (pollPlan is Int && pollPlan in 2..ObdPollPlan.VERSION) ||
+                (pollPlan is Long && pollPlan in 2L..ObdPollPlan.VERSION.toLong()),
+        ) { "manifest poll plan must be a supported integer version" }
         val lastSample = manifest.instantOrNull("last_sample_at_utc")
         val lastResponse = manifest.instantOrNull("last_successful_obd_response_at_utc")
         val noticed = manifest.instantOrNull("termination_noticed_at_utc")
