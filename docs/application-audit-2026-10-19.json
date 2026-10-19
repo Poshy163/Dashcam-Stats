@@ -137,6 +137,15 @@
         "tests/test_ingest_health.py",
         "frontend/tests/backup-countdown.test.mjs"
       ]
+    },
+    {
+      "priority": "P2",
+      "issue": "A lock during implicit flush in a stage-marker commit invalidated the ORM session; retrying commit then masked the original cause with PendingRollbackError.",
+      "fix": "Allow the retry helper to refuse retries on inactive sessions and propagate the exact original lock error to the owning rollback/requeue path. Do not discard pending writes in the helper.",
+      "tests": [
+        "tests/test_commit_retry_session_state.py"
+      ],
+      "validation": "Real SQLite competing-writer regression plus 59 targeted tests passed; stored metadata and counters remain unchanged after failed flush."
     }
   ],
   "unresolved": [
@@ -176,7 +185,7 @@
     "raw_evidence": "Kept out of Git; aggregate report contains no credentials or raw telemetry."
   },
   "post_deployment_verification": {
-    "observed_at_utc": "2026-10-19T09:50:08.850070+00:00",
+    "observed_at_utc": "2026-10-19T09:55:17.133526+00:00",
     "running_source_revision": "87d0c968054386b413626d8f5de4ebe122375236",
     "health": {
       "status": "healthy",
@@ -225,30 +234,29 @@
       "skipped_attempts": 0
     },
     "processing_snapshot": {
-      "completed": 12442,
-      "pending": 1,
-      "processing": 4,
+      "completed": 12449,
+      "pending": 0,
+      "processing": 0,
       "failed": 0,
       "invalid": 0,
-      "settling": 2,
+      "settling": 0,
       "recordings_today": 240,
-      "throughput_per_hour": 11.0
+      "throughput_per_hour": 18.0
     },
     "jobs_snapshot": {
-      "queued": 1,
-      "running": 4,
+      "queued": 0,
+      "running": 0,
       "failed": 0,
-      "completed": 23554,
-      "completed_today": 338,
+      "completed": 23561,
+      "completed_today": 345,
       "thumbnails_pending": 0,
-      "phase": "analysis",
+      "phase": "idle",
       "paused": false,
-      "throughput_per_hour": 166.0,
-      "estimated_minutes_remaining": 0.4
+      "throughput_per_hour": 195.9,
+      "estimated_minutes_remaining": 0.0
     },
-    "preservation": "Existing 329 drives and 428 sessions remained visible while 18 new files were discovered. Retention deletion remains disabled.",
-    "new_processing_errors_observed": 2,
-    "recovery_observation": "Two SQLite lock failures were automatically requeued without consuming an attempt and advanced through telemetry to detection. A unit-log storage-busy refresh succeeded on its next attempt. No MissingGreenlet or PendingRollbackError observed.",
+    "preservation": "All 329 baseline drive IDs and 428 baseline session IDs remain visible. Eighteen new recordings completed every stage; final session count 429. Retention deletion remains disabled.",
+    "recovery_observation": "Two stage SQLite lock failures requeued without consuming an attempt and completed. A later idle-worker claim lock retried on its next poll. A pre-stage marker commit masked its lock with PendingRollbackError; its recording still recovered, and the inactive-commit retry helper is now corrected. A unit-log storage-busy refresh succeeded on its next attempt.",
     "warning_interpretation": [
       "Historical event sequence gap",
       "Recorder inactivity without ignition evidence; wording corrected",
@@ -259,8 +267,49 @@
       "backend_health_tests": 35,
       "frontend_tests": 131,
       "frontend_lint_and_build": "passed",
-      "ruff_and_diff_check": "passed"
+      "ruff_and_diff_check": "passed",
+      "commit_retry_targeted_tests": 59,
+      "warning_fix_ci": "ad693265: 2785 backend tests passed / 20 skipped; 131 frontend tests; Android, Docker and image publication passed."
     },
-    "limit": "Normal arrival transfers and processing observed. No deliberate database contention, cancellation race, radio fault, power loss or failed import was injected on the live device."
+    "limit": "Normal arrival transfers and processing observed. No deliberate database contention, cancellation race, radio fault, power loss or failed import was injected on the live device.",
+    "new_recording_states": {
+      "completed": 18
+    },
+    "new_stage_states": {
+      "metadata_state": {
+        "done": 18
+      },
+      "telemetry_state": {
+        "done": 18
+      },
+      "detection_state": {
+        "done": 18
+      },
+      "plate_state": {
+        "done": 18
+      }
+    },
+    "new_analysis_totals": {
+      "gps_point_count": 998,
+      "vehicle_count": 34,
+      "plate_count": 0,
+      "telemetry_rows": 1057
+    },
+    "new_error_log_entries": 4,
+    "carplay_direct_file_limit": "A diagnostic sampler-file recovery encountered SQLite contention. Regular unit-log imports recovered; direct-file recovery success was not positively observed.",
+    "settled_file_rescan": {
+      "scan_id": 3421,
+      "seen": 12518,
+      "new": 0,
+      "changed": 2,
+      "unsettled": 0,
+      "invalid": 0,
+      "damaged_hidden": 0,
+      "damaged_deleted": 0,
+      "missing": 0,
+      "queued": 2,
+      "errors": 0
+    },
+    "fix_deployment_boundary": "Live device checks used 87d0c968. Follow-up recorder wording and commit-helper fixes are pushed separately; no automatic deployment performed."
   }
 }

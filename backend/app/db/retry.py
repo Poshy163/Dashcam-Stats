@@ -93,12 +93,16 @@ async def retry_on_locked(
     attempts: int = DEFAULT_ATTEMPTS,
     base_delay_s: float = DEFAULT_BASE_DELAY_S,
     on_retry: Callable[[], Awaitable[None]] | None = None,
+    can_retry: Callable[[], bool] | None = None,
 ) -> T:
     """Run *operation*, retrying it while SQLite reports the database as locked.
 
     ``on_retry`` is awaited before each retry and is where the session gets rolled back;
     it is a parameter rather than hard-coded so this stays usable for callers that hold a
     connection rather than a session.
+
+    ``can_retry`` can refuse a retry when the operation has invalidated its transaction.
+    The original exception then propagates without another attempt masking its cause.
 
     The final attempt's exception propagates unchanged. Swallowing it would be worse than
     the lock: a write that silently did not happen is the failure mode this codebase is
@@ -109,7 +113,11 @@ async def retry_on_locked(
         try:
             return await operation()
         except Exception as exc:
-            if not is_locked_error(exc) or attempt >= attempts:
+            if (
+                not is_locked_error(exc)
+                or attempt >= attempts
+                or (can_retry is not None and not can_retry())
+            ):
                 raise
             last = exc
             if on_retry is not None:
@@ -181,7 +189,11 @@ async def commit_with_retry(session: AsyncSession, *, what: str) -> None:
     async def attempt() -> None:
         await session.commit()
 
-    await retry_on_locked(attempt, what=what)
+    # commit() may first flush pending ORM changes. A failed flush leaves the session
+    # inactive, so another commit can only raise PendingRollbackError and hide the real
+    # lock failure. Leave rollback/requeue to the owner; arbitrary pending work cannot
+    # safely be replayed by this helper.
+    await retry_on_locked(attempt, what=what, can_retry=lambda: session.is_active)
 
 
 __all__ = [
