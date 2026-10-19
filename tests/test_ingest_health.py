@@ -87,7 +87,38 @@ class TestTheStallRule:
         ]
         report = health.analyze(health.parse(_log(rows)))
         assert len(report.incidents) == 1
-        assert "STOPPED WRITING" in report.incidents[0]
+        assert "newest recording was more than 3 min old" in report.incidents[0]
+        assert "whether recording was expected were not recorded" in report.incidents[0]
+        assert "does not establish missing footage" in report.incidents[0]
+        assert "that footage does not exist" not in report.incidents[0]
+
+    def test_a_warm_unit_after_both_cameras_stop_does_not_prove_missing_footage(self):
+        start = 1_755_640_000
+        rows = [
+            (start + i * TICK, "rw", 30, 20_000_000, 500_000, "-", "0:30;1:30;") for i in range(10)
+        ]
+        # The unit stays awake after ignition-off, while both cameras stop normally.
+        # The old seven-field watcher log has no ignition/recording-intent evidence.
+        rows += [
+            (
+                start + (10 + i) * TICK,
+                "rw",
+                30 + i * TICK,
+                20_000_000,
+                500_000,
+                "-",
+                f"0:{30 + i * TICK};1:{30 + i * TICK};",
+            )
+            for i in range(20)
+        ]
+        report = health.analyze(health.parse(_log(rows)))
+        assert len(report.incidents) == 1, (
+            "stale recording evidence must remain available for review"
+        )
+        assert "normal after ignition-off" in report.incidents[0]
+        assert "does not establish missing footage" in report.incidents[0]
+        assert "STOPPED WRITING" not in report.incidents[0]
+        assert "STOPPED RECORDING" not in report.incidents[0]
 
     def test_the_boot_age_artifact_is_not_a_stall(self):
         """At power-on the newest recording is the previous drive's last, hours old. The
@@ -157,6 +188,7 @@ class TestPerCameraLiveness:
         report = health.analyze(health.parse(_log(rows)))
         joined = " ".join(report.incidents)
         assert "camera 1 STOPPED RECORDING" in joined, report.incidents
+        assert "footage from that camera does not exist" in joined
         assert "camera 0" not in joined, "the working camera must not be blamed"
 
     def test_a_parked_car_with_both_cameras_idle_is_not_an_incident(self):

@@ -32,7 +32,9 @@ parked car with everything idle is never mistaken for a failure.
 
 **The stall rule needs its grace period explained.** The age of the newest ``.ts`` is the
 liveness signal — this camera closes a segment roughly every minute, so an age beyond
-:data:`STALL_AGE_S` means the recorder has stopped writing. But the first samples of every
+:data:`STALL_AGE_S` means no recent file was observed. This watcher does not record ignition
+or whether recording was expected, so a warm unit after ignition-off must not be described
+as lost driving footage. The first samples of every
 trip would trip it falsely: at power-on the newest recording is the last one of the
 *previous* drive, hours old, and it stays the newest until the camera closes its first new
 segment. So a stall only counts once the trip is at least :data:`STALL_AGE_S` old — by
@@ -77,8 +79,8 @@ REMOTE_PID = "/data/local/tmp/.dashcam_health.pid"
 #: camera closes segments at, so a stall is seen within one segment of it starting.
 SAMPLE_INTERVAL_S = 20
 
-#: A recording older than this, well into a trip, means the recorder has stopped writing.
-#: The camera closes a segment about every 60 seconds; three misses is a stall, not jitter.
+#: A recording older than this merits review after startup. The camera normally closes a
+#: segment about every 60 seconds, but an awake unit need not be expected to record.
 STALL_AGE_S = 180
 
 #: Free space below this is an incident: the camera recycles old footage by itself, so a
@@ -350,8 +352,10 @@ def analyze(samples: list[Sample]) -> Report:
         if stalls:
             span = max(1, round((stalls[-1].ts - stalls[0].ts + SAMPLE_INTERVAL_S) / 60))
             report.incidents.append(
-                f"the recorder STOPPED WRITING around {_when(stalls[0].ts)} for ~{span} "
-                f"min while the unit was running — that footage does not exist"
+                f"the newest recording was more than {STALL_AGE_S // 60} min old around "
+                f"{_when(stalls[0].ts)} for ~{span} min while the unit was awake. "
+                "Ignition state and whether recording was expected were not recorded; "
+                "this can be normal after ignition-off and does not establish missing footage"
             )
 
         # One camera stopped while another kept going. The single-newest-file check above

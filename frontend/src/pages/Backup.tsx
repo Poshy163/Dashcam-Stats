@@ -565,7 +565,7 @@ export default function Backup() {
               data.recorderHealthOk ? 'text-state-ok' : 'text-state-error'
             }`}
           >
-            {data.recorderHealthOk ? 'Recorder healthy' : 'Recording problem detected'}
+            {data.recorderHealthOk ? 'Recorder healthy' : 'Recorder check needs review'}
           </div>
           <div className="mt-1 break-words text-content-muted">{data.recorderHealth}</div>
           {data.recorderHealthAt && (

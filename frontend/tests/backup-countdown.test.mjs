@@ -223,6 +223,15 @@ test('a positive fraction of a second does not round into a zero-second timer', 
   assert.equal(root.root.findByProps({ label: 'Estimated sleep' }).props.value, '1s')
 })
 
+test('recorder inactivity remains a check to review rather than a conclusive detected failure', async t => {
+  const observation = 'The newest recording is old. Ignition state and whether recording was expected were not recorded; this can be normal after ignition-off and does not establish missing footage.'
+  const root = await mountBackup(t, status({ recorderHealth: observation, recorderHealthOk: false, recorderHealthAt: new Date(observedAt).toISOString() }))
+  const rendered = JSON.stringify(root.toJSON())
+  assert.match(rendered, /Recorder check needs review/)
+  assert.match(rendered, /does not establish missing footage/)
+  assert.doesNotMatch(rendered, /Recording problem detected|Recorder healthy/)
+})
+
 test('a startup hold with unknown inventory is Waiting, keeps manual pull available, and shows unknown sleep', async t => {
   const root = await mountBackup(t, status({ arrivalHold: true, arrivalHoldReason: 'Waiting for minimum uptime', sleepCountdownSource: 'unknown', sleepCountdownRemainingS: null }))
   assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Waiting after startup')

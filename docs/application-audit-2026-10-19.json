@@ -84,7 +84,7 @@
       "priority": "P2",
       "issue": "An unfinished event mirror could silently block future activity syncs.",
       "fix": "Expose active phase, age and skipped-attempt health; Backup shows cleanup waiting without promising immediate retry.",
-      "limit": "Live seven-day stall remains unproven until new runtime health is deployed and observed."
+      "limit": "Fresh post-deployment sync completed twice during the online window, with new events, no mirror error and no skipped attempts. A retained historical sequence gap remains reported."
     },
     {
       "priority": "P2",
@@ -128,6 +128,15 @@
         "test_log_privacy.py",
         "frontend/tests/list-filters.test.mjs"
       ]
+    },
+    {
+      "priority": "P2",
+      "issue": "Awake-unit recorder inactivity was described as lost footage without ignition or expected-recording evidence.",
+      "fix": "Describe measured inactivity and its evidence limits; show Recorder check needs review. Preserve supported per-camera/card warnings and notification behavior.",
+      "tests": [
+        "tests/test_ingest_health.py",
+        "frontend/tests/backup-countdown.test.mjs"
+      ]
     }
   ],
   "unresolved": [
@@ -138,7 +147,7 @@
     },
     {
       "issue": "Radio lease/watchdog failures",
-      "status": "Protective transfer stops. Safety checks remain enabled; no physical unit or radio operations were performed."
+      "status": "Historical protective stops remain recorded. Two new backup passes completed, each followed by durable Bluetooth/hotspot/logger restoration; native probes confirmed quiet transfer and restored Bluetooth/AP interface."
     },
     {
       "issue": "GPU CPU fallback",
@@ -146,7 +155,7 @@
     },
     {
       "issue": "Long-lived event mirror cleanup",
-      "status": "Observed stale completed-check timestamp; bounded storage and health visibility added, but no live post-deployment confirmation yet."
+      "status": "Resolved in the observed online window: two completed mirror reads, 518 newly accepted events, no active cleanup, no error or skipped attempts. Older sequence gap remains visible and is not reconstructed."
     }
   ],
   "validation": {
@@ -159,11 +168,99 @@
     "diff_check": "passed",
     "local_runtime": "Windows CPython 3.14.7",
     "local_docker": "Unavailable: local Docker engine is not running.",
-    "ci": "Pending push; CI additionally covers Linux CPython 3.12, Android and Docker."
+    "ci": "87d0c968: Linux backend 2784 passed / 20 skipped; frontend, Android, Docker and image publication passed."
   },
   "delivery": {
     "unrelated_workspace_changes": "Excluded from staging",
-    "live_changes": "Read-only investigation; no live mutation or deployment performed",
+    "live_changes": "User deployed 87d0c968; verified using authenticated GETs and read-only native Android probes. No manual device settings changes or forced suspend.",
     "raw_evidence": "Kept out of Git; aggregate report contains no credentials or raw telemetry."
+  },
+  "post_deployment_verification": {
+    "observed_at_utc": "2026-10-19T09:50:08.850070+00:00",
+    "running_source_revision": "87d0c968054386b413626d8f5de4ebe122375236",
+    "health": {
+      "status": "healthy",
+      "database": "healthy",
+      "scanner": "healthy",
+      "worker": "healthy",
+      "version": "main",
+      "detail": {}
+    },
+    "database_migration": "0024",
+    "successful_backup_passes": 2,
+    "copied_files": 18,
+    "copied_bytes": 1013351960,
+    "completed_at_utc": [
+      "2026-10-19T09:42:39Z",
+      "2026-10-19T09:44:18Z"
+    ],
+    "native_transfer_radio_evidence": {
+      "bluetooth_on": false,
+      "interfaces_up": [
+        "dummy0",
+        "lo",
+        "wlan0"
+      ],
+      "home_wifi_connected": true
+    },
+    "native_restoration_evidence": {
+      "bluetooth_on": true,
+      "hotspot_interface": "wlan2",
+      "hotspot_has_ipv4": true,
+      "home_wifi_connected": true
+    },
+    "both_passes": {
+      "restore_verified_bluetooth": true,
+      "restore_verified_hotspot": true,
+      "resume_verified_logger": true,
+      "recovery_required": false
+    },
+    "remaining_footage_backlog": 0,
+    "unit_capture_rearmed_and_running": true,
+    "unit_logs_fresh_across_repeated_refreshes": true,
+    "event_mirror": {
+      "new_events_accepted": 518,
+      "historical_sequence_gap": 18305,
+      "last_error": null,
+      "skipped_attempts": 0
+    },
+    "processing_snapshot": {
+      "completed": 12442,
+      "pending": 1,
+      "processing": 4,
+      "failed": 0,
+      "invalid": 0,
+      "settling": 2,
+      "recordings_today": 240,
+      "throughput_per_hour": 11.0
+    },
+    "jobs_snapshot": {
+      "queued": 1,
+      "running": 4,
+      "failed": 0,
+      "completed": 23554,
+      "completed_today": 338,
+      "thumbnails_pending": 0,
+      "phase": "analysis",
+      "paused": false,
+      "throughput_per_hour": 166.0,
+      "estimated_minutes_remaining": 0.4
+    },
+    "preservation": "Existing 329 drives and 428 sessions remained visible while 18 new files were discovered. Retention deletion remains disabled.",
+    "new_processing_errors_observed": 2,
+    "recovery_observation": "Two SQLite lock failures were automatically requeued without consuming an attempt and advanced through telemetry to detection. A unit-log storage-busy refresh succeeded on its next attempt. No MissingGreenlet or PendingRollbackError observed.",
+    "warning_interpretation": [
+      "Historical event sequence gap",
+      "Recorder inactivity without ignition evidence; wording corrected",
+      "OSD coordinate/journey-leg rejection guards",
+      "Current SQLite contention retried automatically"
+    ],
+    "followup_fix_validation": {
+      "backend_health_tests": 35,
+      "frontend_tests": 131,
+      "frontend_lint_and_build": "passed",
+      "ruff_and_diff_check": "passed"
+    },
+    "limit": "Normal arrival transfers and processing observed. No deliberate database contention, cancellation race, radio fault, power loss or failed import was injected on the live device."
   }
 }
