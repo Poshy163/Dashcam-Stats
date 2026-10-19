@@ -597,6 +597,12 @@ export interface OBDStatus {
     duplicates: number
     sequenceGap: number
     lastError: string | null
+    syncActive?: boolean
+    syncPhase?: 'idle' | 'reading' | 'storing' | 'cleanup_pending'
+    syncStartedAt?: string | null
+    syncAgeS?: number | null
+    skippedAttempts?: number
+    lastSkippedAt?: string | null
   }
   waitingOnUnit: number
   currentBundleCopy: string | null

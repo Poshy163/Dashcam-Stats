@@ -262,10 +262,10 @@ class TestServerSideEnforcement:
 
 class TestReadingTheCapture:
     @pytest.mark.asyncio
-    async def test_a_consuming_read_stops_the_writer_before_clearing(self, monkeypatch):
-        """logcat holds the current file open. Clearing it underneath a non-append writer
-        pads the file with NULs, destroying the evidence we came for -- so the kill has to
-        come first and the delete last."""
+    async def test_a_consuming_read_stops_the_writer_but_preserves_unacknowledged_files(
+        self, monkeypatch
+    ):
+        """The stopped capture remains available if the later host transaction fails."""
         seen: list[str] = []
 
         async def fake_shell(address, command, timeout=None):
@@ -275,8 +275,10 @@ class TestReadingTheCapture:
         monkeypatch.setattr(unit_logs.adb, "shell", fake_shell)
         await unit_logs._read_capture("unit", consume=True)
         command = seen[0]
-        assert command.index("kill") < command.index("cat")
-        assert command.index("cat") < command.index("rm -f")
+        assert command.index('kill "$unitlog_pid"') < command.index('cat "$unitlog_file"')
+        assert "rm -f" not in command
+        assert 'kill -0 "$unitlog_pid"' in command
+        assert unit_logs._READ_COMPLETE in command
 
     @pytest.mark.asyncio
     async def test_a_refresh_never_consumes(self, monkeypatch):

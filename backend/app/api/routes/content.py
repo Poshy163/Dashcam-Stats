@@ -689,8 +689,17 @@ async def export_recording_metadata(recording_id: RowId, session: SessionDep) ->
 async def list_journeys(
     session: SessionDep,
     page: PaginationDep,
-    date_from: DateFilter | None = None,
-    date_to: DateFilter | None = None,
+    date_from: DateFilter | None = Query(
+        None,
+        description="Journeys starting on or after this date in the configured display timezone.",
+    ),
+    date_to: DateFilter | None = Query(
+        None,
+        description=(
+            "Journeys starting on or before this date, including the whole local day. "
+            "An explicit timestamp is an inclusive instant."
+        ),
+    ),
     has_gps: bool | None = None,
     sort: str = Query("started_desc"),
     include_parked: bool = Query(
@@ -702,6 +711,26 @@ async def list_journeys(
         ),
     ),
 ):
+    if date_from is not None and date_to is not None:
+        started_after = _day_start(date_from)
+        if isinstance(date_to, datetime):
+            reversed_range = started_after > _day_start(date_to)
+        else:
+            # A date upper bound includes the entire local day, even when date_from
+            # is an instant later than its midnight. Compare in that same calendar.
+            try:
+                reversed_range = started_after.astimezone(local_zone()).date() > date_to
+            except (OverflowError, OSError, ValueError):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    "date_from is outside the range of dates this application can represent.",
+                ) from None
+        if reversed_range:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "date_from must be on or before date_to",
+            )
+
     stmt = select(Journey).where(Journey.id.in_(visible_journey_ids()))
     if not include_parked:
         # A parked session is a real grouping of real footage and not a drive. Hidden here

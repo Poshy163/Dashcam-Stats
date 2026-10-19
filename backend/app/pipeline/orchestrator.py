@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import inspect, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -235,7 +235,11 @@ def recording_probe_evidence(session: AsyncSession, recording_id: int) -> dict[s
     a conclusive probe rejection writes one of these.
     """
     recording = session.identity_map.get(session.identity_key(Recording, recording_id), None)
-    probe = getattr(recording, "probe_json", None)
+    # A failed flush expires mapped attributes and leaves the session inactive. Reading
+    # a descriptor here would attempt a lazy load before _revive can roll it back,
+    # replacing the original SQL failure with PendingRollbackError/MissingGreenlet.
+    # Only unflushed evidence needs carrying; persisted evidence will be reloaded below.
+    probe = inspect(recording).dict.get("probe_json") if recording is not None else None
     if not isinstance(probe, dict):
         return {}
     return {key: probe[key] for key in _PROBE_EVIDENCE_KEYS if key in probe}

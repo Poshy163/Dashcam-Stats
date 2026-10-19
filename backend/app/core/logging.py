@@ -119,6 +119,16 @@ _URL_CREDS_RE = re.compile(
     r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<userinfo>[^/\s@]+:[^/\s@]*)@"
 )
 
+# A webhook's path is a bearer credential even when there is no token query/key.
+_WEBHOOK_PATH_RE = re.compile(
+    r"(?P<prefix>/(?:api/(?:v\d+/)?)?webhooks?/)[^\s?#\"'<>),;\\]+",
+    re.IGNORECASE,
+)
+_SLACK_WEBHOOK_RE = re.compile(
+    r"(?P<prefix>https?://hooks\.slack\.com/services/)[^\s?#\"'<>),;\\]+",
+    re.IGNORECASE,
+)
+
 #: ``password=x``, ``"token": "y"``, ``--secret 'z'`` in free text, JSON and command lines.
 #: The key may be quoted (JSON) and the value may carry an auth scheme, which has to be
 #: swallowed too -- otherwise ``Authorization: Bearer <jwt>`` redacts the word "Bearer"
@@ -141,6 +151,8 @@ _BEARER_RE = re.compile(r"\b(?P<kind>Bearer|Basic)\s+[A-Za-z0-9._~+/=\-]{8,}", r
 def redact_text(value: str) -> str:
     """Strip anything that looks like a credential out of a rendered string."""
     out = _URL_CREDS_RE.sub(lambda m: f"{m.group('scheme')}{REDACTED}@", value)
+    out = _WEBHOOK_PATH_RE.sub(lambda m: f"{m.group('prefix')}{REDACTED}", out)
+    out = _SLACK_WEBHOOK_RE.sub(lambda m: f"{m.group('prefix')}{REDACTED}", out)
     out = _SMB_USER_PERCENT_RE.sub(lambda m: f"{m.group('flag')}%{REDACTED}", out)
     out = _INLINE_SECRET_RE.sub(lambda m: f"{m.group('key')}{m.group('sep')}{REDACTED}", out)
     out = _BEARER_RE.sub(lambda m: f"{m.group('kind')} {REDACTED}", out)
@@ -164,12 +176,21 @@ def redact(value: Any, *, _depth: int = 0) -> Any:
     if isinstance(value, (list, tuple, set)):
         redacted = [redact(v, _depth=_depth + 1) for v in value]
         return type(value)(redacted) if isinstance(value, (list, tuple)) else set(redacted)
-    return value
+    if value is None or isinstance(value, (bool, int, float, datetime)):
+        return value
+    # URL/error/path objects are commonly logged without an explicit str(). Their
+    # renderer must not be the first place their credential-bearing text appears.
+    try:
+        return redact_text(str(value))
+    except Exception:
+        return REDACTED
 
 
 def _redact_processor(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     for key in list(event_dict):
-        if key.startswith("_"):  # ProcessorFormatter bookkeeping; not user data
+        if key.startswith("_") or key == "exc_info":
+            # Preserve exception transport until format_exc_info runs; its rendered
+            # string is redacted in the final formatter before either output renderer.
             continue
         if _SENSITIVE_KEY_RE.search(key):
             event_dict[key] = REDACTED
@@ -672,13 +693,18 @@ def configure_logging(
         except (SystemError, ImportError):
             # Colour on a Windows console needs colorama, which is not a dependency.
             renderer = structlog.dev.ConsoleRenderer(colors=False)
-        final: list[Any] = [structlog.stdlib.ProcessorFormatter.remove_processors_meta, renderer]
     else:
-        final = [
-            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
-            structlog.processors.format_exc_info,
-            structlog.processors.JSONRenderer(),
-        ]
+        renderer = structlog.processors.JSONRenderer()
+
+    # Exception objects are still opaque during the shared pre-chain. Format them
+    # before this final redaction pass, including stdlib/SQLAlchemy tracebacks, so
+    # neither JSON output nor the console renderer can expose their credentials.
+    final: list[Any] = [
+        structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+        structlog.processors.format_exc_info,
+        _redact_processor,
+        renderer,
+    ]
 
     structlog.configure(
         processors=[

@@ -13,6 +13,7 @@ import {
 } from '@/components/ui'
 import { api } from '@/lib/api'
 import { formatDateTime, formatDuration, realtimeFactor } from '@/lib/format'
+import { listPage } from '@/lib/listFilters'
 
 const STATES = ['', 'queued', 'running', 'failed', 'completed', 'cancelled']
 const stateLabel = (state: string) =>
@@ -20,8 +21,9 @@ const stateLabel = (state: string) =>
 
 export default function Queue() {
   const [params, setParams] = useSearchParams()
-  const state = params.get('state') ?? ''
-  const page = Number(params.get('page') ?? 1)
+  const requestedState = params.get('state') ?? ''
+  const state = STATES.includes(requestedState) ? requestedState : ''
+  const page = listPage(params.get('page'))
   const client = useQueryClient()
 
   // The same query key the shell's nav badge uses, deliberately.
@@ -231,7 +233,10 @@ export default function Queue() {
       {jobs.isLoading && <Spinner className="py-16" />}
       {jobs.isError && <ErrorState error={jobs.error} retry={() => jobs.refetch()} />}
       {jobs.data?.items.length === 0 && (
-        <EmptyState title="No jobs" description="Nothing is queued. Run a scan to look for new footage." />
+        <EmptyState
+          title={state ? 'No jobs match this state' : 'No jobs'}
+          description={state ? 'Choose another state to see other processing activity.' : 'No processing jobs appear on this page. Run a scan to look for new footage.'}
+        />
       )}
 
       {jobs.data && jobs.data.items.length > 0 && (

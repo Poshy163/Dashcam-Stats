@@ -9,8 +9,9 @@ import { EmptyState, ErrorState, PageHeader, Pagination } from '@/components/ui'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { formatDateTime } from '@/lib/format'
+import { listPage } from '@/lib/listFilters'
 
-const LEVELS = ['', 'DEBUG', 'INFO', 'WARNING', 'ERROR']
+const LEVELS = ['', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
 
 const LEVEL_STYLE: Record<string, string> = {
   DEBUG: 'text-content-faint',
@@ -27,8 +28,9 @@ export default function Logs() {
 
   const rawSource = params.get('source')
   const source = rawSource === 'unit' || rawSource === 'carplay' ? rawSource : 'server'
-  const page = Number(params.get('page') ?? 1)
-  const level = params.get('level') ?? ''
+  const page = listPage(params.get('page'))
+  const requestedLevel = params.get('level')?.toUpperCase() ?? ''
+  const level = LEVELS.includes(requestedLevel) ? requestedLevel : ''
   const search = params.get('search') ?? ''
   // Follows the URL as well as leading it — see the note in Recordings.tsx. Back, forward
   // and an inbound filtered link all change the filter without touching this box.

@@ -6,11 +6,12 @@ import Spinner from '@/components/Spinner'
 import { EmptyState, ErrorState, PageHeader, Pagination, PlateText } from '@/components/ui'
 import { api, mediaUrl } from '@/lib/api'
 import { formatDateTime } from '@/lib/format'
+import { listPage } from '@/lib/listFilters'
 
 export default function Plates() {
   const [params, setParams] = useSearchParams()
 
-  const page = Number(params.get('page') ?? 1)
+  const page = listPage(params.get('page'))
   const q = params.get('q') ?? ''
   // The box follows the URL as well as leading it — the same reconciliation Recordings and
   // Logs already do. Seeded once and never resynced, it kept showing "ABC" after Back had

@@ -10,6 +10,7 @@ workers racing for the same row cannot both win.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -247,7 +248,9 @@ async def enqueue(
     return job
 
 
-async def claim_next(session: AsyncSession, worker_id: str) -> ProcessingJob | None:
+async def claim_next(
+    session: AsyncSession, worker_id: str, *, active_recording_ids: Sequence[int] = ()
+) -> ProcessingJob | None:
     """Atomically take the next runnable job, or None."""
     if _paused:
         return None
@@ -305,6 +308,13 @@ async def claim_next(session: AsyncSession, worker_id: str) -> ProcessingJob | N
             ProcessingJob.state == JobState.QUEUED,
             (ProcessingJob.not_before.is_(None)) | (ProcessingJob.not_before <= now),
             ~already_running,
+            # A cancelled job row no longer expresses ownership, but its task may still
+            # be settling a native call or a shielded write. Keep the local pool's active
+            # recordings excluded until their tasks have actually left the run.
+            or_(
+                ProcessingJob.recording_id.is_(None),
+                ProcessingJob.recording_id.not_in(active_recording_ids),
+            ),
             or_(
                 ProcessingJob.recording_id.is_(None),
                 ProcessingJob.recording_id.in_(visible_recordings),

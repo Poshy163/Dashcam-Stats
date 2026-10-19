@@ -1131,9 +1131,18 @@ async def stage_telemetry(
     # it is verbatim the statement that failed four times running on a real recording while
     # a journey rebuild held the lock for longer than the busy timeout. Everything it needs
     # is already in ``rows``, so re-running it produces exactly the same result.
+    recording_id = recording.id
+    timeline = (recording.started_at, recording.ended_at, recording.time_from_osd)
+
     async def write() -> None:
+        # Rollback expires even the primary key. Refresh explicitly through AsyncSession
+        # before later ORM reads, and replay the newly inferred timeline that rollback
+        # discarded together with the previous attempt's point replacement.
+        if inspect(recording).expired:
+            await session.refresh(recording)
+        recording.started_at, recording.ended_at, recording.time_from_osd = timeline
         await session.execute(
-            delete(TelemetryPoint).where(TelemetryPoint.recording_id == recording.id)
+            delete(TelemetryPoint).where(TelemetryPoint.recording_id == recording_id)
         )
         if rows:
             await session.execute(TelemetryPoint.__table__.insert(), rows)
@@ -1548,9 +1557,15 @@ async def stage_detect(
     # recording_id = ?`` opens this stage's transaction and is the other statement that
     # failed its way through all four attempts on a real recording. Everything it needs is
     # in ``prepared``, so a retry writes exactly the same rows.
+    recording_id = recording.id
+
     async def write() -> None:
+        # A rolled-back attempt expires the recording, including the clock used by
+        # _moment below. An ordinary attribute read would try synchronous database I/O.
+        if inspect(recording).expired:
+            await session.refresh(recording)
         await session.execute(
-            delete(TrackedObject).where(TrackedObject.recording_id == recording.id)
+            delete(TrackedObject).where(TrackedObject.recording_id == recording_id)
         )
 
         # Two passes, one flush. The flush used to sit inside this loop, purely to populate
@@ -1562,7 +1577,7 @@ async def stage_detect(
         objects: list[TrackedObject] = []
         for track, located, crop_path in prepared:
             stored = TrackedObject(
-                recording_id=recording.id,
+                recording_id=recording_id,
                 # Deliberately not stamped here -- see _JOURNEY_ID_IS_DERIVED below.
                 track_key=track.track_key,
                 class_label=track.class_label,
@@ -1608,7 +1623,7 @@ async def stage_detect(
                 session.add(
                     Detection(
                         tracked_object_id=stored.id,
-                        recording_id=recording.id,
+                        recording_id=recording_id,
                         t_offset_s=offset,
                         class_label=track.class_label,
                         confidence=confidence,

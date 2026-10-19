@@ -7,6 +7,7 @@ import { EmptyState, ErrorState, Pagination } from '@/components/ui'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { formatDateTime } from '@/lib/format'
+import { listPage } from '@/lib/listFilters'
 
 /**
  * Android log levels as the unit emits them. The capture keeps error and fatal by
@@ -18,6 +19,8 @@ const LEVELS: Array<{ value: string; label: string }> = [
   { value: 'E', label: 'Error' },
   { value: 'W', label: 'Warning' },
   { value: 'I', label: 'Info' },
+  { value: 'D', label: 'Debug' },
+  { value: 'V', label: 'Verbose' },
 ]
 
 const LEVEL_STYLE: Record<string, string> = {
@@ -45,8 +48,9 @@ const LEVEL_LABEL: Record<string, string> = {
  */
 export default function UnitLogView({ live }: { live: boolean }) {
   const [params, setParams] = useSearchParams()
-  const page = Number(params.get('page') ?? 1)
-  const level = params.get('level') ?? ''
+  const page = listPage(params.get('page'))
+  const requestedLevel = params.get('level')?.toUpperCase().slice(0, 1) ?? ''
+  const level = LEVELS.some((option) => option.value === requestedLevel) ? requestedLevel : ''
   const tag = params.get('tag') ?? ''
   const search = params.get('search') ?? ''
 

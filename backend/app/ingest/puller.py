@@ -40,6 +40,7 @@ from app.ingest.models import (
 from app.ingest.obd_events import (
     EVENT_SYNC_TIMEOUT_SECONDS,
     EventSyncResult,
+    get_logger_event_status,
     sync_remote_events,
 )
 from app.ingest.obd_transfer import (
@@ -1355,6 +1356,9 @@ def _collect_event_mirror(task: asyncio.Task[EventSyncResult]) -> None:
 def _start_event_mirror(address: str, path: str) -> asyncio.Task[EventSyncResult] | None:
     global _event_mirror_task
     if _event_mirror_task is not None and not _event_mirror_task.done():
+        get_logger_event_status().skipped()
+        if _event_mirror_task.cancelling():
+            get_logger_event_status().cleanup_pending()
         log.debug("skipping app event mirror while the previous mirror is still cleaning up")
         return None
     task = asyncio.create_task(sync_remote_events(address, path), name="ingest-event-mirror")
@@ -1366,8 +1370,11 @@ def _start_event_mirror(address: str, path: str) -> asyncio.Task[EventSyncResult
 def _cancel_event_mirror(task: asyncio.Task[EventSyncResult] | None) -> None:
     # The mirror has its own timeout. Do not inject a second CancelledError into
     # database rollback/connection termination already started by that timeout.
-    if task is not None and not task.done() and not task.cancelling():
-        task.cancel()
+    if task is not None and not task.done():
+        if task is _event_mirror_task:
+            get_logger_event_status().cleanup_pending()
+        if not task.cancelling():
+            task.cancel()
 
 
 async def _await_event_mirror(

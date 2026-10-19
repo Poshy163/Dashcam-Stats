@@ -76,7 +76,7 @@ from app.scanner.discovery import Scanner
 from app.workers import queue
 from app.workers.reset import reset_and_rebuild
 from app.workers.scheduler import get_scheduler
-from app.workers.worker import get_worker_pool
+from app.workers.worker import ProcessingStillRunningError, get_worker_pool
 
 log = get_logger(__name__)
 
@@ -403,7 +403,10 @@ async def reprocess_all(body: ReprocessAllRequest, session: SessionDep):
     bulk rerun never starves the scanner.
     """
     if not body.only_failed and not body.only_outdated:
-        summary = await reset_and_rebuild(session, stages=body.stages)
+        try:
+            summary = await reset_and_rebuild(session, stages=body.stages)
+        except ProcessingStillRunningError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         return {
             **summary.as_dict(),
             "reset": True,
@@ -636,7 +639,9 @@ async def list_logs(
     rows = (
         (
             await session.execute(
-                stmt.order_by(LogEntry.ts.desc()).offset(page.offset).limit(page.page_size)
+                stmt.order_by(LogEntry.ts.desc(), LogEntry.id.desc())
+                .offset(page.offset)
+                .limit(page.page_size)
             )
         )
         .scalars()
@@ -681,7 +686,7 @@ async def list_unit_logs(
     rows = (
         (
             await session.execute(
-                stmt.order_by(UnitLogEntry.occurred_at.desc())
+                stmt.order_by(UnitLogEntry.occurred_at.desc(), UnitLogEntry.id.desc())
                 .offset(page.offset)
                 .limit(page.page_size)
             )

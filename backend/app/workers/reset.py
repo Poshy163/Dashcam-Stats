@@ -113,6 +113,16 @@ def _needs_thumbnail(rows: Sequence[tuple[int, str | None]]) -> set[int]:
 async def reset_and_rebuild(
     session: AsyncSession, *, stages: list[str] | None = None
 ) -> RebuildSummary:
+    pool = get_worker_pool()
+    # A claim is not interruptible safely until it has committed and registered its
+    # owner. Outcome transactions also finish before clear, or wait and get cancelled.
+    async with pool.reset_barrier():
+        return await _reset_under_barrier(session, stages=stages)
+
+
+async def _reset_under_barrier(
+    session: AsyncSession, *, stages: list[str] | None = None
+) -> RebuildSummary:
     """Empty the queue, stop what is running, and rebuild it from the footage.
 
     The caller's session is **committed part-way through**, deliberately. The wipe has to be
@@ -130,10 +140,10 @@ async def reset_and_rebuild(
 
     # 2. Stop the work itself. The rows above say the jobs are cancelled; this is what makes
     #    the runs stop, and it must finish before any replacement job can be claimed.
-    try:
-        summary.aborted = await get_worker_pool().abort_active()
-    except Exception as exc:  # pragma: no cover - defensive; the rebuild must still happen
-        log.warning("could not stop in-flight processing cleanly", error=str(exc))
+    # An abort timeout or error must stop the reset here. The cancelled rows no longer
+    # protect these recordings in claim_next, so a replacement could run concurrently
+    # with an old stage that is still finishing a write or settling its filesystem I/O.
+    summary.aborted = await get_worker_pool().abort_active()
 
     # 3. Open the new run. Everything queued from here counts towards it, and everything
     #    before it -- including the rows just cancelled -- does not.

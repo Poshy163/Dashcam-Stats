@@ -10,6 +10,7 @@ import { ObdPollTiming } from '@/components/ObdPollTiming'
 import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/components/ui'
 import { api, type OBDBattery, type OBDSeriesSample } from '@/lib/api'
 import { formatDateTime, formatDuration, formatRelative, formatSpeed, formatTime, utcInputValue } from '@/lib/format'
+import { listPage } from '@/lib/listFilters'
 
 /** One metric drawn against elapsed drive time. */
 interface Series {
@@ -670,7 +671,7 @@ export default function ObdDriveDetail() {
   const [params, setParams] = useSearchParams()
   const start = params.get('start') || undefined
   const end = params.get('end') || undefined
-  const diagnosticPage = Math.max(1, Number(params.get('diagnostic_page')) || 1)
+  const diagnosticPage = listPage(params.get('diagnostic_page'))
   const query = useQuery({
     queryKey: ['obd-drive', driveId, start, end, diagnosticPage],
     queryFn: () => api.obd.driveSeries(driveId ?? '', { start, end, maxPoints: 2000, diagnosticPage, diagnosticPageSize: 100 }),

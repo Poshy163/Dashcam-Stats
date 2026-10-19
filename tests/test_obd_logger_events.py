@@ -357,6 +357,12 @@ def test_sequence_gap_health_accumulates_until_explicit_reset(
         "duplicates": 0,
         "sequence_gap": 0,
         "last_error": None,
+        "sync_active": False,
+        "sync_phase": "idle",
+        "sync_started_at": None,
+        "sync_age_s": None,
+        "skipped_attempts": 0,
+        "last_skipped_at": None,
     }
 
 

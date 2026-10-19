@@ -5,6 +5,7 @@ import Spinner from '@/components/Spinner'
 import { EmptyState, ErrorState, PageHeader, Pagination, PlateText } from '@/components/ui'
 import { api, mediaUrl } from '@/lib/api'
 import { formatDateTime } from '@/lib/format'
+import { listPage } from '@/lib/listFilters'
 
 const CLASSES = ['', 'car', 'truck', 'bus', 'motorcycle']
 const classLabelText = (value: string) =>
@@ -12,9 +13,11 @@ const classLabelText = (value: string) =>
 
 export default function Vehicles() {
   const [params, setParams] = useSearchParams()
-  const page = Number(params.get('page') ?? 1)
-  const classLabel = params.get('class_label') ?? ''
-  const hasPlate = params.get('has_plate') ?? ''
+  const page = listPage(params.get('page'))
+  const requestedClass = params.get('class_label') ?? ''
+  const classLabel = CLASSES.includes(requestedClass) ? requestedClass : ''
+  const requestedHasPlate = params.get('has_plate') ?? ''
+  const hasPlate = requestedHasPlate === 'yes' || requestedHasPlate === 'no' ? requestedHasPlate : ''
   const dateFrom = params.get('date_from') ?? ''
   const dateTo = params.get('date_to') ?? ''
 

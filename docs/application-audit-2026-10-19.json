@@ -1,0 +1,169 @@
+{
+  "date": "2026-10-19",
+  "baseline_revision": "c7ae92ef15ebed572c5dfbc026a51578917fff9c",
+  "scope": {
+    "server_logs": {
+      "retained_rows": 76193,
+      "first_utc": "2026-09-19T05:42:23.762994Z",
+      "last_utc": "2026-10-19T08:36:42.574958Z",
+      "levels": {
+        "INFO": 64353,
+        "WARNING": 11451,
+        "ERROR": 389
+      }
+    },
+    "head_unit_logs": {
+      "retained_rows": 50000,
+      "first_utc": "2026-10-15T02:46:49Z",
+      "last_utc": "2026-10-19T04:31:23.224000Z",
+      "note": "All retained rows have producer level E. 22078 are CarPlay sampler observations; producer severity alone is not evidence of a failure."
+    },
+    "method": "All retained pages inventoried through GET requests, IDs deduplicated, exception patterns mapped to current implementation, synthetic regressions and independent review.",
+    "coverage_limit": "Retained history only; this does not reconstruct pruned logs or establish a physical device fault."
+  },
+  "findings": [
+    {
+      "priority": "P1",
+      "issue": "Reset could replace processing while the old owner was still writing.",
+      "fix": "Serialize claim commit/owner registration, resets and outcome transactions; register before hardware discovery; abort waits complete owner and refuses replacement on timeout.",
+      "tests": [
+        "test_queue_abort_safety.py",
+        "test_worker_reset_ownership.py"
+      ]
+    },
+    {
+      "priority": "P1",
+      "issue": "HTTP messages, exception tracebacks and URL objects could expose webhook path credentials.",
+      "fix": "Redact webhook paths before storage and after exception formatting for both stdout renderers; redact historical API log responses without rewriting source rows.",
+      "tests": [
+        "test_log_privacy.py"
+      ]
+    },
+    {
+      "priority": "P1",
+      "issue": "Head-unit log consumption deleted remote capture files before a durable host import.",
+      "fix": "Read without deletion, verify capture process exited and complete transfer marker, commit host storage before acknowledgement/rearm; retain failed captures for retry.",
+      "tests": [
+        "test_unit_log_storage_lifecycle.py",
+        "test_ingest_unit_logs.py"
+      ]
+    },
+    {
+      "priority": "P2",
+      "issue": "Rollback expired ORM state and could turn SQLite contention into MissingGreenlet or PendingRollbackError.",
+      "fix": "Refresh stage retry state asynchronously, replay inferred timeline, and inspect probe evidence passively before rollback.",
+      "tests": [
+        "test_stage_write_retry.py",
+        "test_stage_failure_recovery.py"
+      ]
+    },
+    {
+      "priority": "P2",
+      "issue": "Event mirror storage could wait beyond its deadline, exceed SQLite bind limits, or partially commit before retention failed.",
+      "fix": "Short writer waits and bounded transaction retries, executemany, SQL retention subquery, atomic insertion/pruning, and connection timeout restoration.",
+      "tests": [
+        "test_obd_event_storage.py",
+        "test_obd_logger_events.py"
+      ]
+    },
+    {
+      "priority": "P2",
+      "issue": "Unit-log imports awaited one SQL INSERT per line and background task failures were unobserved.",
+      "fix": "250-row executemany batches, atomic retention, bounded per-address work, queued arrival preservation, and sanitized exception collection.",
+      "measurement": {
+        "synthetic_lines": 1001,
+        "awaited_insert_calls_before": 1001,
+        "awaited_insert_calls_after": 5,
+        "note": "SQL-call reduction, not a production latency measurement."
+      },
+      "tests": [
+        "test_unit_log_storage_lifecycle.py"
+      ]
+    },
+    {
+      "priority": "P2",
+      "issue": "An unfinished event mirror could silently block future activity syncs.",
+      "fix": "Expose active phase, age and skipped-attempt health; Backup shows cleanup waiting without promising immediate retry.",
+      "limit": "Live seven-day stall remains unproven until new runtime health is deployed and observed."
+    },
+    {
+      "priority": "P2",
+      "issue": "Journey date API had no page controls and selection could outlive visible rows.",
+      "fix": "Camera-local calendar range/presets with URL state, invalid-range errors, filtered empty recovery, safe page parsing and selection pruning.",
+      "tests": [
+        "test_journey_date_filters.py",
+        "frontend/tests/journeys.test.mjs"
+      ]
+    },
+    {
+      "priority": "P2",
+      "issue": "Backup hid older bundles and lost independent content after status failure.",
+      "fix": "Bookmarkable bundle pagination, stale status explanation, retained data access and safe action availability.",
+      "tests": [
+        "frontend/tests/backup-access.test.mjs"
+      ]
+    },
+    {
+      "priority": "P2",
+      "issue": "Malformed URL pages/booleans/IDs silently failed or changed filter meaning.",
+      "fix": "Normalize supported list pagination/filter inputs across library, logs, queue and diagnostics; preserve browser history and show accurate empty-state meaning.",
+      "tests": [
+        "frontend/tests/list-filters.test.mjs"
+      ]
+    },
+    {
+      "priority": "P3",
+      "issue": "Equal-count map results at different locations did not refit; idle system alerts pointed to unrelated queue state.",
+      "fix": "Fit changed geographic bounds and route warnings to the actual diagnostic, recording or backup page.",
+      "tests": [
+        "frontend/tests/map-viewport.test.mjs",
+        "frontend/tests/dashboard-status.test.mjs"
+      ]
+    },
+    {
+      "priority": "P3",
+      "issue": "Simultaneous log entries had no deterministic pagination tiebreaker.",
+      "fix": "Order by timestamp and row ID; expose available critical/debug/verbose filters.",
+      "tests": [
+        "test_log_privacy.py",
+        "frontend/tests/list-filters.test.mjs"
+      ]
+    }
+  ],
+  "unresolved": [
+    {
+      "issue": "Historical NFS stale file handles",
+      "evidence": "116 stage inspection errors clustered on 6 October.",
+      "status": "Environmental cause not reproduced locally; no mount configuration changed."
+    },
+    {
+      "issue": "Radio lease/watchdog failures",
+      "status": "Protective transfer stops. Safety checks remain enabled; no physical unit or radio operations were performed."
+    },
+    {
+      "issue": "GPU CPU fallback",
+      "status": "Retained GPU failure policy unchanged; no claim of restored GPU inference."
+    },
+    {
+      "issue": "Long-lived event mirror cleanup",
+      "status": "Observed stale completed-check timestamp; bounded storage and health visibility added, but no live post-deployment confirmation yet."
+    }
+  ],
+  "validation": {
+    "backend_full_suite": "2772 passed, 32 skipped in 152.46s; four workers",
+    "frontend_tests": 130,
+    "frontend_lint": "passed",
+    "frontend_typecheck_and_production_build": "passed",
+    "npm_audit": "zero known findings",
+    "ruff_lint_and_format": "passed",
+    "diff_check": "passed",
+    "local_runtime": "Windows CPython 3.14.7",
+    "local_docker": "Unavailable: local Docker engine is not running.",
+    "ci": "Pending push; CI additionally covers Linux CPython 3.12, Android and Docker."
+  },
+  "delivery": {
+    "unrelated_workspace_changes": "Excluded from staging",
+    "live_changes": "Read-only investigation; no live mutation or deployment performed",
+    "raw_evidence": "Kept out of Git; aggregate report contains no credentials or raw telemetry."
+  }
+}

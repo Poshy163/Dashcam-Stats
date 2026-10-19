@@ -1,13 +1,12 @@
 import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { MapContainer, TileLayer, useMap } from 'react-leaflet'
-import L from 'leaflet'
+import { MapContainer, TileLayer } from 'react-leaflet'
 // Imported beside the library rather than in main.tsx, so the ~14 kB of Leaflet CSS
 // is emitted with the lazily-loaded map chunk instead of the stylesheet every page
 // blocks on.
 import 'leaflet/dist/leaflet.css'
-import { useEffect } from 'react'
 
+import FitMapToData from '@/components/FitMapToData'
 import HeatLayer from '@/components/HeatLayer'
 import RouteLines from '@/components/RouteLines'
 import Spinner from '@/components/Spinner'
@@ -52,19 +51,6 @@ const LAYERS = [
 ] as const
 
 type Layer = (typeof LAYERS)[number]['value']
-
-function FitToData({ points }: { points: [number, number][] }) {
-  const map = useMap()
-  useEffect(() => {
-    if (points.length === 0) return
-    const bounds = L.latLngBounds(points.map(([lat, lon]) => [lat, lon] as [number, number]))
-    map.fitBounds(bounds, { padding: [32, 32] })
-    // Only refit when the shape of the data changes, not on every pan or filter tweak that
-    // returns the same coverage -- otherwise the map yanks itself back while being read.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [map, points.length])
-  return null
-}
 
 export default function HeatmapPage() {
   const maps = useMapSettings()
@@ -199,7 +185,7 @@ export default function HeatmapPage() {
                 attribution={maps.attribution ?? ATTRIBUTION}
                 maxZoom={maps.maxZoom ?? 19}
               />
-              <FitToData points={mapPoints} />
+              <FitMapToData points={mapPoints} />
               {layer !== 'routes' && data && (
                 <HeatLayer
                   points={heatPoints}

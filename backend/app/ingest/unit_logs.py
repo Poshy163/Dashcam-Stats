@@ -56,8 +56,9 @@ size bound is enforced by the tool rather than by our arithmetic.
 **Why collect-then-rearm rather than truncate.**  The capture holds the current file open.
 Truncating underneath a writer that is not in append mode leaves it writing at its old
 offset, which pads the file with NULs and corrupts exactly the evidence we came for.  So a
-consuming read kills the capture, drains every rotation, deletes them, and starts a fresh
-one — which is what re-arming does anyway.  The non-destructive glance used while the car
+consuming read stops the capture and drains every rotation while preserving the files.
+Only a completed host import permits re-arming to delete them and start a fresh capture.
+The non-destructive glance used while the car
 is parked at home reads without deleting, and the unique constraint on the line hash means
 re-reading the same lines is free.
 
@@ -76,10 +77,12 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
 from app.db.models import UnitLogEntry, utcnow
+from app.db.retry import is_locked_error
 from app.db.session import session_scope
 from app.ingest import adb
 
@@ -169,6 +172,7 @@ DEFAULT_DENY_TAGS = (
 #: they exist to explain a fault someone noticed recently, so they age out quickly.
 SERVER_RETENTION_DAYS = 14
 MAX_SERVER_ROWS = 50_000
+STORE_BATCH_SIZE = 250
 
 #: One capture line in ``threadtime`` with the ``year`` and ``UTC`` modifiers applied:
 #: ``2026-09-01 13:19:41.979 +0000   971  1476 E BatteryService: message``.  The tag runs
@@ -192,6 +196,15 @@ MAX_MESSAGE_CHARS = 2048
 
 _tasks: set[asyncio.Task] = set()
 _last_refresh: dict[str, float] = {}
+_tasks_by_address: dict[str, asyncio.Task[None]] = {}
+_pending_arrivals: set[str] = set()
+_needs_collection: set[str] = set()
+_shutting_down = False
+_READ_COMPLETE = "__DASHCAM_UNIT_LOG_READ_COMPLETE_V1__"
+
+
+class UnitLogReadError(RuntimeError):
+    """A stopped capture could not be read completely and must remain unacknowledged."""
 
 
 @dataclass(frozen=True)
@@ -358,30 +371,47 @@ async def arm(address: str) -> bool:
 
 
 async def _read_capture(address: str, *, consume: bool) -> str | None:
-    """Every rotation oldest-first, optionally stopping the capture and clearing it.
+    """Every rotation oldest-first, optionally stopping the capture before reading.
 
     logcat rotates by renaming the current file to ``.1`` and shifting existing rotations
     up, so the highest suffix is the oldest and the unsuffixed file is newest.  Reading in
     that order keeps the lines in time order, which matters because the parser trusts the
     timestamps but the operator reads the tail.
 
-    A consuming read must kill the capture before deleting: the writer holds the current
-    file open, and clearing it underneath a non-append writer pads the file with NULs.
+    A consuming read verifies that the writer exited before reading, but never deletes
+    files. Rearming acknowledges them only after a successful host transaction. A final
+    marker proves that all existing rotations were read without a cat/transport failure.
     """
     rotations = " ".join(f"{REMOTE_LOG}.{index}" for index in range(ROTATE_COUNT, 0, -1))
-    command = f"cat {rotations} {REMOTE_LOG} 2>/dev/null"
+    command = ""
     if consume:
         command = (
-            f"[ -f {REMOTE_PID} ] && kill $(cat {REMOTE_PID}) 2>/dev/null; "
-            + command
-            + f"; rm -f {REMOTE_LOG} {REMOTE_LOG}.* {REMOTE_PID} 2>/dev/null"
+            f"if [ -f {REMOTE_PID} ]; then "
+            f"unitlog_pid=$(cat {REMOTE_PID} 2>/dev/null) || exit 1; "
+            "case \"$unitlog_pid\" in ''|*[!0-9]*) exit 1;; esac; "
+            '[ "$unitlog_pid" -gt 1 ] 2>/dev/null || exit 1; '
+            'if kill -0 "$unitlog_pid" 2>/dev/null; then '
+            'kill "$unitlog_pid" 2>/dev/null || exit 1; '
+            "for unitlog_wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do "
+            'kill -0 "$unitlog_pid" 2>/dev/null || break; sleep 0.05; done; '
+            'if kill -0 "$unitlog_pid" 2>/dev/null; then exit 1; fi; fi; fi; '
         )
-    command += "; exit 0"
+    command += (
+        f"for unitlog_file in {rotations} {REMOTE_LOG}; do "
+        'if [ -e "$unitlog_file" ] || [ -L "$unitlog_file" ]; then '
+        '[ -f "$unitlog_file" ] && [ ! -L "$unitlog_file" ] || exit 1; '
+        'cat "$unitlog_file" 2>/dev/null || exit 1; fi; done; '
+        f"printf '\\n{_READ_COMPLETE}\\n'"
+    )
     try:
-        return await adb.shell(address, command, timeout=UNIT_LOG_TIMEOUT_S)
+        raw = await adb.shell(address, command, timeout=UNIT_LOG_TIMEOUT_S)
     except adb.AdbError as exc:
         log.debug("could not read the unit log capture", error=str(exc))
         return None
+    if raw != _READ_COMPLETE and not raw.endswith("\n" + _READ_COMPLETE):
+        log.warning("unit log capture read did not reach its completion marker")
+        return None
+    return raw[: -len(_READ_COMPLETE)].rstrip("\n")
 
 
 def parse(raw: str) -> list[ParsedLine]:
@@ -419,28 +449,19 @@ def parse(raw: str) -> list[ParsedLine]:
     return entries
 
 
-async def _prune() -> None:
+async def _prune(session: AsyncSession) -> None:
     """Age out old rows and cap the table, oldest first."""
     cutoff = utcnow() - timedelta(days=SERVER_RETENTION_DAYS)
-    async with session_scope() as session:
-        await session.execute(delete(UnitLogEntry).where(UnitLogEntry.occurred_at < cutoff))
-        total = int((await session.execute(select(func.count(UnitLogEntry.id)))).scalar() or 0)
-        excess = total - MAX_SERVER_ROWS
-        if excess <= 0:
-            return
+    await session.execute(delete(UnitLogEntry).where(UnitLogEntry.occurred_at < cutoff))
+    total = int((await session.execute(select(func.count(UnitLogEntry.id)))).scalar() or 0)
+    excess = total - MAX_SERVER_ROWS
+    if excess > 0:
         victims = (
-            (
-                await session.execute(
-                    select(UnitLogEntry.id)
-                    .order_by(UnitLogEntry.occurred_at.asc(), UnitLogEntry.id.asc())
-                    .limit(excess)
-                )
-            )
-            .scalars()
-            .all()
+            select(UnitLogEntry.id)
+            .order_by(UnitLogEntry.occurred_at.asc(), UnitLogEntry.id.asc())
+            .limit(excess)
         )
-        if victims:
-            await session.execute(delete(UnitLogEntry).where(UnitLogEntry.id.in_(victims)))
+        await session.execute(delete(UnitLogEntry).where(UnitLogEntry.id.in_(victims)))
 
 
 async def store(entries: list[ParsedLine]) -> tuple[int, int]:
@@ -451,9 +472,6 @@ async def store(entries: list[ParsedLine]) -> tuple[int, int]:
     and an atomic upsert avoids a lookup per line. Accepted includes enriched observations;
     their original capture/arrival metadata and identity remain unchanged.
     """
-    if not entries:
-        await _prune()
-        return 0, 0
     received = utcnow()
     rows = [
         {
@@ -468,32 +486,29 @@ async def store(entries: list[ParsedLine]) -> tuple[int, int]:
         }
         for entry in entries
     ]
+    statement = sqlite_insert(UnitLogEntry.__table__)
+    incoming = statement.excluded.message
+    statement = statement.on_conflict_do_update(
+        index_elements=["line_hash"],
+        set_={"message": incoming},
+        # One template handles ordinary duplicates and sampler enrichment in input
+        # order. Only a strict CarPlay prefix extension may change a stored message;
+        # the original timestamp, arrival metadata, and identity are never replaced.
+        where=(UnitLogEntry.tag == "CarPlayTiming")
+        & (statement.excluded.tag == "CarPlayTiming")
+        & (func.length(incoming) > func.length(UnitLogEntry.message))
+        & (func.substr(incoming, 1, func.length(UnitLogEntry.message)) == UnitLogEntry.message),
+    )
     accepted = 0
     async with session_scope() as session:
-        for row in rows:
-            statement = sqlite_insert(UnitLogEntry).values(**row)
-            if row["tag"] == "CarPlayTiming":
-                # The unit's logcat transport cuts long messages at 1024 characters.
-                # A later direct-file copy shares the explicit sample identity, but can
-                # recover the lost tail. Only a strict prefix extension is trustworthy;
-                # a conflicting observation with the same ID must never overwrite it.
-                # Legacy lines hash their full message, so cannot match this condition.
-                incoming = statement.excluded.message
-                statement = statement.on_conflict_do_update(
-                    index_elements=["line_hash"],
-                    set_={"message": incoming},
-                    where=(UnitLogEntry.tag == "CarPlayTiming")
-                    & (func.length(incoming) > func.length(UnitLogEntry.message))
-                    & (
-                        func.substr(incoming, 1, func.length(UnitLogEntry.message))
-                        == UnitLogEntry.message
-                    ),
-                )
-            else:
-                statement = statement.on_conflict_do_nothing(index_elements=["line_hash"])
-            result = await session.execute(statement)
+        for offset in range(0, len(rows), STORE_BATCH_SIZE):
+            # Core executemany binds one row at a time inside the driver, so a full
+            # capture needs hundreds of awaited calls rather than tens of thousands.
+            result = await session.execute(statement, rows[offset : offset + STORE_BATCH_SIZE])
             accepted += int(result.rowcount or 0)
-    await _prune()
+        # Commit retention and new rows together. A failed prune must not leave a
+        # partially reported import or remove the previously committed generation.
+        await _prune(session)
     return accepted, len(rows) - accepted
 
 
@@ -533,6 +548,8 @@ def drop_silenced(entries: list[ParsedLine]) -> list[ParsedLine]:
 
 async def _ingest(address: str, *, consume: bool) -> tuple[int, int]:
     raw = await _read_capture(address, consume=consume)
+    if raw is None and consume:
+        raise UnitLogReadError("unit log capture was not read completely; retained for retry")
     if not raw:
         return 0, 0
     entries = drop_silenced(parse(raw))
@@ -548,7 +565,7 @@ async def refresh(address: str) -> None:
 
 
 async def collect(address: str) -> tuple[int, int]:
-    """The authoritative read on arrival: drain the capture and clear it."""
+    """Stop and import the capture, leaving its files intact until rearming succeeds."""
     accepted, duplicate = await _ingest(address, consume=True)
     if accepted:
         log.info("collected unit logs", accepted=accepted, duplicate=duplicate)
@@ -558,30 +575,71 @@ async def collect(address: str) -> tuple[int, int]:
 async def _collect_then_arm(address: str) -> None:
     # Collect first for the same reason the recording watcher does: arming destroys the
     # capture, and the story of the last drive lives in the file it is about to replace.
+    _needs_collection.add(address)
     await collect(address)
-    await arm(address)
+    if await arm(address):
+        _needs_collection.discard(address)
+
+
+def _task_finished(address: str, task: asyncio.Task[None]) -> None:
+    _tasks.discard(task)
+    owns_address = _tasks_by_address.get(address) is task
+    if owns_address:
+        _tasks_by_address.pop(address, None)
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        # SQL errors can include captured messages in their parameters. Report only a
+        # bounded category/type, while retrieving the exception so asyncio does not log
+        # an unobserved task failure with the entire statement and payload.
+        log.warning(
+            "could not update unit logs",
+            operation="arrival" if task.get_name().endswith("arrival") else "refresh",
+            category="storage_busy" if is_locked_error(exc) else "internal_error",
+            error_type=type(exc).__name__,
+        )
+    if owns_address and address in _pending_arrivals and not _shutting_down:
+        _pending_arrivals.discard(address)
+        on_unit_seen(address)
+
+
+def _busy(address: str) -> bool:
+    task = _tasks_by_address.get(address)
+    return task is not None and not task.done()
+
+
+def _start_task(address: str, *, arrival: bool) -> None:
+    work = _collect_then_arm(address) if arrival else refresh(address)
+    task = asyncio.create_task(
+        work, name="ingest-unit-logs-arrival" if arrival else "ingest-unit-logs-refresh"
+    )
+    _tasks.add(task)
+    _tasks_by_address[address] = task
+    task.add_done_callback(lambda finished: _task_finished(address, finished))
 
 
 def on_unit_seen(address: str) -> None:
     """The car has just arrived: drain what it recorded away, then start a fresh capture."""
-    if not _enabled():
+    if _shutting_down or not _enabled():
         return
-    task = asyncio.create_task(_collect_then_arm(address), name="ingest-unit-logs-arrival")
-    _tasks.add(task)
-    task.add_done_callback(_tasks.discard)
+    if _busy(address):
+        _pending_arrivals.add(address)
+        return
+    _last_refresh[address] = time.monotonic()
+    _start_task(address, arrival=True)
 
 
 def on_unit_present(address: str) -> None:
     """The car is sitting here: keep the view current without consuming the capture."""
-    if not _enabled():
+    if _shutting_down or not _enabled() or _busy(address):
         return
     now = time.monotonic()
     if now - _last_refresh.get(address, 0.0) < REFRESH_S:
         return
     _last_refresh[address] = now
-    task = asyncio.create_task(refresh(address), name="ingest-unit-logs-refresh")
-    _tasks.add(task)
-    task.add_done_callback(_tasks.discard)
+    _start_task(address, arrival=address in _needs_collection)
 
 
 async def shutdown() -> None:
@@ -590,12 +648,20 @@ async def shutdown() -> None:
     The remote capture keeps running by design: the app being down is exactly the absence
     it exists to cover, and it is detached from this process's adb sessions anyway.
     """
-    tasks = list(_tasks)
-    for task in tasks:
-        task.cancel()
-    for task in tasks:
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
-    _tasks.clear()
+    global _shutting_down
+    _shutting_down = True
+    _pending_arrivals.clear()
+    try:
+        tasks = list(_tasks)
+        for task in tasks:
+            if not task.cancelling():
+                task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        _tasks.clear()
+        _tasks_by_address.clear()
+    finally:
+        _shutting_down = False

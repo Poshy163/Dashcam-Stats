@@ -1,11 +1,12 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 
 import { ObdLoggerCard } from '@/components/ObdLoggerCard'
 import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
 import Spinner from '@/components/Spinner'
-import { EmptyState, ErrorState, PageHeader, ProgressBar, StatTile } from '@/components/ui'
+import { EmptyState, ErrorState, PageHeader, Pagination, ProgressBar, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
+import { listPage } from '@/lib/listFilters'
 import type {
   IngestRadioDeviceState,
   IngestRadioStatus,
@@ -266,6 +267,14 @@ function radioEvidence(
 
 export default function Backup() {
   const client = useQueryClient()
+  const [params, setParams] = useSearchParams()
+  const bundlePage = listPage(params.get('bundle_page'))
+  const setBundlePage = (page: number) => {
+    const next = new URLSearchParams(params)
+    if (page > 1) next.set('bundle_page', String(page))
+    else next.delete('bundle_page')
+    setParams(next)
+  }
 
   const status = useQuery({
     queryKey: ['ingest-status'],
@@ -291,8 +300,8 @@ export default function Backup() {
     refetchInterval: 10_000,
   })
   const obdBundles = useQuery({
-    queryKey: ['obd-bundles'],
-    queryFn: () => api.obd.bundles({ pageSize: 10 }),
+    queryKey: ['obd-bundles', bundlePage],
+    queryFn: () => api.obd.bundles({ page: bundlePage, pageSize: 10 }),
     refetchInterval: 15_000,
   })
   const obdEvents = useInfiniteQuery({
@@ -330,11 +339,10 @@ export default function Backup() {
   const data = status.data
   const countdown = useSleepCountdown(data, status.dataUpdatedAt, status.isError)
 
-  if (status.isError) return <ErrorState error={status.error} retry={() => status.refetch()} />
-
   const liveCountdown = countdown.remainingS
   const hold = backupHold(data)
-  const eventSequenceGap = obdStatus.data?.eventStream?.sequenceGap ?? 0
+  const eventStream = obdStatus.data?.eventStream
+  const eventSequenceGap = eventStream?.sequenceGap ?? 0
   const running = data?.state === 'running'
   const transition = radioStatus.data?.transition
   const recovery = backupRecoveryNotice(transition)
@@ -346,9 +354,11 @@ export default function Backup() {
   const radioShutdownPending = transition?.active === true && transition.phase === 'ingesting' &&
     (!transition.bluetooth.disableVerified || !transition.hotspot.disableVerified)
   const transitionBusy = transition?.active === true && (!running || transition.phase !== 'ingesting' || radioWindowEnded || radioShutdownPending)
-  const copying = running && data?.phase === 'transferring' && !hold && !recoveryBlocked && !transitionBusy
+  const copying = !status.isError && running && data?.phase === 'transferring' && !hold && !recoveryBlocked && !transitionBusy
   const prediction = countdown.state === 'estimated' && !hold && !recoveryBlocked && !transitionBusy ? data?.sleepWindowPrediction : null
-  const descriptor = recoveryBlocked
+  const descriptor = status.isError
+    ? { label: 'Status unavailable', tone: 'warn' as const }
+    : recoveryBlocked
     ? recovery
       ? { label: recovery.label, tone: 'busy' as const }
       : { label: restoreOriginalState ? 'Radio restoration not confirmed' : 'Radios need switching back on', tone: 'error' as const }
@@ -371,7 +381,9 @@ export default function Backup() {
               ? { label: data.phase === 'idle' ? 'Preparing backup' : PHASES[data.phase], tone: 'busy' as const }
               : STATES[data.state] ?? STATES.idle
           : { label: 'Checking', tone: 'busy' as const }
-  const statusHint = recoveryBlocked
+  const statusHint = status.isError
+    ? data ? 'Last known values; waiting for a successful refresh' : 'Waiting for a successful status check'
+    : recoveryBlocked
     ? recovery
       ? 'New backups wait until recovery is confirmed'
       : 'No backup will start until radio restoration is confirmed'
@@ -451,7 +463,7 @@ export default function Backup() {
             ) : (
               <button
                 className="btn btn-primary"
-                disabled={pullNow.isPending || data?.state === 'disabled'}
+                disabled={pullNow.isPending || !data || status.isError || data.state === 'disabled'}
                 onClick={() => pullNow.mutate()}
               >
                 Pull now
@@ -461,6 +473,17 @@ export default function Backup() {
         }
       />
       {status.isLoading && <Spinner label="Loading backup status…" />}
+      {status.isError && (
+        <div className="mb-6 space-y-2">
+          <ErrorState title="Could not refresh backup status" error={status.error} retry={() => void status.refetch()} />
+          {data && (
+            <p className="text-sm text-content-muted" role="status">
+              Showing last known backup values from {formatDateTime(new Date(status.dataUpdatedAt).toISOString())}.
+              Current transfer progress is unavailable until the status refresh succeeds.
+            </p>
+          )}
+        </div>
+      )}
 
       {(pullNow.isError || cancel.isError) && (
         <div className="mb-6 space-y-3">
@@ -638,7 +661,9 @@ export default function Backup() {
                 : 'Connected'
           }
           hint={
-            !data?.unitOnline
+            !data
+              ? 'Not checked yet'
+              : !data.unitOnline
               ? 'Car is not here'
               : data.wifiFrequencyMhz
                 ? `${data.wifiFrequencyMhz} MHz • Observed frequency`
@@ -698,13 +723,13 @@ export default function Backup() {
         />
         <StatTile
           label="Last copied"
-          value={data?.lastSuccessTs ? formatRelative(data.lastSuccessTs) : 'Never'}
-          hint={data?.unitOnline ? 'car is on the network' : 'car is not here'}
+          value={data ? data.lastSuccessTs ? formatRelative(data.lastSuccessTs) : 'Never' : '—'}
+          hint={data ? data.unitOnline ? 'car is on the network' : 'car is not here' : 'Not checked yet'}
           tone={data?.unitOnline ? 'ok' : 'default'}
         />
       </div>
 
-      {running && data && (
+      {running && data && !status.isError && (
         <div className="card mb-6 px-5 py-4">
           <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
@@ -902,7 +927,9 @@ export default function Backup() {
                 </p>
               </div>
               <span className="text-xs text-content-faint">
-                {obdStatus.data?.eventStream?.lastReceivedAt
+                {eventStream?.syncActive
+                  ? eventStream.syncPhase === 'cleanup_pending' ? 'cleanup pending' : 'sync in progress'
+                  : obdStatus.data?.eventStream?.lastReceivedAt
                   ? `synced ${formatRelative(obdStatus.data.eventStream.lastReceivedAt)}`
                   : obdEventItems.length > 0
                     ? 'waiting for the next device sync'
@@ -912,10 +939,21 @@ export default function Backup() {
               </span>
             </div>
             <div className="p-5">
-              {obdStatus.data?.eventStream?.lastError && (
+              {eventStream?.syncActive && (
+                <div className="mb-3 rounded-lg bg-state-warn/10 px-3 py-2 text-sm text-state-warn" role="status">
+                  {eventStream.syncPhase === 'cleanup_pending'
+                    ? 'Activity sync is waiting for cleanup. Later syncs wait for this attempt to finish.'
+                    : eventStream.syncPhase === 'storing'
+                      ? 'Saving the activity snapshot.'
+                      : 'Reading the activity snapshot.'}
+                  {eventStream.syncAgeS != null && Number.isFinite(eventStream.syncAgeS) && ` Running for ${formatDuration(eventStream.syncAgeS)}.`}
+                  {' '}Footage and stored OBD bundles remain independent.
+                </div>
+              )}
+              {eventStream?.lastError && (
                 <div className="mb-3 rounded-lg bg-state-warn/10 px-3 py-2 text-sm text-state-warn">
-                  The latest app event snapshot could not be mirrored. Backup and OBD data remain
-                  independent and will retry next visit.
+                  The last completed activity sync was unsuccessful. Another sync can start
+                  {eventStream.syncActive ? ' after the current attempt finishes.' : ' when the head unit is reachable.'}
                 </div>
               )}
               {eventSequenceGap > 0 && (
@@ -1004,7 +1042,7 @@ export default function Backup() {
       {obdBundles.isError && <ErrorState title="Could not load stored OBD bundles" error={obdBundles.error} retry={() => void obdBundles.refetch()} />}
 
       {obdBundles.data?.items.length ? (
-        <div className="card mb-8 overflow-x-auto">
+        <div className="card overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-xs uppercase tracking-wide text-content-faint">
@@ -1071,7 +1109,19 @@ export default function Backup() {
             </tbody>
           </table>
         </div>
+      ) : obdBundles.data ? (
+        <EmptyState title="No stored OBD bundles on this page" description="Completed drive bundles appear here after they are copied from the dashcam." />
       ) : null}
+      {obdBundles.data && (
+        <div className="mb-8">
+          <Pagination
+            page={obdBundles.data.page}
+            pages={obdBundles.data.pages}
+            total={obdBundles.data.total}
+            onChange={setBundlePage}
+          />
+        </div>
+      )}
 
       <h2 className="mb-3 text-lg font-semibold">Recent transfers</h2>
       {history.isError ? (

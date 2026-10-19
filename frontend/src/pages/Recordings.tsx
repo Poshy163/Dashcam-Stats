@@ -7,6 +7,7 @@ import { EmptyState, ErrorState, PageHeader, Pagination, StateBadge } from '@/co
 import { api, mediaUrl, type RecordingFilters } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { formatBytes, formatDateTime, formatDuration } from '@/lib/format'
+import { booleanFilter, listPage, rowIdFilter } from '@/lib/listFilters'
 import type { Recording } from '@/lib/types'
 
 const STATES = [
@@ -15,12 +16,15 @@ const STATES = [
   ['processing', 'Processing'],
   ['queued', 'Queued'],
   ['discovered', 'Discovered'],
+  ['metadata_extracted', 'Inspected'],
   ['failed', 'Failed'],
   // Its own filter because it is the answer to "why has nothing happened to these": they
   // are empty or carry no video stream, and no amount of waiting or retrying changes that.
   ['invalid', 'Unusable file'],
   ['hidden', 'Hidden / blacklisted'],
   ['settling', 'Still writing'],
+  ['ignored', 'Ignored'],
+  ['deleted', 'Deleted'],
 ] as const
 
 export default function Recordings() {
@@ -30,16 +34,18 @@ export default function Recordings() {
     () => (localStorage.getItem('dashcam-recordings-view') as 'grid' | 'table') ?? 'grid',
   )
 
-  const page = Number(params.get('page') ?? 1)
+  const page = listPage(params.get('page'))
+  const requestedState = params.get('state') ?? ''
+  const state = STATES.some(([value]) => value === requestedState) ? requestedState : ''
   const filters: RecordingFilters = {
     page,
     pageSize: 24,
     availability: params.get('availability') === 'available' ? 'available' : params.get('availability') === 'missing' ? 'missing' : 'all',
-    state: params.get('state') || undefined,
+    state: state || undefined,
     search: params.get('search') || undefined,
-    journeyId: params.get('journey_id') ? Number(params.get('journey_id')) : undefined,
-    hasGps: params.get('has_gps') ? params.get('has_gps') === 'true' : undefined,
-    hasDetections: params.get('has_detections') ? params.get('has_detections') === 'true' : undefined,
+    journeyId: rowIdFilter(params.get('journey_id')),
+    hasGps: booleanFilter(params.get('has_gps')),
+    hasDetections: booleanFilter(params.get('has_detections')),
     dateFrom: params.get('date_from') || undefined,
     dateTo: params.get('date_to') || undefined,
   }
@@ -128,7 +134,7 @@ export default function Recordings() {
         </label>
         <label>
           <span className="label mb-1 block text-xs">State</span>
-          <select className="input" value={params.get('state') ?? ''} onChange={(e) => update('state', e.target.value)}>
+          <select className="input" value={state} onChange={(e) => update('state', e.target.value)}>
             {STATES.map(([value, label]) => (
               <option key={value} value={value}>{label}</option>
             ))}
@@ -136,7 +142,7 @@ export default function Recordings() {
         </label>
         <label>
           <span className="label mb-1 block text-xs">GPS</span>
-          <select className="input" value={params.get('has_gps') ?? ''} onChange={(e) => update('has_gps', e.target.value)}>
+          <select className="input" value={filters.hasGps === undefined ? '' : String(filters.hasGps)} onChange={(e) => update('has_gps', e.target.value)}>
             <option value="">Any</option>
             <option value="true">Has GPS</option>
             <option value="false">No GPS</option>
@@ -146,7 +152,7 @@ export default function Recordings() {
           <span className="label mb-1 block text-xs">Detections</span>
           <select
             className="input"
-            value={params.get('has_detections') ?? ''}
+            value={filters.hasDetections === undefined ? '' : String(filters.hasDetections)}
             onChange={(e) => update('has_detections', e.target.value)}
           >
             <option value="">Any</option>

@@ -67,7 +67,37 @@ export default function Dashboard() {
   const blockedFeatures = features?.filter((feature) => feature.blockedReason) ?? []
   const effectiveHardware = hardwareSummary(runtimeHardware.data ?? hardware)
   const backupWarnings = backupAttention(ingest.data)
-  const hasAttention = processing.failed > 0 || processing.invalid > 0 || blockedFeatures.length > 0 || effectiveHardware.notes.length > 0 || runtimeHardware.isError || ingest.isError || jobs.isError || backupWarnings.length > 0
+  const attentionReasons: (SystemAttention | undefined)[] = [
+    processing.failed > 0 ? {
+      summary: `${processing.failed} recording${processing.failed === 1 ? '' : 's'} failed analysis.`,
+      to: '/recordings?state=failed', action: 'Review failed recordings',
+    } : undefined,
+    processing.invalid > 0 ? {
+      summary: `${processing.invalid} unusable recording${processing.invalid === 1 ? '' : 's'} need${processing.invalid === 1 ? 's' : ''} review.`,
+      to: '/recordings?state=invalid', action: 'Review unusable recordings',
+    } : undefined,
+    blockedFeatures[0] ? {
+      summary: `${blockedFeatures[0].label} is unavailable. ${blockedFeatures[0].blockedReason}`,
+      to: '/settings', action: 'Review settings',
+    } : undefined,
+    effectiveHardware.notes[0] ? {
+      summary: effectiveHardware.notes[0], to: '/settings?category=advanced', action: 'View diagnostics',
+    } : undefined,
+    backupWarnings[0] ? {
+      summary: backupWarnings[0], to: '/backup', action: 'View backup',
+    } : undefined,
+    runtimeHardware.isError ? {
+      summary: 'Could not check the processing runtime.', to: '/settings?category=advanced', action: 'View diagnostics',
+    } : undefined,
+    ingest.isError ? {
+      summary: 'Could not check backup status.', to: '/backup', action: 'View backup',
+    } : undefined,
+    jobs.isError ? {
+      summary: 'Recent processing activity could not be loaded.', to: '/queue', action: 'View queue',
+    } : undefined,
+  ]
+  const attention = attentionReasons.find((reason) => reason !== undefined)
+  const hasAttention = attention !== undefined
   const policyState = (enabled: boolean | undefined) => enabled === undefined ? 'Not reported' : enabled ? 'Enabled' : 'Disabled'
 
   const hour = new Date().getHours()
@@ -93,7 +123,7 @@ export default function Dashboard() {
       <SystemStatus
         active={processing.processing}
         waiting={processing.pending}
-        needsAttention={hasAttention}
+        attention={attention}
         checking={runtimeHardware.isPending || ingest.isPending}
       />
 
@@ -248,7 +278,7 @@ export default function Dashboard() {
           {hasAttention ? (
             <div className="mt-5 space-y-2.5">
               {processing.invalid > 0 && <AttentionLink to="/recordings?state=invalid" value={processing.invalid} label="unusable files" />}
-              {processing.failed > 0 && <AttentionLink to="/queue?state=failed" value={processing.failed} label="failed jobs" error />}
+              {processing.failed > 0 && <AttentionLink to="/recordings?state=failed" value={processing.failed} label="failed recordings" error />}
               {blockedFeatures.map((feature) => (
                 <AttentionLink key={feature.key} to="/settings" label={`${feature.label} is unavailable`} />
               ))}
@@ -326,10 +356,14 @@ function friendlyStage(stage: string) {
   return stage.replace(/_/g, ' ').replace(/^./, (letter) => letter.toUpperCase())
 }
 
-function SystemStatus({ active, waiting, needsAttention, checking }: { active: number; waiting: number; needsAttention: boolean; checking: boolean }) {
+type SystemAttention = { summary: string; to: string; action: string }
+
+function SystemStatus({ active, waiting, attention, checking }: { active: number; waiting: number; attention?: SystemAttention; checking: boolean }) {
+  const needsAttention = attention !== undefined
   const healthy = !needsAttention
+  const idleAttention = active === 0 && waiting === 0 ? attention : undefined
   return (
-    <section className={`relative flex flex-wrap items-center gap-4 rounded-xl border p-4 sm:px-5 overflow-hidden ${healthy ? 'border-state-ok/40 bg-state-ok/[0.06]' : 'border-state-warn/40 bg-state-warn/[0.08]'}`}>
+    <section aria-label="System status" className={`relative flex flex-wrap items-center gap-4 rounded-xl border p-4 sm:px-5 overflow-hidden ${healthy ? 'border-state-ok/40 bg-state-ok/[0.06]' : 'border-state-warn/40 bg-state-warn/[0.08]'}`}>
       <div className={`absolute top-0 left-0 right-0 h-[1px] bg-gradient-to-r from-transparent ${healthy ? 'via-state-ok/60' : 'via-state-warn/60'} to-transparent`} />
       <span className={`grid h-11 w-11 shrink-0 place-items-center rounded-xl text-white shadow-sm ${healthy ? 'bg-state-ok shadow-[0_0_12px_rgba(16,210,130,0.4)]' : 'bg-state-warn shadow-glow-orange'}`}>
         {healthy ? <CheckIcon /> : <AttentionIcon />}
@@ -339,10 +373,10 @@ function SystemStatus({ active, waiting, needsAttention, checking }: { active: n
           {needsAttention ? 'System needs attention' : checking ? 'Checking system status' : active > 0 ? 'Analysis is running' : 'All systems operational'}
         </h2>
         <p className="mt-0.5 text-xs text-content-muted">
-          {active > 0 ? `${active} stream${active === 1 ? '' : 's'} running · ${waiting} clips waiting` : `${waiting} recording${waiting === 1 ? '' : 's'} queued`}
+          {idleAttention ? idleAttention.summary : active > 0 ? `${active} stream${active === 1 ? '' : 's'} running · ${waiting} clips waiting` : `${waiting} recording${waiting === 1 ? '' : 's'} queued`}
         </p>
       </div>
-      <Link to="/queue" className="btn font-mono text-xs font-bold border-state-ok/40 hover:border-state-ok">View queue</Link>
+      <Link to={idleAttention?.to ?? '/queue'} className={`btn font-mono text-xs font-bold ${healthy ? 'border-state-ok/40 hover:border-state-ok' : 'border-state-warn/40 hover:border-state-warn'}`}>{idleAttention?.action ?? 'View queue'}</Link>
     </section>
   )
 }

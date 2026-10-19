@@ -6,6 +6,7 @@ import Spinner from '@/components/Spinner'
 import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
 import { formatDateTime } from '@/lib/format'
+import { listPage } from '@/lib/listFilters'
 
 const reasonLabels: Record<string, string> = {
   analysis_pending: 'Analysis unfinished',
@@ -20,7 +21,7 @@ const reasonLabels: Record<string, string> = {
 
 export default function TelemetryHealth() {
   const [params, setParams] = useSearchParams()
-  const page = Math.max(1, Number(params.get('page')) || 1)
+  const page = listPage(params.get('page'))
   const reason = params.get('reason') ?? ''
   const dateFrom = params.get('date_from') ?? ''
   const dateTo = params.get('date_to') ?? ''

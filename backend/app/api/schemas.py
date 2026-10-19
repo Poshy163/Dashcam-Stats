@@ -14,9 +14,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Generic, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.api.deps import SQLITE_MAX_INT
+from app.core.logging import redact, redact_text
 
 T = TypeVar("T")
 
@@ -308,6 +309,18 @@ class LogEntryOut(ApiModel):
     recording_id: int | None = None
     job_id: int | None = None
 
+    @field_validator("message")
+    @classmethod
+    def redact_message(cls, value: str) -> str:
+        # Older persisted logs predate current redaction rules. Reading them must
+        # not reveal those credentials or require rewriting the source evidence.
+        return redact_text(value)
+
+    @field_validator("context")
+    @classmethod
+    def redact_context(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        return redact(value)
+
 
 class UnitLogEntryOut(ApiModel):
     """One filtered line of the head unit's own system log."""
@@ -320,6 +333,11 @@ class UnitLogEntryOut(ApiModel):
     level: str
     tag: str
     message: str
+
+    @field_validator("message")
+    @classmethod
+    def redact_message(cls, value: str) -> str:
+        return redact_text(value)
 
 
 class SettingOut(BaseModel):

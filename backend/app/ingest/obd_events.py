@@ -19,12 +19,14 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.core.logging import get_logger
 from app.db.models import OBDLoggerEvent, utcnow
-from app.db.session import session_scope
+from app.db.retry import is_locked_error
+from app.db.session import get_engine
 from app.ingest import adb
 from app.ingest.obd_bundle import SAFE_DRIVE_ID
 
@@ -39,6 +41,12 @@ SERVER_RETENTION_DAYS = 90
 # for validation, the insert and retention pruning, while keeping observability off
 # the backup critical path when any one of those stages becomes stuck.
 EVENT_SYNC_TIMEOUT_SECONDS = 6.0
+# Optional observability must not enter the application's normal 30-second writer wait.
+# Short waits and bounded transaction retries let cancellation settle promptly while a
+# footage/pipeline writer is busy, without changing any other pooled connection's policy.
+EVENT_DB_BUSY_TIMEOUT_MS = 200
+EVENT_STORE_ATTEMPTS = 3
+EVENT_STORE_RETRY_SECONDS = 0.05
 
 EVENT_KINDS = frozenset(
     {
@@ -271,6 +279,34 @@ class LoggerEventStatus:
         self.duplicates = 0
         self.sequence_gap = 0
         self.last_error: str | None = None
+        self.sync_active = False
+        self.sync_phase = "idle"
+        self.sync_started_at: datetime | None = None
+        self._sync_started_monotonic: float | None = None
+        self.skipped_attempts = 0
+        self.last_skipped_at: datetime | None = None
+
+    def start(self) -> None:
+        with self._lock:
+            self.sync_active = True
+            self.sync_phase = "reading"
+            self.sync_started_at = utcnow()
+            self._sync_started_monotonic = time.monotonic()
+
+    def storing(self) -> None:
+        with self._lock:
+            if self.sync_active:
+                self.sync_phase = "storing"
+
+    def cleanup_pending(self) -> None:
+        with self._lock:
+            if self.sync_active:
+                self.sync_phase = "cleanup_pending"
+
+    def skipped(self) -> None:
+        with self._lock:
+            self.skipped_attempts += 1
+            self.last_skipped_at = utcnow()
 
     def finish(self, result: EventSyncResult) -> None:
         now = utcnow()
@@ -284,6 +320,10 @@ class LoggerEventStatus:
             # Accumulate newly observed gaps until an explicit process/test reset.
             self.sequence_gap += max(0, result.sequence_gap)
             self.last_error = result.error
+            self.sync_active = False
+            self.sync_phase = "idle"
+            self.sync_started_at = None
+            self._sync_started_monotonic = None
             if result.accepted or result.duplicates:
                 self.last_received_at = now
 
@@ -297,6 +337,12 @@ class LoggerEventStatus:
             self.duplicates = 0
             self.sequence_gap = 0
             self.last_error = None
+            self.sync_active = False
+            self.sync_phase = "idle"
+            self.sync_started_at = None
+            self._sync_started_monotonic = None
+            self.skipped_attempts = 0
+            self.last_skipped_at = None
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
@@ -310,6 +356,20 @@ class LoggerEventStatus:
                 "duplicates": self.duplicates,
                 "sequence_gap": self.sequence_gap,
                 "last_error": self.last_error,
+                "sync_active": self.sync_active,
+                "sync_phase": self.sync_phase,
+                "sync_started_at": (
+                    self.sync_started_at.isoformat() if self.sync_started_at else None
+                ),
+                "sync_age_s": (
+                    round(max(0.0, time.monotonic() - self._sync_started_monotonic), 3)
+                    if self._sync_started_monotonic is not None
+                    else None
+                ),
+                "skipped_attempts": self.skipped_attempts,
+                "last_skipped_at": (
+                    self.last_skipped_at.isoformat() if self.last_skipped_at else None
+                ),
             }
 
 
@@ -516,48 +576,50 @@ async def read_remote_event_snapshot(address: str, path: str) -> str | None:
     return raw
 
 
-async def _prune_server_events() -> None:
+async def _prune_server_events(connection: AsyncConnection) -> None:
     cutoff = utcnow() - timedelta(days=SERVER_RETENTION_DAYS)
-    async with session_scope() as session:
-        await session.execute(delete(OBDLoggerEvent).where(OBDLoggerEvent.occurred_at < cutoff))
-        total = int((await session.execute(select(func.count(OBDLoggerEvent.id)))).scalar() or 0)
-        excess = total - MAX_SERVER_EVENTS
-        if excess <= 0:
-            return
-        victim_ids = (
-            (
-                await session.execute(
-                    select(OBDLoggerEvent.id)
-                    .order_by(OBDLoggerEvent.occurred_at.asc(), OBDLoggerEvent.id.asc())
-                    .limit(excess)
-                )
-            )
-            .scalars()
-            .all()
+    await connection.execute(delete(OBDLoggerEvent).where(OBDLoggerEvent.occurred_at < cutoff))
+    total = int(await connection.scalar(select(func.count(OBDLoggerEvent.id))) or 0)
+    excess = total - MAX_SERVER_EVENTS
+    if excess > 0:
+        # Let SQLite select victims rather than materialising an unbounded IN bind list.
+        victims = (
+            select(OBDLoggerEvent.id)
+            .order_by(OBDLoggerEvent.occurred_at.asc(), OBDLoggerEvent.id.asc())
+            .limit(excess)
         )
-        if victim_ids:
-            await session.execute(delete(OBDLoggerEvent).where(OBDLoggerEvent.id.in_(victim_ids)))
+        await connection.execute(delete(OBDLoggerEvent).where(OBDLoggerEvent.id.in_(victims)))
 
 
 async def store_event_snapshot(snapshot: ValidatedEventSnapshot) -> tuple[int, int, int]:
     """Store unseen sequence rows and return accepted, duplicate and missing counts."""
-    if not snapshot.events:
-        await _prune_server_events()
-        return 0, 0, 0
+    for attempt in range(EVENT_STORE_ATTEMPTS):
+        try:
+            return await _store_event_snapshot_once(snapshot)
+        except Exception as exc:
+            if not is_locked_error(exc) or attempt + 1 == EVENT_STORE_ATTEMPTS:
+                raise
+            await asyncio.sleep(EVENT_STORE_RETRY_SECONDS)
+    raise AssertionError("event snapshot retries exhausted without a result")
 
-    sequences = [event.sequence for event in snapshot.events]
-    async with session_scope() as session:
-        latest = (
-            await session.execute(
+
+async def _store_event_snapshot_once(snapshot: ValidatedEventSnapshot) -> tuple[int, int, int]:
+    async with get_engine().connect() as connection:
+        previous_timeout = None
+        try:
+            if connection.dialect.name == "sqlite":
+                previous_timeout = int(await connection.scalar(text("PRAGMA busy_timeout")))
+                await connection.exec_driver_sql(f"PRAGMA busy_timeout={EVENT_DB_BUSY_TIMEOUT_MS}")
+                # No remote reads, validation, or filesystem work occurs under this lock.
+                await connection.exec_driver_sql("BEGIN IMMEDIATE")
+            latest = await connection.scalar(
                 select(func.max(OBDLoggerEvent.sequence)).where(
                     OBDLoggerEvent.source_id_hash == snapshot.source_id_hash
                 )
             )
-        ).scalar()
-        statement = (
-            sqlite_insert(OBDLoggerEvent)
-            .values(
-                [
+            accepted = 0
+            if snapshot.events:
+                rows = [
                     {
                         "source_id_hash": snapshot.source_id_hash,
                         "sequence": event.sequence,
@@ -575,23 +637,36 @@ async def store_event_snapshot(snapshot: ValidatedEventSnapshot) -> tuple[int, i
                     }
                     for event in snapshot.events
                 ]
-            )
-            .on_conflict_do_nothing(
-                index_elements=[OBDLoggerEvent.source_id_hash, OBDLoggerEvent.sequence]
-            )
-        )
-        result = await session.execute(statement)
-        accepted = max(0, int(result.rowcount or 0))
+                # Executemany keeps each statement's bind count to one event, even for
+                # the full public ring, and preserves source/sequence deduplication.
+                statement = sqlite_insert(OBDLoggerEvent).on_conflict_do_nothing(
+                    index_elements=[OBDLoggerEvent.source_id_hash, OBDLoggerEvent.sequence]
+                )
+                result = await connection.execute(statement, rows)
+                accepted = max(0, int(result.rowcount or 0))
+            await _prune_server_events(connection)
+            await connection.commit()
+        except BaseException:
+            await connection.rollback()
+            raise
+        finally:
+            # busy_timeout belongs to the connection, not the transaction. Restore it
+            # after failure/cancellation too before returning this connection to the pool.
+            if previous_timeout is not None:
+                try:
+                    await connection.exec_driver_sql(f"PRAGMA busy_timeout={previous_timeout}")
+                except BaseException:
+                    await connection.invalidate()
+                    raise
 
     expected = 1 if latest is None else int(latest) + 1
     sequence_gap = 0
-    for sequence in sequences:
+    for sequence in (event.sequence for event in snapshot.events):
         if sequence < expected:
             continue
         if sequence > expected:
             sequence_gap += sequence - expected
         expected = sequence + 1
-    await _prune_server_events()
     return accepted, len(snapshot.events) - accepted, sequence_gap
 
 
@@ -604,6 +679,7 @@ async def sync_remote_events(
     """Fail-soft read/validate/store used alongside every normal head-unit visit."""
     started = time.monotonic()
     result = EventSyncResult()
+    _status.start()
     try:
         # One cancellation budget covers the whole mirror. Database cancellation
         # cleanup can outlast it; the puller bounds its wait separately and keeps
@@ -614,6 +690,7 @@ async def sync_remote_events(
                 return result
             result.available = True
             snapshot = validate_event_snapshot(raw)
+            _status.storing()
             result.accepted, result.duplicates, result.sequence_gap = await store_event_snapshot(
                 snapshot
             )
@@ -622,6 +699,9 @@ async def sync_remote_events(
                     "the app event snapshot starts after unseen sequence rows",
                     missing=result.sequence_gap,
                 )
+    except asyncio.CancelledError:
+        result.error = "cancelled"
+        raise
     except TimeoutError:
         result.error = "timeout"
         log.warning("could not mirror the app event stream", category=result.error)
@@ -634,10 +714,10 @@ async def sync_remote_events(
     except OSError:
         result.error = "storage_error"
         log.warning("could not mirror the app event stream", category=result.error)
-    except Exception:
+    except Exception as exc:
         # Observability is never a durability gate. Keep unexpected database/runtime
         # failures fail-soft too, but never surface their text through status or logs.
-        result.error = "internal_error"
+        result.error = "storage_busy" if is_locked_error(exc) else "internal_error"
         log.warning("could not mirror the app event stream", category=result.error)
     finally:
         result.seconds = time.monotonic() - started

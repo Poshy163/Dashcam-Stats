@@ -71,6 +71,10 @@ _HEARTBEAT_WARN_AFTER = 3
 _ABORT_GRACE_S = 20.0
 
 
+class ProcessingStillRunningError(TimeoutError):
+    """An interrupted run has not confirmed it stopped writing its recording."""
+
+
 @dataclass(slots=True)
 class ActiveJob:
     job_id: int
@@ -113,11 +117,21 @@ class WorkerPool:
         self._active: dict[int, ActiveJob] = {}
         #: The in-flight run for each job, so a cancellation can interrupt it.
         self._work: dict[int, asyncio.Task] = {}
+        #: Owners include hardware discovery, outcome writes and heartbeat cleanup, which
+        #: can outlive the processing child. A reset must wait for the complete run.
+        self._runs: dict[int, asyncio.Task] = {}
+        self._reset_lock = asyncio.Lock()
         self._running = False
         self._supervisor: asyncio.Task[None] | None = None
         self._pool_id = uuid.uuid4().hex[:8]
 
     # -- lifecycle ---------------------------------------------------------------------
+
+    @contextlib.asynccontextmanager
+    async def reset_barrier(self):
+        """Serialize queue resets with claims/registration and outcome transactions."""
+        async with self._reset_lock:
+            yield
 
     async def start(self) -> None:
         if self._running:
@@ -227,20 +241,38 @@ class WorkerPool:
                 # window kills a worker that already owns a RUNNING job, which is exactly
                 # the outcome retiring was introduced to prevent.
                 self._busy.add(index)
-                async with session_scope() as session:
-                    job = await queue.claim_next(session, worker_id)
-                    if job is not None:
-                        # Materialise what we need before the session closes.
-                        recording = (
-                            await session.get(Recording, job.recording_id)
-                            if job.recording_id
-                            else None
+                async with self.reset_barrier():
+                    async with session_scope() as session:
+                        job = await queue.claim_next(
+                            session,
+                            worker_id,
+                            active_recording_ids=tuple(
+                                active.recording_id
+                                for active in self._active.values()
+                                if active.recording_id is not None
+                            ),
                         )
-                        job_id = job.id
-                        recording_id = job.recording_id
-                        kind = job.kind
-                        stages = list(job.stages) if job.stages else None
-                        filename = recording.filename if recording else f"job {job.id}"
+                        if job is not None:
+                            # Materialise what we need before the session closes.
+                            recording = (
+                                await session.get(Recording, job.recording_id)
+                                if job.recording_id
+                                else None
+                            )
+                            job_id = job.id
+                            recording_id = job.recording_id
+                            kind = job.kind
+                            stages = list(job.stages) if job.stages else None
+                            filename = recording.filename if recording else f"job {job.id}"
+                    if job is not None:
+                        # Register before releasing the barrier: reset cannot cancel a
+                        # committed claim while its owner is still invisible to abort.
+                        active = ActiveJob(job_id, recording_id, filename)
+                        self._active[job_id] = active
+                        run = asyncio.create_task(
+                            self._run_job(job_id, recording_id, kind, stages, filename)
+                        )
+                        self._runs[job_id] = run
 
                 if job is None:
                     self._busy.discard(index)
@@ -248,8 +280,15 @@ class WorkerPool:
                     continue
 
                 try:
-                    await self._run_job(job_id, recording_id, kind, stages, filename)
+                    await run
+                except asyncio.CancelledError:
+                    # Reset cancels the owned run, not this reusable worker. A real pool
+                    # shutdown still cancels the worker itself and must propagate.
+                    if not active.cancelled or asyncio.current_task().cancelling():
+                        raise
                 finally:
+                    self._active.pop(job_id, None)
+                    self._runs.pop(job_id, None)
                     self._busy.discard(index)
 
             except asyncio.CancelledError:
@@ -311,32 +350,29 @@ class WorkerPool:
         stages: list[str] | None,
         filename: str,
     ) -> None:
-        hardware = await detect_hardware_async()
-        active = ActiveJob(
-            job_id=job_id,
-            recording_id=recording_id,
-            filename=filename,
-            # Availability is not usage. The stage callback fills this with the decoder
-            # that actually produced frames, including a VAAPI-to-software fallback.
-            decoder=None if hardware.vaapi_available else "software",
-        )
+        active = self._active.get(job_id) or ActiveJob(job_id, recording_id, filename)
         self._active[job_id] = active
+        owner = asyncio.current_task()
+        self._runs.setdefault(job_id, owner)
+
+        async def process():
+            # Hardware discovery is part of the cancellable run too. No post-claim
+            # await may happen before the owner and active recording are registered.
+            hardware = await detect_hardware_async()
+            active.decoder = None if hardware.vaapi_available else "software"
+            if recording_id is None:
+                return None
+            if kind is JobKind.THUMBNAIL:
+                return await self._make_thumbnail(recording_id, active)
+            return await self._process(recording_id, stages, active)
 
         heartbeat_task = asyncio.create_task(self._heartbeat(active))
         try:
-            if recording_id is None:
-                await self._finish(job_id, active, note="no recording attached")
-                return
-
             # The run happens in its own task so the heartbeat can stop it. Cancelling is
             # the only way to interrupt work that is inside a model or an ffmpeg read;
             # without it the Cancel button changed a badge and nothing else, and the run
             # then wrote its own result over the top and un-cancelled itself.
-            work = asyncio.create_task(
-                self._make_thumbnail(recording_id, active)
-                if kind is JobKind.THUMBNAIL
-                else self._process(recording_id, stages, active)
-            )
+            work = asyncio.create_task(process())
             self._work[job_id] = work
             try:
                 report = await work
@@ -368,6 +404,9 @@ class WorkerPool:
                 )
                 return
 
+            if recording_id is None:
+                await self._finish(job_id, active, note="no recording attached")
+                return
             if report is None:
                 await self._finish(
                     job_id, active, fail="recording no longer exists", permanent=True
@@ -388,6 +427,7 @@ class WorkerPool:
                 await heartbeat_task
             self._active.pop(job_id, None)
             self._work.pop(job_id, None)
+            self._runs.pop(job_id, None)
 
     async def _make_thumbnail(self, recording_id: int, active: ActiveJob):
         """Run the thumbnail-first pass over one recording. Returns a report, or None.
@@ -477,6 +517,17 @@ class WorkerPool:
             return report
 
     async def _finish(
+        self,
+        job_id: int,
+        active: ActiveJob,
+        **kwargs,
+    ) -> bool:
+        # An outcome that read RUNNING before clear must not overwrite CANCELLED later.
+        # Serialize the whole transaction with reset; a waiting owner stays abortable.
+        async with self.reset_barrier():
+            return await self._finish_under_barrier(job_id, active, **kwargs)
+
+    async def _finish_under_barrier(
         self,
         job_id: int,
         active: ActiveJob,
@@ -639,7 +690,7 @@ class WorkerPool:
             # for rather than propagating out as an unexplained failure, and what stops it
             # writing an outcome over a queue that has moved on without it.
             job.cancelled = True
-            task = self._work.get(job.job_id)
+            task = self._runs.get(job.job_id) or self._work.get(job.job_id)
             if task is not None and not task.done():
                 task.cancel()
                 tasks.append(task)
@@ -651,6 +702,10 @@ class WorkerPool:
                     "some runs did not stop within the abort grace period",
                     still_running=len(pending),
                     grace_s=_ABORT_GRACE_S,
+                )
+                raise ProcessingStillRunningError(
+                    "Processing is still stopping. No replacement jobs were queued. "
+                    "Try again shortly."
                 )
         log.info("stopped in-flight processing", jobs=len(interrupted))
         return len(interrupted)
