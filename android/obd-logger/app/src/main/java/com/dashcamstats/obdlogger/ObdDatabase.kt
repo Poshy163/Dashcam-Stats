@@ -278,16 +278,18 @@ class ObdDatabase(
             // eventually exports it. These producer releases have verified cadence
             // contracts in Git history; unknown/pre-versioned producers stay unknown.
             db.execSQL("ALTER TABLE drives ADD COLUMN poll_plan_version INTEGER")
-            db.execSQL(
-                """
-                UPDATE drives SET poll_plan_version=CASE
-                  WHEN logger_version IN ('0.2.1','0.2.2') THEN 2
-                  WHEN logger_version IN ('0.2.3','0.2.4','0.2.5','0.2.6') THEN 3
-                  WHEN logger_version='0.2.8' THEN 4
-                  WHEN logger_version IN ('0.2.9','0.3.0','0.3.1','0.3.2','0.3.3','0.3.4') THEN 5
-                  ELSE NULL END
-                """.trimIndent(),
-            )
+            if (tableHasColumn(db, "drives", "logger_version")) {
+                db.execSQL(
+                    """
+                    UPDATE drives SET poll_plan_version=CASE
+                      WHEN logger_version IN ('0.2.1','0.2.2') THEN 2
+                      WHEN logger_version IN ('0.2.3','0.2.4','0.2.5','0.2.6') THEN 3
+                      WHEN logger_version='0.2.8' THEN 4
+                      WHEN logger_version IN ('0.2.9','0.3.0','0.3.1','0.3.2','0.3.3','0.3.4') THEN 5
+                      ELSE NULL END
+                    """.trimIndent(),
+                )
+            }
         }
         upgradeFailureForTest?.invoke()
         if (oldVersion !in 1 until newVersion || newVersion > DATABASE_VERSION) {

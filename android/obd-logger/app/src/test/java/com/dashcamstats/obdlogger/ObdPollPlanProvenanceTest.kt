@@ -320,6 +320,7 @@ class ObdPollPlanProvenanceTest {
         val schema = ObdDatabase(context).use { current ->
             current.readableDatabase.rawQuery(
                 "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' " +
+                    "AND name <> 'android_metadata' " +
                     "ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END,name",
                 null,
             ).use { cursor ->
