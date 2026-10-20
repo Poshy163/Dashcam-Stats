@@ -2057,11 +2057,32 @@ class ObdLoggerService : Service() {
         }
         lastWebhookDispatchAtMillis = now
         scope.launch {
-            val result = sendWebhookPost(
+            // The unit's radios are the first thing the server quiets once it sees the car,
+            // and the hotspot that carries this request may still be settling right after
+            // ignition-off. A transient failure is retried a few times with short backoff;
+            // anything the server actively rejected is not, because it will not change.
+            var attempt = 0
+            var result = sendWebhookPost(
                 url = config.webhookUrl,
                 apiKey = config.webhookApiKey,
                 vehicleId = config.vehicleId,
             )
+            while (!result.success && webhookRetryDelayMillis(result, attempt) != null) {
+                val wait = webhookRetryDelayMillis(result, attempt) ?: break
+                emitEvent(
+                    kind = "ingest.webhook",
+                    level = "info",
+                    outcome = "retrying",
+                    reasonCode = result.reasonCode,
+                )
+                delay(wait)
+                attempt += 1
+                result = sendWebhookPost(
+                    url = config.webhookUrl,
+                    apiKey = config.webhookApiKey,
+                    vehicleId = config.vehicleId,
+                )
+            }
             emitEvent(
                 kind = "ingest.webhook",
                 level = if (result.success) "info" else "warning",
@@ -2125,6 +2146,26 @@ internal fun configureWebhookConnection(connection: java.net.HttpURLConnection, 
 }
 
 internal data class WebhookResult(val success: Boolean, val reasonCode: String)
+
+/** Reason codes worth another attempt: the network, not the server's verdict, said no. */
+internal val WEBHOOK_TRANSIENT_REASONS = setOf(
+    "webhook_timeout",
+    "webhook_network_error",
+    "webhook_server_error",
+)
+
+/** Backoff between webhook attempts; the list length bounds the retries. */
+internal val WEBHOOK_RETRY_DELAYS_MILLIS = listOf(3_000L, 10_000L, 20_000L)
+
+/**
+ * How long to wait before retrying after [result] on zero-based [attempt], or null when the
+ * failure is final or the retry budget is spent.
+ */
+internal fun webhookRetryDelayMillis(result: WebhookResult, attempt: Int): Long? {
+    if (result.success) return null
+    if (result.reasonCode !in WEBHOOK_TRANSIENT_REASONS) return null
+    return WEBHOOK_RETRY_DELAYS_MILLIS.getOrNull(attempt)
+}
 
 internal fun classifyWebhookResponse(code: Int): WebhookResult = when (code) {
     in 200..299 -> WebhookResult(true, "webhook_ok")

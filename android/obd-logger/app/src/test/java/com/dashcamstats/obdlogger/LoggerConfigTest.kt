@@ -92,6 +92,22 @@ class LoggerConfigTest {
         assertEquals("webhook_unexpected_response", classifyWebhookResponse(302).reasonCode)
     }
 
+    @Test
+    fun webhookRetriesTransientFailuresWithBoundedBackoffOnly() {
+        val timeout = WebhookResult(false, "webhook_timeout")
+        assertEquals(3_000L, webhookRetryDelayMillis(timeout, 0))
+        assertEquals(10_000L, webhookRetryDelayMillis(timeout, 1))
+        assertEquals(20_000L, webhookRetryDelayMillis(timeout, 2))
+        assertEquals(null, webhookRetryDelayMillis(timeout, 3))
+        assertEquals(3_000L, webhookRetryDelayMillis(WebhookResult(false, "webhook_network_error"), 0))
+        assertEquals(3_000L, webhookRetryDelayMillis(WebhookResult(false, "webhook_server_error"), 0))
+        // A verdict from the server will not change by asking again.
+        assertEquals(null, webhookRetryDelayMillis(WebhookResult(false, "webhook_auth_rejected"), 0))
+        assertEquals(null, webhookRetryDelayMillis(WebhookResult(false, "webhook_client_error"), 0))
+        assertEquals(null, webhookRetryDelayMillis(WebhookResult(false, "invalid_webhook_url"), 0))
+        assertEquals(null, webhookRetryDelayMillis(WebhookResult(true, "webhook_ok"), 0))
+    }
+
     private class FakeHttpConnection : HttpURLConnection(URL("http://127.0.0.1/unused")) {
         override fun connect() = Unit
         override fun disconnect() = Unit

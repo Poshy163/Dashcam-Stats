@@ -342,6 +342,19 @@ identity, but durable status writes occur immediately only for state/ownership/d
 changes and otherwise on a one-minute heartbeat. SQLite sample commits remain independent,
 avoiding an extra TF-card fsync and atomic rename on every five-second polling cycle.
 
+The launcher activity reads the same `status.json` every two seconds while it is in the
+foreground and renders a dark, large-type summary above the configuration form: logger state and
+age of the last publish (flagged `STALE` after 90 s, which is how a stopped service looks from the
+head unit), vehicle state, adapter/ECU connection, battery voltage, current drive, last sample age,
+bundles waiting for the server, Wi-Fi/sleep hold and the last error. It keeps the screen on while
+open. There is no service binding; the panel is purely a reader of the published file, so it shows
+exactly what the server would see over ADB.
+
+The ingest-ready webhook retries on transient failures (`webhook_network_error`,
+`webhook_timeout`, `webhook_server_error`) with a bounded 3 s / 10 s / 20 s backoff before giving
+up; auth, client and `disabled` outcomes are not retried. Each attempt is recorded in the event
+stream.
+
 Before an on-device schema upgrade, the logger forces a complete WAL checkpoint, validates the
 source, then publishes a synced main-only migration snapshot with a ready marker; SQLite SHM is
 never treated as durable backup data. Restore copies and validates a staged main file before an

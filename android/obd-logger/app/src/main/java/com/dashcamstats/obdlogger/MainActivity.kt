@@ -3,16 +3,23 @@ package com.dashcamstats.obdlogger
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.graphics.Color
+import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import org.json.JSONObject
+import java.io.File
 
 class MainActivity : Activity() {
     private lateinit var address: EditText
@@ -31,9 +38,20 @@ class MainActivity : Activity() {
     private lateinit var ownership: CheckBox
     private lateinit var enabled: CheckBox
     private lateinit var status: TextView
+    private lateinit var liveStatus: TextView
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val refreshLiveStatus = object : Runnable {
+        override fun run() {
+            renderLiveStatus()
+            mainHandler.postDelayed(this, LIVE_STATUS_REFRESH_MILLIS)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The head unit's screen is the only place this status is visible; the activity is
+        // opened on purpose and should not dim while someone is reading it.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val current = LoggerPreferences.load(this)
         val padding = (16 * resources.displayMetrics.density).toInt()
         val layout = LinearLayout(this).apply {
@@ -44,6 +62,19 @@ class MainActivity : Activity() {
             text = "Dashcam OBD logger"
             textSize = 24f
         })
+        liveStatus = TextView(this).apply {
+            textSize = 18f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.rgb(24, 24, 28))
+            setPadding(padding, padding, padding, padding)
+            setLineSpacing(0f, 1.2f)
+        }
+        layout.addView(
+            liveStatus,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
         layout.addView(TextView(this).apply {
             text = "Before enabling: turn off switch.nissan_tiida_obd2_connection and stop all phone OBD apps. The adapter permits one owner."
         })
@@ -117,6 +148,42 @@ class MainActivity : Activity() {
         })
         layout.addView(status)
         setContentView(ScrollView(this).apply { addView(layout) })
+    }
+
+    override fun onResume() {
+        super.onResume()
+        mainHandler.removeCallbacks(refreshLiveStatus)
+        mainHandler.post(refreshLiveStatus)
+    }
+
+    override fun onPause() {
+        mainHandler.removeCallbacks(refreshLiveStatus)
+        super.onPause()
+    }
+
+    private fun renderLiveStatus() {
+        val published = readPublishedStatus()
+        liveStatus.text = LiveStatusSummary.lines(published, System.currentTimeMillis())
+            .joinToString("\n")
+    }
+
+    /**
+     * The service publishes `status.json` for the server to read over ADB; the same file is
+     * the activity's only view of a process it does not hold a binding to. Removable storage
+     * first, then the fallback the publisher uses when the card is missing.
+     */
+    private fun readPublishedStatus(): JSONObject? {
+        val roots = listOfNotNull(
+            runCatching { DeviceFiles.removableRootOrNull(this) }.getOrNull(),
+            runCatching { DeviceFiles.fallbackStatusRoot(this) }.getOrNull(),
+        )
+        for (root in roots) {
+            val file = File(root, "status.json")
+            if (!file.isFile) continue
+            val parsed = runCatching { JSONObject(file.readText(Charsets.UTF_8)) }.getOrNull()
+            if (parsed != null) return parsed
+        }
+        return null
     }
 
     private fun field(parent: LinearLayout, hint: String, value: String): EditText {
@@ -248,5 +315,9 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(service)
         else startService(service)
         status.text = "Logger starting"
+    }
+
+    private companion object {
+        const val LIVE_STATUS_REFRESH_MILLIS = 2_000L
     }
 }
