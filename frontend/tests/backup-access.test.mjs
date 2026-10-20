@@ -36,7 +36,12 @@ async function flush() {
   await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
 }
 
-async function mount(t, { entry = '/backup', getStatus = () => idle, getBundles = () => paginated([bundle(11)]), eventStream } = {}) {
+async function mount(t, {
+  entry = '/backup', getStatus = () => idle, getBundles = () => paginated([bundle(11)]), eventStream,
+  getRadioStatus = () => ({ quieting_enabled: false, transition: null }),
+  getObdStatus = () => ({ stored_drive_count: 11, failed_count: 1, copy_throughput_mbs: 0, event_stream: eventStream }),
+  onCancel = () => ({ cancelled: true }),
+} = {}) {
   const requests = []
   const oldFetch = globalThis.fetch
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity }, mutations: { retry: false } } })
@@ -46,9 +51,11 @@ async function mount(t, { entry = '/backup', getStatus = () => idle, getBundles 
     let body
     switch (request.pathname) {
       case '/api/ingest/status': body = await getStatus(); break
-      case '/api/ingest/radio-status': body = { quieting_enabled: false, transition: null }; break
+      case '/api/ingest/radio-status': body = await getRadioStatus(); break
+      case '/api/ingest/cancel': body = await onCancel(); break
       case '/api/ingest/history': body = paginated([{ id: 90, started_at: '2026-10-01T04:00:00Z', state: 'ok', files_transferred: 2, bytes_transferred: 100 }]); break
-      case '/api/obd/status': body = { stored_drive_count: 11, failed_count: 1, copy_throughput_mbs: 0, event_stream: eventStream }; break
+      case '/api/obd/status': body = await getObdStatus(); break
+      case '/api/system/info': body = { version: 'main', source_revision: 'abcdef0123456789' }; break
       case '/api/obd/bundles': body = getBundles(Number(request.searchParams.get('page'))); break
       case '/api/obd/events': body = paginated([]); break
       case '/api/obd/bundles/1/validate': body = { valid: true, bundle: bundle(1) }; break
@@ -67,6 +74,75 @@ async function mount(t, { entry = '/backup', getStatus = () => idle, getBundles 
   await flush()
   return { root, client, requests }
 }
+
+test('an acknowledged stop stays disabled through shutdown, then prevents a new pull until recovery settles', async t => {
+  let current = { ...idle, state: 'running', phase: 'transferring' }
+  let transition = {
+    phase: 'restoring_radios', active: true, recovery_required: true,
+    bluetooth: { baseline: 'on', disable_attempted: true, restore_verified: false },
+    hotspot: { baseline: 'on', disable_attempted: true, restore_verified: false },
+    obd_logger: { quiesce_attempted: true, resume_attempted: true, resume_verified: false },
+  }
+  const { root, client, requests } = await mount(t, {
+    getStatus: () => current,
+    getRadioStatus: () => ({ quieting_enabled: true, transition }),
+    onCancel: () => { current = { ...current, cancellation_requested: true }; return { cancelled: true } },
+  })
+  await act(async () => button(root, 'Cancel').props.onClick())
+  await flush()
+  assert.equal(button(root, 'Stopping…').props.disabled, true)
+  assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Stopping backup')
+  assert.match(text(root), /stop request is acknowledged/)
+  assert.equal(requests.filter(({ url }) => url.pathname === '/api/ingest/cancel').length, 1)
+
+  current = { ...current, state: 'cancelled', phase: 'idle', cancellation_requested: false }
+  await act(async () => { await client.refetchQueries({ queryKey: ['ingest-status'] }) })
+  await flush()
+  assert.match(text(root), /Backup stopped/)
+  assert.match(text(root), /Logger resumption is not confirmed yet/)
+  assert.equal(button(root, 'Pull now').props.disabled, true)
+
+  transition = {
+    ...transition, active: false, recovery_required: false, phase: 'complete',
+    bluetooth: { ...transition.bluetooth, restore_verified: true },
+    hotspot: { ...transition.hotspot, restore_verified: true },
+    obd_logger: { ...transition.obd_logger, resume_verified: true },
+  }
+  await act(async () => { await client.refetchQueries({ queryKey: ['ingest-radio-status'] }) })
+  await flush()
+  assert.equal(button(root, 'Pull now').props.disabled, false)
+  assert.match(text(root), /logger was verified resumed/)
+})
+
+test('a reloaded page reads an existing stop request and a failed request can be retried', async t => {
+  await t.test('server stop acknowledgement survives a fresh page', async t => {
+    const { root } = await mount(t, { getStatus: () => ({ ...idle, state: 'running', cancellation_requested: true }) })
+    assert.equal(button(root, 'Stopping…').props.disabled, true)
+    assert.match(text(root), /stop request is acknowledged/)
+  })
+  await t.test('request failure is visible and does not claim acknowledgement', async t => {
+    const { root } = await mount(t, {
+      getStatus: () => ({ ...idle, state: 'running' }),
+      onCancel: () => { throw new Error('Stop request failed') },
+    })
+    await act(async () => button(root, 'Cancel').props.onClick())
+    await flush()
+    assert.match(text(root), /Could not cancel the backup/)
+    assert.equal(button(root, 'Cancel').props.disabled, false)
+    assert.doesNotMatch(text(root), /stop request is acknowledged/)
+  })
+})
+
+test('an offline dashcam cannot leave the summary claiming a live ECU connection', async t => {
+  const { root, requests } = await mount(t, {
+    getObdStatus: () => ({ logger: { state: 'ecu_online', ecu_connected: true, updated_at_utc: new Date().toISOString() } }),
+  })
+  const tile = root.root.findByProps({ label: 'Logger state' })
+  assert.equal(tile.props.value, 'Dashcam offline')
+  assert.equal(tile.props.tone, 'default')
+  assert.ok(requests.some(({ url }) => url.pathname === '/api/obd/events' && url.searchParams.get('kind') === 'ingest.webhook'))
+  assert.match(text(root), /abcdef012345/)
+})
 
 test('stored-bundle pagination reaches and validates older failures while preserving other URL parameters', async t => {
   const { root, requests } = await mount(t, {

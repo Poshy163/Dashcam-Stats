@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { cn } from '@/lib/cn'
 import { formatBytes, formatDateTime, formatDuration, formatRelative } from '@/lib/format'
 import type { OBDLoggerEvent } from '@/lib/api'
+import { webhookEventPresentation } from '@/lib/webhookPresentation'
 
 const KIND_LABELS: Record<string, string> = {
   'app.boot': 'App boot',
@@ -15,6 +16,7 @@ const KIND_LABELS: Record<string, string> = {
   'obd.poll_health': 'Polling',
   'drive.lifecycle': 'Drive',
   'ingest.handoff': 'Backup handoff',
+  'ingest.webhook': 'Backup notification',
   'radio.observation': 'Radio state',
   'bundle.export': 'Drive export',
   'receipt.verification': 'Server receipt',
@@ -63,6 +65,7 @@ export function ObdAppEventTimeline({
     <ol className="space-y-2" aria-label="OBD app activity">
       {events.map((event) => {
         const metrics = Object.entries(event.metrics)
+        const webhook = event.kind === 'ingest.webhook' ? webhookEventPresentation(event) : null
         return (
           <li
             key={`${event.buildGitSha}-${event.sequence}-${event.occurredAt}`}
@@ -73,7 +76,7 @@ export function ObdAppEventTimeline({
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="font-medium">{KIND_LABELS[event.kind] ?? humanize(event.kind)}</span>
                   <span className="badge bg-surface-sunken text-content-muted">
-                    {humanize(event.outcome)}
+                    {webhook?.outcome ?? humanize(event.outcome)}
                   </span>
                   {event.level !== 'info' && (
                     <span
@@ -90,9 +93,10 @@ export function ObdAppEventTimeline({
                 </div>
                 {event.reasonCode && (
                   <div className="mt-1 text-sm text-content-muted">
-                    {humanize(event.reasonCode)}
+                    {webhook?.title ?? humanize(event.reasonCode)}
                   </div>
                 )}
+                {webhook && <p className="mt-1 text-sm text-content-muted">{webhook.detail}</p>}
               </div>
               <time
                 className="shrink-0 text-xs tabular text-content-faint"

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
 
@@ -10,6 +10,7 @@ import { formatBytes, formatDate, formatRelative } from '@/lib/format'
 import { invalidateAnalysisQueries } from '@/lib/queryInvalidation'
 import type { RetentionPlan, SettingDef } from '@/lib/types'
 import { removeSavedDraft } from '@/lib/settingsDraft'
+import { clearSettingError, settingControlId, settingsErrorSummary, settingsSaveErrors } from '@/lib/settingsErrors'
 
 export default function Settings() {
   const client = useQueryClient()
@@ -19,13 +20,34 @@ export default function Settings() {
   const active = params.get('category') ?? 'general'
   const setActive = (key: string) => setParams({ category: key }, { replace: true })
   const [dirty, setDirty] = useState<Record<string, unknown>>({})
+  const latestDraft = useRef(dirty)
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [saved, setSaved] = useState(false)
+  const [focusError, setFocusError] = useState<string | null>(null)
+  const errorSummaryRef = useRef<HTMLElement>(null)
 
   const query = useQuery({ queryKey: ['settings'], queryFn: api.settings.get })
 
+  useEffect(() => { latestDraft.current = dirty }, [dirty])
+  useEffect(() => {
+    if (!focusError || typeof document === 'undefined') return
+    const id = settingControlId(focusError)
+    const control = document.getElementById(id)
+    const target = control && !control.matches(':disabled')
+      ? control
+      : document.getElementById(`${id}-field`)
+    if (!target) return
+    target.scrollIntoView?.({ block: 'center', behavior: 'smooth' })
+    target.focus({ preventScroll: true })
+    setFocusError(null)
+  }, [active, focusError, query.data])
+
   const save = useMutation({
     mutationFn: (submitted: Record<string, unknown>) => api.settings.update(submitted),
+    onMutate: () => {
+      setSaved(false)
+      setErrors((current) => clearSettingError(current, '_'))
+    },
     onSuccess: (categories, submitted) => {
       setDirty((current) => removeSavedDraft(current, submitted))
       setErrors({})
@@ -38,8 +60,7 @@ export default function Settings() {
     onError: (error: Error & { detail?: unknown }, submitted) => {
       // The API names the offending key, so surface it against that field.
       const message = error.message ?? 'Could not save settings'
-      const key = Object.keys(submitted).find((k) => message.includes(k))
-      setErrors(key ? { [key]: message } : { _: message })
+      setErrors((current) => ({ ...current, ...settingsSaveErrors(message, submitted, latestDraft.current) }))
     },
   })
 
@@ -54,11 +75,7 @@ export default function Settings() {
         delete next[key]
         return next
       })
-      setErrors((current) => {
-        const next = { ...current }
-        delete next[key]
-        return next
-      })
+      setErrors((current) => clearSettingError(current, key))
       void client.invalidateQueries({ queryKey: ['status'] })
       void client.invalidateQueries({ queryKey: ['system-hardware'] })
     },
@@ -66,6 +83,12 @@ export default function Settings() {
       setErrors((current) => ({ ...current, [key]: error.message }))
     },
   })
+
+  useEffect(() => {
+    if (!save.isError && !reset.isError) return
+    errorSummaryRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' })
+    errorSummaryRef.current?.focus({ preventScroll: true })
+  }, [save.isError, save.submittedAt, reset.isError, reset.submittedAt])
 
   const refreshQueueAndAnalysis = () => {
     void client.invalidateQueries({ queryKey: ['jobs'] })
@@ -124,6 +147,7 @@ export default function Settings() {
   const categories = query.data
   const category = categories.find((c) => c.key === active) ?? categories[0]!
   const dirtyCount = Object.keys(dirty).length
+  const errorSummary = settingsErrorSummary(errors, categories)
 
   // A setting gated by an unticked boolean is shown but disabled, so the dependency is
   // visible rather than the control just silently doing nothing.
@@ -143,6 +167,34 @@ export default function Settings() {
         subtitle="Saved changes take effect without restarting the container."
       />
 
+      {errorSummary.length > 0 && (
+        <section ref={errorSummaryRef} tabIndex={-1} className="card border-state-error/50 p-4" role="alert" aria-labelledby="settings-error-title">
+          <h2 id="settings-error-title" className="font-semibold text-state-error">Settings need attention</h2>
+          <p className="mt-1 text-sm text-content-muted">
+            {dirtyCount > 0 ? 'Your unsaved changes have been kept.' : 'Review the problem below and try again.'}
+          </p>
+          <ul className="mt-3 space-y-2 text-sm">
+            {errorSummary.map(({ key, message, category: errorCategory, setting }) => (
+              <li key={key}>
+                {errorCategory && setting ? (
+                  <button
+                    type="button"
+                    className="text-left font-medium text-accent underline"
+                    onClick={() => {
+                      setActive(errorCategory.key)
+                      setFocusError(key)
+                    }}
+                  >
+                    {errorCategory.label} · {setting.label}
+                  </button>
+                ) : key !== '_' ? <span className="font-medium">{key} (not available in this view)</span> : null}
+                <p className="mt-0.5 text-state-error">{message}</p>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       {[
         { title: 'Could not scan footage', mutation: scanNow },
         { title: 'Could not queue new footage', mutation: processNew },
@@ -152,12 +204,15 @@ export default function Settings() {
       ].map(({ title, mutation }) => mutation.isError && <ErrorState key={title} title={title} error={mutation.error} />)}
 
       <div className="grid gap-5 md:grid-cols-[13rem_minmax(0,1fr)]">
-        <nav className="card flex h-fit gap-1 overflow-x-auto p-2 md:sticky md:top-24 md:flex-col">
-          {categories.map((c) => (
+        <nav aria-label="Settings categories" className="card flex h-fit gap-1 overflow-x-auto p-2 md:sticky md:top-24 md:flex-col">
+          {categories.map((c) => {
+            const errorCount = c.settings.filter((setting) => errors[setting.key]).length
+            return (
             <button
               key={c.key}
               onClick={() => setActive(c.key)}
               aria-pressed={c.key === category.key}
+              aria-label={errorCount > 0 ? `${c.label}, ${errorCount} error${errorCount === 1 ? '' : 's'}` : undefined}
               className={cn(
                 'min-h-10 whitespace-nowrap rounded-lg px-3 py-2 text-left text-sm transition-colors',
                 c.key === category.key
@@ -166,8 +221,14 @@ export default function Settings() {
               )}
             >
               {c.label}
+              {errorCount > 0 && (
+                <span aria-hidden="true" className="ml-2 rounded bg-state-error/15 px-1.5 py-0.5 text-xs text-state-error">
+                  {errorCount} error{errorCount === 1 ? '' : 's'}
+                </span>
+              )}
             </button>
-          ))}
+            )
+          })}
         </nav>
 
         <div className="space-y-4">
@@ -189,7 +250,11 @@ export default function Settings() {
                   }
                   error={errors[setting.key]}
                   resetDisabled={save.isPending}
-                  onChange={(v) => setDirty((d) => ({ ...d, [setting.key]: v }))}
+                  onChange={(v) => {
+                    setDirty((d) => ({ ...d, [setting.key]: v }))
+                    setErrors((current) => clearSettingError(current, setting.key))
+                    setSaved(false)
+                  }}
                   onReset={() => reset.mutate(setting.key)}
                 />
               ))}
@@ -457,7 +522,7 @@ function Field({
   onReset: () => void
 }) {
   const [pendingDangerous, setPendingDangerous] = useState<unknown>(undefined)
-  const controlId = `setting-${setting.key.replace(/[^a-zA-Z0-9_-]/g, '-')}`
+  const controlId = settingControlId(setting.key)
   const labelId = `${controlId}-label`
   const descriptionId = setting.description ? `${controlId}-description` : undefined
   const errorId = error ? `${controlId}-error` : undefined
@@ -494,6 +559,7 @@ function Field({
               id={controlId}
               aria-labelledby={labelId}
               aria-describedby={describedBy}
+              aria-invalid={!!error}
               type="checkbox"
               checked={checked}
               disabled={disabled}
@@ -509,6 +575,7 @@ function Field({
             id={controlId}
             aria-labelledby={labelId}
             aria-describedby={describedBy}
+            aria-invalid={!!error}
             className="input"
             value={String(value ?? '')}
             disabled={disabled}
@@ -527,6 +594,7 @@ function Field({
             id={controlId}
             aria-labelledby={labelId}
             aria-describedby={describedBy}
+            aria-invalid={!!error}
             type="number"
             className="input"
             value={Number(value ?? 0)}
@@ -544,6 +612,7 @@ function Field({
               id={controlId}
               aria-labelledby={labelId}
               aria-describedby={describedBy}
+              aria-invalid={!!error}
               type="text"
               className="input"
               value={String(value ?? '')}
@@ -568,7 +637,7 @@ function Field({
   }
 
   return (
-    <div className={cn('space-y-1', disabled && 'opacity-50')}>
+    <div id={`${controlId}-field`} tabIndex={-1} className={cn('space-y-1', disabled && 'opacity-50')}>
       {label}
       {setting.description && <p className="hint" id={descriptionId}>{setting.description}</p>}
       <div className="max-w-md">{control()}</div>

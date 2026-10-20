@@ -3,6 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 
 import { ObdLoggerCard } from '@/components/ObdLoggerCard'
 import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
+import { ObdWebhookStatus } from '@/components/ObdWebhookStatus'
 import Spinner from '@/components/Spinner'
 import { EmptyState, ErrorState, PageHeader, Pagination, ProgressBar, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
@@ -15,7 +16,8 @@ import type {
   OBDBundle,
 } from '@/lib/api'
 import { formatBytes, formatDateTime, formatDuration, formatRelative } from '@/lib/format'
-import { backupHold, backupIdleLabel, backupRecoveryNotice, radioQuietingNotice, unverifiedRadioRestores } from '@/lib/backupPresentation'
+import { backupHold, backupIdleLabel, backupRecoveryNotice, loggerRecoveryEvidence, radioQuietingNotice, unverifiedRadioRestores } from '@/lib/backupPresentation'
+import { loggerEvidenceFreshness } from '@/lib/obdLoggerPresentation'
 import { sleepStatusRefetchInterval, useSleepCountdown } from '@/lib/useSleepCountdown'
 
 /** How the state reads to a person, and how alarming it should look. */
@@ -299,6 +301,9 @@ export default function Backup() {
     queryFn: api.obd.status,
     refetchInterval: 10_000,
   })
+  const systemInfo = useQuery({
+    queryKey: ['system-info'], queryFn: api.system.info, staleTime: 60_000,
+  })
   const obdBundles = useQuery({
     queryKey: ['obd-bundles', bundlePage],
     queryFn: () => api.obd.bundles({ page: bundlePage, pageSize: 10 }),
@@ -314,6 +319,11 @@ export default function Backup() {
   })
   const obdEventItems = obdEvents.data?.pages.flatMap((page) => page.items) ?? []
   const obdEventTotal = obdEvents.data?.pages[0]?.total ?? 0
+  const webhookEvents = useQuery({
+    queryKey: ['obd-webhook-events'],
+    queryFn: () => api.obd.events({ kind: 'ingest.webhook', pageSize: 1 }),
+    refetchInterval: 10_000,
+  })
 
   const invalidate = () => {
     client.invalidateQueries({ queryKey: ['ingest-status'] })
@@ -322,11 +332,19 @@ export default function Backup() {
     client.invalidateQueries({ queryKey: ['obd-status'] })
     client.invalidateQueries({ queryKey: ['obd-bundles'] })
     client.invalidateQueries({ queryKey: ['obd-app-events'] })
+    client.invalidateQueries({ queryKey: ['obd-webhook-events'] })
     client.invalidateQueries({ queryKey: ['obd-drives'] })
     client.invalidateQueries({ queryKey: ['obd-drives-summary'] })
   }
   const pullNow = useMutation({ mutationFn: api.ingest.run, onSuccess: invalidate })
-  const cancel = useMutation({ mutationFn: api.ingest.cancel, onSuccess: invalidate })
+  const cancel = useMutation({
+    mutationFn: api.ingest.cancel,
+    onSuccess: () => {
+      client.setQueryData<IngestStatus>(['ingest-status'], (current) => current?.state === 'running'
+        ? { ...current, cancellationRequested: true } : current)
+      invalidate()
+    },
+  })
   // Deliberately not invalidating anything: this changes what is on the car's screen, not
   // anything this page displays.
   const showTest = useMutation({ mutationFn: api.ingest.showTest })
@@ -344,6 +362,8 @@ export default function Backup() {
   const eventStream = obdStatus.data?.eventStream
   const eventSequenceGap = eventStream?.sequenceGap ?? 0
   const running = data?.state === 'running'
+  const stopping = running && (data?.cancellationRequested === true || cancel.isPending)
+  const loggerFreshness = loggerEvidenceFreshness(obdStatus.data?.logger?.updatedAtUtc, status.isError ? undefined : data?.unitOnline)
   const transition = radioStatus.data?.transition
   const recovery = backupRecoveryNotice(transition)
   const restoreOriginalState = transition && unverifiedRadioRestores(transition).some((name) =>
@@ -354,10 +374,12 @@ export default function Backup() {
   const radioShutdownPending = transition?.active === true && transition.phase === 'ingesting' &&
     (!transition.bluetooth.disableVerified || !transition.hotspot.disableVerified)
   const transitionBusy = transition?.active === true && (!running || transition.phase !== 'ingesting' || radioWindowEnded || radioShutdownPending)
-  const copying = !status.isError && running && data?.phase === 'transferring' && !hold && !recoveryBlocked && !transitionBusy
-  const prediction = countdown.state === 'estimated' && !hold && !recoveryBlocked && !transitionBusy ? data?.sleepWindowPrediction : null
+  const copying = !status.isError && running && !stopping && data?.phase === 'transferring' && !hold && !recoveryBlocked && !transitionBusy
+  const prediction = countdown.state === 'estimated' && !stopping && !hold && !recoveryBlocked && !transitionBusy ? data?.sleepWindowPrediction : null
   const descriptor = status.isError
     ? { label: 'Status unavailable', tone: 'warn' as const }
+    : stopping
+    ? { label: 'Stopping backup', tone: 'busy' as const }
     : recoveryBlocked
     ? recovery
       ? { label: recovery.label, tone: 'busy' as const }
@@ -383,6 +405,8 @@ export default function Backup() {
           : { label: 'Checking', tone: 'busy' as const }
   const statusHint = status.isError
     ? data ? 'Last known values; waiting for a successful refresh' : 'Waiting for a successful status check'
+    : stopping
+    ? 'Stop requested; waiting for transfer shutdown and cleanup'
     : recoveryBlocked
     ? recovery
       ? 'New backups wait until recovery is confirmed'
@@ -458,14 +482,18 @@ export default function Backup() {
               {showTest.isPending ? 'Opening…' : 'Test car screen'}
             </button>
             {running ? (
-              <button className="btn" disabled={cancel.isPending} onClick={() => cancel.mutate()}>
-                Cancel
+              <button className="btn" disabled={stopping} onClick={() => cancel.mutate()}>
+                {stopping ? 'Stopping…' : 'Cancel'}
               </button>
             ) : (
               <button
                 className="btn btn-primary"
-                disabled={pullNow.isPending || !data || status.isError || data.state === 'disabled'}
+                disabled={pullNow.isPending || !data || status.isError || data.state === 'disabled' ||
+                  radioStatus.isPending || radioStatus.isError || transition?.active || recoveryBlocked}
                 onClick={() => pullNow.mutate()}
+                title={transition?.active || recoveryBlocked
+                  ? 'Wait until radio and logger recovery is confirmed before starting another backup.'
+                  : radioStatus.isPending || radioStatus.isError ? 'Waiting for radio and logger safety status.' : undefined}
               >
                 Pull now
               </button>
@@ -490,6 +518,19 @@ export default function Backup() {
         <div className="mb-6 space-y-3">
           {pullNow.isError && <ErrorState title="Could not start the backup" error={pullNow.error} />}
           {cancel.isError && <ErrorState title="Could not cancel the backup" error={cancel.error} />}
+        </div>
+      )}
+
+      {!status.isError && (stopping || data?.state === 'cancelled') && (
+        <div className="card mb-6 border-accent/40 px-5 py-4 text-sm" role="status">
+          <div className="font-medium">{stopping ? 'Stopping backup' : 'Backup stopped'}</div>
+          <p className="mt-1 text-content-muted">
+            {stopping
+              ? cancel.isPending && !data?.cancellationRequested
+                ? 'Sending the stop request. Waiting for the server to acknowledge it.'
+                : 'The stop request is acknowledged. The transfer is shutting down and completing cleanup. Radio and logger recovery is checked below.'
+              : 'Footage copying has stopped. Check the radio and logger recovery evidence below before starting another backup.'}
+          </p>
         </div>
       )}
 
@@ -605,6 +646,7 @@ export default function Backup() {
                 </div>
               )}
               <div>Updated {formatRelative(radioStatus.data.transition.updatedAt)}</div>
+              <div>{loggerRecoveryEvidence(radioStatus.data.transition)}</div>
             </div>
           )}
         </div>
@@ -634,6 +676,7 @@ export default function Backup() {
       <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         <StatTile
           label="Status"
+          compact
           value={descriptor.label}
           hint={statusHint}
           tone={descriptor.tone}
@@ -734,7 +777,7 @@ export default function Backup() {
         <div className="card mb-6 px-5 py-4">
           <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
-              <span>{hold || recoveryBlocked || transitionBusy ? descriptor.label : PHASES[data.phase]}</span>
+              <span>{stopping || hold || recoveryBlocked || transitionBusy ? descriptor.label : PHASES[data.phase]}</span>
               {data.filesTotal > 0 && (
                 <span className="font-normal text-content-muted">
                   {data.filesDone} of {data.filesTotal} files
@@ -853,16 +896,17 @@ export default function Backup() {
           <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-5">
             <StatTile
               label="Logger state"
-              value={obdStatus.data?.logger?.state ?? (data?.unitOnline ? 'Unknown' : 'Car away')}
+              compact
+              value={loggerFreshness.current ? obdStatus.data?.logger?.state ?? 'Unknown' : loggerFreshness.label}
               hint={
-                obdStatus.data?.logger?.lastDriveFinishedAtUtc
+                !loggerFreshness.current ? loggerFreshness.hint : obdStatus.data?.logger?.lastDriveFinishedAtUtc
                   ? `last drive ${formatRelative(obdStatus.data.logger.lastDriveFinishedAtUtc)}`
                   : 'best-effort status from the unit'
               }
               tone={
-                obdStatus.data?.logger?.ecuConnected === true ||
+                loggerFreshness.current && (obdStatus.data?.logger?.ecuConnected === true ||
                 (obdStatus.data?.logger?.ecuConnected === undefined &&
-                  obdStatus.data?.logger?.state === 'ecu_online')
+                  obdStatus.data?.logger?.state === 'ecu_online'))
                   ? 'busy'
                   : 'default'
               }
@@ -916,6 +960,18 @@ export default function Backup() {
           <ObdLoggerCard
             logger={obdStatus.data?.logger}
             checkedAt={obdStatus.data?.loggerCheckedAt}
+            unitOnline={status.isError ? undefined : data?.unitOnline}
+            backendInfo={systemInfo.data}
+            backendInfoLoading={systemInfo.isPending}
+            backendInfoError={systemInfo.isError}
+            backendCheckedAt={systemInfo.dataUpdatedAt ? new Date(systemInfo.dataUpdatedAt).toISOString() : null}
+          />
+
+          <ObdWebhookStatus
+            event={webhookEvents.data?.items[0]}
+            loading={webhookEvents.isPending}
+            error={webhookEvents.isError}
+            checkedAt={webhookEvents.dataUpdatedAt ? new Date(webhookEvents.dataUpdatedAt).toISOString() : null}
           />
 
           <section className="card mb-6 overflow-hidden" aria-label="Head-unit OBD app activity">

@@ -159,7 +159,7 @@ test('the shared hook measures delayed callbacks, refreshes identical values, an
 async function mountBackup(t, data, radio) {
   const client = new QueryClient({ defaultOptions: { queries: { enabled: false, retry: false, gcTime: Infinity } } })
   client.setQueryData(['ingest-status'], data)
-  if (radio) client.setQueryData(['ingest-radio-status'], radio)
+  client.setQueryData(['ingest-radio-status'], radio ?? { quietingEnabled: false, transition: null })
   let root
   await act(async () => { root = create(React.createElement(QueryClientProvider, { client }, React.createElement(MemoryRouter, null, React.createElement(Backup)))) })
   t.after(async () => { await act(async () => root.unmount()); client.clear() })

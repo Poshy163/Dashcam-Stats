@@ -177,6 +177,8 @@ export interface IngestStatus {
    * ended.
    */
   phase: 'idle' | 'connecting' | 'scanning' | 'preparing' | 'transferring' | 'verifying'
+  /** A stop is acknowledged; the run retains ownership until shutdown and cleanup settle. */
+  cancellationRequested?: boolean
   unitOnline: boolean
   filesTotal: number
   filesDone: number

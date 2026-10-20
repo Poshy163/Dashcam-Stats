@@ -32,6 +32,7 @@ export function StatTile({
   tone = 'default',
   href,
   icon,
+  compact = false,
 }: {
   label: string
   value: ReactNode
@@ -39,6 +40,7 @@ export function StatTile({
   tone?: 'default' | 'ok' | 'warn' | 'error' | 'busy'
   href?: string
   icon?: ReactNode
+  compact?: boolean
 }) {
   const toneClass = {
     default: 'text-content',
@@ -54,7 +56,8 @@ export function StatTile({
         <div className="font-mono text-xs font-semibold uppercase tracking-wider text-content-muted">
           {label}
         </div>
-        <div className={cn('tabular font-mono text-2xl font-black leading-none tracking-tight sm:text-3xl mt-2', toneClass)}>
+        <div className={cn('tabular mt-2 break-words font-mono font-black tracking-tight [overflow-wrap:anywhere]',
+          compact ? 'text-lg leading-snug sm:text-xl' : 'text-2xl leading-none sm:text-3xl', toneClass)}>
           {value}
         </div>
         {hint && <div className="mt-2 font-mono text-2xs text-content-faint">{hint}</div>}

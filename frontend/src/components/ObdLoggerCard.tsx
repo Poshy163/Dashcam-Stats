@@ -1,5 +1,7 @@
+import { useEffect, useState } from 'react'
 import { cn } from '@/lib/cn'
-import { formatRelative } from '@/lib/format'
+import { formatDateTime, formatRelative } from '@/lib/format'
+import { loggerEvidenceFreshness, loggerTimestampMillis } from '@/lib/obdLoggerPresentation'
 import type { OBDLoggerStatus } from '@/lib/api'
 
 type Tone = 'default' | 'ok' | 'warn' | 'error' | 'busy'
@@ -32,13 +34,19 @@ function stateTone(state: string | undefined): Tone {
   return 'default'
 }
 
-function voltageQuality(logger: OBDLoggerStatus): { label: string; tone: Tone } {
+function voltageQuality(logger: OBDLoggerStatus, nowMs: number): { label: string; tone: Tone } {
   if (logger.batteryVoltageQuality === 'failed') return { label: 'Probe failed', tone: 'error' }
   if (logger.batteryVoltageQuality === 'invalid') return { label: 'Invalid reply', tone: 'warn' }
   if (logger.batteryVoltageQuality === 'unavailable') {
     return { label: 'Unavailable', tone: 'default' }
   }
-  if (logger.batteryVoltageFresh === true) return { label: 'Fresh', tone: 'ok' }
+  const sampledAt = loggerTimestampMillis(logger.batteryVoltageSampleAtUtc)
+  // The ATRV contract has its own 75-second TTL, independent of the status heartbeat.
+  const sampleAge = sampledAt === null ? null : nowMs - sampledAt
+  if (logger.batteryVoltageFresh === true && sampleAge !== null && sampleAge >= -5_000) {
+    return sampleAge <= 75_000 ? { label: 'Fresh', tone: 'ok' } : { label: 'Stale', tone: 'warn' }
+  }
+  if (logger.batteryVoltageFresh === true) return { label: 'Sample time unavailable', tone: 'warn' }
   if (logger.batteryVoltageQuality === 'stale' || logger.batteryVoltageFresh === false) {
     return { label: 'Stale', tone: 'warn' }
   }
@@ -122,6 +130,7 @@ function ConnectionState({
   inactiveLabel,
   activeHint,
   inactiveHint,
+  current,
 }: {
   label: string
   value: boolean | undefined
@@ -129,11 +138,14 @@ function ConnectionState({
   inactiveLabel: string
   activeHint: string
   inactiveHint: string
+  current: boolean
 }) {
-  const known = value !== undefined
-  const tone: Tone = value === true ? 'ok' : 'default'
-  const stateLabel = known ? (value ? activeLabel : inactiveLabel) : 'Not reported'
-  const hint = known ? (value ? activeHint : inactiveHint) : 'Requires logger status schema v4.'
+  const known = typeof value === 'boolean'
+  const tone: Tone = current && value === true ? 'ok' : 'default'
+  const reportedLabel = known ? (value ? activeLabel : inactiveLabel) : 'Not reported'
+  const stateLabel = current ? reportedLabel : known ? `Last reported: ${reportedLabel}` : 'Unknown'
+  const hint = !current ? 'Current state is unknown until a fresh logger report arrives.'
+    : known ? (value ? activeHint : inactiveHint) : 'Requires logger status schema v4.'
 
   return (
     <div className="rounded-xl border border-border/70 bg-surface-sunken/45 px-4 py-3">
@@ -144,47 +156,123 @@ function ConnectionState({
   )
 }
 
+function buildText(value: unknown): string {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= 64
+    ? value : 'Not reported'
+}
+
+function revision(value: unknown): string {
+  return typeof value === 'string' && /^[a-f0-9]{7,40}$/i.test(value)
+    ? value.slice(0, 12) : 'Not reported'
+}
+
+function VersionEvidence({
+  logger, backendInfo, backendInfoLoading, backendInfoError, backendCheckedAt,
+}: {
+  logger?: OBDLoggerStatus | null
+  backendInfo?: Record<string, unknown>
+  backendInfoLoading?: boolean
+  backendInfoError?: boolean
+  backendCheckedAt?: string | null
+}) {
+  return (
+    <div className="grid gap-4 border-t border-border px-5 py-4 sm:grid-cols-2" aria-label="Installed software versions">
+      <div>
+        <div className="text-xs font-medium uppercase tracking-wide text-content-faint">Companion · last reported</div>
+        <div className="mt-1 text-sm font-medium">
+          {buildText(logger?.appVersionName ?? logger?.loggerVersion)}
+          {Number.isSafeInteger(logger?.appVersionCode) && (logger?.appVersionCode ?? -1) >= 0
+            ? ` (code ${logger?.appVersionCode})` : ''}
+        </div>
+        <div className="mt-1 text-xs text-content-muted">
+          Build <span className="font-mono">{revision(logger?.buildGitSha)}</span>
+          {' · '}Poll plan {Number.isSafeInteger(logger?.pollPlanVersion) && (logger?.pollPlanVersion ?? -1) >= 0
+            ? logger?.pollPlanVersion : 'not reported'}
+        </div>
+      </div>
+      <div>
+        <div className="text-xs font-medium uppercase tracking-wide text-content-faint">Backend · running server</div>
+        <div className="mt-1 text-sm font-medium">
+          {backendInfoError ? 'Version check unavailable' : backendInfoLoading ? 'Checking version…' : buildText(backendInfo?.version)}
+        </div>
+        <div className="mt-1 text-xs text-content-muted">
+          Revision <span className="font-mono">{revision(backendInfo?.sourceRevision)}</span>
+          {backendInfoError && backendInfo ? ' · last successful check' : ''}
+        </div>
+        <div className="mt-1 text-xs text-content-faint">
+          {loggerTimestampMillis(backendCheckedAt) !== null
+            ? <>Last checked <time dateTime={backendCheckedAt ?? undefined} title={formatDateTime(backendCheckedAt)}>{formatRelative(backendCheckedAt)}</time></>
+            : 'Check time not reported'}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function ObdLoggerCard({
   logger,
   checkedAt,
+  unitOnline,
+  backendInfo,
+  backendInfoLoading,
+  backendInfoError,
+  backendCheckedAt,
 }: {
   logger: OBDLoggerStatus | null | undefined
   checkedAt: string | null | undefined
+  unitOnline?: boolean | null
+  backendInfo?: Record<string, unknown>
+  backendInfoLoading?: boolean
+  backendInfoError?: boolean
+  backendCheckedAt?: string | null
 }) {
+  const [nowMs, setNowMs] = useState(Date.now)
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 1_000)
+    return () => clearInterval(timer)
+  }, [])
+  const freshness = loggerEvidenceFreshness(logger?.updatedAtUtc, unitOnline, nowMs)
+  const versions = <VersionEvidence logger={logger} backendInfo={backendInfo}
+    backendInfoLoading={backendInfoLoading} backendInfoError={backendInfoError} backendCheckedAt={backendCheckedAt} />
   if (!logger) {
     return (
-      <section className="card mb-6 px-5 py-4" aria-label="OBD logger live state">
+      <section className="card mb-6 px-5 py-4" aria-label="OBD logger state">
         <div className="font-medium">Logger state unavailable</div>
         <p className="mt-1 text-sm text-content-muted">
           The server has not read a status document from the dashcam yet. No adapter, ECU, or
           engine connection is being inferred.
         </p>
+        {versions}
       </section>
     )
   }
 
-  const quality = voltageQuality(logger)
+  const quality = voltageQuality(logger, nowMs)
   const owner = ownerStatus(logger)
   const voltage =
     typeof logger.batteryVoltage === 'number' && Number.isFinite(logger.batteryVoltage)
       ? `${logger.batteryVoltage.toFixed(1)} V`
       : 'Unavailable'
-  const voltageAge = logger.batteryVoltageSampleAtUtc
+  const voltageAge = loggerTimestampMillis(logger.batteryVoltageSampleAtUtc) !== null
     ? `sampled ${formatRelative(logger.batteryVoltageSampleAtUtc)}`
     : 'sample time not reported'
-  const adapterOnly = logger.adapterReachable === true && logger.ecuConnected !== true
+  const adapterReachable = logger.adapterReachable === true ? quality.label === 'Fresh' : logger.adapterReachable
+  const adapterOnly = freshness.current && adapterReachable === true && logger.ecuConnected !== true
 
   return (
-    <section className="card mb-6 overflow-hidden" aria-label="OBD logger live state">
+    <section className="card mb-6 overflow-hidden" aria-label="OBD logger state">
       <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border px-5 py-4">
         <div>
-          <h3 className="font-semibold">Live logger evidence</h3>
+          <h3 className="font-semibold">{freshness.current ? 'Live logger evidence' : 'Last reported logger evidence'}</h3>
           <p className="mt-0.5 text-sm text-content-muted">
             Adapter voltage, BLE ownership, and ECU evidence are reported independently.
           </p>
+          <p className={cn('mt-2 text-sm', TONE_TEXT[freshness.tone])} role="status">
+            {freshness.label}. {freshness.hint}
+          </p>
         </div>
-        <span className={cn('badge', TONE_BADGE[stateTone(logger.state)])}>
-          {logger.state ? humanize(logger.state) : 'State not reported'}
+        <span className={cn('badge', TONE_BADGE[freshness.current ? stateTone(logger.state) : 'default'])}>
+          {logger.state ? `${freshness.current ? '' : 'Last reported: '}${humanize(logger.state)}` : 'State not reported'}
         </span>
       </div>
 
@@ -209,23 +297,28 @@ export function ObdLoggerCard({
         <div className="rounded-xl border border-border/70 p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="text-sm font-medium text-content-muted">BLE owner (last report)</div>
-            <span className={cn('badge', TONE_BADGE[owner.tone])}>{owner.label}</span>
+            <span className={cn('badge', TONE_BADGE[freshness.current ? owner.tone : 'default'])}>{owner.label}</span>
           </div>
-          <div className={cn('mt-2 text-2xl font-bold', TONE_TEXT[owner.tone])}>{owner.label}</div>
-          <p className="mt-2 text-xs leading-relaxed text-content-muted">{owner.hint}</p>
+          <div className={cn('mt-2 text-2xl font-bold', TONE_TEXT[freshness.current ? owner.tone : 'default'])}>
+            {freshness.current ? owner.label : 'Current owner unknown'}
+          </div>
+          <p className="mt-2 text-xs leading-relaxed text-content-muted">
+            {freshness.current ? owner.hint : `Last reported owner: ${owner.label}. A fresh logger report is needed to confirm BLE ownership.`}
+          </p>
           {logger.voltageOnlyMode === true && (
             <div className="mt-3 rounded-lg bg-accent-muted/50 px-3 py-2 text-xs text-content">
-              Controlled ATRV-only mode is active; ECU initialisation is fenced off.
+              {freshness.current ? 'Controlled ATRV-only mode is active; ECU initialisation is fenced off.'
+                : 'The last report had controlled ATRV-only mode enabled.'}
             </div>
           )}
           <div className="mt-3 text-xs text-content-faint">
             {logger.headUnitState
               ? `Head unit last reported ${humanize(logger.headUnitState).toLowerCase()}`
               : 'Head-unit state not reported'}
-            {logger.updatedAtUtc
+            {loggerTimestampMillis(logger.updatedAtUtc) !== null
               ? ` · logger reported ${formatRelative(logger.updatedAtUtc)}`
               : ' · producer time not reported'}
-            {checkedAt ? ` · server checked ${formatRelative(checkedAt)}` : ''}
+            {loggerTimestampMillis(checkedAt) !== null ? ` · server checked ${formatRelative(checkedAt)}` : ''}
           </div>
         </div>
       </div>
@@ -233,7 +326,8 @@ export function ObdLoggerCard({
       <div className="grid gap-3 px-5 pb-5 sm:grid-cols-2 xl:grid-cols-4">
         <ConnectionState
           label="Adapter reachable"
-          value={logger.adapterReachable}
+          current={freshness.current}
+          value={adapterReachable}
           activeLabel="ATRV reply"
           inactiveLabel="No fresh reply"
           activeHint="The ELM adapter answered a recent voltage-only request."
@@ -241,6 +335,7 @@ export function ObdLoggerCard({
         />
         <ConnectionState
           label="BLE session"
+          current={freshness.current}
           value={logger.adapterConnected}
           activeLabel="Connected"
           inactiveLabel="Closed"
@@ -249,6 +344,7 @@ export function ObdLoggerCard({
         />
         <ConnectionState
           label="ECU"
+          current={freshness.current}
           value={logger.ecuConnected}
           activeLabel="Online"
           inactiveLabel="Offline"
@@ -257,6 +353,7 @@ export function ObdLoggerCard({
         />
         <ConnectionState
           label="Engine"
+          current={freshness.current}
           value={logger.engineRunning}
           activeLabel="Running"
           inactiveLabel="Off"
@@ -264,6 +361,8 @@ export function ObdLoggerCard({
           inactiveHint="No live engine-running evidence is active."
         />
       </div>
+
+      {versions}
 
       {adapterOnly && (
         <div className="border-t border-border bg-accent-muted/35 px-5 py-3 text-sm text-content-muted">

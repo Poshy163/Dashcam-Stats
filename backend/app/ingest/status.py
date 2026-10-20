@@ -926,6 +926,7 @@ class IngestStatus:
             return {
                 "state": self.state.value,
                 "phase": self.phase.value,
+                "cancellation_requested": self._running and self._cancel.is_set(),
                 "unit_online": self.unit_online,
                 "files_total": self.files_total,
                 "files_done": self.files_done,

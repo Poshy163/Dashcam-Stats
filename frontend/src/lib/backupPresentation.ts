@@ -62,3 +62,13 @@ export function backupIdleLabel(status: IngestStatus): string {
   if (status.backlogKnown && status.backlogFiles === 0) return 'Up to date'
   return status.state === 'ok' ? 'Backup completed' : 'Waiting for backup'
 }
+
+export function loggerRecoveryEvidence(transition: IngestRadioStatus['transition']): string {
+  const logger = transition?.obdLogger
+  if (!logger) return 'Logger recovery evidence is unavailable.'
+  if (logger.resumeVerified) return 'The logger was verified resumed after this radio transition.'
+  if (logger.quiesceAttempted || logger.quiesceVerified || logger.resumeAttempted) {
+    return 'Logger resumption is not confirmed yet.'
+  }
+  return 'This radio transition did not report pausing the logger.'
+}
