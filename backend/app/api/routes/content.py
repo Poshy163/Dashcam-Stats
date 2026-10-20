@@ -29,6 +29,8 @@ from app.api.schemas import (
     PlatePatch,
     QueueStatsOut,
     RecordingEventPatch,
+    RecordingNeighbourOut,
+    RecordingNeighboursOut,
     RecordingOut,
     ReprocessRequest,
     SearchResults,
@@ -239,6 +241,62 @@ async def get_recording(recording_id: RowId, session: SessionDep):
     if recording is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording not found")
     return RecordingOut.model_validate(recording)
+
+
+@router.get("/recordings/{recording_id}/neighbours", response_model=RecordingNeighboursOut)
+async def get_recording_neighbours(recording_id: RowId, session: SessionDep):
+    """The previous and next clip from the same camera, in recording order.
+
+    Dashcams write footage as a chain of fixed-length files, so the natural question in
+    the viewer is "what happened just before/after this?" -- which the list page cannot
+    answer without knowing which page the neighbour is on. The ordering matches the
+    list's default (``started_at``, then id) so the two never disagree about what "next"
+    means. Hidden footage is skipped, like everywhere else.
+    """
+    current = (
+        await session.execute(
+            select(Recording.id, Recording.camera_id, Recording.started_at).where(
+                Recording.id == recording_id
+            )
+        )
+    ).one_or_none()
+    if current is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Recording not found")
+
+    base = select(Recording.id, Recording.filename, Recording.started_at).where(
+        Recording.ignored.is_(False),
+        Recording.id != current.id,
+        Recording.camera_id == current.camera_id
+        if current.camera_id is not None
+        else Recording.camera_id.is_(None),
+    )
+
+    if current.started_at is None:
+        # Nothing to order by but the id; keep to the other undated clips so a date is
+        # never "after" an unknown one.
+        base = base.where(Recording.started_at.is_(None))
+        after = Recording.id > current.id
+        before = Recording.id < current.id
+        later = (Recording.id.asc(),)
+        earlier = (Recording.id.desc(),)
+    else:
+        after = or_(
+            Recording.started_at > current.started_at,
+            and_(Recording.started_at == current.started_at, Recording.id > current.id),
+        )
+        before = or_(
+            Recording.started_at < current.started_at,
+            and_(Recording.started_at == current.started_at, Recording.id < current.id),
+        )
+        later = (Recording.started_at.asc(), Recording.id.asc())
+        earlier = (Recording.started_at.desc(), Recording.id.desc())
+
+    next_row = (await session.execute(base.where(after).order_by(*later).limit(1))).one_or_none()
+    prev_row = (await session.execute(base.where(before).order_by(*earlier).limit(1))).one_or_none()
+    return RecordingNeighboursOut(
+        previous=RecordingNeighbourOut.model_validate(prev_row) if prev_row else None,
+        next=RecordingNeighbourOut.model_validate(next_row) if next_row else None,
+    )
 
 
 @router.get("/recordings/{recording_id}/telemetry", response_model=list[TelemetryPointOut])

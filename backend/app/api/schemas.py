@@ -120,6 +120,19 @@ class RecordingOut(ApiModel):
         return self
 
 
+class RecordingNeighbourOut(ApiModel):
+    id: int
+    filename: str
+    started_at: datetime | None = None
+
+
+class RecordingNeighboursOut(BaseModel):
+    """The clips either side of one on the same camera, for the viewer's prev/next."""
+
+    previous: RecordingNeighbourOut | None = None
+    next: RecordingNeighbourOut | None = None
+
+
 class TelemetryPointOut(ApiModel):
     t_offset_s: float
     captured_at: datetime | None = None

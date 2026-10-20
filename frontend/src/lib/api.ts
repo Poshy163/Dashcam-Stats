@@ -22,6 +22,7 @@ import type {
   PlateObservation,
   QueueStats,
   Recording,
+  RecordingNeighbours,
   ReprocessResult,
   RetentionPlan,
   RouteFilters,
@@ -698,6 +699,7 @@ export const api = {
     list: (filters?: RecordingFilters) =>
       request<Paginated<Recording>>('/recordings', { query: filters }),
     get: (id: number) => request<Recording>(`/recordings/${id}`),
+    neighbours: (id: number) => request<RecordingNeighbours>(`/recordings/${id}/neighbours`),
     telemetry: (id: number) => request<TelemetryPoint[]>(`/recordings/${id}/telemetry`),
     /** What the overlay reader saw at this instant, and what it made of it. */
     osdDebug: (id: number, t: number) =>

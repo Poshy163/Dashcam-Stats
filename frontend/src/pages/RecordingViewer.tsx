@@ -11,6 +11,7 @@ import {
   StateBadge,
 } from '@/components/ui'
 import { api, mediaUrl } from '@/lib/api'
+import { clipWindow } from '@/lib/clipWindow'
 import { cn } from '@/lib/cn'
 import {
   formatBytes,
@@ -20,7 +21,7 @@ import {
   formatDuration,
   formatSpeed,
 } from '@/lib/format'
-import type { StageState, TelemetryPoint } from '@/lib/types'
+import type { RecordingNeighbour, StageState, TelemetryPoint } from '@/lib/types'
 import { rowIdFilter } from '@/lib/listFilters'
 
 const REPROCESS_OPTIONS = [
@@ -30,6 +31,35 @@ const REPROCESS_OPTIONS = [
   ['detection', 'Object detection'],
   ['plates', 'Licence plate detection'],
 ] as const
+
+const EXPORT_CLIP_SECONDS = 30
+const SEEK_STEP_SECONDS = 5
+
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  return target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
+}
+
+function NeighbourLink({ neighbour, direction, loading }: { neighbour: RecordingNeighbour | null | undefined; direction: 'previous' | 'next'; loading: boolean }) {
+  const label = direction === 'previous' ? '← Previous clip' : 'Next clip →'
+  if (!neighbour) {
+    return (
+      <span className={cn('btn cursor-default opacity-50', direction === 'next' && 'ml-auto')} aria-disabled="true" title={loading ? 'Looking up adjacent clips' : 'No more footage from this camera in that direction'}>
+        {label}
+      </span>
+    )
+  }
+  return (
+    <Link
+      to={`/recordings/${neighbour.id}`}
+      className={cn('btn min-w-0', direction === 'next' && 'ml-auto')}
+      title={`${neighbour.filename}${neighbour.startedAt ? ` · ${formatDateTime(neighbour.startedAt)}` : ''}`}
+      rel={direction === 'previous' ? 'prev' : 'next'}
+    >
+      {label}
+    </Link>
+  )
+}
 
 const CLASS_COLOUR: Record<string, string> = {
   car: 'bg-cyan text-slate-950 font-bold',
@@ -338,6 +368,11 @@ function RecordingViewerContent({ recordingId }: { recordingId: number }) {
     queryFn: () => api.recordings.plates(recordingId),
     enabled: Number.isFinite(recordingId),
   })
+  const neighbours = useQuery({
+    queryKey: ['recording-neighbours', recordingId],
+    queryFn: () => api.recordings.neighbours(recordingId),
+    enabled: Number.isFinite(recordingId),
+  })
 
   const reprocess = useMutation({
     mutationFn: () => api.recordings.reprocess(recordingId, [stage]),
@@ -392,6 +427,46 @@ function RecordingViewerContent({ recordingId }: { recordingId: number }) {
     [telemetry.data, currentTime],
   )
 
+  // Dashcam footage is a chain of fixed-length files; reviewing an incident means
+  // stepping along it, which the Back button and a 563-page list cannot do.
+  const previousId = neighbours.data?.previous?.id
+  const nextId = neighbours.data?.next?.id
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return
+      if (isTypingTarget(event.target)) return
+      const video = videoRef.current
+      switch (event.key) {
+        case 'ArrowLeft':
+        case 'ArrowRight': {
+          const forward = event.key === 'ArrowRight'
+          if (event.shiftKey) {
+            const target = forward ? nextId : previousId
+            if (target !== undefined) navigate(`/recordings/${target}`)
+            event.preventDefault()
+          } else if (video && event.target !== video) {
+            // The native controls own the arrows while the player is focused.
+            video.currentTime = Math.max(0, video.currentTime + (forward ? SEEK_STEP_SECONDS : -SEEK_STEP_SECONDS))
+            event.preventDefault()
+          }
+          return
+        }
+        case ' ':
+        case 'k':
+          if (video && event.target !== video) {
+            if (video.paused) void video.play().catch(() => undefined)
+            else video.pause()
+            event.preventDefault()
+          }
+          return
+        default:
+          return
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [navigate, previousId, nextId])
+
   if (recording.isLoading) return <Spinner label="Loading recording…" className="py-24" />
   if (recording.isError) return <ErrorState error={recording.error} retry={() => recording.refetch()} />
   if (!recording.data) return null
@@ -399,6 +474,7 @@ function RecordingViewerContent({ recordingId }: { recordingId: number }) {
   const r = recording.data
   const duration = r.durationS ?? 0
   const tracks = detections.data ?? []
+  const exportWindow = clipWindow(currentTime, EXPORT_CLIP_SECONDS, r.durationS)
 
   return (
     <div className="space-y-4">
@@ -428,11 +504,7 @@ function RecordingViewerContent({ recordingId }: { recordingId: number }) {
             </button>
             <a
               className="btn"
-              href={api.recordings.exportClipUrl(
-                r.id,
-                Math.max(0, currentTime - 15),
-                duration > 0 ? Math.min(duration, currentTime + 15) : undefined,
-              )}
+              href={api.recordings.exportClipUrl(r.id, exportWindow.start, exportWindow.end)}
               title="Download 30 seconds around the current playback position"
             >
               Export 30s
@@ -492,6 +564,13 @@ function RecordingViewerContent({ recordingId }: { recordingId: number }) {
 
       <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(18rem,1fr)]">
         <div className="space-y-3">
+          <nav aria-label="Adjacent recordings" className="flex items-center justify-between gap-3 text-xs">
+            <NeighbourLink neighbour={neighbours.data?.previous} direction="previous" loading={neighbours.isPending} />
+            <span className="hidden font-mono text-2xs text-content-faint sm:inline" title="Space: play / pause · ← →: seek 5 s · Shift+← →: previous / next clip">
+              Space · ← → · Shift+← →
+            </span>
+            <NeighbourLink neighbour={neighbours.data?.next} direction="next" loading={neighbours.isPending} />
+          </nav>
           {r.fileMissing ? (
             <div className="card flex aspect-video items-center justify-center text-sm text-content-muted">
               This recording is no longer on disk.

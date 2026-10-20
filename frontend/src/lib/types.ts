@@ -106,6 +106,17 @@ export interface Recording {
   sourceDamaged: boolean
 }
 
+export interface RecordingNeighbour {
+  id: number
+  filename: string
+  startedAt: string | null
+}
+
+export interface RecordingNeighbours {
+  previous: RecordingNeighbour | null
+  next: RecordingNeighbour | null
+}
+
 export interface TelemetryPoint {
   tOffsetS: number
   capturedAt: string | null
