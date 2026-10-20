@@ -272,7 +272,10 @@ class Journey(Base):
     motion_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
+    # Indexed because the map cache fingerprints the library by its newest change.
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, default=utcnow, onupdate=utcnow, index=True
+    )
 
     recordings: Mapped[list[Recording]] = relationship(back_populates="journey")
 
@@ -401,7 +404,9 @@ class Recording(Base):
     event_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
     last_scanned_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
-    processed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    # Indexed: the dashboard's "processed in the last hour" and the map cache fingerprint
+    # both ask for the newest value.
+    processed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True, index=True)
     # Set when the file is gone from disk; the row is kept so history survives cleanup.
     file_missing: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     deleted_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
@@ -478,6 +483,9 @@ class TelemetryPoint(Base):
         # the quality keeps that query index-only rather than visiting rows to discard
         # the rejected ones.
         Index("ix_telemetry_quality", "gps_quality", "journey_id"),
+        # The whole-library heat map and route overlay filter on has_fix and a date range
+        # with no journey to narrow by; without this they sweep every point ever recorded.
+        Index("ix_telemetry_fix_captured", "has_fix", "captured_at"),
         CheckConstraint("lat IS NULL OR (lat >= -90 AND lat <= 90)", name="ck_telemetry_lat"),
         CheckConstraint("lon IS NULL OR (lon >= -180 AND lon <= 180)", name="ck_telemetry_lon"),
     )
@@ -718,7 +726,11 @@ class ProcessingJob(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
-    __table_args__ = (Index("ix_jobs_claim", "state", "priority", "queued_at"),)
+    __table_args__ = (
+        Index("ix_jobs_claim", "state", "priority", "queued_at"),
+        # Queue statistics: completed today, and the newest completions for throughput.
+        Index("ix_jobs_state_finished", "state", "finished_at"),
+    )
 
 
 class ScanRun(Base):

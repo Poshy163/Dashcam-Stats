@@ -115,6 +115,12 @@ class Scheduler:
                 run=self._run_prune,
             ),
             TaskState(
+                name="db-maintenance",
+                interval_s=lambda: _fixed(6 * 3600.0),
+                enabled=lambda: _fixed(True),
+                run=self._run_db_maintenance,
+            ),
+            TaskState(
                 name="plate-revalidation",
                 interval_s=lambda: _fixed(30.0),
                 enabled=lambda: _flag("plates.auto_revalidate"),
@@ -496,6 +502,13 @@ class Scheduler:
         days = int(get_settings_service().get_nowait("advanced.log_retention_days"))
         async with session_scope() as session:
             await prune_logs(session, days)
+
+    async def _run_db_maintenance(self) -> None:
+        from app.db.maintenance import run_maintenance
+
+        days = int(get_settings_service().get_nowait("advanced.job_history_days"))
+        async with session_scope() as session:
+            await run_maintenance(session, job_history_days=days)
 
     # -- manual triggers ---------------------------------------------------------------
 

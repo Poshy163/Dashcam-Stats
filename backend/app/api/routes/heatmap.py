@@ -398,7 +398,12 @@ async def _routes(
 
 
 @router.get("/map/coverage", response_model=list[dict])
-async def coverage(session: SessionDep):
+async def coverage(
+    session: SessionDep,
+    limit: int = Query(
+        500, ge=1, le=5000, description="Most recent journeys to list; the rest are omitted."
+    ),
+):
     """Per-journey bounds and distance, for listing routes beside the heat map."""
     stmt = (
         select(
@@ -421,6 +426,7 @@ async def coverage(session: SessionDep):
             Journey.min_lon.is_not(None),
         )
         .order_by(Journey.started_at.desc())
+        .limit(limit)
     )
     return [
         {

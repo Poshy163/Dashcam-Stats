@@ -13,6 +13,16 @@ from starlette.requests import Request
 from app.db import backup
 
 
+def head_revision() -> str:
+    from alembic.script import ScriptDirectory
+
+    from app.db.session import alembic_config
+
+    head = ScriptDirectory.from_config(alembic_config()).get_current_head()
+    assert head is not None
+    return head
+
+
 @pytest.fixture
 def snapshot(db_session):
     return backup.create_backup()
@@ -28,7 +38,7 @@ async def test_valid_chunked_restore_is_atomic_and_reports_policy(client, snapsh
     response = await client.post("/api/system/database/restore", content=chunks(snapshot))
     assert response.status_code == 200, response.text
     assert response.json()["size_bytes"] == snapshot.stat().st_size
-    assert response.json()["migration_revision"] == "0024"
+    assert response.json()["migration_revision"] == head_revision()
     pending = backup.backup_dir() / "restore.pending.db"
     assert pending.read_bytes() == snapshot.read_bytes()
     assert not list(backup.backup_dir().glob("restore-upload-*"))
@@ -272,7 +282,7 @@ async def test_failed_restore_replacement_preserves_current_and_pending(
     with pytest.raises(OSError):
         backup.apply_pending_restore()
     assert pending.is_file()
-    assert backup.validate_database(app_config.db_path, compatible=True) == "0024"
+    assert backup.validate_database(app_config.db_path, compatible=True) == head_revision()
     assert len(list(backup.backup_dir().glob("pre-restore-*.db"))) == 1
 
 
@@ -312,7 +322,9 @@ async def test_supported_legacy_schema_can_restore_and_migrate(
     assert await asyncio.to_thread(backup.apply_pending_restore)
     await asyncio.to_thread(upgrade_to_head)
     with sqlite3.connect(app_config.db_path) as connection:
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("0024",)
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            head_revision(),
+        )
         assert connection.execute("SELECT value FROM audit_marker").fetchone() == ("preserved",)
 
 

@@ -1278,3 +1278,91 @@ class TestMapCache:
 
         assert (await client.get("/api/map/heatmap")).json()["cells"] == 0
         assert (await client.get("/api/map/routes")).json()["points"] == 0
+
+    async def test_status_totals_follow_the_data_not_the_cache(self, client, a_short_drive):
+        """The dashboard counts are memoised too, and must still move when the data does."""
+        from datetime import UTC, datetime
+
+        from app.db.models import TrackedObject
+        from app.pipeline.revisions import INVALIDATED_REVISION
+
+        rec_id, _ = a_short_drive
+        first = (await client.get("/api/status")).json()["totals"]
+        assert first["telemetry_points"] == 30
+        assert first["tracked_objects"] == 0
+
+        base = datetime(2026, 8, 4, 17, 43, tzinfo=UTC)
+        async with session_scope() as session:
+            session.add(
+                TrackedObject(
+                    recording_id=rec_id,
+                    track_key=1,
+                    class_label="car",
+                    confidence_max=0.9,
+                    confidence_avg=0.8,
+                    first_seen_offset_s=0.0,
+                    last_seen_offset_s=5.0,
+                    duration_s=5.0,
+                    frame_count=12,
+                    first_seen_at=base,
+                    last_seen_at=base,
+                )
+            )
+            await session.flush()
+
+        second = (await client.get("/api/status")).json()["totals"]
+        assert second["tracked_objects"] == 1
+
+        # Invalidation changes nothing in tracked_objects itself; the recording-side term
+        # of the fingerprint is what has to catch it.
+        async with session_scope() as session:
+            await session.execute(
+                update(Recording)
+                .where(Recording.id == rec_id)
+                .values(detection_revision=INVALIDATED_REVISION)
+            )
+
+        third = (await client.get("/api/status")).json()["totals"]
+        assert third["tracked_objects"] == 0
+        assert third["telemetry_points"] == 30
+
+    async def test_coverage_honours_its_limit(self, client, a_short_drive):
+        from datetime import UTC, datetime, timedelta
+
+        from app.db.models import Journey
+
+        async with session_scope() as session:
+            base = datetime(2026, 8, 5, 8, 0, tzinfo=UTC)
+            for index in range(3):
+                start = base + timedelta(hours=index)
+                journey = Journey(
+                    started_at=start,
+                    ended_at=start + timedelta(minutes=5),
+                    duration_s=300.0,
+                    min_lat=-34.9,
+                    min_lon=138.5,
+                    max_lat=-34.8,
+                    max_lon=138.6,
+                )
+                session.add(journey)
+                await session.flush()
+                # Only journeys backed by an analysed recording are visible.
+                session.add(
+                    Recording(
+                        rel_path=f"cov-{index}.ts",
+                        filename=f"cov-{index}.ts",
+                        size_bytes=1,
+                        state=RecordingState.COMPLETED,
+                        journey_id=journey.id,
+                        started_at=start,
+                    )
+                )
+            await session.flush()
+
+        everything = (await client.get("/api/map/coverage")).json()
+        assert len(everything) >= 3
+        two = (await client.get("/api/map/coverage?limit=2")).json()
+        assert len(two) == 2
+        # Newest first, so the limit keeps the most recent drives.
+        assert [row["id"] for row in two] == [row["id"] for row in everything[:2]]
+        assert (await client.get("/api/map/coverage?limit=0")).status_code == 422

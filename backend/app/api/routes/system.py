@@ -15,6 +15,7 @@ from app.ai.openvino_session import (
     read_gpu_failure_marker,
 )
 from app.ai.runtime import describe_media_policy, describe_runtime
+from app.api import map_cache
 from app.api.deps import PaginationDep, RowIdFilter, SessionDep
 from app.api.schemas import (
     FeatureStatus,
@@ -144,6 +145,30 @@ def _feature_status(settings, totals: StatusTotals) -> list[FeatureStatus]:
 
 @router.get("/status", response_model=StatusOut)
 async def get_status(session: SessionDep):
+    async def count_telemetry() -> int:
+        return int(
+            (
+                await session.execute(
+                    select(func.count(TelemetryPoint.id))
+                    .join(Recording, Recording.id == TelemetryPoint.recording_id)
+                    .where(visible_revision(Recording.telemetry_revision))
+                )
+            ).scalar()
+            or 0
+        )
+
+    async def count_tracked_objects() -> int:
+        return int(
+            (
+                await session.execute(
+                    select(func.count(TrackedObject.id))
+                    .join(Recording, Recording.id == TrackedObject.recording_id)
+                    .where(visible_revision(Recording.detection_revision))
+                )
+            ).scalar()
+            or 0
+        )
+
     totals = StatusTotals(
         recordings=int(
             (
@@ -167,25 +192,17 @@ async def get_status(session: SessionDep):
             ).scalar()
             or 0
         ),
-        telemetry_points=int(
-            (
-                await session.execute(
-                    select(func.count(TelemetryPoint.id))
-                    .join(Recording, Recording.id == TelemetryPoint.recording_id)
-                    .where(visible_revision(Recording.telemetry_revision))
-                )
-            ).scalar()
-            or 0
+        # The two million-row joins are memoised against what they are counted from; the
+        # rest are cheap enough to run on every poll, and their inputs (ignored flags,
+        # plate merges) are not in any fingerprint.
+        telemetry_points=await map_cache.cached(
+            session, ("status", "telemetry_points"), count_telemetry
         ),
-        tracked_objects=int(
-            (
-                await session.execute(
-                    select(func.count(TrackedObject.id))
-                    .join(Recording, Recording.id == TrackedObject.recording_id)
-                    .where(visible_revision(Recording.detection_revision))
-                )
-            ).scalar()
-            or 0
+        tracked_objects=await map_cache.cached(
+            session,
+            ("status", "tracked_objects"),
+            count_tracked_objects,
+            fingerprint_of=map_cache.detection_fingerprint,
         ),
         plates=int(
             (

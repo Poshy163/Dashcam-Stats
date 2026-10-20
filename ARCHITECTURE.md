@@ -982,7 +982,29 @@ auth_credentials, auth_sessions
 ```
 
 Media files are never stored in the database — only paths under `/data/media`.
-Migrations are managed by Alembic.
+Migrations are managed by Alembic. Startup takes an advisory lock on
+`/data/.migrate.lock` around the upgrade, so two processes sharing a data directory (a
+rolling redeploy, or a maintenance command run beside the server) cannot both back up and
+migrate the same file.
+
+### Housekeeping the database does not do for itself
+
+Every six hours the scheduler's `db-maintenance` task (`app/db/maintenance.py`):
+
+* deletes completed, failed and cancelled `processing_jobs` — and, through the cascade,
+  their `log_entries` — older than `advanced.job_history_days` (default 90), and
+  `scan_runs` of the same age. Queued and running jobs are never touched. Without this a
+  busy library carries tens of thousands of job rows that nothing reads;
+* runs `ANALYZE` once, when `sqlite_stat1` is empty, and `PRAGMA optimize` on every pass
+  after that. Without statistics the planner guesses index selectivity, and on tables that
+  have grown a thousandfold since the schema was created the guess is wrong;
+* issues `PRAGMA wal_checkpoint(PASSIVE)`. The automatic checkpoint is skipped whenever a
+  reader holds the WAL open, which a long map request does, and the WAL file grows until
+  one succeeds. `PASSIVE` never blocks anyone.
+
+The whole-library map queries, the dashboard's "processed in the last hour" and the queue
+statistics each have an index for their filter (migration 0025); `tests/test_migrations.py`
+checks that every index the models declare is one the migrations create.
 
 ---
 

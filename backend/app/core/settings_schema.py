@@ -968,6 +968,18 @@ SETTINGS: tuple[SettingDef, ...] = (
         unit="days",
     ),
     SettingDef(
+        "advanced.job_history_days",
+        "Job history retention",
+        "int",
+        90,
+        "advanced",
+        "Finished, failed and cancelled processing jobs older than this are removed "
+        "from the database together with their log lines.",
+        minimum=7,
+        maximum=3650,
+        unit="days",
+    ),
+    SettingDef(
         "advanced.keep_sparse_detections",
         "Store per-frame detections",
         "bool",

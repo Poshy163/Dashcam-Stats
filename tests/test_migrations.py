@@ -71,6 +71,25 @@ class TestMigrations:
         assert any("recording" in ix for ix in indexes.get("telemetry_points", set()))
         assert any("recording" in ix for ix in indexes.get("detections", set()))
 
+    async def test_every_declared_index_exists(self, migrated):
+        # An index added to a model but not to a migration only shows up as a slow query
+        # on someone's library months later, so the two are compared directly.
+        engine = get_engine()
+        async with engine.connect() as conn:
+            actual = await conn.run_sync(
+                lambda c: {
+                    name: {ix["name"] for ix in inspect(c).get_indexes(name)}
+                    for name in inspect(c).get_table_names()
+                }
+            )
+
+        missing: list[str] = []
+        for name, table in Base.metadata.tables.items():
+            for index in table.indexes:
+                if index.name not in actual.get(name, set()):
+                    missing.append(f"{name}.{index.name}")
+        assert not missing, f"migrations do not create: {sorted(missing)}"
+
     async def test_running_init_twice_is_idempotent(self, app_config):
         # Every container restart runs this; a second run must be a no-op rather than an
         # error or a duplicate seed.
@@ -950,3 +969,60 @@ class TestTheJourneyRollupRecount:
         with_break, without = rows
         assert with_break[1] is None, "the journey holding a break kept its stale distance"
         assert without[1] == 5000.0, "a journey with no break was needlessly cleared"
+
+
+class TestMigrationLock:
+    """Two processes booting against one data directory must not both run Alembic."""
+
+    def test_second_holder_waits_for_the_first(self, tmp_path):
+        import threading
+        import time
+
+        from app.db.session import _migration_lock
+
+        order: list[str] = []
+        first_inside = threading.Event()
+        release_first = threading.Event()
+
+        def first():
+            with _migration_lock(tmp_path):
+                order.append("first-in")
+                first_inside.set()
+                release_first.wait(5)
+                order.append("first-out")
+
+        def second():
+            first_inside.wait(5)
+            with _migration_lock(tmp_path):
+                order.append("second-in")
+
+        threads = [threading.Thread(target=first), threading.Thread(target=second)]
+        for t in threads:
+            t.start()
+        first_inside.wait(5)
+        time.sleep(0.3)
+        assert order == ["first-in"], "second holder entered while the first held the lock"
+        release_first.set()
+        for t in threads:
+            t.join(10)
+        assert order == ["first-in", "first-out", "second-in"]
+        assert (tmp_path / ".migrate.lock").exists()
+
+    def test_times_out_rather_than_hanging_forever(self, tmp_path):
+        from app.db.session import _migration_lock
+
+        with (
+            _migration_lock(tmp_path),
+            pytest.raises(TimeoutError),
+            _migration_lock(tmp_path, timeout_s=0.3),
+        ):
+            pass  # pragma: no cover
+
+    def test_unwritable_directory_does_not_block_startup(self, tmp_path):
+        from app.db.session import _migration_lock
+
+        blocked = tmp_path / "file-not-dir"
+        blocked.write_text("")
+        # mkdir() on a path that is a regular file raises; the lock must fall back.
+        with _migration_lock(blocked):
+            pass

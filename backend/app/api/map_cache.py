@@ -14,6 +14,10 @@ and update time is a handful of index lookups, which next to the query is free.
 
 Process-local and bounded. There is one backend process, so this is the only copy that
 matters, and the entry count is capped so a date picker cannot grow it without limit.
+
+The dashboard's heaviest totals (``/api/status``) use the same mechanism: counting every
+telemetry point or tracked object through a join on its recording's revision is most of
+that endpoint's cost, and it is polled every ten seconds.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.visibility import visible_revision
-from app.db.models import Journey, Recording, TelemetryPoint
+from app.db.models import Journey, Recording, TelemetryPoint, TrackedObject
 
 T = TypeVar("T")
 
@@ -69,13 +73,41 @@ async def fingerprint(session: AsyncSession) -> Fingerprint:
     return tuple(row)
 
 
-async def cached(session: AsyncSession, key: tuple, compute: Callable[[], Awaitable[T]]) -> T:
+async def detection_fingerprint(session: AsyncSession) -> Fingerprint:
+    """What the tracked-object count depends on.
+
+    A bare ``count(*)`` is a walk of the smallest index, which is an order of magnitude
+    cheaper than the join it stands in for; the recording-side term catches detection
+    revisions being invalidated without a row changing in ``tracked_objects``.
+    """
+    row = (
+        await session.execute(
+            select(
+                func.count(TrackedObject.id),
+                func.max(TrackedObject.id),
+                select(func.count(Recording.id))
+                .where(visible_revision(Recording.detection_revision))
+                .scalar_subquery(),
+            )
+        )
+    ).one()
+    return tuple(row)
+
+
+async def cached(
+    session: AsyncSession,
+    key: tuple,
+    compute: Callable[[], Awaitable[T]],
+    *,
+    fingerprint_of: Callable[[AsyncSession], Awaitable[Fingerprint]] = fingerprint,
+) -> T:
     """Return the memoised value for ``key`` if the library is unchanged, else recompute.
 
+    ``fingerprint_of`` names what the value depends on; the default is the map's.
     Concurrent requests for the same key wait for the first to finish rather than each
     running the query -- two tabs opening the Map page should cost one computation.
     """
-    stamp = await fingerprint(session)
+    stamp = await fingerprint_of(session)
     hit = _lookup(key, stamp)
     if hit is not None:
         return hit[0]

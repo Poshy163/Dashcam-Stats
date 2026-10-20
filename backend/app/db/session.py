@@ -16,11 +16,13 @@ atomic UPDATE rather than a read-modify-write.
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import time
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
@@ -35,7 +37,10 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import StaticPool
 
 from app.config import get_config
+from app.core.logging import get_logger
 from app.db.seed import seed_defaults
+
+logger = get_logger(__name__)
 
 #: ``backend/`` -- alembic.ini and migrations/ live here, next to the ``app`` package.
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
@@ -216,24 +221,106 @@ def alembic_config() -> AlembicConfig:
 
 
 def upgrade_to_head() -> None:
-    """Back up an existing stale SQLite schema, then upgrade it to Alembic head."""
+    """Back up an existing stale SQLite schema, then upgrade it to Alembic head.
+
+    Serialised across processes: two containers (or a tool and the server) booting against
+    the same data directory would otherwise both decide a backup is due and both run
+    Alembic. Whoever arrives second simply waits, then finds the database already at head.
+    """
     config = get_config()
     alembic = alembic_config()
-    if not config.database_url and config.db_path.is_file() and config.db_path.stat().st_size:
-        from alembic.script import ScriptDirectory
+    with _migration_lock(config.data_dir):
+        if not config.database_url and config.db_path.is_file() and config.db_path.stat().st_size:
+            from alembic.script import ScriptDirectory
 
-        revision = current_revision()
-        head = ScriptDirectory.from_config(alembic).get_current_head()
-        # ``None`` is the ordinary brand-new database (SQLite may create the file while
-        # inspecting it). It contains no user schema to preserve. Any stamped, stale
-        # deployment gets exactly one backup because the next boot is already at head.
-        if revision is not None and head is not None and revision != head:
-            from app.db.backup import create_pre_migration_backup
+            revision = current_revision()
+            head = ScriptDirectory.from_config(alembic).get_current_head()
+            # ``None`` is the ordinary brand-new database (SQLite may create the file
+            # while inspecting it). It contains no user schema to preserve. Any stamped,
+            # stale deployment gets exactly one backup because the next boot is already
+            # at head.
+            if revision is not None and head is not None and revision != head:
+                from app.db.backup import create_pre_migration_backup
 
-            # Deliberately outside a suppress/finally: if backup or integrity validation
-            # fails, Alembic must not touch the current database.
-            create_pre_migration_backup(revision, head)
-    command.upgrade(alembic, "head")
+                # Deliberately outside a suppress/finally: if backup or integrity
+                # validation fails, Alembic must not touch the current database.
+                create_pre_migration_backup(revision, head)
+        command.upgrade(alembic, "head")
+
+
+#: Name of the advisory lock file placed next to the database during migrations.
+MIGRATION_LOCK_NAME = ".migrate.lock"
+
+#: How long a second process waits for the first to finish migrating before giving up.
+MIGRATION_LOCK_TIMEOUT_S = 600.0
+
+
+@contextmanager
+def _migration_lock(
+    data_dir: Path, *, timeout_s: float = MIGRATION_LOCK_TIMEOUT_S
+) -> Iterator[None]:
+    """Blocking, cross-process exclusive lock on ``data_dir/.migrate.lock``.
+
+    ``fcntl.flock`` where available, ``msvcrt.locking`` on Windows. Both are released by
+    the OS if the holder dies, so a crashed migration never leaves a stale lock behind.
+    """
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        handle = open(data_dir / MIGRATION_LOCK_NAME, "a+b")  # noqa: SIM115 - closed below
+    except OSError as exc:
+        # A read-only or otherwise unlockable data directory is Alembic's problem to
+        # report, not ours; proceed unlocked rather than mask the real failure.
+        logger.warning("migration lock unavailable (%s); continuing without it", exc)
+        yield
+        return
+
+    try:
+        _acquire_file_lock(handle, timeout_s)
+        try:
+            yield
+        finally:
+            _release_file_lock(handle)
+    finally:
+        handle.close()
+
+
+def _acquire_file_lock(handle: IO[bytes], timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    if sys.platform == "win32":
+        import msvcrt
+
+        handle.seek(0)
+        while True:
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("timed out waiting for the migration lock") from None
+                time.sleep(0.1)
+    else:
+        import fcntl
+
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("timed out waiting for the migration lock") from None
+                time.sleep(0.1)
+
+
+def _release_file_lock(handle: IO[bytes]) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def current_revision() -> str | None:
