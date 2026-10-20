@@ -38,7 +38,11 @@ class LoggerConfigTest {
             .putString("webhook_api_key", "configured-value")
             .commit()
 
-        assertEquals("configured-value", LoggerPreferences.load(context).webhookApiKey)
+        val prefs = context.getSharedPreferences("obd_logger", Context.MODE_PRIVATE)
+        val cipher = TestWebhookCredentialCipher()
+        assertEquals("configured-value", LoggerPreferences.load(context, WebhookCredentialStore(prefs, cipher)).webhookApiKey)
+        assertFalse(prefs.contains(WebhookCredentialStore.LEGACY_KEY))
+        assertTrue(prefs.contains(WebhookCredentialStore.ENCRYPTED_KEY))
     }
 
     @Test

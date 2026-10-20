@@ -41,7 +41,7 @@ The backup server's `DASHCAM_OBD_REMOTE_READY_DIR`, `DASHCAM_OBD_REMOTE_STATUS_F
 for a unit whose app-specific path resolves differently. Status schema v6 publishes
 `ingestion_quiesce_v1`,
 `voltage_only_audit_v1`, `controlled_voltage_only_mode_v1` and
-`adaptive_sleep_window_v1`, current/last drive identity,
+`adaptive_sleep_window_v1` and `adaptive_sleep_window_v2`, current/last drive identity,
 last sample, pending bundle count, the correlated ingestion request ID and fixed-schema
 saturating pipeline counters. It also keeps adapter reachability, transient BLE connection, ECU,
 engine and drive state independent; exposes the last reported BLE owner and producer update time;
@@ -90,6 +90,10 @@ The server still widens to 900 before arrival recovery and uses the same fallbac
 or invalid app status.
 
 ## Build, sign and install
+
+The current source/candidate status and remaining work are tracked in
+[obd-logger-release-status.md](obd-logger-release-status.md); a source version is not proof of
+installation on the physical unit.
 
 The Android project targets SDK 34 and compiles with SDK 35. CI runs the JVM tests, debug and
 release lint, and both assemblies. Its release APK is deliberately **unsigned**, and the debug APK
@@ -148,6 +152,25 @@ values disable the logger.
 The app asks only for Nearby Devices (`BLUETOOTH_CONNECT`) plus notification permission on
 Android 13+. It uses direct configured-MAC GATT and never calls a Bluetooth scan API, so it does
 not request `BLUETOOTH_SCAN` or location.
+
+Version 0.3.7 stores the ingest webhook key as authenticated AES-256-GCM ciphertext in private
+preferences, using a non-exportable Android Keystore wrapping key. The first full configuration
+load migrates an existing plaintext value only after encryption and round-trip verification;
+one synchronous preference commit installs ciphertext and removes plaintext together. Failure
+retains the stored value and reports `webhook_credential_unavailable`; it does not fall back to
+plaintext or stop OBD collection. An unreadable encrypted key cannot be erased by an unrelated
+save with an empty key field. Entering a replacement key can recover delivery when Keystore is
+usable. The setup screen performs secure load/save off the UI thread and shows a persistent
+credential warning. Boot/service permission gates read only non-secret configuration before
+foreground promotion, so Keystore work cannot delay that deadline. Android backup remains
+disabled; the wrapping key is independent of the production APK signing key.
+
+The live panel has an expandable metrics/sleep view with bounded pipeline counters, duty cycle,
+target/readback/verification, ACC and ingestion hold. It reads at most 64 KiB per candidate file
+off the UI thread, chooses the newest timestamp-valid card/fallback status, and flags future
+timestamps stale. It displays allowlisted values rather than raw error bodies or identifiers.
+The additive v1 webhook event codes require the matching server update before the new APK;
+0.3.6 attempted to emit these events but its producer allowlist dropped them.
 Do not enable the persistent ownership checkbox until the cutover below is complete.
 
 ## Ownership cutover and safety proof

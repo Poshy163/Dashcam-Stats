@@ -7,9 +7,8 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.text.InputType
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
@@ -18,8 +17,16 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.io.File
 
 class MainActivity : Activity() {
     private lateinit var address: EditText
@@ -39,20 +46,40 @@ class MainActivity : Activity() {
     private lateinit var enabled: CheckBox
     private lateinit var status: TextView
     private lateinit var liveStatus: TextView
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val refreshLiveStatus = object : Runnable {
-        override fun run() {
-            renderLiveStatus()
-            mainHandler.postDelayed(this, LIVE_STATUS_REFRESH_MILLIS)
-        }
-    }
+    private lateinit var metricsToggle: Button
+    private lateinit var liveMetrics: TextView
+    private lateinit var credentialError: TextView
+    private val activityScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var refreshJob: Job? = null
+    private var foreground = false
+    private var metricsExpanded = false
+    private var publishedStatus: JSONObject? = null
+    private var credentialLoadError: String? = null
+    private var saving = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // The head unit's screen is the only place this status is visible; the activity is
         // opened on purpose and should not dim while someone is reading it.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        val current = LoggerPreferences.load(this)
+        setContentView(TextView(this).apply { text = "Loading logger configuration…" })
+        activityScope.launch {
+            val current = withContext(Dispatchers.IO) {
+                runCatching { LoggerPreferences.load(this@MainActivity) }.getOrNull()
+            }
+            if (current == null) {
+                setContentView(TextView(this@MainActivity).apply {
+                    text = "Logger configuration could not be loaded. Reopen the app to try again."
+                })
+                return@launch
+            }
+            createConfigurationForm(current)
+            if (foreground) startStatusRefresh()
+        }
+    }
+
+    private fun createConfigurationForm(current: LoggerConfig) {
+        credentialLoadError = current.webhookCredentialError
         val padding = (16 * resources.displayMetrics.density).toInt()
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -75,6 +102,21 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         )
+        liveMetrics = TextView(this).apply {
+            textSize = 16f
+            typeface = Typeface.MONOSPACE
+            setPadding(padding, padding, padding, padding)
+            visibility = View.GONE
+        }
+        metricsToggle = Button(this).apply {
+            text = "Show metrics and sleep details"
+            setOnClickListener {
+                metricsExpanded = !metricsExpanded
+                renderLiveStatus()
+            }
+        }
+        layout.addView(metricsToggle)
+        layout.addView(liveMetrics)
         layout.addView(TextView(this).apply {
             text = "Before enabling: turn off switch.nissan_tiida_obd2_connection and stop all phone OBD apps. The adapter permits one owner."
         })
@@ -117,6 +159,11 @@ class MainActivity : Activity() {
         webhookApiKey = field(layout, "Webhook API key (X-API-Key)", current.webhookApiKey).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
+        credentialError = TextView(this).apply {
+            setTextColor(Color.rgb(180, 30, 30))
+        }
+        layout.addView(credentialError)
+        showCredentialError(credentialLoadError)
         backupAwakeSeconds = field(
             layout,
             "Backup awake time (Wi-Fi connected, seconds)",
@@ -152,38 +199,57 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        mainHandler.removeCallbacks(refreshLiveStatus)
-        mainHandler.post(refreshLiveStatus)
+        foreground = true
+        if (::liveStatus.isInitialized) startStatusRefresh()
     }
 
     override fun onPause() {
-        mainHandler.removeCallbacks(refreshLiveStatus)
+        foreground = false
+        refreshJob?.cancel()
+        refreshJob = null
         super.onPause()
     }
 
-    private fun renderLiveStatus() {
-        val published = readPublishedStatus()
-        liveStatus.text = LiveStatusSummary.lines(published, System.currentTimeMillis())
-            .joinToString("\n")
+    override fun onDestroy() {
+        activityScope.cancel()
+        super.onDestroy()
     }
 
-    /**
-     * The service publishes `status.json` for the server to read over ADB; the same file is
-     * the activity's only view of a process it does not hold a binding to. Removable storage
-     * first, then the fallback the publisher uses when the card is missing.
-     */
-    private fun readPublishedStatus(): JSONObject? {
-        val roots = listOfNotNull(
-            runCatching { DeviceFiles.removableRootOrNull(this) }.getOrNull(),
-            runCatching { DeviceFiles.fallbackStatusRoot(this) }.getOrNull(),
-        )
-        for (root in roots) {
-            val file = File(root, "status.json")
-            if (!file.isFile) continue
-            val parsed = runCatching { JSONObject(file.readText(Charsets.UTF_8)) }.getOrNull()
-            if (parsed != null) return parsed
+    private fun startStatusRefresh() {
+        refreshJob?.cancel()
+        refreshJob = activityScope.launch {
+            while (isActive) {
+                publishedStatus = withContext(Dispatchers.IO) {
+                    val roots = listOfNotNull(
+                        runCatching { DeviceFiles.removableRootOrNull(this@MainActivity) }.getOrNull(),
+                        runCatching { DeviceFiles.fallbackStatusRoot(this@MainActivity) }.getOrNull(),
+                    )
+                    LiveStatusSummary.readPublishedStatus(roots, System.currentTimeMillis())
+                }
+                renderLiveStatus()
+                delay(LIVE_STATUS_REFRESH_MILLIS)
+            }
         }
-        return null
+    }
+
+    private fun renderLiveStatus() {
+        liveStatus.text = LiveStatusSummary.lines(publishedStatus, System.currentTimeMillis())
+            .joinToString("\n")
+        liveMetrics.visibility = if (metricsExpanded) View.VISIBLE else View.GONE
+        metricsToggle.text = if (metricsExpanded) "Hide metrics and sleep details"
+            else "Show metrics and sleep details"
+        if (metricsExpanded) {
+            liveMetrics.text = LiveStatusSummary.detailLines(publishedStatus).joinToString("\n")
+        }
+    }
+
+    private fun showCredentialError(message: String?) {
+        credentialError.text = when (message) {
+            WEBHOOK_CREDENTIAL_UNAVAILABLE ->
+                "The saved webhook API key is unavailable. Re-enter it to restore webhook delivery. Existing logging continues."
+            else -> message.orEmpty()
+        }
+        credentialError.visibility = if (message == null) View.GONE else View.VISIBLE
     }
 
     private fun field(parent: LinearLayout, hint: String, value: String): EditText {
@@ -204,6 +270,7 @@ class MainActivity : Activity() {
         }
 
     private fun saveAndApply() {
+        if (saving) return
         val config = LoggerConfig(
             enabled = enabled.isChecked,
             ownershipTransferred = ownership.isChecked,
@@ -218,9 +285,15 @@ class MainActivity : Activity() {
             webhookEnabled = webhookEnabled.isChecked,
             webhookUrl = webhookUrl.text.toString().trim(),
             webhookApiKey = webhookApiKey.text.toString().trim(),
+            webhookCredentialError = credentialLoadError.takeIf { webhookApiKey.text.isBlank() },
             backupAwakeSeconds = backupAwakeSeconds.text.toString().toIntOrNull() ?: -1,
             idleAwakeSeconds = idleAwakeSeconds.text.toString().toIntOrNull() ?: -1,
         )
+        if (config.enabled && config.webhookEnabled && config.webhookCredentialError != null) {
+            status.text = "Re-enter the webhook API key to save these settings. Existing logging continues."
+            showCredentialError(config.webhookCredentialError)
+            return
+        }
         if (!config.thresholdConfigurationValid) {
             rejectConfiguration(
                 "Use 10.0–16.0 V, engine-off below engine-on, 0–300 seconds grace, " +
@@ -228,7 +301,8 @@ class MainActivity : Activity() {
             )
             return
         }
-        val webhookError = webhookConfigurationError(config)
+        // Stopping collection must remain possible while the webhook credential is unavailable.
+        val webhookError = if (config.enabled) webhookConfigurationError(config) else null
         when (webhookError) {
             "webhook_api_key_required" -> rejectConfiguration("Enter the webhook API key")
             "webhook_api_key_too_long" -> rejectConfiguration("Webhook API key is too long")
@@ -243,15 +317,33 @@ class MainActivity : Activity() {
             rejectConfiguration("A valid adapter address, vehicle ID and logger ID are required")
             return
         }
-        LoggerPreferences.save(this, config)
-        if (config.enabled && config.ownershipTransferred) {
-            requestNeededPermissions()
-        } else {
-            stopService(Intent(this, ObdLoggerService::class.java))
-            runCatching {
-                StatusPublisher.publish(this, PublicStatus("disabled", config.ownershipTransferred))
+        saving = true
+        status.text = "Saving settings…"
+        activityScope.launch {
+            try {
+                withContext(Dispatchers.IO) { LoggerPreferences.save(this@MainActivity, config) }
+            } catch (error: WebhookCredentialStorageException) {
+                showCredentialError(error.message)
+                status.text = "Settings were not saved. Unlock the device and re-enter the webhook API key to try again. Existing logging continues."
+                return@launch
+            } finally {
+                saving = false
             }
-            status.text = "Logger disabled"
+            credentialLoadError = config.webhookCredentialError
+            showCredentialError(credentialLoadError)
+            if (config.enabled && config.ownershipTransferred) {
+                requestNeededPermissions()
+            } else {
+                stopService(Intent(this@MainActivity, ObdLoggerService::class.java))
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        StatusPublisher.publish(
+                            this@MainActivity, PublicStatus("disabled", config.ownershipTransferred),
+                        )
+                    }
+                }
+                status.text = "Logger disabled"
+            }
         }
     }
 
@@ -304,7 +396,7 @@ class MainActivity : Activity() {
     }
 
     private fun startLogger() {
-        val config = LoggerPreferences.load(this)
+        val config = LoggerPreferences.load(this, includeWebhookCredential = false)
         if (!config.canRun) {
             status.text = "Ownership, valid adapter address, vehicle ID and logger ID are required"
             return

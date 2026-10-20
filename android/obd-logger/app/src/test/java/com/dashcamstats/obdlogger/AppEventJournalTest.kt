@@ -109,6 +109,79 @@ class AppEventJournalTest {
     }
 
     @Test
+    fun webhookDiagnosticsPersistAlongsideLegacyEventsWithoutFreeText() {
+        val session = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val journal = journal()
+        val diagnostics = listOf(
+            "dispatched" to "webhook_ok",
+            "retrying" to "webhook_timeout",
+            "retrying" to "webhook_network_error",
+            "retrying" to "webhook_server_error",
+            "failed" to "webhook_timeout",
+            "failed" to "webhook_network_error",
+            "failed" to "webhook_server_error",
+            "failed" to "webhook_auth_rejected",
+            "failed" to "webhook_client_error",
+            "failed" to "webhook_unexpected_response",
+            "failed" to "webhook_security_error",
+            "failed" to "webhook_failed",
+            "failed" to "invalid_webhook_url",
+            "failed" to "webhook_credential_unavailable",
+            "failed" to "webhook_api_key_required",
+            "failed" to "webhook_api_key_too_long",
+        )
+        assertTrue(journal.append(session, "app.service", "info", "started", "service_started"))
+        diagnostics.forEach { (outcome, reason) ->
+            assertTrue(
+                reason,
+                journal.append(
+                    session,
+                    "ingest.webhook",
+                    if (outcome == "failed") "warning" else "info",
+                    outcome,
+                    reason,
+                    metrics = mapOf("attempt" to 1, "retry_delay_ms" to 3_000),
+                ),
+            )
+        }
+
+        // Re-read the private ring through a fresh instance, not just its first projection.
+        assertTrue(journal().publishSnapshot())
+        val body = JSONObject(File(root, "events.json").readText())
+        val events = body.getJSONArray("events")
+        assertEquals(APP_EVENT_SCHEMA_VERSION, body.getInt("schema_version"))
+        assertEquals(diagnostics.size + 1, events.length())
+        assertEquals("app.service", events.getJSONObject(0).getString("kind"))
+        diagnostics.forEachIndexed { index, (outcome, reason) ->
+            val event = events.getJSONObject(index + 1)
+            assertEquals("ingest.webhook", event.getString("kind"))
+            assertEquals(outcome, event.getString("outcome"))
+            assertEquals(reason, event.getString("reason_code"))
+            assertEquals(
+                setOf("attempt", "retry_delay_ms"),
+                event.getJSONObject("metrics").keysSetForTest(),
+            )
+        }
+        assertFalse(
+            journal.append(session, "ingest.webhook", "warning", "failed", "webhook_timeout: raw"),
+        )
+        assertFalse(
+            journal.append(
+                session,
+                "ingest.webhook",
+                "warning",
+                "failed",
+                "webhook_failed",
+                metrics = mapOf("api_key" to 1),
+            ),
+        )
+        assertEquals(
+            diagnostics.size + 1,
+            JSONObject(File(root, "events.json").readText()).getJSONArray("events").length(),
+        )
+    }
+
+    @Test
     fun failedPublicProjectionRetriesFromTheDurablePrivateRing() {
         val journal = journal()
         val session = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"

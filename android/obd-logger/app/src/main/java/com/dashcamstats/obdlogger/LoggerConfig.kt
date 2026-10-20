@@ -23,7 +23,13 @@ data class LoggerConfig(
     val webhookApiKey: String = "",
     val backupAwakeSeconds: Int = 1200,
     val idleAwakeSeconds: Int = 300,
+    val webhookCredentialError: String? = null,
 ) {
+    override fun toString(): String =
+        "LoggerConfig(enabled=$enabled, ownershipTransferred=$ownershipTransferred, " +
+            "voltageOnlyMode=$voltageOnlyMode, webhookEnabled=$webhookEnabled, " +
+            "webhookCredentialConfigured=${webhookApiKey.isNotEmpty()}, webhookCredentialError=$webhookCredentialError)"
+
     val thresholdConfigurationValid: Boolean
         get() = voltageOn in 10.0..16.0 && voltageOff in 10.0..16.0 &&
             voltageOff < voltageOn && offGraceSeconds in 0L..300L &&
@@ -49,19 +55,30 @@ data class LoggerConfig(
 object LoggerPreferences {
     private const val NAME = "obd_logger"
 
-    fun load(context: Context): LoggerConfig {
+    fun load(context: Context, includeWebhookCredential: Boolean = true): LoggerConfig {
+        // Foreground/boot gates must not wait for another thread's Keystore operation.
+        if (!includeWebhookCredential) return readConfiguration(context, StoredWebhookCredential())
+        return load(context, WebhookCredentialStore(context.getSharedPreferences(NAME, Context.MODE_PRIVATE)))
+    }
+
+    @Synchronized
+    internal fun load(context: Context, credentials: WebhookCredentialStore): LoggerConfig =
+        readConfiguration(context, credentials.load())
+
+    private fun readConfiguration(context: Context, savedCredential: StoredWebhookCredential): LoggerConfig {
         val prefs = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
-        val loggerId = if (prefs.contains("logger_id")) {
-            prefs.getString("logger_id", "")?.trim().orEmpty()
-        } else {
-            generatedLoggerId().also { generated ->
-                check(prefs.edit().putString("logger_id", generated).commit()) {
-                    "could not persist the logger identity"
+        val loggerId = synchronized(preferenceWriteLock) {
+            if (prefs.contains("logger_id")) {
+                prefs.getString("logger_id", "")?.trim().orEmpty()
+            } else {
+                generatedLoggerId().also { generated ->
+                    check(prefs.edit().putString("logger_id", generated).commit()) {
+                        "could not persist the logger identity"
+                    }
                 }
             }
         }
         val savedUrl = prefs.getString("webhook_url", LoggerConfig.DEFAULT_WEBHOOK_URL)?.trim().orEmpty()
-        val savedApiKey = prefs.getString("webhook_api_key", LoggerConfig.DEFAULT_WEBHOOK_API_KEY)?.trim().orEmpty()
         return LoggerConfig(
             enabled = prefs.getBoolean("enabled", false),
             ownershipTransferred = prefs.getBoolean("ownership_transferred", false),
@@ -75,15 +92,25 @@ object LoggerPreferences {
             voltageOnlyMode = prefs.getBoolean("voltage_only_mode", false),
             webhookEnabled = prefs.getBoolean("webhook_enabled", true),
             webhookUrl = if (savedUrl.isBlank()) LoggerConfig.DEFAULT_WEBHOOK_URL else savedUrl,
-            webhookApiKey = savedApiKey,
+            webhookApiKey = savedCredential.value,
+            webhookCredentialError = savedCredential.error,
             backupAwakeSeconds = prefs.getInt("backup_awake_seconds", LoggerConfig.DEFAULT_BACKUP_AWAKE_SECONDS),
             idleAwakeSeconds = prefs.getInt("idle_awake_seconds", LoggerConfig.DEFAULT_IDLE_AWAKE_SECONDS),
         )
     }
 
-    fun save(context: Context, config: LoggerConfig) {
+    fun save(context: Context, config: LoggerConfig) = save(
+        context, config, WebhookCredentialStore(context.getSharedPreferences(NAME, Context.MODE_PRIVATE)),
+    )
+
+    @Synchronized
+    internal fun save(context: Context, config: LoggerConfig, credentials: WebhookCredentialStore) {
         require(config.thresholdConfigurationValid) { "invalid voltage hysteresis or grace period" }
-        context.getSharedPreferences(NAME, Context.MODE_PRIVATE).edit()
+        val editor = context.getSharedPreferences(NAME, Context.MODE_PRIVATE).edit()
+        credentials.writeTo(
+            editor, config.webhookApiKey.trim(), preserveUnreadable = config.webhookCredentialError != null,
+        )
+        val update = editor
             .putBoolean("enabled", config.enabled)
             .putBoolean("ownership_transferred", config.ownershipTransferred)
             .putString("adapter_address", config.adapterAddress.uppercase())
@@ -96,16 +123,17 @@ object LoggerPreferences {
             .putBoolean("voltage_only_mode", config.voltageOnlyMode)
             .putBoolean("webhook_enabled", config.webhookEnabled)
             .putString("webhook_url", config.webhookUrl.trim())
-            .putString("webhook_api_key", config.webhookApiKey.trim())
             .putInt("backup_awake_seconds", config.backupAwakeSeconds)
             .putInt("idle_awake_seconds", config.idleAwakeSeconds)
-            .apply()
+        commitPreferenceUpdate(context.getSharedPreferences(NAME, Context.MODE_PRIVATE), update)
     }
 
     fun disable(context: Context) {
-        context.getSharedPreferences(NAME, Context.MODE_PRIVATE).edit()
-            .putBoolean("enabled", false)
-            .apply()
+        synchronized(preferenceWriteLock) {
+            context.getSharedPreferences(NAME, Context.MODE_PRIVATE).edit()
+                .putBoolean("enabled", false)
+                .apply()
+        }
     }
 }
 
@@ -124,6 +152,7 @@ internal fun isAllowedWebhookUrl(value: String): Boolean = runCatching {
 
 internal fun webhookConfigurationError(config: LoggerConfig): String? = when {
     !config.webhookEnabled -> null
+    config.webhookCredentialError != null && config.webhookApiKey.isBlank() -> WEBHOOK_CREDENTIAL_UNAVAILABLE
     config.webhookApiKey.isBlank() -> "webhook_api_key_required"
     config.webhookApiKey.length > MAX_WEBHOOK_API_KEY_LENGTH -> "webhook_api_key_too_long"
     !isAllowedWebhookUrl(config.webhookUrl) -> "invalid_webhook_url"

@@ -108,7 +108,7 @@ class ObdLoggerService : Service() {
         eventJournal = AppEventJournal(applicationContext)
         eventEmitter = AppEventEmitter(eventJournal, eventSessionId, eventScope)
         emitEvent("app.service", "info", "started", "service_started")
-        val config = LoggerPreferences.load(this)
+        val config = LoggerPreferences.load(this, includeWebhookCredential = false)
         when (ServiceStartupGate.decide(config.canRun, hasLoggerPermissions(this))) {
             ServiceStartupDecision.STOP_PERMISSION_REQUIRED -> {
                 LoggerPreferences.disable(this)

@@ -74,7 +74,7 @@ app.boot                 app.service              network.wifi
 power.sleep_window       obd.ble_connection       obd.elm_session
 obd.ecu_session          obd.poll_health          drive.lifecycle
 ingest.handoff           radio.observation        bundle.export
-receipt.verification
+receipt.verification     ingest.webhook
 ```
 
 Levels are `info`, `warning` and `error`.
@@ -85,7 +85,7 @@ Outcomes:
 started       succeeded      failed          retrying        connected
 disconnected  available      lost            requested       acknowledged
 resumed       verified       changed         skipped         completed
-interrupted   recovered      observed        pruned
+interrupted   recovered      observed        pruned          dispatched
 ```
 
 Reason codes (or null):
@@ -101,7 +101,8 @@ adapter_discovered         adapter_not_found          gatt_connected
 gatt_disconnected          gatt_error                 gatt_timeout
 services_ready             notifications_ready        elm_ready
 elm_timeout                protocol_search_failed     adapter_voltage_valid
-ecu_proof_valid            ecu_offline                engine_running
+ecu_proof_valid            ecu_offline                bus_silent
+engine_running
 engine_stopped             voltage_below_start        voltage_below_stop
 connection_lost            connection_failed          backoff_scheduled
 retry_woken                ble_callback               sleep_wake
@@ -117,7 +118,19 @@ receipt_invalid            retention_pruned           first_sample_persisted
 drive_summary              cadence_gap                poll_timeout
 manual_request             configuration_disabled     storage_unavailable
 permission_denied          unknown
+webhook_ok                 webhook_timeout            webhook_network_error
+webhook_server_error       webhook_auth_rejected      webhook_client_error
+webhook_unexpected_response webhook_security_error    webhook_failed
+invalid_webhook_url        webhook_credential_unavailable
+webhook_api_key_required   webhook_api_key_too_long
 ```
+
+`ingest.webhook` records transient failures as `retrying`, successful HTTP dispatch as
+`dispatched`, and terminal network, server or local configuration failures as `failed`.
+`webhook_credential_unavailable` means the app could not read or migrate its locally protected
+credential. These codes carry no URL, API key, response body or exception text. This is an
+additive v1 contract update: existing event shapes and codes remain valid, and the server
+must accept the new codes before an updated app's event snapshot is mirrored.
 
 Metrics are finite non-negative numeric scalars. Supported keys:
 
@@ -130,6 +143,7 @@ sleep_target_s                sleep_observed_s              wifi_frequency_mhz
 sample_count                  pending_bundle_count          bundle_bytes
 receipt_count                 gap_count                     timeout_count
 command_count                 consecutive_failures          queue_depth
+silent_cycles
 ```
 
 Durations have bounded millisecond/second ranges, percentage is 0–100, sleep values are at most

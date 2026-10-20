@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -92,6 +94,64 @@ def test_event_snapshot_accepts_bounded_wake_reason_codes(reason_code: str) -> N
     )
 
     assert snapshot.events[0].reason_code == reason_code
+
+
+@pytest.mark.parametrize(
+    ("outcome", "reason_code"),
+    [
+        ("dispatched", "webhook_ok"),
+        ("retrying", "webhook_timeout"),
+        ("retrying", "webhook_network_error"),
+        ("retrying", "webhook_server_error"),
+        ("failed", "webhook_timeout"),
+        ("failed", "webhook_network_error"),
+        ("failed", "webhook_server_error"),
+        ("failed", "webhook_auth_rejected"),
+        ("failed", "webhook_client_error"),
+        ("failed", "webhook_unexpected_response"),
+        ("failed", "webhook_security_error"),
+        ("failed", "webhook_failed"),
+        ("failed", "invalid_webhook_url"),
+        ("failed", "webhook_credential_unavailable"),
+        ("failed", "webhook_api_key_required"),
+        ("failed", "webhook_api_key_too_long"),
+    ],
+)
+def test_webhook_events_accept_only_canonical_diagnostics(outcome: str, reason_code: str) -> None:
+    snapshot = obd_events.validate_event_snapshot(
+        json.dumps(
+            event_document(
+                kind="ingest.webhook",
+                outcome=outcome,
+                reason_code=reason_code,
+                metrics={"attempt": 1, "retry_delay_ms": 3_000},
+            )
+        )
+    )
+
+    assert snapshot.events[0].kind == "ingest.webhook"
+    assert snapshot.events[0].outcome == outcome
+    assert snapshot.events[0].reason_code == reason_code
+    assert snapshot.events[0].metrics == {"attempt": 1, "retry_delay_ms": 3_000}
+
+
+def test_app_event_code_and_metric_allowlists_match_the_server() -> None:
+    """One-sided contract additions silently drop the producer or reject its whole snapshot."""
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "android/obd-logger/app/src/main/java/com/dashcamstats/obdlogger/AppEventJournal.kt"
+    ).read_text(encoding="utf-8")
+    for name in ("KINDS", "LEVELS", "OUTCOMES", "REASON_CODES"):
+        match = re.search(rf"APP_EVENT_{name} = setOf\((.*?)\)", source, re.DOTALL)
+        assert match is not None, f"Android event {name} contract was not found"
+        producer_codes = set(re.findall(r'"([a-z_.]+)"', match.group(1)))
+        assert producer_codes == getattr(obd_events, f"EVENT_{name}")
+
+    metric_limits = {
+        key: (float(lower.replace("_", "")), float(upper.replace("_", "")))
+        for key, lower, upper in re.findall(r'"([a-z_]+)" to \(([\d_.]+)\.\.([\d_.]+)\)', source)
+    }
+    assert metric_limits == obd_events.EVENT_METRIC_LIMITS
 
 
 @pytest.mark.parametrize(
@@ -226,6 +286,30 @@ async def test_store_counts_sequence_holes_inside_a_snapshot(db_session) -> None
     snapshot = obd_events.validate_event_snapshot(json.dumps(body))
 
     assert await obd_events.store_event_snapshot(snapshot) == (2, 0, 3)
+
+
+async def test_legacy_and_webhook_events_share_v1_storage_and_api(db_session, client) -> None:
+    body = event_document()
+    webhook = event_document(
+        sequence=2,
+        kind="ingest.webhook",
+        outcome="failed",
+        reason_code="webhook_credential_unavailable",
+    )["events"][0]
+    body["events"].append(webhook)
+    body["last_sequence"] = 2
+    snapshot = obd_events.validate_event_snapshot(json.dumps(body))
+
+    assert await obd_events.store_event_snapshot(snapshot) == (2, 0, 0)
+    assert await obd_events.store_event_snapshot(snapshot) == (0, 2, 0)
+    response = await client.get("/api/obd/events", params={"kind": "ingest.webhook"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert payload["items"][0]["reason_code"] == "webhook_credential_unavailable"
+    assert SOURCE_ID not in response.text
+    assert SESSION_ID not in response.text
+    assert (await client.get("/api/obd/events")).json()["total"] == 2
 
 
 async def test_event_api_rejects_unknown_filters(client) -> None:

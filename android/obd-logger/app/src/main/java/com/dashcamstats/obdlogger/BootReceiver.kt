@@ -36,7 +36,7 @@ class BootReceiver : BroadcastReceiver() {
                 eventScope.cancel()
             }
         }
-        val config = LoggerPreferences.load(context)
+        val config = LoggerPreferences.load(context, includeWebhookCredential = false)
         if (!config.canRun) {
             runCatching {
                 StatusPublisher.error(
