@@ -6,7 +6,7 @@ import { EmptyState, ErrorState, JobStateBadge, PageHeader, ProgressBar, StatTil
 import { api } from '@/lib/api'
 import type { IngestStatus } from '@/lib/api'
 import { hardwareSummary } from '@/lib/hardware'
-import { backupAttention } from '@/lib/operationalStatus'
+import { backupAttention, capacityExceeded } from '@/lib/operationalStatus'
 import { backupHold } from '@/lib/backupPresentation'
 import { sleepStatusRefetchInterval, useSleepCountdown } from '@/lib/useSleepCountdown'
 import {
@@ -52,6 +52,7 @@ export default function Dashboard() {
 
   const { totals, processing, storage, latestJourney, hardware, features } = status.data
   const storagePct = storage.limitBytes ? storage.usedBytes / storage.limitBytes : 0
+  const overCapacity = capacityExceeded(storage.usedBytes, storage.limitBytes)
   // Every state the ring draws is in the total it is drawn against. "Unusable" was
   // rendered as a slice of a denominator that excluded it, so the percentages never
   // summed to the ring and the centre number disagreed with the Recordings tile above.
@@ -85,6 +86,13 @@ export default function Dashboard() {
     } : undefined,
     backupWarnings[0] ? {
       summary: backupWarnings[0], to: '/backup', action: 'View backup',
+    } : undefined,
+    // Report-only retention is the default, so an over-cap library is the normal way to
+    // discover the policy has never been switched on. Ranked below failures and warnings
+    // from the pipeline because it threatens disk space, not the analysis itself.
+    overCapacity ? {
+      summary: `Footage uses ${formatBytes(storage.usedBytes)} against a ${formatBytes(storage.limitBytes)} capacity limit${storage.deletionEnabled ? '.' : ' and size-policy deletion is report only.'}`,
+      to: '/settings?category=storage', action: 'Manage storage',
     } : undefined,
     runtimeHardware.isError ? {
       summary: 'Could not check the processing runtime.', to: '/settings?category=advanced', action: 'View diagnostics',
@@ -184,11 +192,13 @@ export default function Dashboard() {
                 <ProgressMetric color="bg-accent-muted border border-accent/40" value={processing.recordingsToday} label="Added today" />
               </div>
               <div className="mt-5 rounded-lg border border-border/80 bg-surface-sunken/80 px-4 py-3 font-mono text-xs text-content-muted flex items-center justify-between">
-                <span>Analysis throughput</span>
+                {/* A measured count, not the projected rate the Queue page shows. The two used
+                    to carry the same "per hour" label with different numbers. */}
+                <span>Processed in the last hour</span>
                 {processing.throughputPerHour === null ? (
-                  <span className="text-content-faint">Calibrating…</span>
+                  <span className="text-content-faint">Nothing yet</span>
                 ) : (
-                  <strong className="tabular font-bold text-cyan text-sm">{processing.throughputPerHour.toFixed(1)} clips / hr</strong>
+                  <strong className="tabular font-bold text-cyan text-sm">{Math.round(processing.throughputPerHour)} clips</strong>
                 )}
               </div>
             </div>
@@ -213,10 +223,13 @@ export default function Dashboard() {
                 <span className="tabular font-mono text-3xl font-black tracking-tight">{formatBytes(storage.usedBytes)}</span>
                 <span className="ml-2 font-mono text-xs text-content-muted uppercase">used</span>
               </div>
-              <span className="tabular font-mono text-sm font-bold text-accent">{Math.round(storagePct * 100)}%</span>
+              <span className={`tabular font-mono text-sm font-bold ${overCapacity ? 'text-state-warn' : 'text-accent'}`}>{Math.round(storagePct * 100)}%</span>
             </div>
-            <ProgressBar value={storagePct} label="Footage capacity used" className="mt-4" />
-            <div className="mt-2 font-mono text-2xs text-content-muted">Capacity limit: {formatBytes(storage.limitBytes)}</div>
+            <ProgressBar value={storagePct} label="Footage capacity used" tone={overCapacity ? 'warn' : 'default'} className="mt-4" />
+            <div className="mt-2 font-mono text-2xs text-content-muted">
+              Capacity limit: {formatBytes(storage.limitBytes)}
+              {overCapacity && <span className="ml-2 text-state-warn">· {formatBytes(storage.usedBytes - storage.limitBytes)} over</span>}
+            </div>
           </div>
           <div className="mt-6 rounded-lg border border-border bg-surface-sunken/70 p-3 text-xs font-mono leading-relaxed text-content-muted">
             <dl className="space-y-1"><div>Automatic cleanup schedule: <strong>{policyState(storage.cleanupEnabled)}</strong></div><div>Size / age policy deletion: <strong>{storage.deletionEnabled ? 'Enabled' : 'Report only'}</strong></div><div>Static / empty clip deletion: <strong>{policyState(storage.idleDeleteEnabled)}</strong></div><div>Parked-session deletion: <strong>{policyState(storage.parkedDeleteEnabled)}</strong></div></dl>
@@ -361,7 +374,12 @@ type SystemAttention = { summary: string; to: string; action: string }
 function SystemStatus({ active, waiting, attention, checking }: { active: number; waiting: number; attention?: SystemAttention; checking: boolean }) {
   const needsAttention = attention !== undefined
   const healthy = !needsAttention
-  const idleAttention = active === 0 && waiting === 0 ? attention : undefined
+  const busy = active > 0 || waiting > 0
+  // The queue line is secondary whenever there is a reason to worry: a banner that says
+  // "needs attention" and then only reports throughput tells nobody what is wrong.
+  const progress = active > 0
+    ? `${active} stream${active === 1 ? '' : 's'} running · ${waiting} clips waiting`
+    : `${waiting} recording${waiting === 1 ? '' : 's'} queued`
   return (
     <section aria-label="System status" className={`relative flex flex-wrap items-center gap-4 rounded-xl border p-4 sm:px-5 overflow-hidden ${healthy ? 'border-state-ok/40 bg-state-ok/[0.06]' : 'border-state-warn/40 bg-state-warn/[0.08]'}`}>
       <div className={`absolute top-0 left-0 right-0 h-[1px] bg-gradient-to-r from-transparent ${healthy ? 'via-state-ok/60' : 'via-state-warn/60'} to-transparent`} />
@@ -372,11 +390,14 @@ function SystemStatus({ active, waiting, attention, checking }: { active: number
         <h2 className={`text-xs sm:text-sm font-bold tracking-wider uppercase ${healthy ? 'text-state-ok' : 'text-state-warn'}`}>
           {needsAttention ? 'System needs attention' : checking ? 'Checking system status' : active > 0 ? 'Analysis is running' : 'All systems operational'}
         </h2>
-        <p className="mt-0.5 text-xs text-content-muted">
-          {idleAttention ? idleAttention.summary : active > 0 ? `${active} stream${active === 1 ? '' : 's'} running · ${waiting} clips waiting` : `${waiting} recording${waiting === 1 ? '' : 's'} queued`}
-        </p>
+        <p className="mt-0.5 text-xs text-content-muted">{attention ? attention.summary : progress}</p>
+        {attention && busy && (
+          <p className="mt-0.5 text-2xs text-content-faint">
+            Meanwhile: {progress} · <Link to="/queue" className="underline-offset-2 hover:underline">view queue</Link>
+          </p>
+        )}
       </div>
-      <Link to={idleAttention?.to ?? '/queue'} className={`btn font-mono text-xs font-bold ${healthy ? 'border-state-ok/40 hover:border-state-ok' : 'border-state-warn/40 hover:border-state-warn'}`}>{idleAttention?.action ?? 'View queue'}</Link>
+      <Link to={attention?.to ?? '/queue'} className={`btn font-mono text-xs font-bold ${healthy ? 'border-state-ok/40 hover:border-state-ok' : 'border-state-warn/40 hover:border-state-warn'}`}>{attention?.action ?? 'View queue'}</Link>
     </section>
   )
 }

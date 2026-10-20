@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { ReactNode } from 'react'
 
 import { cn } from '@/lib/cn'
@@ -16,7 +17,7 @@ export function PageHeader({
   return (
     <div className="mb-7 flex flex-col items-stretch justify-between gap-4 sm:flex-row sm:items-start">
       <div className="min-w-0">
-        <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">{title}</h1>
+        <h1 className="break-words text-2xl font-bold tracking-tight sm:text-3xl [overflow-wrap:anywhere]">{title}</h1>
         {subtitle && <div className="mt-1.5 text-sm text-content-muted sm:text-base">{subtitle}</div>}
       </div>
       {actions && <div className="flex flex-wrap items-center gap-2 sm:justify-end">{actions}</div>}
@@ -229,27 +230,68 @@ export function Pagination({
   total: number
   onChange: (page: number) => void
 }) {
+  const last = Math.max(1, pages)
+  const go = (next: number) => {
+    const clamped = Math.min(last, Math.max(1, next))
+    if (clamped !== page) onChange(clamped)
+  }
   if (pages <= 1 && page <= 1) {
     return <div className="tabular py-3 text-xs text-content-faint">{total} results</div>
   }
   return (
     <nav className="flex flex-wrap items-center justify-between gap-3 py-3" aria-label="Pagination">
       <div className="tabular text-xs text-content-faint">
-        Page {page} of {Math.max(1, pages)} · {total} results
+        Page {page} of {last} · {total} results
       </div>
-      <div className="flex gap-1.5">
-        <button className="btn" disabled={page <= 1} onClick={() => onChange(Math.min(Math.max(1, pages), page - 1))}>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <button className="btn" disabled={page <= 1} onClick={() => go(1)} aria-label="First page" title="First page">
+          «
+        </button>
+        <button className="btn" disabled={page <= 1} onClick={() => go(page - 1)}>
           Previous
         </button>
-        <button className="btn" disabled={page >= pages} onClick={() => onChange(page + 1)}>
+        <PageJump key={page} page={page} last={last} onJump={go} />
+        <button className="btn" disabled={page >= last} onClick={() => go(page + 1)}>
           Next
+        </button>
+        <button className="btn" disabled={page >= last} onClick={() => go(last)} aria-label="Last page" title="Last page">
+          »
         </button>
       </div>
     </nav>
   )
 }
 
-export function ProgressBar({ value, label, className }: { value: number; label: string; className?: string }) {
+// Keyed on the current page by the caller so a navigation elsewhere (Next, a filter
+// change) resets whatever was half-typed here rather than leaving a stale number.
+function PageJump({ page, last, onJump }: { page: number; last: number; onJump: (page: number) => void }) {
+  const [draft, setDraft] = useState(String(page))
+  const submit = () => {
+    const value = Number.parseInt(draft, 10)
+    if (Number.isFinite(value)) onJump(value)
+    else setDraft(String(page))
+  }
+  return (
+    <label className="flex items-center gap-1 font-mono text-xs text-content-muted">
+      <span className="sr-only">Go to page</span>
+      <input
+        type="number"
+        inputMode="numeric"
+        min={1}
+        max={last}
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={submit}
+        onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); submit() } }}
+        className="input tabular w-16 px-2 py-1.5 text-center text-xs"
+        aria-label="Go to page"
+      />
+      <span className="tabular">/ {last}</span>
+    </label>
+  )
+}
+
+export function ProgressBar({ value, label, tone = 'default', className }: { value: number; label: string; tone?: 'default' | 'warn'; className?: string }) {
   const pct = Math.max(0, Math.min(100, value * 100))
   return (
     <div
@@ -261,7 +303,7 @@ export function ProgressBar({ value, label, className }: { value: number; label:
       aria-valuenow={Math.round(pct)}
     >
       <div
-        className="h-full rounded-full bg-accent transition-[width] duration-500"
+        className={cn('h-full rounded-full transition-[width] duration-500', tone === 'warn' ? 'bg-state-warn' : 'bg-accent')}
         style={{ width: `${pct}%` }}
       />
     </div>

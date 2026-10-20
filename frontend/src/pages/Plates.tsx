@@ -100,7 +100,7 @@ export default function Plates() {
           <span className="label mb-1 block text-xs">Plate</span>
           <input
             className="input font-mono uppercase tracking-wide"
-            placeholder="Full or partial — ABC finds ABC123"
+            placeholder="e.g. ABC or ABC123"
             value={term}
             onChange={(e) => setTerm(e.target.value.toUpperCase())}
             autoFocus
@@ -168,7 +168,7 @@ export default function Plates() {
                   {plate.flagged && <span className="badge bg-state-warn/15 text-state-warn">flagged</span>}
                 </div>
                 <div className="tabular text-2xs text-content-faint">
-                  {plate.observationCount} sightings · {plate.journeyCount} journeys
+                  {plate.observationCount} {plate.observationCount === 1 ? 'sighting' : 'sightings'} · {plate.journeyCount} {plate.journeyCount === 1 ? 'journey' : 'journeys'}
                 </div>
                 <div className="tabular text-2xs text-content-faint">
                   last seen {formatDateTime(plate.lastSeenAt)}

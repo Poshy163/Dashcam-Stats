@@ -36,11 +36,16 @@ const cpuFallback = {
   policy: { decode: 'software', decodeReason: null, gpuInferenceDisabled: 'CL_OUT_OF_RESOURCES' },
 }
 
-async function mountDashboard(t, { processing = {}, runtime = hardware, features = [], ingest = {}, fail } = {}) {
+function text(node) {
+  if (typeof node === 'string') return node
+  return node.children.map(text).join('')
+}
+
+async function mountDashboard(t, { processing = {}, storage = {}, runtime = hardware, features = [], ingest = {}, fail } = {}) {
   const status = {
     totals: { recordings: 10, journeys: 2, footageBytes: 1000, durationS: 600, plates: 4 },
     processing: { completed: 10, pending: 0, processing: 0, failed: 0, invalid: 0, settling: 0, recordingsToday: 0, throughputPerHour: null, ...processing },
-    storage: { usedBytes: 1000, limitBytes: 10000, cleanupEnabled: false, deletionEnabled: false, idleDeleteEnabled: false, parkedDeleteEnabled: false },
+    storage: { usedBytes: 1000, limitBytes: 10000, cleanupEnabled: false, deletionEnabled: false, idleDeleteEnabled: false, parkedDeleteEnabled: false, ...storage },
     latestJourney: null, hardware, features,
   }
   const oldFetch = globalThis.fetch
@@ -66,11 +71,13 @@ async function mountDashboard(t, { processing = {}, runtime = hardware, features
   await act(async () => { root = create(React.createElement(QueryClientProvider, { client }, React.createElement(MemoryRouter, null, React.createElement(Dashboard)))) })
   for (let n = 0; n < 4; n++) await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
   const banner = root.root.findByProps({ 'aria-label': 'System status' })
+  const paragraphs = banner.findAllByType('p')
   return {
     root, banner,
     heading: banner.findByType('h2').children.join(''),
-    summary: banner.findByType('p').children.join(''),
-    action: banner.findByType('a'),
+    summary: paragraphs[0].children.join(''),
+    progress: paragraphs[1] ? text(paragraphs[1]) : undefined,
+    action: banner.findAllByType('a').at(-1),
   }
 }
 
@@ -128,20 +135,43 @@ test('polling failures name the unavailable check and offer the relevant destina
   }
 })
 
-test('active or waiting processing keeps queue progress and its queue action', async t => {
-  for (const [processing, summary] of [
+test('active or waiting processing keeps the attention reason first and the queue progress second', async t => {
+  for (const [processing, progress] of [
     [{ processing: 1, pending: 3 }, '1 stream running · 3 clips waiting'],
     [{ processing: 2, pending: 3 }, '2 streams running · 3 clips waiting'],
     [{ pending: 1 }, '1 recording queued'],
   ]) {
-    await t.test(summary, async t => {
+    await t.test(progress, async t => {
       const view = await mountDashboard(t, { processing, runtime: cpuFallback })
       assert.equal(view.heading, 'System needs attention')
-      assert.equal(view.summary, summary)
-      assert.equal(view.action.props.href, '/queue')
-      assert.equal(view.action.children.join(''), 'View queue')
+      assert.match(view.summary, /GPU inference is disabled; using CPU/)
+      assert.equal(view.progress, `Meanwhile: ${progress} · view queue`)
+      assert.equal(view.action.props.href, '/settings?category=advanced')
+      assert.equal(view.action.children.join(''), 'View diagnostics')
+      assert.ok(view.banner.findAllByType('a').some(link => link.props.href === '/queue'))
     })
   }
+})
+
+test('healthy active processing reports progress without a secondary line', async t => {
+  const view = await mountDashboard(t, { processing: { processing: 2, pending: 3 } })
+  assert.equal(view.heading, 'Analysis is running')
+  assert.equal(view.summary, '2 streams running · 3 clips waiting')
+  assert.equal(view.progress, undefined)
+  assert.equal(view.action.props.href, '/queue')
+})
+
+test('footage over the capacity limit is called out and links to storage settings', async t => {
+  const view = await mountDashboard(t, { storage: { usedBytes: 730 * 1024 ** 3, limitBytes: 200 * 1024 ** 3 } })
+  assert.equal(view.heading, 'System needs attention')
+  assert.equal(view.summary, 'Footage uses 730.0 GB against a 200.0 GB capacity limit and size-policy deletion is report only.')
+  assert.equal(view.action.props.href, '/settings?category=storage')
+  assert.equal(view.action.children.join(''), 'Manage storage')
+  const bar = view.root.root.findByProps({ 'aria-label': 'Footage capacity used' })
+  assert.equal(bar.props['aria-valuenow'], 100)
+  assert.match(bar.children[0].props.className, /bg-state-warn/)
+  const over = view.root.root.findAll(node => node.type === 'span' && text(node).includes('over'))
+  assert.equal(text(over[0]), '· 530.0 GB over')
 })
 
 test('healthy idle processing preserves the operational message', async t => {

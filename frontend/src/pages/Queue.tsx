@@ -155,7 +155,7 @@ export default function Queue() {
       {(stats.data?.throughputPerHour != null || stats.data?.estimatedMinutesRemaining != null) && (
         <div className="card flex flex-wrap gap-x-6 gap-y-1 p-3 text-sm text-content-muted">
           {stats.data.throughputPerHour != null && (
-            <span><strong className="text-content">{stats.data.throughputPerHour}</strong> recordings/hour recently</span>
+            <span title="Projected from the average duration of the last 100 completed analyses and the configured worker count"><strong className="text-content">~{stats.data.throughputPerHour}</strong> recordings/hour at the current pace</span>
           )}
           {stats.data.estimatedMinutesRemaining != null && (
             <span>Estimated backlog: <strong className="text-content">{formatDuration(stats.data.estimatedMinutesRemaining * 60)}</strong></span>
