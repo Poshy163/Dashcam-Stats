@@ -98,6 +98,13 @@ test('idle backup failure explains the error and links directly to Backup', asyn
   assert.equal(view.action.children.join(''), 'View backup')
 })
 
+test('a disk-space hold on the footage volume is called out even while the car is away', async t => {
+  const view = await mountDashboard(t, { ingest: { state: 'ok', spaceHold: true, spaceHoldReason: 'Only 2.0 GB free', backlogFiles: 3, lastSuccessTs: new Date().toISOString() } })
+  assert.equal(view.heading, 'System needs attention')
+  assert.match(view.summary, /footage disk is below its free-space reserve/)
+  assert.equal(view.action.props.href, '/backup')
+})
+
 test('failed recordings take priority over hardware and backup warnings and open the failed-recording filter', async t => {
   const view = await mountDashboard(t, { processing: { failed: 1, invalid: 2 }, runtime: cpuFallback, ingest: { state: 'error' } })
   assert.equal(view.summary, '1 recording failed analysis.')

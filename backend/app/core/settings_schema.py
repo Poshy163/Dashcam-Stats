@@ -1681,6 +1681,22 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.min_free_gb",
+        "Keep this much free on the footage disk",
+        "float",
+        5.0,
+        "ingest",
+        "A run only copies as many recordings as fit above this reserve; the rest stay on "
+        "the card as backlog until retention or an operator frees space. Filling the share "
+        "to the last byte stalls the database, the playback cache and any other service on "
+        "the same volume, and a copy that fails for space is a copy that gets retried on "
+        "the next visit anyway. Zero disables the check.",
+        minimum=0.0,
+        maximum=2000.0,
+        unit="GB",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
         "ingest.chunk_size",
         "Transfer batch chunk size",
         "int",

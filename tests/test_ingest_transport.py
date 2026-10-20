@@ -202,6 +202,58 @@ class TestTheDelta:
         assert plan.backlog_files == 2, "the interior lens is still sitting on the card"
 
 
+class TestFittingThePlanToFreeSpace:
+    """The footage volume is this server's, and filling it to the last byte takes the
+    database and the playback cache down with it. The plan is cut to what fits above a
+    reserve, in the plan's own order, and the rest stays on the card as backlog."""
+
+    def _files(self, *sizes):
+        return [
+            RemoteFile(f"2026081212{i:02d}00_camera_0.ts", size, 0) for i, size in enumerate(sizes)
+        ]
+
+    def test_a_plan_that_fits_is_returned_untouched(self):
+        from app.ingest.puller import fit_to_free_space
+
+        files = self._files(100, 100, 100)
+        fit = fit_to_free_space(files, free_bytes=1_000, reserve_bytes=500)
+
+        assert fit.fits == files
+        assert fit.deferred == []
+        assert fit.nothing_fits is False
+
+    def test_the_cut_is_made_in_plan_order_not_by_size(self):
+        """Oldest-first and newest-first are policies the operator chose; skipping a big
+        file to squeeze a small later one in would quietly undo them."""
+        from app.ingest.puller import fit_to_free_space
+
+        files = self._files(100, 400, 50, 50)
+        fit = fit_to_free_space(files, free_bytes=800, reserve_bytes=500)
+
+        assert [item.size for item in fit.fits] == [100]
+        assert [item.size for item in fit.deferred] == [400, 50, 50]
+        assert fit.deferred_bytes == 500
+        assert fit.nothing_fits is False
+
+    def test_nothing_fitting_is_distinguishable_from_an_empty_plan(self):
+        from app.ingest.puller import fit_to_free_space
+
+        fit = fit_to_free_space(self._files(100), free_bytes=550, reserve_bytes=500)
+        assert fit.fits == [] and fit.nothing_fits is True
+
+        empty = fit_to_free_space([], free_bytes=0, reserve_bytes=500)
+        assert empty.nothing_fits is False, "an empty plan is idle, not full"
+
+    def test_a_zero_reserve_switches_the_check_off(self):
+        from app.ingest.puller import fit_to_free_space
+
+        files = self._files(100, 100)
+        fit = fit_to_free_space(files, free_bytes=0, reserve_bytes=0)
+
+        assert fit.fits == files
+        assert fit.deferred == []
+
+
 class TestTheStagedCommit:
     """Nothing reaches the footage directory until it is byte-complete."""
 
@@ -1535,6 +1587,119 @@ class TestARunEndToEnd:
         assert again.state is RunState.IDLE
         assert again.files == 0
         assert unit.served["names"] is not None
+
+    def _shrinking_disk(self, monkeypatch, footage, free_bytes: int):
+        """A footage volume with ``free_bytes`` to spare before anything is copied,
+        and less by exactly what the run has committed since."""
+        from app.ingest import puller
+
+        def free(path):
+            return free_bytes - sum(p.stat().st_size for p in footage.glob("*.ts"))
+
+        monkeypatch.setattr(puller, "_free_bytes", free)
+
+    async def test_a_nearly_full_disk_copies_what_fits_and_holds_the_rest(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """Two 4 KB recordings, room above the reserve for one. The run is a success --
+        one file is safely in the library -- and the other is visibly held, not lost."""
+        from app.ingest.models import RunState
+        from app.ingest.puller import run_pull
+        from app.ingest.status import get_status
+
+        await self._enable(**{"ingest.min_free_gb": 5_000 / 1e9})
+        self._shrinking_disk(monkeypatch, app_config.footage_dir, free_bytes=9_096)
+
+        result = await run_pull(trigger="manual")
+
+        assert result.state is RunState.OK, result.error
+        assert result.files == 1
+        assert result.error is None, "a partial hold is a postponement, not a fault"
+        assert sorted(p.name for p in app_config.footage_dir.glob("*.ts")) == [
+            "20260812120000_camera_0.ts"
+        ]
+        status = get_status()
+        assert status.space_hold is True
+        assert "stay on the card" in (status.space_hold_reason or "") or "fit" in (
+            status.space_hold_reason or ""
+        )
+        assert status.backlog_files == 1, "the held recording is still owed"
+        snapshot = status.snapshot()
+        assert snapshot["space_hold"] is True
+        assert snapshot["destination_free_bytes"] == 9_096 - 4_096
+
+    async def test_a_full_disk_refuses_before_touching_the_unit(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        """Nothing fits: that is a fault worth reporting, because nothing will move until
+        somebody frees space, and an idle result would hide it behind 'up to date'."""
+        from app.ingest.models import RunState
+        from app.ingest.puller import run_pull
+        from app.ingest.status import get_status
+
+        await self._enable(**{"ingest.min_free_gb": 5_000 / 1e9})
+        self._shrinking_disk(monkeypatch, app_config.footage_dir, free_bytes=5_000)
+
+        result = await run_pull(trigger="manual")
+
+        assert result.state is RunState.ERROR
+        assert "GB free" in (result.error or "")
+        assert unit.served["names"] is None, "no listener, no transfer"
+        assert unit.deleted == []
+        assert list(app_config.footage_dir.glob("*.ts")) == []
+        assert get_status().space_hold is True
+
+    async def test_space_held_recordings_are_copied_once_room_is_made(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        from app.ingest.models import RunState
+        from app.ingest.puller import run_pull
+        from app.ingest.status import get_status
+
+        await self._enable(**{"ingest.min_free_gb": 5_000 / 1e9})
+        self._shrinking_disk(monkeypatch, app_config.footage_dir, free_bytes=9_096)
+        assert (await run_pull(trigger="manual")).files == 1
+
+        self._shrinking_disk(monkeypatch, app_config.footage_dir, free_bytes=100_000)
+        result = await run_pull(trigger="manual")
+
+        assert result.state is RunState.OK, result.error
+        assert result.files == 1
+        assert len(list(app_config.footage_dir.glob("*.ts"))) == 2
+        assert get_status().space_hold is False
+        assert get_status().space_hold_reason is None
+
+    async def test_a_zero_reserve_copies_onto_a_disk_reported_full(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        from app.ingest.models import RunState
+        from app.ingest.puller import run_pull
+        from app.ingest.status import get_status
+
+        await self._enable(**{"ingest.min_free_gb": 0})
+        self._shrinking_disk(monkeypatch, app_config.footage_dir, free_bytes=0)
+
+        result = await run_pull(trigger="manual")
+
+        assert result.state is RunState.OK, result.error
+        assert result.files == 2
+        assert get_status().space_hold is False
+        assert get_status().destination_free_bytes == 0, "measured and shown even when not enforced"
+
+    async def test_an_unmeasurable_volume_does_not_block_the_backup(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        from app.ingest import puller
+        from app.ingest.models import RunState
+        from app.ingest.puller import run_pull
+
+        await self._enable(**{"ingest.min_free_gb": 5_000 / 1e9})
+        monkeypatch.setattr(puller, "_free_bytes", lambda path: None)
+
+        result = await run_pull(trigger="manual")
+
+        assert result.state is RunState.OK, result.error
+        assert result.files == 2
 
     async def test_pending_radio_recovery_does_not_publish_a_fake_empty_backlog(
         self, db_session, unit, app_config, monkeypatch

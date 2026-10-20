@@ -201,6 +201,12 @@ export interface IngestStatus {
   wifiBandHold: boolean
   /** Why it is being held, including whether 5 GHz is in range. Null unless held. */
   wifiBandHoldReason: string | null
+  /** Free space on the footage volume as measured at the start of the last run; null if never measured. */
+  destinationFreeBytes?: number | null
+  /** True when the last run left recordings on the card because the footage volume is below its reserve. */
+  spaceHold?: boolean
+  /** Why, in a sentence that names the reserve and how much was held back. Null unless held. */
+  spaceHoldReason?: string | null
   /** The unit's running time in seconds as last read by the arrival gate; null if unknown. */
   unitUptimeS: number | null
   /** True while the first pull is being held until the unit has been running long enough. */

@@ -1,11 +1,12 @@
 import type { IngestStatus } from './api'
 
 /** An absent car is normal. Alert on recorded failures and an outstanding, stale backlog. */
-export function backupAttention(status: Pick<IngestStatus, 'state' | 'lastError' | 'backlogKnown' | 'backlogFiles' | 'lastSuccessTs' | 'radioQuietingHold'> | undefined, now = Date.now()): string[] {
+export function backupAttention(status: Pick<IngestStatus, 'state' | 'lastError' | 'backlogKnown' | 'backlogFiles' | 'lastSuccessTs' | 'radioQuietingHold' | 'spaceHold'> | undefined, now = Date.now()): string[] {
   if (!status || status.state === 'disabled' || status.state === 'running') return []
   const warnings: string[] = []
   const waitingForRadios = status.state === 'idle' && status.radioQuietingHold
   if ((status.lastError && !waitingForRadios) || status.state === 'error' || status.state === 'unauthorized') warnings.push('The last backup attempt reported an error. View Backup for details.')
+  if (status.spaceHold) warnings.push('The footage disk is below its free-space reserve; recordings are being held on the camera.')
   if (status.backlogKnown && status.backlogFiles > 0) {
     const last = status.lastSuccessTs ? Date.parse(status.lastSuccessTs) : NaN
     if (!Number.isFinite(last)) warnings.push(`${status.backlogFiles} files are waiting; no successful backup time is recorded.`)

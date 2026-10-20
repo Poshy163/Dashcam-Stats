@@ -66,7 +66,7 @@ while the engine runs — roughly a **60–120 second window**.
 
 ### Sequence of a run
 
-1. Poller ticks every `poll_interval_s` (default **8 s**, floor 3 s); skips entirely while a
+1. Poller ticks every `poll_interval_s` (default **2 s**, floor 1 s); skips entirely while a
    run is in flight.
 2. Each tick calls `probe_unit()` → `adb.describe()` → `adb disconnect` + `adb connect` +
    `adb get-state` + (if online) a `sh` source probe.
@@ -79,6 +79,12 @@ while the engine runs — roughly a **60–120 second window**.
       than `skip_active_s` (15 s), skip names the library deliberately removed, size-compare
    5. `status.plan(plan)`
    6. `_footage_is_safe_to_write()` — DB session + `evaluate_safety` + `is_writable`
+   6b. Free-space preflight — `shutil.disk_usage(footage)` once, then the plan is cut in its
+       own order to what fits above `ingest.min_free_gb` (default 5 GB; 0 disables). Files
+       that do not fit stay on the card as backlog and the status reports `space_hold`;
+       if *nothing* fits the run ends `ERROR` before any listener is launched. Each sweep
+       re-measures, so a disk filled by the opening pass stops the sweep rather than the
+       commit.
    7. **`await report_event("started")`** — HTTP POST to the configured webhook, 10 s timeout,
       plus optional blocking MQTT connect
    8. clean staging, `clear_listener()` (kill stray `nc`), `launch_listener()` (not awaited)
@@ -118,7 +124,7 @@ At 34.3 MB/s a 90 s window is ~3.1 GB, so **every second of startup latency is ~
 
 | Cost | Where | Estimate |
 | --- | --- | --- |
-| Presence detection delay | `poller.MIN_POLL_S` / `poll_interval_s` = 8 s | mean 4 s, worst 8 s → up to **275 MB** |
+| Presence detection delay | `poller.MIN_POLL_S` / `poll_interval_s` = 2 s (was 8 s when this was written) | mean 1 s, worst 2 s → up to **70 MB** |
 | Duplicate `probe_unit()` | `poller._loop` probes, then `run_pull` probes again — including `adb disconnect`, tearing down the connection just established | ~1–3 s |
 | **Awaited `report_event("started")`** | `puller.py:291`, before the listener is launched. `httpx` with a **10 s timeout**; the reporter's own docstring notes a mistyped URL fails silently | 0–10 s, **up to 340 MB** |
 | Per-file `stat` exec in `inventory` | `for f in *.ts; do stat …; done` = one process spawn per file, ~140 on a full card, on a weak SoC | ~0.5–2 s (measure) |
@@ -168,18 +174,25 @@ when several could sit outside it.
 
 ### 2c. Progress and observability
 
+> **Status, since written.** `snapshot()` now exposes `speed_mbs_recent` (a recent-window
+> rate), `eta_seconds`, a `phase` alongside `state` (`connecting / scanning / preparing /
+> transferring / verifying`), `active_skipped`, and — as of the free-space preflight —
+> `destination_free_bytes` / `space_hold` / `space_hold_reason`. The bullets below record
+> what the investigation found at the time; the items still open are marked.
+
 - `throughput_mbs` is a **cumulative average since run start**, not a recent rate. It reads
-  artificially low early in a run and cannot support an ETA.
-- **There is no ETA at all.**
-- **There is no phase**, only `RunState` (`disabled/idle/running/ok/partial/error/offline/
-  unauthorized/cancelled`). "Scanning footage", "Preparing transfer", "Verifying" do not exist.
-- `IngestStatus.file_done()` sets `current_file = name` — the file that just *finished* — so
-  the UI shows the previous filename until the next one starts
-  ([status.py:126](../backend/app/ingest/status.py#L126)).
+  artificially low early in a run and cannot support an ETA. *(Kept for API compatibility;
+  `speed_mbs_recent` is the one to show.)*
+- ~~**There is no ETA at all.**~~ `eta_seconds`, null unless bytes are moving.
+- ~~**There is no phase**, only `RunState`.~~ `phase` sits alongside `state`.
+- ~~`IngestStatus.file_done()` sets `current_file = name` — the file that just *finished* — so
+  the UI shows the previous filename until the next one starts.~~ `file_done()` now clears
+  it and `file_started()` sets it ([status.py](../backend/app/ingest/status.py)).
 - `bytes_done` counts **socket** bytes (tar headers, 512-byte padding, the 10 KB end-of-archive
   blocks); `bytes_total` counts **file** sizes. Progress can therefore exceed 100 % slightly.
-- `DeltaPlan.active_skipped` is computed and then never surfaced in `snapshot()`.
-- No per-file byte progress within the current file.
+  *(Still true; the UI clamps the bar.)*
+- ~~`DeltaPlan.active_skipped` is computed and then never surfaced in `snapshot()`.~~
+- No per-file byte progress within the current file. *(Still open.)*
 
 ### 2d. Host/container
 

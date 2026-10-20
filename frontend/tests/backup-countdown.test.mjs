@@ -247,10 +247,23 @@ test('idle becomes Up to date only after known empty inventory; a hold still win
     [{ backlogKnown: true }, 'Up to date'],
     [{ backlogKnown: true, ignitionHold: true, ignitionState: 'unknown' }, 'Waiting for ignition status'],
     [{ backlogKnown: true, wifiBandHold: true }, 'Waiting for 5 GHz WiFi'],
+    [{ backlogKnown: true, spaceHold: true, spaceHoldReason: 'Only 2.0 GB free' }, 'Server disk is nearly full'],
   ]) {
     const root = await mountBackup(t, status(overrides))
     assert.equal(root.root.findByProps({ label: 'Status' }).props.value, label)
   }
+})
+
+test('a disk-space hold names the free space on the backlog tile and does not double-report as an error', async t => {
+  const reason = '/footage has 2.0 GB free with 5.0 GB kept in reserve; 3 recordings (1.2 GB) stay on the card until space is freed.'
+  const root = await mountBackup(t, status({
+    backlogKnown: true, backlogFiles: 3, backlogBytes: 1_200_000_000, spaceHold: true, spaceHoldReason: reason,
+    destinationFreeBytes: 2_000_000_000, lastError: reason,
+  }))
+  assert.equal(root.root.findByProps({ label: 'Status' }).props.hint, reason)
+  const backlog = root.root.findByProps({ label: 'Still on the camera' })
+  assert.match(backlog.props.hint, /3 files · held for disk space · .*free on the server/)
+  assert.doesNotMatch(JSON.stringify(root.toJSON()), /Last attempt reported a problem/)
 })
 
 test('dashboard hold reasons outrank optimistic predictions and stale data never shows a timer', async t => {

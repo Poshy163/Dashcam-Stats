@@ -46,6 +46,9 @@ export function backupHold(status: IngestStatus | undefined): { label: string; r
   if (status.state !== 'running' && status.wifiBandHold) {
     return { label: 'Waiting for 5 GHz WiFi', reason: status.wifiBandHoldReason || 'Backup is waiting for a 5 GHz connection.' }
   }
+  if (status.state !== 'running' && status.spaceHold) {
+    return { label: 'Server disk is nearly full', reason: status.spaceHoldReason || 'Recordings stay on the card until the footage disk has room above its reserve.' }
+  }
   const radioReason = radioQuietingNotice(status, null)
   if (radioReason) return { label: 'Waiting for radio shutdown', reason: radioReason }
   if (status.state === 'running') return null

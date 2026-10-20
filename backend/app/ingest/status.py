@@ -132,6 +132,15 @@ class IngestStatus:
         self.ignition_hold_reason: str | None = None
         self.radio_quieting_hold = False
         self.radio_quieting_hold_reason: str | None = None
+        #: Free space on the footage volume as last measured at the start of a run, and
+        #: whether that measurement held back part or all of the plan. Not cleared when the
+        #: unit leaves: the disk is this server's, not the car's, and the reason it is
+        #: holding the backlog stays true until somebody frees space. Like the other
+        #: holds it is not routed through ``last_error`` when only *part* of the plan was
+        #: deferred -- the run still copies what fits, and that is a success with a caveat.
+        self.destination_free_bytes: int | None = None
+        self.space_hold: bool = False
+        self.space_hold_reason: str | None = None
         #: Configured duration for the next OFF timer (1200 active / 300 idle).
         #: The running timer uses the duration witnessed at its ignition-off edge.
         self.sleep_window_s: int = 1200
@@ -615,6 +624,14 @@ class IngestStatus:
             self.wifi_band_hold = held
             self.wifi_band_hold_reason = reason if held else None
 
+    def set_destination_space(
+        self, free_bytes: int | None, *, held: bool = False, reason: str | None = None
+    ) -> None:
+        with self._lock:
+            self.destination_free_bytes = free_bytes
+            self.space_hold = held
+            self.space_hold_reason = reason if held else None
+
     def set_arrival(self, uptime_s: float | None, *, held: bool, reason: str | None) -> None:
         with self._lock:
             self.unit_uptime_s = uptime_s
@@ -925,6 +942,9 @@ class IngestStatus:
                 "wifi_frequency_mhz": self.wifi_frequency_mhz,
                 "wifi_band_hold": self.wifi_band_hold,
                 "wifi_band_hold_reason": self.wifi_band_hold_reason,
+                "destination_free_bytes": self.destination_free_bytes,
+                "space_hold": self.space_hold,
+                "space_hold_reason": self.space_hold_reason,
                 "unit_uptime_s": self._observed_uptime_s if fresh else None,
                 "unit_observed_at": (
                     self._unit_observed_at.isoformat() if self._unit_observed_at else None

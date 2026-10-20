@@ -399,8 +399,9 @@ export default function Backup() {
               : 'Making the radio transition safe'
       : hold?.reason ?? (running && data ? PHASES[data.phase] : undefined)
   const backlogKnown = data?.backlogKnown === true
+  const freeHint = data?.destinationFreeBytes != null ? ` · ${formatBytes(data.destinationFreeBytes)} free on the server` : ''
   const backlogHint = backlogKnown && data
-    ? `${data.backlogFiles} file${data.backlogFiles === 1 ? '' : 's'}`
+    ? `${data.backlogFiles} file${data.backlogFiles === 1 ? '' : 's'}${data.spaceHold ? ' · held for disk space' : ''}${freeHint}`
     : recoveryBlocked
       ? recovery ? 'Not checked; waiting for backup recovery' : 'Not checked; waiting for radio recovery'
       : 'Not checked yet'
@@ -795,7 +796,7 @@ export default function Backup() {
         </div>
       )}
 
-      {data?.lastError && !running && !data.wifiBandHold && !(data.state === 'idle' && data.radioQuietingHold) && (
+      {data?.lastError && !running && !data.wifiBandHold && !(data.spaceHold && hold) && !(data.state === 'idle' && data.radioQuietingHold) && (
         <div className="card mb-6 px-5 py-4 text-sm">
           <div className="font-medium text-state-warn">Last attempt reported a problem</div>
           <div className="mt-1 break-words text-content-muted">{data.lastError}</div>

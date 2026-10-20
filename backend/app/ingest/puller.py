@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import shutil
 import time
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
@@ -53,7 +54,7 @@ from app.ingest.obd_transfer import (
     sync_remote_bundles,
     verified_bundle_matches,
 )
-from app.ingest.status import get_status
+from app.ingest.status import IngestStatus, get_status
 
 log = get_logger(__name__)
 
@@ -1084,6 +1085,107 @@ def delta(
     return plan
 
 
+@dataclass(slots=True)
+class SpaceFit:
+    """How much of a plan the footage volume can actually take right now."""
+
+    #: Files that fit, in the plan's own order.
+    fits: list[RemoteFile]
+    #: Files pushed back to the backlog for lack of room, in the plan's own order.
+    deferred: list[RemoteFile]
+    free_bytes: int
+    reserve_bytes: int
+
+    @property
+    def deferred_bytes(self) -> int:
+        return sum(item.size for item in self.deferred)
+
+    @property
+    def nothing_fits(self) -> bool:
+        return bool(self.deferred) and not self.fits
+
+
+def fit_to_free_space(files: list[RemoteFile], free_bytes: int, reserve_bytes: int) -> SpaceFit:
+    """Cut a plan down to what fits above the configured reserve.
+
+    Walks the plan in order and stops at the first file that would push the volume below
+    the reserve, instead of skipping it to try a smaller one later: the order *is* the
+    policy (oldest first keeps the library contiguous; newest first gets today's drive),
+    and cherry-picking by size would quietly undo it. A reserve of zero means the check
+    is off, and a plan that fits is returned untouched.
+    """
+    budget = free_bytes - reserve_bytes
+    fits: list[RemoteFile] = []
+    deferred: list[RemoteFile] = []
+    if reserve_bytes <= 0:
+        return SpaceFit(list(files), [], free_bytes, reserve_bytes)
+    for index, item in enumerate(files):
+        if item.size > budget:
+            deferred = list(files[index:])
+            break
+        budget -= item.size
+        fits.append(item)
+    return SpaceFit(fits, deferred, free_bytes, reserve_bytes)
+
+
+def _free_bytes(path: Path) -> int | None:
+    """Free space on the volume holding ``path``; None if it cannot be measured."""
+    try:
+        return int(shutil.disk_usage(path).free)
+    except OSError:
+        return None
+
+
+def _space_hold_reason(fit: SpaceFit, *, footage: Path) -> str:
+    free_gb = fit.free_bytes / 1e9
+    reserve_gb = fit.reserve_bytes / 1e9
+    held = len(fit.deferred)
+    if fit.nothing_fits:
+        return (
+            f"{footage} has {free_gb:.1f} GB free and the backup keeps {reserve_gb:.1f} GB "
+            f"in reserve, so none of the {held} waiting recording{'s' if held != 1 else ''} "
+            f"fit. Free some space, lower the reserve in Settings > Backup / Ingest, or "
+            f"let retention catch up; the footage stays on the card until then."
+        )
+    return (
+        f"{footage} has {free_gb:.1f} GB free with {reserve_gb:.1f} GB kept in reserve; "
+        f"{held} recording{'s' if held != 1 else ''} ({fit.deferred_bytes / 1e9:.1f} GB) "
+        f"stay on the card until space is freed."
+    )
+
+
+async def _fit_plan_to_space(
+    files: list[RemoteFile], footage: Path, status: IngestStatus
+) -> SpaceFit | None:
+    """Measure the footage volume and trim ``files`` in place to what fits.
+
+    Returns None when the check is off or the volume cannot be measured -- in both cases
+    the plan is left alone, and the status reflects whatever was learnt about free space.
+    The measurement is taken fresh each call: a sweep partway through a multi-GB run sees
+    a very different disk from the one the opening plan was drawn against.
+    """
+    reserve_bytes = int(max(0.0, float(_get("min_free_gb", 5.0))) * 1e9)
+    free = await asyncio.to_thread(_free_bytes, footage)
+    if free is None:
+        log.warning("could not measure free space on the footage volume", path=str(footage))
+        return None
+    fit = fit_to_free_space(files, free, reserve_bytes)
+    if not fit.deferred:
+        status.set_destination_space(free)
+        return fit
+    reason = _space_hold_reason(fit, footage=footage)
+    status.set_destination_space(free, held=True, reason=reason)
+    log.warning(
+        "footage volume is low on space; holding part of the plan on the card",
+        free_gb=round(free / 1e9, 1),
+        reserve_gb=round(reserve_bytes / 1e9, 1),
+        deferred_files=len(fit.deferred),
+        deferred_gb=round(fit.deferred_bytes / 1e9, 1),
+    )
+    files[:] = fit.fits
+    return fit
+
+
 def commit(staging: Path, footage: Path, expected: dict[str, int]) -> list[str]:
     """Move only whole files into the footage directory.
 
@@ -2033,6 +2135,21 @@ async def _run_pull_started(
             log.error("refusing to transfer into an unsafe footage directory", reason=why)
             return result
 
+        # Same moment, same reasoning: the volume is measured once the plan is known and
+        # before anything is fetched. Deferring part of the plan is a hold, not a fault --
+        # the run copies what fits and the rest stays on the card as backlog. Deferring
+        # *all* of it is reported as an error, because then nothing will move until
+        # somebody acts, and an idle result would hide that behind "up to date".
+        if plan.files:
+            fit = await _fit_plan_to_space(plan.files, footage, status)
+            if fit is not None and fit.nothing_fits:
+                why = _space_hold_reason(fit, footage=footage)
+                result = RunResult(state=RunState.ERROR, error=why)
+                log.error("refusing to transfer: the footage volume is full", reason=why)
+                return result
+            if fit is not None and fit.deferred:
+                status.plan(plan)
+
         # Only the first pull of a visit may take the screen over.  The actual launch is
         # deferred until immediately before the transfer starts, after the OBD/radio gates;
         # that way a safety refusal does not show a misleading copying screen.
@@ -2188,6 +2305,10 @@ async def _run_pull_started(
             )
             if more.files:
                 await _drop_still_growing(info, more, sources)
+            if more.files:
+                fit = await _fit_plan_to_space(more.files, footage, status)
+                if fit is not None and fit.nothing_fits:
+                    break
             if not more.files:
                 break
             log.info(
