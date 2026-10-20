@@ -23,6 +23,8 @@ frontend/.vite/
 .kotlin/
 local.properties
 keystore.properties
+# Workstation-local production signing material; see AGENTS.md.
+/android/obd-logger/secrets/
 *.jks
 *.keystore
 *.apk

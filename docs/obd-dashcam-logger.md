@@ -98,26 +98,24 @@ never deploy either as the production logger. A later APK can update the install
 it has the same application ID and release certificate, so changing or losing the production key
 would require uninstalling the logger and losing its app-private database and preferences.
 
-Provision one stable signing key outside this repository on a protected workstation, keep its
-password in a password manager, and store an encrypted offline backup of both the keystore and its
-recovery instructions. Restrict the live file to the build account. For example, after selecting a
-secure path and alias:
+This workstation's production signing key is at
+`android/obd-logger/secrets/dashcam-obd-prod.p12`, with its build credentials in
+`android/obd-logger/keystore.properties`. The properties file uses
+`obdReleaseKeystorePath=secrets/dashcam-obd-prod.p12`, relative to the Android project root.
+Both files are Git-ignored and excluded from the root and Android Docker build contexts.
+Their locations are also documented in the root `AGENTS.md` for future agents.
+Fresh clones and worktrees do not contain the signing files; reuse the existing production key
+from the original checkout. Preserve its file permissions and an encrypted offline recovery
+backup of the key, credentials and recovery instructions.
 
-```powershell
-keytool -genkeypair -v -keystore D:\protected\obd-logger-release.jks `
-  -alias obd-logger -keyalg RSA -keysize 4096 -validity 10000
-```
-
-Use environment variables (or an ignored `android/obd-logger/keystore.properties`) for the build.
+Use the ignored properties file for local builds, or environment variables on another protected
+build host. Gradle command-line properties and environment variables override the local file;
+remove stale overrides when using the relocated key.
 Setting `OBD_PRODUCTION_SIGNING=true` makes missing or partial input a clear build failure rather
 than silently emitting an unsigned production candidate:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
-$env:OBD_RELEASE_KEYSTORE_PATH = "D:\protected\obd-logger-release.jks"
-$env:OBD_RELEASE_KEYSTORE_PASSWORD = "<from password manager>"
-$env:OBD_RELEASE_KEY_ALIAS = "obd-logger"
-$env:OBD_RELEASE_KEY_PASSWORD = "<from password manager>"
 
 cd android\obd-logger
 .\gradlew.bat --no-daemon clean :app:testDebugUnitTest :app:lintRelease :app:assembleRelease

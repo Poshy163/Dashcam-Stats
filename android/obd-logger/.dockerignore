@@ -1,0 +1,12 @@
+# Verification images use source only, without workstation signing credentials.
+secrets/
+keystore.properties
+signing.properties
+**/*.jks
+**/*.keystore
+**/*.p12
+**/*.pfx
+local.properties
+.gradle/
+.kotlin/
+**/build/

@@ -25,6 +25,14 @@ tests/fixtures/*.mp4
 credentials*
 *.pem
 *.key
+# Signing material stays local, including in Android build contexts.
+**/secrets
+**/keystore.properties
+**/signing.properties
+**/*.jks
+**/*.keystore
+**/*.p12
+**/*.pfx
 
 # Docs and dev-only files add nothing to the runtime image.
 *.md
