@@ -24,7 +24,9 @@ from typing import Annotated
 from fastapi import APIRouter, Query
 from sqlalchemy import Float, String, distinct, func, or_, select
 from sqlalchemy import cast as sa_cast
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api import map_cache
 from app.api.deps import SQLITE_MAX_INT, SessionDep
 from app.api.geometry import build_polylines
 from app.api.schemas import HeatmapOut, RoutesOut
@@ -108,6 +110,24 @@ async def heatmap(
     limit: int = Query(MAX_CELLS, ge=1, le=MAX_CELLS),
 ):
     """Grid cells with a visit count, ready to be drawn as a heat layer."""
+    key = ("heatmap", precision, start, end, journey_id, camera, min_speed_kmh, limit)
+    return await map_cache.cached(
+        session,
+        key,
+        lambda: _heatmap(session, precision, start, end, journey_id, camera, min_speed_kmh, limit),
+    )
+
+
+async def _heatmap(
+    session: AsyncSession,
+    precision: int,
+    start: datetime | None,
+    end: datetime | None,
+    journey_id: int | None,
+    camera: str | None,
+    min_speed_kmh: float,
+    limit: int,
+) -> HeatmapOut:
     lat_cell = func.round(TelemetryPoint.lat, precision)
     lon_cell = func.round(TelemetryPoint.lon, precision)
 
@@ -245,10 +265,24 @@ async def routes(
     which roads and the heat says how often.
 
     Front camera only by default. Both cameras record the same drive and both burn the same
-    overlay, so including each would draw every road twice with a metre or two of OCR
+    overlay so including each would draw every road twice with a metre or two of OCR
     disagreement between the copies — visible as a doubled line, and twice the payload for
     no extra information.
     """
+    key = ("routes", start, end, journey_id, simplify_m, max_points)
+    return await map_cache.cached(
+        session, key, lambda: _routes(session, start, end, journey_id, simplify_m, max_points)
+    )
+
+
+async def _routes(
+    session: AsyncSession,
+    start: datetime | None,
+    end: datetime | None,
+    journey_id: int | None,
+    simplify_m: float,
+    max_points: int,
+) -> RoutesOut:
     stmt = (
         select(
             TelemetryPoint.journey_id,

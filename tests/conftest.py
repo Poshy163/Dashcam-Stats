@@ -181,6 +181,11 @@ async def db_session(app_config) -> AsyncIterator:
     # challenged.
     reset_auth_state()
     ratelimit.reset()
+    # The map aggregates are memoised on a fingerprint of row counts and ids, which two
+    # freshly seeded test databases can share while holding different coordinates.
+    from app.api import map_cache
+
+    map_cache.clear()
 
     try:
         async with session_scope() as session:
@@ -188,6 +193,7 @@ async def db_session(app_config) -> AsyncIterator:
     finally:
         reset_auth_state()
         ratelimit.reset()
+        map_cache.clear()
         await shutdown_settings_service()
         # Reset the process-wide singleton so the next test does not inherit this
         # database's settings cache.

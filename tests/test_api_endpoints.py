@@ -1091,3 +1091,190 @@ class TestOsdDebugView:
         response = await client.get(f"/api/recordings/{clip_recording}/osd-debug?t=99999")
         assert response.status_code == 422
         assert "decoded" in response.text.lower()
+
+
+class TestRecordingNeighbours:
+    """The viewer's previous/next clip, which must agree with the list's ordering."""
+
+    @pytest.fixture
+    async def chain(self, db_session):
+        from datetime import UTC, datetime, timedelta
+
+        from app.db.models import Camera, CameraRole
+
+        async with session_scope() as session:
+            front = Camera(key="front-n", name="Front", role=CameraRole.FRONT)
+            rear = Camera(key="rear-n", name="Rear", role=CameraRole.REAR)
+            session.add_all([front, rear])
+            await session.flush()
+            base = datetime(2026, 8, 4, 17, 0, tzinfo=UTC)
+            ids = {}
+            for minute, (key, cam, hidden) in enumerate(
+                [
+                    ("a", front, False),
+                    ("rear", rear, False),  # interleaved, must be skipped
+                    ("b", front, False),
+                    ("hidden", front, True),  # blacklisted, must be skipped
+                    ("c", front, False),
+                ]
+            ):
+                rec = Recording(
+                    rel_path=f"{key}.ts",
+                    filename=f"{key}.ts",
+                    size_bytes=1,
+                    state=RecordingState.COMPLETED,
+                    camera_id=cam.id,
+                    started_at=base + timedelta(minutes=minute),
+                    ignored=hidden,
+                )
+                session.add(rec)
+                await session.flush()
+                ids[key] = rec.id
+            undated = Recording(
+                rel_path="undated.ts",
+                filename="undated.ts",
+                size_bytes=1,
+                state=RecordingState.COMPLETED,
+                camera_id=front.id,
+            )
+            session.add(undated)
+            await session.flush()
+            ids["undated"] = undated.id
+            return ids
+
+    async def test_walks_the_same_camera_skipping_hidden_footage(self, client, chain):
+        body = (await client.get(f"/api/recordings/{chain['b']}/neighbours")).json()
+        assert body["previous"]["id"] == chain["a"]
+        assert body["next"]["id"] == chain["c"]
+        assert body["next"]["filename"] == "c.ts"
+
+    async def test_the_ends_of_the_chain_have_no_neighbour_on_that_side(self, client, chain):
+        first = (await client.get(f"/api/recordings/{chain['a']}/neighbours")).json()
+        assert first["previous"] is None
+        assert first["next"]["id"] == chain["b"]
+        last = (await client.get(f"/api/recordings/{chain['c']}/neighbours")).json()
+        assert last["previous"]["id"] == chain["b"]
+        assert last["next"] is None
+
+    async def test_undated_clips_do_not_mix_with_dated_ones(self, client, chain):
+        body = (await client.get(f"/api/recordings/{chain['undated']}/neighbours")).json()
+        assert body == {"previous": None, "next": None}
+
+    async def test_unknown_recording_is_404(self, client, chain):
+        assert (await client.get("/api/recordings/999999/neighbours")).status_code == 404
+
+
+class TestMapCache:
+    """The map aggregates are memoised until the data under them changes."""
+
+    @pytest.fixture
+    async def a_short_drive(self, db_session):
+        from datetime import UTC, datetime, timedelta
+
+        from app.db.models import Journey, TelemetryPoint
+
+        async with session_scope() as session:
+            base = datetime(2026, 8, 4, 17, 43, tzinfo=UTC)
+            j = Journey(started_at=base, ended_at=base + timedelta(minutes=1), duration_s=60.0)
+            session.add(j)
+            await session.flush()
+            rec = Recording(
+                rel_path="short.ts",
+                filename="short.ts",
+                size_bytes=1,
+                state=RecordingState.COMPLETED,
+                journey_id=j.id,
+                started_at=base,
+            )
+            session.add(rec)
+            await session.flush()
+            for step in range(30):
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec.id,
+                        journey_id=j.id,
+                        t_offset_s=float(step),
+                        captured_at=base + timedelta(seconds=step),
+                        lat=-34.8088 + step * 1e-4,
+                        lon=138.6769,
+                        has_fix=True,
+                        speed_kmh=40.0,
+                    )
+                )
+            await session.flush()
+            return rec.id, j.id
+
+    async def test_a_repeat_request_is_served_without_recomputing(
+        self, client, a_short_drive, monkeypatch
+    ):
+        from app.api.routes import heatmap as module
+
+        calls = {"routes": 0, "heatmap": 0}
+        real_routes, real_heatmap = module._routes, module._heatmap
+
+        async def counted_routes(*args, **kwargs):
+            calls["routes"] += 1
+            return await real_routes(*args, **kwargs)
+
+        async def counted_heatmap(*args, **kwargs):
+            calls["heatmap"] += 1
+            return await real_heatmap(*args, **kwargs)
+
+        monkeypatch.setattr(module, "_routes", counted_routes)
+        monkeypatch.setattr(module, "_heatmap", counted_heatmap)
+
+        first = (await client.get("/api/map/routes")).json()
+        second = (await client.get("/api/map/routes")).json()
+        assert first == second and first["points"] > 0
+        assert calls["routes"] == 1
+
+        (await client.get("/api/map/heatmap?precision=3")).json()
+        (await client.get("/api/map/heatmap?precision=3")).json()
+        # A different grid is a different answer, so it is a different entry.
+        (await client.get("/api/map/heatmap?precision=2")).json()
+        assert calls["heatmap"] == 2
+
+    async def test_new_telemetry_invalidates_the_cached_lines(self, client, a_short_drive):
+        from datetime import UTC, datetime, timedelta
+
+        from app.db.models import TelemetryPoint
+
+        rec_id, journey_id = a_short_drive
+        before = (await client.get("/api/map/routes?simplify_m=0")).json()
+
+        async with session_scope() as session:
+            base = datetime(2026, 8, 4, 17, 44, tzinfo=UTC)
+            for step in range(30):
+                session.add(
+                    TelemetryPoint(
+                        recording_id=rec_id,
+                        journey_id=journey_id,
+                        t_offset_s=60.0 + step,
+                        captured_at=base + timedelta(seconds=step),
+                        lat=-34.80,
+                        lon=138.6769 + step * 1e-4,
+                        has_fix=True,
+                        speed_kmh=40.0,
+                    )
+                )
+            await session.flush()
+
+        after = (await client.get("/api/map/routes?simplify_m=0")).json()
+        assert after["points"] > before["points"]
+
+    async def test_invalidating_the_recording_empties_the_cached_map(self, client, a_short_drive):
+        """Reanalysis used to leave the heat behind; the cache must not bring that back."""
+        from app.pipeline.revisions import INVALIDATED_REVISION
+
+        rec_id, _ = a_short_drive
+        assert (await client.get("/api/map/heatmap")).json()["cells"] > 0
+
+        async with session_scope() as session:
+            await session.execute(
+                update(Recording)
+                .where(Recording.id == rec_id)
+                .values(telemetry_revision=INVALIDATED_REVISION)
+            )
+
+        assert (await client.get("/api/map/heatmap")).json()["cells"] == 0
+        assert (await client.get("/api/map/routes")).json()["points"] == 0
