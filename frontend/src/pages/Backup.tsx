@@ -4,6 +4,8 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { ObdLoggerCard } from '@/components/ObdLoggerCard'
 import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
 import { ObdWebhookStatus } from '@/components/ObdWebhookStatus'
+import { MovementManifestCard } from '@/components/MovementManifestCard'
+import { MaintenanceWakeCard } from '@/components/MaintenanceWakeCard'
 import Spinner from '@/components/Spinner'
 import { EmptyState, ErrorState, PageHeader, Pagination, ProgressBar, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
@@ -845,6 +847,9 @@ export default function Backup() {
           <div className="mt-1 break-words text-content-muted">{data.lastError}</div>
         </div>
       )}
+
+      <MaintenanceWakeCard />
+      <MovementManifestCard />
 
       <div className="mb-3 mt-8 flex flex-wrap items-center justify-between gap-3">
         <div>

@@ -27,7 +27,17 @@ from app.core.settings_schema import (
     INGEST_SLEEP_WINDOW_IDLE_SECONDS,
 )
 from app.core.settings_service import get_settings_service
-from app.ingest import adb, band, elevate, obd_control, origin, radio_coordinator, radios, transport
+from app.ingest import (
+    adb,
+    band,
+    elevate,
+    movement,
+    obd_control,
+    origin,
+    radio_coordinator,
+    radios,
+    transport,
+)
 from app.ingest.models import (
     DeltaPlan,
     Phase,
@@ -1623,6 +1633,12 @@ async def _shutdown_pull() -> None:
     log.info("stopped an in-flight transfer for shutdown")
 
 
+async def stop_for_maintenance() -> bool:
+    """Drain the active run and reconcile radios without stopping the arrival poller."""
+    await _shutdown_pull()
+    return await radio_coordinator.reconcile_pending()
+
+
 async def run_pull(
     *, trigger: str = "auto", info: UnitInfo | None = None, continuation: bool = False
 ) -> RunResult:
@@ -1839,6 +1855,23 @@ async def _run_pull_started(
             if locked:
                 sources.append(locked)
         remote = await adb.inventory_all(info.address, sources)
+        # New companions publish bounded advisory movement evidence. Read it before
+        # drawing the footage plan, but never let it change that plan. Older units
+        # make no extra ADB request. Logger-read failures are handled normally below.
+        try:
+            movement_logger = await obd_logger
+        except Exception:
+            movement_logger = None
+        if isinstance(movement_logger, dict) and movement.CAPABILITY in (
+            movement_logger.get("capabilities") or []
+        ):
+            try:
+                await movement.inspect_before_plan(
+                    info.address, get_config().obd_remote_status_file, remote, info.source
+                )
+            except Exception:
+                # A diagnostic regression must still fail open for footage backup.
+                log.warning("movement manifest observation failed; footage will continue")
         status.set_phase(Phase.PREPARING)
         # Off the event loop: this stats every candidate against the footage share, which
         # is a hard NFS mount in the deployment, and a full card is ~140 files. Doing it

@@ -75,6 +75,12 @@ class ObdLoggerService : Service() {
     private var sleepStatusPublishJob: Job? = null
     private val retryWakeSignals = Channel<LoggerWakeReason>(Channel.CONFLATED)
     private var retryWakeReceiverRegistered = false
+    private var motionJournal: MotionJournal? = null
+    private var clipIndexer: ClosedClipIndexer? = null
+    private var passiveMotion: PassiveMotionObserver? = null
+    private var movementVisibleLaunch = false
+    private val movementLifecycleLock = Any()
+    private var movementStopping = false
 
     private val retryWakeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -158,6 +164,13 @@ class ObdLoggerService : Service() {
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
+        movementVisibleLaunch = intent?.getBooleanExtra(EXTRA_MOVEMENT_FROM_VISIBLE_ACTIVITY, false) == true
+        passiveMotion?.start(movementVisibleLaunch) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification("Recording telemetry and passive movement evidence"),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+            }
+        }
         when (
             serviceWorkerDecision(
                 workerActive = worker?.isActive == true,
@@ -211,6 +224,12 @@ class ObdLoggerService : Service() {
         retryWakeSignals.close()
         sleepWindowController?.close()
         sleepWindowController = null
+        synchronized(movementLifecycleLock) {
+            movementStopping = true
+            passiveMotion?.stop()
+            clipIndexer?.stop()
+            motionJournal?.stop()
+        }
         scope.cancel()
         // Do not close SQLite here: the IO coroutine can be between its final DML and
         // setTransactionSuccessful when Android calls onDestroy on the main thread.
@@ -249,6 +268,25 @@ class ObdLoggerService : Service() {
             database = initializedDatabase
             exporter = initializedExporter
             collaboratorsInitialized = true
+            // Optional reporting has independent failure handling and cannot disable telemetry.
+            runCatching {
+                synchronized(movementLifecycleLock) {
+                    if (!movementStopping && motionJournal == null) {
+                        MotionJournal(applicationContext).also { journal ->
+                            motionJournal = journal
+                            clipIndexer = ClosedClipIndexer(applicationContext, journal, scope)
+                            passiveMotion = PassiveMotionObserver(applicationContext, journal).also { observer ->
+                                // A background restart requires background location permission.
+                                observer.start(movementVisibleLaunch) {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) startForeground(
+                                        NOTIFICATION_ID, notification("Recording telemetry and passive movement evidence"),
+                                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         } catch (error: Exception) {
             if (error is CancellationException) throw error
             startupAllowed = false
@@ -1016,6 +1054,9 @@ class ObdLoggerService : Service() {
                         is LivePidPollResult.Values -> {
                             malformedLivePids.recordValid(pid)
                             values.putAll(result.decoded)
+                            if (pid == 0x0D) (result.decoded["vehicle_speed"] as? Number)?.toDouble()?.let {
+                                motionJournal?.speed(it)
+                            }
                         }
                         is LivePidPollResult.Malformed -> {
                             missing += pid
@@ -1826,6 +1867,9 @@ class ObdLoggerService : Service() {
             sleepWindowVerified = sleepWindow.verified,
             sleepWindowError = sleepWindow.error,
             sleepDeadlineEvidence = sleepWindow.deadline,
+            movementState = clipIndexer?.state ?: "starting",
+            movementClipCount = clipIndexer?.clipCount ?: 0,
+            movementGpsState = passiveMotion?.state ?: "disabled",
             lastError = error,
             lastErrorAtUtc = error?.let { Instant.now().toString() },
         )
@@ -1926,6 +1970,7 @@ class ObdLoggerService : Service() {
 
     private fun recordSleepWindowObservation(value: SleepWindowControllerObservation) {
         when (value) {
+            is SleepWindowControllerObservation.AccRead -> motionJournal?.acc(value.on)
             SleepWindowControllerObservation.DeadlineUpdated -> scheduleSleepStatusPublish()
             is SleepWindowControllerObservation.Wifi -> emitEvent(
                 kind = "network.wifi",

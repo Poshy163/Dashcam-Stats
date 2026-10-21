@@ -8,13 +8,52 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.8 candidate** (`versionCode` 21) |
-| Source | `android/obd-logger/` (0.3.8 / code 21) |
+| Version | **0.3.9 candidate** (`versionCode` 22) |
+| Source | `android/obd-logger/` (0.3.9 / code 22) |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
 | Poll plan | 7; five-second target with measured optional-command admission |
-| Deployment | 0.3.7/code 20 is installed; its production drive, webhook and verified receipt were checked on 21 October. 0.3.8 has not been installed. |
+| Deployment | 0.3.8/code 21 was installed in place on 21 October with the production certificate and preserved app UID. 0.3.9 has not been installed. |
+
+### What changed in 0.3.9
+
+- **Report-only clip movement manifests**: a bounded private journal reuses validated OBD
+  speed and five-second ACC observations, with optional permission-gated passive GPS speed.
+  A read-only DCIM picker enables closed-clip indexing and bounded sampled fingerprints.
+  Clock ambiguity, missing coverage, unstable footage and old clips remain unknown.
+- **Server validation and Backup page evidence**: the server reads a bounded report before
+  its ordinary transfer plan, matches it against the footage inventory, and exposes advisory
+  class counts and bytes. Malformed, unavailable or stale reports cannot block copying.
+  No classification can exclude or delete footage in this release.
+- **Verified maintenance hold**: an operator can acquire a bounded hold only after the
+  server witnesses cancellation of the supported native countdown on the same parked boot.
+  Short-lived host/device evidence gates backup admission and detached radio recovery.
+  Ending a hold restores radio safety; a real ignition cycle restarts the normal countdown.
+
+See [clip-movement-manifests.md](clip-movement-manifests.md) for setup, classification
+limits, endpoints and physical acceptance checks. Poll plan 7 and the immutable OBD bundle
+and event contracts remain unchanged. New movement evidence begins after installation;
+existing footage cannot be retrospectively labelled stationary from absent observations.
+
+### Local 0.3.9 validation (21 October 2026)
+
+- All 231 Android JVM/Robolectric tests passed, including real SAF provider indexing,
+  read-only folder access, both lenses, locked/orphan files, clock and observation gaps,
+  queue overflow with durable gap recovery, and permission-gated passive location.
+- Debug/release lint completed with zero errors (46 warnings), and both APK assemblies
+  passed. Candidate metadata is 0.3.9/code 22 with poll plan 7.
+- Full backend regression: 2,973 passed and 32 platform/fixture skips. Final targeted
+  maintenance, movement, deadline, radio and OBD transfer/import checks: 498 passed and
+  16 platform skips, with thread warnings treated as errors. A pre-existing test timing
+  race was fixed by awaiting its fake heartbeat's cancellation; Windows Python 3.14
+  deprecation warnings remain.
+- All 203 frontend tests passed, with frontend lint and production build successful.
+  New cases cover advisory counts, stale/invalid and restored reports, proof expiry,
+  and a usable radio-restoration retry action.
+- The backend accepts a synthetic fixture produced by the actual Android SAF indexer and
+  atomic exporter. Physical directory/GPS grants, resource impact and the next drive's
+  coverage remain unverified; the installed companion is still 0.3.8.
 
 ### What changed in 0.3.8
 
@@ -49,7 +88,8 @@ measured cadence; fallback does not guarantee that an ECU will supply a valid re
 - All 196 frontend tests, frontend lint and the production web build passed. Focused Python
   Ruff lint/format checks and `git diff --check` passed.
 - These software checks do not establish the physical adapter's next-drive cadence or
-  recovery of the two rejected readings. The installed companion remains 0.3.7 until updated.
+  recovery of the two rejected readings. The production-signed 0.3.8 update was subsequently
+  installed in place on 21 October; a new drive is still required for those acceptance checks.
 
 ### Previous changes in 0.3.7
 
@@ -95,7 +135,7 @@ key storage and real boot behavior still require checks on this particular head 
   failure before a retry and the final outcome now persist in the event stream with the 0.3.7
   contract fix.
 
-Installed release: 0.3.7 (`versionCode` 20), with fresh status and app-owned events verified
+Previous installed release: 0.3.7 (`versionCode` 20), with fresh status and app-owned events verified
 after the first production drive. The matching server revision was `6edc404`.
 
 ### Previous 0.3.7 local validation (20 October 2026)
@@ -136,7 +176,7 @@ First integrate/review the candidate source in the protected signing checkout, o
 protected build host to use the existing signing files. The original checkout may still contain
 older source and unrelated local changes: do not blindly pull, switch branches or overwrite it.
 Fresh worktrees do not contain the signing files. From the chosen source checkout, after verifying
-`app/build.gradle.kts` declares version 0.3.8/code 21:
+`app/build.gradle.kts` declares version 0.3.9/code 22:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
@@ -148,7 +188,8 @@ Get-FileHash -Algorithm SHA256 $apk
 ```
 
 Check that the printed `Signer #1 certificate SHA-256 digest` equals the complete digest above.
-Record that digest and the APK SHA-256. Deploy server acceptance for poll plan 7 first;
+Record that digest and the APK SHA-256. Deploy this candidate's server manifest and
+maintenance support first (poll plan 7 remains required);
 then, with the head unit awake and explicitly selected on ADB:
 
 ```powershell
@@ -163,7 +204,7 @@ other settings, the metrics toggle works, and `Bundles waiting for the server` d
 next Wi-Fi window. Verify webhook events reach the server and boot recovery still works.
 
 After ingestion obtains a fresh status snapshot, `GET /api/obd/status` should report
-`app_version_name: "0.3.8"` and `app_version_code: 21` under `logger`. A cached status alone does
+`app_version_name: "0.3.9"` and `app_version_code: 22` under `logger`. A cached status alone does
 not establish the currently installed/running version.
 
 ## What is still left to do
@@ -182,6 +223,16 @@ Remaining work; these are not implemented or claimed deployed by this candidate:
 4. **Physical verification** — exercise migration/decryption with the real Android Keystore,
    reboot and in-place update persistence, newest status selection with an unavailable TF card,
    UI legibility/touch behavior and a complete webhook/ingestion cycle.
+5. **Movement and maintenance acceptance** — select DCIM, exercise optional location and
+   folder permission loss, compare a new drive's observations with clips, and test a fresh
+   native countdown, hold expiry/connectivity loss and radio recovery. Report-only operation
+   is intentional; automatic footage filtering is not implemented.
+6. **Rear recorder recovery** — during the parked 21 October inspection, front clips continued
+   while the rear active file remained unchanged. The rear camera still supplied preview
+   frames but lacked a recording encoder surface. Start-only and guarded graceful all-camera
+   stop/start broadcasts did not recover it. No hardware fault is established. A controlled
+   device power cycle/reboot after backup and radio cleanup is still needed to test recovery;
+   no automatic restart loop or persistent recording configuration change was enabled.
 
 The earlier backend reset warning was stale: `87d0c968` already serializes reset, claim/owner
 registration and outcome transactions, and abort refuses replacement jobs until cancellation

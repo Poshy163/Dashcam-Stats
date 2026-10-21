@@ -73,6 +73,9 @@ data class PublicStatus(
     val sleepWindowVerified: Boolean = false,
     val sleepWindowError: String? = null,
     val sleepDeadlineEvidence: SleepDeadlineEvidence? = null,
+    val movementState: String = "starting",
+    val movementClipCount: Int = 0,
+    val movementGpsState: String = "disabled",
     val lastError: String? = null,
     val lastErrorAtUtc: String? = null,
 )
@@ -132,6 +135,7 @@ object StatusPublisher {
                         "adaptive_sleep_window_v2",
                         "app_event_stream_v1",
                         "sleep_deadline_evidence_v1",
+                        "clip_movement_manifest_v1",
                     ),
                 ),
             )
@@ -168,6 +172,10 @@ object StatusPublisher {
             .put("sleep_window_observed_s", status.sleepWindowObservedSeconds ?: JSONObject.NULL)
             .put("sleep_window_verified", status.sleepWindowVerified)
             .put("sleep_window_error", status.sleepWindowError ?: JSONObject.NULL)
+            .put("movement_state", status.movementState)
+            .put("movement_clip_count", status.movementClipCount)
+            .put("movement_gps_state", status.movementGpsState)
+            .put("movement_report_only", true)
             .put("sleep_deadline_evidence", status.sleepDeadlineEvidence?.let { value ->
                 JSONObject()
                     .put("schema_version", 1)

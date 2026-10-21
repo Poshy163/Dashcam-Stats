@@ -7,6 +7,8 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
+import android.net.Uri
+import android.provider.Settings
 import android.text.InputType
 import android.view.View
 import android.view.ViewGroup
@@ -118,6 +120,43 @@ class MainActivity : Activity() {
         layout.addView(metricsToggle)
         layout.addView(liveMetrics)
         layout.addView(TextView(this).apply {
+            text = "On-camera movement report (advisory only). Footage is never excluded or deleted. " +
+                "Choose the recorder's DCIM folder to summarise closed clips. GPS is optional; " +
+                "only speed, uncertainty and coverage are stored, never coordinates."
+        })
+        layout.addView(Button(this).apply {
+            text = "Choose DCIM folder (read only)"
+            setOnClickListener {
+                runCatching {
+                    startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION), 201)
+                }.onFailure { status.text = "The system folder picker is unavailable; logging and backup continue." }
+            }
+        })
+        layout.addView(Button(this).apply {
+            text = "Remove footage folder access"
+            setOnClickListener { MovementTreeAccess.revoke(this@MainActivity); status.text = "Folder access removed." }
+        })
+        layout.addView(CheckBox(this).apply {
+            text = "Use optional passive GPS speed (no active GPS requests)"
+            isChecked = getSharedPreferences(MOVEMENT_TREE_PREFERENCES, MODE_PRIVATE)
+                .getBoolean(MOVEMENT_GPS_ENABLED, false)
+            setOnCheckedChangeListener { _, checked ->
+                getSharedPreferences(MOVEMENT_TREE_PREFERENCES, MODE_PRIVATE).edit()
+                    .putBoolean(MOVEMENT_GPS_ENABLED, checked).apply()
+                if (checked) requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION), 101)
+                else if (LoggerPreferences.load(this@MainActivity, false).canRun) startLogger()
+            }
+        })
+        layout.addView(Button(this).apply {
+            text = "Optional GPS after reboot: app location settings"
+            setOnClickListener {
+                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:$packageName")))
+            }
+        })
+        layout.addView(TextView(this).apply {
             text = "Before enabling: turn off switch.nissan_tiida_obd2_connection and stop all phone OBD apps. The adapter permits one owner."
         })
         address = field(layout, "BLE adapter address", current.adapterAddress).apply {
@@ -200,11 +239,13 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         foreground = true
+        MovementActivityVisibility.visible = true
         if (::liveStatus.isInitialized) startStatusRefresh()
     }
 
     override fun onPause() {
         foreground = false
+        MovementActivityVisibility.visible = false
         refreshJob?.cancel()
         refreshJob = null
         super.onPause()
@@ -378,6 +419,11 @@ class MainActivity : Activity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 101) {
+            if (LoggerPreferences.load(this, false).canRun) startLogger()
+            status.text = "Passive GPS is optional. Missing permission leaves ACC and OBD movement reporting active."
+            return
+        }
         if (requestCode == 100 && hasLoggerPermissions(this)) {
             startLogger()
         } else if (requestCode == 100) {
@@ -403,10 +449,20 @@ class MainActivity : Activity() {
         }
         val service = Intent(this, ObdLoggerService::class.java).setAction(
             ObdLoggerService.ACTION_RELOAD_CONFIGURATION,
-        )
+        ).putExtra(EXTRA_MOVEMENT_FROM_VISIBLE_ACTIVITY, true)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(service)
         else startService(service)
         status.text = "Logger starting"
+    }
+
+    @Deprecated("Activity result API remains supported on the head unit")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 201 || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        runCatching { MovementTreeAccess.save(this, uri, data.flags) }
+            .onSuccess { status.text = "Read-only DCIM access saved. Closed clips are indexed within one minute." }
+            .onFailure { status.text = "Select the recorder's DCIM folder and allow read access. Logging and backup continue." }
     }
 
     private companion object {

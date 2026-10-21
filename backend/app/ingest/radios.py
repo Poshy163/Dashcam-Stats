@@ -1026,7 +1026,10 @@ def _watchdog_report_functions(
 
 
 def _watchdog_sleep_guard_functions(
-    report: WatchdogReport | None, *, sleep_deadline_uptime_s: int | None = None
+    report: WatchdogReport | None,
+    *,
+    sleep_deadline_uptime_s: int | None = None,
+    maintenance_required: bool = False,
 ) -> str:
     """Shell that folds the unit's own sleep deadline into the watchdog's expiry.
 
@@ -1040,6 +1043,11 @@ def _watchdog_sleep_guard_functions(
     server lease can still end recovery sooner. Without an observed ceiling, retain the
     legacy ACC/property estimate; unreadable inputs leave only the lease in force.
     """
+    from app.ingest.maintenance import watchdog_maintenance_functions
+
+    maintenance_guard = (
+        f"maintenance_seen={int(maintenance_required)}; " + watchdog_maintenance_functions()
+    )
     ceilings = [
         value
         for value in (sleep_deadline_uptime_s, report.sleep_deadline_uptime_s if report else None)
@@ -1050,7 +1058,7 @@ def _watchdog_sleep_guard_functions(
     deadline = min(ceilings) if ceilings else None
     guard_s = report.guard_s if report else WATCHDOG_SLEEP_GUARD_S
     if (report is None and deadline is None) or (guard_s <= 0 and deadline is None):
-        return "sleep_fold() { return 0; }; "
+        return maintenance_guard + "sleep_fold() { maintenance_fold || true; return 0; }; "
     ceiling = (
         f'left="$(({deadline} - {int(guard_s)} - now))"; '
         '[ "$left" -lt "$remaining" ] && { remaining="$left"; '
@@ -1059,9 +1067,15 @@ def _watchdog_sleep_guard_functions(
         else ""
     )
     if deadline is not None:
-        return "sleep_fold() { " + ceiling + "return 0; }; "
+        return (
+            maintenance_guard
+            + "sleep_fold() { maintenance_fold && return 0; "
+            + ceiling
+            + "return 0; }; "
+        )
     return (
-        "sleep_fold() { "
+        maintenance_guard
+        + "sleep_fold() { maintenance_fold && return 0; "
         + f'window="$(/system/bin/getprop {SLEEP_COUNTDOWN_PROPERTY} 2>/dev/null)"; '
         'case "$window" in ""|*[!0-9]*) acc_off_at=""; return 0;; esac; '
         '[ "$window" -gt 0 ] || { acc_off_at=""; return 0; }; '
@@ -1362,11 +1376,14 @@ async def _arm_watchdog(
         f"'{ready_path}' '{lease_path}' '{lease_partial_path}' "
         f"'{expiry_claim_path}' '{script_path}' '{script_partial_path}'; fi; }}; "
     )
+    from app.ingest.maintenance import get_controller as get_maintenance_controller
     from app.ingest.status import get_status
 
     # Reporting is optional (for example an HTTPS-only origin), recovery timing is not.
     guard_functions = _watchdog_sleep_guard_functions(
-        report, sleep_deadline_uptime_s=get_status().sleep_deadline_uptime_s()
+        report,
+        sleep_deadline_uptime_s=get_status().sleep_deadline_uptime_s(),
+        maintenance_required=get_maintenance_controller().snapshot()["active"] is True,
     )
     report_functions = _watchdog_report_functions(
         report,

@@ -1275,6 +1275,8 @@ async def test_heartbeat_does_not_misclassify_deliberate_restore_as_proof_loss(
     read_started = asyncio.Event()
     release_read = asyncio.Event()
     renewed = asyncio.Event()
+    renewal_cancelled = asyncio.Event()
+    release_renewal = asyncio.Event()
     cancelled = asyncio.Event()
     monkeypatch.setattr(radio_coordinator, "HEARTBEAT_INTERVAL_S", 0.001)
     transition = await radio_coordinator.begin(
@@ -1292,7 +1294,16 @@ async def test_heartbeat_does_not_misclassify_deliberate_restore_as_proof_loss(
         return False
 
     async def renew():
-        renewed.set()
+        try:
+            renewed.set()
+            # This test ends at the first renewal after the blocked quiet proof.
+            # Keep that fake call pending until restore closes the heartbeat. A
+            # free-running 1ms heartbeat can otherwise enter an unrelated SQLite
+            # checkpoint while teardown cancels it, leaving aiosqlite's worker
+            # delivering to an already closed per-test event loop.
+            await release_renewal.wait()
+        finally:
+            renewal_cancelled.set()
 
     transition.controller.quiet_state_verified = read
     transition._radios_quiet = True
@@ -1309,6 +1320,8 @@ async def test_heartbeat_does_not_misclassify_deliberate_restore_as_proof_loss(
         assert not cancelled.is_set()
         assert not transition.lease_lost
         assert await transition.restore()
+        assert renewal_cancelled.is_set()
+        assert transition._heartbeat_task is None
     finally:
         release_read.set()
         await transition.close()

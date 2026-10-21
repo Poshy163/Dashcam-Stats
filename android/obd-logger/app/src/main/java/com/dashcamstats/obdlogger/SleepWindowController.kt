@@ -133,6 +133,8 @@ internal sealed interface SleepWindowControllerObservation {
 
     data class Acc(val on: Boolean) : SleepWindowControllerObservation
 
+    data class AccRead(val on: Boolean?) : SleepWindowControllerObservation
+
     data class Attempt(
         val evidence: SleepWindowEvidence,
         val attempt: Int,
@@ -540,6 +542,7 @@ internal class AdaptiveSleepWindowController(
             deadlineTracker.observe(boot, started, elapsedMillis(), on, window)
             on
         }
+        reportObservation(SleepWindowControllerObservation.AccRead(observed))
         reportObservation(SleepWindowControllerObservation.DeadlineUpdated)
         if (observed == null) {
             synchronized(stateLock) { accStateKnown = false }

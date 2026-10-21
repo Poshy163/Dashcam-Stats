@@ -40,6 +40,42 @@ import type {
 } from './types'
 import { apiErrorMessage, apiHeaders } from './apiTransport'
 
+export interface MovementClassTotals {
+  movingObserved: number
+  sampledStationary: number
+  accOffCandidate: number
+  unknown: number
+}
+
+export interface MovementManifestStatus {
+  reportOnly: boolean
+  transferFiltering: boolean
+  state: 'unavailable' | 'ready' | 'stale' | 'invalid' | 'error'
+  checkedAt?: string | null
+  receivedAt?: string | null
+  generatedAt?: string | null
+  reportStatus?: string | null
+  truncated?: boolean
+  producerVersion?: string | null
+  requiresLiveVerification?: boolean
+  manifest?: { clipCount: number; totalBytes: number; classCounts: MovementClassTotals; classBytes: MovementClassTotals; reasonCounts: Record<string, number> } | null
+  inventory?: { clipCount: number; totalBytes: number; matchedClips: number; matchedBytes: number; unmatchedClips: number; identityMismatches: number; classCounts: MovementClassTotals; classBytes: MovementClassTotals } | null
+  cardIdentityVerified: boolean
+  error?: string | null
+}
+
+export interface MaintenanceWakeStatus {
+  active: boolean
+  verified: boolean
+  state: 'inactive' | 'active' | 'restoring' | 'expired' | 'failed'
+  remainingS: number | null
+  expiresAt?: string | null
+  evidenceValidForS: number | null
+  reason?: string | null
+  countdownCancelled: boolean
+  requiresIgnitionCycle: boolean
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -791,6 +827,10 @@ export const api = {
 
   ingest: {
     status: () => request<IngestStatus>('/ingest/status'),
+    movementStatus: () => request<MovementManifestStatus>('/ingest/movement-status'),
+    maintenanceStatus: () => request<MaintenanceWakeStatus>('/ingest/maintenance'),
+    startMaintenance: (durationS: number) => post<MaintenanceWakeStatus>('/ingest/maintenance', { durationS }),
+    stopMaintenance: () => request<MaintenanceWakeStatus>('/ingest/maintenance', { method: 'DELETE' }),
     radioStatus: () => request<IngestRadioStatus>('/ingest/radio-status'),
     run: () => post<{ started: boolean; state: string }>('/ingest/run'),
     cancel: () => post<{ cancelled: boolean }>('/ingest/cancel'),

@@ -330,7 +330,7 @@ class SleepWindowControllerTest {
     }
 
     @Test
-    fun manifestRequestsOnlyNonLocationNetworkVisibility() {
+    fun movementLocationPermissionsDoNotPermitNetworkMutation() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val permissions = context.packageManager
             .getPackageInfo(context.packageName, PackageManager.GET_PERMISSIONS)
@@ -339,8 +339,9 @@ class SleepWindowControllerTest {
             .orEmpty()
 
         assertTrue(Manifest.permission.ACCESS_NETWORK_STATE in permissions)
-        assertFalse(Manifest.permission.ACCESS_FINE_LOCATION in permissions)
-        assertFalse(Manifest.permission.ACCESS_COARSE_LOCATION in permissions)
+        assertTrue(Manifest.permission.ACCESS_FINE_LOCATION in permissions)
+        assertTrue(Manifest.permission.ACCESS_COARSE_LOCATION in permissions)
+        assertTrue(Manifest.permission.FOREGROUND_SERVICE_LOCATION in permissions)
         assertFalse(Manifest.permission.CHANGE_NETWORK_STATE in permissions)
     }
 

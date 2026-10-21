@@ -99,6 +99,11 @@ internal object LiveStatusSummary {
         } ?: "none yet")
         val pending = counter(status, "pending_bundle_count")
         out += "Bundles waiting for the server: $pending"
+        if (status.optBoolean("movement_report_only", false)) {
+            val movement = allowedText(status, "movement_state", setOf("starting", "ready", "directory_required",
+                "directory_unavailable", "storage_unavailable", "scan_failed"))
+            out += "Movement report: $movement · ${counter(status, "movement_clip_count")} clips (advisory only)"
+        }
         out += "Wi-Fi: " + (if (flag(status, "wifi_connected")) "connected" else "off") +
             (if (flag(status, "ingestion_sleep_hold")) " · sleep held for backup" else "")
         if (hasText(status, "last_error")) {
@@ -141,6 +146,7 @@ internal object LiveStatusSummary {
             "Verification: ${if (verified) "verified" else "not verified"}",
             "Sleep error: $sleepError",
             "ACC: $acc · backup hold: $hold",
+            "Passive GPS: ${allowedText(status, "movement_gps_state", setOf("disabled", "permission_required", "passive", "unavailable"))} · coordinates never stored",
             "Pipeline counters · published snapshot",
             "Commands requested / sent / completed: ${counters(metrics, "commands_requested", "commands_sent", "commands_completed")}",
             "Commands blocked / timed out: ${counters(metrics, "commands_blocked", "command_timeouts")}",

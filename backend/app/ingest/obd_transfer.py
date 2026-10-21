@@ -236,6 +236,10 @@ _LOGGER_KEYS = frozenset(
         "pending_bundle_count",
         "sample_count",
         "capabilities",
+        "movement_state",
+        "movement_clip_count",
+        "movement_gps_state",
+        "movement_report_only",
         "metrics",
         "last_error",
         "last_error_at_utc",
@@ -457,6 +461,29 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
         elif key in {"pending_bundle_count", "sample_count"}:
             if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 1_000_000_000:
                 clean[key] = item
+        elif key == "movement_clip_count":
+            if type(item) is int and 0 <= item <= 512:
+                clean[key] = item
+        elif key == "movement_state":
+            if isinstance(item, str) and item in {
+                "ready",
+                "directory_required",
+                "directory_unavailable",
+                "storage_unavailable",
+                "scan_failed",
+            }:
+                clean[key] = item
+        elif key == "movement_gps_state":
+            if isinstance(item, str) and item in {
+                "disabled",
+                "permission_required",
+                "passive",
+                "unavailable",
+            }:
+                clean[key] = item
+        elif key == "movement_report_only":
+            if item is True:
+                clean[key] = True
         elif key == "build_git_sha":
             if isinstance(item, str) and _LOGGER_BUILD_GIT_SHA_RE.fullmatch(item):
                 clean[key] = item

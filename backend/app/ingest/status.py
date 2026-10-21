@@ -351,6 +351,9 @@ class IngestStatus:
         property writes do not prove a native timer restart and cannot extend it.
         """
         with self._lock:
+            from app.ingest.maintenance import get_controller
+
+            get_controller().observe(observation)
             now = time.monotonic()
             changed_boot = (
                 (
@@ -527,6 +530,14 @@ class IngestStatus:
         now = time.monotonic() if now is None else now
         if not self._unit_observation_fresh(now=now) or self._observed_ignition_state != "off":
             return None
+        from app.ingest.maintenance import get_controller
+
+        maintenance = get_controller()
+        maintenance_remaining = maintenance.remaining(self._unit_boot_id)
+        if maintenance_remaining is not None:
+            return maintenance_remaining
+        if maintenance.native_cancelled(self._unit_boot_id):
+            return None
         candidates = []
         unit_remaining = self._unit_countdown_remaining(now=now)
         if unit_remaining is not None:
@@ -556,6 +567,14 @@ class IngestStatus:
             return _Countdown(None, "not_running", "Ignition is on")
         if self._observed_ignition_state != "off":
             return _Countdown(None, "unknown", "Head-unit ignition state is unknown")
+        from app.ingest.maintenance import get_controller
+
+        if get_controller().native_cancelled(self._unit_boot_id):
+            return _Countdown(
+                None,
+                "not_running",
+                "Native countdown cancellation was attempted for maintenance; a real ignition cycle restarts it.",
+            )
         unit_remaining = self._unit_countdown_remaining(now=now)
         server_remaining = (
             max(0.0, self._observed_off_monotonic + self._observed_off_window_s - now)
@@ -818,6 +837,11 @@ class IngestStatus:
     def sleep_deadline_uptime_s(self) -> int | None:
         """A frozen device elapsed-time ceiling for the detached recovery watchdog."""
         with self._lock:
+            from app.ingest.maintenance import get_controller
+
+            if get_controller().native_cancelled(self._unit_boot_id):
+                # The separate maintenance lease is never a fabricated native deadline.
+                return None
             if (
                 self._credible_countdown_remaining() is None
                 or self._operational_deadline_monotonic is None
@@ -835,9 +859,21 @@ class IngestStatus:
             )
 
     def sleep_countdown_remaining_s(self) -> float | None:
-        """Remaining seconds before the head unit sleeps, or None if unknown/offline."""
+        """Operational transfer budget, or None if offline.
+
+        A verified maintenance lease has its own bound; it never claims that the
+        cancelled vendor timer will sleep the unit when that lease expires.
+        """
         if not self.unit_online:
             return None
+        from app.ingest.maintenance import get_controller
+
+        maintenance = get_controller()
+        maintenance_remaining = maintenance.remaining(self._unit_boot_id)
+        if maintenance_remaining is not None and self._observed_ignition_state == "off":
+            return maintenance_remaining
+        if maintenance.native_cancelled(self._unit_boot_id):
+            return 0.0
         if self.ignition_state == "on":
             return float(self.sleep_window_s)
         if self.ignition_state == "off":

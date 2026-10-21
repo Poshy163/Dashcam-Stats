@@ -7,6 +7,11 @@ existing ADB arrival backup.
 The exact producer/validator contracts are [obd-bundle-schema-v1.md](obd-bundle-schema-v1.md)
 and [obd-app-event-schema-v1.md](obd-app-event-schema-v1.md).
 
+Companion 0.3.9 adds optional, report-only on-camera clip movement manifests and server
+maintenance wake holds. Setup, classification limits and physical checks are documented in
+[clip-movement-manifests.md](clip-movement-manifests.md). These reports do not filter or delete
+footage, change the OBD poll plan, or stop the recorder.
+
 ## Why it is an APK
 
 The verified unit is a locked, unrooted UIS7861 head unit running Android 14 (SDK 34). The
@@ -75,9 +80,9 @@ the next boot/recovery transition is the durable evidence for that boundary.
 The server retains the validated mirror for 90 days up to 50,000 rows and exposes it through
 `GET /api/obd/events`, the Backup activity timeline and each matching OBD drive page.
 
-The companion writes and reads back a fixed 900-second countdown while Wi-Fi is connected or a
+The companion writes and reads back a fixed 1200-second countdown while Wi-Fi is connected or a
 valid ingestion lease is active, and a fixed 300 seconds otherwise. Known ACC-on state prevents
-the post-ingestion handoff from narrowing an active Wi-Fi window; it does not select 900 seconds
+the post-ingestion handoff from narrowing an active Wi-Fi window; it does not select 1200 seconds
 by itself. This policy is always on: the server exposes it and both values read-only in Settings,
 coerces any older disabled toggle or duration override back to the fixed contract, and never lets
 the puller branch on a stale cached toggle. The two controllers therefore cannot fight over the
@@ -86,7 +91,7 @@ collection when the vendor property is unavailable. A fresh status advertising
 `adaptive_sleep_window_v2` makes request removal the app's safe completion trigger, so the server
 does not race the final 300-second write. Before accepting that evidence, the server directly
 reads the current property; stale status falls through to its verified 300-second fallback write.
-The server still widens to 900 before arrival recovery and uses the same fallback for v1, missing
+The server still widens to 1200 before arrival recovery and uses the same fallback for v1, missing
 or invalid app status.
 
 ## Build, sign and install

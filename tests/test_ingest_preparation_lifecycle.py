@@ -405,3 +405,34 @@ async def test_shutdown_joins_retained_mirror_even_without_a_current_run(
         release_cleanup.set()
         with contextlib.suppress(asyncio.CancelledError):
             await shutdown
+
+
+@pytest.mark.parametrize("inspection_fails", [False, True])
+async def test_movement_report_precedes_plan_and_never_excludes_footage(
+    prepared_unit, monkeypatch, inspection_fails
+):
+    observed = False
+    original_delta = puller.delta
+
+    async def inspect(address, path, remote, source):
+        nonlocal observed
+        observed = True
+        assert address == prepared_unit.info.address
+        assert remote[0].name == prepared_unit.path.name
+        if inspection_fails:
+            raise RuntimeError("private failure must not stop backup")
+
+    def plan(*args, **kwargs):
+        assert observed
+        return original_delta(*args, **kwargs)
+
+    monkeypatch.setattr(
+        puller,
+        "read_logger_status",
+        AsyncMock(return_value={"capabilities": [puller.movement.CAPABILITY]}),
+    )
+    monkeypatch.setattr(puller.movement, "inspect_before_plan", inspect)
+    monkeypatch.setattr(puller, "delta", plan)
+    result = await asyncio.wait_for(puller.run_pull(info=prepared_unit.info), timeout=1)
+    assert result.state is RunState.OK
+    assert prepared_unit.path.read_bytes() == prepared_unit.payload

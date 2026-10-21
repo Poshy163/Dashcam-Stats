@@ -355,6 +355,8 @@ internal fun durableStatusSignature(status: PublicStatus): String = listOf(
     status.sleepWindowObservedSeconds?.toString().orEmpty(),
     status.sleepWindowVerified.toString(),
     status.sleepWindowError.orEmpty(),
+    status.movementState,
+    status.movementGpsState,
     status.sleepDeadlineEvidence?.let {
         // Observation timestamps get the bounded heartbeat, not an fsync every ACC poll.
         listOf(

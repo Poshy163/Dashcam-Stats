@@ -23,7 +23,18 @@ from starlette.responses import RedirectResponse, Response
 from app.ai.openvino_session import restore_gpu_failure_state
 from app.ai.runtime import describe_media_policy
 from app.api.errors import install_error_handlers
-from app.api.routes import auth, content, heatmap, ingest, media, obd_import, osd_debug, system
+from app.api.routes import (
+    auth,
+    content,
+    heatmap,
+    ingest,
+    ingest_maintenance,
+    ingest_movement,
+    media,
+    obd_import,
+    osd_debug,
+    system,
+)
 from app.api.schemas import HealthOut
 from app.auth import service
 from app.auth.gate import AuthGate, authenticate, request_is_https
@@ -41,7 +52,7 @@ from app.core.settings_service import get_settings_service, init_settings_servic
 from app.db.session import dispose_engine, get_session_factory, init_db
 from app.hardware.detect import detect_hardware_async
 from app.hardware.ffmpeg import media_health
-from app.ingest import origin
+from app.ingest import maintenance, origin
 from app.ingest.obd_reconciliation import reconcile_all_drives
 from app.ingest.obd_storage import reconcile_orphan_bundles, recover_interrupted_validations
 from app.ingest.poller import get_poller
@@ -93,6 +104,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         footage_dir=str(config.footage_dir),
     )
 
+    await maintenance.initialize()
     await init_db()
     await init_settings_service(get_session_factory())
     # Live transfer counters stay memory-only, but "Last copied" is historical truth and
@@ -226,6 +238,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await obd_storage_reconcile
         await get_poller().stop()
+        await maintenance.shutdown()
         await scheduler.stop()
         await pool.stop()
         with contextlib.suppress(Exception):
@@ -273,6 +286,8 @@ def create_app() -> FastAPI:
     app.include_router(heatmap.router)
     app.include_router(osd_debug.router)
     app.include_router(ingest.router)
+    app.include_router(ingest_movement.router)
+    app.include_router(ingest_maintenance.router)
     app.include_router(obd_import.router)
 
     @app.get("/health", response_model=HealthOut, tags=["health"])
