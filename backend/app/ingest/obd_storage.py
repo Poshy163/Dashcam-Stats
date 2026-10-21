@@ -27,12 +27,19 @@ log = get_logger(__name__)
 
 MAX_ERROR_TEXT = 1000
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}")
+_SQL_DETAILS_RE = re.compile(r"(?i)\s*(?:\[SQL:|\[parameters:|\(Background on this error at:)")
 _storage_claim_lock = asyncio.Lock()
 
 
 def redact(value: object, *, token: str | None = None) -> str:
-    """Return bounded single-line error text with bearer credentials removed."""
+    """Return bounded public error text without credentials or database parameters."""
     text = str(value).replace("\r", " ").replace("\n", " ")
+    # SQLAlchemy embeds statement parameters in exception text. Radio leases and report
+    # tokens are legitimate database values, but never belong in UI/history diagnostics.
+    # Keep the underlying error (for example "database is locked"), not the query dump.
+    details = _SQL_DETAILS_RE.search(text)
+    if details is not None:
+        text = text[: details.start()].rstrip()
     text = _BEARER_RE.sub("Bearer [REDACTED]", text)
     if token:
         text = text.replace(token, "[REDACTED]")

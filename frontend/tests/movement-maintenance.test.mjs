@@ -32,7 +32,7 @@ const report = {
 test('current movement counts remain advisory and explicitly retain stationary candidates', () => {
   const html = render(MovementManifestEvidence, { data: report })
   assert.match(html, /Report only/)
-  assert.match(html, /Every recording remains eligible for backup/)
+  assert.match(html, /movement labels alone never exclude footage/)
   assert.match(html, /No movement in sampled readings/)
   assert.match(html, />19</)
   assert.match(html, /28 of 31 inventoried clips matched/)
@@ -59,7 +59,40 @@ test('directory setup and truncated reports explain incomplete coverage without 
   assert.doesNotMatch(setup, />19</)
   const partial = render(MovementManifestEvidence, { data: { ...report, truncated: true } })
   assert.match(partial, /Other clips remain eligible for backup/)
-  assert.doesNotMatch(partial, /saved|deleted|excluded/)
+  assert.doesNotMatch(partial, /saved|deleted/)
+})
+
+const exclusions = {
+  policyVersion: 'parked_visual_quiet_v1', status: 'ready', policyEnabled: true,
+  stale: false, currentCount: 2, currentBytes: 1000, locallyIndexedCount: 0,
+  historicalCount: 8, historicalBytes: 8000, countsAsBackedUp: false, filesDeleted: false,
+}
+
+test('quiet transfer decisions explain card retention and processing without treating movement labels as proof', () => {
+  const html = render(MovementManifestEvidence, { data: { ...report, intentionalExclusions: exclusions } })
+  assert.match(html, /Quiet-clip filtering enabled/)
+  assert.match(html, /2 clips .* excluded in the latest transfer plan/)
+  assert.match(html, /Both camera views must pass/)
+  assert.match(html, /stay on the memory card and are not counted as backed up or sent for processing/)
+  assert.match(html, /8 unique clips/)
+})
+
+test('stale or failed exclusions never claim that the historical plan is current', () => {
+  for (const props of [
+    { data: { ...report, intentionalExclusions: { ...exclusions, stale: true } } },
+    { data: { ...report, intentionalExclusions: { ...exclusions, status: 'invalid' } } },
+    { data: { ...report, intentionalExclusions: exclusions }, error: true },
+  ]) {
+    assert.doesNotMatch(render(MovementManifestEvidence, props), /2 clips .* excluded in the latest transfer plan/)
+  }
+})
+
+test('disabled exclusions and later local copies are explained separately', () => {
+  const disabled = render(MovementManifestEvidence, { data: { ...report, intentionalExclusions: { ...exclusions, policyEnabled: false } } })
+  assert.match(disabled, /Skipping is disabled/)
+  assert.doesNotMatch(disabled, /excluded in the latest transfer plan/)
+  const local = render(MovementManifestEvidence, { data: { ...report, intentionalExclusions: { ...exclusions, locallyIndexedCount: 1 } } })
+  assert.match(local, /1 of these clips also have a local copy/)
 })
 
 test('an awake flag alone never renders as a verified maintenance lease', () => {

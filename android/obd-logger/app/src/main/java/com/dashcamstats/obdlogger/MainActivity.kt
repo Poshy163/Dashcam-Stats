@@ -120,7 +120,7 @@ class MainActivity : Activity() {
         layout.addView(metricsToggle)
         layout.addView(liveMetrics)
         layout.addView(TextView(this).apply {
-            text = "On-camera movement report (advisory only). Footage is never excluded or deleted. " +
+            text = "On-camera movement report. The optional quiet-footage filter below controls transfer; files stay on the card. " +
                 "Choose the recorder's DCIM folder to summarise closed clips. GPS is optional; " +
                 "only speed, uncertainty and coverage are stored, never coordinates."
         })
@@ -136,6 +136,24 @@ class MainActivity : Activity() {
         layout.addView(Button(this).apply {
             text = "Remove footage folder access"
             setOnClickListener { MovementTreeAccess.revoke(this@MainActivity); status.text = "Folder access removed." }
+        })
+        layout.addView(CheckBox(this).apply {
+            text = "Skip quiet parked footage during backup (off by default)"
+            isChecked = getSharedPreferences(MOVEMENT_TREE_PREFERENCES, MODE_PRIVATE)
+                .getBoolean(QUIET_FILTER_ENABLED, false)
+            setOnCheckedChangeListener { _, checked ->
+                getSharedPreferences(MOVEMENT_TREE_PREFERENCES, MODE_PRIVATE).edit()
+                    .putBoolean(QUIET_FILTER_ENABLED, checked).apply()
+                status.text = if (checked) "Quiet filtering enabled. Both lenses require complete visual and ignition evidence; uncertain footage uploads."
+                    else "Quiet filtering disabled. Normal backup includes all footage."
+            }
+        })
+        layout.addView(TextView(this).apply {
+            text = "Experimental quiet filtering compares every decoded frame for scene change on the camera. It retains driving, " +
+                "ignition transitions, locked clips, detected activity, unusable light and uncertain analysis. Small or static objects " +
+                "may not be recognised; enable only after reviewing the camera's results. Analysis pauses during " +
+                "driving, backup, heat or low memory. Pending analysis may delay transfer by at most six minutes; " +
+                "activity and uncertain results upload normally. No footage is deleted."
         })
         layout.addView(CheckBox(this).apply {
             text = "Use optional passive GPS speed (no active GPS requests)"

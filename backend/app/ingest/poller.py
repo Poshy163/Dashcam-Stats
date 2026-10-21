@@ -214,6 +214,16 @@ class IngestPoller:
             # still terminal below; clearing an old error budget does not restart it.
             self._error_retries_started = 0
 
+        if getattr(status, "policy_deferred_files", 0) and status.state in (
+            RunState.IDLE,
+            RunState.OK,
+            RunState.PARTIAL,
+        ):
+            # Deferred files have a fixed clip-end deadline, not a renewed visit lease.
+            # Re-evaluate without another radio cycle when only analysis is pending;
+            # expiry or a short/unknown native sleep budget restores ordinary upload.
+            return status.since_finished() >= IDLE_RECHECK_S
+
         if status.state is RunState.IDLE:
             now = time.monotonic()
             if self._idle_since and now - self._idle_since < IDLE_RECHECK_S:

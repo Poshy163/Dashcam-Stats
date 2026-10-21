@@ -242,6 +242,11 @@ _LOGGER_KEYS = frozenset(
         "movement_clip_count",
         "movement_gps_state",
         "movement_report_only",
+        "transfer_policy_enabled",
+        "transfer_policy_state",
+        "transfer_policy_skip_count",
+        "transfer_policy_upload_count",
+        "transfer_policy_defer_count",
         "metrics",
         "last_error",
         "last_error_at_utc",
@@ -436,6 +441,7 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
         "ingestion_sleep_hold",
         "ingestion_sleep_hold_known",
         "sleep_window_verified",
+        "transfer_policy_enabled",
     }
     for key, item in value.items():
         if key not in _LOGGER_KEYS:
@@ -463,8 +469,22 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
         elif key in {"pending_bundle_count", "sample_count"}:
             if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 1_000_000_000:
                 clean[key] = item
-        elif key == "movement_clip_count":
+        elif key in {
+            "movement_clip_count",
+            "transfer_policy_skip_count",
+            "transfer_policy_upload_count",
+            "transfer_policy_defer_count",
+        }:
             if type(item) is int and 0 <= item <= 512:
+                clean[key] = item
+        elif key == "transfer_policy_state":
+            if isinstance(item, str) and item in {
+                "disabled",
+                "waiting",
+                "scanning",
+                "ready",
+                "unavailable",
+            }:
                 clean[key] = item
         elif key == "movement_state":
             if isinstance(item, str) and item in {

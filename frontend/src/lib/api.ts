@@ -62,6 +62,20 @@ export interface MovementManifestStatus {
   inventory?: { clipCount: number; totalBytes: number; matchedClips: number; matchedBytes: number; unmatchedClips: number; identityMismatches: number; classCounts: MovementClassTotals; classBytes: MovementClassTotals } | null
   cardIdentityVerified: boolean
   error?: string | null
+  intentionalExclusions?: {
+    policyVersion: string
+    status: string
+    policyEnabled: boolean
+    evaluatedAt: string | null
+    stale: boolean
+    currentCount: number
+    currentBytes: number
+    locallyIndexedCount: number
+    historicalCount: number
+    historicalBytes: number
+    filesDeleted: false
+    countsAsBackedUp: false
+  }
 }
 
 export interface MaintenanceWakeStatus {
@@ -233,6 +247,10 @@ export interface IngestStatus {
   backlogKnown: boolean
   /** Recordings left alone because the camera is still writing them. */
   activeSkipped: number
+  /** Temporary analysis wait; these files are still pending on the card. */
+  policyDeferredFiles?: number
+  policyDeferredBytes?: number
+  policyDeferredUntilUtc?: string | null
   /** The unit's WiFi frequency in MHz as last read by the band gate; null when unknown. */
   wifiFrequencyMhz: number | null
   /** True while a transfer is being held waiting for a 5 GHz link. */

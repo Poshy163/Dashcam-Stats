@@ -86,6 +86,9 @@ class IngestStatus:
         #: checked" and must not be presented as an empty card.
         self.backlog_known = False
         self.active_skipped = 0
+        self.policy_deferred_files = 0
+        self.policy_deferred_bytes = 0
+        self.policy_deferred_until_utc: str | None = None
         #: The unit's WiFi frequency in MHz as last read by the band gate, whether a
         #: transfer is currently being held for it, and why. Cleared when the unit leaves:
         #: the reading describes a link that no longer exists, and the next arrival may
@@ -197,6 +200,9 @@ class IngestStatus:
             self.bytes_total = self.bytes_done = 0
             self.backlog_known = False
             self.active_skipped = 0
+            self.policy_deferred_files = 0
+            self.policy_deferred_bytes = 0
+            self.policy_deferred_until_utc = None
             self.current_file = None
             self.last_error = None
             # A run that has actually begun is not being held for anything. Both holds are
@@ -267,6 +273,7 @@ class IngestStatus:
             self.backlog_bytes = plan.backlog_bytes
             self.backlog_known = True
             self.active_skipped = plan.active_skipped
+            self.set_policy_deferred(plan)
 
     def extend_plan(self, plan: DeltaPlan) -> None:
         """Grow the run's totals for a sweep: recordings found by re-checking the card
@@ -276,6 +283,13 @@ class IngestStatus:
             self.files_total += len(plan.files)
             self.bytes_total += plan.bytes
             self.active_skipped = plan.active_skipped
+            self.set_policy_deferred(plan)
+
+    def set_policy_deferred(self, plan: DeltaPlan) -> None:
+        with self._lock:
+            self.policy_deferred_files = plan.policy_deferred_files
+            self.policy_deferred_bytes = plan.policy_deferred_bytes
+            self.policy_deferred_until_utc = plan.policy_deferred_until_utc
 
     def set_phase(self, phase: Phase) -> None:
         with self._lock:
@@ -976,6 +990,9 @@ class IngestStatus:
                 "backlog_bytes": self.backlog_bytes,
                 "backlog_known": self.backlog_known,
                 "active_skipped": self.active_skipped,
+                "policy_deferred_files": self.policy_deferred_files,
+                "policy_deferred_bytes": self.policy_deferred_bytes,
+                "policy_deferred_until_utc": self.policy_deferred_until_utc,
                 "wifi_frequency_mhz": self.wifi_frequency_mhz,
                 "wifi_band_hold": self.wifi_band_hold,
                 "wifi_band_hold_reason": self.wifi_band_hold_reason,

@@ -1132,6 +1132,63 @@ class UnitLogEntry(Base):
     __table_args__ = (Index("ix_unit_log_entries_tag_time", "tag", "occurred_at"),)
 
 
+class ClipTransferEvaluation(Base):
+    """Latest observed camera exclusion plan, separate from footage durability."""
+
+    __tablename__ = "clip_transfer_evaluations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    generation: Mapped[str] = mapped_column(String(36))
+    evaluated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    policy_enabled: Mapped[bool] = mapped_column(Boolean)
+    policy_version: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32))
+    source_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    card_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    manifest_generated_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    considered_count: Mapped[int] = mapped_column(Integer)
+    considered_bytes: Mapped[int] = mapped_column(BigInteger)
+    excluded_count: Mapped[int] = mapped_column(Integer)
+    excluded_bytes: Mapped[int] = mapped_column(BigInteger)
+
+
+class ClipTransferExclusion(Base):
+    """Observed skip evidence; neither a media row nor proof a clip was never copied.
+
+    Exact identities deduplicate repeat inventories. A later ordinary upload may index
+    the clip, which projections report independently instead of inventing missing media.
+    """
+
+    __tablename__ = "clip_transfer_exclusions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    identity_sha256: Mapped[str] = mapped_column(String(64), unique=True)
+    source_id: Mapped[str] = mapped_column(String(36))
+    card_id: Mapped[str] = mapped_column(String(64))
+    clip_id: Mapped[str] = mapped_column(String(36))
+    relative_path: Mapped[str] = mapped_column(String(128))
+    filename: Mapped[str] = mapped_column(String(64), index=True)
+    camera_key: Mapped[str] = mapped_column(String(16))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    mtime_ms: Mapped[int] = mapped_column(BigInteger)
+    fingerprint_json: Mapped[dict] = mapped_column(JSON)
+    started_at: Mapped[datetime] = mapped_column(UtcDateTime)
+    ended_at: Mapped[datetime] = mapped_column(UtcDateTime)
+    policy_version: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(String(64))
+    proof_json: Mapped[dict] = mapped_column(JSON)
+    first_observed_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    last_observed_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    observation_count: Mapped[int] = mapped_column(Integer, default=1)
+    latest_generation: Mapped[str] = mapped_column(String(36), index=True)
+
+    __table_args__ = (
+        Index("ix_clip_exclusions_span", "started_at", "ended_at"),
+        Index("ix_clip_exclusions_observed", "last_observed_at", "id"),
+    )
+
+
 class AppSetting(Base):
     """UI-editable configuration. Values are JSON so types survive round-tripping."""
 

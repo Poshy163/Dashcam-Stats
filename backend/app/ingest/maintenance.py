@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -33,6 +34,13 @@ SYSTEMUI_SHA256 = "f3f7e00d938c6c74a88c5db24c60a908fbcd7923a7098f2b65439465921d6
 EVIDENCE_TTL_S = 30.0
 DEVICE_HEARTBEAT_TTL_S = 45
 HEARTBEAT_INTERVAL_S = 10.0
+HEARTBEAT_REFRESH_TIMEOUT_S = 14.0
+UI_DUMP_TIMEOUT_S = 5
+UI_SCREEN_TIMEOUT_S = 8.0
+UI_HELPER_PATH = "/data/local/tmp/.dashcam_stats_fresh_ui_v1.dex"
+UI_HELPER_ASSET = Path(__file__).with_name("assets") / "fresh-ui.dex"
+UI_HELPER_SHA256 = "0f331af612480bd7fa63ee65b16b3dd9a8cda4a5308daecf484a1a473cc8f5e4"
+UI_HELPER_CLASS = "com.dashcamstats.maintenance.FreshUiSnapshot"
 RESTORE_RESERVE_S = 60
 MAX_DURATION_S = 1800
 MAX_UI_BYTES = 128 * 1024
@@ -144,16 +152,62 @@ async def _power(address: str) -> PowerProof:
     return proof
 
 
-async def _screen(address: str) -> str:
-    # A fixed helper path contains no footage or credentials. A failed/partial dump
-    # cannot reuse yesterday's XML: remove it first and require the dump's success.
-    path = "/data/local/tmp/.dashcam_stats_maintenance_ui.xml"
-    return await adb.shell(
+async def _ensure_ui_helper(address: str) -> None:
+    # This small generated asset has tracked source and a reproducible local build.
+    # Refuse a damaged server package before uploading or executing anything.
+    metadata = UI_HELPER_ASSET.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or not 1 <= metadata.st_size <= 16 * 1024
+        or hashlib.sha256(UI_HELPER_ASSET.read_bytes()).hexdigest() != UI_HELPER_SHA256
+    ):
+        raise MaintenanceRefused("The verified maintenance screen helper is unavailable.")
+    reply = await adb.shell(
         address,
-        f"rm -f '{path}'; if timeout 7 uiautomator dump --compressed '{path}' "
-        f">/dev/null 2>&1; then head -c {MAX_UI_BYTES + 1} '{path}'; fi; rm -f '{path}'",
-        timeout=9.0,
+        f"if [ -f '{UI_HELPER_PATH}' ] && [ ! -L '{UI_HELPER_PATH}' ]; "
+        f"then sha256sum '{UI_HELPER_PATH}' 2>/dev/null; fi; exit 0",
+        timeout=1.0,
     )
+    if reply.split() == [UI_HELPER_SHA256, UI_HELPER_PATH]:
+        return
+    partial = f"{UI_HELPER_PATH}.{uuid.uuid4().hex}.partial"
+    result = await adb._adb("-s", address, "push", str(UI_HELPER_ASSET), partial, timeout=3.0)
+    if result.returncode:
+        raise MaintenanceRefused("The verified maintenance screen helper could not be installed.")
+    reply = await adb.shell(
+        address,
+        f"chmod 600 '{partial}' && [ ! -d '{UI_HELPER_PATH}' ] && "
+        f"mv -f '{partial}' '{UI_HELPER_PATH}' && sha256sum '{UI_HELPER_PATH}'; "
+        f"result=$?; rm -f '{partial}'; exit \"$result\"",
+        timeout=1.0,
+    )
+    if reply.split() != [UI_HELPER_SHA256, UI_HELPER_PATH]:
+        raise MaintenanceRefused("The on-device maintenance screen helper was not verified.")
+
+
+async def _screen(address: str) -> str:
+    # The standard dump waits for one idle second: a one-second native countdown
+    # can prevent it from ever producing XML. A fresh accessibility connection gets
+    # the current root directly. Its output remains subject to the exact parser.
+    path = f"/data/local/tmp/.dashcam_stats_maintenance_ui.{uuid.uuid4().hex}.xml"
+    try:
+        async with asyncio.timeout(UI_SCREEN_TIMEOUT_S):
+            await _ensure_ui_helper(address)
+            return await adb.shell(
+                address,
+                f"umask 077; trap \"rm -f '{path}'\" EXIT HUP INT TERM; "
+                f"rm -f '{path}' && [ -f '{UI_HELPER_PATH}' ] && [ ! -L '{UI_HELPER_PATH}' ] && "
+                f"digest=\"$(sha256sum '{UI_HELPER_PATH}' 2>/dev/null)\" && "
+                f"[ \"${{digest%% *}}\" = '{UI_HELPER_SHA256}' ] && "
+                f"CLASSPATH='{UI_HELPER_PATH}:/system/framework/uiautomator.jar' "
+                f"timeout {UI_DUMP_TIMEOUT_S} app_process /data/local/tmp {UI_HELPER_CLASS} '{path}' "
+                f">/dev/null 2>&1 && [ -s '{path}' ] && [ ! -L '{path}' ] && "
+                f"head -c {MAX_UI_BYTES + 1} '{path}'; "
+                f"result=$?; rm -f '{path}'; exit \"$result\"",
+                timeout=6.0,
+            )
+    except (OSError, TimeoutError, adb.AdbError) as exc:
+        raise MaintenanceRefused("The dashcam screen could not be safely identified.") from exc
 
 
 async def _attest(address: str) -> None:
@@ -497,12 +551,15 @@ class MaintenanceController:
                 if self._state != "active":
                     break
                 assert self._address is not None
-                if countdown_target(await _screen(self._address)) is not None:
-                    raise MaintenanceRefused("A new native countdown appeared; maintenance ended.")
-                proof = await _power(self._address)
-                if proof.boot_id != self._boot:
-                    raise MaintenanceRefused("The device boot changed; maintenance ended.")
-                await self._publish(proof)
+                async with asyncio.timeout(HEARTBEAT_REFRESH_TIMEOUT_S):
+                    if countdown_target(await _screen(self._address)) is not None:
+                        raise MaintenanceRefused(
+                            "A new native countdown appeared; maintenance ended."
+                        )
+                    proof = await _power(self._address)
+                    if proof.boot_id != self._boot:
+                        raise MaintenanceRefused("The device boot changed; maintenance ended.")
+                    await self._publish(proof)
                 self._verified_at = time.monotonic()
             await self._end_hold(
                 "expired", "Maintenance ended; radios are restored before backup can resume."

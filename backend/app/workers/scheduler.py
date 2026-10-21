@@ -44,6 +44,7 @@ _POST_PROCESS_IDLE_QUEUE_LIMIT = 512
 # Bound the extra full share walks even when a camera continues changing one file.
 _SETTLING_SCAN_LIMIT = 3
 _SETTLING_SCAN_MIN_DELAY_S = 30.0
+_INGEST_SCAN_DEBOUNCE_S = 2.0
 
 
 @dataclass(slots=True)
@@ -82,6 +83,8 @@ class Scheduler:
         self._settling_scan_due_at: float | None = None
         self._settling_scan_remaining = 0
         self._settling_scan_generation = 0
+        self._ingest_scan_due_at: float | None = None
+        self._ingest_scan_generation = 0
 
     async def start(self) -> None:
         if self._running:
@@ -188,6 +191,7 @@ class Scheduler:
             # This independent deadline survives the TaskState.finally assignment above,
             # including manual scans requested while another scheduled task was running.
             try:
+                await self._run_due_ingest_scan()
                 await self._run_due_settling_scan()
             except asyncio.CancelledError:
                 raise
@@ -218,10 +222,38 @@ class Scheduler:
     async def _run_scan(self) -> None:
         await self._scan_with_followup(trigger="scheduled")
 
+    def request_ingest_scan(self) -> bool:
+        """Coalesce completed footage batches on the existing serial scan loop."""
+        if not self._running:
+            return False
+        self._ingest_scan_generation += 1
+        due = time.monotonic() + _INGEST_SCAN_DEBOUNCE_S
+        if self._ingest_scan_due_at is None:
+            self._ingest_scan_due_at = due
+        else:
+            self._ingest_scan_due_at = min(self._ingest_scan_due_at, due)
+        return True
+
+    async def _run_due_ingest_scan(self, now: float | None = None) -> bool:
+        moment = time.monotonic() if now is None else now
+        if self._ingest_scan_due_at is None or moment < self._ingest_scan_due_at:
+            return False
+        # Consume before awaiting settings/the scan so a failure cannot retry every tick.
+        self._ingest_scan_due_at = None
+        if not await get_settings_service().scan_enabled():
+            return False
+        await self._scan_with_followup(trigger="ingest")
+        return True
+
     async def _scan_with_followup(
         self, *, trigger: str, generation: int | None = None
     ) -> ScanSummary:
+        ingest_generation = self._ingest_scan_generation
         summary = await self._scanner.scan(trigger=trigger)
+        if ingest_generation == self._ingest_scan_generation:
+            # A scheduled/manual scan can already cover a pending batch. A notification
+            # arriving during the walk gets a newer generation and keeps its own deadline.
+            self._ingest_scan_due_at = None
         earlier_due = None
         if generation is None:
             # A real scheduled/manual scan starts a new bounded chain. Register before
@@ -526,10 +558,15 @@ class Scheduler:
     def describe(self) -> list[dict[str, object]]:
         descriptions = [task.as_dict() for task in self._tasks]
         for item in descriptions:
-            if item["name"] == "scan" and self._settling_scan_due_at is not None:
+            deadlines = [
+                value
+                for value in (self._settling_scan_due_at, self._ingest_scan_due_at)
+                if value is not None
+            ]
+            if item["name"] == "scan" and deadlines:
                 item["seconds_until_next"] = min(
                     item["seconds_until_next"],
-                    max(0.0, round(self._settling_scan_due_at - time.monotonic(), 1)),
+                    max(0.0, round(min(deadlines) - time.monotonic(), 1)),
                 )
         return descriptions
 
@@ -543,6 +580,11 @@ async def _fixed(value):
 
 
 _scheduler: Scheduler | None = None
+
+
+def request_ingest_scan() -> bool:
+    """Notify an already-running scheduler; startup's normal scan covers offline arrivals."""
+    return _scheduler.request_ingest_scan() if _scheduler is not None else False
 
 
 def get_scheduler() -> Scheduler:

@@ -16,6 +16,7 @@ Two details matter more than they look:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from weakref import WeakKeyDictionary
@@ -35,6 +36,7 @@ from app.db.models import (
     TrackedObject,
 )
 from app.db.retry import commit_with_retry
+from app.ingest.clip_exclusions import IntentionalGapBarriers, intentional_intervals
 from app.journeys.motion import assess_motion
 from app.journeys.track import single_track
 from app.osd import haversine_m
@@ -207,7 +209,8 @@ class JourneyBuilder:
             await self._refresh_start_positions(session, movable[start : start + _ID_CHUNK])
             await commit_with_retry(session, what="prepare journey positions")
 
-        clusters = self._cluster(movable, gap, use_gps, max_jump_m)
+        intentional_gaps = await self._intentional_gaps(session, movable)
+        clusters = self._cluster(movable, gap, use_gps, max_jump_m, intentional_gaps)
         # Keep every old membership until its replacement commits. Deleting the library
         # before the first per-journey commit published an almost empty library and left
         # the remaining recordings orphaned if the rebuild stopped. Reusing a row also
@@ -733,7 +736,8 @@ class JourneyBuilder:
             return False
 
         claimed: set[int] = set()
-        for cluster in self._cluster(movable, gap, use_gps, max_jump_m):
+        intentional_gaps = await self._intentional_gaps(session, movable)
+        for cluster in self._cluster(movable, gap, use_gps, max_jump_m, intentional_gaps):
             ids = {r.journey_id for r in cluster.recordings}
             if len(cluster.recordings) < min_recordings:
                 # These would be detached; they are stale unless they already are.
@@ -774,12 +778,31 @@ class JourneyBuilder:
             await session.execute(delete(Journey).where(Journey.id.in_(orphan_ids)))
         return len(orphan_ids)
 
+    @staticmethod
+    async def _intentional_gaps(
+        session: AsyncSession,
+        recordings: Sequence[Recording | Journey],
+    ) -> IntentionalGapBarriers:
+        timed = [recording for recording in recordings if recording.started_at is not None]
+        if not timed:
+            return IntentionalGapBarriers()
+        start = min(as_utc(recording.started_at) for recording in timed)
+        end = max(as_utc(recording.ended_at or recording.started_at) for recording in timed)
+        return IntentionalGapBarriers.from_intervals(
+            await intentional_intervals(
+                session,
+                start=start,
+                end=end,
+            )
+        )
+
     def _cluster(
         self,
         recordings: list[Recording],
         gap: timedelta,
         use_gps: bool,
         max_jump_m: float,
+        intentional_gaps: IntentionalGapBarriers | None = None,
     ) -> list[_Cluster]:
         clusters: list[_Cluster] = []
         current: list[Recording] = []
@@ -791,7 +814,14 @@ class JourneyBuilder:
                 previous = recording
                 continue
 
-            if self._same_journey(previous, recording, gap, use_gps, max_jump_m):
+            if self._same_journey(
+                previous,
+                recording,
+                gap,
+                use_gps,
+                max_jump_m,
+                intentional_gaps,
+            ):
                 current.append(recording)
             else:
                 clusters.append(_Cluster(current))
@@ -815,6 +845,7 @@ class JourneyBuilder:
         gap: timedelta,
         use_gps: bool,
         max_jump_m: float,
+        intentional_gaps: IntentionalGapBarriers | None = None,
     ) -> bool:
         prev_end = as_utc(previous.ended_at or previous.started_at)
         candidate_start = as_utc(candidate.started_at)
@@ -822,6 +853,11 @@ class JourneyBuilder:
             return False
 
         if candidate_start - prev_end > gap:
+            return False
+        # A deliberately omitted quiet parked interval is an explicit boundary even
+        # when shorter than the normal adjacency tolerance. Available overlapping rear
+        # or front coverage still wins: there must be real uncovered time between them.
+        if intentional_gaps and intentional_gaps.blocks(prev_end, candidate_start):
             return False
 
         if use_gps and max_jump_m > 0:
@@ -1415,17 +1451,61 @@ class JourneyBuilder:
 
         gap = timedelta(minutes=float(settings.get_nowait("journeys.gap_minutes")))
 
-        journey = (
-            await session.execute(
-                select(Journey)
-                .where(
-                    Journey.started_at <= recording.started_at + gap,
-                    Journey.ended_at >= recording.started_at - gap,
+        candidates = list(
+            (
+                await session.execute(
+                    select(Journey)
+                    .where(
+                        Journey.started_at <= recording.started_at + gap,
+                        Journey.ended_at >= recording.started_at - gap,
+                    )
+                    .order_by(Journey.started_at.desc())
                 )
-                .order_by(Journey.started_at.desc())
-                .limit(1)
+            ).scalars()
+        )
+        journey = None
+        for candidate in candidates:
+            if candidate.manual:
+                journey = candidate
+                break
+            barriers = await self._intentional_gaps(session, [candidate, recording])
+            # Keep the ordinary incremental path cheap for the large existing library:
+            # only a span containing an audited omission needs its member recordings.
+            if not barriers.starts:
+                journey = candidate
+                break
+            members = list(
+                (
+                    await session.scalars(
+                        select(Recording).where(
+                            Recording.journey_id == candidate.id,
+                            Recording.ignored.is_(False),
+                            Recording.id != recording.id,
+                            Recording.started_at.is_not(None),
+                            _journey_ready_recording(),
+                        )
+                    )
+                ).all()
             )
-        ).scalar_one_or_none()
+            combined = sorted(
+                [*members, recording],
+                key=lambda row: (as_utc(row.started_at), row.id or 0),
+            )
+            # When an omission is involved, use the same clustering as a rebuild.
+            gap_clusters = self._cluster(
+                combined,
+                gap,
+                bool(settings.get_nowait("journeys.use_gps_continuity")),
+                float(settings.get_nowait("journeys.max_jump_km")) * 1000.0,
+                barriers,
+            )
+            if any(
+                recording in cluster.recordings
+                and any(member in cluster.recordings for member in members)
+                for cluster in gap_clusters
+            ):
+                journey = candidate
+                break
 
         if journey is None:
             journey = Journey(

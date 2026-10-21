@@ -76,6 +76,11 @@ data class PublicStatus(
     val movementState: String = "starting",
     val movementClipCount: Int = 0,
     val movementGpsState: String = "disabled",
+    val transferPolicyEnabled: Boolean = false,
+    val transferPolicyState: String = "disabled",
+    val transferPolicySkipCount: Int = 0,
+    val transferPolicyUploadCount: Int = 0,
+    val transferPolicyDeferCount: Int = 0,
     val lastError: String? = null,
     val lastErrorAtUtc: String? = null,
 )
@@ -136,6 +141,7 @@ object StatusPublisher {
                         "app_event_stream_v1",
                         "sleep_deadline_evidence_v1",
                         "clip_movement_manifest_v1",
+                        "clip_transfer_policy_v1",
                     ),
                 ),
             )
@@ -176,6 +182,11 @@ object StatusPublisher {
             .put("movement_clip_count", status.movementClipCount)
             .put("movement_gps_state", status.movementGpsState)
             .put("movement_report_only", true)
+            .put("transfer_policy_enabled", status.transferPolicyEnabled)
+            .put("transfer_policy_state", status.transferPolicyState)
+            .put("transfer_policy_skip_count", status.transferPolicySkipCount)
+            .put("transfer_policy_upload_count", status.transferPolicyUploadCount)
+            .put("transfer_policy_defer_count", status.transferPolicyDeferCount)
             .put("sleep_deadline_evidence", status.sleepDeadlineEvidence?.let { value ->
                 JSONObject()
                     .put("schema_version", 1)

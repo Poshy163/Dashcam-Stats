@@ -24,6 +24,7 @@ from app.core.logging import get_logger
 from app.db.models import IngestRadioTransition, IngestRun, UnifiCredential, utcnow
 from app.ingest import puller, radio_coordinator, unifi
 from app.ingest.models import RunState
+from app.ingest.obd_storage import redact
 from app.ingest.status import get_status
 
 log = get_logger(__name__)
@@ -33,7 +34,11 @@ router = APIRouter(prefix="/api", tags=["ingest"])
 
 @router.get("/ingest/status", summary="Live ingest progress")
 async def ingest_status() -> dict[str, object]:
-    return get_status().snapshot()
+    snapshot = get_status().snapshot()
+    for key in ("last_error", "radio_quieting_hold_reason"):
+        if snapshot.get(key) is not None:
+            snapshot[key] = redact(snapshot[key])
+    return snapshot
 
 
 def _radio_baseline(value: str) -> str:
@@ -338,7 +343,7 @@ async def ingest_history(session: SessionDep, page: PaginationDep) -> dict[str, 
                 "files_transferred": row.files_transferred,
                 "bytes_transferred": row.bytes_transferred,
                 "throughput_mbs_avg": row.throughput_mbs_avg,
-                "error": row.error,
+                "error": redact(row.error) if row.error else None,
             }
             for row in rows
         ],

@@ -26,15 +26,18 @@ export function MovementManifestEvidence({ data, loading = false, error = false 
   const current = !error && data?.state === 'ready' && data.reportStatus === 'ready'
   const summary = current ? data.inventory : null
   const setupMessage = data?.state === 'ready' && data.reportStatus ? setupMessages[data.reportStatus] : undefined
+  const exclusions = !error ? data?.intentionalExclusions : undefined
+  const filtering = exclusions?.policyEnabled === true
+  const currentExclusions = filtering && !exclusions.stale && exclusions.status === 'ready'
   return (
     <section className="card mb-6 px-5 py-4" aria-label="On-camera movement reports">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-base font-semibold">On-camera movement</h2>
-        <span className="text-xs font-medium text-content-muted">Report only</span>
+        <span className="text-xs font-medium text-content-muted">{filtering ? 'Quiet-clip filtering enabled' : 'Report only'}</span>
       </div>
       <p className="mt-1 text-sm text-content-muted">
         Small clip summaries use ignition and movement readings recorded on the dashcam.
-        Every recording remains eligible for backup, including stationary candidates.
+        {' '}These movement labels alone never exclude footage from backup.
       </p>
       {summary ? (
         <>
@@ -68,6 +71,20 @@ export function MovementManifestEvidence({ data, loading = false, error = false 
       )}
       {data?.truncated && <p className="mt-2 text-xs text-state-warn">This report covers part of the card. Other clips remain eligible for backup.</p>}
       {data?.receivedAt && <p className="mt-2 text-xs text-content-faint">Last report received {formatRelative(data.receivedAt)}{data.producerVersion ? ` · companion ${data.producerVersion}` : ''}.</p>}
+      {exclusions && <div className="mt-4 border-t border-line pt-4" aria-label="Quiet footage transfer decisions">
+        <h3 className="text-sm font-semibold">Quiet parked footage</h3>
+        <p className="mt-1 text-sm text-content-muted">
+          {currentExclusions
+            ? `${exclusions.currentCount} clips (${formatBytes(exclusions.currentBytes)}) excluded in the latest transfer plan.`
+            : filtering
+              ? 'Waiting for a fresh, verified quiet-clip transfer plan. Unverified footage uploads normally.'
+              : 'Skipping is disabled. All footage remains eligible for backup.'}
+        </p>
+        <p className="mt-2 text-xs text-content-muted">Both camera views must pass the visual check with ignition off. Activity, locked clips, darkness and incomplete checks upload normally. Excluded files stay on the memory card and are not counted as backed up or sent for processing.</p>
+        <p className="mt-2 text-xs text-content-faint">This experimental scene-change check can miss very small or distant activity.</p>
+        {currentExclusions && exclusions.locallyIndexedCount > 0 && <p className="mt-2 text-xs text-content-muted">{exclusions.locallyIndexedCount} of these clips also have a local copy from another transfer and can be processed normally.</p>}
+        {exclusions.historicalCount > 0 && <p className="mt-2 text-xs text-content-faint">Saved exclusion decisions cover {exclusions.historicalCount} unique clips ({formatBytes(exclusions.historicalBytes)}). This history is separate from the current card inventory.</p>}
+      </div>}
     </section>
   )
 }

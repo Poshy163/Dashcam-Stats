@@ -9,12 +9,41 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 | | |
 |---|---|
 | Version | **0.3.9** (`versionCode` 22) |
-| Source | `android/obd-logger/` (0.3.9 / code 22) |
+| Source candidate | `android/obd-logger/` (0.3.10 / code 23); installed version remains 0.3.9 until an in-place update is verified |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
 | Poll plan | 7; five-second target with measured optional-command admission |
 | Deployment | 0.3.9/code 22 was installed in place on 21 October with the production certificate, preserved app UID and settings, and verified runtime revision `af7e532f4619`. |
+
+### Candidate 0.3.10
+
+- Experimental on-camera scene-change screening can omit quiet parked front/rear pairs
+  from transfer after separate companion and server opt-in. Both default off. Locked,
+  active, dark, uncertain or incompletely analysed clips upload normally; excluded clips
+  stay on the card. Short analysis deferrals remain backlog and expire by clip end plus
+  six minutes or earlier when the native sleep budget is insufficient.
+- A separate durable exclusion ledger and Backup page distinguish decisions from copied
+  files. Exclusions create no recordings or processing jobs; later uploads scan normally.
+  Known omitted intervals cannot bridge automatic journeys without retained camera coverage.
+- Backup commits coalesce an immediate scanner handoff, preserving scanner enablement,
+  settling and automatic-processing settings. Historical ingest errors redact SQL parameter
+  dumps as well as bearer credentials.
+- Private real-footage grids replayed through the actual Kotlin v2 tracker classified both
+  reviewed quiet views as quiet, the parked pedestrian and driving views as activity, and
+  the dark view as unavailable. This covers those examples; small/distant activity and
+  sustained decoder capacity still require broader physical validation.
+- The physical feasibility probe decoded only 44.6 seconds within a 45-second budget.
+  A later SoC reading was 94 C. The candidate refuses analysis at 85 C or above and fails
+  open to ordinary upload. It is not yet installed or activated on the camera.
+- Local candidate validation: 244 Android tests passed, including the five private
+  production-tracker replays, background-thread priority and cache-write failure
+  containment. Both Android lint/build variants passed (zero errors, 56 warnings).
+  All 206 frontend tests, frontend lint and production build passed.
+  Full backend regression passed: 3,162 tests with 33 platform/fixture skips; Ruff passed.
+
+See [quiet-clip-transfer-policy.md](quiet-clip-transfer-policy.md) for the exact contract,
+resource limits and remaining physical acceptance checks.
 
 ### What changed in 0.3.9
 

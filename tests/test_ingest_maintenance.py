@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -93,6 +96,161 @@ def test_exact_power_and_countdown_are_recognised():
 def test_ambiguous_malformed_unsafe_or_imminent_screen_refuses(xml):
     with pytest.raises(maintenance.MaintenanceRefused):
         maintenance.countdown_target(xml)
+
+
+def test_bundled_ui_helper_matches_reviewed_generated_digest():
+    raw = maintenance.UI_HELPER_ASSET.read_bytes()
+    assert raw.startswith(b"dex\n")
+    assert hashlib.sha256(raw).hexdigest() == maintenance.UI_HELPER_SHA256
+
+
+@pytest.mark.parametrize("dump_mode", ["missing", "valid", "oversized", "failed", "wrong_hash"])
+async def test_screen_requires_current_bounded_xml_and_verified_helper(
+    monkeypatch, tmp_path, dump_mode
+):
+    shell_path = shutil.which("sh")
+    if shell_path is None and os.name == "nt":
+        candidate = Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Git/bin/sh.exe"
+        shell_path = str(candidate) if candidate.is_file() else None
+    if shell_path is None:
+        pytest.skip("POSIX shell needed to execute the Android UI snapshot wrapper")
+    helper = tmp_path / "snapshot.sh"
+    device_asset = tmp_path / "fresh-ui.dex"
+    device_asset.write_bytes(maintenance.UI_HELPER_ASSET.read_bytes())
+    if dump_mode == "wrong_hash":
+        device_asset.write_bytes(b"different program")
+    target = tmp_path / "dump.xml"
+    called = tmp_path / "called"
+    target.write_text(COUNTDOWN)  # A failed new snapshot must never reuse this stale XML.
+    helper.write_text(
+        f"printf called > '{called.as_posix()}'\n"
+        + (
+            f"printf '%s' '{COUNTDOWN}' > \"$1\"\n"
+            if dump_mode == "valid"
+            else (
+                f"head -c {maintenance.MAX_UI_BYTES + 10} /dev/zero | tr '\\000' x > \"$1\"\n"
+                if dump_mode == "oversized"
+                else "exit 1\n"
+                if dump_mode == "failed"
+                else "true\n"
+            )
+        ),
+        encoding="utf-8",
+    )
+    generated_paths = []
+
+    async def run(_address, command, *, timeout):
+        path = re.search(r"/data/local/tmp/\.dashcam_stats_maintenance_ui\.[a-f0-9]+\.xml", command)
+        assert path is not None
+        generated_paths.append(path[0])
+        command = command.replace(path[0], target.as_posix())
+        command = command.replace(maintenance.UI_HELPER_PATH, device_asset.as_posix())
+        command = command.replace(
+            f"app_process /data/local/tmp {maintenance.UI_HELPER_CLASS}",
+            f"sh '{helper.as_posix()}'",
+        )
+        result = subprocess.run(
+            [shell_path, "-c", command], capture_output=True, text=True, timeout=3
+        )
+        if result.returncode:
+            raise adb.AdbError("snapshot command refused")
+        return result.stdout
+
+    monkeypatch.setattr(maintenance, "_ensure_ui_helper", AsyncMock())
+    monkeypatch.setattr(adb, "shell", run)
+    if dump_mode in {"missing", "failed", "wrong_hash"}:
+        with pytest.raises(maintenance.MaintenanceRefused, match="safely identified"):
+            await maintenance._screen("unit")
+    else:
+        xml = await maintenance._screen("unit")
+        if dump_mode == "valid":
+            assert maintenance.countdown_target(xml) == (800, 400)
+        else:
+            assert len(xml) == maintenance.MAX_UI_BYTES + 1
+            with pytest.raises(maintenance.MaintenanceRefused):
+                maintenance.countdown_target(xml)
+        await maintenance._screen("unit")
+        assert generated_paths[0] != generated_paths[1]
+    assert not target.exists()
+    assert called.exists() is (dump_mode != "wrong_hash")
+
+
+async def test_matching_device_ui_helper_is_not_pushed_again(monkeypatch):
+    shell = AsyncMock(return_value=f"{maintenance.UI_HELPER_SHA256}  {maintenance.UI_HELPER_PATH}")
+    push = AsyncMock()
+    monkeypatch.setattr(adb, "shell", shell)
+    monkeypatch.setattr(adb, "_adb", push)
+    await maintenance._ensure_ui_helper("unit")
+    push.assert_not_awaited()
+    shell.assert_awaited_once()
+
+
+@pytest.mark.parametrize("existing", ["", "0" * 64 + "  " + maintenance.UI_HELPER_PATH])
+async def test_missing_or_changed_device_helper_is_pushed_and_verified(monkeypatch, existing):
+    shell = AsyncMock(
+        side_effect=[existing, f"{maintenance.UI_HELPER_SHA256}  {maintenance.UI_HELPER_PATH}"]
+    )
+    push = AsyncMock(return_value=adb.AdbResult(0, "", ""))
+    monkeypatch.setattr(adb, "shell", shell)
+    monkeypatch.setattr(adb, "_adb", push)
+    await maintenance._ensure_ui_helper("unit")
+    assert push.await_args.args[:4] == ("-s", "unit", "push", str(maintenance.UI_HELPER_ASSET))
+    assert push.await_args.args[4].startswith(maintenance.UI_HELPER_PATH + ".")
+    assert "sha256sum" in shell.await_args.args[1]
+
+
+@pytest.mark.parametrize(
+    "problem", ["missing_asset", "corrupt_asset", "upload_failed", "hash_mismatch"]
+)
+async def test_unverified_helper_never_reaches_a_cancellation_gesture(
+    controller, monkeypatch, tmp_path, problem
+):
+    monkeypatch.setattr(maintenance, "_attest", AsyncMock())
+    monkeypatch.setattr(
+        maintenance, "_power", AsyncMock(return_value=maintenance.PowerProof(BOOT, 1000))
+    )
+    if problem.endswith("asset"):
+        asset = tmp_path / "helper.dex"
+        if problem == "corrupt_asset":
+            asset.write_bytes(b"corrupt")
+        monkeypatch.setattr(maintenance, "UI_HELPER_ASSET", asset)
+    shell = AsyncMock(side_effect=["", "0" * 64 + "  " + maintenance.UI_HELPER_PATH])
+    push = AsyncMock(
+        return_value=adb.AdbResult(1 if problem == "upload_failed" else 0, "", "private stderr")
+    )
+    monkeypatch.setattr(adb, "shell", shell)
+    monkeypatch.setattr(adb, "_adb", push)
+    with pytest.raises(maintenance.MaintenanceRefused):
+        await controller.start("unit", 900)
+    assert not controller._record_path().exists()
+    assert not controller.snapshot()["active"]
+    assert all(
+        "input swipe" not in call.args[1] and "app_process" not in call.args[1]
+        for call in shell.await_args_list
+    )
+    if problem.endswith("asset"):
+        shell.assert_not_awaited()
+        push.assert_not_awaited()
+
+
+async def test_helper_install_timeout_never_reaches_a_cancellation_gesture(controller, monkeypatch):
+    monkeypatch.setattr(maintenance, "_attest", AsyncMock())
+    monkeypatch.setattr(
+        maintenance, "_power", AsyncMock(return_value=maintenance.PowerProof(BOOT, 1000))
+    )
+    monkeypatch.setattr(maintenance, "UI_SCREEN_TIMEOUT_S", 0.01)
+
+    async def unavailable(_address):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(maintenance, "_ensure_ui_helper", unavailable)
+    shell = AsyncMock()
+    monkeypatch.setattr(adb, "shell", shell)
+    with pytest.raises(maintenance.MaintenanceRefused, match="safely identified"):
+        await controller.start("unit", 900)
+    shell.assert_not_awaited()
+    assert not controller._record_path().exists()
+    assert not controller.snapshot()["active"]
 
 
 async def test_already_dismissed_popup_never_gets_a_retroactive_hold(monkeypatch, controller):
@@ -227,6 +385,65 @@ async def test_heartbeat_loss_revokes_and_restores_without_force_sleep(monkeypat
     await controller._heartbeat()
     assert controller.snapshot()["state"] == "failed"
     assert "private" not in str(controller.snapshot())
+    restore.assert_awaited_once()
+
+
+async def test_slow_screen_refresh_keeps_original_evidence_lifetime(monkeypatch, controller):
+    now = [100.0]
+    monkeypatch.setattr(maintenance.time, "monotonic", lambda: now[0])
+    arm_for_test(controller, now[0])
+    controller._address = "unit"
+
+    async def pause(seconds):
+        now[0] += seconds
+
+    async def screen(_address):
+        now[0] += maintenance.UI_SCREEN_TIMEOUT_S
+        assert controller.remaining(BOOT) is not None
+        return NORMAL
+
+    async def power_proof(_address):
+        now[0] += 3
+        assert controller.remaining(BOOT) is not None
+        return maintenance.PowerProof(BOOT, 1000)
+
+    async def publish(_proof):
+        now[0] += 3
+        assert controller.remaining(BOOT) is not None
+        controller._end = now[0] + maintenance.RESTORE_RESERVE_S
+
+    monkeypatch.setattr(maintenance.asyncio, "sleep", pause)
+    monkeypatch.setattr(maintenance, "_screen", screen)
+    monkeypatch.setattr(maintenance, "_power", power_proof)
+    monkeypatch.setattr(controller, "_publish", publish)
+    finish = AsyncMock()
+    monkeypatch.setattr(controller, "_end_hold", finish)
+    await controller._heartbeat()
+    assert controller._verified_at == now[0]
+    assert maintenance.EVIDENCE_TTL_S == 30
+    assert maintenance.DEVICE_HEARTBEAT_TTL_S == 45
+    finish.assert_awaited_once_with(
+        "expired", "Maintenance ended; radios are restored before backup can resume."
+    )
+
+
+async def test_aggregate_slow_refresh_timeout_closes_admission_and_restores(
+    monkeypatch, controller
+):
+    arm_for_test(controller, maintenance.time.monotonic())
+    controller._address = "unit"
+    monkeypatch.setattr(maintenance, "HEARTBEAT_INTERVAL_S", 0)
+    monkeypatch.setattr(maintenance, "HEARTBEAT_REFRESH_TIMEOUT_S", 0.01)
+
+    async def stuck_screen(_address):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(maintenance, "_screen", stuck_screen)
+    restore = AsyncMock(return_value=True)
+    monkeypatch.setattr(puller, "stop_for_maintenance", restore)
+    await controller._heartbeat()
+    assert controller.remaining(BOOT) is None
+    assert controller.snapshot()["state"] == "failed"
     restore.assert_awaited_once()
 
 

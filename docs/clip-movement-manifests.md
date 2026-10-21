@@ -5,6 +5,10 @@ version is **report only**: it cannot exclude a recording from transfer, delete 
 change retention, or stop the recorder. Existing videos without observations remain
 unknown. It does not retroactively decide whether last night's footage was useful.
 
+The advisory report remains unchanged in 0.3.10. A separate, optional
+[visual quiet-clip policy](quiet-clip-transfer-policy.md) can exclude guarded quiet clips
+from transfer after camera and server opt-in; the movement labels themselves never do so.
+
 ## Setup
 
 In the companion, select the recorder card's **DCIM** folder using the Android folder
@@ -33,7 +37,7 @@ bounded speed and position uncertainty; an unavailable fix is unknown.
 Boot/service boundaries, clock changes, ambiguous local time, large observation gaps,
 unstable files and orphan `pre_` recordings are treated conservatively. Locked clips are
 identified and remain eligible for backup. Adjacent same-camera filenames bound an
-analysis window; they do not prove the video's duration. This implementation does not
+analysis window; they do not prove the video's duration. The advisory report does not
 decode video or claim to recognise a collision, person, vehicle or other visual event.
 
 ## Storage and server contract
@@ -76,6 +80,11 @@ server supports durations from 60 to 1,800 seconds. It verifies the exact suppor
 SystemUI build, live ignition-off/awake state and a visible native countdown, long-presses
 that countdown, then verifies its disappearance on the same boot. An already dismissed
 popup is insufficient to acquire a new hold.
+
+The server's small, hash-verified UI helper reads a fresh accessibility hierarchy without
+waiting for an idle second (the countdown updates every second). Its source and reproducible
+build are in `tools/maintenance-ui/`. Missing, changed or unsupported helper output still
+refuses maintenance before any gesture; the helper itself only reads the screen.
 
 `GET`, `POST {"duration_s": 900}` and `DELETE /api/ingest/maintenance` inspect, acquire and
 end the hold. Fresh host evidence expires after 30 seconds; an on-device lease expires

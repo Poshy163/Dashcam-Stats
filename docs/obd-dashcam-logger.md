@@ -12,6 +12,12 @@ maintenance wake holds. Setup, classification limits and physical checks are doc
 [clip-movement-manifests.md](clip-movement-manifests.md). These reports do not filter or delete
 footage, change the OBD poll plan, or stop the recorder.
 
+Companion 0.3.10 adds an experimental, opt-in visual quiet-clip transfer policy. It requires
+both views, complete guarded analysis and fresh server verification; exclusions stay on
+the card and remain separate from backed-up or processed files. See
+[quiet-clip-transfer-policy.md](quiet-clip-transfer-policy.md) for resource limits, deferred
+uploads, scanner handoff and the physical checks required before activation.
+
 ## Why it is an APK
 
 The verified unit is a locked, unrooted UIS7861 head unit running Android 14 (SDK 34). The

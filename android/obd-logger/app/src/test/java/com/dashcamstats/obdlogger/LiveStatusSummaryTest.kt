@@ -57,8 +57,9 @@ class LiveStatusSummaryTest {
         assertEquals("Last sample: 3s ago", lines[5])
         assertEquals("Bundles waiting for the server: 2", lines[6])
         assertEquals("Movement report: starting · 0 clips (advisory only)", lines[7])
-        assertEquals("Wi-Fi: off", lines[8])
-        assertEquals(9, lines.size)
+        assertEquals("Quiet footage filter: disabled · 0 skip / 0 upload / 0 pending", lines[8])
+        assertEquals("Wi-Fi: off", lines[9])
+        assertEquals(10, lines.size)
     }
 
     @Test

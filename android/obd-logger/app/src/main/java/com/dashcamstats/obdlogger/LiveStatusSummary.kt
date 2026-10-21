@@ -104,6 +104,10 @@ internal object LiveStatusSummary {
                 "directory_unavailable", "storage_unavailable", "scan_failed"))
             out += "Movement report: $movement · ${counter(status, "movement_clip_count")} clips (advisory only)"
         }
+        if (status.has("transfer_policy_enabled")) out += "Quiet footage filter: " +
+            allowedText(status, "transfer_policy_state", setOf("disabled", "waiting", "scanning", "ready", "unavailable")) +
+            " · ${counter(status, "transfer_policy_skip_count")} skip / ${counter(status, "transfer_policy_upload_count")} upload / " +
+            "${counter(status, "transfer_policy_defer_count")} pending"
         out += "Wi-Fi: " + (if (flag(status, "wifi_connected")) "connected" else "off") +
             (if (flag(status, "ingestion_sleep_hold")) " · sleep held for backup" else "")
         if (hasText(status, "last_error")) {

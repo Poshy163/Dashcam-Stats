@@ -99,6 +99,10 @@ class DeltaPlan:
     backlog_bytes: int = 0
     #: Files excluded because the camera is still writing them.
     active_skipped: int = 0
+    #: Temporary on-camera analysis holds remain pending, never backed up or excluded.
+    policy_deferred_files: int = 0
+    policy_deferred_bytes: int = 0
+    policy_deferred_until_utc: str | None = None
     #: Recordings the card still holds that the library already has, byte-for-byte.
     #:
     #: Not fetched -- that is the point of the delta -- but with delete-after-verify on they

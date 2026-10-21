@@ -19,6 +19,7 @@ import java.security.MessageDigest
 import java.time.Instant
 import java.time.ZoneId
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 
 internal const val MOTION_MAX_GAP_MS = 10_000L
 internal const val MOTION_RETENTION_MS = 7L * 24 * 60 * 60 * 1_000
@@ -82,6 +83,7 @@ internal class MotionJournal(context: Context, scope: CoroutineScope? = null) :
         UUID.fromString(File("/proc/sys/kernel/random/boot_id").readText().trim()).toString()
     }.getOrElse { UUID.randomUUID().toString() }
     private val clock = MotionClock(sessionId)
+    private val recentAcc = AtomicReference<Pair<Boolean?, Long>?>(null)
     @Volatile var failed = false
         private set
 
@@ -124,7 +126,14 @@ internal class MotionJournal(context: Context, scope: CoroutineScope? = null) :
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
 
-    fun acc(value: Boolean?) = offer(clock.observation("acc", acc = value))
+    fun acc(value: Boolean?) {
+        recentAcc.set(value to SystemClock.elapsedRealtime())
+        offer(clock.observation("acc", acc = value))
+    }
+
+    fun parkedNow(): Boolean = recentAcc.get()?.let {
+        it.first == false && SystemClock.elapsedRealtime() - it.second in 0..7_500
+    } == true
 
     fun speed(value: Double) {
         if (value.isFinite() && value in 0.0..255.0) offer(clock.observation("obd", speed = value))
@@ -211,6 +220,10 @@ internal class MotionJournal(context: Context, scope: CoroutineScope? = null) :
         "SELECT MIN(wall_ms),MAX(wall_ms) FROM observations", null,
     ).use { if (!it.moveToFirst() || it.isNull(0)) null to null else
         Instant.ofEpochMilli(it.getLong(0)).toString() to Instant.ofEpochMilli(it.getLong(1)).toString() }
+
+    fun latestAccWallMs(): Long? = readableDatabase.rawQuery(
+        "SELECT MAX(wall_ms) FROM observations WHERE kind='acc'", null,
+    ).use { if (!it.moveToFirst() || it.isNull(0)) null else it.getLong(0) }
 
     fun evidenceHealthy(start: Long, end: Long): Boolean {
         if (synchronized(pendingGaps) { pendingGaps.any { it.first <= end && it.second >= start } }) return false

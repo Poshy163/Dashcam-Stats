@@ -274,7 +274,11 @@ class ObdLoggerService : Service() {
                     if (!movementStopping && motionJournal == null) {
                         MotionJournal(applicationContext).also { journal ->
                             motionJournal = journal
-                            clipIndexer = ClosedClipIndexer(applicationContext, journal, scope)
+                            clipIndexer = ClosedClipIndexer(applicationContext, journal, scope, canAnalyze = {
+                                val sleep = sleepWindowController?.snapshot()
+                                journal.parkedNow() && sleep?.ingestionStateKnown == true &&
+                                    !sleep.ingestionRequestActive && currentDriveId == null
+                            })
                             passiveMotion = PassiveMotionObserver(applicationContext, journal).also { observer ->
                                 // A background restart requires background location permission.
                                 observer.start(movementVisibleLaunch) {
@@ -1870,6 +1874,11 @@ class ObdLoggerService : Service() {
             movementState = clipIndexer?.state ?: "starting",
             movementClipCount = clipIndexer?.clipCount ?: 0,
             movementGpsState = passiveMotion?.state ?: "disabled",
+            transferPolicyEnabled = clipIndexer?.transferPolicy?.enabled ?: false,
+            transferPolicyState = clipIndexer?.transferPolicy?.state ?: "disabled",
+            transferPolicySkipCount = clipIndexer?.transferPolicy?.skipCount ?: 0,
+            transferPolicyUploadCount = clipIndexer?.transferPolicy?.uploadCount ?: 0,
+            transferPolicyDeferCount = clipIndexer?.transferPolicy?.deferCount ?: 0,
             lastError = error,
             lastErrorAtUtc = error?.let { Instant.now().toString() },
         )

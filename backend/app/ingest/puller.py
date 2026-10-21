@@ -34,6 +34,7 @@ from app.ingest import (
     movement,
     obd_control,
     origin,
+    parked_filter,
     radio_coordinator,
     radios,
     transport,
@@ -56,6 +57,7 @@ from app.ingest.obd_events import (
     get_logger_event_status,
     sync_remote_events,
 )
+from app.ingest.obd_storage import redact
 from app.ingest.obd_transfer import (
     OBDTransferResult,
     get_obd_transfer_status,
@@ -73,6 +75,7 @@ log = get_logger(__name__)
 class _RunLifecycle:
     started_at: datetime
     released: bool = False
+    policy_fingerprint_checks: int = 0
 
 
 # Status clears its start and can admit a successor before history writes finish.
@@ -320,7 +323,7 @@ def _radio_shutdown_hold(reason: object) -> RunResult:
     status = get_status()
     if status.cancel_event.is_set():
         return RunResult(state=RunState.CANCELLED, error="the transfer was cancelled")
-    text = str(reason or "").strip()[:1000] or "radio state could not be verified"
+    text = redact(reason or "").strip() or "radio state could not be verified"
     text = text.removeprefix("Radios left unchanged: ")
     if not text.startswith("Waiting for radio shutdown:"):
         text = f"Waiting for radio shutdown: {text}"
@@ -539,6 +542,7 @@ async def _sleep_window_may_close(result: RunResult) -> bool:
         result.state not in (RunState.OK, RunState.IDLE)
         or not status_snapshot["backlog_known"]
         or bool(status_snapshot["backlog_files"])
+        or bool(status_snapshot.get("policy_deferred_files", 0))
         or bool(get_obd_transfer_status().snapshot()["waiting_on_unit"])
     ):
         return False
@@ -547,7 +551,7 @@ async def _sleep_window_may_close(result: RunResult) -> bool:
     except Exception as exc:
         log.warning(
             "could not prove radio recovery is clear; leaving the sleep window open",
-            error=f"{type(exc).__name__}: {exc}",
+            error=redact(f"{type(exc).__name__}: {exc}"),
         )
         return False
 
@@ -583,7 +587,7 @@ async def _reclaim(
                 "could not reclaim space on the card",
                 directory=directory,
                 files=len(directory_items),
-                error=str(exc),
+                error=redact(exc),
             )
         if lease is not None:
             lease.raise_if_lease_lost()
@@ -987,7 +991,7 @@ async def _rescue_partials(
         try:
             staged.rename(staging / target)
         except OSError as exc:
-            log.debug("could not stage a rescued recording", name=item.name, error=str(exc))
+            log.debug("could not stage a rescued recording", name=item.name, error=redact(exc))
             continue
         expected[target] = item.size
         by_target[target] = item
@@ -1092,6 +1096,69 @@ def delta(
         plan.files.append(item)
 
     plan.files.sort(key=lambda item: item.name, reverse=newest_first)
+    return plan
+
+
+async def _filter_parked_inventory(
+    info: UnitInfo, remote: list[RemoteFile], logger: dict | None, *, refresh_logger: bool = False
+) -> parked_filter.FilterResult:
+    enabled = bool(_get("skip_parked_footage", False))
+    if not enabled and not (
+        isinstance(logger, dict) and parked_filter.CAPABILITY in (logger.get("capabilities") or [])
+    ):
+        return parked_filter.FilterResult(remote)
+    if refresh_logger:
+        try:
+            logger = await read_logger_status(info.address, get_config().obd_remote_status_file)
+        except Exception:
+            logger = None
+    native = get_status().snapshot()
+    lifecycle = _run_lifecycle.get()
+    used = lifecycle.policy_fingerprint_checks if lifecycle is not None else 0
+    filtered = await parked_filter.filter_inventory(
+        info.address,
+        get_config().obd_remote_status_file,
+        remote,
+        info.source or "",
+        logger,
+        enabled=enabled,
+        native_remaining_s=native["sleep_countdown_remaining_s"],
+        fingerprint_budget=max(0, parked_filter.MAX_FINGERPRINT_CHECKS - used),
+    )
+    if lifecycle is not None:
+        lifecycle.policy_fingerprint_checks += filtered.fingerprint_checks
+    return filtered
+
+
+def _with_deferred_backlog(
+    plan: DeltaPlan,
+    filtered: parked_filter.FilterResult,
+    footage: Path,
+    seen: set[str],
+    now: float,
+    camera: str = "both",
+) -> DeltaPlan:
+    pending = delta(
+        [item for item, _ in filtered.deferred],
+        footage,
+        skip_active_s=0,
+        camera="both",
+        already_seen=seen,
+        now=now,
+    )
+    names = {item.name for item in pending.files}
+    filtered.deferred = [(item, until) for item, until in filtered.deferred if item.name in names]
+    selected = [
+        (item, until)
+        for item, until in filtered.deferred
+        if camera == "both" or item.name.endswith(f"_{camera}.ts")
+    ]
+    deadlines = [until for _, until in selected]
+    plan.policy_deferred_files = len(selected)
+    plan.policy_deferred_bytes = sum(item.size for item, _ in selected)
+    plan.policy_deferred_until_utc = min(deadlines).isoformat() if deadlines else None
+    plan.backlog_files += pending.backlog_files
+    plan.backlog_bytes += pending.backlog_bytes
     return plan
 
 
@@ -1311,7 +1378,7 @@ def commit(staging: Path, footage: Path, expected: dict[str, int]) -> list[str]:
             _sync_directory(footage)
             committed.append(path.name)
         except OSError as exc:
-            log.warning("could not commit a staged recording", file=path.name, error=str(exc))
+            log.warning("could not commit a staged recording", file=path.name, error=redact(exc))
     return committed
 
 
@@ -1387,7 +1454,7 @@ async def _drop_still_growing(info: UnitInfo, plan: DeltaPlan, sources: list[str
     except adb.AdbError as exc:
         # Best effort. The commit's size check is still behind this, so the worst case of
         # not knowing is the transfer this was meant to save.
-        log.debug("could not take a second look at the card", error=str(exc))
+        log.debug("could not take a second look at the card", error=redact(exc))
         return
 
     keep: list[RemoteFile] = []
@@ -1677,8 +1744,8 @@ async def run_pull(
         result = RunResult(state=RunState.CANCELLED, error="backup cancelled")
         raise
     except Exception as exc:
-        result = RunResult(state=RunState.ERROR, error=f"{type(exc).__name__}: {exc}")
-        log.exception("the ingest run could not finish", error=str(exc))
+        result = RunResult(state=RunState.ERROR, error=redact(f"{type(exc).__name__}: {exc}"))
+        log.error("the ingest run could not finish", error=redact(exc))
         return result
     finally:
         try:
@@ -1694,6 +1761,7 @@ async def run_pull(
                 # already publish their richer result before history/sleep handling.
                 if not lifecycle.released and status.running:
                     result.seconds = time.monotonic() - started
+                    result.error = redact(result.error) if result.error else None
                     status.finish(result)
                     lifecycle.released = True
                     # Initialization and failed cleanup are material attempts too.
@@ -1872,6 +1940,8 @@ async def _run_pull_started(
             except Exception:
                 # A diagnostic regression must still fail open for footage backup.
                 log.warning("movement manifest observation failed; footage will continue")
+        filtered_inventory = await _filter_parked_inventory(info, remote, movement_logger)
+        remote = filtered_inventory.files
         status.set_phase(Phase.PREPARING)
         # Off the event loop: this stats every candidate against the footage share, which
         # is a hard NFS mount in the deployment, and a full card is ~140 files. Doing it
@@ -1897,9 +1967,21 @@ async def _run_pull_started(
             newest_first=str(_get("transfer_order", "oldest_first")) == "newest_first",
             now=time.time() + skew,
         )
+        plan = await asyncio.to_thread(
+            _with_deferred_backlog,
+            plan,
+            filtered_inventory,
+            footage,
+            await removed,
+            time.time() + skew,
+            camera=str(_get("camera_filter", "both")),
+        )
         # Growth filtering removes candidates but leaves their backlog intact.
         # Remember them first so a later sweep cannot count the same file twice.
-        initial_backlog_sizes = {item.name: item.size for item in plan.files}
+        initial_backlog_sizes = {
+            item.name: item.size
+            for item in [*plan.files, *(item for item, _ in filtered_inventory.deferred)]
+        }
         # A second opinion on which files are still open, from two sizes rather than one
         # timestamp. Only when there is something to fetch, so an idle window still costs
         # exactly one listing.
@@ -1911,7 +1993,7 @@ async def _run_pull_started(
         except Exception as exc:
             remote_obd = []
             obd_inventory_ok = False
-            log.warning("could not inventory OBD exports; footage will continue", error=str(exc))
+            log.warning("could not inventory OBD exports; footage will continue", error=redact(exc))
         previous_logger = get_obd_transfer_status().snapshot()["logger"]
         try:
             observed_logger = await obd_logger
@@ -1920,7 +2002,9 @@ async def _run_pull_started(
                 "state": "status_unavailable",
                 "last_error": "logger status read failed",
             }
-            log.warning("could not read OBD logger status; footage will continue", error=str(exc))
+            log.warning(
+                "could not read OBD logger status; footage will continue", error=redact(exc)
+            )
         if observed_logger is not None:
             get_obd_transfer_status().set_logger(observed_logger)
         elif _obd_logger_owns_bluetooth(previous_logger):
@@ -2034,7 +2118,7 @@ async def _run_pull_started(
             except radio_coordinator.RadioTransitionError as exc:
                 log.warning(
                     "could not establish crash-safe radio ownership; leaving radios on",
-                    error=str(exc),
+                    error=redact(exc),
                 )
                 result = _radio_shutdown_hold(exc)
                 return result
@@ -2058,7 +2142,7 @@ async def _run_pull_started(
                 except Exception as exc:
                     log.warning(
                         "OBD logger could not be quiesced; leaving radios on",
-                        error=str(exc),
+                        error=redact(exc),
                     )
                     restored = await _restore_radio_transition(radio_transition, error=exc)
                     radio_transition = None
@@ -2089,7 +2173,7 @@ async def _run_pull_started(
                     radio_transition.raise_if_lease_lost()
             except Exception as exc:
                 obd_transfer_error = exc
-                log.exception("OBD backup failed without affecting footage", error=str(exc))
+                log.error("OBD backup failed without affecting footage", error=redact(exc))
 
         if radio_transition is not None:
             try:
@@ -2125,7 +2209,7 @@ async def _run_pull_started(
             except Exception as exc:
                 log.warning(
                     "OBD backup did not complete before radio shutdown; leaving radios on",
-                    error=str(exc),
+                    error=redact(exc),
                 )
                 restored = await _restore_radio_transition(radio_transition, error=exc)
                 radio_transition = None
@@ -2220,7 +2304,7 @@ async def _run_pull_started(
                 radio_transition.raise_if_lease_lost()
             except Exception as exc:
                 log.warning(
-                    "could not safely quiet radios; restoring before transfer", error=str(exc)
+                    "could not safely quiet radios; restoring before transfer", error=redact(exc)
                 )
                 reason = status.radio_quieting_hold_reason or str(exc)
                 restored = await _restore_radio_transition(radio_transition, error=exc)
@@ -2326,9 +2410,16 @@ async def _run_pull_started(
             if not transferred.complete or status.cancel_event.is_set():
                 break
             status.set_phase(Phase.SCANNING)
+            sweep_inventory = await _filter_parked_inventory(
+                info,
+                await adb.inventory_all(info.address, sources),
+                movement_logger,
+                refresh_logger=True,
+            )
+            filtered_inventory = sweep_inventory
             more = await asyncio.to_thread(
                 delta,
-                await adb.inventory_all(info.address, sources),
+                sweep_inventory.files,
                 footage,
                 skip_active_s=int(_get("skip_active_seconds", 15)),
                 camera=str(_get("camera_filter", "both")),
@@ -2336,6 +2427,16 @@ async def _run_pull_started(
                 newest_first=str(_get("transfer_order", "oldest_first")) == "newest_first",
                 now=time.time() + skew,
             )
+            more = await asyncio.to_thread(
+                _with_deferred_backlog,
+                more,
+                sweep_inventory,
+                footage,
+                await removed,
+                time.time() + skew,
+                camera=str(_get("camera_filter", "both")),
+            )
+            status.set_policy_deferred(more)
             if more.files:
                 await _drop_still_growing(info, more, sources)
             if more.files:
@@ -2413,7 +2514,7 @@ async def _run_pull_started(
             except radio_coordinator.RadioTransitionError:
                 raise
             except Exception as exc:
-                log.warning("could not rescue cut-short recordings", error=str(exc))
+                log.warning("could not rescue cut-short recordings", error=redact(exc))
             else:
                 wanted.extend(rescued)
                 committed = [*committed, *rescued_names]
@@ -2496,7 +2597,7 @@ async def _run_pull_started(
                         error="Could not finish checking newly completed OBD bundles",
                     )
                 )
-                log.warning("late OBD catch-up failed without affecting footage", error=str(exc))
+                log.warning("late OBD catch-up failed without affecting footage", error=redact(exc))
             finally:
                 if late_inventory is not None:
                     # sync_remote_bundles sees only new names. Preserve older retained
@@ -2519,10 +2620,25 @@ async def _run_pull_started(
             seconds=transferred.seconds + (obd_result.seconds if obd_result is not None else 0),
             error=None if state is RunState.OK else transferred.error,
         )
+        skipped_now = (
+            {item.name for item in filtered_inventory.skipped} & set(initial_backlog_sizes)
+        ) - set(committed)
+        extra_names = set(expected) - set(initial_backlog_sizes)
+        known_backlog_files = plan.backlog_files + len(extra_names)
+        known_backlog_bytes = plan.backlog_bytes + sum(
+            size - initial_backlog_sizes.get(name, 0) for name, size in expected.items()
+        )
         status.set_backlog(
-            max(0, plan.backlog_files - len(committed)),
-            # OBD archives share the run summary but are not footage backlog bytes.
-            max(0, plan.backlog_bytes - committed_footage_bytes),
+            max(
+                status.policy_deferred_files,
+                known_backlog_files - len(committed) - len(skipped_now),
+            ),
+            max(
+                status.policy_deferred_bytes,
+                known_backlog_bytes
+                - committed_footage_bytes
+                - sum(initial_backlog_sizes[name] for name in skipped_now),
+            ),
         )
         log.info(
             "pull finished",
@@ -2536,13 +2652,13 @@ async def _run_pull_started(
         result.error = "backup cancelled"
         raise
     except adb.AdbError as exc:
-        interrupted_error = str(exc)
+        interrupted_error = redact(exc)
         result = RunResult(state=RunState.ERROR, error=interrupted_error)
-        log.warning("the control channel failed during a pull", error=str(exc))
+        log.warning("the control channel failed during a pull", error=redact(exc))
     except Exception as exc:
-        interrupted_error = f"{type(exc).__name__}: {exc}"
+        interrupted_error = redact(f"{type(exc).__name__}: {exc}")
         result = RunResult(state=RunState.ERROR, error=interrupted_error)
-        log.exception("the ingest run failed", error=str(exc))
+        log.error("the ingest run failed", error=redact(exc))
     finally:
         # This task alone is optional observability: its database cleanup may
         # outlive the run, with the single retained slot preventing accumulation.
@@ -2607,7 +2723,8 @@ async def _run_pull_started(
                     size - initial_backlog_sizes.get(name, 0) for name, size in expected.items()
                 )
                 status.set_backlog(
-                    max(0, backlog_files - len(committed)), max(0, backlog_bytes - saved_bytes)
+                    max(status.policy_deferred_files, backlog_files - len(committed)),
+                    max(status.policy_deferred_bytes, backlog_bytes - saved_bytes),
                 )
 
         # Restoring the driver's radios/logger outranks a courtesy screen change. An
@@ -2628,7 +2745,18 @@ async def _run_pull_started(
 
         if result.seconds <= 0:
             result.seconds = time.monotonic() - started
+        if committed:
+            # Discover only after the batch (including partial/salvaged arrivals), never
+            # once per chunk. The scheduler serializes and coalesces this with its normal
+            # scans, honors scanner.enabled/auto_process, and supplies settling retries.
+            from app.workers import scheduler
+
+            try:
+                scheduler.request_ingest_scan()
+            except Exception as exc:
+                log.error("could not notify scanner about committed footage", error=redact(exc))
         lifecycle = _run_lifecycle.get()
+        result.error = redact(result.error) if result.error else None
         status.finish(result)
         if lifecycle is not None:
             lifecycle.released = True
@@ -2746,7 +2874,7 @@ async def _deliberately_removed() -> set[str]:
             return {name for name in rows.scalars() if name}
     except Exception as exc:
         # A failure here must not stop a transfer; the worst case is re-fetching a file.
-        log.debug("could not read the removed-recording list", error=str(exc))
+        log.debug("could not read the removed-recording list", error=redact(exc))
         return set()
 
 
@@ -2767,7 +2895,7 @@ async def _persist(result: RunResult, trigger: str) -> None:
                 files_transferred=result.files,
                 bytes_transferred=result.bytes,
                 throughput_mbs_avg=result.throughput_mbs,
-                error=result.error,
+                error=redact(result.error) if result.error else None,
             )
         )
 
@@ -2786,7 +2914,7 @@ async def _record_run_completion(result: RunResult, trigger: str, *, continuatio
             "could not persist completed ingest run history",
             trigger=trigger,
             state=result.state.value,
-            error=f"{type(exc).__name__}: {exc}",
+            error=redact(f"{type(exc).__name__}: {exc}"),
         )
     # History is one row per completed attempt, including a successful re-drain.
     # Notification is one per visit. Coupling these conditions made history stale whenever
@@ -2803,4 +2931,6 @@ async def report_event(
 ):
     from app.ingest.reporter import publish
 
+    if result is not None and result.error:
+        result.error = redact(result.error)
     await publish(event, plan=plan, result=result)

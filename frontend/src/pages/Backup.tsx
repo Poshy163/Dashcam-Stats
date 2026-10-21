@@ -588,6 +588,16 @@ export default function Backup() {
         </div>
       )}
 
+      {(data?.policyDeferredFiles ?? 0) > 0 && data?.unitOnline && data.state !== 'disabled' && (
+        <div className="card mb-6 px-5 py-4 text-sm" role="status">
+          <div className="font-medium">Checking quiet parked footage on the camera</div>
+          <div className="mt-1 text-content-muted">
+            {data.policyDeferredFiles} clips ({formatBytes(data.policyDeferredBytes ?? 0)}) are still pending on the card while both views are checked.
+            {' '}They remain in the backlog. Activity uploads normally; an unfinished check falls back to upload within six minutes of the clip ending, or sooner if the sleep window is short.
+          </div>
+        </div>
+      )}
+
       {data?.ignitionHold && data.state !== 'disabled' && (
         <div className="card mb-6 border-state-warn/40 px-5 py-4 text-sm">
           <div className="font-medium text-state-warn">{data.ignitionState === 'on' ? 'Waiting for the ignition to go off' : 'Waiting for ignition status'}</div>

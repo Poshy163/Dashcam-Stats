@@ -1242,6 +1242,20 @@ SETTINGS: tuple[SettingDef, ...] = (
         requires="ingest.enabled",
     ),
     SettingDef(
+        "ingest.skip_parked_footage",
+        "Leave verified quiet parked recordings on the camera",
+        "bool",
+        False,
+        "ingest",
+        "Requires the camera's matching visual-quiet policy to be enabled too. Only closed, "
+        "stable, unprotected clips with complete ignition-off and visual-quiet evidence "
+        "outside drive buffers are excluded from wireless backup. Detected scene activity, "
+        "unknown evidence and protected recordings are still copied. This experimental "
+        "scene-change check can miss small or distant activity. Excluded clips remain "
+        "on the camera and are recorded separately from backed-up or processed footage.",
+        requires="ingest.enabled",
+    ),
+    SettingDef(
         "ingest.sweep_passes",
         "Re-check the card before finishing a backup",
         "int",
