@@ -24,7 +24,7 @@ pydantic-settings>=2.15.0,<3
 # for functions that are never called here.
 opencv-python-headless>=4.14,<5
 numpy>=1.26,<3
-Pillow>=12.3.0,<13
+Pillow>=13.0.0,<14
 
 # --- inference -------------------------------------------------------------------------
 # Execute ONNX models directly with OpenVINO. The separate ONNX Runtime OpenVINO wheel is
