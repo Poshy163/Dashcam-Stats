@@ -148,7 +148,7 @@ Get-FileHash -Algorithm SHA256 $apk
 ```
 
 Check that the printed `Signer #1 certificate SHA-256 digest` equals the complete digest above.
-Record that digest and the APK SHA-256. Deploy the matching server event-contract change first;
+Record that digest and the APK SHA-256. Deploy server acceptance for poll plan 7 first;
 then, with the head unit awake and explicitly selected on ADB:
 
 ```powershell
