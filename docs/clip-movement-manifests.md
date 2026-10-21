@@ -46,10 +46,13 @@ The private SQLite journal is separate from immutable OBD bundles and bounded to
 days or 100,000 observations. Optional observations batch for up to ten seconds to reduce
 flash writes; normal service shutdown drains accepted observations within a bounded wait.
 Persisted gap ranges keep affected windows unknown after queue or storage failures, while
-later fully observed windows can recover. The clip indexer runs approximately once per minute at
-background priority. It reads directory metadata and bounded content samples for file
-fingerprints; it never reads whole videos for motion analysis. A file must be unchanged
-across scans before receiving usable timing evidence.
+later fully observed windows can recover. The clip indexer runs at background priority,
+waiting up to one minute after a completed scan while the visual policy is disabled, or
+five seconds while it is enabled. Visual decoding runs separately on a dedicated
+background thread, so a slow decode does not block metadata and policy refreshes.
+The advisory report reads directory metadata and bounded content samples for file
+fingerprints. Whole-video visual analysis belongs to the separate opt-in policy.
+A file must be unchanged across scans before receiving usable timing evidence.
 
 The app atomically publishes UTF-8 schema version 1 at
 `<obd-root>/movement/report.json`, limited to 512 KiB and 512 clips. The report includes
@@ -85,6 +88,13 @@ The server's small, hash-verified UI helper reads a fresh accessibility hierarch
 waiting for an idle second (the countdown updates every second). Its source and reproducible
 build are in `tools/maintenance-ui/`. Missing, changed or unsupported helper output still
 refuses maintenance before any gesture; the helper itself only reads the screen.
+On 21 October 2026, server revision `fd96348` physically verified native countdown
+cancellation and a maintenance hold with fresh heartbeat evidence. Evidence was lost
+around 08:58 UTC, before the planned 09:07 UTC expiry; the exact cause is unproven and
+native forced sleep is not established. Following a Wi-Fi interruption, the server
+verified both radios and logger restored with `recovery_required=false`; the transition
+remained failed/inactive. Ending the hold through the API then returned maintenance
+inactive. Planned expiry and diagnosis of the early evidence loss remain open checks.
 
 `GET`, `POST {"duration_s": 900}` and `DELETE /api/ingest/maintenance` inspect, acquire and
 end the hold. Fresh host evidence expires after 30 seconds; an on-device lease expires

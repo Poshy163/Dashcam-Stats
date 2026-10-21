@@ -40,6 +40,13 @@ An intentional source/toolchain update must regenerate the asset, inspect the
 source, and update this digest and `UI_HELPER_SHA256` in `maintenance.py` together.
 
 An earlier equivalent read-only prototype obtained the live countdown hierarchy
-on the Android 34 camera while the ordinary idle-wait dump failed. The packaged
-helper still needs a live start/cancellation/heartbeat verification after server
-deployment; a successful build or digest check does not establish that evidence.
+on the Android 34 camera while the ordinary idle-wait dump failed. On 21 October
+2026, deployed server revision `fd96348` used the packaged helper to verify native
+countdown cancellation and an active maintenance hold with fresh heartbeat evidence.
+Heartbeat evidence was lost around 08:58 UTC before the planned 09:07 UTC expiry; the
+exact cause is unproven and native forced sleep is not established. Subsequent server
+checks verified Bluetooth, hotspot and logger restoration with `recovery_required=false`,
+while the transition remained failed/inactive. The operator then ended the hold through
+the API, which reported maintenance inactive. Planned expiry and diagnosis of the early
+evidence loss remain separate checks; this sequence does not establish a fully successful
+backup run.

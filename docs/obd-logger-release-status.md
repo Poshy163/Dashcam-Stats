@@ -8,15 +8,15 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.9** (`versionCode` 22) |
-| Source candidate | `android/obd-logger/` (0.3.10 / code 23); installed version remains 0.3.9 until an in-place update is verified |
+| Version | **0.3.10** (`versionCode` 23) |
+| Source | `fd96348b00b7461b0970b8c543041b6f22e08b51` (`android/obd-logger/`) |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
 | Poll plan | 7; five-second target with measured optional-command admission |
-| Deployment | 0.3.9/code 22 was installed in place on 21 October with the production certificate, preserved app UID and settings, and verified runtime revision `af7e532f4619`. |
+| Deployment | Production-signed 0.3.10/code 23 was installed in place on 21 October; the running companion and the server's `source_revision` were separately verified at `fd96348`. Both quiet-filter opt-ins remain OFF. |
 
-### Candidate 0.3.10
+### What changed in 0.3.10
 
 - Experimental on-camera scene-change screening can omit quiet parked front/rear pairs
   from transfer after separate companion and server opt-in. Both default off. Locked,
@@ -33,10 +33,36 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
   reviewed quiet views as quiet, the parked pedestrian and driving views as activity, and
   the dark view as unavailable. This covers those examples; small/distant activity and
   sustained decoder capacity still require broader physical validation.
-- The physical feasibility probe decoded only 44.6 seconds within a 45-second budget.
-  A later SoC reading was 94 C. The candidate refuses analysis at 85 C or above and fails
-  open to ordinary upload. It is not yet installed or activated on the camera.
-- Local candidate validation: 244 Android tests passed, including the five private
+- After installation, a front hardware probe completed 1,499 frames covering 60.033
+  seconds in 55.740 seconds of wall time, reached both end-of-stream markers, and returned
+  quiet. The rear attempt returned unavailable before decoding any frames
+  (`soc_hot_or_unknown`). Both cameras' native active files independently rolled and grew
+  after the front probe. This is one observed recording-continuity window, not sustained
+  paired-decoder validation.
+- A later shell SoC reading during normal recording/backup was 93.760 C. Further decoder
+  tests were stopped. A production-signed, read-only private instrumentation probe then
+  read both thermal nodes under the existing app UID and PID without restarting it.
+  Expected UID/PID checks passed, the PID was unchanged before and after, and the SoC type
+  matched. The app-UID reading was 92.995 C and the CPU guard correctly returned false.
+  Thermal access is verified; the measured temperature still prevents activation.
+- The packaged maintenance helper physically verified native countdown cancellation and
+  a maintenance hold with fresh heartbeat evidence. Heartbeat evidence was lost around
+  08:58 UTC, before the planned 09:07 UTC expiry; the exact cause is unproven. This is not
+  evidence that the server forced native sleep. The hold was subsequently ended through
+  the API and verified inactive.
+- Backup run 580 copied 57 files / 3,486,902,740 bytes, with zero backlog at that run's
+  final observed inventory. It ended partial after Wi-Fi dropped during restoration.
+  Subsequent server checks verified Bluetooth, hotspot and logger restoration, with
+  `recovery_required=false`; the transition remained failed/inactive. This is not a
+  fully successful run or a claim that later recordings cannot add backlog.
+- Both quiet-filter options remain OFF and the genuine exclusion count is zero. Ordinary
+  uploaded moving, stopped, quiet and parked-activity examples completed metadata,
+  telemetry, detection and plate processing; the filtered end-to-end path still needs
+  physical acceptance.
+- Newly copied `20261021190938_camera_1.ts` was automatically indexed as recording 18165
+  and queued without a manual scan. All four processing stages were pending at the check;
+  this proves discovery/queuing, not completion of that new recording's processing.
+- Local release validation: 244 Android tests passed, including the five private
   production-tracker replays, background-thread priority and cache-write failure
   containment. Both Android lint/build variants passed (zero errors, 56 warnings).
   All 206 frontend tests, frontend lint and production build passed.
@@ -210,13 +236,13 @@ Both files are Git-ignored. Never regenerate the key: the installed app only acc
 signed by this certificate, and replacing it means uninstalling and losing the on-device
 database and preferences.
 
-## How to build and install the candidate
+## How to build and install the companion
 
-First integrate/review the candidate source in the protected signing checkout, or configure a
+First integrate/review the release source in the protected signing checkout, or configure a
 protected build host to use the existing signing files. The original checkout may still contain
 older source and unrelated local changes: do not blindly pull, switch branches or overwrite it.
 Fresh worktrees do not contain the signing files. From the chosen source checkout, after verifying
-`app/build.gradle.kts` declares version 0.3.9/code 22:
+`app/build.gradle.kts` declares version 0.3.10/code 23:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
@@ -228,7 +254,7 @@ Get-FileHash -Algorithm SHA256 $apk
 ```
 
 Check that the printed `Signer #1 certificate SHA-256 digest` equals the complete digest above.
-Record that digest and the APK SHA-256. Deploy this candidate's server manifest and
+Record that digest and the APK SHA-256. Deploy the matching server manifest and
 maintenance support first (poll plan 7 remains required);
 then, with the head unit awake and explicitly selected on ADB:
 
@@ -244,12 +270,12 @@ other settings, the metrics toggle works, and `Bundles waiting for the server` d
 next Wi-Fi window. Verify webhook events reach the server and boot recovery still works.
 
 After ingestion obtains a fresh status snapshot, `GET /api/obd/status` should report
-`app_version_name: "0.3.9"` and `app_version_code: 22` under `logger`. A cached status alone does
+`app_version_name: "0.3.10"` and `app_version_code: 23` under `logger`. A cached status alone does
 not establish the currently installed/running version.
 
 ## What is still left to do
 
-Remaining work; these are not implemented or claimed deployed by this candidate:
+Remaining work and physical checks:
 
 1. **No OTA / self-update path** — every update is `adb install -r` with physical or network ADB
    access. A signed-APK check against the server (same certificate pinned) would let the server
@@ -263,16 +289,19 @@ Remaining work; these are not implemented or claimed deployed by this candidate:
 4. **Physical verification** — exercise migration/decryption with the real Android Keystore,
    reboot and in-place update persistence, newest status selection with an unavailable TF card,
    UI legibility/touch behavior and a complete webhook/ingestion cycle.
-5. **Movement and maintenance acceptance** — select DCIM, exercise optional location and
-   folder permission loss, compare a new drive's observations with clips, and test a fresh
-   native countdown, hold expiry/connectivity loss and radio recovery. Report-only operation
-   is intentional; automatic footage filtering is not implemented.
-6. **Rear recorder recovery** — during the parked 21 October inspection, front clips continued
-   while the rear active file remained unchanged. The rear camera still supplied preview
-   frames but lacked a recording encoder surface. Start-only and guarded graceful all-camera
-   stop/start broadcasts did not recover it. No hardware fault is established. A controlled
-   device power cycle/reboot after backup and radio cleanup is still needed to test recovery;
-   no automatic restart loop or persistent recording configuration change was enabled.
+5. **Movement, filtering and maintenance acceptance** — exercise optional location and
+   folder permission loss, sustained paired decoding and recording within the thermal limits,
+   an actual quiet exclusion retained on the card, an activity upload, and their downstream
+   scan/job state. App-UID thermal access, native countdown cancellation, fresh maintenance
+   heartbeat evidence and subsequent radio/logger restoration are verified. Planned hold
+   expiry and the cause of the early heartbeat loss still need investigation.
+   Advisory labels remain report only. The separate visual policy is implemented but
+   both opt-ins remain OFF pending those checks.
+6. **Recording continuity** — an earlier parked 21 October inspection found an unchanged
+   rear active file despite live preview. After the 0.3.10 installation and front decode
+   probe, both cameras' native active files independently rolled and grew. This verifies
+   recording in that observed window; it does not identify the earlier stall's cause or
+   establish sustained paired decoding. No automatic recorder restart policy was enabled.
 
 The earlier backend reset warning was stale: `87d0c968` already serializes reset, claim/owner
 registration and outcome transactions, and abort refuses replacement jobs until cancellation

@@ -85,10 +85,43 @@ creating segments. SoC readings increased from approximately 79 C to 84 C; a lat
 reading was 94 C, near the firmware's 95 C passive trip point. Further decoder load was
 held. This does not establish sustained decoder capacity or safe concurrent recording.
 
-Before activation, replay representative private clip grids through the actual Kotlin
-tracker, verify retained activity and dark views, then test the production-signed APK on
-the camera. Confirm permissions, temperature gates, complete decoding, both-lens recording
-continuity, a real exclusion retained on the card, an activity upload, and downstream scan
-and job state. Synthetic tests and server-side calibration do not replace these checks.
+The production-signed 0.3.10/code 23 APK was then installed in place, with its running
+revision and the server's `source_revision` separately verified at `fd96348`. A front
+hardware probe completed 1,499 input, decoded and sampled frames covering 60.033 seconds
+in 55.740 seconds of wall time, with both end-of-stream markers, and returned quiet.
+The rear attempt returned unavailable with `soc_hot_or_unknown` before decoding any
+frames. Both cameras' native active files independently rolled and grew after the front
+probe. This confirms one observed recording-continuity window, not sustained paired
+decoder capacity.
+
+A later shell SoC reading during normal recording/backup was 93.760 C, so no further
+decoder load was attempted. A production-signed, read-only private instrumentation probe
+then read both thermal nodes under the existing app UID and PID, with matching expected
+UID/PID and no PID change before/after. The SoC type matched, the app-UID temperature was
+92.995 C and the CPU guard returned false. Thermal access is verified; the camera remains
+too hot for visual analysis.
+
+The packaged maintenance helper verified native countdown cancellation and a hold with
+fresh heartbeat evidence. That evidence was lost around 08:58 UTC, before the planned
+09:07 UTC expiry, for an unproven reason; native forced sleep is not established. Backup
+run 580 copied 57 files / 3,486,902,740 bytes and observed zero backlog in its final
+inventory, but ended partial after Wi-Fi dropped during restoration. Subsequent checks
+verified Bluetooth, hotspot and logger restoration with `recovery_required=false`, while
+the transition remained failed/inactive. The maintenance API subsequently reported
+inactive after the hold was ended. These results do not make run 580 fully successful or
+establish that later recordings cannot add backlog.
+
+Representative ordinary uploads from moving, stopped, quiet and parked-activity views
+completed metadata, telemetry, detection and plate processing. The new ordinary copy
+`20261021190938_camera_1.ts` was automatically indexed as recording 18165 and queued
+without a manual scan; all four stages were still pending. Automatic discovery/queuing is
+therefore verified, while that new recording's processing completion remains unverified.
+
+Both quiet-filter opt-ins remain OFF and the genuine exclusion count is zero. Before
+activation, confirm permissions, temperature gates, complete decoding and recording
+continuity across both cameras under sustained load within the thermal limits, a real quiet
+exclusion retained on the card, an activity upload, and downstream scan/job behavior for
+those decisions. The ordinary-upload processing checks do not establish the filtered
+end-to-end path. Synthetic tests and server-side calibration do not replace these checks.
 Private footage, coordinates, plate images and credentials must stay out of repository
 fixtures and release artifacts.
