@@ -9,9 +9,11 @@ import math
 import os
 import re
 import shutil
+import stat
 import threading
 import time
 import uuid
+import zipfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -840,6 +842,138 @@ def _receipt_eligible(row: OBDBundle) -> bool:
     )
 
 
+def _safe_reexport_path(config: AppConfig, filename: str, digest: str, *, create: bool) -> Path:
+    """Keep immutable alternate exports below a tree containing no symlink ancestors."""
+    if not is_bundle_name(filename) or not SHA256_RE.fullmatch(digest):
+        raise BundleError("re-export identity is unsafe")
+    directory = Path(os.path.abspath(config.obd_verified_dir)) / "reexports" / digest
+    for ancestor in (*reversed(directory.parents), directory):
+        try:
+            attributes = ancestor.lstat()
+        except FileNotFoundError:
+            if not create:
+                raise BundleError("preserved re-export directory is missing") from None
+            ancestor.mkdir()
+            attributes = ancestor.lstat()
+        if (
+            not stat.S_ISDIR(attributes.st_mode)
+            or stat.S_ISLNK(attributes.st_mode)
+            or getattr(attributes, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ):
+            raise BundleError("re-export directory has an unsafe ancestor")
+    path = directory / filename
+    if path.exists() or path.is_symlink():
+        attributes = path.lstat()
+        if (
+            not stat.S_ISREG(attributes.st_mode)
+            or stat.S_ISLNK(attributes.st_mode)
+            or getattr(attributes, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ):
+            raise BundleError("preserved re-export is not a regular file")
+    return path
+
+
+def _prove_equivalent_reexport(
+    path: Path,
+    digest: str,
+    row: OBDBundle,
+    config: AppConfig,
+) -> ValidatedBundle:
+    """Allow only a new export clock/outer ZIP, never changed observations or metadata."""
+    if not _receipt_eligible(row):
+        raise BundleConflict("same-name original bundle is not durably verified")
+    # Check every ancestor even for the canonical file. A symlinked data/verified tree
+    # must not become authority to acknowledge or remove the only remote source.
+    _safe_reexport_path(config, row.filename, digest, create=False)
+    canonical_path = config.obd_verified_dir / row.filename
+    canonical = validate_bundle(canonical_path, config=config)
+    alternate = validate_bundle(path, config=config)
+    if (
+        canonical.bundle_sha256 != row.bundle_hash
+        or canonical.size_bytes != row.size_bytes
+        or canonical.filename != row.filename
+        or canonical.drive_id != row.drive_id
+        or canonical.schema_version != row.schema_version
+        or alternate.bundle_sha256 != digest
+        or alternate.filename != row.filename
+    ):
+        raise BundleConflict("same-name original bundle identity could not be verified")
+    if canonical.summary_source != "producer" or alternate.summary_source != "producer":
+        raise BundleConflict("re-export requires intact producer payload members")
+    originals = {key: value for key, value in canonical.manifest.items() if key != "created_at_utc"}
+    alternatives = {
+        key: value for key, value in alternate.manifest.items() if key != "created_at_utc"
+    }
+    # Canonical JSON also distinguishes booleans/integers and integers/floats, unlike
+    # Python mapping equality. No source field, declared payload hash or count is ignored.
+    if json.dumps(originals, sort_keys=True, allow_nan=False) != json.dumps(
+        alternatives, sort_keys=True, allow_nan=False
+    ):
+        raise BundleConflict("same-name re-export changes durable metadata or payload identities")
+    try:
+        with zipfile.ZipFile(canonical.path) as first, zipfile.ZipFile(alternate.path) as second:
+            for name in ("samples.ndjson.gz", "diagnostics.json", "summary.json"):
+                compared = 0
+                with first.open(name) as original, second.open(name) as regenerated:
+                    while True:
+                        before, after = original.read(64 * 1024), regenerated.read(64 * 1024)
+                        compared += len(before)
+                        if compared > config.obd_max_expanded_bytes or before != after:
+                            raise BundleConflict("same-name re-export changes a durable payload")
+                        if not before:
+                            break
+    except (zipfile.BadZipFile, KeyError, EOFError) as exc:
+        raise BundleConflict("same-name re-export payload comparison failed") from exc
+    return alternate
+
+
+def _fsync_directory(directory: Path) -> None:
+    if os.name != "nt":
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def _preserve_equivalent_reexport(
+    alternate: ValidatedBundle, row: OBDBundle, config: AppConfig
+) -> ValidatedBundle:
+    """Publish exact alternate bytes without replacing either immutable identity."""
+    target = _safe_reexport_path(config, alternate.filename, alternate.bundle_sha256, create=True)
+    _prove_equivalent_reexport(alternate.path, alternate.bundle_sha256, row, config)
+    if target.exists():
+        # A damaged same-hash path is evidence, not permission to replace it silently.
+        preserved = _prove_equivalent_reexport(target, alternate.bundle_sha256, row, config)
+        if preserved.size_bytes != alternate.size_bytes:
+            raise BundleConflict("preserved re-export size differs from the received archive")
+    else:
+        with alternate.path.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        # link() creates the final name exclusively, unlike replace()/POSIX rename().
+        # Unsupported/cross-device links fail safely with the remote file retained.
+        os.link(alternate.path, target, follow_symlinks=False)
+    return _verify_preserved_reexport(target, alternate.bundle_sha256, row, config)
+
+
+def _verify_preserved_reexport(
+    target: Path, digest: str, row: OBDBundle, config: AppConfig
+) -> ValidatedBundle:
+    # Re-flush on retry/ACK checks too: merely finding a path left behind by a failed
+    # fsync must never grant deletion authority.
+    if target != _safe_reexport_path(config, row.filename, digest, create=False):
+        raise BundleError("preserved re-export path is unsafe")
+    with target.open("r+b") as handle:
+        os.fsync(handle.fileno())
+    # Flush new directory entries from the leaf back through verified/. An earlier
+    # interrupted publish is made durable here too before it can receive a receipt.
+    for directory in (target.parent, target.parent.parent, config.obd_verified_dir):
+        _fsync_directory(directory)
+    return _prove_equivalent_reexport(target, digest, row, config)
+
+
 def _clear_stale_quarantine(filename: str, config: AppConfig) -> None:
     """Remove only the canonical corrupt copy after its verified identity is repaired."""
     target = (config.obd_quarantine_dir / filename).resolve()
@@ -915,13 +1049,24 @@ async def verified_bundle_matches(filename: str, bundle_sha256: str) -> bool:
         row = await session.scalar(
             select(OBDBundle).where(
                 OBDBundle.filename == filename,
-                OBDBundle.bundle_hash == bundle_sha256,
                 OBDBundle.metadata_trusted.is_(True),
                 OBDBundle.verified_at.is_not(None),
             )
         )
     if row is None:
         return False
+
+    if row.bundle_hash != bundle_sha256:
+        try:
+            alternate = await asyncio.to_thread(
+                _safe_reexport_path, config, filename, bundle_sha256, create=False
+            )
+            await asyncio.to_thread(
+                _verify_preserved_reexport, alternate, bundle_sha256, row, config
+            )
+        except (BundleError, OSError):
+            return False
+        return True
 
     target = config.obd_verified_dir / filename
     if (
@@ -1230,6 +1375,7 @@ async def _sync_remote_bundles(
             target: Path | None = None
             target_owned_by_run = False
             validated: ValidatedBundle | None = None
+            reconciled_reexport = False
             if item is None or not staged.is_file():
                 continue
             try:
@@ -1254,34 +1400,46 @@ async def _sync_remote_bundles(
                                 )
                             ).scalar_one_or_none()
                         if known is None or known.bundle_hash != validated.bundle_sha256:
-                            raise BundleConflict(
-                                "a verified bundle with the same filename has different bytes"
+                            if known is None:
+                                raise BundleConflict(
+                                    "a verified bundle with the same filename has different bytes"
+                                )
+                            validated = await asyncio.to_thread(
+                                _preserve_equivalent_reexport, validated, known, cfg
                             )
-                        # The database identity and fresh unit copy agree, proving the
-                        # retained same-name bytes are the corrupt side. Quarantine them
-                        # before atomically restoring the verified path.
-                        await asyncio.to_thread(_quarantine, target, target_hash, cfg)
-                        await asyncio.to_thread(_durable_move, staged, target)
-                        target_owned_by_run = True
+                            row = known
+                            reconciled_reexport = True
+                            log.info(
+                                "preserved an equivalent OBD re-export without replacing history",
+                                bundle=name,
+                            )
+                        else:
+                            # The database identity and fresh unit copy agree, proving the
+                            # retained same-name bytes are the corrupt side. Quarantine them
+                            # before atomically restoring the verified path.
+                            await asyncio.to_thread(_quarantine, target, target_hash, cfg)
+                            await asyncio.to_thread(_durable_move, staged, target)
+                            target_owned_by_run = True
                     else:
                         staged.unlink()
                 else:
                     await asyncio.to_thread(_durable_move, staged, target)
                     target_owned_by_run = True
-                # The move preserves the inode but the dataclass path is immutable.
-                validated = ValidatedBundle(
-                    path=target,
-                    filename=validated.filename,
-                    bundle_sha256=validated.bundle_sha256,
-                    size_bytes=validated.size_bytes,
-                    manifest=validated.manifest,
-                    summary=validated.summary,
-                    diagnostics_document=validated.diagnostics_document,
-                    summary_source=validated.summary_source,
-                    warnings=validated.warnings,
-                )
-                row = await _register(validated)
-                if row.state == OBDBundleState.STORED.value:
+                if not reconciled_reexport:
+                    # The move preserves the inode but the dataclass path is immutable.
+                    validated = ValidatedBundle(
+                        path=target,
+                        filename=validated.filename,
+                        bundle_sha256=validated.bundle_sha256,
+                        size_bytes=validated.size_bytes,
+                        manifest=validated.manifest,
+                        summary=validated.summary,
+                        diagnostics_document=validated.diagnostics_document,
+                        summary_source=validated.summary_source,
+                        warnings=validated.warnings,
+                    )
+                    row = await _register(validated)
+                if not reconciled_reexport and row.state == OBDBundleState.STORED.value:
                     try:
                         await asyncio.to_thread(_clear_stale_quarantine, name, cfg)
                     except (BundleError, OSError) as cleanup_error:
@@ -1384,7 +1542,7 @@ async def _sync_remote_bundles(
                     info.address,
                     cfg.obd_remote_receipts_dir,
                     drive_id=row.drive_id,
-                    bundle_sha256=row.bundle_hash,
+                    bundle_sha256=validated.bundle_sha256,
                 )
             except (BundleError, adb.AdbError) as exc:
                 result.failed += 1
@@ -1402,7 +1560,7 @@ async def _sync_remote_bundles(
                     info.address,
                     source,
                     filename=name,
-                    bundle_sha256=row.bundle_hash,
+                    bundle_sha256=validated.bundle_sha256,
                 )
             except (BundleError, adb.AdbError) as exc:
                 # The verified server copy and DB transaction are durable.  Leaving the

@@ -450,6 +450,17 @@ non-regular files, path escapes, invalid UTF-8, duplicate/extra keys, malformed 
 mismatch are rejected. A valid acknowledgement is removed only after the matching raw DB prune
 commits.
 
+If a retained drive is re-exported after its archive and acknowledgement are missing, the
+export timestamp changes its archive hash. The server accepts this as an equivalent export
+only after validating both archives, proving the original still matches its trusted stored
+record, and comparing every manifest field except `created_at_utc` and the exact sample,
+diagnostic and summary member bytes. Changed telemetry, source identity or lifecycle metadata
+remain conflicts. The original archive and database history remain unchanged. The exact new
+archive is retained under `verified/reexports/<new-sha256>/<original-filename>`, flushed and
+read back before the server acknowledges the new hash and performs hash-guarded device
+reclamation. Radio admission also verifies this retained alternate against the original;
+neither a matching drive ID nor an unverified receipt can authorize backup shutdown.
+
 This is a safety bound, not permission to discard the only copy: a recording or export backlog can
 grow beyond it, and a corrupt ready archive deliberately keeps its raw rows. New databases enable
 incremental auto-vacuum before schema creation; pruning also performs a separate bounded passive

@@ -8,13 +8,13 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.9 candidate** (`versionCode` 22) |
+| Version | **0.3.9** (`versionCode` 22) |
 | Source | `android/obd-logger/` (0.3.9 / code 22) |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
 | Poll plan | 7; five-second target with measured optional-command admission |
-| Deployment | 0.3.8/code 21 was installed in place on 21 October with the production certificate and preserved app UID. 0.3.9 has not been installed. |
+| Deployment | 0.3.9/code 22 was installed in place on 21 October with the production certificate, preserved app UID and settings, and verified runtime revision `af7e532f4619`. |
 
 ### What changed in 0.3.9
 
@@ -52,8 +52,19 @@ existing footage cannot be retrospectively labelled stationary from absent obser
   New cases cover advisory counts, stale/invalid and restored reports, proof expiry,
   and a usable radio-restoration retry action.
 - The backend accepts a synthetic fixture produced by the actual Android SAF indexer and
-  atomic exporter. Physical directory/GPS grants, resource impact and the next drive's
-  coverage remain unverified; the installed companion is still 0.3.8.
+  atomic exporter. The physical DCIM read grant is persisted and both lenses are indexed;
+  a subsequent scan classified moving, sampled-stationary and ACC-off clips. The server
+  verified the card identity and received these classifications. Passive GPS remains
+  disabled; its physical behaviour and resource impact remain unverified.
+- The first verified post-update drive contained 234 samples over 19 minutes 36 seconds
+  and 14.66 km, with no polling overruns or connection losses. MIL-distance PID `0x21`
+  succeeded on all 18 attempts; downstream oxygen PID `0x15` still failed on all 20
+  attempts. Two MAF replies and one calibration-ID response also failed validation.
+- Sixteen historical archives were regenerated after a boot without their exact receipts.
+  Comparing every archive against its original verified server copy found identical sample,
+  diagnostic and summary bytes; only the manifest export timestamp differed. These copies
+  exposed a same-filename conflict in backup reconciliation, while the original history
+  and the new drive remained stored and verified. This is independent of folder access.
 
 ### What changed in 0.3.8
 
