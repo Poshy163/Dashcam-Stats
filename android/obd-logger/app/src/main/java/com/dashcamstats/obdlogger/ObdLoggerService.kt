@@ -914,6 +914,7 @@ class ObdLoggerService : Service() {
         val malformedLivePids = LivePidMalformedTracker()
         val sparseDiagnosticBudget = SparseDiagnosticBudgetTracker()
         val diagnosticScheduler = SparseDiagnosticScheduler()
+        val liveScheduler = LivePollScheduler(SystemClock::elapsedRealtime)
         val pollTiming = PollTiming(driveStartedElapsedMillis, SystemClock::elapsedRealtime)
         var timingFlushReason = "drive_end"
         var sequence = 0L
@@ -939,23 +940,54 @@ class ObdLoggerService : Service() {
                 )
                 val values = linkedMapOf<String, Any>()
                 val missing = mutableListOf<Int>()
-                for ((requestedIndex, pid) in requested.withIndex()) {
-                    currentQuiesceRequest(deviceRoot)?.let {
+                val cycle = liveScheduler.beginCycle(sequence, requested, cycleStarted)
+                var liveCommandAttempts = 0
+                while (true) {
+                    val quiesce = currentQuiesceRequest(deviceRoot)
+                    val step = cycle.next(preempted = quiesce != null)
+                    if (step is LivePollStep.Interrupted) {
                         persistPartialSample(
                             driveId,
                             sequence,
                             values,
-                            missing + requested.drop(requestedIndex),
+                            missing + step.remainingPids,
                             driveClock.nowUtc(),
                             pollTiming,
                         )
-                        return RecordingExit.Quiesce(it)
+                        return RecordingExit.Quiesce(checkNotNull(quiesce))
                     }
+                    if (step === LivePollStep.Complete) break
+                    if (step is LivePollStep.Deferred) {
+                        missing += step.pid
+                        continue
+                    }
+                    if (step === LivePollStep.ReadVoltage) {
+                        val voltageStarted = SystemClock.elapsedRealtime()
+                        try {
+                            elm.readVoltage()?.let { values["adapter_voltage"] = it }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            persistPartialSample(
+                                driveId, sequence, values, missing + cycle.remainingPids,
+                                driveClock.nowUtc(), pollTiming,
+                            )
+                            throw error
+                        } finally {
+                            val elapsed = boundedElapsedMillis(voltageStarted)
+                            sparseDiagnosticBudget.observeCommand(elapsed)
+                            liveScheduler.observeCommand(elapsed)
+                        }
+                        continue
+                    }
+                    val pid = (step as LivePollStep.QueryPid).pid
                     if (!malformedLivePids.shouldPoll(pid, sequence)) {
                         pollTiming.cooldownSkip(pid)
                         missing += pid
                         continue
                     }
+                    cycle.attempted(pid)
+                    liveCommandAttempts += 1
                     val commandStarted = SystemClock.elapsedRealtime()
                     val result = try {
                         timedLivePidPoll(pid, pollTiming, elm::query)
@@ -966,13 +998,15 @@ class ObdLoggerService : Service() {
                             driveId,
                             sequence,
                             values,
-                            missing + requested.drop(requestedIndex),
+                            missing + pid + cycle.remainingPids,
                             driveClock.nowUtc(),
                             pollTiming,
                         )
                         throw error
                     } finally {
-                        sparseDiagnosticBudget.observeCommand(boundedElapsedMillis(commandStarted))
+                        val elapsed = boundedElapsedMillis(commandStarted)
+                        sparseDiagnosticBudget.observeCommand(elapsed)
+                        liveScheduler.observeCommand(elapsed)
                     }
                     when (result) {
                         LivePidPollResult.Missing -> {
@@ -999,33 +1033,8 @@ class ObdLoggerService : Service() {
                             )
                         }
                     }
-                    currentQuiesceRequest(deviceRoot)?.let {
-                        persistPartialSample(
-                            driveId,
-                            sequence,
-                            values,
-                            missing + requested.drop(requestedIndex + 1),
-                            driveClock.nowUtc(),
-                            pollTiming,
-                        )
-                        return RecordingExit.Quiesce(it)
-                    }
                 }
-                currentQuiesceRequest(deviceRoot)?.let {
-                    persistPartialSample(driveId, sequence, values, missing, driveClock.nowUtc(), pollTiming)
-                    return RecordingExit.Quiesce(it)
-                }
-                val voltageStarted = SystemClock.elapsedRealtime()
-                try {
-                    elm.readVoltage()?.let { values["adapter_voltage"] = it }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (error: Exception) {
-                    persistPartialSample(driveId, sequence, values, missing, driveClock.nowUtc(), pollTiming)
-                    throw error
-                } finally {
-                    sparseDiagnosticBudget.observeCommand(boundedElapsedMillis(voltageStarted))
-                }
+                val primaryTailStarted = SystemClock.elapsedRealtime()
                 values.putAll(staticValues)
                 values.putAll(ElmProtocol.estimates(values))
                 val sampleTimestamp = driveClock.nowUtc()
@@ -1041,10 +1050,11 @@ class ObdLoggerService : Service() {
                     ),
                 )
                 if (samplePersisted) pollTiming.rowPersisted(rowAges)
+                liveScheduler.observePrimaryTail(boundedElapsedMillis(primaryTailStarted))
                 // A cycle where every requested PID went unanswered is the bus being silent,
                 // not a slow sample. One such cycle is ordinary -- a single dropped frame, a
                 // reconnect -- so recovery waits for a run of them.
-                busSilentCycles = if (requested.isNotEmpty() && missing.size == requested.size) {
+                busSilentCycles = if (liveCommandAttempts > 0 && missing.size == requested.size) {
                     busSilentCycles + 1
                 } else {
                     0
@@ -1103,7 +1113,7 @@ class ObdLoggerService : Service() {
                                     ObdPollPlan.TARGET_CYCLE_MILLIS.toDouble() * 100.0
                                 ).coerceIn(0.0, 100.0),
                             "gap_count" to if (overrun) 1 else 0,
-                            "command_count" to requested.size,
+                            "command_count" to liveCommandAttempts,
                         ),
                     )
                 }
@@ -1111,11 +1121,10 @@ class ObdLoggerService : Service() {
                 publish("ecu_online", config)
                 pollTiming.finishCycle(completed = samplePersisted)
                 emitPollTiming(driveId, pollTiming, "periodic", driveClock)
-                delay(
-                    (
-                        ObdPollPlan.TARGET_CYCLE_MILLIS -
-                            (SystemClock.elapsedRealtime() - cycleStarted)
-                        ).coerceAtLeast(0),
+                awaitLivePollDeadline(
+                    cycleStartedMillis = cycleStarted,
+                    monotonicMillis = SystemClock::elapsedRealtime,
+                    preempted = { !scope.isActive || currentQuiesceRequest(deviceRoot) != null },
                 )
             }
             throw CancellationException("logger scope stopped")

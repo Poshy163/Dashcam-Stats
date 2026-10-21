@@ -103,10 +103,9 @@ object ElmProtocol {
             return ElmCommandCategory.VEHICLE_BUS
         }
         // A mode-01 request is `01` + PID, optionally followed by ONE hex digit: the ELM327's
-        // expected-response-count. On this K-line car exactly one ECU answers, so `010C1`
-        // lets the adapter return the moment that reply lands instead of sitting out its
-        // adaptive timeout waiting for a second ECU that does not exist -- the single
-        // biggest lever on per-command latency here. Still exactly one PID per request.
+        // expected-response-count. `010C1` lets an adapter stop waiting after one response;
+        // its actual latency benefit depends on the adapter. This formatting hint does not
+        // weaken header, source, length or checksum validation. Still one PID per request.
         if (value.length in 4..5 && value.startsWith("01")) {
             val pidHex = value.substring(2, 4)
             val suffixOk = value.length == 4 || value[4] in RESPONSE_COUNT_DIGITS

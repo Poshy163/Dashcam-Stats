@@ -292,6 +292,24 @@ because doing so would taint prompt ownership and require a reconnect. The scans
 04/08 or clear DTCs. These changes require an APK update; refreshing server-managed Wi-Fi helper
 scripts does not replace the companion APK.
 
+App `0.3.8` / poll plan **v7** adds measured admission for optional live readings. The
+five-second target, critical load/RPM/speed reads and adapter-voltage evidence are retained.
+Before each optional command, the scheduler checks its learned cost plus a completion margin
+against the remaining cycle budget. Deferral rotates fairly among the due PIDs and remains
+visible as missing data; no old dynamic values are copied forward. The nominal medium and
+slow expectations remain 15 and 60 seconds, so coverage continues to expose deferred work.
+Reserved sparse diagnostics keep their existing bounded exception. Unexpected latency can
+still overrun a cycle; in-flight commands are not cancelled to make timing look better.
+
+The same release adds a per-PID response-count compatibility fallback. A prompt-complete
+suffixed reply failing ISO validation is rejected, and only that PID uses the plain form on
+its next normally scheduled attempt. This does not issue an immediate retry or weaken source,
+checksum or exact-length validation. A malformed plain reply stays missing. The per-session
+decision resets on reconnect, while adapters returning `?` retain the existing whole-session
+unsupported-suffix handling. Production raw frames were not retained, so the fallback must be
+confirmed on the physical adapter in a subsequent drive rather than assumed to repair every
+rejected reply.
+
 ## Local data and bundle v1
 
 SQLite stores drives, samples and sparse diagnostics transactionally with stable UUIDv7 drive IDs,
@@ -302,11 +320,11 @@ power-loss durability boundary. Each connection captures one UTC anchor and adva
 only from Android elapsed realtime, so NTP or manual wall-clock changes cannot regress a drive's
 sequence timestamps. Recovery clamps later lifecycle clocks to the final sequence sample when the
 wall clock was corrected backward, and bundle creation is likewise ordered after finalisation.
-Database version 5 adds a nullable producer `poll_plan_version` per drive. New drives record v6;
+Database version 5 adds a nullable producer `poll_plan_version` per drive. New drives record v7;
 an additive migration assigns only Git-verified historical release mappings. Unknown legacy
 producers retain no asserted plan and export the supported legacy v1 manifest/summary shape.
 Delayed exports use the recorded producer's plan, and valid ready archives for supported plans
-2–6 remain immutable when the APK changes.
+2–7 remain immutable when the APK changes.
 Diagnostics deduplicate only an unchanged consecutive value of the same kind; a real
 `A → B → A` transition keeps all three observations and timestamps. Startup recovery closes an
 orphaned `recording` or `finalising` drive at its final persisted sample timestamp (not at the

@@ -88,7 +88,7 @@ class ObdPollPlanProvenanceTest {
         ))
         opened.close()
         opened = ObdDatabase(context).also { database = it }
-        assertEquals(6, opened.drive("default-plan").getInt("poll_plan_version"))
+        assertEquals(ObdPollPlan.VERSION, opened.drive("default-plan").getInt("poll_plan_version"))
         for (plan in listOf(5, 6)) {
             assertEquals(plan, opened.drive("recorded-$plan").getInt("poll_plan_version"))
             assertManifest(exporter(opened).export("recorded-$plan"), plan, if (plan == 5) "0.3.4" else "0.3.5")

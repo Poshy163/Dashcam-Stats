@@ -47,14 +47,16 @@ The manifest hashes the stored bytes of `samples.ndjson.gz`, `diagnostics.json` 
 atomic rename and becomes the server and receipt idempotency identity.
 
 Hardened v1 uses one other exact manifest shape: all legacy keys plus
-`poll_plan_version: 2`, `last_sample_at_utc`,
+`poll_plan_version` (an integer from 2 through 7), `last_sample_at_utc`,
 `last_successful_obd_response_at_utc`, `termination_noticed_at_utc`,
 `finalised_at_utc`, and `interruption_reason`. Lifecycle timestamps are UTC or `null` and
 ordered; an unclean hardened drive cannot claim `complete`, while a clean drive has no
 interruption reason. No partial subset or additional key is accepted. The explicit poll
-plan version identifies the distributed medium phases (`index % 3`) and slow phases
-(`0`, `4`, `8`) used for cadence analysis; legacy manifests retain the grouped phase-zero
-plan.
+plan version selects immutable cadence and phase metadata for the producing release;
+legacy manifests retain the grouped phase-zero plan. Plan 7 keeps plan 6's five-second
+fast, 15-second medium and 60-second slow nominal expectations while admitting optional
+due commands against the measured cycle budget. Deferred observations stay missing in
+coverage. Existing plans 2 through 6 are not reinterpreted as plan 7.
 
 ## Units and samples
 

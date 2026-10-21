@@ -136,7 +136,7 @@ def test_v4_reads_the_constants_once_and_adds_the_lamp() -> None:
     (and out of measured completeness), PID 0x01 in the slot they free. v3 must not move."""
     version4, v4 = specs_for_poll_plan(4)
     assert version4 == 4
-    assert POLL_PLAN_VERSION == 5
+    assert POLL_PLAN_VERSION == 7
     by = {spec.name: spec for spec in v4}
     assert (by["timing_advance"].tier, by["timing_advance"].cadence_s) == ("medium", 15.0)
     assert (by["vehicle_speed"].tier, by["vehicle_speed"].cadence_s) == ("fast", 5.0)

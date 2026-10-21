@@ -81,19 +81,16 @@ class ElmBleClient(
     private var lastCommandAt = 0L
 
     /**
-     * Whether live mode-01 requests carry the ELM327 expected-response-count suffix (`010C1`).
-     * On: the adapter returns as soon as the one ECU reply lands. Some clones do not
-     * implement the suffix and answer `?`; the first such reply turns it off for this
-     * session and the request is repeated in the plain form, so the worst case is exactly
-     * the behaviour before it existed. Reset on every connect so a replaced adapter gets a
-     * fresh chance.
+     * The suffix is enabled for the session unless the adapter rejects its syntax. Individual
+     * PIDs can independently select plain requests after a strict ISO failure; this does not
+     * change other PIDs or permit an invalid value into a sample.
      */
-    @Volatile
-    var responseCountSuffixActive = true
-        private set
+    val responseCountSuffixActive: Boolean
+        get() = livePidReader.responseCountSuffixActive
 
     /** Invoked once per session when the suffix is found unsupported and switched off. */
     var onResponseCountSuffixDisabled: (() -> Unit)? = null
+    private val livePidReader = ElmLivePidReader { onResponseCountSuffixDisabled?.invoke() }
     @Volatile
     private var gattConnected = false
     @Volatile
@@ -215,7 +212,7 @@ class ElmBleClient(
     }
 
     suspend fun connect() {
-        responseCountSuffixActive = true
+        livePidReader.freshConnection()
         val startedAt = SystemClock.elapsedRealtime()
         metrics.connectionAttempted()
         try {
@@ -368,27 +365,13 @@ class ElmBleClient(
     }
 
     suspend fun queryPayload(pid: Int): ByteArray? {
-        val length = ElmProtocol.pidLengths[pid] ?: return null
-        val plain = "01%02X".format(pid)
-        var command = if (responseCountSuffixActive) plain + "1" else plain
-        var reply = command(command)
-        if (command != plain && ElmProtocol.isUnrecognised(reply)) {
-            // The adapter does not know the suffix. Fall back for the rest of this session
-            // and ask again the old way, so this PID is not lost to the discovery.
-            responseCountSuffixActive = false
-            onResponseCountSuffixDisabled?.invoke()
-            command = plain
-            reply = command(command)
-        }
-        if (reply.uppercase().contains("NO DATA")) return null
-        if (ElmProtocol.hasTransportError(reply)) throw ElmException("transport error for $command")
+        if (pid !in ElmProtocol.pidLengths) return null
         val source = ecuSource ?: throw ElmException("ECU source is not learned")
-        rejectNegative(reply, command, 0x01, source)
         // command() only returns after receiving the next ELM prompt, so the command stream is
         // synchronized even when this optional PID's ISO frame is malformed. Reject the value
         // without tainting the connection; the poller records it as missing and continues. A
         // missing prompt, overflow, failed write or disconnect is still tainted in command().
-        return ElmProtocol.requirePayload(reply, command, pid, length, source).second
+        return livePidReader.queryPayload(pid, source) { requested -> command(requested) }
     }
 
     suspend fun queryDtcs(mode: Int): List<String> {

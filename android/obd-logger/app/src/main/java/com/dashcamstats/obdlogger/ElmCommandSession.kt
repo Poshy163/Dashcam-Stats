@@ -156,3 +156,65 @@ internal class ElmCommandSession(maximumResponseBytes: Int = 8192) {
         throw error
     }
 }
+
+/**
+ * Connection-scoped request formatting for live PIDs. A prompt-complete invalid reply is never
+ * telemetry. It selects the ordinary request form for that PID's next scheduled observation,
+ * without adding an extra bus command to the current cycle or relaxing ISO validation.
+ */
+internal class ElmLivePidReader(private val suffixDisabled: () -> Unit = {}) {
+    @Volatile
+    var responseCountSuffixActive: Boolean = true
+        private set
+
+    private val plainRequestPids = mutableSetOf<Int>()
+
+    @Synchronized
+    fun freshConnection() {
+        responseCountSuffixActive = true
+        plainRequestPids.clear()
+    }
+
+    @Synchronized
+    private fun request(pid: Int, plain: String): String =
+        if (responseCountSuffixActive && pid !in plainRequestPids) plain + "1" else plain
+
+    @Synchronized
+    private fun usePlainRequest(pid: Int): Boolean = plainRequestPids.add(pid)
+
+    suspend fun queryPayload(
+        pid: Int,
+        expectedSource: Int,
+        execute: suspend (String) -> String,
+    ): ByteArray? {
+        val length = ElmProtocol.pidLengths[pid] ?: return null
+        val plain = "01%02X".format(pid)
+        var command = request(pid, plain)
+        var reply = execute(command)
+        if (command != plain && ElmProtocol.isUnrecognised(reply)) {
+            // Preserve the established whole-session fallback for adapters which reject the
+            // suffix syntax itself. This is distinct from one PID returning invalid ISO data.
+            responseCountSuffixActive = false
+            suffixDisabled()
+            command = plain
+            reply = execute(command)
+        }
+        if (reply.uppercase().contains("NO DATA")) return null
+        if (ElmProtocol.hasTransportError(reply)) throw ElmException("transport error for $command")
+        ElmProtocol.negativeResponse(reply, command, 0x01, expectedSource)?.let { nrc ->
+            throw ElmCommandRejectedException("ECU rejected $command with NRC %02X".format(nrc))
+        }
+        try {
+            return ElmProtocol.requirePayload(reply, command, pid, length, expectedSource).second
+        } catch (error: ElmProtocolException) {
+            if (command != plain && usePlainRequest(pid)) {
+                // Fixed, bounded metadata only: never include response bytes in diagnostics.
+                throw ElmProtocolException(
+                    "$command reply failed ISO header/length/source/checksum validation; " +
+                        "next scheduled poll uses a plain request",
+                )
+            }
+            throw error
+        }
+    }
+}

@@ -519,7 +519,7 @@ object RemovableStoragePolicy {
 }
 
 object ObdPollPlan {
-    const val VERSION = 6
+    const val VERSION = 7
     const val TARGET_CYCLE_MILLIS = 5_000L
 
     // ISO 9141 has to serialize every request.  Six fast PIDs plus the rotating work
@@ -537,6 +537,9 @@ object ObdPollPlan {
     private val fast = listOf(0x04, 0x0C, 0x0D)
     private val medium = listOf(0x0E, 0x10, 0x11, 0x03, 0x05, 0x06, 0x07, 0x0F, 0x14, 0x15)
     private val slow = listOf(0x21, 0x01)
+
+    // v7 preserves this nominal cadence. LivePollScheduler admits optional due commands
+    // against measured remaining time; omitted values remain missing, never carried forward.
 
     /** Constant for the life of a drive: polled once after the ECU proof, carried into every sample. */
     val staticOnce = listOf(0x13, 0x1C)

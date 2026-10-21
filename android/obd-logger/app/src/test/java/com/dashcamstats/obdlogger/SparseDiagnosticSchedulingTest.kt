@@ -36,8 +36,8 @@ class SparseDiagnosticSchedulingTest {
             else assertEquals(ordinary, requested)
             deferredCommands += ordinary.size - requested.size
             val primaryPersisted = true
-            val elapsedMillis = requested.size * 700L + 50L
-            if (ObdPollPlan.mayRunSparseDiagnostic(ordinary.size * 700L + 50L, budget.requiredBudgetMillis())) {
+            val elapsedMillis = (requested.size + 1) * 700L + 50L // includes mandatory ATRV
+            if (ObdPollPlan.mayRunSparseDiagnostic((ordinary.size + 1) * 700L + 50L, budget.requiredBudgetMillis())) {
                 oldPolicyAttempts++
             }
             var cycleMillis = elapsedMillis
@@ -58,7 +58,7 @@ class SparseDiagnosticSchedulingTest {
         assertEquals(listOf(3L, 16L, 29L, 42L, 55L), scanCycles)
         assertTrue(scanCycles.zipWithNext().all { (a, b) -> b - a >= 13 })
         assertTrue(deferredCommands > scan.size) // fewer total ECU requests than before
-        assertEquals(8_150L, longestCycleMillis)
+        assertEquals(8_850L, longestCycleMillis)
     }
 
     @Test

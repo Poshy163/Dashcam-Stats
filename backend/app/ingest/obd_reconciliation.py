@@ -23,7 +23,7 @@ from app.obd.fuel import EstimatedFuelAccumulator
 
 log = structlog.get_logger(__name__)
 
-POLL_PLAN_VERSION = 5
+POLL_PLAN_VERSION = 7
 PROJECTION_VERSION = 5
 NOMINAL_CYCLE_S = 5.0
 GAP_TOLERANCE = 1.5
@@ -237,6 +237,10 @@ _POLL_PLAN_SPECS: dict[int, tuple[tuple[SignalSpec, ...], dict[int, int]]] = {
     # diagnostics. Deliberately deferred observations remain missing in coverage;
     # neither their timestamps nor values are fabricated by the projection.
     6: (SIGNALS_V4, POLL_PHASES_V5),
+    # v7 admits only optional commands that fit the remaining cycle budget. It
+    # retains v6's due cohorts and nominal cadence: a deferred observation stays
+    # missing rather than being carried forward or changing older plans' coverage.
+    7: (SIGNALS_V4, POLL_PHASES_V5),
 }
 
 

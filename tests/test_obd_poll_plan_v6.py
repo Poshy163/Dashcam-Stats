@@ -25,7 +25,7 @@ def _hardened_fields(plan):
     }
 
 
-@pytest.mark.parametrize("plan", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("plan", [2, 3, 4, 5, 6, 7])
 def test_current_and_older_poll_plans_keep_the_hardened_bundle_contract(tmp_path, app_config, plan):
     lifecycle = _hardened_fields(plan)
     summary = {
@@ -45,7 +45,7 @@ def test_current_and_older_poll_plans_keep_the_hardened_bundle_contract(tmp_path
 
 
 def test_unknown_future_poll_plan_is_still_rejected(tmp_path, app_config):
-    path = make_bundle(tmp_path, manifest_patch=_hardened_fields(7))
+    path = make_bundle(tmp_path, manifest_patch=_hardened_fields(8))
     with pytest.raises(BundleError, match="poll_plan_version is not supported"):
         validate_bundle(path, config=app_config)
 

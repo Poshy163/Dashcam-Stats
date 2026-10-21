@@ -8,14 +8,50 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.7 candidate** (`versionCode` 20) |
-| Source | `android/obd-logger/` on `main` (0.3.7 / code 20) |
+| Version | **0.3.8 candidate** (`versionCode` 21) |
+| Source | `android/obd-logger/` (0.3.8 / code 21) |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Deployment | Production installation and physical checks have not been performed |
+| Poll plan | 7; five-second target with measured optional-command admission |
+| Deployment | 0.3.7/code 20 is installed; its production drive, webhook and verified receipt were checked on 21 October. 0.3.8 has not been installed. |
 
-### What changed in 0.3.7
+### What changed in 0.3.8
+
+- **Measured polling budget**: fast engine readings and adapter voltage retain priority.
+  Optional due readings run only when the measured command cost and a completion margin fit
+  the five-second cycle. Deferred readings stay missing, with fair admission on later due
+  cycles; old values are not copied into a fresh sample. Reserved sparse diagnostic work
+  remains bounded and an unexpectedly slow command can still cause an honestly reported
+  overrun. Poll plan 7 keeps the nominal 5/15/60-second expectations of plan 6.
+- **Per-PID command compatibility**: when a response-count-suffixed request produces a
+  prompt-complete reply that fails ISO validation, only that PID switches to a plain request
+  on its next scheduled attempt. This addresses the observed rejection path for PIDs `15`
+  and `21` without an immediate extra bus request. Source, checksum and exact payload length
+  remain mandatory; a malformed plain reply stays rejected. Reconnecting resets this
+  session-local compatibility decision.
+- **Historical provenance remains immutable**: existing drives retain their producer poll
+  plans. Deploy server acceptance for plan 7 before installing this APK.
+
+The rejected production replies were not retained as raw frames, so a specific decoder bug
+has not been established. Unit tests reproduce the compatibility fallback and strict rejection
+cases. A further drive on 0.3.8 is required to confirm the physical adapter's response and
+measured cadence; fallback does not guarantee that an ECU will supply a valid reading.
+
+### Local 0.3.8 validation (21 October 2026)
+
+- All 213 Android JVM/Robolectric tests passed. New cases cover measured command and storage
+  costs, optional-PID fairness, reserve recovery, sparse diagnostic completion, quiesce timing,
+  per-PID plain fallback and strict rejection of malformed data.
+- Debug/release lint and both APK assemblies passed; metadata reports 0.3.8/code 21.
+- All 336 OBD server tests passed, with three platform/fixture skips on Windows; server plan 7
+  admission preserves earlier plans and continues counting deferred observations as missing.
+- All 196 frontend tests, frontend lint and the production web build passed. Focused Python
+  Ruff lint/format checks and `git diff --check` passed.
+- These software checks do not establish the physical adapter's next-drive cadence or
+  recovery of the two rejected readings. The installed companion remains 0.3.7 until updated.
+
+### Previous changes in 0.3.7
 
 - **Encrypted webhook credential storage**: AES-256-GCM ciphertext in preferences, with a
   non-exportable wrapping key in Android Keystore. An existing plaintext key migrates on the
@@ -59,9 +95,10 @@ key storage and real boot behavior still require checks on this particular head 
   failure before a retry and the final outcome now persist in the event stream with the 0.3.7
   contract fix.
 
-Previous source release: 0.3.6 (`versionCode` 19). The installed version has not been checked.
+Installed release: 0.3.7 (`versionCode` 20), with fresh status and app-owned events verified
+after the first production drive. The matching server revision was `6edc404`.
 
-### Local validation (20 October 2026)
+### Previous 0.3.7 local validation (20 October 2026)
 
 - 199 Android JVM/Robolectric tests passed, including migration/write-failure recovery, AES-GCM
   tamper/wrong-key rejection, startup isolation, status selection and webhook event persistence.
@@ -69,7 +106,10 @@ Previous source release: 0.3.6 (`versionCode` 19). The installed version has not
   20; the release verification artifact is `app-release-unsigned.apk`, not a deployable update.
 - 54 Python event-contract/storage tests and 45 worker/reset/abort/outcome tests passed.
 - Focused Ruff checks/formatting and `git diff --check` passed.
-- No production signing, installation, live server change or physical-unit test was performed.
+- Those local checks preceded production signing and the in-place installation. Subsequent
+  live checks confirmed 0.3.7/code 20, successful authenticated webhook delivery, all produced
+  samples stored, and a device verification receipt matching the server bundle. Cold-boot
+  behavior and hardware-backed Keystore properties have not been established by those checks.
 
 ## Where the APK comes from
 
@@ -96,7 +136,7 @@ First integrate/review the candidate source in the protected signing checkout, o
 protected build host to use the existing signing files. The original checkout may still contain
 older source and unrelated local changes: do not blindly pull, switch branches or overwrite it.
 Fresh worktrees do not contain the signing files. From the chosen source checkout, after verifying
-`app/build.gradle.kts` declares version 0.3.7/code 20:
+`app/build.gradle.kts` declares version 0.3.8/code 21:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
@@ -123,7 +163,7 @@ other settings, the metrics toggle works, and `Bundles waiting for the server` d
 next Wi-Fi window. Verify webhook events reach the server and boot recovery still works.
 
 After ingestion obtains a fresh status snapshot, `GET /api/obd/status` should report
-`app_version_name: "0.3.7"` and `app_version_code: 20` under `logger`. A cached status alone does
+`app_version_name: "0.3.8"` and `app_version_code: 21` under `logger`. A cached status alone does
 not establish the currently installed/running version.
 
 ## What is still left to do
