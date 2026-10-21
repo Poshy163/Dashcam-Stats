@@ -630,6 +630,17 @@ class IngestStatus:
         """
         with self._lock:
             remaining = self._credible_countdown_remaining()
+            from app.ingest.maintenance import get_controller
+
+            # Durable recorded-cycle clearance happens outside this status lock.
+            # Its first OFF snapshot may precede fsync, so require another fresh
+            # observation to freeze the native watchdog deadline before quieting.
+            if (
+                remaining is not None
+                and get_controller().remaining(self._unit_boot_id) is None
+                and self._operational_deadline_monotonic is None
+            ):
+                remaining = None
             if remaining is None:
                 reason = (
                     "Waiting for radio shutdown: the remaining head-unit sleep time is unknown."

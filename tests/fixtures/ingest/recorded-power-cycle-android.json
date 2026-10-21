@@ -1,0 +1,22 @@
+{
+  "after_short_cycle": {
+    "schema_version": 1,
+    "boot_id": "01234567-1234-1234-1234-012345678901",
+    "boot_count": 12,
+    "observed_elapsed_ms": 10000,
+    "ignition_on": false,
+    "off_lower_elapsed_ms": 5000,
+    "off_upper_elapsed_ms": 10000,
+    "window_s": 1200
+  },
+  "after_off_heartbeats": {
+    "schema_version": 1,
+    "boot_id": "01234567-1234-1234-1234-012345678901",
+    "boot_count": 12,
+    "observed_elapsed_ms": 25000,
+    "ignition_on": false,
+    "off_lower_elapsed_ms": 5000,
+    "off_upper_elapsed_ms": 10000,
+    "window_s": 1200
+  }
+}

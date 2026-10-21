@@ -71,6 +71,44 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 See [quiet-clip-transfer-policy.md](quiet-clip-transfer-policy.md) for the exact contract,
 resource limits and remaining physical acceptance checks.
 
+### Server-only recorded-cycle recovery (awaiting deployment)
+
+This backend update uses the installed 0.3.10 companion's existing deadline evidence
+when the camera records a real ON to OFF cycle but the server misses live ON. It does
+not change the APK, version code, poll plan or permissions, and has not yet been
+physically verified or established as deployed behaviour.
+
+- A version-two cancellation marker retains admission blocking before the gesture,
+  then durably records a verified post-gesture monotonic upper bound with one second
+  of padding. Fresh native OFF and fresh companion OFF proof must share the exact boot
+  UUID, and the recorded ON-sample lower bound must be strictly after that barrier.
+- Clearing compares the complete expected marker, including generation and baseline,
+  so concurrent updates cannot be removed by an old proof. Timed-out disk workers keep
+  their process fence until they exit, protecting successor records. Legacy markers use their
+  first fresh same-boot native OFF observation while maintenance is inactive and owns
+  no fence only to save a future-cycle baseline; the cycle already carried by that
+  observation is excluded. Corrupt records and unresolved version-two bounds cannot
+  take this legacy path.
+- Repeated OFF heartbeats preserve edge bounds and the captured window. Process
+  restart, missing observations and invalid continuity cannot create another edge.
+  Normal deadline ceilings, remaining-budget and radio-restoration gates still apply;
+  no full countdown is inferred from the current configured duration.
+- Android regression coverage exercises a captured five-second ON pulse, real JSON
+  evidence with frozen OFF heartbeats, same-boot process restart and observation-gap
+  recovery. These are local contract checks, not proof that a physical short pulse
+  will always be sampled or that the recovery update has worked on the camera.
+
+See [clip-movement-manifests.md](clip-movement-manifests.md#recorded-ignition-cycle-recovery)
+for the exact safety boundary and pending physical checks.
+
+Local validation on 21 October: all 3,214 backend tests passed with 33 platform/fixture
+skips and unhandled-thread warnings treated as errors; Ruff passed. All 247 Android
+tests were covered successfully (246 in the full run plus the optional private replay),
+with both lint variants at zero errors and 56 existing warnings each. All 206 frontend
+tests, frontend lint and the production build passed. Recorded-cycle tests include the
+actual synthetic Android JSON producer output and blocked disk workers with a competing
+process lock. These checks do not claim live deployment or a physical recovery result.
+
 ### What changed in 0.3.9
 
 - **Report-only clip movement manifests**: a bounded private journal reuses validated OBD

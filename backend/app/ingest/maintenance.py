@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -44,6 +45,9 @@ UI_HELPER_CLASS = "com.dashcamstats.maintenance.FreshUiSnapshot"
 RESTORE_RESERVE_S = 60
 MAX_DURATION_S = 1800
 MAX_UI_BYTES = 128 * 1024
+_ELAPSED_MAX_MS = 2**53 - 1
+_ELAPSED_PADDING_MS = 1000
+_RECORD_IO_TIMEOUT_S = 3.0
 _BOOT = re.compile(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}")
 _BOUNDS = re.compile(r"\[(\d{1,4}),(\d{1,4})\]\[(\d{1,4}),(\d{1,4})\]")
 _POWER_COMMAND = (
@@ -72,6 +76,23 @@ class MaintenanceRefused(Exception):
 class PowerProof:
     boot_id: str
     uptime_s: float
+
+
+@dataclass(frozen=True)
+class CancellationRecord:
+    boot_id: str
+    generation: str
+    cycle_after_elapsed_ms: int | None
+    legacy: bool = False
+
+    def document(self) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "boot_id": self.boot_id,
+            "cancelled": True,
+            "generation": self.generation,
+            "cycle_after_elapsed_ms": self.cycle_after_elapsed_ms,
+        }
 
 
 def parse_power(reply: str) -> PowerProof | None:
@@ -245,6 +266,9 @@ class MaintenanceController:
         self._generation: str | None = None
         self._tombstone_lock = threading.Lock()
         self._clear_task: asyncio.Task[None] | None = None
+        self._anchor_task: asyncio.Task[None] | None = None
+        self._record: CancellationRecord | None = None
+        self._persistence_task: asyncio.Task[object] | None = None
 
     def _record_path(self) -> Path:
         if self._tombstone_path is None:
@@ -252,7 +276,7 @@ class MaintenanceController:
         return self._tombstone_path
 
     @staticmethod
-    def _read_record(path: Path) -> tuple[str, str] | None:
+    def _read_record(path: Path) -> CancellationRecord | None:
         try:
             metadata = path.lstat()
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024:
@@ -264,11 +288,16 @@ class MaintenanceController:
         if len(raw) > 1024:
             raise ValueError("invalid cancellation record")
         record = json.loads(raw, object_pairs_hook=_record_pairs)
+        if not isinstance(record, dict):
+            raise ValueError("invalid cancellation record")
+        version = record.get("schema_version")
+        fields = {"schema_version", "boot_id", "cancelled", "generation"}
+        if type(version) is int and version == 2:
+            fields.add("cycle_after_elapsed_ms")
         if (
-            not isinstance(record, dict)
-            or set(record) != {"schema_version", "boot_id", "cancelled", "generation"}
-            or type(record["schema_version"]) is not int
-            or record["schema_version"] != 1
+            set(record) != fields
+            or type(version) is not int
+            or version not in (1, 2)
             or record["cancelled"] is not True
             or not isinstance(record["boot_id"], str)
             or not _BOOT.fullmatch(record["boot_id"])
@@ -276,7 +305,13 @@ class MaintenanceController:
             or not _BOOT.fullmatch(record["generation"])
         ):
             raise ValueError("invalid cancellation record")
-        return record["boot_id"], record["generation"]
+        legacy = version == 1
+        boundary = record.get("cycle_after_elapsed_ms")
+        if boundary is not None and (
+            type(boundary) is not int or not 0 <= boundary <= _ELAPSED_MAX_MS
+        ):
+            raise ValueError("invalid cancellation record")
+        return CancellationRecord(record["boot_id"], record["generation"], boundary, legacy)
 
     def load_once(self) -> None:
         # Lifespan performs this off the event loop before starting the poller.
@@ -288,9 +323,9 @@ class MaintenanceController:
                 return
             try:
                 record = self._read_record(self._record_path())
-                self._durable_boot, self._generation = (
-                    record if record is not None else (None, None)
-                )
+                self._record = record
+                self._durable_boot = record.boot_id if record else None
+                self._generation = record.generation if record else None
             except (OSError, ValueError, TypeError, RecursionError):
                 self._tombstone_error = True
             self._tombstone_loaded = True
@@ -306,40 +341,93 @@ class MaintenanceController:
 
     def _record_cancellation(self, boot_id: str) -> None:
         self.load_once()
-        path = self._record_path()
-        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
-        generation = str(uuid.uuid4())
-        raw = json.dumps(
-            {"schema_version": 1, "boot_id": boot_id, "cancelled": True, "generation": generation}
-        )
+        record = CancellationRecord(boot_id, str(uuid.uuid4()), None)
         with self._tombstone_lock:
             try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    handle.write(raw)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, path)
-                self._sync_directory(path.parent)
+                self._write_record(record)
                 self._durable_boot, self._tombstone_error = boot_id, False
-                self._generation = generation
+                self._record, self._generation = record, record.generation
             except (OSError, ValueError) as exc:
                 self._tombstone_error = True
                 raise MaintenanceRefused(
                     "The cancellation record could not be saved; the countdown was left unchanged."
                 ) from exc
-            finally:
-                with contextlib.suppress(OSError):
-                    temporary.unlink(missing_ok=True)
 
-    def _clear_record(self, expected_boot: str | None, expected_generation: str | None) -> bool:
-        # Serialize with another process preparing a new cancellation. A stale
-        # ON observation must never erase the successor's newer boot marker.
-        fence = self._fence or try_acquire(get_config().data_dir / ".ingest-maintenance.lock")
+    async def _persist(self, operation: Callable[..., object], *args: object) -> object:
+        # wait_for(to_thread(...)) only cancels its await, not the disk worker.
+        # Keep that worker tracked and shielded so cleanup retains its process fence
+        # until it has actually exited, including after the request's bounded timeout.
+        task = asyncio.create_task(asyncio.to_thread(operation, *args))
+        self._persistence_task = task
+        task.add_done_callback(
+            lambda finished: None if finished.cancelled() else finished.exception()
+        )
+        return await asyncio.wait_for(asyncio.shield(task), timeout=_RECORD_IO_TIMEOUT_S)
+
+    def _write_record(self, record: CancellationRecord) -> None:
+        """Caller owns the tombstone lock; publish only after file and directory fsync."""
+        path = self._record_path()
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(record.document(), handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            self._sync_directory(path.parent)
+        finally:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+
+    def _record_cycle_boundary(self, expected: CancellationRecord, upper_ms: int) -> bool:
+        """Complete this exact cancellation, or anchor a legacy marker for FUTURE cycles."""
+        if (
+            type(upper_ms) is not int
+            or not 0 <= upper_ms <= _ELAPSED_MAX_MS
+            or expected.cycle_after_elapsed_ms is not None
+        ):
+            return False
+        # Legacy bootstrap is independent of start(): it must never borrow a
+        # newly acquired controller fence that start() could release on refusal.
+        fence = (self._fence if not expected.legacy else None) or try_acquire(
+            get_config().data_dir / ".ingest-maintenance.lock"
+        )
         if fence is None:
             return False
         owned_fence = self._fence is fence
+        try:
+            with self._tombstone_lock:
+                if self._read_record(self._record_path()) != expected:
+                    return False
+                updated = CancellationRecord(expected.boot_id, expected.generation, upper_ms)
+                self._write_record(updated)
+                self._record = updated
+                self._durable_boot, self._generation = updated.boot_id, updated.generation
+                return True
+        except (OSError, ValueError, TypeError, RecursionError):
+            self._tombstone_error = True
+            return False
+        finally:
+            if not owned_fence:
+                fence.release()
+
+    def _clear_record(
+        self,
+        expected_boot: str | None,
+        expected_generation: str | None,
+        expected_record: CancellationRecord | None = None,
+        borrowed_fence: ProcessFileLock | None = None,
+    ) -> bool:
+        # Serialize with another process preparing a new cancellation. A stale
+        # ON observation must never erase the successor's newer boot marker.
+        # Borrow only the fence captured when this clear was scheduled. Reading
+        # self._fence here could borrow a later start()'s short-lived refusal fence.
+        fence = borrowed_fence or try_acquire(get_config().data_dir / ".ingest-maintenance.lock")
+        if fence is None:
+            return False
+        owned_fence = borrowed_fence is fence
         try:
             with self._tombstone_lock:
                 try:
@@ -348,7 +436,11 @@ class MaintenanceController:
                     if expected_boot is not None:
                         return False
                     current = None
-                if current is not None and current != (expected_boot, expected_generation):
+                if expected_record is not None and current != expected_record:
+                    return False
+                if current is not None and (
+                    (current.boot_id, current.generation) != (expected_boot, expected_generation)
+                ):
                     return False
                 self._record_path().unlink(missing_ok=True)
                 if self._record_path().parent.exists():
@@ -362,18 +454,63 @@ class MaintenanceController:
                 fence.release()
 
     async def _clear_after_observation(
-        self, expected_boot: str | None, expected_generation: str | None
+        self,
+        expected_boot: str | None,
+        expected_generation: str | None,
+        expected_record: CancellationRecord | None = None,
+        borrowed_fence: ProcessFileLock | None = None,
     ) -> None:
         try:
             if (
-                await asyncio.to_thread(self._clear_record, expected_boot, expected_generation)
+                await asyncio.to_thread(
+                    self._clear_record,
+                    expected_boot,
+                    expected_generation,
+                    expected_record,
+                    borrowed_fence,
+                )
                 and self._generation == expected_generation
+                and (expected_record is None or self._record == expected_record)
             ):
                 self._cancelled = False
                 self._cancellation_verified = False
                 self._generation = None
+                self._record = None
         except Exception:
             self._tombstone_error = True
+
+    async def _anchor_legacy_after_observation(
+        self, record: CancellationRecord, uptime_s: float
+    ) -> None:
+        # No wall clock/mtime conversion and no retrospective acceptance of the edge
+        # already present at upgrade. A later camera-recorded cycle must cross this bound.
+        await asyncio.to_thread(
+            self._record_cycle_boundary,
+            record,
+            math.ceil(uptime_s * 1000) + _ELAPSED_PADDING_MS,
+        )
+
+    def _recorded_cycle(self, observation: adb.RuntimeObservation) -> bool:
+        record = self._record
+        if (
+            self._tombstone_error
+            or record is None
+            or record.legacy
+            or record.cycle_after_elapsed_ms is None
+            or observation.boot_id != record.boot_id
+        ):
+            return False
+        evidence = observation.validated_sleep_deadline()
+        return (
+            evidence is not None
+            and evidence.boot_id == record.boot_id
+            and evidence.off_lower_elapsed_ms > record.cycle_after_elapsed_ms
+            and evidence.off_lower_elapsed_ms / 1000
+            + evidence.window_s
+            - observation.uptime_s
+            - adb.RUNTIME_OBSERVATION_TIMEOUT_S
+            > 0
+        )
 
     def remaining(self, boot_id: str | None) -> float | None:
         self.load_once()
@@ -400,13 +537,17 @@ class MaintenanceController:
 
     def observe(self, observation: adb.RuntimeObservation) -> None:
         self.load_once()
+        # Never clear/anchor underneath an in-flight cancellation gesture or stop.
+        if self._lock.locked():
+            return
         known_new_boot = (
             observation.boot_id is not None
             and _BOOT.fullmatch(observation.boot_id) is not None
             and (self._durable_boot or self._boot) is not None
             and observation.boot_id != (self._durable_boot or self._boot)
         )
-        if known_new_boot or observation.ignition_state == "on":
+        recorded_cycle = self._recorded_cycle(observation)
+        if known_new_boot or observation.ignition_state == "on" or recorded_cycle:
             if self._state == "active":
                 self._state = "restoring"
                 self._reason = "Maintenance ended after ignition or device boot changed."
@@ -419,9 +560,34 @@ class MaintenanceController:
                         # Keep refusing until an asynchronous fresh observation arrives.
                         return
                     self._clear_task = loop.create_task(
-                        self._clear_after_observation(self._durable_boot, self._generation),
+                        self._clear_after_observation(
+                            self._durable_boot,
+                            self._generation,
+                            self._record if recorded_cycle else None,
+                            self._fence,
+                        ),
                         name="maintenance-clear-cancellation",
                     )
+        elif (
+            not self._tombstone_error
+            and self._record is not None
+            and self._record.legacy
+            and self._state in {"inactive", "failed", "expired"}
+            and self._fence is None
+            and observation.boot_id == self._record.boot_id
+            and observation.ignition_state == "off"
+            and math.isfinite(observation.uptime_s)
+            and 0 <= observation.uptime_s <= (_ELAPSED_MAX_MS - _ELAPSED_PADDING_MS) / 1000
+            and (self._anchor_task is None or self._anchor_task.done())
+        ):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            self._anchor_task = loop.create_task(
+                self._anchor_legacy_after_observation(self._record, observation.uptime_s),
+                name="maintenance-anchor-legacy-cancellation",
+            )
 
     def snapshot(self) -> dict[str, object]:
         now = time.monotonic()
@@ -485,6 +651,8 @@ class MaintenanceController:
                 raise MaintenanceRefused("Maintenance is already active or restoring radios.")
             if self._clear_task is not None and not self._clear_task.done():
                 raise MaintenanceRefused("The previous cancellation record is still being cleared.")
+            if self._anchor_task is not None and not self._anchor_task.done():
+                raise MaintenanceRefused("The previous cancellation record is still being updated.")
             # No cached status or caller-provided boolean can authorize this action.
             await _attest(address)
             before = await _power(address)
@@ -507,9 +675,7 @@ class MaintenanceController:
             self._reason = "Countdown cancellation was attempted but is not yet verified."
             try:
                 try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(self._record_cancellation, fresh.boot_id), timeout=3.0
-                    )
+                    await self._persist(self._record_cancellation, fresh.boot_id)
                 except TimeoutError as exc:
                     raise MaintenanceRefused(
                         "The cancellation record could not be saved in time; the countdown was left unchanged."
@@ -518,8 +684,18 @@ class MaintenanceController:
                 if countdown_target(await _screen(address)) is not None:
                     raise MaintenanceRefused("The native countdown did not disappear.")
                 after = await _power(address)
-                if after.boot_id != fresh.boot_id:
+                if after.boot_id != fresh.boot_id or after.uptime_s < fresh.uptime_s:
                     raise MaintenanceRefused("The dashcam restarted during countdown cancellation.")
+                record = self._record
+                assert record is not None
+                # The pre-gesture record is deliberately provisional. Only completed
+                # input + fresh post-gesture OFF/boot proof can permit recorded recovery.
+                if not await self._persist(
+                    self._record_cycle_boundary,
+                    record,
+                    math.ceil(after.uptime_s * 1000) + _ELAPSED_PADDING_MS,
+                ):
+                    raise MaintenanceRefused("The verified cancellation time could not be saved.")
                 self._cancellation_verified = True
                 now = time.monotonic()
                 self._token = str(uuid.uuid4())
@@ -590,15 +766,16 @@ class MaintenanceController:
         self._reason = (
             reason if restored else "Maintenance ended; radio restoration remains pending."
         )
-        if restored and self._clear_task is not None and not self._clear_task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(self._clear_task), timeout=3.0)
-            except Exception:
-                restored = False
-                self._state, self._reason = (
-                    "restoring",
-                    "Maintenance cancellation cleanup remains pending.",
-                )
+        for task in (self._persistence_task, self._clear_task):
+            if restored and task is not None and not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=_RECORD_IO_TIMEOUT_S)
+                except Exception:
+                    restored = False
+                    self._state, self._reason = (
+                        "restoring",
+                        "Maintenance cancellation cleanup remains pending.",
+                    )
         if restored and self._fence is not None:
             self._fence.release()
             self._fence = None
@@ -624,6 +801,12 @@ def get_controller() -> MaintenanceController:
 
 async def shutdown() -> None:
     await _controller.stop()
+    for task in (_controller._persistence_task, _controller._clear_task, _controller._anchor_task):
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
+            except (OSError, TimeoutError):
+                _controller._tombstone_error = True
 
 
 async def initialize() -> None:

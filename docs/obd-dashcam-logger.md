@@ -77,7 +77,7 @@ free-form message, hardware/network identifier, raw adapter response or exceptio
 source UUID is random and app-scoped, not an Android/hardware identity; the server hashes both it
 and the session UUID, deduplicates by source hash plus sequence, and never returns either hash.
 Missing or malformed event telemetry cannot block footage, OBD bundle, receipt or radio recovery.
-The vendor ACC state is sampled every five seconds as a fallback wake edge, in addition to Android
+The vendor ACC state has a nominal five-second poll as a fallback wake edge, in addition to Android
 Bluetooth, screen, user-present and power broadcasts, so a head unit that emits none of those
 broadcasts does not sit through the parked retry interval after ignition-on. The normal
 service-stop record is reserved outside the bounded producer queue and the event worker
@@ -99,6 +99,35 @@ does not race the final 300-second write. Before accepting that evidence, the se
 reads the current property; stale status falls through to its verified 300-second fallback write.
 The server still widens to 1200 before arrival recovery and uses the same fallback for v1, missing
 or invalid app status.
+
+### Recovery after native countdown cancellation
+
+The server-only recovery update uses the installed 0.3.10 companion's existing
+`sleep_deadline_evidence_v1` proof to recognise an actual ON to OFF cycle even if the
+server missed live ON. No APK version change or reinstall is required. The Android poll
+waits five seconds after each read; property work and scheduling can lengthen that
+interval, so neither a short pulse nor a connected Wi-Fi session guarantees capture.
+
+After a completed cancellation gesture and same-boot power verification, a version-two
+server marker durably records a monotonic cancellation upper bound plus one second of
+padding in `cycle_after_elapsed_ms`; a pre-gesture `null` bound remains blocked.
+Fresh native OFF, fresh companion OFF proof and the exact same boot UUID are
+required. The proof's `off_lower_elapsed_ms`, the start of its last actual ON sample,
+must be strictly after that barrier. Repeated OFF observations cannot qualify an older
+cycle: they refresh observation time while preserving its original lower/upper bounds
+and captured window. Invalid continuity or a new companion process requires another
+observed ON before it can create an edge.
+
+Clearing compares the full expected marker, including its generation and bound, so
+concurrent cancellation or baseline updates cannot be erased. Legacy markers first
+need a fresh same-boot native OFF observation while maintenance is inactive and owns
+no fence to save a padded baseline for a future cycle; the edge already present is
+excluded. Corrupt records and unresolved version-two bounds cannot use this legacy
+path. Existing live-ON/new-boot recovery is retained. Successful
+recorded-cycle validation uses only its conservative remaining deadline and preserves
+operational ceilings and radio-restoration gates. This backend update has not yet
+been physically verified; see [clip-movement-manifests.md](clip-movement-manifests.md)
+for the complete recovery and acceptance conditions.
 
 ## Build, sign and install
 

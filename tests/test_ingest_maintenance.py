@@ -9,6 +9,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -606,11 +608,18 @@ async def test_cancellation_record_is_durable_before_even_an_unanswered_gesture(
 
     async def gesture(*args, **kwargs):
         record = json.loads(controller._record_path().read_text())
-        assert set(record) == {"schema_version", "boot_id", "cancelled", "generation"}
+        assert set(record) == {
+            "schema_version",
+            "boot_id",
+            "cancelled",
+            "generation",
+            "cycle_after_elapsed_ms",
+        }
         assert (
-            record["schema_version"] == 1
+            record["schema_version"] == 2
             and record["boot_id"] == BOOT
             and record["cancelled"] is True
+            and record["cycle_after_elapsed_ms"] is None
         )
         assert maintenance._BOOT.fullmatch(record["generation"])
         raise adb.AdbError("unanswered gesture")
@@ -641,6 +650,155 @@ async def test_failed_durable_write_never_sends_the_gesture(controller, monkeypa
     with pytest.raises(maintenance.MaintenanceRefused, match="saved"):
         await controller.start("unit", 900)
     shell.assert_not_awaited()
+
+
+async def test_post_gesture_bound_is_padded_durable_and_keeps_the_generation(
+    controller, monkeypatch
+):
+    monkeypatch.setattr(maintenance, "_attest", AsyncMock())
+    monkeypatch.setattr(
+        maintenance,
+        "_power",
+        AsyncMock(
+            side_effect=[
+                maintenance.PowerProof(BOOT, 1000),
+                maintenance.PowerProof(BOOT, 1000.5),
+                maintenance.PowerProof(BOOT, 1005.321),
+            ]
+        ),
+    )
+    monkeypatch.setattr(maintenance, "_screen", AsyncMock(side_effect=[COUNTDOWN, NORMAL]))
+    generations = []
+
+    async def gesture(*args, **kwargs):
+        record = json.loads(controller._record_path().read_text())
+        assert record["cycle_after_elapsed_ms"] is None
+        generations.append(record["generation"])
+
+    monkeypatch.setattr(adb, "shell", gesture)
+    monkeypatch.setattr(controller, "_publish", AsyncMock())
+    monkeypatch.setattr(puller, "stop_for_maintenance", AsyncMock(return_value=True))
+    await controller.start("unit", 900)
+    record = json.loads(controller._record_path().read_text())
+    assert record["generation"] == generations[0]
+    assert record["cycle_after_elapsed_ms"] >= 1_006_321
+    assert record["cycle_after_elapsed_ms"] <= 1_006_322
+    await controller.stop()
+    restarted = maintenance.MaintenanceController(controller._record_path())
+    restarted.load_once()
+    assert restarted._record.cycle_after_elapsed_ms == record["cycle_after_elapsed_ms"]
+
+
+@pytest.mark.parametrize("failure", ["write", "timeout", "regressed_clock"])
+async def test_failed_post_gesture_bound_never_authorises_recorded_cycle(
+    controller, monkeypatch, failure
+):
+    monkeypatch.setattr(maintenance, "_attest", AsyncMock())
+    monkeypatch.setattr(
+        maintenance,
+        "_power",
+        AsyncMock(
+            side_effect=[
+                maintenance.PowerProof(BOOT, 1000),
+                maintenance.PowerProof(BOOT, 1000),
+                maintenance.PowerProof(BOOT, 999 if failure == "regressed_clock" else 1001),
+            ]
+        ),
+    )
+    monkeypatch.setattr(maintenance, "_screen", AsyncMock(side_effect=[COUNTDOWN, NORMAL]))
+    monkeypatch.setattr(adb, "shell", AsyncMock())
+    publish = AsyncMock()
+    monkeypatch.setattr(controller, "_publish", publish)
+    restore = AsyncMock(return_value=True)
+    monkeypatch.setattr(puller, "stop_for_maintenance", restore)
+    original = controller._write_record
+
+    def save(record):
+        if record.cycle_after_elapsed_ms is not None:
+            raise TimeoutError() if failure == "timeout" else OSError("disk unavailable")
+        original(record)
+
+    monkeypatch.setattr(controller, "_write_record", save)
+    with pytest.raises(maintenance.MaintenanceRefused):
+        await controller.start("unit", 900)
+    publish.assert_not_awaited()
+    restore.assert_awaited_once()
+    assert json.loads(controller._record_path().read_text())["cycle_after_elapsed_ms"] is None
+    restarted = maintenance.MaintenanceController(controller._record_path())
+    evidence = adb.SleepDeadlineEvidence(1, BOOT, 12, 1_020_000, False, 1_010_000, 1_015_000, 300)
+    restarted.observe(adb.RuntimeObservation(BOOT, 1021, "off", 300, 12, evidence))
+    assert restarted._clear_task is None and restarted.native_cancelled(BOOT)
+
+
+@pytest.mark.parametrize("phase", ["provisional", "post_gesture"])
+async def test_timed_out_disk_worker_retains_process_fence_until_it_exits(
+    controller, monkeypatch, app_config, phase
+):
+    monkeypatch.setattr(maintenance, "_RECORD_IO_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(maintenance, "_attest", AsyncMock())
+    monkeypatch.setattr(
+        maintenance, "_power", AsyncMock(return_value=maintenance.PowerProof(BOOT, 1000))
+    )
+    monkeypatch.setattr(maintenance, "_screen", AsyncMock(side_effect=[COUNTDOWN, NORMAL]))
+    monkeypatch.setattr(adb, "shell", AsyncMock())
+    monkeypatch.setattr(puller, "stop_for_maintenance", AsyncMock(return_value=True))
+    entered, release = threading.Event(), threading.Event()
+    original = controller._write_record
+
+    def blocked_write(record):
+        if (record.cycle_after_elapsed_ms is None) == (phase == "provisional"):
+            entered.set()
+            if not release.wait(timeout=10):
+                raise OSError("test disk stayed blocked")
+        original(record)
+
+    monkeypatch.setattr(controller, "_write_record", blocked_write)
+    lock_path = app_config.data_dir / ".ingest-maintenance.lock"
+    backend = Path(__file__).resolve().parents[1] / "backend"
+    child = (
+        "import sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); "
+        "from app.core.process_lock import try_acquire; "
+        "fence=try_acquire(Path(sys.argv[2])); "
+        "code=11 if fence is None else 10; "
+        "fence.release() if fence is not None else None; raise SystemExit(code)"
+    )
+
+    try:
+        with pytest.raises((maintenance.MaintenanceRefused, TimeoutError)):
+            await controller.start("unit", 900)
+        assert entered.is_set()
+        assert not controller._persistence_task.done()
+        assert controller._fence is not None and controller._fence.held
+        assert controller.snapshot()["state"] == "restoring"
+        assert (
+            subprocess.run(
+                [sys.executable, "-c", child, str(backend), str(lock_path)],
+                capture_output=True,
+                timeout=3,
+            ).returncode
+            == 11
+        )
+    finally:
+        release.set()
+        if controller._persistence_task is not None:
+            await asyncio.wait_for(asyncio.shield(controller._persistence_task), timeout=3)
+        await controller.stop()
+
+    assert controller._fence is None
+    assert (
+        subprocess.run(
+            [sys.executable, "-c", child, str(backend), str(lock_path)],
+            capture_output=True,
+            timeout=3,
+        ).returncode
+        == 10
+    )
+    # A successor can start only after the old worker has truly finished, so the
+    # old rename can never overwrite this newer generation.
+    successor = maintenance.MaintenanceController(controller._record_path())
+    successor._record_cancellation(BOOT)
+    assert successor._generation != controller._generation
+    assert json.loads(controller._record_path().read_text())["generation"] == successor._generation
 
 
 async def test_failed_clear_preserves_marker_until_another_fresh_edge(controller, monkeypatch):

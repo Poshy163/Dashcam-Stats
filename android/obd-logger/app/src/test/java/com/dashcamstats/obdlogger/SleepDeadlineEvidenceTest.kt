@@ -6,6 +6,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -13,6 +14,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import java.io.File
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -47,6 +49,116 @@ class SleepDeadlineEvidenceTest {
         assertEquals(first.offUpperElapsedMillis, later.offUpperElapsedMillis)
         assertEquals(first.windowSeconds, later.windowSeconds)
         assertEquals(16100L, later.observedElapsedMillis)
+    }
+
+    @Test
+    fun fiveSecondOnPulsePublishesActualEdgeAndOffHeartbeatsCannotRenewIt() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        var on = false
+        var seconds = 1200
+        val property = object : SleepWindowPropertyAccessor {
+            override fun readSeconds(): Int = seconds
+            override fun writeSeconds(value: Int): Boolean {
+                seconds = value
+                return true
+            }
+        }
+        val controller = AdaptiveSleepWindowController(
+            context, this, property,
+            object : AccStateAccessor { override fun readAccOn(): Boolean = on },
+            elapsedMillis = { testScheduler.currentTime },
+            bootIdentity = { boot },
+        )
+        fun publishedDeadline(): JSONObject = StatusPublisher.buildStatusJson(
+            PublicStatus("parked", true, sleepDeadlineEvidence = controller.snapshot().deadline), 0,
+        ).getJSONObject("sleep_deadline_evidence")
+        try {
+            controller.start()
+            controller.setIngestionRequestActive(true)
+            runCurrent()
+            assertNull(controller.snapshot().deadline?.offLowerElapsedMillis)
+
+            on = true
+            advanceTimeBy(5000)
+            runCurrent()
+            assertTrue(controller.snapshot().deadline!!.ignitionOn)
+            on = false
+            advanceTimeBy(5000)
+            runCurrent()
+            val edge = publishedDeadline()
+            assertEquals(boot.bootId, edge.getString("boot_id"))
+            assertEquals(boot.bootCount, edge.getInt("boot_count"))
+            assertEquals(5000L, edge.getLong("off_lower_elapsed_ms"))
+            assertEquals(10000L, edge.getLong("off_upper_elapsed_ms"))
+            assertEquals(10000L, edge.getLong("observed_elapsed_ms"))
+            assertEquals(1200, edge.getInt("window_s"))
+            assertFalse(edge.getBoolean("ignition_on"))
+
+            // This property describes future policy; it cannot replace the duration
+            // captured at the actual OFF edge or turn later OFF samples into a new edge.
+            seconds = 300
+            repeat(3) {
+                advanceTimeBy(5000)
+                runCurrent()
+            }
+            val heartbeat = publishedDeadline()
+            assertEquals(25000L, heartbeat.getLong("observed_elapsed_ms"))
+            assertEquals(5000L, heartbeat.getLong("off_lower_elapsed_ms"))
+            assertEquals(10000L, heartbeat.getLong("off_upper_elapsed_ms"))
+            assertEquals(1200, heartbeat.getInt("window_s"))
+            assertFalse(heartbeat.getBoolean("ignition_on"))
+
+            // Synthetic producer output for the backend's cross-language contract test.
+            File(System.getProperty("java.io.tmpdir"), "sleep-deadline-cycle-v1-android.json")
+                .writeText(JSONObject().put("after_short_cycle", edge)
+                    .put("after_off_heartbeats", heartbeat).toString(2))
+        } finally {
+            controller.close()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun sameBootProcessRestartCannotReconstructAnEdgeFromFreshOffSamples() {
+        val oldProcess = SleepDeadlineTracker()
+        oldProcess.read(1000, true)
+        oldProcess.read(6000, false)
+        assertEquals(1000L, oldProcess.snapshot(6100)?.offLowerElapsedMillis)
+
+        val restartedProcess = SleepDeadlineTracker()
+        restartedProcess.read(11000, false)
+        restartedProcess.read(16000, false)
+        val freshOff = restartedProcess.snapshot(16100)!!
+        assertEquals(boot.bootId, freshOff.bootId)
+        assertEquals(16100L, freshOff.observedElapsedMillis)
+        assertFalse(freshOff.ignitionOn)
+        assertNull(freshOff.offLowerElapsedMillis)
+        assertNull(freshOff.offUpperElapsedMillis)
+        assertNull(freshOff.windowSeconds)
+    }
+
+    @Test
+    fun freshOffHeartbeatsAfterGapNeedAnotherRealOnBeforeRecordingAnEdge() {
+        val tracker = SleepDeadlineTracker()
+        tracker.read(1000, true)
+        tracker.read(6000, false)
+        assertEquals(1000L, tracker.snapshot(6100)?.offLowerElapsedMillis)
+
+        // More than 15 seconds between completed observations invalidates continuity.
+        tracker.read(21001, false)
+        tracker.read(26001, false)
+        val freshOff = tracker.snapshot(26101)!!
+        assertEquals(26101L, freshOff.observedElapsedMillis)
+        assertNull(freshOff.offLowerElapsedMillis)
+        assertNull(freshOff.offUpperElapsedMillis)
+        assertNull(freshOff.windowSeconds)
+
+        tracker.read(31001, true, 300)
+        tracker.read(36001, false, 1200)
+        val newCycle = tracker.snapshot(36101)!!
+        assertEquals(31001L, newCycle.offLowerElapsedMillis)
+        assertEquals(36101L, newCycle.offUpperElapsedMillis)
+        assertEquals(300, newCycle.windowSeconds)
     }
 
     @Test

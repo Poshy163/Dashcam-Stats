@@ -107,6 +107,53 @@ The boot-bound cancellation marker survives a server restart and the end of a le
 so old companion countdown evidence cannot reopen backup admission. An unreadable marker
 or missing boot identity cannot prove another safe window.
 
+### Recorded ignition-cycle recovery
+
+The backend recovery update can accept a genuine ON to OFF cycle recorded by the
+installed 0.3.10 companion even when the server did not sample the ON state live. This
+uses the existing `sleep_deadline_evidence_v1` status contract; it needs no APK update,
+new permission or motion-journal export. It has not yet been physically verified.
+
+A version-two cancellation marker first blocks admission before the cancellation
+gesture. Once that gesture has completed and same-boot post-gesture power checks pass,
+the server atomically saves a monotonic cancellation upper bound,
+`ceil(post_gesture_uptime_s * 1000) + 1000`, with one second of conservative padding.
+The exact server-private marker is:
+
+```json
+{"schema_version":2,"boot_id":"<kernel boot UUID>","cancelled":true,"generation":"<random UUID>","cycle_after_elapsed_ms":null}
+```
+
+The bound replaces `null` only after verification and only if the complete expected
+record still matches. An unresolved check/write keeps recovery blocked. Timed-out disk
+workers retain their process fence until they actually exit, so a delayed rename cannot
+overwrite another process's newer cancellation. The
+server must then read fresh native ignition OFF and fresh companion evidence on that
+exact boot UUID. The recorded `off_lower_elapsed_ms` must be strictly greater than the
+cancellation bound: it is the start of a real ON sample after cancellation, not the time
+of a later OFF heartbeat. Its first OFF upper bound and captured countdown duration
+remain frozen while subsequent OFF observations refresh only observation freshness.
+
+The marker is cleared only by an atomic compare-and-swap of the full expected record,
+so an old observation cannot erase a newer cancellation or baseline. A legacy marker
+has no trusted cancellation time. While maintenance is inactive and owns no maintenance
+fence, its first fresh, same-boot native OFF observation can establish a durable,
+padded baseline for a future cycle; it cannot authorize the edge already present in
+that observation. A later recorded ON sample must begin after that baseline. Corrupt
+records and unresolved version-two markers with a `null` bound cannot use this legacy
+baseline path. Fresh live native ON or a verified new boot retain their existing
+recovery paths.
+
+Restart, unknown reads or observation gaps cannot manufacture a cycle. The companion
+starts with no tracker history after a process restart; any previously written status
+still has its original monotonic freshness limit. The existing five-second poll is a
+nominal delay after each read, not a guarantee that every short ignition pulse will be
+captured, and Wi-Fi connectivity alone proves no transition. Missing or rejected proof
+continues to block ordinary countdown admission. Accepted proof supplies only the
+conservative remaining portion of its captured window; operational deadline ceilings,
+radio restoration and all other admission checks still apply. It never grants a fresh
+full configured countdown or fabricates an ignition state.
+
 Cancelling the native timer physically keeps this parked session awake. Ending the
 server hold restores backup/radio safety; it does not force sleep or recreate the native
 timer. A real accessory-power ON to OFF cycle is needed to establish another normal
@@ -122,3 +169,6 @@ subsequent drive, compare positive-speed and parked windows against both camera 
 Check a genuine ignition transition and visible native countdown before testing hold
 acquisition, expiry, connectivity loss and radio restoration. Software tests alone do
 not establish those device-specific results or make footage filtering safe.
+For the recovery update, separately verify a short cycle captured by the companion
+while the server misses live ON, rejection of the preceding cycle, recovery across a
+server restart, and fail-closed behaviour after a companion restart or evidence gap.
