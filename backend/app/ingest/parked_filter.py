@@ -133,6 +133,7 @@ VISUAL_REASONS = {
     "memory_guard",
     "cpu_temperature_unavailable",
     "cpu_temperature_guard",
+    "cpu_temperature_hard_limit",
     "hardware_decoder_unavailable",
     "source_unavailable",
     "format_unsupported",

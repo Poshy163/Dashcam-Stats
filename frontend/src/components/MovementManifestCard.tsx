@@ -19,7 +19,8 @@ const setupMessages: Record<string, string> = {
 }
 
 const analysisReasons: Record<string, string> = {
-  cpuTemperatureGuard: 'Processor at or above the 85°C analysis limit',
+  cpuTemperatureGuard: 'Processor temperature guard prevented a complete analysis',
+  cpuTemperatureHardLimit: 'Processor temperature reached the analysis hard stop',
   batteryTemperatureGuard: 'Battery at or above the 42°C analysis limit',
   systemThermalGuard: 'Android thermal protection active',
   cpuTemperatureUnavailable: 'Processor temperature probe unavailable',

@@ -115,7 +115,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         }.onFailure { cached.clear() }
     }
 
-    private fun key(item: PolicyClip, card: String): String = movementHash("$QUIET_POLICY_VERSION/$QUIET_ALGORITHM_VERSION/$card/" +
+    private fun key(item: PolicyClip, card: String): String = movementHash("$QUIET_POLICY_VERSION/$QUIET_ALGORITHM_VERSION/resources-$QUIET_RESOURCE_POLICY_VERSION/$card/" +
         "${item.clip.relativePath}/${item.clip.size}/${item.clip.mtime}/" +
         item.body.optJSONObject("fingerprint")?.optString("digest").orEmpty())
 

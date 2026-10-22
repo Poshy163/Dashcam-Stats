@@ -23,6 +23,21 @@ def test_older_producer_without_diagnostics_remains_compatible():
     assert summary["reason_counts"] == {"reason_not_reported": 1}
 
 
+def test_new_hard_stop_and_historical_guard_remain_distinct_upload_diagnostics():
+    doc = make_policy()
+    for entry, reason in zip(
+        doc["decisions"], ("cpu_temperature_guard", "cpu_temperature_hard_limit"), strict=True
+    ):
+        entry.update(decision="upload", reason="visual_incomplete")
+        entry["visual"].update(status="unavailable", reason=reason)
+    parsed = parked_filter.validate_policy_manifest(json.dumps(doc))
+    assert parked_filter.analysis_summary(parsed, "ready")["reason_counts"] == {
+        "cpu_temperature_guard": 1,
+        "cpu_temperature_hard_limit": 1,
+    }
+    assert all(not parked_filter.eligible_skip(entry) for entry in parsed["decisions"])
+
+
 @pytest.mark.parametrize("reason", sorted(parked_filter.VISUAL_REASONS))
 def test_reason_can_never_turn_a_quiet_proof_into_exclusion_authority(reason):
     doc = make_policy()

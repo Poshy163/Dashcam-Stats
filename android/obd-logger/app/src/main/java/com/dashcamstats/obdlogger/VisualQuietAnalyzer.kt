@@ -31,6 +31,10 @@ internal const val QUIET_ALGORITHM_VERSION = 2
 internal const val QUIET_ROI_ROWS = 86
 internal const val QUIET_ROI_PROFILE = "dashcam_osd_bottom4_v1"
 internal const val QUIET_MOTION_METRIC = "adjacent_rolling6_coherent3x3_v1"
+// Resource admission/continuation changed; an older refusal must not suppress a new analysis.
+internal const val QUIET_RESOURCE_POLICY_VERSION = 2
+
+internal enum class QuietThermalPhase { ADMISSION, DECODING }
 
 /** Fixed public categories only: never publish an exception, codec name, URI or file path. */
 internal enum class QuietAnalysisReason(val wire: String) {
@@ -43,6 +47,7 @@ internal enum class QuietAnalysisReason(val wire: String) {
     MEMORY_GUARD("memory_guard"),
     CPU_TEMPERATURE_UNAVAILABLE("cpu_temperature_unavailable"),
     CPU_TEMPERATURE_GUARD("cpu_temperature_guard"),
+    CPU_TEMPERATURE_HARD_LIMIT("cpu_temperature_hard_limit"),
     HARDWARE_DECODER_UNAVAILABLE("hardware_decoder_unavailable"),
     SOURCE_UNAVAILABLE("source_unavailable"),
     FORMAT_UNSUPPORTED("format_unsupported"),
@@ -57,6 +62,25 @@ internal enum class QuietAnalysisReason(val wire: String) {
     CLIP_CHANGED("clip_changed"),
     BACKGROUND_PRIORITY_UNAVAILABLE("background_priority_unavailable"),
     ANALYSIS_STORAGE_UNAVAILABLE("analysis_storage_unavailable"),
+}
+
+/** Full Binder/resource probes retain their one-second cadence; CPU is checked per frame. */
+internal class QuietDecodeResourceGate(
+    private val fullProbe: () -> QuietAnalysisReason?,
+    private val cpuProbe: () -> QuietAnalysisReason?,
+    private val monotonicMs: () -> Long,
+) {
+    private var lastFullProbe = monotonicMs()
+
+    fun periodicRefusal(): QuietAnalysisReason? {
+        val now = monotonicMs()
+        if (now - lastFullProbe < 1_000) return null
+        lastFullProbe = now
+        return fullProbe()
+    }
+
+    fun beforeFrameRefusal(): QuietAnalysisReason? = cpuProbe()
+    fun finalRefusal(): QuietAnalysisReason? = fullProbe()
 }
 
 /** Every decoded frame is checked for scene change and usable exposure/contrast. The known native
@@ -181,35 +205,63 @@ internal class QuietFrameTracker {
 /** No frames are retained. Hardware-only, one bounded sequential read, on the indexer's IO worker.
  * Permission, thermal, memory, decode and coverage failures all preserve normal upload behavior. */
 internal open class VisualQuietAnalyzer(private val context: Context) {
-    internal open fun cpuResourceRefusal(): QuietAnalysisReason? = runCatching {
+    internal open fun cpuResourceRefusal(phase: QuietThermalPhase = QuietThermalPhase.ADMISSION): QuietAnalysisReason? = runCatching {
         cpuTemperatureRefusal(File("/sys/class/thermal/thermal_zone0/type").readText().trim(),
-            File("/sys/class/thermal/thermal_zone0/temp").readText().trim().toIntOrNull())
+            File("/sys/class/thermal/thermal_zone0/temp").readText().trim().toIntOrNull(), phase)
     }.getOrDefault(QuietAnalysisReason.CPU_TEMPERATURE_UNAVAILABLE)
 
-    internal open fun resourceRefusal(): QuietAnalysisReason? {
-        var probeFailure = QuietAnalysisReason.BATTERY_TEMPERATURE_UNAVAILABLE
-        return runCatching {
+    internal open fun batteryResourceRefusal(): QuietAnalysisReason? = runCatching {
         val battery = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         batteryTemperatureRefusal(if (battery?.hasExtra("temperature") == true)
-            battery.getIntExtra("temperature", Int.MIN_VALUE) else null)?.let { return@runCatching it }
-        probeFailure = QuietAnalysisReason.SYSTEM_THERMAL_UNAVAILABLE
-        val power = context.getSystemService(PowerManager::class.java)
+            battery.getIntExtra("temperature", Int.MIN_VALUE) else null)
+    }.getOrDefault(QuietAnalysisReason.BATTERY_TEMPERATURE_UNAVAILABLE)
+
+    internal open fun systemResourceRefusal(): QuietAnalysisReason? = runCatching {
         if (Build.VERSION.SDK_INT >= 29) {
-            if (power == null) return@runCatching QuietAnalysisReason.SYSTEM_THERMAL_UNAVAILABLE
-            if (power.currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE)
-                return@runCatching QuietAnalysisReason.SYSTEM_THERMAL_GUARD
-        }
-        probeFailure = QuietAnalysisReason.MEMORY_PROBE_UNAVAILABLE
+            systemThermalRefusal(context.getSystemService(PowerManager::class.java)?.currentThermalStatus)
+        } else null
+    }.getOrDefault(QuietAnalysisReason.SYSTEM_THERMAL_UNAVAILABLE)
+
+    internal open fun memoryResourceRefusal(): QuietAnalysisReason? = runCatching {
         val memory = ActivityManager.MemoryInfo()
         val activity = context.getSystemService(ActivityManager::class.java)
             ?: return@runCatching QuietAnalysisReason.MEMORY_PROBE_UNAVAILABLE
         activity.getMemoryInfo(memory)
-        if (memory.lowMemory || memory.availMem < 128L * 1024 * 1024) return@runCatching QuietAnalysisReason.MEMORY_GUARD
-        cpuResourceRefusal()
-        }.getOrDefault(probeFailure)
+        if (memory.lowMemory || memory.availMem < 128L * 1024 * 1024) QuietAnalysisReason.MEMORY_GUARD else null
+    }.getOrDefault(QuietAnalysisReason.MEMORY_PROBE_UNAVAILABLE)
+
+    internal open fun resourceRefusal(phase: QuietThermalPhase = QuietThermalPhase.ADMISSION): QuietAnalysisReason? {
+        batteryResourceRefusal()?.let { return it }
+        systemResourceRefusal()?.let { return it }
+        memoryResourceRefusal()?.let { return it }
+        return cpuResourceRefusal(phase)
     }
 
     fun resourcesAvailable(): Boolean = resourceRefusal() == null
+
+    internal fun decodeResourceGate(monotonicMs: () -> Long = SystemClock::elapsedRealtime) = QuietDecodeResourceGate(
+        { resourceRefusal(QuietThermalPhase.DECODING) },
+        { cpuResourceRefusal(QuietThermalPhase.DECODING) }, monotonicMs,
+    )
+
+    internal fun acceptDecodedFrame(tracker: QuietFrameTracker, gate: QuietDecodeResourceGate, pts: Long,
+                                    readLuma: () -> IntArray): QuietAnalysisReason? {
+        gate.beforeFrameRefusal()?.let { return it }
+        tracker.accept(readLuma(), pts)
+        return null
+    }
+
+    internal fun finalProof(tracker: QuietFrameTracker, gate: QuietDecodeResourceGate, inputFrames: Int,
+                            inputEos: Boolean, decoderEos: Boolean, allowed: () -> Boolean,
+                            reason: QuietAnalysisReason? = null): JSONObject {
+        if (decoderEos) {
+            if (!allowed()) return tracker.proof(inputFrames, inputEos, false, "unavailable", QuietAnalysisReason.POLICY_NOT_PERMITTED)
+            gate.finalRefusal()?.let {
+                return tracker.proof(inputFrames, inputEos, false, "unavailable", it)
+            }
+        }
+        return tracker.proof(inputFrames, inputEos, decoderEos, reason = reason)
+    }
 
     open suspend fun analyze(uri: Uri, allowed: () -> Boolean): JSONObject {
         val tracker = QuietFrameTracker()
@@ -221,6 +273,7 @@ internal open class VisualQuietAnalyzer(private val context: Context) {
             resourceRefusal()?.let { return tracker.proof(0, false, false, "unavailable", it) }
             val coroutine = currentCoroutineContext()
             val started = SystemClock.elapsedRealtime()
+            val resources = decodeResourceGate()
             extractor = MediaExtractor()
             context.contentResolver.openFileDescriptor(uri, "r").use { descriptor ->
                 checkNotNull(descriptor)
@@ -252,14 +305,10 @@ internal open class VisualQuietAnalyzer(private val context: Context) {
             codec.configure(format, null, null, 0)
             codec.start()
             val info = MediaCodec.BufferInfo()
-            var lastResourceCheck = started
             while (!decoderEos && SystemClock.elapsedRealtime() - started < 90_000 && tracker.frames < 7_200) {
                 coroutine.ensureActive()
                 if (!allowed()) return tracker.proof(inputFrames, inputEos, false, "unavailable", QuietAnalysisReason.POLICY_NOT_PERMITTED)
-                if (SystemClock.elapsedRealtime() - lastResourceCheck >= 1_000) {
-                    resourceRefusal()?.let { return tracker.proof(inputFrames, inputEos, false, "unavailable", it) }
-                    lastResourceCheck = SystemClock.elapsedRealtime()
-                }
+                resources.periodicRefusal()?.let { return tracker.proof(inputFrames, inputEos, false, "unavailable", it) }
                 if (!inputEos) {
                     val index = codec.dequeueInputBuffer(5_000)
                     if (index >= 0) {
@@ -280,10 +329,11 @@ internal open class VisualQuietAnalyzer(private val context: Context) {
                 val index = codec.dequeueOutputBuffer(info, 5_000)
                 if (index >= 0) try {
                     if (info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
-                        cpuResourceRefusal()?.let { return tracker.proof(inputFrames, inputEos, false, "unavailable", it) }
                         failure = QuietAnalysisReason.IMAGE_UNAVAILABLE
-                        checkNotNull(codec.getOutputImage(index)).use { image ->
-                            tracker.accept(luma(image), info.presentationTimeUs)
+                        acceptDecodedFrame(tracker, resources, info.presentationTimeUs) {
+                            checkNotNull(codec.getOutputImage(index)).use { image -> luma(image) }
+                        }?.let {
+                            return tracker.proof(inputFrames, inputEos, false, "unavailable", it)
                         }
                         failure = QuietAnalysisReason.DECODER_FAILURE
                         // Activity or unusable imagery already requires upload; stop wasting decoder/thermal budget.
@@ -292,7 +342,7 @@ internal open class VisualQuietAnalyzer(private val context: Context) {
                     decoderEos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                 } finally { codec.releaseOutputBuffer(index, false) }
             }
-            return tracker.proof(inputFrames, inputEos, decoderEos, reason = when {
+            return finalProof(tracker, resources, inputFrames, inputEos, decoderEos, allowed, reason = when {
                 decoderEos -> null
                 tracker.frames >= 7_200 -> QuietAnalysisReason.FRAME_LIMIT
                 else -> QuietAnalysisReason.ANALYSIS_TIMEOUT
@@ -322,9 +372,16 @@ internal open class VisualQuietAnalyzer(private val context: Context) {
     }
 
     companion object {
-        internal fun cpuTemperatureRefusal(type: String?, milliC: Int?): QuietAnalysisReason? = when {
+        internal fun cpuTemperatureRefusal(type: String?, milliC: Int?,
+                                           phase: QuietThermalPhase = QuietThermalPhase.ADMISSION): QuietAnalysisReason? = when {
             type != "soc-thmzone" || milliC == null || milliC !in 10_000..150_000 -> QuietAnalysisReason.CPU_TEMPERATURE_UNAVAILABLE
-            milliC >= 85_000 -> QuietAnalysisReason.CPU_TEMPERATURE_GUARD
+            milliC >= 100_000 -> QuietAnalysisReason.CPU_TEMPERATURE_HARD_LIMIT
+            phase == QuietThermalPhase.ADMISSION && milliC >= 95_000 -> QuietAnalysisReason.CPU_TEMPERATURE_GUARD
+            else -> null
+        }
+        internal fun systemThermalRefusal(status: Int?): QuietAnalysisReason? = when {
+            status == null || status !in PowerManager.THERMAL_STATUS_NONE..PowerManager.THERMAL_STATUS_SHUTDOWN -> QuietAnalysisReason.SYSTEM_THERMAL_UNAVAILABLE
+            status >= PowerManager.THERMAL_STATUS_SEVERE -> QuietAnalysisReason.SYSTEM_THERMAL_GUARD
             else -> null
         }
         internal fun batteryTemperatureRefusal(tenthsC: Int?): QuietAnalysisReason? = when {

@@ -26,10 +26,13 @@ Capture timestamps determine the horizontal position, rather than the time the
 server received the logs. A stale latest observation remains historical evidence,
 not a current camera-temperature claim.
 
-The dashed **85 C quiet-analysis limit** is the companion's existing decoder admission
-limit. It is not a manufacturer temperature rating. Readings above that limit remain
-visible, including the approximately 107 C measured on 22 October; graphing does not
-change thermal settings or permit decoding above the limit.
+The two dashed policy-reference lines show companion 0.3.14's **95 C start/restart**
+threshold and **100 C running-analysis stop**. Earlier companions used 85 C. The legend
+identifies the policy version; it does not claim that historical observations were
+captured under the new limits or that the latest companion is installed. These are
+software policy references, not manufacturer temperature ratings. Readings above them
+remain visible, including the approximately 107 C measured on 22 October. Graphing does
+not change the camera's thermal settings.
 
 ## OBD polling assessment
 

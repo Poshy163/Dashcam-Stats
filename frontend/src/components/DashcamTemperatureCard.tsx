@@ -6,7 +6,7 @@ import Spinner from '@/components/Spinner'
 import { EmptyState, ErrorState, Pagination } from '@/components/ui'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
-import { QUIET_ANALYSIS_LIMIT_C, temperatureHistoryIsOld, temperatureSegments, temperatureValue } from '@/lib/dashcamTemperature'
+import { QUIET_ANALYSIS_HARD_STOP_C, QUIET_ANALYSIS_START_C, temperatureHistoryIsOld, temperatureSegments, temperatureValue } from '@/lib/dashcamTemperature'
 import { formatDateTime, formatShortDateTime, formatTime } from '@/lib/format'
 import type { DashcamTemperatureHistory } from '@/lib/types'
 
@@ -51,8 +51,8 @@ function TemperatureChart({ data }: { data: DashcamTemperatureHistory }) {
   }, [usable])
   if (!usable) return <EmptyState title="No usable temperature readings" description="The retained captures contain no valid camera processor temperature for this range." />
   const W = width
-  const lo = Math.floor((Math.min(QUIET_ANALYSIS_LIMIT_C, ...values) - 5) / 5) * 5
-  const hi = Math.ceil((Math.max(QUIET_ANALYSIS_LIMIT_C, ...values) + 5) / 5) * 5
+  const lo = Math.floor((Math.min(QUIET_ANALYSIS_START_C, ...values) - 5) / 5) * 5
+  const hi = Math.ceil((Math.max(QUIET_ANALYSIS_HARD_STOP_C, ...values) + 5) / 5) * 5
   const start = Date.parse(data.rangeStart)
   const end = Date.parse(data.rangeEnd)
   const x = (time: string) => LEFT + (Date.parse(time) - start) / Math.max(1, end - start) * (W - LEFT - RIGHT)
@@ -75,13 +75,14 @@ function TemperatureChart({ data }: { data: DashcamTemperatureHistory }) {
       <div ref={container} className="w-full"><svg ref={svg} viewBox={`0 0 ${W} ${H}`} height={H} className="mt-4 w-full" style={{ touchAction: 'pan-y' }} role="img"
         aria-labelledby={`${id}-title ${id}-description`} onPointerMove={onPointerMove}>
         <title id={`${id}-title`}>Dashcam processor temperature over time, in degrees Celsius</title>
-        <desc id={`${id}-description`}>Captured observations; gaps remain blank. The dashed line is the 85 degree quiet-analysis limit.</desc>
+        <desc id={`${id}-description`}>Captured observations; gaps remain blank. Dashed lines show the companion 0.3.14 policy reference: start or restart below 95 degrees, stop running analysis at 100 degrees. Earlier companions used 85 degrees.</desc>
         {[0, .25, .5, .75, 1].map((fraction) => {
           const value = lo + (hi - lo) * fraction
           return <g key={fraction}><line x1={LEFT} x2={W - RIGHT} y1={y(value)} y2={y(value)} className="stroke-border" />
             <text x={LEFT - 7} y={y(value) + 3} textAnchor="end" fontSize={11} fill="currentColor" className="text-content-faint">{value.toFixed(0)} °C</text></g>
         })}
-        <line x1={LEFT} x2={W - RIGHT} y1={y(QUIET_ANALYSIS_LIMIT_C)} y2={y(QUIET_ANALYSIS_LIMIT_C)} className="stroke-state-warn" strokeDasharray="5 4" />
+        <line x1={LEFT} x2={W - RIGHT} y1={y(QUIET_ANALYSIS_START_C)} y2={y(QUIET_ANALYSIS_START_C)} className="stroke-state-warn" strokeDasharray="5 4" aria-label="0.3.14 analysis start or restart reference: 95 degrees Celsius" />
+        <line x1={LEFT} x2={W - RIGHT} y1={y(QUIET_ANALYSIS_HARD_STOP_C)} y2={y(QUIET_ANALYSIS_HARD_STOP_C)} className="stroke-state-error" strokeDasharray="2 3" aria-label="0.3.14 analysis hard stop reference: 100 degrees Celsius" />
         {(W < 480 ? [0, 1] : [0, .5, 1]).map((fraction) => <text key={fraction} x={LEFT + fraction * (W - LEFT - RIGHT)} y={H - 7}
           textAnchor={fraction === 0 ? 'start' : fraction === 1 ? 'end' : 'middle'} fontSize={11} fill="currentColor" className="text-content-faint">
           {(data.hours > 24 ? formatShortDateTime : formatTime)(new Date(start + fraction * (end - start)).toISOString())}
@@ -92,7 +93,7 @@ function TemperatureChart({ data }: { data: DashcamTemperatureHistory }) {
           : <circle key={indices[0]} cx={x(points[indices[0]!]!.occurredAt)} cy={y(temperatureValue(points[indices[0]!])!)} r={3} fill="currentColor" className="text-accent" />)}
         {point && <line x1={x(point.occurredAt)} x2={x(point.occurredAt)} y1={TOP} y2={H - BOTTOM} className="stroke-content-faint" strokeDasharray="2 3" />}
       </svg></div>
-      <p className="mt-1 text-xs text-content-muted">Dashed line: {QUIET_ANALYSIS_LIMIT_C} °C quiet-analysis limit. Gaps are unobserved; this line is not a manufacturer safety rating.</p>
+      <p className="mt-1 text-xs text-content-muted">Companion 0.3.14 policy reference: <span className="text-state-warn">long dashes, start/restart below {QUIET_ANALYSIS_START_C} °C</span>; <span className="text-state-error">short dashes, stop running analysis at {QUIET_ANALYSIS_HARD_STOP_C} °C</span>. Earlier companions used 85 °C. These references do not identify the policy used for historical captures and are not a manufacturer safety rating. Gaps are unobserved.</p>
       <div className="mt-3 text-sm">
         <label htmlFor={`${id}-sample`} className="text-xs text-content-muted">Explore captured temperatures</label>
         <input id={`${id}-sample`} className="mt-1 w-full" type="range" min={0} max={points.length - 1} step={1}

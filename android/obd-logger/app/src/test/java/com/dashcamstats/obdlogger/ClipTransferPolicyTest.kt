@@ -120,19 +120,20 @@ class ClipTransferPolicyTest {
 
     @Test fun cpuThermalGuardUsesMeasuredSocSensorAndNeverAcceptsUnknownOrHotReadings() {
         assertTrue(VisualQuietAnalyzer.validCpuTemperature("soc-thmzone", 83_560))
-        assertFalse(VisualQuietAnalyzer.validCpuTemperature("soc-thmzone", 85_000))
-        assertFalse(VisualQuietAnalyzer.validCpuTemperature("soc-thmzone", 94_015))
+        assertTrue(VisualQuietAnalyzer.validCpuTemperature("soc-thmzone", 85_000))
+        assertTrue(VisualQuietAnalyzer.validCpuTemperature("soc-thmzone", 94_015))
+        assertFalse(VisualQuietAnalyzer.validCpuTemperature("soc-thmzone", 95_000))
         assertFalse(VisualQuietAnalyzer.validCpuTemperature("battery", 30_000))
         assertFalse(VisualQuietAnalyzer.validCpuTemperature(null, null))
         assertFalse(VisualQuietAnalyzer.validCpuTemperature("soc-thmzone", 79))
     }
 
-    @Test fun resourceRefusalsExplainBoundariesWithoutWeakeningThermalLimits() {
+    @Test fun resourceRefusalsExplainAdmissionAndPreserveBatteryLimit() {
         assertEquals(QuietAnalysisReason.CPU_TEMPERATURE_GUARD,
             VisualQuietAnalyzer.cpuTemperatureRefusal("soc-thmzone", 97_800))
         assertEquals(QuietAnalysisReason.CPU_TEMPERATURE_GUARD,
-            VisualQuietAnalyzer.cpuTemperatureRefusal("soc-thmzone", 85_000))
-        assertNull(VisualQuietAnalyzer.cpuTemperatureRefusal("soc-thmzone", 84_999))
+            VisualQuietAnalyzer.cpuTemperatureRefusal("soc-thmzone", 95_000))
+        assertNull(VisualQuietAnalyzer.cpuTemperatureRefusal("soc-thmzone", 94_999))
         assertEquals(QuietAnalysisReason.CPU_TEMPERATURE_UNAVAILABLE,
             VisualQuietAnalyzer.cpuTemperatureRefusal("battery", 30_000))
         assertEquals(QuietAnalysisReason.CPU_TEMPERATURE_UNAVAILABLE,
@@ -147,7 +148,7 @@ class ClipTransferPolicyTest {
     @Test fun guardedAnalysisReportsItsReasonBeforeOpeningOrDecodingVideo() = runTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val analyzer = object : VisualQuietAnalyzer(context) {
-            override fun resourceRefusal() = QuietAnalysisReason.CPU_TEMPERATURE_GUARD
+            override fun resourceRefusal(phase: QuietThermalPhase) = QuietAnalysisReason.CPU_TEMPERATURE_GUARD
         }
         // This intentionally invalid URI must never be opened when a resource guard refuses.
         val report = analyzer.analyze(Uri.parse("content://invalid/private-test.ts")) { true }
@@ -424,6 +425,17 @@ class ClipTransferPolicyTest {
             }
         }
         val clock: () -> Long = System::currentTimeMillis
+        // A refusal cached by the former 85C/MODERATE resource policy must be
+        // re-evaluated under the new policy, never inherited forever by this identity.
+        val legacyEntries = items.map { item ->
+            val key = movementHash("$QUIET_POLICY_VERSION/$QUIET_ALGORITHM_VERSION/${"b".repeat(64)}/" +
+                "${item.clip.relativePath}/${item.clip.size}/${item.clip.mtime}/" +
+                item.body.getJSONObject("fingerprint").getString("digest"))
+            JSONObject().put("key", key).put("visual", ClipTransferPolicy.emptyVisual(
+                "unavailable", QuietAnalysisReason.CPU_TEMPERATURE_GUARD))
+        }
+        File(context.filesDir, "quiet-analysis-v2.json").writeText(
+            JSONObject().put("entries", JSONArray(legacyEntries)).toString())
         val policy = ClipTransferPolicy(context, journal, { root }, { true }, fake, clock)
         policy.publish(items.map { it.copy(stable = false, freshFingerprint = false) }, "b".repeat(64), "ready", false) { true }
         assertEquals(0, analyses); assertEquals(2, policy.deferCount)

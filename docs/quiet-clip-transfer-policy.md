@@ -47,10 +47,22 @@ isolated compression noise as activity. The exact metric and thresholds are incl
 the proof and validated by the server. Version 1 proofs cannot authorize an exclusion.
 
 All frames must meet exposure and contrast checks. The decoder has a 90-second wall
-budget and stops for renewed ignition, ingestion, memory pressure, Android thermal
-warnings, battery temperature of 42 C or more, or a measured SoC temperature of 85 C or
-more. Missing supported SoC telemetry preserves ordinary upload. These limits preserve
-recording priority; they can mean that no clips qualify on a hot camera.
+budget and stops for renewed ignition, ingestion or memory pressure. Companion 0.3.14
+starts or restarts analysis only below 95 C; a running analysis stops when a resource
+check observes 100 C or more. It permits Android's moderate thermal status and stops
+at severe or worse. CPU temperature is checked before each decoded frame; full resource
+checks are scheduled about once per second and again before accepting a complete quiet
+result. This software policy does not control the physical temperature between
+observations. Battery temperature of 42 C or more,
+missing or invalid thermal probes, and the existing memory limits still refuse analysis.
+Firmware thermal protection remains active. Resource-policy cache version 2 prevents
+old 85 C/moderate refusals from being reused after the update; visual algorithm version
+2 and its proof requirements are unchanged. Earlier companions used the 85 C limit.
+Refused or interrupted analysis preserves ordinary upload; an incomplete check cannot
+authorize exclusion. Start/restart admission applies to future analysis attempts; it
+does not add automatic retries of already refused clips or another transfer deferral.
+These limits preserve recording priority and still require
+physical validation of both recording streams under sustained analysis.
 
 ## Scanning, processing and journeys
 

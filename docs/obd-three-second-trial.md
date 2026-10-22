@@ -85,7 +85,7 @@ schedule and are shown as unavailable; the older plans retain those counts.
 ## Deployment and physical acceptance
 
 1. Deploy the matching server and verify its revision and health.
-2. Install the production-signed 0.3.13 update in place, retaining configuration and
+2. Install the production-signed 0.3.14 update in place, retaining configuration and
    storage permissions. Verify the pinned signing certificate before installation.
 3. Explicitly enable the trial, then use a normal drive. No accessory-power hold
    is needed for a driving test.

@@ -64,7 +64,7 @@ def parse_observation(occurred_at: datetime, message: str) -> Observation | None
     if quality == "valid":
         try:
             number = float(raw)
-            # Telemetry bounds are independent of the decoder's 85 C resource guard.
+            # Telemetry bounds are independent of the decoder's admission/stop limits.
             if not math.isfinite(number) or not -40 <= number <= 200:
                 raise ValueError
             value = number

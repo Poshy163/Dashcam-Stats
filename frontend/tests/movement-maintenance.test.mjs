@@ -97,10 +97,12 @@ test('disabled exclusions and later local copies are explained separately', () =
 })
 
 test('thermal refusals and decoder failures are distinguished without implying skipped footage', () => {
-  const policyAnalysis = { status: 'ready', stale: false, clipCount: 6,
-    checkedAt: new Date().toISOString(), reasonCounts: { cpuTemperatureGuard: 4, decoderFailure: 1, reasonNotReported: 1 } }
+  const policyAnalysis = { status: 'ready', stale: false, clipCount: 7,
+    checkedAt: new Date().toISOString(), reasonCounts: { cpuTemperatureGuard: 4, cpuTemperatureHardLimit: 1, decoderFailure: 1, reasonNotReported: 1 } }
   const html = render(MovementManifestEvidence, { data: { ...report, intentionalExclusions: { ...exclusions, currentCount: 0 }, policyAnalysis } })
-  assert.match(html, /Processor at or above the 85°C analysis limit: 4 clips/)
+  assert.match(html, /Processor temperature guard prevented a complete analysis: 4 clips/)
+  assert.match(html, /Processor temperature reached the analysis hard stop: 1 clip/)
+  assert.doesNotMatch(html, /85°C|95°C|100°C/)
   assert.match(html, /Video decoder failed: 1 clip/)
   assert.match(html, /Companion did not report the refusal reason: 1 clip/)
   assert.match(html, /footage without a complete quiet proof uploads normally/)
@@ -110,7 +112,7 @@ test('thermal refusals and decoder failures are distinguished without implying s
   assert.match(stale, /Last reported visual checks/)
   assert.match(stale, /saved diagnostics, current camera conditions unverified/)
   const failed = render(MovementManifestEvidence, { data: { ...report, intentionalExclusions: exclusions, policyAnalysis }, error: true })
-  assert.doesNotMatch(failed, /Processor at or above/)
+  assert.doesNotMatch(failed, /Processor temperature guard|Processor temperature reached/)
 })
 
 test('an awake flag alone never renders as a verified maintenance lease', () => {

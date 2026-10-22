@@ -8,21 +8,47 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.12** (`versionCode` 25), installed in place on 22 October 2026 |
-| Source | `6875998e149268480f76f9a4ad9e633429ebb8a9` (`android/obd-logger/`), verified in the running companion |
+| Version | **0.3.13** (`versionCode` 26), installed in place on 22 October 2026 |
+| Source | `1e3fb244306663ffe750c1433b3384db55459b89` (`android/obd-logger/`), verified in the running companion and installed APK |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | Latest completed segment used baseline plan 7; the physical plan 8 trial fell back after 57 seconds |
-| Deployment | Production-signed 0.3.12/code 25 was installed in place on 22 October 2026, retaining configuration and permissions. The running companion's revision and version were verified separately from the APK. Both quiet-filter opt-ins remain enabled with unchanged thermal and proof gates. Sustained three-second polling and genuine quiet exclusions remain unverified. |
+| Poll plan | Parked plan 7; the three-second trial was explicitly re-armed for the next drive after the 0.3.13 update |
+| Deployment | Production-signed 0.3.13/code 26 was installed in place on 22 October 2026, retaining app identity, runtime permissions, folder access, ownership and quiet filtering. The installed APK bytes, fresh companion status, successful webhook and matching server revision were verified separately. Sustained three-second polling and genuine quiet exclusions remain unverified. |
 
-## 0.3.13 candidate
+## 0.3.14 thermal-policy candidate
+
+Source version **0.3.14/code 27** implements the operator's 95 C/100 C request. It
+starts or restarts visual analysis below 95 C and stops running analysis when a
+resource check observes 100 C or more. Moderate Android thermal status is permitted;
+severe or worse still stops analysis. Battery temperature at 42 C, memory, unknown
+probes, driving and backup guards retain their previous behavior. Native firmware
+thermal protection is unchanged. Resource-policy cache version 2 prevents reuse of
+the older 85 C/moderate refusals; the visual algorithm and exclusion proof stay v2.
+
+Checks remain bounded during decoding and run again before accepting a complete
+quiet result. Partial or resource-refused results preserve upload. The chart shows
+separate 95 C/100 C reference lines explicitly labelled as the 0.3.14 policy; historical
+85 C refusals are not relabelled as 95 C. These limits are a software policy, not a
+manufacturer rating or a guarantee that the physical sensor cannot overshoot between
+checks. Sustained paired analysis and recording at the raised limits require a new
+physical acceptance test. This candidate has not yet been installed.
+
+Local validation on 22 October passed all 290 Android JVM tests, including the
+private footage-grid replay, with no failures or skips. Debug/release lint had zero
+errors and 58 warnings per variant; both APK assemblies passed. All 3,454 backend
+tests passed with 33 platform/fixture skips, as did Ruff lint/format checks across
+296 files. All 232 frontend tests, typecheck, lint and the production build passed.
+The actual chart component was visually checked with labelled synthetic temperatures;
+the 95 C and 100 C references remained distinct. Automated and synthetic checks do
+not establish sustained analysis/recording performance at the raised limits.
+
+## 0.3.13 installed
 
 Source version **0.3.13/code 26** addresses the issues found in the 22 October drive
-review. It has not been installed on the camera. Deploy the matching server before
-updating the production-signed companion, then explicitly re-arm the polling trial.
-A new physical drive is required to accept the polling fix, and a sufficiently cool
-camera is required to exercise quiet decoding.
+review. It was installed after the matching server was deployed; the polling trial
+was explicitly re-armed in the native app. A new physical drive is still required
+to accept the polling fix, and sustained quiet decoding remains unverified.
 
 - Critical-reading health distinguishes an actual failed reply from a bounded,
   intentional parser cooldown. Missing values remain missing; the parser and transport
@@ -44,9 +70,26 @@ Backup-page component was visually checked with clearly labelled synthetic refus
 counts, including separate saved/stale wording. These checks do not establish
 physical decoder capacity or sustained three-second operation on the camera.
 
+The installed APK matched the production certificate and had SHA-256
+`43fde5b843bd3bf042b7b96ce5093cbe76f2eba4ea907f697f51eb728157422a`.
+Fresh 0.3.13 events confirmed automatic package-replaced startup and successful
+authenticated webhook delivery. The camera's Wi-Fi address changed during maintenance;
+after the operator selected its device MAC, the server address was restored to
+`192.168.1.214:5555` and fresh 0.3.13 status was verified there.
+
+Run 594 durably recorded 81 files / 4,954,339,372 bytes, retaining a partial outcome
+because radio restoration initially needed recovery. The subsequent four-file /
+246,366,856-byte catch-up run 595 finished `ok`, with Bluetooth, hotspot and logger
+restoration verified. Automatic ingest was restored after the temporary maintenance
+hold. A vendor-native sleep request was sent, but the loss of the previous IP did
+not prove suspension: after the address change the suspend-success counter remained
+716 and the camera was awake. Do not count that request as physical sleep acceptance.
+New visual diagnostics reported eight `system_thermal_guard` refusals; they validate
+the refusal reporting, not quiet exclusions or decoding capacity.
+
 ## 0.3.12 polling trial
 
-Companion 0.3.12/code 25 from build `6875998` is installed. A physical drive on
+The preceding companion 0.3.12/code 25 from build `6875998` was installed for a physical drive on
 22 October exercised plan 8 from 16:53:02 to 16:53:59 Australia/Adelaide. Median
 successful response intervals were approximately 3.10 seconds for speed, 3.12 for
 RPM and 3.17 for MAF. One malformed MAF reply was followed by two intentional
@@ -480,7 +523,7 @@ First integrate/review the release source in the protected signing checkout, or 
 protected build host to use the existing signing files. The original checkout may still contain
 older source and unrelated local changes: do not blindly pull, switch branches or overwrite it.
 Fresh worktrees do not contain the signing files. From the chosen source checkout, after verifying
-`app/build.gradle.kts` declares version 0.3.13/code 26:
+`app/build.gradle.kts` declares version 0.3.14/code 27:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
@@ -508,7 +551,7 @@ other settings, the metrics toggle works, and `Bundles waiting for the server` d
 next Wi-Fi window. Verify webhook events reach the server and boot recovery still works.
 
 After ingestion obtains a fresh status snapshot, `GET /api/obd/status` should report
-`app_version_name: "0.3.13"` and `app_version_code: 26` under `logger`. A cached status alone does
+`app_version_name: "0.3.14"` and `app_version_code: 27` under `logger`. A cached status alone does
 not establish the currently installed/running version.
 
 ## What is still left to do

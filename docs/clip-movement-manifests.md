@@ -85,9 +85,14 @@ are replaced with a fixed category and cannot authorize exclusion or deferral.
 The server retains only aggregate status/reason counts alongside the last observation;
 these diagnostics contain no video paths, raw exceptions or frame data and never grant
 permission to skip footage. Saved/stale diagnostics are labelled separately from current
-camera conditions. The 85 C processor and 42 C battery limits remain unchanged. Hot or
-unmeasurable cameras keep uploading normally; software reporting does not resolve the
-camera's physical heat or prove a complete quiet-clip analysis.
+camera conditions. Companion 0.3.14 starts/restarts analysis below 95 C and stops running
+analysis at an observed 100 C; Android severe-or-worse status also stops it. Earlier
+companions used 85 C and refused moderate status. The 42 C battery limit, memory and
+missing-probe checks remain. The bounded `cpu_temperature_hard_limit` reason identifies
+the new running stop; the older `cpu_temperature_guard` remains readable without
+claiming a particular threshold for historical checks. Hot or unmeasurable cameras keep
+uploading normally; software reporting does not resolve the camera's physical heat or
+prove a complete quiet-clip analysis.
 
 ## Verified maintenance wake hold
 

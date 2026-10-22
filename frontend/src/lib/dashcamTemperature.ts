@@ -1,6 +1,8 @@
 import type { DashcamTemperatureObservation, DashcamTemperaturePoint } from './types'
 
-export const QUIET_ANALYSIS_LIMIT_C = 85
+// Versioned reference only: historical captures do not identify the running companion.
+export const QUIET_ANALYSIS_START_C = 95
+export const QUIET_ANALYSIS_HARD_STOP_C = 100
 
 export function temperatureValue(observation: DashcamTemperatureObservation | null | undefined): number | null {
   const value = observation?.socC
