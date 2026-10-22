@@ -51,10 +51,12 @@ export function MaintenanceWakeCard() {
   const stop = useMutation({ mutationFn: api.ingest.stopMaintenance, onSuccess: refresh })
   const busy = start.isPending || stop.isPending
   const restoring = state.data?.state === 'restoring'
+  const retrying = state.data?.countdownCancelled === true && !state.data.active && !restoring
   return (
     <section className="card mb-6 px-5 py-4" aria-label="Maintenance wake hold">
       <h2 className="text-base font-semibold">Keep the dashcam awake</h2>
-      <p className="mt-1 text-sm text-content-muted">For maintenance while parked. The server must observe and cancel the dashcam’s native countdown before it can verify a bounded wake hold.</p>
+      <p className="mt-1 text-sm text-content-muted">For maintenance while parked. The server checks that the dashcam is parked and awake, then cancels a visible native countdown or starts a fresh bounded hold after a previously verified cancellation.</p>
+      <p className="mt-1 text-sm text-content-muted">A retry requires fresh device checks, and the dashcam must not have restarted since the verified cancellation. An unverified cancellation cannot be retried.</p>
       <MaintenanceWakeEvidence data={state.data} error={state.isError} checkedAtMs={state.dataUpdatedAt} nowMs={Math.max(now, Date.now())} />
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <label className="text-sm" htmlFor="maintenance-duration">Duration</label>
@@ -62,7 +64,7 @@ export function MaintenanceWakeCard() {
           <option value={5}>5 minutes</option><option value={15}>15 minutes</option><option value={30}>30 minutes</option>
         </select>
         <button type="button" className="btn" onClick={() => start.mutate()} disabled={busy || state.isPending || state.isError || state.data?.active || restoring}>
-          {start.isPending ? 'Verifying countdown…' : 'Start verified wake hold'}
+          {start.isPending ? 'Verifying parked state…' : retrying ? 'Retry verified wake hold' : 'Start verified wake hold'}
         </button>
         {(state.data?.active || restoring) && <button type="button" className="btn" onClick={() => stop.mutate()} disabled={busy}>{stop.isPending ? 'Restoring radios…' : restoring ? 'Retry radio restoration' : 'End wake hold'}</button>}
       </div>

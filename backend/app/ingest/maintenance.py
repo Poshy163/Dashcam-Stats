@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import structlog
+
 from app.config import get_config
 from app.core.process_lock import ProcessFileLock, try_acquire
 from app.ingest import adb
@@ -36,11 +38,13 @@ EVIDENCE_TTL_S = 30.0
 DEVICE_HEARTBEAT_TTL_S = 45
 HEARTBEAT_INTERVAL_S = 10.0
 HEARTBEAT_REFRESH_TIMEOUT_S = 14.0
+HEARTBEAT_MAX_ATTEMPTS = 8
+HEARTBEAT_RETRY_DELAY_S = 0.25
 UI_DUMP_TIMEOUT_S = 5
 UI_SCREEN_TIMEOUT_S = 8.0
 UI_HELPER_PATH = "/data/local/tmp/.dashcam_stats_fresh_ui_v1.dex"
 UI_HELPER_ASSET = Path(__file__).with_name("assets") / "fresh-ui.dex"
-UI_HELPER_SHA256 = "0f331af612480bd7fa63ee65b16b3dd9a8cda4a5308daecf484a1a473cc8f5e4"
+UI_HELPER_SHA256 = "a64731a494599c2800e6dc3c161c17b8f39bc644ef51dea08eae1910ad5675e7"
 UI_HELPER_CLASS = "com.dashcamstats.maintenance.FreshUiSnapshot"
 RESTORE_RESERVE_S = 60
 MAX_DURATION_S = 1800
@@ -57,6 +61,7 @@ _POWER_COMMAND = (
     "settings get global acc_status; getprop persist.sys.state.system_sleep; "
     "settings get global system_sleep_status; cat /proc/sys/kernel/random/boot_id"
 )
+log = structlog.get_logger(__name__)
 
 
 def _record_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -72,6 +77,14 @@ class MaintenanceRefused(Exception):
     """A bounded, safe public reason; raw device output never crosses the API."""
 
 
+class MaintenanceTransient(MaintenanceRefused):
+    """Only transport/unavailability failures may retry inside the original evidence budget."""
+
+    def __init__(self, stage: str, code: str, message: str) -> None:
+        super().__init__(message)
+        self.stage, self.code = stage, code
+
+
 @dataclass(frozen=True)
 class PowerProof:
     boot_id: str
@@ -84,14 +97,16 @@ class CancellationRecord:
     generation: str
     cycle_after_elapsed_ms: int | None
     legacy: bool = False
+    native_verified: bool = False
 
     def document(self) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "boot_id": self.boot_id,
             "cancelled": True,
             "generation": self.generation,
             "cycle_after_elapsed_ms": self.cycle_after_elapsed_ms,
+            "native_verified": self.native_verified,
         }
 
 
@@ -165,12 +180,43 @@ def countdown_target(xml: str) -> tuple[int, int] | None:
 
 
 async def _power(address: str) -> PowerProof:
-    proof = parse_power(await adb.shell(address, _POWER_COMMAND, timeout=3.0))
+    try:
+        reply = await adb.shell(address, _POWER_COMMAND, timeout=3.0)
+    except (OSError, TimeoutError, adb.AdbError) as exc:
+        raise MaintenanceTransient(
+            "power", "power_transport", "The dashcam power verification was unavailable."
+        ) from exc
+    proof = parse_power(reply)
     if proof is None:
+        code = _power_failure_code(reply)
+        log.warning("maintenance power proof refused", reason_code=code)
         raise MaintenanceRefused(
-            "Maintenance requires verified ignition OFF and normal sleep policy."
+            f"Maintenance requires verified ignition OFF and normal sleep policy ({code})."
         )
     return proof
+
+
+def _power_failure_code(reply: str) -> str:
+    """Classify only; never retain the device reply or disclose its field values."""
+    lines = [part.strip() for part in reply.strip().splitlines()]
+    if len(lines) != 10:
+        return "power_shape"
+    boot, before, acc, policy, sleeping, after, acc2, policy2, sleeping2, boot2 = lines
+    if not _BOOT.fullmatch(boot) or boot != boot2:
+        return "power_boot"
+    if acc != "0" or acc2 != "0":
+        return "ignition_not_off"
+    if policy != "true" or policy2 != "true":
+        return "sleep_policy"
+    if sleeping != "0" or sleeping2 != "0":
+        return "device_sleeping"
+    try:
+        initial, final = float(before.split()[0]), float(after.split()[0])
+    except (ValueError, IndexError):
+        return "power_uptime"
+    if not math.isfinite(initial) or not math.isfinite(final) or not 0 <= initial <= final:
+        return "power_uptime"
+    return "power_sample_window"
 
 
 async def _ensure_ui_helper(address: str) -> None:
@@ -214,7 +260,7 @@ async def _screen(address: str) -> str:
     try:
         async with asyncio.timeout(UI_SCREEN_TIMEOUT_S):
             await _ensure_ui_helper(address)
-            return await adb.shell(
+            reply = await adb.shell(
                 address,
                 f"umask 077; trap \"rm -f '{path}'\" EXIT HUP INT TERM; "
                 f"rm -f '{path}' && [ -f '{UI_HELPER_PATH}' ] && [ ! -L '{UI_HELPER_PATH}' ] && "
@@ -222,13 +268,29 @@ async def _screen(address: str) -> str:
                 f"[ \"${{digest%% *}}\" = '{UI_HELPER_SHA256}' ] && "
                 f"CLASSPATH='{UI_HELPER_PATH}:/system/framework/uiautomator.jar' "
                 f"timeout {UI_DUMP_TIMEOUT_S} app_process /data/local/tmp {UI_HELPER_CLASS} '{path}' "
-                f">/dev/null 2>&1 && [ -s '{path}' ] && [ ! -L '{path}' ] && "
+                f">/dev/null 2>&1; helper_result=$?; "
+                'if [ "$helper_result" -eq 75 ]; then printf __DASHCAM_UI_BUSY__; exit 0; fi; '
+                'if [ "$helper_result" -eq 124 ]; then printf __DASHCAM_UI_TIMEOUT__; exit 0; fi; '
+                f"[ \"$helper_result\" -eq 0 ] && [ -s '{path}' ] && [ ! -L '{path}' ] && "
                 f"head -c {MAX_UI_BYTES + 1} '{path}'; "
                 f"result=$?; rm -f '{path}'; exit \"$result\"",
                 timeout=6.0,
             )
+            if reply == "__DASHCAM_UI_BUSY__":
+                raise MaintenanceTransient(
+                    "screen", "screen_busy", "Another maintenance screen snapshot is still running."
+                )
+            if reply == "__DASHCAM_UI_TIMEOUT__":
+                raise MaintenanceTransient(
+                    "screen", "screen_timeout", "The dashcam screen verification timed out."
+                )
+            return reply
     except (OSError, TimeoutError, adb.AdbError) as exc:
-        raise MaintenanceRefused("The dashcam screen could not be safely identified.") from exc
+        raise MaintenanceTransient(
+            "screen",
+            "screen_timeout" if isinstance(exc, TimeoutError) else "screen_transport",
+            "The dashcam screen could not be safely identified.",
+        ) from exc
 
 
 async def _attest(address: str) -> None:
@@ -292,12 +354,14 @@ class MaintenanceController:
             raise ValueError("invalid cancellation record")
         version = record.get("schema_version")
         fields = {"schema_version", "boot_id", "cancelled", "generation"}
-        if type(version) is int and version == 2:
+        if type(version) is int and version in (2, 3):
             fields.add("cycle_after_elapsed_ms")
+        if type(version) is int and version == 3:
+            fields.add("native_verified")
         if (
             set(record) != fields
             or type(version) is not int
-            or version not in (1, 2)
+            or version not in (1, 2, 3)
             or record["cancelled"] is not True
             or not isinstance(record["boot_id"], str)
             or not _BOOT.fullmatch(record["boot_id"])
@@ -311,7 +375,12 @@ class MaintenanceController:
             type(boundary) is not int or not 0 <= boundary <= _ELAPSED_MAX_MS
         ):
             raise ValueError("invalid cancellation record")
-        return CancellationRecord(record["boot_id"], record["generation"], boundary, legacy)
+        verified = record.get("native_verified", False)
+        if type(verified) is not bool or (verified and boundary is None):
+            raise ValueError("invalid cancellation verification")
+        return CancellationRecord(
+            record["boot_id"], record["generation"], boundary, legacy, verified
+        )
 
     def load_once(self) -> None:
         # Lifespan performs this off the event loop before starting the poller.
@@ -381,12 +450,16 @@ class MaintenanceController:
             with contextlib.suppress(OSError):
                 temporary.unlink(missing_ok=True)
 
-    def _record_cycle_boundary(self, expected: CancellationRecord, upper_ms: int) -> bool:
+    def _record_cycle_boundary(
+        self, expected: CancellationRecord, upper_ms: int, native_verified: bool = False
+    ) -> bool:
         """Complete this exact cancellation, or anchor a legacy marker for FUTURE cycles."""
         if (
             type(upper_ms) is not int
             or not 0 <= upper_ms <= _ELAPSED_MAX_MS
             or expected.cycle_after_elapsed_ms is not None
+            or type(native_verified) is not bool
+            or (native_verified and expected.legacy)
         ):
             return False
         # Legacy bootstrap is independent of start(): it must never borrow a
@@ -401,7 +474,12 @@ class MaintenanceController:
             with self._tombstone_lock:
                 if self._read_record(self._record_path()) != expected:
                     return False
-                updated = CancellationRecord(expected.boot_id, expected.generation, upper_ms)
+                updated = CancellationRecord(
+                    expected.boot_id,
+                    expected.generation,
+                    upper_ms,
+                    native_verified=native_verified,
+                )
                 self._write_record(updated)
                 self._record = updated
                 self._durable_boot, self._generation = updated.boot_id, updated.generation
@@ -618,15 +696,95 @@ class MaintenanceController:
         now = math.floor(proof.uptime_s)
         expiry = min(now + DEVICE_HEARTBEAT_TTL_S, self._device_end)
         record = f"{self._token} {proof.boot_id} {expiry} {self._device_end}"
-        reply = await adb.shell(
-            self._address,
-            f"umask 077; printf '%s\\n' '{record}' > '{LEASE_PARTIAL_PATH}' && "
-            f"chmod 600 '{LEASE_PARTIAL_PATH}' && "
-            f"mv -f '{LEASE_PARTIAL_PATH}' '{LEASE_PATH}' && cat '{LEASE_PATH}'",
-            timeout=3.0,
-        )
+        try:
+            reply = await adb.shell(
+                self._address,
+                f"umask 077; printf '%s\\n' '{record}' > '{LEASE_PARTIAL_PATH}' && "
+                f"chmod 600 '{LEASE_PARTIAL_PATH}' && "
+                f"mv -f '{LEASE_PARTIAL_PATH}' '{LEASE_PATH}' && cat '{LEASE_PATH}'",
+                timeout=3.0,
+            )
+        except (OSError, TimeoutError, adb.AdbError) as exc:
+            raise MaintenanceTransient(
+                "publish",
+                "lease_transport",
+                "The maintenance lease acknowledgement was unavailable.",
+            ) from exc
         if reply.strip() != record:
             raise MaintenanceRefused("The on-device maintenance lease was not verified.")
+
+    def _verified_record_matches(self, expected: CancellationRecord) -> bool:
+        with self._tombstone_lock:
+            try:
+                return (
+                    not self._tombstone_error
+                    and self._record == expected
+                    and self._read_record(self._record_path()) == expected
+                )
+            except (OSError, ValueError, TypeError, RecursionError):
+                self._tombstone_error = True
+                return False
+
+    async def _activate_lease(
+        self, address: str, proof: PowerProof, duration_s: int
+    ) -> dict[str, object]:
+        self._boot, self._address = proof.boot_id, address
+        self._cancelled = True
+        self._cancellation_verified = True
+        self._token = str(uuid.uuid4())
+        now = time.monotonic()
+        self._end = now + duration_s
+        self._device_end = math.floor(proof.uptime_s) + duration_s
+        self._expires_at = datetime.now(UTC) + timedelta(seconds=duration_s)
+        await self._publish(proof)
+        self._verified_at = now
+        self._state, self._reason = "active", None
+        self._task = asyncio.create_task(self._heartbeat(), name="ingest-maintenance")
+        return self.snapshot()
+
+    async def _retry_verified_cancellation(
+        self, address: str, before: PowerProof, duration_s: int
+    ) -> dict[str, object]:
+        self.load_once()
+        record = self._record
+        if (
+            self._tombstone_error
+            or record is None
+            or record.legacy
+            or not record.native_verified
+            or record.cycle_after_elapsed_ms is None
+            or record.boot_id != before.boot_id
+            or self._generation != record.generation
+            or self._durable_boot != record.boot_id
+            or before.uptime_s * 1000 < record.cycle_after_elapsed_ms
+        ):
+            raise MaintenanceRefused(
+                "The native countdown is not visible and no verified same-boot cancellation is available."
+            )
+        # The operator is requesting a new bounded lease, not a native deadline.
+        # Keep the exact cancellation record throughout expiry, stop and retry.
+        self._boot, self._address = before.boot_id, address
+        try:
+            if not await self._persist(self._verified_record_matches, record):
+                raise MaintenanceRefused(
+                    "The verified cancellation record changed; retry was refused."
+                )
+            fresh = await _power(address)
+            if fresh.boot_id != before.boot_id or fresh.uptime_s < before.uptime_s:
+                raise MaintenanceRefused("The dashcam restarted during maintenance preparation.")
+            if countdown_target(await _screen(address)) is not None:
+                raise MaintenanceRefused("A new native countdown appeared; retry was refused.")
+            after = await _power(address)
+            if after.boot_id != fresh.boot_id or after.uptime_s < fresh.uptime_s:
+                raise MaintenanceRefused("The dashcam restarted during maintenance preparation.")
+            if not await self._persist(self._verified_record_matches, record):
+                raise MaintenanceRefused(
+                    "The verified cancellation record changed; retry was refused."
+                )
+            return await self._activate_lease(address, after, duration_s)
+        except BaseException:
+            await self._end_hold("failed", "Maintenance retry could not be verified.")
+            raise
 
     async def start(self, address: str, duration_s: int) -> dict[str, object]:
         if self._fence is not None:
@@ -653,14 +811,16 @@ class MaintenanceController:
                 raise MaintenanceRefused("The previous cancellation record is still being cleared.")
             if self._anchor_task is not None and not self._anchor_task.done():
                 raise MaintenanceRefused("The previous cancellation record is still being updated.")
+            if self._persistence_task is not None and not self._persistence_task.done():
+                raise MaintenanceRefused(
+                    "The previous cancellation record operation is still pending."
+                )
             # No cached status or caller-provided boolean can authorize this action.
             await _attest(address)
             before = await _power(address)
             target = countdown_target(await _screen(address))
             if target is None:
-                raise MaintenanceRefused(
-                    "The native countdown is not visible. An already dismissed popup cannot prove a maintenance hold."
-                )
+                return await self._retry_verified_cancellation(address, before, duration_s)
             fresh = await _power(address)
             if fresh.boot_id != before.boot_id:
                 raise MaintenanceRefused("The dashcam restarted during maintenance preparation.")
@@ -694,19 +854,10 @@ class MaintenanceController:
                     self._record_cycle_boundary,
                     record,
                     math.ceil(after.uptime_s * 1000) + _ELAPSED_PADDING_MS,
+                    True,
                 ):
                     raise MaintenanceRefused("The verified cancellation time could not be saved.")
-                self._cancellation_verified = True
-                now = time.monotonic()
-                self._token = str(uuid.uuid4())
-                self._end = now + duration_s
-                self._device_end = math.floor(after.uptime_s) + duration_s
-                self._expires_at = datetime.now(UTC) + timedelta(seconds=duration_s)
-                await self._publish(after)
-                self._verified_at = time.monotonic()
-                self._state, self._reason = "active", None
-                self._task = asyncio.create_task(self._heartbeat(), name="ingest-maintenance")
-                return self.snapshot()
+                return await self._activate_lease(address, after, duration_s)
             except BaseException:
                 # The gesture may have succeeded even if verification failed. Preserve
                 # that uncertainty and close transfer admission; never claim a timer.
@@ -714,36 +865,92 @@ class MaintenanceController:
                 raise
 
     async def _heartbeat(self) -> None:
+        next_refresh = self._verified_at + HEARTBEAT_INTERVAL_S
+        stage = "screen"
+        failure_code = "heartbeat_unexpected"
         try:
             while self._state == "active":
                 if self._end - time.monotonic() <= RESTORE_RESERVE_S:
                     break
                 await asyncio.sleep(
                     min(
-                        HEARTBEAT_INTERVAL_S,
+                        max(0.0, next_refresh - time.monotonic()),
                         max(0.0, self._end - time.monotonic() - RESTORE_RESERVE_S),
                     )
                 )
                 if self._state != "active":
                     break
+                if self._end - time.monotonic() <= RESTORE_RESERVE_S:
+                    break
                 assert self._address is not None
-                async with asyncio.timeout(HEARTBEAT_REFRESH_TIMEOUT_S):
-                    if countdown_target(await _screen(self._address)) is not None:
-                        raise MaintenanceRefused(
-                            "A new native countdown appeared; maintenance ended."
-                        )
-                    proof = await _power(self._address)
-                    if proof.boot_id != self._boot:
-                        raise MaintenanceRefused("The device boot changed; maintenance ended.")
-                    await self._publish(proof)
+                refresh_started = time.monotonic()
+                next_refresh = refresh_started + HEARTBEAT_INTERVAL_S
+                budget = min(
+                    HEARTBEAT_REFRESH_TIMEOUT_S,
+                    self._verified_at + EVIDENCE_TTL_S - refresh_started,
+                    self._end - RESTORE_RESERVE_S - refresh_started,
+                )
+                if budget <= 0:
+                    failure_code = "heartbeat_evidence_expired"
+                    raise MaintenanceRefused("Maintenance evidence expired before refresh.")
+                async with asyncio.timeout(budget):
+                    for attempt in range(1, HEARTBEAT_MAX_ATTEMPTS + 1):
+                        try:
+                            failure_code = "heartbeat_unexpected"
+                            stage = "screen"
+                            if countdown_target(await _screen(self._address)) is not None:
+                                failure_code = "native_countdown_returned"
+                                raise MaintenanceRefused(
+                                    "A new native countdown appeared; maintenance ended."
+                                )
+                            stage = "power"
+                            proof = await _power(self._address)
+                            if proof.boot_id != self._boot:
+                                failure_code = "heartbeat_boot_changed"
+                                raise MaintenanceRefused(
+                                    "The device boot changed; maintenance ended."
+                                )
+                            stage = "publish"
+                            await self._publish(proof)
+                            break
+                        except (MaintenanceTransient, OSError, TimeoutError, adb.AdbError) as exc:
+                            failure_code = (
+                                exc.code
+                                if isinstance(exc, MaintenanceTransient)
+                                else f"{stage}_transport"
+                            )
+                            log.warning(
+                                "maintenance heartbeat probe retry",
+                                stage=stage,
+                                reason_code=failure_code,
+                                attempt=attempt,
+                                elapsed_ms=round((time.monotonic() - refresh_started) * 1000),
+                            )
+                            if attempt == HEARTBEAT_MAX_ATTEMPTS:
+                                raise
+                            await asyncio.sleep(
+                                min(1.0, HEARTBEAT_RETRY_DELAY_S * 2 ** (attempt - 1))
+                            )
                 self._verified_at = time.monotonic()
             await self._end_hold(
                 "expired", "Maintenance ended; radios are restored before backup can resume."
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            await self._end_hold("failed", "Fresh on-device maintenance evidence was lost.")
+        except Exception as exc:
+            if isinstance(exc, TimeoutError):
+                failure_code = f"{stage}_timeout"
+            elif isinstance(exc, MaintenanceRefused) and failure_code == "heartbeat_unexpected":
+                failure_code = f"{stage}_refused"
+            log.warning(
+                "maintenance heartbeat failed",
+                stage=stage,
+                reason_code=failure_code,
+                error_kind=type(exc).__name__[:48],
+            )
+            await self._end_hold(
+                "failed", f"Fresh on-device maintenance evidence was lost ({failure_code})."
+            )
 
     async def _end_hold(self, state: str, reason: str) -> None:
         self._state, self._reason = "restoring", reason

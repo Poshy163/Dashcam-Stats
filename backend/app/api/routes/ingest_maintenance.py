@@ -21,7 +21,7 @@ async def maintenance_status() -> dict[str, object]:
     return maintenance.get_controller().snapshot()
 
 
-@router.post("/maintenance", summary="Cancel the visible native countdown for maintenance")
+@router.post("/maintenance", summary="Verify a new or retried maintenance hold")
 async def maintenance_start(
     payload: MaintenanceRequest, settings: SettingsDep
 ) -> dict[str, object]:

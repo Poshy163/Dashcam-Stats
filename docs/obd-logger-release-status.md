@@ -8,19 +8,23 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.11** (`versionCode` 24), installed in place on 22 October |
-| Source | `b348066d24edbc5bb25c673c09c4f183d1bc887b` (`android/obd-logger/`), verified in the running companion |
+| Version | **0.3.12** (`versionCode` 25), installed in place on 22 October 2026 |
+| Source | `6875998e149268480f76f9a4ad9e633429ebb8a9` (`android/obd-logger/`), verified in the running companion |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | 7; five-second target with measured optional-command admission |
-| Deployment | Production-signed 0.3.11/code 24 was installed in place on 22 October. The running companion's revision, version and retained configuration were verified separately from the APK. The coverage validator was deployed and verified at server revision `53346a6` that day. Both quiet-filter opt-ins remain enabled with unchanged thermal and proof gates. |
+| Poll plan | 7 reported while parked; the three-second plan 8 trial is armed for the next drive |
+| Deployment | Production-signed 0.3.12/code 25 was installed in place on 22 October 2026, retaining configuration and permissions. The running companion's revision and version were verified separately from the APK. Both quiet-filter opt-ins remain enabled with unchanged thermal and proof gates. No physical three-second drive has been accepted. |
 
 ## 0.3.12 polling trial
 
-The new companion implementation is 0.3.12/code 25. It has not been installed or
-physically accepted on the camera. The installed-version evidence above still
-describes 0.3.11.
+Companion 0.3.12/code 25 from build `6875998` is installed. Its three-second trial is
+armed for the next drive; the parked companion still reports baseline plan 7. No
+physical three-second drive has been accepted.
+
+The in-place installation on 22 October 2026 retained existing configuration and
+permissions. The APK matched the pinned production signing certificate and had SHA-256
+`a6f06bdec37d78ab579764d8b3724d2b4be0d594ddf945ab0b50593ce6e0a608`.
 
 - An opt-in immutable poll plan 8 targets fresh speed, RPM and MAF reads every three
   seconds. Plan 7 remains the default; slower readings retain explicit opportunities
@@ -38,6 +42,29 @@ describes 0.3.11.
   Python formatting checks passing. Source-window, missing-data and reply-time UI
   behavior was visually checked with synthetic fixtures. These are implementation
   checks; no physical three-second drive has been accepted.
+
+### Server maintenance retry update (physical acceptance pending)
+
+The implementation now records explicit version-three `native_verified` provenance
+after a witnessed countdown cancellation and durable same-boot post-gesture proof.
+An operator's duration-only maintenance request can retry that verified cancellation
+after fresh native OFF/awake/normal-policy and absent-countdown checks. The complete
+durable marker must still match under the controller and process fences. Older or
+provisional records are not automatically eligible; neither a cached flag nor an absent
+popup can authorize copying.
+
+Each successful retry creates a new bounded lease and retains the cancellation
+tombstone. Expiry, stop or failure still closes admission and restores radios; it does
+not establish a normal native sleep deadline or invent an ignition transition. The
+30-second host evidence lifetime, 45-second on-device heartbeat lifetime and 60-second
+restoration reserve are unchanged.
+
+The UI snapshot helper now serializes its accessibility ownership with an on-device
+kernel lock, and transient heartbeat transport failures may retry within the original
+evidence budget. The Backup page explains retry prerequisites and still requires new
+server verification. All 230 frontend tests, typecheck, lint and build pass. Live
+acceptance of this maintenance fix, a resulting backup and subsequent requested sleep
+remains pending; installation of 0.3.12 alone does not verify that server-only path.
 
 ### What changed in 0.3.11
 
@@ -161,7 +188,7 @@ resource limits and remaining physical acceptance checks.
 
 ### Server-only recorded-cycle recovery (deployed; physical acceptance pending)
 
-This backend update uses the installed 0.3.10 companion's existing deadline evidence
+This backend update originally used the 0.3.10 companion's existing deadline evidence
 when the camera records a real ON to OFF cycle but the server misses live ON. It does
 not change the APK, version code, poll plan or permissions. The live server's
 `source_revision` was freshly verified at `6c31999` on 22 October. Successful physical
@@ -377,7 +404,7 @@ First integrate/review the release source in the protected signing checkout, or 
 protected build host to use the existing signing files. The original checkout may still contain
 older source and unrelated local changes: do not blindly pull, switch branches or overwrite it.
 Fresh worktrees do not contain the signing files. From the chosen source checkout, after verifying
-`app/build.gradle.kts` declares version 0.3.11/code 24:
+`app/build.gradle.kts` declares version 0.3.12/code 25:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
@@ -390,7 +417,7 @@ Get-FileHash -Algorithm SHA256 $apk
 
 Check that the printed `Signer #1 certificate SHA-256 digest` equals the complete digest above.
 Record that digest and the APK SHA-256. Deploy the matching server manifest and
-maintenance support first (poll plan 7 remains required);
+maintenance and plan 8 support before enabling the trial (baseline plan 7 remains the default);
 then, with the head unit awake and explicitly selected on ADB:
 
 ```powershell
@@ -405,7 +432,7 @@ other settings, the metrics toggle works, and `Bundles waiting for the server` d
 next Wi-Fi window. Verify webhook events reach the server and boot recovery still works.
 
 After ingestion obtains a fresh status snapshot, `GET /api/obd/status` should report
-`app_version_name: "0.3.11"` and `app_version_code: 24` under `logger`. A cached status alone does
+`app_version_name: "0.3.12"` and `app_version_code: 25` under `logger`. A cached status alone does
 not establish the currently installed/running version.
 
 ## What is still left to do
@@ -429,7 +456,8 @@ Remaining work and physical checks:
    an actual quiet exclusion retained on the card, an activity upload, and their downstream
    scan/job state. App-UID thermal access, native countdown cancellation, fresh maintenance
    heartbeat evidence and subsequent radio/logger restoration are verified. Planned hold
-   expiry and the cause of the early heartbeat loss still need investigation.
+   expiry, physical acceptance of the version-three same-boot retry and the scope of
+   the early heartbeat-loss cause still need investigation.
    Advisory labels remain report only. Both visual-policy opt-ins were enabled on
    22 October at the operator's request, with unchanged resource and proof gates.
    The camera was above the 85 C limit; genuine exclusion, parked-activity transfer and

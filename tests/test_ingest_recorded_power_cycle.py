@@ -200,7 +200,8 @@ async def test_legacy_bootstrap_is_durable_and_excludes_the_already_captured_edg
     await finish(controller, "_anchor_task")
     expected_barrier = math.ceil(first.uptime_s * 1000) + 1000
     anchored = json.loads(path.read_text())
-    assert anchored["schema_version"] == 2
+    assert anchored["schema_version"] == 3
+    assert anchored["native_verified"] is False
     assert anchored["cycle_after_elapsed_ms"] == expected_barrier
     assert anchored["boot_id"] == BOOT and anchored["cancelled"] is True
     assert controller.native_cancelled(BOOT)

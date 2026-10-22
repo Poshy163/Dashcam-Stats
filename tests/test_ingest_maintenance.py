@@ -263,7 +263,7 @@ async def test_already_dismissed_popup_never_gets_a_retroactive_hold(monkeypatch
         maintenance, "_power", AsyncMock(return_value=maintenance.PowerProof(BOOT, 1000))
     )
     monkeypatch.setattr(maintenance, "_screen", AsyncMock(return_value=NORMAL))
-    with pytest.raises(maintenance.MaintenanceRefused, match="already dismissed"):
+    with pytest.raises(maintenance.MaintenanceRefused, match="no verified same-boot"):
         await controller.start("unit", 900)
     shell.assert_not_awaited()
     assert not controller.snapshot()["active"]
@@ -614,12 +614,14 @@ async def test_cancellation_record_is_durable_before_even_an_unanswered_gesture(
             "cancelled",
             "generation",
             "cycle_after_elapsed_ms",
+            "native_verified",
         }
         assert (
-            record["schema_version"] == 2
+            record["schema_version"] == 3
             and record["boot_id"] == BOOT
             and record["cancelled"] is True
             and record["cycle_after_elapsed_ms"] is None
+            and record["native_verified"] is False
         )
         assert maintenance._BOOT.fullmatch(record["generation"])
         raise adb.AdbError("unanswered gesture")

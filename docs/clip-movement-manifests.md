@@ -80,14 +80,24 @@ generation time still governs freshness.
 
 The Backup page can request a 5, 15 or 30 minute maintenance window while parked. The
 server supports durations from 60 to 1,800 seconds. It verifies the exact supported
-SystemUI build, live ignition-off/awake state and a visible native countdown, long-presses
-that countdown, then verifies its disappearance on the same boot. An already dismissed
-popup is insufficient to acquire a new hold.
+SystemUI build and live ignition-off/awake state. For an initial hold, it long-presses a
+visible native countdown, then verifies its disappearance on the same boot. An absent
+popup alone is insufficient to acquire a hold. A new explicit request can instead reuse
+a previously verified cancellation on the same boot, subject to the fresh checks below.
 
 The server's small, hash-verified UI helper reads a fresh accessibility hierarchy without
 waiting for an idle second (the countdown updates every second). Its source and reproducible
 build are in `tools/maintenance-ui/`. Missing, changed or unsupported helper output still
 refuses maintenance before any gesture; the helper itself only reads the screen.
+
+The updated helper holds an on-device kernel file lock across its accessibility
+connection, snapshot and disconnect, preventing concurrent snapshot readers from
+evicting one another. The lock is released on process exit. Transient heartbeat
+transport failures may retry only inside the original aggregate refresh and evidence
+budget; a new countdown or invalid power proof still ends the hold. This implementation
+does not establish the cause of every earlier heartbeat loss, and physical acceptance
+of the updated helper and retry path remains pending.
+
 On 21 October 2026, server revision `fd96348` physically verified native countdown
 cancellation and a maintenance hold with fresh heartbeat evidence. Evidence was lost
 around 08:58 UTC, before the planned 09:07 UTC expiry; the exact cause is unproven and
@@ -96,9 +106,10 @@ verified both radios and logger restored with `recovery_required=false`; the tra
 remained failed/inactive. Ending the hold through the API then returned maintenance
 inactive. Planned expiry and diagnosis of the early evidence loss remain open checks.
 
-`GET`, `POST {"duration_s": 900}` and `DELETE /api/ingest/maintenance` inspect, acquire and
-end the hold. Fresh host evidence expires after 30 seconds; an on-device lease expires
-within 45 seconds without heartbeats. Backup admission reserves the final 60 seconds for
+`GET`, `POST {"duration_s": 900}` and `DELETE /api/ingest/maintenance` inspect, acquire or
+retry, and end the hold. POST accepts only the bounded duration, never a client claim
+that cancellation or power state is safe. Fresh host evidence expires after 30 seconds;
+an on-device lease expires within 45 seconds without heartbeats. Backup admission reserves the final 60 seconds for
 radio restoration. Lost evidence, ignition/boot changes, expiry or cancellation closes
 admission and stops copying before reconciling radios. The detached recovery watchdog
 accepts an extended deadline only with a valid same-boot on-device lease.
@@ -107,28 +118,55 @@ The boot-bound cancellation marker survives a server restart and the end of a le
 so old companion countdown evidence cannot reopen backup admission. An unreadable marker
 or missing boot identity cannot prove another safe window.
 
+### Retrying a verified cancellation
+
+Version-three cancellation records add the strict boolean `native_verified`. It is
+saved as `true` only after the witnessed gesture completes, the native countdown is
+absent, and same-boot post-gesture power checks and the durable monotonic bound succeed.
+Provisional records and legacy baselines retain `false`. Version-one and version-two
+records remain readable for normal ignition-cycle recovery, but their bounds do not
+prove native cancellation and never automatically authorize a retry.
+
+An operator can request a new bounded hold after a failed, expired or ended hold. The
+server requires a verified version-three record, the same camera boot, fresh native
+ignition OFF/awake/normal sleep-policy observations and a freshly absent countdown.
+The controller and process fences exclude concurrent maintenance and pending record
+workers. The complete durable record must still match before and after those checks.
+Only then does the server publish a new lease token and deadline. This also applies
+after a server restart; no cached flag or missing popup substitutes for fresh proof.
+
+Retry does not clear or replace the cancellation tombstone, fabricate an ignition
+transition, or turn the lease into a normal native sleep deadline. The tombstone remains
+after failure, stop and expiry, and the normal deadline stays unknown until a genuine
+recovery event establishes it. The unchanged 30-second host evidence lifetime,
+45-second device heartbeat lifetime and final 60-second radio-restoration reserve
+continue to gate copying. Implementation tests cover this contract; a successful retry,
+backup and subsequent requested sleep still require separate physical verification.
+
 ### Recorded ignition-cycle recovery
 
 The backend recovery update can accept a genuine ON to OFF cycle recorded by the
-installed 0.3.10 companion even when the server did not sample the ON state live. This
+companion even when the server did not sample the ON state live. This capability was
+introduced in 0.3.10 and is retained by the current release. It
 uses the existing `sleep_deadline_evidence_v1` status contract; it needs no APK update,
 new permission or motion-journal export. It has not yet been physically verified.
 
-A version-two cancellation marker first blocks admission before the cancellation
+A version-three cancellation marker first blocks admission before the cancellation
 gesture. Once that gesture has completed and same-boot post-gesture power checks pass,
 the server atomically saves a monotonic cancellation upper bound,
 `ceil(post_gesture_uptime_s * 1000) + 1000`, with one second of conservative padding.
 The exact server-private marker is:
 
 ```json
-{"schema_version":2,"boot_id":"<kernel boot UUID>","cancelled":true,"generation":"<random UUID>","cycle_after_elapsed_ms":null}
+{"schema_version":3,"boot_id":"<kernel boot UUID>","cancelled":true,"generation":"<random UUID>","cycle_after_elapsed_ms":null,"native_verified":false}
 ```
 
-The bound replaces `null` only after verification and only if the complete expected
-record still matches. An unresolved check/write keeps recovery blocked. Timed-out disk
-workers retain their process fence until they actually exit, so a delayed rename cannot
-overwrite another process's newer cancellation. The
-server must then read fresh native ignition OFF and fresh companion evidence on that
+For a new cancellation, the bound replaces `null` and `native_verified` becomes `true`
+only after verification and only if the complete expected record still matches. An
+unresolved check/write keeps recovery blocked. Timed-out disk workers retain their
+process fence until they actually exit, so a delayed rename cannot overwrite another
+process's newer cancellation. The server must then read fresh native ignition OFF and
+fresh companion evidence on that
 exact boot UUID. The recorded `off_lower_elapsed_ms` must be strictly greater than the
 cancellation bound: it is the start of a real ON sample after cancellation, not the time
 of a later OFF heartbeat. Its first OFF upper bound and captured countdown duration
@@ -140,8 +178,8 @@ has no trusted cancellation time. While maintenance is inactive and owns no main
 fence, its first fresh, same-boot native OFF observation can establish a durable,
 padded baseline for a future cycle; it cannot authorize the edge already present in
 that observation. A later recorded ON sample must begin after that baseline. Corrupt
-records and unresolved version-two markers with a `null` bound cannot use this legacy
-baseline path. Fresh live native ON or a verified new boot retain their existing
+records and unresolved version-two or version-three markers with a `null` bound cannot
+use this legacy baseline path. Fresh live native ON or a verified new boot retain their existing
 recovery paths.
 
 Restart, unknown reads or observation gaps cannot manufacture a cycle. The companion

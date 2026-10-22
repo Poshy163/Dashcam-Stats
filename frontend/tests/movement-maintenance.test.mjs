@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { act, create } from 'react-test-renderer'
 
 const directory = await mkdtemp(fileURLToPath(new URL('../node_modules/.movement-test-', import.meta.url)))
 after(() => rm(directory, { recursive: true, force: true }))
@@ -122,13 +123,63 @@ test('ending a cancelled native countdown explains the required real ignition tr
   assert.match(html, /Normal backup sleep-window checks apply/)
 })
 
-test('pending radio recovery keeps a usable retry action and blocks another hold', () => {
-  const query = new QueryClient()
-  try {
-    query.setQueryData(['maintenance-wake'], { active: false, verified: false, state: 'restoring', remainingS: 0, evidenceValidForS: 0 })
-    const html = renderToStaticMarkup(React.createElement(QueryClientProvider, { client: query }, React.createElement(MaintenanceWakeCard)))
-    assert.match(html, /Ending wake hold and restoring radios/)
-    assert.match(html, /<button[^>]*>Retry radio restoration<\/button>/)
-    assert.match(html, /<button[^>]*disabled[^>]*>Start verified wake hold<\/button>/)
-  } finally { query.clear() }
+test('pending radio recovery keeps a usable retry action and blocks another hold', async t => {
+  const query = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false, gcTime: Infinity } } })
+  query.setQueryData(['maintenance-wake'], { active: false, verified: false, state: 'restoring', remainingS: 0, evidenceValidForS: 0 })
+  let root
+  t.after(async () => { await act(async () => root?.unmount()); query.clear() })
+  await act(async () => { root = create(React.createElement(QueryClientProvider, { client: query }, React.createElement(MaintenanceWakeCard))) })
+  assert.match(JSON.stringify(root.toJSON()), /Ending wake hold and restoring radios/)
+  const buttons = root.root.findAllByType('button')
+  assert.equal(buttons.find(item => item.children.includes('Retry radio restoration')).props.disabled, false)
+  assert.equal(buttons.find(item => item.children.includes('Start verified wake hold')).props.disabled, true)
+})
+
+async function settle() {
+  for (let index = 0; index < 4; index++) await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
+}
+
+test('retry uses the duration-only maintenance request and requires new server verification', async t => {
+  const cached = { active: false, verified: false, state: 'failed', remainingS: 0, evidenceValidForS: 0,
+    countdownCancelled: true, requiresIgnitionCycle: true, reason: 'Fresh maintenance evidence was lost.' }
+  const fresh = { ...cached, active: true, verified: true, state: 'active', remainingS: 840,
+    evidenceValidForS: 30, reason: null }
+  const query = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false, gcTime: Infinity } } })
+  query.setQueryData(['maintenance-wake'], cached)
+  const oldFetch = globalThis.fetch, oldWindow = globalThis.window
+  const requests = []
+  let finishRequest, attempts = 0, current = cached, root
+  globalThis.window = { setInterval, clearInterval }
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, method: init.method, body: init.body })
+    assert.equal(url, '/api/ingest/maintenance')
+    if (init.method === 'POST') {
+      attempts++
+      await new Promise(resolve => { finishRequest = resolve })
+      if (attempts === 1) return new Response(JSON.stringify({ detail: 'Fresh parked-state verification failed.' }), { status: 409 })
+      current = fresh
+    }
+    return new Response(JSON.stringify(current), { status: 200 })
+  }
+  t.after(async () => { await act(async () => root?.unmount()); query.clear(); globalThis.fetch = oldFetch
+    if (oldWindow === undefined) delete globalThis.window; else globalThis.window = oldWindow })
+  await act(async () => { root = create(React.createElement(QueryClientProvider, { client: query }, React.createElement(MaintenanceWakeCard))) })
+  const button = label => root.root.findAllByType('button').find(item => item.children.includes(label))
+  assert.match(JSON.stringify(root.toJSON()), /must not have restarted/)
+  assert.doesNotMatch(JSON.stringify(root.toJSON()), /Verified wake hold ·/)
+  await act(async () => button('Retry verified wake hold').props.onClick())
+  assert.equal(button('Verifying parked state…').props.disabled, true)
+  assert.doesNotMatch(JSON.stringify(root.toJSON()), /Verified wake hold ·/)
+  await act(async () => finishRequest())
+  await settle()
+  assert.match(JSON.stringify(root.toJSON()), /Fresh parked-state verification failed/)
+  assert.doesNotMatch(JSON.stringify(root.toJSON()), /Verified wake hold ·/)
+  await act(async () => button('Retry verified wake hold').props.onClick())
+  await act(async () => finishRequest())
+  await settle()
+  assert.match(JSON.stringify(root.toJSON()), /Verified wake hold ·/)
+  const posts = requests.filter(item => item.method === 'POST')
+  assert.equal(posts.length, 2)
+  for (const request of posts) assert.deepEqual(JSON.parse(request.body), { duration_s: 900 })
+  assert.equal(requests.some(item => item.method === 'DELETE'), false, 'retry never deletes the cancellation barrier')
 })

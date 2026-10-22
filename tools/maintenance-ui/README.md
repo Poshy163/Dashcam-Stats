@@ -4,6 +4,16 @@
 `backend/app/ingest/assets/fresh-ui.dex`. It opens a fresh Android accessibility
 connection, requests the current window root, writes one hierarchy, and disconnects.
 It sends no input and changes no recording, radio, ignition, or power setting.
+Before connecting, it takes an exclusive, nonblocking kernel file lock. Concurrent
+copies using this helper fail without acquiring Android's single UiAutomation
+connection or evicting its current owner. Process exit or timeout releases the lock;
+the empty lock file is not a persistent ownership claim. Older helper binaries and
+other accessibility tools do not participate, so they must not run during a hold.
+The helper exits with code 75 when busy. The shell wrapper reports only a bounded
+busy/timeout marker; device exception output is discarded. A heartbeat may retry
+transient failures inside its original 14-second refresh budget and remaining
+30-second evidence lifetime. New countdowns, invalid state and changed boot identity
+still revoke the hold immediately. The on-device lease retains its 45-second TTL.
 
 The normal `uiautomator dump` waits for one second without accessibility events,
 with a ten-second overall idle wait. The native sleep countdown changes every
@@ -34,8 +44,8 @@ with the packaged asset. The recorded build uses OpenJDK 17.0.20.1+1,
 `8.6.2-dev` (build `abaab469b5ebd4dd2bb91ba0ed6f45277faae4ca`). Java compilation
 targets release 8 without debug information; D8 uses release mode and min API 23.
 
-The packaged 3,068-byte DEX has SHA-256
-`0f331af612480bd7fa63ee65b16b3dd9a8cda4a5308daecf484a1a473cc8f5e4`.
+The packaged 4,452-byte DEX has SHA-256
+`a64731a494599c2800e6dc3c161c17b8f39bc644ef51dea08eae1910ad5675e7`.
 An intentional source/toolchain update must regenerate the asset, inspect the
 source, and update this digest and `UI_HELPER_SHA256` in `maintenance.py` together.
 
