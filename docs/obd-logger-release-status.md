@@ -8,13 +8,33 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.10** (`versionCode` 23) |
-| Source | `fd96348b00b7461b0970b8c543041b6f22e08b51` (`android/obd-logger/`) |
+| Version | **0.3.11** (`versionCode` 24); installation pending, current device remains 0.3.10/code 23 |
+| Source | 0.3.11 source under `android/obd-logger/`; installed 0.3.10 source is `fd96348b00b7461b0970b8c543041b6f22e08b51` |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
 | Poll plan | 7; five-second target with measured optional-command admission |
-| Deployment | Production-signed 0.3.10/code 23 was installed in place on 21 October; the running companion and the server's `source_revision` were separately verified at `fd96348`. Both quiet-filter opt-ins remain OFF. |
+| Deployment | Production-signed 0.3.10/code 23 was installed in place on 21 October; the running companion was verified at `fd96348`. The server's `source_revision` was freshly verified at `6c31999` on 22 October. Both quiet-filter opt-ins were enabled that day at the operator's request; thermal limits and all proof requirements remain enforced. |
+
+### What changed in 0.3.11
+
+- Fresh native segments were three seconds apart. The 0.3.10 closest-peer limit was two
+  seconds, and that transfer gate ran before decoder selection, so fresh otherwise
+  eligible clips could never reach analysis. Version 0.3.11 schedules independent clip
+  analysis before final transfer pairing.
+- Exclusion requires all overlapping opposite-view segments to independently qualify
+  and continuously cover the complete candidate interval. The previous overlapping
+  segment is checked too; activity, locked or unknown views and any uncovered gap retain
+  upload. This does not widen the old closest-peer tolerance.
+- Independently quiet or pending boundary views may still provide their own validated
+  evidence when retained for upload. The server verifies the candidate and witness
+  identities and sampled hashes before exclusion; retained witnesses do not count as
+  excluded or backed up. Fixed six-minute deferral and all thermal/resource limits remain.
+- On 22 October the enabled 0.3.10 producer reported ready manifests and ordinary upload
+  decisions, with zero genuine exclusions. Visual results were `not_analyzed`, so the
+  observations do not establish a production decoder thermal rejection. The camera was
+  above the 85 C guard; physical paired decoding, exclusion and activity-transfer
+  acceptance remain pending for the 0.3.11 update.
 
 ### What changed in 0.3.10
 
@@ -44,7 +64,7 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
   read both thermal nodes under the existing app UID and PID without restarting it.
   Expected UID/PID checks passed, the PID was unchanged before and after, and the SoC type
   matched. The app-UID reading was 92.995 C and the CPU guard correctly returned false.
-  Thermal access is verified; the measured temperature still prevents activation.
+  Thermal access is verified; the measured temperature prevents visual analysis.
 - The packaged maintenance helper physically verified native countdown cancellation and
   a maintenance hold with fresh heartbeat evidence. Heartbeat evidence was lost around
   08:58 UTC, before the planned 09:07 UTC expiry; the exact cause is unproven. This is not
@@ -55,13 +75,23 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
   Subsequent server checks verified Bluetooth, hotspot and logger restoration, with
   `recovery_required=false`; the transition remained failed/inactive. This is not a
   fully successful run or a claim that later recordings cannot add backlog.
-- Both quiet-filter options remain OFF and the genuine exclusion count is zero. Ordinary
+- Both quiet-filter options were enabled on 22 October at the operator's request. The
+  companion checkbox changed from unchecked to checked, and the server accepted
+  `ingest.skip_parked_footage=true`. A SoC reading of approximately 102.9 C was above
+  the unchanged 85 C guard, so no further decoder probe was launched. Resource failures
+  preserve ordinary upload; enablement does not establish a genuine exclusion. Ordinary
   uploaded moving, stopped, quiet and parked-activity examples completed metadata,
   telemetry, detection and plate processing; the filtered end-to-end path still needs
   physical acceptance.
 - Newly copied `20261021190938_camera_1.ts` was automatically indexed as recording 18165
-  and queued without a manual scan. All four processing stages were pending at the check;
-  this proves discovery/queuing, not completion of that new recording's processing.
+  and queued without a manual scan. All four stages were pending on 21 October. A fresh
+  22 October check found metadata, telemetry, detection and plate processing complete,
+  with no error or missing-file flag, verifying ordinary automatic handoff and completion.
+- Ordinary backup run 582 completed on 22 October, copying 239 video files /
+  12,724,617,944 bytes and separately acknowledging one duplicate OBD bundle. Fresh checks
+  verified Bluetooth, hotspot and logger restoration with `recovery_required=false`.
+  The subsequent automatic ingest scan finished with 65 new recordings, 25 changed and
+  no scan errors. These are ordinary-copy results; no genuine quiet exclusion was proved.
 - Local release validation: 244 Android tests passed, including the five private
   production-tracker replays, background-thread priority and cache-write failure
   containment. Both Android lint/build variants passed (zero errors, 56 warnings).
@@ -71,12 +101,20 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 See [quiet-clip-transfer-policy.md](quiet-clip-transfer-policy.md) for the exact contract,
 resource limits and remaining physical acceptance checks.
 
-### Server-only recorded-cycle recovery (awaiting deployment)
+### Server-only recorded-cycle recovery (deployed; physical acceptance pending)
 
 This backend update uses the installed 0.3.10 companion's existing deadline evidence
 when the camera records a real ON to OFF cycle but the server misses live ON. It does
-not change the APK, version code, poll plan or permissions, and has not yet been
-physically verified or established as deployed behaviour.
+not change the APK, version code, poll plan or permissions. The live server's
+`source_revision` was freshly verified at `6c31999` on 22 October. Successful physical
+clearance from a camera-recorded cycle remains unverified; deployment alone does not
+establish that result.
+
+On 22 October, a normal short accessory-power ON/OFF cycle cleared the public admission
+gate (`requires_ignition_cycle=false`, `countdown_cancelled=false`) and fresh native OFF
+evidence supplied a positive decreasing sleep budget. Backup run 582 subsequently
+completed and restored radios/logger. The server may have sampled ON live, so this
+result does not isolate or prove the recorded-only recovery route.
 
 - A version-two cancellation marker retains admission blocking before the gesture,
   then durably records a verified post-gesture monotonic upper bound with one second
@@ -107,7 +145,8 @@ tests were covered successfully (246 in the full run plus the optional private r
 with both lint variants at zero errors and 56 existing warnings each. All 206 frontend
 tests, frontend lint and the production build passed. Recorded-cycle tests include the
 actual synthetic Android JSON producer output and blocked disk workers with a competing
-process lock. These checks do not claim live deployment or a physical recovery result.
+process lock. These local checks do not establish a physical recovery result; live
+deployment was verified separately as described above.
 
 ### What changed in 0.3.9
 
@@ -280,7 +319,7 @@ First integrate/review the release source in the protected signing checkout, or 
 protected build host to use the existing signing files. The original checkout may still contain
 older source and unrelated local changes: do not blindly pull, switch branches or overwrite it.
 Fresh worktrees do not contain the signing files. From the chosen source checkout, after verifying
-`app/build.gradle.kts` declares version 0.3.10/code 23:
+`app/build.gradle.kts` declares version 0.3.11/code 24:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
@@ -308,7 +347,7 @@ other settings, the metrics toggle works, and `Bundles waiting for the server` d
 next Wi-Fi window. Verify webhook events reach the server and boot recovery still works.
 
 After ingestion obtains a fresh status snapshot, `GET /api/obd/status` should report
-`app_version_name: "0.3.10"` and `app_version_code: 23` under `logger`. A cached status alone does
+`app_version_name: "0.3.11"` and `app_version_code: 24` under `logger`. A cached status alone does
 not establish the currently installed/running version.
 
 ## What is still left to do
@@ -333,8 +372,10 @@ Remaining work and physical checks:
    scan/job state. App-UID thermal access, native countdown cancellation, fresh maintenance
    heartbeat evidence and subsequent radio/logger restoration are verified. Planned hold
    expiry and the cause of the early heartbeat loss still need investigation.
-   Advisory labels remain report only. The separate visual policy is implemented but
-   both opt-ins remain OFF pending those checks.
+   Advisory labels remain report only. Both visual-policy opt-ins were enabled on
+   22 October at the operator's request, with unchanged resource and proof gates.
+   The camera was above the 85 C limit; genuine exclusion, parked-activity transfer and
+   sustained paired-decoder acceptance remain unverified.
 6. **Recording continuity** — an earlier parked 21 October inspection found an unchanged
    rear active file despite live preview. After the 0.3.10 installation and front decode
    probe, both cameras' native active files independently rolled and grew. This verifies

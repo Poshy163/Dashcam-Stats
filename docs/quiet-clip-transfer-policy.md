@@ -15,9 +15,12 @@ that an event could never have occurred. Do not enable it solely because unit te
 - Ignition must be continuously observed OFF throughout the clip and the two-minute
   buffer on each side. Unknown states, clock discontinuities, gaps over 7.5 seconds,
   observed movement, or insufficient history preserve ordinary upload.
-- Both overlapping front and rear clips must qualify. An active, locked, unknown or
-  missing companion view preserves both views. Small recorder start offsets are allowed;
-  missing coverage is not inferred to be quiet.
+- Every overlapping opposite-view clip must independently qualify, and their intervals
+  must continuously cover the candidate's whole interval. Recorder boundaries can be
+  staggered, so the previous and next opposite-view segments may both be required.
+  Active, locked, unknown or missing overlapping views preserve upload; no gap is bridged.
+  Independent analysis runs before this transfer gate so a retained boundary view can
+  still provide its own evidence for another candidate, without recursive dependencies.
 - Every decoded frame is evaluated. Both input and decoder end-of-stream, increasing
   timestamps, matching frame counts and bounded gaps are required. Partial, unsupported,
   dark, overexposed, interrupted or failed analysis preserves ordinary upload.
@@ -114,14 +117,45 @@ establish that later recordings cannot add backlog.
 Representative ordinary uploads from moving, stopped, quiet and parked-activity views
 completed metadata, telemetry, detection and plate processing. The new ordinary copy
 `20261021190938_camera_1.ts` was automatically indexed as recording 18165 and queued
-without a manual scan; all four stages were still pending. Automatic discovery/queuing is
-therefore verified, while that new recording's processing completion remains unverified.
+without a manual scan. Its four stages were pending on 21 October; a fresh 22 October
+check confirmed metadata, telemetry, detection and plate processing complete, with no
+error or missing-file flag. This verifies ordinary automatic discovery and processing.
 
-Both quiet-filter opt-ins remain OFF and the genuine exclusion count is zero. Before
-activation, confirm permissions, temperature gates, complete decoding and recording
-continuity across both cameras under sustained load within the thermal limits, a real quiet
-exclusion retained on the card, an activity upload, and downstream scan/job behavior for
-those decisions. The ordinary-upload processing checks do not establish the filtered
-end-to-end path. Synthetic tests and server-side calibration do not replace these checks.
+On 22 October, the operator requested activation and both opt-ins were enabled: the
+companion's quiet-footage checkbox was changed from unchecked to checked, and the server
+accepted `ingest.skip_parked_footage=true`. The SoC reading was approximately 102.9 C,
+above the unchanged 85 C analysis limit. No additional decoder probe was launched.
+Enabling the policy does not override resource guards or turn advisory movement labels
+into exclusion authority; unavailable analysis preserves ordinary upload.
+
+Fresh producer output confirmed both policy options enabled with a ready, non-truncated
+manifest, ordinary upload decisions and zero genuine exclusions. It did not prove a
+thermal rejection by the production decoder: every visual result was `not_analyzed`,
+with no decoder attempt observed. The historical backlog had passed the six-minute
+analysis deadline. Fresh front and rear segments were also three seconds apart; the
+0.3.10 two-second closest-peer gate changed pending decisions to upload before selecting
+any decoder candidate, preventing their independent analysis even on a cool device.
+
+The 0.3.11 source update separates per-clip analysis eligibility from final transfer
+coverage. It checks all overlapping opposite-view segments and exact continuous coverage
+instead of widening the closest-peer tolerance. Retained `peer_coverage_required` and
+`peer_analysis_pending` decisions can carry independently validated witness evidence;
+they still upload, and the server rechecks their identities and fingerprints before
+using them to support another exclusion. Physical validation of this update remains
+pending; no additional decoder load was attempted on the hot camera.
+
+Ordinary backup run 582 completed on 22 October: 239 video files / 12,724,617,944 bytes
+were copied, with one duplicate OBD bundle acknowledged separately. Fresh restoration
+checks verified Bluetooth, hotspot and logger restoration with `recovery_required=false`.
+The subsequent automatic ingest scan finished with 65 new recordings, 25 changed and no
+scan errors. This is ordinary-copy and scanner-handoff evidence; it does not establish
+a quiet exclusion or the filtered end-to-end path.
+
+Guarded enablement does not complete physical acceptance. Sustained paired decoding and
+recording continuity within the thermal limits, a genuine quiet exclusion retained on the
+card, a parked-activity upload, and downstream scan/job behavior for those decisions
+remain unverified. No genuine exclusion has yet been established. The ordinary-upload
+processing checks do not establish the filtered end-to-end path. Synthetic tests and
+server-side calibration do not replace these checks.
 Private footage, coordinates, plate images and credentials must stay out of repository
 fixtures and release artifacts.

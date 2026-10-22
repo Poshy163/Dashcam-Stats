@@ -107,6 +107,8 @@ REASONS = {
     "analysis_pending",
     "awaiting_post_guard",
     "file_settling",
+    "peer_coverage_required",
+    "peer_analysis_pending",
 }
 
 
@@ -135,7 +137,7 @@ UNSAFE_CLIP_REASONS = {
 
 
 def validate_policy_manifest(raw: str) -> dict[str, Any]:
-    """Strict, bounded schema; uploaded/unknown decisions confer no skip authority."""
+    """Strict, bounded schema; retained peer evidence never confers skip authority."""
     if len(raw.encode("utf-8")) > MAX_BYTES:
         raise movement.ManifestError("too_large")
     try:
@@ -174,14 +176,24 @@ def validate_policy_manifest(raw: str) -> dict[str, Any]:
             raise movement.ManifestError("duplicate_clip")
         identities.add(clip["clip_id"])
         paths.add(clip["relative_path"])
-        if decision["decision"] in {"skip", "defer"}:
+        retained_proof = decision["decision"] == "upload" and decision["reason"] in {
+            "peer_coverage_required",
+            "peer_analysis_pending",
+        }
+        if decision["decision"] in {"skip", "defer"} or retained_proof:
             guard_end = movement._timestamp(decision["guard"]["end_utc"], nullable=True)
             completed = movement._timestamp(
                 decision["visual"]["analysis_completed_at_utc"], nullable=True
             )
             if (
                 guard_end is None
-                or (decision["decision"] == "skip" and completed is None)
+                or (
+                    (
+                        decision["decision"] == "skip"
+                        or decision["reason"] == "peer_coverage_required"
+                    )
+                    and completed is None
+                )
                 or guard_end > generated
                 or (completed is not None and completed > generated)
             ):
@@ -299,8 +311,8 @@ def _no_movement(clip: dict[str, Any]) -> bool:
     )
 
 
-def eligible_skip(decision: dict[str, Any]) -> bool:
-    """Require complete ACC and decoded-frame evidence, independently for each lens."""
+def _eligible_quiet(decision: dict[str, Any], *, witness: bool = False) -> bool:
+    """Check a clip's own evidence, independently of its opposite-lens coverage."""
     try:
         _validate_decision(decision)
         clip, guard, visual = decision["clip"], decision["guard"], decision["visual"]
@@ -308,9 +320,11 @@ def eligible_skip(decision: dict[str, Any]) -> bool:
         first, last = movement._timestamp(guard["start_utc"]), movement._timestamp(guard["end_utc"])
         completed = movement._timestamp(visual["analysis_completed_at_utc"])
         duration = clip["duration_ms"]
+        allowed = {("skip", "parked_visual_quiet")}
+        if witness:
+            allowed.update({("upload", "peer_coverage_required"), ("defer", "analysis_pending")})
         if (
-            decision["decision"] != "skip"
-            or decision["reason"] != "parked_visual_quiet"
+            (decision["decision"], decision["reason"]) not in allowed
             or not clip["relative_path"].startswith("DCIM/Video/")
             or clip["locked"]
             or clip["fingerprint"] is None
@@ -332,6 +346,15 @@ def eligible_skip(decision: dict[str, Any]) -> bool:
         return _no_movement(clip)
     except (movement.ManifestError, KeyError, TypeError, ValueError):
         return False
+
+
+def eligible_skip(decision: dict[str, Any]) -> bool:
+    """Only an explicit final skip with complete own evidence may be omitted."""
+    return _eligible_quiet(decision)
+
+
+def _quiet_witness(decision: dict[str, Any]) -> bool:
+    return _eligible_quiet(decision, witness=True)
 
 
 def eligible_defer(
@@ -394,6 +417,29 @@ def eligible_defer(
         return False
 
 
+def _pending_witness(
+    decision: dict[str, Any], *, now: datetime, native_remaining_s: float | None
+) -> bool:
+    if _quiet_witness(decision):
+        return True
+    if decision["decision"] == "upload" and decision["reason"] == "peer_analysis_pending":
+        # A retained boundary clip may support its neighbour's bounded opportunity,
+        # but never gets a new deadline or becomes a deferred target itself.
+        try:
+            until = movement._timestamp(decision["clip"]["end_utc"]) + timedelta(
+                seconds=MAX_DEFER_SECONDS
+            )
+        except (movement.ManifestError, KeyError, TypeError, ValueError):
+            return False
+        decision = {
+            **decision,
+            "decision": "defer",
+            "reason": "analysis_pending",
+            "defer_until_utc": until.isoformat(),
+        }
+    return eligible_defer(decision, now=now, native_remaining_s=native_remaining_s)
+
+
 def _relative_path(item: RemoteFile, source: str) -> str | None:
     directory = item.directory or source
     if directory != source or PurePosixPath(directory).name != "Video":
@@ -402,23 +448,71 @@ def _relative_path(item: RemoteFile, source: str) -> str | None:
     return path if movement._PATH.fullmatch(path) else None
 
 
+def _matched_proofs(
+    doc: dict[str, Any],
+    remote: list[RemoteFile],
+    source: str,
+    accept: Callable[[dict], bool],
+) -> list[dict]:
+    live = {_relative_path(item, source): item for item in remote}
+    return [
+        decision
+        for decision in doc["decisions"]
+        if (item := live.get(decision["clip"]["relative_path"]))
+        and accept(decision)
+        and item.size == decision["clip"]["size_bytes"]
+        and item.mtime == decision["clip"]["mtime_ms"] // 1000
+    ]
+
+
+def _overlapping_entries(doc: dict[str, Any], decision: dict) -> list[dict]:
+    clip = decision["clip"]
+    start, end = movement._timestamp(clip["start_utc"]), movement._timestamp(clip["end_utc"])
+    return [
+        entry
+        for entry in doc["decisions"]
+        if entry["clip"]["relative_path"] != clip["relative_path"]
+        and entry["clip"]["start_utc"] is not None
+        and entry["clip"]["end_utc"] is not None
+        and movement._timestamp(entry["clip"]["start_utc"]) < end
+        and movement._timestamp(entry["clip"]["end_utc"]) > start
+    ]
+
+
+def _overlapping_peers(doc: dict[str, Any], decision: dict) -> list[dict]:
+    return [
+        entry
+        for entry in _overlapping_entries(doc, decision)
+        if entry["clip"]["camera_key"] != decision["clip"]["camera_key"]
+    ]
+
+
+def _covers(peers: list[dict], start: datetime, end: datetime) -> bool:
+    through = start
+    for lower, upper in sorted(
+        (
+            movement._timestamp(peer["clip"]["start_utc"]),
+            movement._timestamp(peer["clip"]["end_utc"]),
+        )
+        for peer in peers
+    ):
+        if lower > through:
+            return False
+        through = max(through, upper)
+    return through >= end
+
+
 def _paired_candidates(
     doc: dict[str, Any],
     remote: list[RemoteFile],
     source: str,
     accept: Callable[[dict], bool] | None = None,
+    *,
+    witness_accept: Callable[[dict], bool] | None = None,
 ) -> list[dict]:
-    live = {_relative_path(item, source): item for item in remote}
-    matched = []
-    for decision in doc["decisions"]:
-        clip = decision["clip"]
-        item = live.get(clip["relative_path"])
-        if (
-            item
-            and (accept or eligible_skip)(decision)
-            and (item.size == clip["size_bytes"] and item.mtime == clip["mtime_ms"] // 1000)
-        ):
-            matched.append(decision)
+    matched = _matched_proofs(doc, remote, source, accept or eligible_skip)
+    witnesses = _matched_proofs(doc, remote, source, witness_accept or accept or _quiet_witness)
+    witness_paths = {entry["clip"]["relative_path"] for entry in witnesses}
     # Every overlapping opposite-lens perspective must be present, independently quiet
     # and identity matched. Missing/locked/unknown peers protect the whole interval.
     paired = []
@@ -433,7 +527,7 @@ def _paired_candidates(
             parent = PurePosixPath(item.directory or source).name
             path = f"DCIM/{parent}/{item.name}"
             match = movement._PATH.fullmatch(path)
-            if match is None or f"camera_{match[3]}" == clip["camera_key"]:
+            if match is None or path == clip["relative_path"]:
                 continue
             peer_start = datetime.strptime(match[2], "%Y%m%d%H%M%S")
             entry = by_path.get(path)
@@ -446,27 +540,34 @@ def _paired_candidates(
                 break
         if unknown_peer:
             continue
-        peers = [
-            entry
+        # An uncertain/active duplicate interval on this lens also remains protected.
+        # Adjacent fully proved segments may overlap by a few decoded frames.
+        if any(
+            entry["clip"]["relative_path"] != clip["relative_path"]
+            and entry["clip"]["camera_key"] == clip["camera_key"]
+            and entry["clip"]["relative_path"] not in witness_paths
+            and entry["clip"]["start_utc"] is not None
+            and entry["clip"]["end_utc"] is not None
+            and movement._timestamp(entry["clip"]["start_utc"]) < end
+            and movement._timestamp(entry["clip"]["end_utc"]) > start
             for entry in doc["decisions"]
-            if (
-                entry["clip"]["camera_key"] != clip["camera_key"]
-                and entry["clip"]["start_utc"] is not None
-                and entry["clip"]["end_utc"] is not None
-                and movement._timestamp(entry["clip"]["start_utc"]) < end
-                and movement._timestamp(entry["clip"]["end_utc"]) > start
-            )
-        ]
-        if not peers or any(peer not in matched for peer in peers):
+        ):
             continue
-        if not any(
-            abs((movement._timestamp(peer["clip"]["start_utc"]) - start).total_seconds()) <= 2
-            and abs((movement._timestamp(peer["clip"]["end_utc"]) - end).total_seconds()) <= 2
-            for peer in peers
+        peers = _overlapping_peers(doc, decision)
+        if any(peer["clip"]["relative_path"] not in witness_paths for peer in peers) or not _covers(
+            peers, start, end
         ):
             continue
         paired.append(decision)
     return paired
+
+
+def _required_quiet_proofs(doc: dict[str, Any], selected: list[dict]) -> list[dict]:
+    """Hash every perspective needed by a skip, including retained boundary witnesses."""
+    paths = {entry["clip"]["relative_path"] for entry in selected}
+    for decision in selected:
+        paths.update(peer["clip"]["relative_path"] for peer in _overlapping_entries(doc, decision))
+    return [entry for entry in doc["decisions"] if entry["clip"]["relative_path"] in paths]
 
 
 async def _read_policy(address: str, status_path: str) -> dict[str, Any] | None:
@@ -585,19 +686,30 @@ async def filter_inventory(
                                     lambda entry: eligible_defer(
                                         entry, now=now, native_remaining_s=native_remaining_s
                                     ),
+                                    witness_accept=lambda entry: _pending_witness(
+                                        entry, now=now, native_remaining_s=native_remaining_s
+                                    ),
                                 )
                                 state = "ready"
                 if selected:
                     async with asyncio.timeout(FINGERPRINT_TIMEOUT_S):
-                        checking = selected[
+                        checking = _required_quiet_proofs(doc, selected)[
                             : max(0, min(MAX_FINGERPRINT_CHECKS, fingerprint_budget))
                         ]
                         checks = len(checking)
                         verified = await _verify_fingerprints(address, source, checking)
-                    selected = [entry for entry in selected if entry["clip"]["clip_id"] in verified]
-                    # Re-run pairing after failed/missing live identity proofs.
-                    proof_doc = {**doc, "decisions": selected}
-                    selected = _paired_candidates(proof_doc, remote, source)
+                    # Retained boundary clips can supply a neighbour's quiet perspective,
+                    # but every target and witness needs its own current byte identity.
+                    # Keep the full report so an unverified/unsafe overlap cannot disappear.
+                    selected = _paired_candidates(
+                        doc,
+                        remote,
+                        source,
+                        lambda entry: eligible_skip(entry) and entry["clip"]["clip_id"] in verified,
+                        witness_accept=lambda entry: (
+                            _quiet_witness(entry) and entry["clip"]["clip_id"] in verified
+                        ),
+                    )
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -627,12 +739,19 @@ async def filter_inventory(
             if type(native_remaining_s) in (int, float)
             else None
         )
+        deferred_ids = {entry["clip"]["clip_id"] for entry in deferred}
         deferred = (
             _paired_candidates(
-                {**doc, "decisions": deferred},
+                doc,
                 remote,
                 source,
-                lambda entry: eligible_defer(entry, now=now, native_remaining_s=remaining),
+                lambda entry: (
+                    entry["clip"]["clip_id"] in deferred_ids
+                    and eligible_defer(entry, now=now, native_remaining_s=remaining)
+                ),
+                witness_accept=lambda entry: _pending_witness(
+                    entry, now=now, native_remaining_s=remaining
+                ),
             )
             if -30 <= age <= MAX_AGE_SECONDS and -30 <= logger_age <= 30
             else []

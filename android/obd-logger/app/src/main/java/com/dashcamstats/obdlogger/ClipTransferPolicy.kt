@@ -18,6 +18,7 @@ import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.time.Instant
+import java.time.LocalDateTime
 import java.time.ZoneId
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -192,10 +193,20 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         attempted.keys.retainAll(present)
         state = if (enabled) "waiting" else "disabled"
         var rows = evaluate(items, card, wallMs())
-        applyPairGate(rows, wallMs())
+        fun recheckQuietIdentities() {
+            for (row in rows) if (row.optString("decision") == "skip") {
+                val item = items.singleOrNull { it.clip.relativePath == row.getJSONObject("clip").optString("relative_path") }
+                if (item == null || !unchanged(item.clip)) row.put("decision", "upload")
+                    .put("reason", "unstable_or_unreadable").put("defer_until_utc", JSONObject.NULL)
+            }
+        }
+        recheckQuietIdentities()
         // Expose bounded pending decisions before a slow decoder starts. This closes the normal
         // backup race without holding arbitrary unknown footage or resetting its deadline.
         writeReport(rows, card, reportState, truncated)
+        // Scheduling uses this clip's own evidence, before transfer pairing. Staggered
+        // camera segments may need two opposite-view witnesses; a missing witness must
+        // retain transfer without preventing the independent analysis from ever running.
         val candidate = if (stopped || !enabled || card == null || !allowed() || analysisJob?.isActive == true) null else items
             .filter { it.stable && it.freshFingerprint && it.clip.size <= 256L * 1024 * 1024 &&
                 synchronized(cacheLock) { cached[key(it, card)] == null } && rows.any { row ->
@@ -227,7 +238,6 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                 // Deterministic publisher harness uses the identical analysis path inline.
                 analyzeCandidate()
                 rows = evaluate(items, card, wallMs())
-                applyPairGate(rows, wallMs())
             } else analysisJob = analysisScope.launch(analysisDispatcher ?: ownedDecoderDispatcher.value) {
                 fun failed() {
                     // Cache persistence and metadata checks are optional too. A result that could
@@ -256,20 +266,22 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                 }
             }
         }
-        // Recheck metadata immediately before authorizing any cached exclusion.
-        for (row in rows) if (row.optString("decision") == "skip") {
-            val item = items.singleOrNull { it.clip.relativePath == row.getJSONObject("clip").optString("relative_path") }
-            if (item == null || !unchanged(item.clip)) row.put("decision", "upload")
-                .put("reason", "unstable_or_unreadable").put("defer_until_utc", JSONObject.NULL)
-        }
-        applyPairGate(rows, wallMs())
+        // Witnesses need the same current identity check as exclusion candidates.
+        recheckQuietIdentities()
         writeReport(rows, card, reportState, truncated)
     }
 
-    private fun writeReport(rows: MutableList<JSONObject>, card: String?, reportState: String, truncated: Boolean) {
+    private fun writeReport(baseRows: List<JSONObject>, card: String?, reportState: String, truncated: Boolean) {
         val active = enabled
-        if (!active) rows.forEach { it.put("decision", "upload").put("reason", "policy_disabled")
-            .put("defer_until_utc", JSONObject.NULL) }
+        // Keep own qualification immutable. Repeated publication/truncation must not
+        // recursively turn a quiet boundary witness into missing evidence for its peer.
+        val retained = baseRows.toMutableList()
+        fun gatedRows(): MutableList<JSONObject> = retained.map { JSONObject(it.toString()) }.toMutableList().also { rows ->
+            if (!active) rows.forEach { it.put("decision", "upload").put("reason", "policy_disabled")
+                .put("defer_until_utc", JSONObject.NULL) }
+            applyPairGate(rows, wallMs())
+        }
+        var rows = gatedRows()
         state = if (!active) "disabled" else if (reportState == "ready") "ready" else "unavailable"
         val output = JSONObject().put("schema_version", 1).put("source_id", journal.sourceId)
             .put("card_id", card ?: JSONObject.NULL).put("session_id", journal.sessionId).put("boot_id", journal.bootId)
@@ -277,10 +289,20 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
             .put("policy_version", QUIET_POLICY_VERSION).put("enabled", active).put("mode", "acc_off_visual_quiet")
             .put("status", reportState).put("truncated", truncated).put("decisions", JSONArray(rows))
         while (output.toString().toByteArray(Charsets.UTF_8).size > MOVEMENT_REPORT_MAX_BYTES && rows.isNotEmpty()) {
-            rows.removeAt(rows.lastIndex); output.put("truncated", true).put("decisions", JSONArray(rows))
+            // Trim a whole oversized tail using the already gated projection. Re-running
+            // interval coverage for each removed row is needlessly expensive on a full card.
+            output.put("truncated", true)
+            var projectedBytes = output.toString().toByteArray(Charsets.UTF_8).size
+            while (projectedBytes > MOVEMENT_REPORT_MAX_BYTES && rows.isNotEmpty()) {
+                retained.removeAt(retained.lastIndex)
+                val removed = rows.removeAt(rows.lastIndex)
+                projectedBytes -= removed.toString().toByteArray(Charsets.UTF_8).size + if (rows.isEmpty()) 0 else 1
+            }
+            // A removed witness must not leave a surviving candidate authorized. Derive
+            // again from the immutable retained prefix, then recheck the actual byte size.
+            rows = gatedRows()
+            output.put("truncated", true).put("decisions", JSONArray(rows))
         }
-        applyPairGate(rows, wallMs())
-        output.put("decisions", JSONArray(rows))
         skipCount = rows.count { it.optString("decision") == "skip" }
         deferCount = rows.count { it.optString("decision") == "defer" }
         uploadCount = rows.size - skipCount - deferCount
@@ -325,31 +347,69 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         }
 
         fun applyPairGate(rows: List<JSONObject>, now: Long = System.currentTimeMillis()) {
-            val eligible = rows.filter { it.optString("decision") in setOf("skip", "defer") }
-            for (row in eligible) {
+            fun bounds(row: JSONObject): Pair<Long, Long>? = runCatching {
                 val clip = row.getJSONObject("clip")
-                val start = runCatching { Instant.parse(clip.getString("start_utc")).toEpochMilli() }.getOrNull()
-                val end = runCatching { Instant.parse(clip.getString("end_utc")).toEpochMilli() }.getOrNull()
-                val peers = eligible.filter { other ->
-                    val body = other.getJSONObject("clip")
-                    body.optString("camera_key") != clip.optString("camera_key") &&
-                        body.optString("relative_path").startsWith("DCIM/Video/") &&
-                        runCatching { start != null && end != null &&
-                            abs(Instant.parse(body.getString("start_utc")).toEpochMilli() - start) <= 2_000 &&
-                            abs(Instant.parse(body.getString("end_utc")).toEpochMilli() - end) <= 2_000 }.getOrDefault(false)
+                val start = Instant.parse(clip.getString("start_utc")).toEpochMilli()
+                val end = Instant.parse(clip.getString("end_utc")).toEpochMilli()
+                (start to end).takeIf { end > start }
+            }.getOrNull()
+            fun own(row: JSONObject): String = when {
+                row.optString("decision") == "upload" && row.optString("reason") == "peer_coverage_required" -> "skip"
+                row.optString("decision") == "upload" && row.optString("reason") == "peer_analysis_pending" -> "defer"
+                row.optString("decision") == "defer" && row.optString("reason") == "analysis_pending" &&
+                    row.optJSONObject("visual")?.let(::validVisual) == true &&
+                    row.optJSONObject("guard")?.let(ParkedGuard::valid) == true -> "skip"
+                else -> row.optString("decision")
+            }
+            // Snapshot before mutating dispositions: a retained boundary clip may still
+            // independently prove its own view, without recursively needing its peers.
+            val originals = rows.map { JSONObject(it.toString()) }
+            for ((index, original) in originals.withIndex()) {
+                val qualification = own(original)
+                if (qualification !in setOf("skip", "defer")) continue
+                val row = rows[index]
+                val clip = original.getJSONObject("clip")
+                val interval = bounds(original)
+                fun retain() { row.put("decision", "upload")
+                    .put("reason", if (qualification == "skip") "peer_coverage_required" else "peer_analysis_pending")
+                    .put("defer_until_utc", JSONObject.NULL) }
+                if (interval == null) { retain(); continue }
+                val (start, end) = interval
+                val allOthers = originals.filterIndexed { otherIndex, _ -> otherIndex != index }
+                val others = allOthers.filter { it.getJSONObject("clip").optString("camera_key") != clip.optString("camera_key") }
+                val localStart = runCatching { LocalDateTime.parse(clip.getString("local_start")) }.getOrNull()
+                val localEnd = localStart?.plusNanos((end - start) * 1_000_000)
+                // A timestamped opposite-view file with unknown bounds could overlap
+                // for up to the maximum supported clip duration. Never infer it quiet.
+                val unknown = allOthers.any { other -> bounds(other) == null && runCatching {
+                    val peerStart = LocalDateTime.parse(other.getJSONObject("clip").getString("local_start"))
+                    localStart != null && localEnd != null && !peerStart.isBefore(localStart.minusSeconds(120)) && peerStart.isBefore(localEnd)
+                }.getOrDefault(true) }
+                // An ambiguous duplicate on this same view is unsafe too. Qualified
+                // adjacent segments may overlap a few decoded frames; unsafe ones may not.
+                val unsafeSameView = allOthers.any { other -> other.getJSONObject("clip").optString("camera_key") == clip.optString("camera_key") &&
+                    bounds(other)?.let { (lo, hi) -> lo < end && hi > start } == true && own(other) !in setOf("skip", "defer") }
+                val peers = others.filter { bounds(it)?.let { (lo, hi) -> lo < end && hi > start } == true }
+                val unique = peers.map { peer ->
+                    val body = peer.getJSONObject("clip")
+                    Triple(body.optString("camera_key"), body.optString("start_utc"), body.optString("end_utc"))
+                }.toSet().size == peers.size && peers.map { it.getJSONObject("clip").optString("relative_path") }.toSet().size == peers.size
+                var through = start
+                var continuous = true
+                for ((lo, hi) in peers.mapNotNull(::bounds).sortedBy { it.first }) {
+                    if (lo > through) { continuous = false; break }
+                    through = max(through, hi)
                 }
-                val peer = peers.singleOrNull()
-                if (peer == null || peer.optString("decision") == "upload") row.put("decision", "upload")
-                    .put("reason", "visual_required").put("defer_until_utc", JSONObject.NULL)
-                else if (row.optString("decision") == "defer" || peer.optString("decision") == "defer") {
-                    val deadline = end?.plus(360_000)
-                    if (deadline == null || now >= deadline) row.put("decision", "upload")
-                        .put("reason", "visual_required").put("defer_until_utc", JSONObject.NULL)
-                    else {
-                        if (row.optString("decision") == "skip") row.put("reason", "analysis_pending")
-                        row.put("decision", "defer").put("defer_until_utc", Instant.ofEpochMilli(deadline).toString())
-                    }
+                if (unknown || unsafeSameView || !unique || peers.isEmpty() || !continuous || through < end || peers.any { own(it) !in setOf("skip", "defer") }) {
+                    retain(); continue
                 }
+                if (qualification == "defer" || peers.any { own(it) == "defer" }) {
+                    val deadline = end + 360_000
+                    if (now >= deadline) retain()
+                    else row.put("decision", "defer").put("reason", if (qualification == "skip") "analysis_pending" else
+                        original.optString("reason").takeUnless { it == "peer_analysis_pending" } ?: "analysis_pending")
+                        .put("defer_until_utc", Instant.ofEpochMilli(deadline).toString())
+                } else row.put("decision", "skip").put("reason", "parked_visual_quiet").put("defer_until_utc", JSONObject.NULL)
             }
         }
     }

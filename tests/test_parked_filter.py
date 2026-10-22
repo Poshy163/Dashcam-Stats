@@ -203,6 +203,61 @@ def policy_inventory(doc):
     ]
 
 
+def staggered_policy(*, pending=False, pairs=2):
+    """Offset lenses need neighbouring clips to prove the leading/trailing strips."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    template = make_deferred_policy(now=now) if pending else make_policy()
+    start = now - timedelta(seconds=210) if pending else START
+    doc = {**template, "decisions": []}
+    for index in range(pairs * 2 + 1):
+        camera = index % 2
+        offset = (index // 2) * 60 + camera * 3
+        entry = json.loads(json.dumps(template["decisions"][camera]))
+        clip, guard = entry["clip"], entry["guard"]
+        lower, upper = start + timedelta(seconds=offset), start + timedelta(seconds=offset + 60)
+        local = lower.astimezone(ZoneInfo("Australia/Adelaide")).replace(tzinfo=None)
+        clip.update(
+            clip_id=str(uuid.uuid4()),
+            relative_path=f"DCIM/Video/{local:%Y%m%d%H%M%S}_camera_{camera}.ts",
+            local_start=local.isoformat(),
+            start_utc=lower.isoformat(),
+            end_utc=upper.isoformat(),
+            mtime_ms=int(upper.timestamp() * 1000),
+        )
+        first = lower - timedelta(seconds=122)
+        last = now - timedelta(seconds=1) if pending else upper + timedelta(seconds=122)
+        window = round((last - first).total_seconds() * 1000)
+        guard.update(
+            start_utc=first.isoformat(),
+            end_utc=last.isoformat(),
+            window_ms=window,
+            acc_off_ms=window,
+            observation_count=window // 5000 + 2,
+        )
+        if pending:
+            entry["defer_until_utc"] = (upper + timedelta(seconds=360)).isoformat()
+        else:
+            entry["visual"]["analysis_completed_at_utc"] = (
+                upper + timedelta(seconds=125)
+            ).isoformat()
+        if index in {0, pairs * 2}:
+            entry.update(
+                decision="upload",
+                reason="peer_analysis_pending" if pending else "peer_coverage_required",
+                defer_until_utc=None,
+            )
+        doc["decisions"].append(entry)
+    return doc
+
+
+def install_policy(policy, doc):
+    policy.doc = parked_filter.validate_policy_manifest(json.dumps(doc))
+    policy.remote = policy_inventory(policy.doc)
+    parked_filter._read_policy.return_value = policy.doc
+    movement.read_remote_card_id.return_value = policy.doc["card_id"]
+    policy.fingerprints.return_value = {e["clip"]["clip_id"] for e in policy.doc["decisions"]}
+
+
 @pytest.fixture
 def policy(monkeypatch):
     doc = make_policy()
@@ -255,6 +310,19 @@ def test_actual_android_publisher_fixture_passes_exact_contract():
     assert len(doc["decisions"]) == 2
     assert all(parked_filter.eligible_skip(entry) for entry in doc["decisions"])
     assert {entry["clip"]["camera_key"] for entry in doc["decisions"]} == {"camera_0", "camera_1"}
+
+
+def test_actual_android_staggered_publisher_keeps_boundary_witnesses_and_proves_middle_clip():
+    raw = (Path(__file__).parent / "fixtures/transfer-policy-staggered-v1-android.json").read_text()
+    doc = parked_filter.validate_policy_manifest(raw)
+    selected = parked_filter._paired_candidates(doc, policy_inventory(doc), SOURCE)
+    assert len(selected) == 1 and selected[0]["clip"]["camera_key"] == "camera_0"
+    witnesses = [entry for entry in doc["decisions"] if entry["decision"] == "upload"]
+    assert len(witnesses) == 2
+    assert all(entry["reason"] == "peer_coverage_required" for entry in witnesses)
+    assert all(parked_filter._quiet_witness(entry) for entry in witnesses)
+    assert not any(parked_filter.eligible_skip(entry) for entry in witnesses)
+    assert len(parked_filter._required_quiet_proofs(doc, selected)) == 3
 
 
 @pytest.mark.parametrize(
@@ -815,6 +883,224 @@ async def test_hash_budget_overflow_never_omits_an_unverified_half_pair(policy):
     assert result.files == policy.remote and result.skipped == []
     assert result.fingerprint_checks == 1
     assert policy.record.await_args.kwargs["excluded"] == []
+
+
+async def test_three_second_skew_uses_retained_quiet_boundary_witnesses_without_excluding_them(
+    policy,
+):
+    install_policy(policy, staggered_policy())
+    assert await filtered(policy) == [policy.remote[0], policy.remote[-1]]
+    assert policy.result.skipped == policy.remote[1:-1]
+    assert policy.result.fingerprint_checks == 5
+    assert policy.fingerprints.await_args.args[2] == policy.doc["decisions"]
+    assert policy.record.await_args.kwargs["excluded"] == policy.doc["decisions"][1:-1]
+    assert all(
+        not parked_filter.eligible_skip(e)
+        for e in (policy.doc["decisions"][0], policy.doc["decisions"][-1])
+    )
+
+
+async def test_adjacent_decoded_frame_overlap_requires_current_identity_for_each_used_witness(
+    policy,
+):
+    doc = staggered_policy()
+    for index, entry in enumerate(doc["decisions"]):
+        clip, guard, visual = entry["clip"], entry["guard"], entry["visual"]
+        clip["end_utc"] = (
+            movement._timestamp(clip["end_utc"]) + timedelta(milliseconds=33)
+        ).isoformat()
+        clip["duration_ms"] = visual["duration_ms"] = visual["covered_ms"] = 60033
+        visual["last_pts_us"] += 33000
+        guard["end_utc"] = (
+            movement._timestamp(guard["end_utc"]) + timedelta(milliseconds=33)
+        ).isoformat()
+        guard["window_ms"] += 33
+        guard["acc_off_ms"] += 33
+        if index != 2:
+            entry.update(decision="upload", reason="peer_coverage_required")
+    install_policy(policy, doc)
+    assert await filtered(policy) == [
+        item for index, item in enumerate(policy.remote) if index != 2
+    ]
+    assert policy.result.skipped == [policy.remote[2]]
+    assert policy.result.fingerprint_checks == 5
+    policy.fingerprints.return_value.remove(policy.doc["decisions"][0]["clip"]["clip_id"])
+    assert await filtered(policy) == policy.remote
+
+
+def test_interval_coverage_gate_is_order_independent_and_does_not_mutate_peer_evidence():
+    doc = staggered_policy()
+    before = json.dumps(doc, sort_keys=True)
+    remote = policy_inventory(doc)
+    selected = parked_filter._paired_candidates(doc, remote, SOURCE)
+    reversed_selected = parked_filter._paired_candidates(
+        {**doc, "decisions": list(reversed(doc["decisions"]))}, list(reversed(remote)), SOURCE
+    )
+    assert (
+        {e["clip"]["clip_id"] for e in selected}
+        == {e["clip"]["clip_id"] for e in reversed_selected}
+        == {e["clip"]["clip_id"] for e in doc["decisions"][1:-1]}
+    )
+    assert json.dumps(doc, sort_keys=True) == before
+
+
+async def test_offset_pair_without_leading_and_trailing_coverage_uploads_both(policy):
+    doc = staggered_policy()
+    doc["decisions"] = doc["decisions"][:2]
+    doc["decisions"][0].update(decision="skip", reason="parked_visual_quiet")
+    install_policy(policy, doc)
+    assert await filtered(policy) == policy.remote
+    assert policy.result.skipped == []
+    policy.fingerprints.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "change", ["activity", "dark", "unknown", "locked", "missing", "size", "mtime", "hash"]
+)
+async def test_unproved_leading_boundary_witness_keeps_the_overlapping_target(policy, change):
+    doc = staggered_policy()
+    witness = doc["decisions"][0]
+    if change == "activity":
+        witness.update(reason="visual_activity")
+        witness["visual"].update(status="activity", motion_frames=1)
+    elif change == "dark":
+        witness["visual"].update(min_mean_luma=10)
+    elif change == "unknown":
+        witness.update(reason="timing_unknown")
+        witness["clip"].update(
+            start_utc=None, end_utc=None, time_quality="unknown", analysis_status="unknown"
+        )
+    elif change == "locked":
+        witness.update(reason="locked_clip")
+        witness["clip"].update(
+            relative_path=witness["clip"]["relative_path"].replace("/Video/", "/LockVideo/"),
+            locked=True,
+        )
+    install_policy(policy, doc)
+    if change == "missing":
+        policy.remote = policy.remote[1:]
+    elif change in {"size", "mtime"}:
+        item = policy.remote[0]
+        policy.remote[0] = RemoteFile(
+            item.name,
+            item.size + (change == "size"),
+            item.mtime + (change == "mtime"),
+            item.directory,
+        )
+    elif change == "hash":
+        policy.fingerprints.return_value.remove(witness["clip"]["clip_id"])
+    target_path = doc["decisions"][1]["clip"]["relative_path"]
+    assert any(item.name == target_path.rsplit("/", 1)[-1] for item in await filtered(policy))
+    assert target_path not in {
+        e["clip"]["relative_path"] for e in policy.record.await_args.kwargs["excluded"]
+    }
+
+
+async def test_activity_in_a_small_overlap_protects_only_the_overlapping_opposite_views(policy):
+    doc = staggered_policy()
+    active = doc["decisions"][1]
+    active.update(decision="upload", reason="visual_activity")
+    active["visual"].update(status="activity", motion_frames=1)
+    install_policy(policy, doc)
+    assert await filtered(policy) == [
+        policy.remote[0],
+        policy.remote[1],
+        policy.remote[2],
+        policy.remote[4],
+    ]
+    assert policy.result.skipped == [policy.remote[3]]
+
+
+async def test_one_millisecond_gap_between_witnesses_cannot_be_bridged(policy):
+    doc = staggered_policy()
+    first = doc["decisions"][0]["clip"]
+    first["end_utc"] = (
+        movement._timestamp(first["end_utc"]) - timedelta(milliseconds=1)
+    ).isoformat()
+    install_policy(policy, doc)
+    assert policy.remote[1] in await filtered(policy)
+    assert policy.remote[1] not in policy.result.skipped
+
+
+async def test_hash_budget_includes_boundary_witnesses_and_keeps_only_unproved_targets(policy):
+    install_policy(policy, staggered_policy())
+
+    async def verified_only_requested(_address, _source, selected):
+        return {entry["clip"]["clip_id"] for entry in selected}
+
+    policy.fingerprints.side_effect = verified_only_requested
+    result = await parked_filter.filter_inventory(
+        "unit:5555",
+        "/obd/status.json",
+        policy.remote,
+        SOURCE,
+        policy.logger,
+        enabled=True,
+        fingerprint_budget=4,
+    )
+    assert result.fingerprint_checks == 4
+    assert result.skipped == policy.remote[1:3]
+    assert result.files == [policy.remote[0], policy.remote[3], policy.remote[4]]
+
+
+async def test_sixty_four_hash_limit_never_uses_the_sixty_fifth_boundary_witness(policy):
+    install_policy(policy, staggered_policy(pairs=32))
+
+    async def verified_only_requested(_address, _source, selected):
+        return {entry["clip"]["clip_id"] for entry in selected}
+
+    policy.fingerprints.side_effect = verified_only_requested
+    assert await filtered(policy) == [policy.remote[0], policy.remote[-2], policy.remote[-1]]
+    assert policy.result.fingerprint_checks == 64
+    assert len(policy.fingerprints.await_args.args[2]) == 64
+    assert len(policy.result.skipped) == 62
+
+
+@pytest.mark.parametrize("field", ["guard", "completion"])
+def test_retained_boundary_proofs_cannot_hide_future_evidence(field):
+    doc = staggered_policy()
+    witness = doc["decisions"][0]
+    future = (datetime.now(UTC) + timedelta(seconds=1)).isoformat()
+    if field == "guard":
+        witness["guard"]["end_utc"] = future
+    else:
+        witness["visual"]["analysis_completed_at_utc"] = future
+    with pytest.raises(movement.ManifestError, match="future_or_missing_proof"):
+        parked_filter.validate_policy_manifest(json.dumps(doc))
+
+
+async def test_staggered_pending_boundaries_only_witness_fixed_defer_opportunities(policy):
+    install_policy(policy, staggered_policy(pending=True))
+    assert await filtered(policy, native_remaining_s=1000) == [policy.remote[0], policy.remote[-1]]
+    assert [item for item, _until in policy.result.deferred] == policy.remote[1:-1]
+    assert policy.result.skipped == []
+    assert policy.record.await_args.kwargs["excluded"] == []
+    policy.fingerprints.assert_not_awaited()
+    now = datetime.now(UTC)
+    boundary = policy.doc["decisions"][0]
+    end = movement._timestamp(boundary["clip"]["end_utc"])
+    assert parked_filter._pending_witness(boundary, now=now, native_remaining_s=1000)
+    assert not parked_filter._pending_witness(
+        boundary, now=end + timedelta(seconds=360), native_remaining_s=1000
+    )
+    assert not parked_filter._pending_witness(boundary, now=now, native_remaining_s=120)
+    assert boundary["decision"] == "upload" and boundary["defer_until_utc"] is None
+
+
+async def test_full_quiet_proof_can_witness_a_neighbour_while_its_own_pair_is_pending(policy):
+    doc = staggered_policy()
+    witness = doc["decisions"][0]
+    witness.update(
+        decision="defer",
+        reason="analysis_pending",
+        defer_until_utc=(
+            movement._timestamp(witness["clip"]["end_utc"]) + timedelta(seconds=360)
+        ).isoformat(),
+    )
+    install_policy(policy, doc)
+    assert await filtered(policy) == [policy.remote[0], policy.remote[-1]]
+    assert policy.result.skipped == policy.remote[1:-1]
+    assert not parked_filter.eligible_skip(witness)
 
 
 async def test_sweeps_share_a_single_bounded_fingerprint_budget(prepared_unit, monkeypatch):

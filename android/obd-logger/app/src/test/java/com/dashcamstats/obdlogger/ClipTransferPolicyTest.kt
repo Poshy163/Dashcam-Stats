@@ -143,24 +143,120 @@ class ClipTransferPolicyTest {
         } finally { dispatcher.close() }
     }
 
-    private fun pair(camera: Int, start: Long = 1_000_000, decision: String = "skip"): JSONObject = JSONObject()
+    private fun pair(camera: Int, start: Long = 1_000_000, decision: String = "skip", duration: Long = 30_000): JSONObject = JSONObject()
         .put("clip", JSONObject().put("camera_key", "camera_$camera")
-            .put("relative_path", "DCIM/Video/example_camera_$camera.ts")
+            .put("relative_path", "DCIM/Video/example_${start}_camera_$camera.ts")
+            .put("local_start", Instant.ofEpochMilli(start).atZone(ZoneId.systemDefault()).toLocalDateTime().toString())
             .put("start_utc", Instant.ofEpochMilli(start).toString())
-            .put("end_utc", Instant.ofEpochMilli(start + 30_000).toString()))
+            .put("end_utc", Instant.ofEpochMilli(start + duration).toString()))
         .put("decision", decision).put("reason", "parked_visual_quiet")
 
     @Test fun missingActivityUnknownOrAmbiguousPeerAlwaysKeepsBothLenses() {
         val lone = pair(0); ClipTransferPolicy.applyPairGate(listOf(lone)); assertEquals("upload", lone.getString("decision"))
         val first = pair(0); val second = pair(1, decision = "upload")
         ClipTransferPolicy.applyPairGate(listOf(first, second)); assertEquals("upload", first.getString("decision"))
-        val a = pair(0); val b = pair(1, 1_002_000)
+        val a = pair(0); val b = pair(1)
         ClipTransferPolicy.applyPairGate(listOf(a, b)); assertEquals("skip", a.getString("decision")); assertEquals("skip", b.getString("decision"))
-        val c = pair(0); val d = pair(1, 1_002_001)
+        val c = pair(0); val d = pair(1, 1_002_000)
         ClipTransferPolicy.applyPairGate(listOf(c, d)); assertEquals("upload", c.getString("decision")); assertEquals("upload", d.getString("decision"))
         val duplicate = listOf(pair(0), pair(1), pair(1))
         ClipTransferPolicy.applyPairGate(duplicate)
         assertEquals("upload", duplicate[0].getString("decision"))
+    }
+
+    @Test fun staggeredThreeSecondViewsNeedAllOverlapsWithoutRecursiveBoundaryStarvation() {
+        val rows = listOf(pair(0, duration = 60_000), pair(1, 943_000, duration = 60_000),
+            pair(1, 1_003_000, duration = 60_000))
+        ClipTransferPolicy.applyPairGate(rows)
+        assertEquals("skip", rows[0].getString("decision"))
+        assertTrue(rows.drop(1).all { it.getString("reason") == "peer_coverage_required" })
+        val first = rows.map { it.toString() }
+        ClipTransferPolicy.applyPairGate(rows)
+        assertEquals(first, rows.map { it.toString() })
+        val reversed = listOf(pair(1, 1_003_000, duration = 60_000), pair(1, 943_000, duration = 60_000),
+            pair(0, duration = 60_000))
+        ClipTransferPolicy.applyPairGate(reversed)
+        assertEquals("skip", reversed.last().getString("decision"))
+    }
+
+    @Test fun previousOverlapActivityLockedUnknownAndOneMillisecondGapCannotBeBridged() {
+        for (unsafe in listOf("visual_activity", "locked_clip", "visual_incomplete")) {
+            val front = pair(0, duration = 60_000)
+            val previous = pair(1, 943_000, "upload", 60_000).put("reason", unsafe)
+            ClipTransferPolicy.applyPairGate(listOf(front, previous, pair(1, 1_003_000, duration = 60_000)))
+            assertEquals("upload", front.getString("decision"))
+        }
+        val front = pair(0, duration = 60_000)
+        val unknown = pair(1, 943_000).also { it.getJSONObject("clip")
+            .put("start_utc", JSONObject.NULL).put("end_utc", JSONObject.NULL) }
+        ClipTransferPolicy.applyPairGate(listOf(front, unknown, pair(1, 1_000_000, duration = 60_000)))
+        assertEquals("upload", front.getString("decision"))
+        val sameView = pair(0, duration = 60_000)
+        val ambiguous = pair(0, 1_030_000, decision = "upload").also { it.getJSONObject("clip")
+            .put("start_utc", JSONObject.NULL).put("end_utc", JSONObject.NULL) }
+        ClipTransferPolicy.applyPairGate(listOf(sameView, ambiguous, pair(1, duration = 60_000)))
+        assertEquals("upload", sameView.getString("decision"))
+        val gap = pair(0, duration = 60_000)
+        ClipTransferPolicy.applyPairGate(listOf(gap, pair(1, 943_000, duration = 59_999),
+            pair(1, 1_003_000, duration = 60_000)))
+        assertEquals("upload", gap.getString("decision"))
+    }
+
+    @Test fun pendingCoverageUsesOwnFixedDeadlineAndRetainedWitnessReason() {
+        val front = pair(0, decision = "defer", duration = 60_000).put("reason", "analysis_pending")
+        val previous = pair(1, 943_000, duration = 60_000)
+        val current = pair(1, 1_003_000, decision = "defer", duration = 60_000).put("reason", "analysis_pending")
+        ClipTransferPolicy.applyPairGate(listOf(front, previous, current), 1_100_000)
+        assertEquals("defer", front.getString("decision"))
+        assertEquals(Instant.ofEpochMilli(1_420_000).toString(), front.getString("defer_until_utc"))
+        assertEquals("peer_analysis_pending", current.getString("reason"))
+        ClipTransferPolicy.applyPairGate(listOf(front, previous, current), 1_420_000)
+        assertEquals("upload", front.getString("decision"))
+        assertEquals("peer_analysis_pending", front.getString("reason"))
+        assertTrue(front.isNull("defer_until_utc"))
+    }
+
+    @Test fun fullCardReportStaysWithinByteCapAndCannotKeepAnExclusionAfterItsWitnessIsTrimmed() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        context.deleteDatabase("clip-movement.db")
+        val prefs = context.getSharedPreferences(MOVEMENT_TREE_PREFERENCES, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(QUIET_FILTER_ENABLED, true).commit()
+        val journal = MotionJournal(context, backgroundScope)
+        val root = File(context.cacheDir, "policy-full-card").apply { mkdirs() }
+        val policy = ClipTransferPolicy(context, journal, { root }, { false })
+        val unknown = MovementClassifier.assess(null, null, emptyList())
+        val absentGuard = ParkedGuard.assess(null, null, emptyList(), false, zone)
+        fun reportRow(camera: Int, at: Long, decision: String): JSONObject = pair(camera, at, decision).also { row ->
+            row.put("visual", ClipTransferPolicy.emptyVisual()).put("guard", JSONObject(absentGuard.toString()))
+                .put("defer_until_utc", JSONObject.NULL)
+            row.getJSONObject("clip").put("classification", "unknown").put("analysis_status", "unknown")
+                .put("reasons", JSONArray(unknown.reasons)).put("coverage", unknown.coverage).put("evidence", unknown.evidence)
+        }
+        val target = reportRow(0, 1_000_000, "skip")
+        val witness = reportRow(1, 1_000_000, "skip")
+        val rows = mutableListOf(target)
+        repeat(510) { rows += reportRow(0, 2_000_000 + it * 60_000L, "upload").put("reason", "observation_gap") }
+        rows += witness
+        assertEquals(MOVEMENT_REPORT_MAX_CLIPS, rows.size)
+        // Exercise the actual report writer with a full-card projection. Only output
+        // bounds and witness safety are asserted, independent of its trimming strategy.
+        val writer = ClipTransferPolicy::class.java.getDeclaredMethod("writeReport", List::class.java,
+            String::class.java, String::class.java, Boolean::class.javaPrimitiveType)
+        writer.isAccessible = true
+        writer.invoke(policy, rows, "b".repeat(64), "ready", false)
+        val file = File(root, "movement/transfer-policy.json")
+        val report = JSONObject(file.readText())
+        assertTrue(file.length() <= MOVEMENT_REPORT_MAX_BYTES)
+        assertTrue(report.getBoolean("truncated"))
+        val kept = report.getJSONArray("decisions")
+        assertTrue(kept.length() in 1 until MOVEMENT_REPORT_MAX_CLIPS)
+        assertEquals("upload", kept.getJSONObject(0).getString("decision"))
+        assertEquals("peer_coverage_required", kept.getJSONObject(0).getString("reason"))
+        assertTrue((0 until kept.length()).none { kept.getJSONObject(it).getJSONObject("clip").getString("camera_key") == "camera_1" })
+        assertEquals(0, policy.skipCount)
+        assertEquals("skip", target.getString("decision"))
+        policy.stop(); journal.stop(); journal.close()
+        prefs.edit().putBoolean(QUIET_FILTER_ENABLED, false).commit()
     }
 
     @Test fun defaultPolicyPublishesBoundedDisabledDecisionsWithoutDecoding() = runTest {
@@ -187,6 +283,61 @@ class ClipTransferPolicyTest {
         assertTrue(report.getJSONArray("capabilities").toString().contains("clip_transfer_policy_v1"))
         assertFalse(report.getBoolean("transfer_policy_enabled"))
         assertEquals("disabled", report.getString("transfer_policy_state"))
+    }
+
+    @Test fun actualPublisherAnalyzesStaggeredClipsEvenWhenTheirFinalPeerGateRetainsThem() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        context.deleteDatabase("clip-movement.db")
+        File(context.filesDir, "quiet-analysis-v2.json").delete()
+        val prefs = context.getSharedPreferences(MOVEMENT_TREE_PREFERENCES, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(QUIET_FILTER_ENABLED, true).commit()
+        val journal = MotionJournal(context, backgroundScope)
+        val now = System.currentTimeMillis()
+        val start = now / 60_000 * 60_000 - 180_000
+        for (offset in -200_000L..200_000L step 5_000) journal.writableDatabase.execSQL(
+            "INSERT INTO observations(wall_ms,elapsed_ms,session_id,segment_id,kind,acc,timezone) VALUES(?,?,?,?,?,?,?)",
+            arrayOf(start + offset, start + offset, journal.sessionId, "one", "acc", 0, zone))
+        fun item(camera: Int, at: Long): PolicyClip {
+            val local = Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault()).toLocalDateTime()
+            val name = local.format(java.time.format.DateTimeFormatter.ofPattern("uuuuMMddHHmmss")) + "_camera_$camera.ts"
+            val clip = MovementClip(name, "DCIM/Video/$name", name, "camera_$camera", local, 10_000, at + 30_000, false, false)
+            val assessment = MovementClassifier.assess(at, at + 30_000, journal.between(at, at + 30_000))
+            val body = JSONObject().put("clip_id", java.util.UUID.nameUUIDFromBytes(name.toByteArray()).toString())
+                .put("relative_path", clip.relativePath).put("camera_key", clip.camera).put("locked", false)
+                .put("size_bytes", clip.size).put("mtime_ms", clip.mtime)
+                .put("fingerprint", JSONObject().put("algorithm", "sha256-sampled-v1").put("sample_bytes", 16_384)
+                    .put("digest", "a".repeat(64)))
+                .put("local_start", local.toString()).put("timezone", zone)
+                .put("start_utc", Instant.ofEpochMilli(at).toString()).put("end_utc", Instant.ofEpochMilli(at + 30_000).toString())
+                .put("duration_ms", JSONObject.NULL).put("time_quality", "bounded")
+                .put("classification", assessment.classification).put("reasons", JSONArray(assessment.reasons))
+                .put("analysis_status", "complete").put("coverage", assessment.coverage).put("evidence", assessment.evidence)
+            return PolicyClip(clip, body, true, true, Uri.parse("content://test/$name"), at, at + 30_000)
+        }
+        val items = listOf(item(0, start), item(1, start - 27_000), item(1, start + 3_000))
+        val root = File(context.cacheDir, "policy-staggered").apply { mkdirs() }
+        var analyses = 0
+        val fake = object : VisualQuietAnalyzer(context) {
+            override suspend fun analyze(uri: Uri, allowed: () -> Boolean): JSONObject {
+                assertTrue(allowed()); analyses++; return quiet()
+            }
+        }
+        val policy = ClipTransferPolicy(context, journal, { root }, { true }, fake, System::currentTimeMillis)
+        repeat(3) { policy.publish(items, "b".repeat(64), "ready", false) { true } }
+        assertEquals(3, analyses)
+        assertEquals(1, policy.skipCount)
+        assertEquals(2, policy.uploadCount)
+        val report = JSONObject(File(root, "movement/transfer-policy.json").readText())
+        val rows = report.getJSONArray("decisions")
+        assertEquals("skip", rows.getJSONObject(0).getString("decision"))
+        assertEquals("peer_coverage_required", rows.getJSONObject(1).getString("reason"))
+        assertEquals("peer_coverage_required", rows.getJSONObject(2).getString("reason"))
+        File(System.getProperty("java.io.tmpdir"), "transfer-policy-staggered-v1-android.json").writeText(report.toString(2))
+        // A changed independently quiet witness invalidates the candidate before publication.
+        policy.publish(items, "b".repeat(64), "ready", false) { it.relativePath != items[1].clip.relativePath }
+        assertEquals(0, policy.skipCount)
+        policy.stop(); journal.stop(); journal.close()
+        prefs.edit().putBoolean(QUIET_FILTER_ENABLED, false).commit()
     }
 
     @Test fun actualPublisherRequiresBothAnalysesFreshIdentityAndPersistentCoverageAndDisablesImmediately() = runTest {
