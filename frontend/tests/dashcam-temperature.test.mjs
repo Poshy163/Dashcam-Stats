@@ -134,6 +134,66 @@ test('keyboard sample exploration and the semantic table expose unavailable rows
   assert.equal(root.root.findByType('tbody').findAllByType('tr').length, 6)
 })
 
+test('narrow charts keep readable axes, map pointer selection correctly and resize with observer cleanup', async t => {
+  const originalObserver = globalThis.ResizeObserver
+  const observers = []
+  globalThis.ResizeObserver = class {
+    constructor(callback) { this.callback = callback; observers.push(this) }
+    observe(target) { this.target = target }
+    disconnect() { this.disconnected = true }
+  }
+  let width = 282
+  const container = { getBoundingClientRect: () => ({ width }) }
+  const svg = { getBoundingClientRect: () => ({ width, left: 10 }) }
+  const points = [point(0, 80), point(60, 90), point(120, 107)]
+  let root
+  await act(async () => { root = create(React.createElement(DashcamTemperatureEvidence, {
+    data: data({ points, rangeEnd: point(120, 107).occurredAt }), nowMs: base + 120_000,
+  }), { createNodeMock: element => element.type === 'div' ? container : element.type === 'svg' ? svg : null }) })
+  t.after(async () => { if (root) await act(async () => root.unmount()); globalThis.ResizeObserver = originalObserver })
+  const chart = () => root.root.findByType('svg')
+  const ticks = () => chart().findAllByType('text').filter(node => node.props.y === 213)
+  assert.equal(chart().props.viewBox, '0 0 282 220')
+  assert.equal(chart().props.height, 220)
+  assert.equal(ticks().length, 2)
+  assert.ok(chart().findAllByType('text').every(node => node.props.fontSize === 11))
+  await act(async () => chart().props.onPointerMove({ clientX: 10 + 45 + (width - 45 - 18) / 2 }))
+  assert.match(root.root.findByType('input').props['aria-valuetext'], /90\.0 °C/)
+  width = 700
+  await act(async () => observers[0].callback([{ target: container, contentRect: { width } }]))
+  assert.equal(chart().props.viewBox, '0 0 700 220')
+  assert.equal(ticks().length, 3)
+  await act(async () => chart().props.onPointerMove({ clientX: 10 + 45 + width - 45 - 18 }))
+  assert.match(root.root.findByType('input').props['aria-valuetext'], /107\.0 °C/)
+  await act(async () => root.unmount())
+  root = null
+  assert.equal(observers.length, 1)
+  assert.equal(observers[0].disconnected, true)
+})
+
+test('chart measurement falls back to window resize and removes the listener without ResizeObserver', async t => {
+  const originalObserver = globalThis.ResizeObserver
+  const originalWindow = globalThis.window
+  globalThis.ResizeObserver = undefined
+  const listeners = new Map()
+  globalThis.window = { addEventListener: (name, callback) => listeners.set(name, callback), removeEventListener: (name, callback) => { if (listeners.get(name) === callback) listeners.delete(name) } }
+  let width = 320
+  const container = { getBoundingClientRect: () => ({ width }) }
+  let root
+  await act(async () => { root = create(React.createElement(DashcamTemperatureEvidence, { data: data() }), {
+    createNodeMock: element => element.type === 'div' ? container : null,
+  }) })
+  t.after(async () => { if (root) await act(async () => root.unmount()); globalThis.ResizeObserver = originalObserver; globalThis.window = originalWindow })
+  assert.equal(root.root.findByType('svg').props.viewBox, '0 0 320 220')
+  assert.ok(listeners.has('resize'))
+  width = 600
+  await act(async () => listeners.get('resize')())
+  assert.equal(root.root.findByType('svg').props.viewBox, '0 0 600 220')
+  await act(async () => root.unmount())
+  root = null
+  assert.equal(listeners.size, 0)
+})
+
 test('range changes use read-only history API and refresh errors retain cached chart data', async t => {
   const previousFetch = globalThis.fetch
   const previousNow = Date.now

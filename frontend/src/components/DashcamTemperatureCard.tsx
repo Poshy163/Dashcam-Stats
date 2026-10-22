@@ -1,4 +1,4 @@
-import { useId, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import type { PointerEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
@@ -10,7 +10,7 @@ import { QUIET_ANALYSIS_LIMIT_C, temperatureHistoryIsOld, temperatureSegments, t
 import { formatDateTime, formatShortDateTime, formatTime } from '@/lib/format'
 import type { DashcamTemperatureHistory } from '@/lib/types'
 
-const W = 720
+const DEFAULT_W = 720
 const H = 220
 const LEFT = 45
 const RIGHT = 18
@@ -20,13 +20,37 @@ const reading = (value: number | null | undefined) => value == null || !Number.i
 
 function TemperatureChart({ data }: { data: DashcamTemperatureHistory }) {
   const id = useId()
+  const container = useRef<HTMLDivElement>(null)
   const svg = useRef<SVGSVGElement>(null)
+  const [width, setWidth] = useState(DEFAULT_W)
   const [selected, setSelected] = useState<number | null>(null)
   const [tableOpen, setTableOpen] = useState(false)
   const [page, setPage] = useState(1)
   const points = data.points.filter((point) => Number.isFinite(Date.parse(point.occurredAt)))
   const values = points.map(temperatureValue).filter((value): value is number => value != null)
-  if (!points.length || !values.length) return <EmptyState title="No usable temperature readings" description="The retained captures contain no valid camera processor temperature for this range." />
+  const usable = points.length > 0 && values.length > 0
+  useEffect(() => {
+    if (!usable) return
+    const element = container.current
+    if (!element) return
+    const resized = (next: number) => { if (Number.isFinite(next) && next > 0) setWidth(Math.max(160, Math.round(next))) }
+    const measure = () => resized(element.getBoundingClientRect().width)
+    measure()
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver((entries) => {
+        const entry = entries.find((item) => item.target === element)
+        if (entry) resized(entry.contentRect.width)
+      })
+      observer.observe(element)
+      return () => observer.disconnect()
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', measure)
+      return () => window.removeEventListener('resize', measure)
+    }
+  }, [usable])
+  if (!usable) return <EmptyState title="No usable temperature readings" description="The retained captures contain no valid camera processor temperature for this range." />
+  const W = width
   const lo = Math.floor((Math.min(QUIET_ANALYSIS_LIMIT_C, ...values) - 5) / 5) * 5
   const hi = Math.ceil((Math.max(QUIET_ANALYSIS_LIMIT_C, ...values) + 5) / 5) * 5
   const start = Date.parse(data.rangeStart)
@@ -48,18 +72,18 @@ function TemperatureChart({ data }: { data: DashcamTemperatureHistory }) {
   }
   return (
     <>
-      <svg ref={svg} viewBox={`0 0 ${W} ${H}`} className="mt-4 w-full" style={{ touchAction: 'pan-y' }} role="img"
+      <div ref={container} className="w-full"><svg ref={svg} viewBox={`0 0 ${W} ${H}`} height={H} className="mt-4 w-full" style={{ touchAction: 'pan-y' }} role="img"
         aria-labelledby={`${id}-title ${id}-description`} onPointerMove={onPointerMove}>
         <title id={`${id}-title`}>Dashcam processor temperature over time, in degrees Celsius</title>
         <desc id={`${id}-description`}>Captured observations; gaps remain blank. The dashed line is the 85 degree quiet-analysis limit.</desc>
         {[0, .25, .5, .75, 1].map((fraction) => {
           const value = lo + (hi - lo) * fraction
           return <g key={fraction}><line x1={LEFT} x2={W - RIGHT} y1={y(value)} y2={y(value)} className="stroke-border" />
-            <text x={LEFT - 7} y={y(value) + 3} textAnchor="end" fontSize={10} fill="currentColor" className="text-content-faint">{value.toFixed(0)} °C</text></g>
+            <text x={LEFT - 7} y={y(value) + 3} textAnchor="end" fontSize={11} fill="currentColor" className="text-content-faint">{value.toFixed(0)} °C</text></g>
         })}
         <line x1={LEFT} x2={W - RIGHT} y1={y(QUIET_ANALYSIS_LIMIT_C)} y2={y(QUIET_ANALYSIS_LIMIT_C)} className="stroke-state-warn" strokeDasharray="5 4" />
-        {[0, .5, 1].map((fraction) => <text key={fraction} x={LEFT + fraction * (W - LEFT - RIGHT)} y={H - 7}
-          textAnchor={fraction === 0 ? 'start' : fraction === 1 ? 'end' : 'middle'} fontSize={10} fill="currentColor" className="text-content-faint">
+        {(W < 480 ? [0, 1] : [0, .5, 1]).map((fraction) => <text key={fraction} x={LEFT + fraction * (W - LEFT - RIGHT)} y={H - 7}
+          textAnchor={fraction === 0 ? 'start' : fraction === 1 ? 'end' : 'middle'} fontSize={11} fill="currentColor" className="text-content-faint">
           {(data.hours > 24 ? formatShortDateTime : formatTime)(new Date(start + fraction * (end - start)).toISOString())}
         </text>)}
         {segments.map((indices) => indices.length > 1
@@ -67,7 +91,7 @@ function TemperatureChart({ data }: { data: DashcamTemperatureHistory }) {
             fill="none" stroke="currentColor" strokeWidth={2} strokeLinejoin="round" className="text-accent" />
           : <circle key={indices[0]} cx={x(points[indices[0]!]!.occurredAt)} cy={y(temperatureValue(points[indices[0]!])!)} r={3} fill="currentColor" className="text-accent" />)}
         {point && <line x1={x(point.occurredAt)} x2={x(point.occurredAt)} y1={TOP} y2={H - BOTTOM} className="stroke-content-faint" strokeDasharray="2 3" />}
-      </svg>
+      </svg></div>
       <p className="mt-1 text-xs text-content-muted">Dashed line: {QUIET_ANALYSIS_LIMIT_C} °C quiet-analysis limit. Gaps are unobserved; this line is not a manufacturer safety rating.</p>
       <div className="mt-3 text-sm">
         <label htmlFor={`${id}-sample`} className="text-xs text-content-muted">Explore captured temperatures</label>

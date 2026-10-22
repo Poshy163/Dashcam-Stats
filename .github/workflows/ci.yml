@@ -140,6 +140,7 @@ jobs:
   frontend:
     name: Frontend (lint + build)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -155,6 +156,14 @@ jobs:
 
       - name: Audit dependencies
         working-directory: frontend
+        # A registry 503 spent seven minutes in the audit before failing. Keep the
+        # same vulnerability gate, but bound network waits and fail on outages.
+        timeout-minutes: 3
+        env:
+          npm_config_fetch_timeout: "30000"
+          npm_config_fetch_retries: "2"
+          npm_config_fetch_retry_mintimeout: "1000"
+          npm_config_fetch_retry_maxtimeout: "5000"
         run: npm audit --audit-level=moderate
 
       - name: Typecheck
