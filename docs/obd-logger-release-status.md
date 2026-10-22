@@ -8,13 +8,13 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.11** (`versionCode` 24); installation pending, current device remains 0.3.10/code 23 |
-| Source | 0.3.11 source under `android/obd-logger/`; installed 0.3.10 source is `fd96348b00b7461b0970b8c543041b6f22e08b51` |
+| Version | **0.3.11** (`versionCode` 24), installed in place on 22 October |
+| Source | `b348066d24edbc5bb25c673c09c4f183d1bc887b` (`android/obd-logger/`), verified in the running companion |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
 | Poll plan | 7; five-second target with measured optional-command admission |
-| Deployment | Production-signed 0.3.10/code 23 was installed in place on 21 October; the running companion was verified at `fd96348`. The server's `source_revision` was freshly verified at `6c31999` on 22 October. Both quiet-filter opt-ins were enabled that day at the operator's request; thermal limits and all proof requirements remain enforced. |
+| Deployment | Production-signed 0.3.11/code 24 was installed in place on 22 October. The running companion's revision, version and retained configuration were verified separately from the APK. The server remains at verified `6c31999`; deployment of the new coverage validator is pending. Both quiet-filter opt-ins remain enabled with unchanged thermal and proof gates. |
 
 ### What changed in 0.3.11
 
@@ -33,8 +33,32 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 - On 22 October the enabled 0.3.10 producer reported ready manifests and ordinary upload
   decisions, with zero genuine exclusions. Visual results were `not_analyzed`, so the
   observations do not establish a production decoder thermal rejection. The camera was
-  above the 85 C guard; physical paired decoding, exclusion and activity-transfer
-  acceptance remain pending for the 0.3.11 update.
+  above the 85 C guard. That pre-update observation is distinct from the production
+  0.3.11 resource-guard result below.
+- The production-signed 0.3.11 APK was installed in place on 22 October. Its certificate
+  matched the pinned production certificate, and APK SHA-256 was
+  `9fd436d3e3c156ffb223d96ae49f2ba5d3f7fb458ac4a3683f3168a890b23375`.
+  The application UID and OS boot were retained; the logger restarted normally for
+  the update. Ownership, read-only DCIM access and quiet-filter opt-in were retained,
+  movement reporting was ready, and passive GPS remained disabled. Both native camera
+  active files independently rolled and grew during the update. Newly observed camera
+  boundaries were approximately six seconds apart, reinforcing the need for interval
+  coverage rather than a wider fixed closest-peer threshold.
+- Fresh 0.3.11 policy evidence around 01:47 UTC was ready and enabled, with 56 upload
+  decisions and zero skips. Three production analysis results were `unavailable`, each
+  with zero decoded or sampled frames. Fresh companion evidence was parked, ACC OFF,
+  with ingestion state known and no ingestion request; the SoC was approximately
+  107.0 C. This physically verifies independent scheduling and resource refusal that
+  preserves ordinary upload. It does not prove complete quiet decoding, sustained paired
+  capacity, a genuine exclusion or parked-activity transfer under the new policy.
+- Final Android validation on 22 October: all 252 tests passed without skips or failures.
+  Debug and release lint reported zero errors and 56 existing warnings each. This includes
+  the staggered-view publisher, unsafe/missing overlap, fixed deadline and full-card
+  report-truncation regressions; physical acceptance remains separate.
+- Final backend regression on 22 October: 3,235 tests passed with 33 platform/fixture
+  skips and unhandled-thread warnings treated as errors. Ruff checks and formatting
+  passed for all 295 checked files. These checks do not establish live deployment of the
+  new server validator or physical quiet-exclusion acceptance.
 
 ### What changed in 0.3.10
 

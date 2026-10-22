@@ -136,13 +136,28 @@ analysis deadline. Fresh front and rear segments were also three seconds apart; 
 0.3.10 two-second closest-peer gate changed pending decisions to upload before selecting
 any decoder candidate, preventing their independent analysis even on a cool device.
 
-The 0.3.11 source update separates per-clip analysis eligibility from final transfer
+The 0.3.11 update separates per-clip analysis eligibility from final transfer
 coverage. It checks all overlapping opposite-view segments and exact continuous coverage
 instead of widening the closest-peer tolerance. Retained `peer_coverage_required` and
 `peer_analysis_pending` decisions can carry independently validated witness evidence;
 they still upload, and the server rechecks their identities and fingerprints before
-using them to support another exclusion. Physical validation of this update remains
-pending; no additional decoder load was attempted on the hot camera.
+using them to support another exclusion.
+
+The production-signed 0.3.11/code 24 APK from `b348066d24ed` was installed in place on
+22 October, with its certificate and running revision verified. The application UID,
+OS boot, ownership, read-only DCIM grant and quiet-filter setting were retained; passive
+GPS remained disabled. Both native active camera files independently rolled and grew
+during the update. Subsequent native boundaries were approximately six seconds apart;
+the coverage rule handles staggered segments without changing a timing threshold.
+
+Fresh production output around 01:47 UTC was ready and enabled, with 56 upload decisions
+and zero skips. Three actual 0.3.11 analysis results were `unavailable`, each with zero
+decoded and sampled frames. The logger was freshly parked with ACC OFF, ingestion state
+known and no ingestion request; the SoC reading was approximately 107.0 C. This verifies
+that independent analysis now reaches the resource guard and preserves ordinary upload
+without decoding on the hot device. It does not establish complete paired quiet analysis
+or a genuine exclusion. The server was still at `6c31999`, with deployment of the new
+coverage validator pending.
 
 Ordinary backup run 582 completed on 22 October: 239 video files / 12,724,617,944 bytes
 were copied, with one duplicate OBD bundle acknowledged separately. Fresh restoration
