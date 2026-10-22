@@ -6,6 +6,7 @@ import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
 import { ObdWebhookStatus } from '@/components/ObdWebhookStatus'
 import { MovementManifestCard } from '@/components/MovementManifestCard'
 import { MaintenanceWakeCard } from '@/components/MaintenanceWakeCard'
+import { DashcamTemperatureCard } from '@/components/DashcamTemperatureCard'
 import Spinner from '@/components/Spinner'
 import { EmptyState, ErrorState, PageHeader, Pagination, ProgressBar, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
@@ -858,6 +859,7 @@ export default function Backup() {
         </div>
       )}
 
+      <DashcamTemperatureCard />
       <MaintenanceWakeCard />
       <MovementManifestCard />
 

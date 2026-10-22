@@ -156,8 +156,16 @@ decoded and sampled frames. The logger was freshly parked with ACC OFF, ingestio
 known and no ingestion request; the SoC reading was approximately 107.0 C. This verifies
 that independent analysis now reaches the resource guard and preserves ordinary upload
 without decoding on the hot device. It does not establish complete paired quiet analysis
-or a genuine exclusion. The server was still at `6c31999`, with deployment of the new
-coverage validator pending.
+or a genuine exclusion. The server was still at `6c31999` at that observation; the new
+coverage validator was subsequently deployed and verified at `53346a6` on 22 October.
+
+After deployment, runs 584–586 copied 105 files / 6,282,289,404 bytes. The first run's
+temporary 49 MB analysis deferral subsequently resolved to ordinary upload. Run 585's
+radio cleanup needed a retry; durable logger resumption was later verified and its
+partial history retained. Run 586 completed successfully with all radio/logger
+restoration verified and no eligible backlog or deferrals in its final inventory.
+The first automatic scan found 95 new files without errors. These are ordinary-upload
+and temporary-deferral observations, not evidence of a genuine quiet exclusion.
 
 Ordinary backup run 582 completed on 22 October: 239 video files / 12,724,617,944 bytes
 were copied, with one duplicate OBD bundle acknowledged separately. Fresh restoration

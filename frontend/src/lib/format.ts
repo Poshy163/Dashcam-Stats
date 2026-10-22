@@ -112,6 +112,14 @@ export function formatTime(iso: string | null | undefined): string {
   return d.toLocaleTimeString(undefined, withZone({ hour: '2-digit', minute: '2-digit' }))
 }
 
+/** Compact chart ticks keep dates visible when a time range spans several days. */
+export function formatShortDateTime(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return '—'
+  return date.toLocaleString(undefined, withZone({ month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }))
+}
+
 /** UTC input fields must normalize offset-bearing bookmarks before dropping the suffix. */
 export function utcInputValue(iso: string | null | undefined): string {
   if (!iso) return ''

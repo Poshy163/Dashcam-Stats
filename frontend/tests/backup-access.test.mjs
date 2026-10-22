@@ -56,6 +56,7 @@ async function mount(t, {
       case '/api/ingest/history': body = paginated([{ id: 90, started_at: '2026-10-01T04:00:00Z', state: 'ok', files_transferred: 2, bytes_transferred: 100 }]); break
       case '/api/obd/status': body = await getObdStatus(); break
       case '/api/system/info': body = { version: 'main', source_revision: 'abcdef0123456789' }; break
+      case '/api/unit-logs/temperature': body = { source: 'retained_carplay_timing', sensor: 'soc-thmzone', hours: 24, range_start: '2026-10-01T00:00:00Z', range_end: '2026-10-02T00:00:00Z', bucket_s: 300, gap_threshold_s: 90, latest: null, minimum_c: null, maximum_c: null, unique_observation_count: 0, source_row_count: 0, input_truncated: false, output_truncated: false, truncated: false, points: [] }; break
       case '/api/obd/bundles': body = getBundles(Number(request.searchParams.get('page'))); break
       case '/api/obd/events': body = paginated([]); break
       case '/api/obd/bundles/1/validate': body = { valid: true, bundle: bundle(1) }; break

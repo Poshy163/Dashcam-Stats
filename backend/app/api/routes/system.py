@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select
+from sqlalchemy.orm import load_only
 
 from app.ai.models import describe_models, is_present
 from app.ai.openvino_session import (
@@ -67,7 +68,7 @@ from app.db.models import (
 )
 from app.db.session import current_revision
 from app.hardware.detect import detect_hardware_async
-from app.ingest import carplay_timing
+from app.ingest import carplay_timing, temperature_history
 from app.pipeline.orchestrator import expand_stages, invalidate_recordings
 from app.pipeline.revisions import outdated_stages
 from app.retention import current_usage, evaluate_safety, plan_idle, plan_parked
@@ -771,6 +772,43 @@ async def carplay_timing_samples(
         "events": events,
         "sessions": carplay_timing.sessions(samples, events),
     }
+
+
+@router.get("/unit-logs/temperature", summary="Temperature observations in retained device logs")
+async def unit_temperature_history(
+    session: SessionDep, hours: int = Query(24)
+) -> dict[str, object]:
+    if hours not in temperature_history.BUCKET_SECONDS:
+        raise HTTPException(422, "Temperature hours must be one of 1, 6, 24 or 168")
+    end = datetime.now(UTC)
+    start = end - timedelta(hours=hours)
+    rows = list(
+        (
+            await session.scalars(
+                select(UnitLogEntry)
+                .options(load_only(UnitLogEntry.occurred_at, UnitLogEntry.message))
+                .where(
+                    UnitLogEntry.tag == carplay_timing.TAG,
+                    UnitLogEntry.message.contains("soc="),
+                    # A copied context just inside the range may belong to a direct
+                    # observation just outside it. Read a bounded attribution margin.
+                    UnitLogEntry.occurred_at
+                    >= start - timedelta(milliseconds=temperature_history.MAX_CONTEXT_AGE_MS),
+                    UnitLogEntry.occurred_at <= end,
+                )
+                .order_by(UnitLogEntry.occurred_at.desc(), UnitLogEntry.id.desc())
+                .limit(temperature_history.MAX_INPUT_ROWS + 1)
+            )
+        ).all()
+    )
+    truncated = len(rows) > temperature_history.MAX_INPUT_ROWS
+    return temperature_history.history(
+        rows[: temperature_history.MAX_INPUT_ROWS],
+        hours=hours,
+        range_start=start,
+        range_end=end,
+        input_truncated=truncated,
+    )
 
 
 @router.get("/unit-logs/tags", summary="Tags present in the collected unit log")

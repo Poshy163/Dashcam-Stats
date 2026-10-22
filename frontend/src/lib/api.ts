@@ -10,6 +10,7 @@ import type {
   AuthSession,
   AuthState,
   CarPlayTimingOut,
+  DashcamTemperatureHistory,
   Heatmap,
   HeatmapFilters,
   Job,
@@ -926,6 +927,8 @@ export const api = {
     tags: () => request<UnitLogTag[]>('/unit-logs/tags'),
     carplayTiming: (query?: Query) =>
       request<CarPlayTimingOut>('/unit-logs/carplay-timing', { query }),
+    temperature: (query: { hours: 1 | 6 | 24 | 168 }) =>
+      request<DashcamTemperatureHistory>('/unit-logs/temperature', { query }),
   },
 
   search: (q: string) => request<SearchResults>('/search', { query: { q } }),

@@ -160,6 +160,7 @@ async function mountBackup(t, data, radio) {
   const client = new QueryClient({ defaultOptions: { queries: { enabled: false, retry: false, gcTime: Infinity } } })
   client.setQueryData(['ingest-status'], data)
   client.setQueryData(['ingest-radio-status'], radio ?? { quietingEnabled: false, transition: null })
+  client.setQueryData(['dashcam-temperature', 24], { source: 'retained_carplay_timing', sensor: 'soc-thmzone', hours: 24, rangeStart: '2026-10-01T00:00:00Z', rangeEnd: '2026-10-02T00:00:00Z', bucketS: 300, gapThresholdS: 90, latest: null, minimumC: null, maximumC: null, uniqueObservationCount: 0, sourceRowCount: 0, inputTruncated: false, outputTruncated: false, truncated: false, points: [] })
   let root
   await act(async () => { root = create(React.createElement(QueryClientProvider, { client }, React.createElement(MemoryRouter, null, React.createElement(Backup)))) })
   t.after(async () => { await act(async () => root.unmount()); client.clear() })

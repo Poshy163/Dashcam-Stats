@@ -707,6 +707,41 @@ export interface CarPlayTimingOut {
   sessions?: CarPlayTimingSession[]
 }
 
+export type DashcamTemperatureQuality = 'valid' | 'unavailable' | 'invalid'
+
+export interface DashcamTemperatureObservation {
+  occurredAt: string
+  socC: number | null
+  sessionId: string | null
+  quality: DashcamTemperatureQuality
+}
+
+export interface DashcamTemperaturePoint extends DashcamTemperatureObservation {
+  segmentId: string
+  samples: number
+  kind: 'min' | 'max' | 'last'
+}
+
+/** Retained timing-capture observations; reading this history never probes the camera. */
+export interface DashcamTemperatureHistory {
+  source: 'retained_carplay_timing'
+  sensor: 'soc-thmzone'
+  hours: number
+  rangeStart: string
+  rangeEnd: string
+  bucketS: number
+  gapThresholdS: number
+  latest: DashcamTemperatureObservation | null
+  minimumC: number | null
+  maximumC: number | null
+  uniqueObservationCount: number
+  sourceRowCount: number
+  inputTruncated: boolean
+  outputTruncated: boolean
+  truncated: boolean
+  points: DashcamTemperaturePoint[]
+}
+
 export type SettingType = 'bool' | 'int' | 'float' | 'string' | 'select' | 'path' | 'bytes'
 
 export interface SettingDef {

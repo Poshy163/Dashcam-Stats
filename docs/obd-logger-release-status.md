@@ -14,7 +14,7 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
 | Poll plan | 7; five-second target with measured optional-command admission |
-| Deployment | Production-signed 0.3.11/code 24 was installed in place on 22 October. The running companion's revision, version and retained configuration were verified separately from the APK. The server remains at verified `6c31999`; deployment of the new coverage validator is pending. Both quiet-filter opt-ins remain enabled with unchanged thermal and proof gates. |
+| Deployment | Production-signed 0.3.11/code 24 was installed in place on 22 October. The running companion's revision, version and retained configuration were verified separately from the APK. The coverage validator was deployed and verified at server revision `53346a6` that day. Both quiet-filter opt-ins remain enabled with unchanged thermal and proof gates. |
 
 ### What changed in 0.3.11
 
@@ -57,8 +57,19 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
   report-truncation regressions; physical acceptance remains separate.
 - Final backend regression on 22 October: 3,235 tests passed with 33 platform/fixture
   skips and unhandled-thread warnings treated as errors. Ruff checks and formatting
-  passed for all 295 checked files. These checks do not establish live deployment of the
-  new server validator or physical quiet-exclusion acceptance.
+  passed for all 295 checked files. Physical quiet-exclusion acceptance remains separate.
+- After deployment, a fresh same-boot accessory-power cycle cleared the cancellation
+  marker and supplied a decreasing unit-derived countdown. Polling was active during
+  this cycle, so it does not isolate the camera-recorded-only clearance path. Runs
+  584–586 copied 105 files / 6,282,289,404 bytes; run 585 retained a partial cleanup result,
+  with its logger-resume debt subsequently verified cleared. Run 586 finished `ok` with
+  Bluetooth, hotspot and logger resumption verified. Its final inventory had no eligible
+  backlog or policy deferrals. The automatic scanner found 95 new files without errors,
+  then settled 25 changed files in a later pass; ordinary processing continued.
+- Fresh device evidence at 02:15 UTC still measured approximately 107 C, with ready,
+  enabled policy output and zero exclusions. Actual quiet exclusion and its downstream
+  scan/job absence remain unverified. Temperature history coverage and its limitations
+  are documented in [dashcam-temperature-history.md](dashcam-temperature-history.md).
 
 ### What changed in 0.3.10
 
