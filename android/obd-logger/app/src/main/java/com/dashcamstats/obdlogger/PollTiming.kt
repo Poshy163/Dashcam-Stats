@@ -56,6 +56,7 @@ internal enum class PollOutcome(val field: String) {
  */
 internal class PollTiming(
     driveOriginMillis: Long? = null,
+    private val targetCycleMillis: Long = ObdPollPlan.TARGET_CYCLE_MILLIS,
     private val monotonicMillis: () -> Long,
 ) {
     private class PidTiming {
@@ -107,7 +108,7 @@ internal class PollTiming(
         val duration = now() - start
         work.observe(duration)
         if (completed) cyclesCompleted += 1
-        if (duration > ObdPollPlan.TARGET_CYCLE_MILLIS) overruns += 1
+        if (duration > targetCycleMillis) overruns += 1
         activeCycle = null
     }
 
@@ -124,9 +125,10 @@ internal class PollTiming(
         stats(pid)?.let { it.skips = (it.skips + 1).coerceAtMost(POLL_TIMING_COUNT_LIMIT) }
     }
 
+    fun successfulRowPids(): Set<Int> = rowCompletions.keys.toSet()
+
     /** Call adjacent to the UTC row timestamp, before the database write. Consumed once. */
-    fun takeRowAges(): Map<Int, Long> {
-        val at = now()
+    fun takeRowAges(at: Long = now()): Map<Int, Long> {
         return rowCompletions.mapValues { at - it.value }.also { rowCompletions.clear() }
     }
 
@@ -154,7 +156,7 @@ internal class PollTiming(
             .put("window_start_elapsed_ms", (windowStart - origin).coerceAtMost(POLL_TIMING_TIME_LIMIT))
             .put("window_duration_ms", (at - windowStart).coerceAtMost(POLL_TIMING_TIME_LIMIT))
             .put("flush_reason", reason)
-            .put("target_cycle_ms", ObdPollPlan.TARGET_CYCLE_MILLIS)
+            .put("target_cycle_ms", targetCycleMillis)
             .put("cycles_started", cyclesStarted)
             .put("cycles_completed", cyclesCompleted)
             .put("overrun_count", overruns)

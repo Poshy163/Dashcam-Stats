@@ -51,6 +51,57 @@ class BundleExporterProductionTest {
     }
 
     @Test
+    fun productionExporterUsesTheSharedTimedFuelDistanceAndIdleFixtures() {
+        for ((index, case) in trialCalculationCases().take(6).withIndex()) {
+            val driveId = "timed-calculation-$index"
+            database.startDrive(DriveRecord(
+                driveId = driveId, vehicleId = "car", adapterId = "adapter", loggerId = "logger",
+                loggerVersion = "0.3.12", startedAtUtc = case.getString("start_time_utc"),
+                originalTimezone = "UTC", startReason = "test", obdProtocol = "test",
+                pollPlanVersion = case.getInt("poll_plan_version"),
+            ))
+            val rows = case.getJSONArray("samples")
+            for (rowIndex in 0 until rows.length()) {
+                val row = rows.getJSONObject(rowIndex)
+                val quality = row.getJSONObject("quality")
+                val ages = quality.optJSONObject(PID_RESPONSE_AGES_KEY)?.let { map ->
+                    map.keys().asSequence().associate { it.toInt(16) to map.getLong(it) }
+                }
+                val missing = quality.getJSONArray("missing_pids")
+                val fields = listOf("vehicle_speed", "engine_rpm", "mass_air_flow", "estimated_fuel_rate")
+                database.addSample(SampleRecord(
+                    driveId = driveId, sequence = row.getLong("sequence"),
+                    timestampUtc = row.getString("timestamp_utc"),
+                    values = fields.filter { !row.isNull(it) }.associateWith(row::get),
+                    transportQuality = quality.getString("transport"),
+                    parserQuality = quality.getString("parser"),
+                    missingPids = (0 until missing.length()).map(missing::getInt),
+                    pidResponseAgeMs = ages,
+                ))
+            }
+            database.finishDrive(driveId, "engine_stopped", true, case.getString("finish_time_utc"))
+            val archive = exporter.export(driveId).file
+            ZipFile(archive).use { zip ->
+                val summary = zip.getInputStream(zip.getEntry("summary.json")).bufferedReader().use {
+                    JSONObject(it.readText())
+                }
+                val expected = case.getJSONObject("expected")
+                for (key in listOf("distance_km", "estimated_fuel_used_l", "idle_duration_s")) {
+                    assertEquals(case.getString("name") + " $key", expected.getDouble(key), summary.getDouble(key), 1e-10)
+                }
+                val manifest = zip.getInputStream(zip.getEntry("manifest.json")).bufferedReader().use {
+                    JSONObject(it.readText())
+                }
+                assertEquals(case.getInt("poll_plan_version"), manifest.getInt("poll_plan_version"))
+                val first = GZIPInputStream(zip.getInputStream(zip.getEntry("samples.ndjson.gz")))
+                    .bufferedReader().use { JSONObject(it.readLine()) }
+                assertEquals(rows.getJSONObject(0).getJSONObject("quality").has(PID_RESPONSE_AGES_KEY),
+                    first.getJSONObject("quality").has(PID_RESPONSE_AGES_KEY))
+            }
+        }
+    }
+
+    @Test
     fun productionSummaryIntegratesSparseFuelAndRespectsFailedMaf() {
         for (failedMaf in listOf(false, true)) {
             val driveId = "sparse-fuel-$failedMaf"
@@ -148,7 +199,7 @@ class BundleExporterProductionTest {
 
     @Test
     fun exporterRejectsMalformedOrUnknownFuturePollPlansWithoutChangingTheirArchives() {
-        val invalidPlans: List<Any> = listOf(ObdPollPlan.VERSION + 1, 5.5, 6.5, true, "5")
+        val invalidPlans: List<Any> = listOf(PollTrialPlan.VERSION + 1, 5.5, 6.5, true, "5")
         for ((index, plan) in invalidPlans.withIndex()) {
             val driveId = "invalid-plan-$index"
             createCompletedDrive(driveId)

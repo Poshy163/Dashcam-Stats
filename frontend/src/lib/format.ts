@@ -95,6 +95,14 @@ export function formatDateTime(iso: string | null | undefined): string {
   )
 }
 
+/** PID replies in one row can finish milliseconds apart. */
+export function formatDateTimeMillis(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return '—'
+  return date.toLocaleString(undefined, withZone({ year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 }))
+}
+
 export function formatDate(iso: string | null | undefined): string {
   if (!iso) return '—'
   const d = new Date(iso)
@@ -121,10 +129,10 @@ export function formatShortDateTime(iso: string | null | undefined): string {
 }
 
 /** UTC input fields must normalize offset-bearing bookmarks before dropping the suffix. */
-export function utcInputValue(iso: string | null | undefined): string {
+export function utcInputValue(iso: string | null | undefined, precision: 'minute' | 'second' = 'minute'): string {
   if (!iso) return ''
   const date = new Date(iso)
-  return Number.isFinite(date.getTime()) ? date.toISOString().slice(0, 16) : ''
+  return Number.isFinite(date.getTime()) ? date.toISOString().slice(0, precision === 'second' ? 19 : 16) : ''
 }
 
 export function formatRelative(iso: string | null | undefined): string {

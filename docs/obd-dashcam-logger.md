@@ -18,6 +18,12 @@ the card and remain separate from backed-up or processed files. See
 [quiet-clip-transfer-policy.md](quiet-clip-transfer-policy.md) for resource limits, deferred
 uploads, scanner handoff and the physical checks required before activation.
 
+Companion 0.3.12 adds an opt-in three-second speed, RPM and MAF trial with per-PID
+response-completion timing, matching calculation changes and a recorded fallback to
+the baseline poll plan. Deploy the matching server first. See
+[obd-three-second-trial.md](obd-three-second-trial.md) for activation, rollback and
+physical acceptance; it does not establish a live web telemetry stream.
+
 ## Why it is an APK
 
 The verified unit is a locked, unrooted UIS7861 head unit running Android 14 (SDK 34). The

@@ -529,8 +529,8 @@ export interface OBDSignalQuality extends OBDCadenceQuality {
   expectedObservationCount: number
   receivedObservationCount: number
   missingObservationCount: number
-  missingRunCount: number
-  longestMissingRun: number
+  missingRunCount: number | null
+  longestMissingRun: number | null
   coveragePercentage: number | null
 }
 
@@ -571,7 +571,7 @@ export interface OBDSeriesSample {
   t: string
   sequence: number
   ecuDataStatus: 'live' | 'last_known' | string
-  quality: { transport?: string; parser?: string; missingPids?: number[] } | null
+  quality: { transport?: string; parser?: string; missingPids?: number[]; pidResponseAgeMs?: Record<string, number> | null } | null
   provenance: Record<string, 'measured' | 'derived' | string>
   engineRpm: number | null
   vehicleSpeedKmh: number | null

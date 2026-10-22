@@ -1,0 +1,684 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "v8_sequential_skew",
+      "poll_plan_version": 8,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:11Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:02Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 0,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 1,
+          "timestamp_utc": "2026-10-22T00:00:05Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1200,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 36,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 12,
+          "mass_air_flow": 36.504999999999995
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 2,
+          "timestamp_utc": "2026-10-22T00:00:08Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 800,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 72,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 0,
+          "mass_air_flow": 0.0
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 3,
+          "timestamp_utc": "2026-10-22T00:00:11Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 0,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        }
+      ],
+      "expected": {
+        "distance_km": 0.093,
+        "estimated_fuel_used_l": 0.015,
+        "idle_duration_s": 2.8
+      }
+    },
+    {
+      "name": "v8_missing_maf_resets",
+      "poll_plan_version": 8,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:11Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:02Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 1,
+          "timestamp_utc": "2026-10-22T00:00:05Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [
+              16
+            ],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 2,
+          "timestamp_utc": "2026-10-22T00:00:08Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 12,
+          "mass_air_flow": 36.504999999999995
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 3,
+          "timestamp_utc": "2026-10-22T00:00:11Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 12,
+          "mass_air_flow": 36.504999999999995
+        }
+      ],
+      "expected": {
+        "distance_km": 0.15,
+        "estimated_fuel_used_l": 0.01,
+        "idle_duration_s": 0
+      }
+    },
+    {
+      "name": "v8_missing_sequence",
+      "poll_plan_version": 8,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:08Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:02Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 2,
+          "timestamp_utc": "2026-10-22T00:00:05Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 12,
+          "mass_air_flow": 36.504999999999995
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 3,
+          "timestamp_utc": "2026-10-22T00:00:08Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 12,
+          "mass_air_flow": 36.504999999999995
+        }
+      ],
+      "expected": {
+        "distance_km": 0.05,
+        "estimated_fuel_used_l": 0.01,
+        "idle_duration_s": 0
+      }
+    },
+    {
+      "name": "v8_hold_expiry",
+      "poll_plan_version": 8,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:11Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:02Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 1,
+          "timestamp_utc": "2026-10-22T00:00:05Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 2,
+          "timestamp_utc": "2026-10-22T00:00:08Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 3,
+          "timestamp_utc": "2026-10-22T00:00:11Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000
+        }
+      ],
+      "expected": {
+        "distance_km": 0.15,
+        "estimated_fuel_used_l": 0.0075,
+        "idle_duration_s": 0
+      }
+    },
+    {
+      "name": "timed_v7_reversed_receipt_dropped",
+      "poll_plan_version": 7,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:22Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:02Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 1,
+          "timestamp_utc": "2026-10-22T00:00:07Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 2,
+          "timestamp_utc": "2026-10-22T00:00:12Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 6000
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 12,
+          "mass_air_flow": 36.504999999999995
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 3,
+          "timestamp_utc": "2026-10-22T00:00:17Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 12,
+          "mass_air_flow": 36.504999999999995
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 4,
+          "timestamp_utc": "2026-10-22T00:00:22Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 12,
+          "mass_air_flow": 36.504999999999995
+        }
+      ],
+      "expected": {
+        "distance_km": 0.3333333333333333,
+        "estimated_fuel_used_l": 0.025333333333333333,
+        "idle_duration_s": 0
+      }
+    },
+    {
+      "name": "legacy_v7_unchanged",
+      "poll_plan_version": 7,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:20Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:00Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": []
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 1,
+          "timestamp_utc": "2026-10-22T00:00:05Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": []
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 2,
+          "timestamp_utc": "2026-10-22T00:00:10Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": []
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 3,
+          "timestamp_utc": "2026-10-22T00:00:15Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": []
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 12,
+          "mass_air_flow": 36.504999999999995
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 4,
+          "timestamp_utc": "2026-10-22T00:00:20Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": []
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000
+        }
+      ],
+      "expected": {
+        "distance_km": 0.3333333333333333,
+        "estimated_fuel_used_l": 0.041666666666666664,
+        "idle_duration_s": 0
+      }
+    },
+    {
+      "name": "v8_missing_explicit_speed_age",
+      "poll_plan_version": 8,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:08Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:02Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 1,
+          "timestamp_utc": "2026-10-22T00:00:05Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 2,
+          "timestamp_utc": "2026-10-22T00:00:08Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        }
+      ],
+      "expected": {
+        "distance_km": null,
+        "estimated_fuel_used_l": 0.01,
+        "idle_duration_s": null
+      }
+    },
+    {
+      "name": "v8_row_clock_regression",
+      "poll_plan_version": 8,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:07Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:05Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 1,
+          "timestamp_utc": "2026-10-22T00:00:04Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 2,
+          "timestamp_utc": "2026-10-22T00:00:07Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 1500,
+              "0D": 1000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        }
+      ],
+      "expected": {
+        "distance_km": 0.05,
+        "estimated_fuel_used_l": null,
+        "idle_duration_s": 0
+      }
+    }
+  ]
+}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import FileResponse
@@ -49,6 +50,7 @@ from app.ingest.obd_storage import (
 )
 from app.ingest.obd_transfer import get_obd_transfer_status
 from app.obd import battery
+from app.obd.timing import pid_is_missing, response_time, row_is_live
 
 router = APIRouter(prefix="/api/obd", tags=["obd"])
 
@@ -258,6 +260,42 @@ def _series_time(value: datetime | None) -> datetime | None:
         return value.astimezone(UTC)
     except (OverflowError, ValueError):
         raise HTTPException(422, "Series time filter is outside the supported range") from None
+
+
+def _source_window_row(row, specs, columns, *, start, end, require_timing):
+    """Mask only the sampler's view; return the immutable original row to API clients.
+
+    A row saved after ``end`` can contain an earlier reply in the requested window.
+    Other replies outside that window must not displace its extrema during sampling.
+    In-window null rows remain present so a full-resolution view preserves gap evidence.
+    """
+    view = SimpleNamespace(**{name: getattr(row, name) for name in columns}, source_row=row)
+    any_visible = False
+    for spec in specs:
+        pid = (
+            0x10 if spec.name in {"estimated_fuel_rate", "estimated_fuel_consumption"} else spec.pid
+        )
+        at = (
+            response_time(row.captured_at, row.quality_json, pid, require_timing=require_timing)
+            if pid is not None and spec.provenance != "static"
+            else row.captured_at
+        )
+        visible = (
+            getattr(row, spec.attribute) is not None
+            and at is not None
+            and (start is None or at >= start)
+            and (end is None or at <= end)
+            and row_is_live(row.ecu_data_status, row.quality_json)
+            and (pid is None or not pid_is_missing(row.quality_json, pid))
+        )
+        if visible:
+            any_visible = True
+        else:
+            setattr(view, spec.attribute, None)
+    row_in_window = (start is None or row.captured_at >= start) and (
+        end is None or row.captured_at <= end
+    )
+    return view if any_visible or row_in_window else None
 
 
 class _SampleBuckets:
@@ -499,7 +537,11 @@ async def drive_series(
         sample_filters.append(OBDSample.captured_at >= start)
         diagnostic_filters.append(OBDDiagnostic.observed_at >= start)
     if end is not None:
-        sample_filters.append(OBDSample.captured_at <= end)
+        try:
+            latest_row = end + timedelta(seconds=60)
+        except OverflowError:
+            latest_row = datetime.max.replace(tzinfo=UTC)
+        sample_filters.append(OBDSample.captured_at <= latest_row)
         diagnostic_filters.append(OBDDiagnostic.observed_at <= end)
     total_samples = int(
         await session.scalar(select(func.count()).select_from(OBDSample).where(*sample_filters))
@@ -528,17 +570,39 @@ async def drive_series(
         .where(*sample_filters)
         .order_by(OBDSample.sequence.asc())
     )
-    sampled = max_points is not None and total_samples > max_points
+    windowed = start is not None or end is not None
+    sampled = not windowed and max_points is not None and total_samples > max_points
     sampler = _SampleBuckets(total_samples, max_points, attributes) if sampled else None
     samples = []
     voltages = []
+    matched_samples = 0
     result = await session.stream_scalars(query.execution_options(yield_per=512))
     try:
         async for row in result:
-            if row.adapter_voltage_v is not None:
+            if row.adapter_voltage_v is not None and (
+                (start is None or row.captured_at >= start)
+                and (end is None or row.captured_at <= end)
+            ):
                 voltages.append(
                     battery.VoltageSample(row.captured_at, row.adapter_voltage_v, row.engine_rpm)
                 )
+            if windowed:
+                row = _source_window_row(
+                    row,
+                    specs,
+                    columns,
+                    start=start,
+                    end=end,
+                    require_timing=_poll_plan_version == 8,
+                )
+                if row is None:
+                    continue
+                matched_samples += 1
+                if sampler is None and max_points is not None and matched_samples > max_points:
+                    sampler = _SampleBuckets(total_samples, max_points, attributes)
+                    for retained in samples:
+                        sampler.add(retained)
+                    samples = []
             if sampler is not None:
                 sampler.add(row)
             else:
@@ -548,6 +612,9 @@ async def drive_series(
     if sampler is not None:
         sampler.emit()
         samples = sampler.output
+    if windowed:
+        total_samples = matched_samples
+        sampled = sampler is not None
     diagnostic_total = int(
         await session.scalar(
             select(func.count()).select_from(OBDDiagnostic).where(*diagnostic_filters)
@@ -589,9 +656,9 @@ async def drive_series(
         "battery": await asyncio.to_thread(battery.estimate, voltages),
         "samples": [
             (
-                _selected_series_sample(row, specs)
+                _selected_series_sample(getattr(row, "source_row", row), specs)
                 if signals is not None
-                else _series_sample(row, specs)
+                else _series_sample(getattr(row, "source_row", row), specs)
             )
             for row in samples
         ],

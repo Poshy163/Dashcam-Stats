@@ -39,6 +39,8 @@ class MainActivity : Activity() {
     private lateinit var offGraceSeconds: EditText
     private lateinit var parkedIntervalSeconds: EditText
     private lateinit var voltageOnlyMode: CheckBox
+    private lateinit var pollTrial: CheckBox
+    private lateinit var pollTrialReason: TextView
     private lateinit var webhookEnabled: CheckBox
     private lateinit var webhookUrl: EditText
     private lateinit var webhookApiKey: EditText
@@ -58,6 +60,7 @@ class MainActivity : Activity() {
     private var publishedStatus: JSONObject? = null
     private var credentialLoadError: String? = null
     private var saving = false
+    private var renderingPollTrial = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -203,6 +206,21 @@ class MainActivity : Activity() {
             isChecked = current.voltageOnlyMode
         }
         layout.addView(voltageOnlyMode)
+        pollTrial = CheckBox(this).apply {
+            text = "Trial: 3-second speed / RPM / MAF (applies next drive; automatic fallback)"
+            isChecked = current.pollTrialEnabled
+        }
+        layout.addView(pollTrial)
+        pollTrialReason = TextView(this).apply {
+            text = current.pollTrialFallbackReason?.let { "${PollTrialPlan.fallbackText(it)} Check the box to re-arm." } ?: "Baseline polling is the default."
+        }
+        layout.addView(pollTrialReason)
+        pollTrial.setOnCheckedChangeListener { _, checked ->
+            if (renderingPollTrial) return@setOnCheckedChangeListener
+            runCatching { LoggerPreferences.setPollTrial(this, checked) }.onSuccess {
+                pollTrialReason.text = if (checked) "Trial armed for the next drive." else "Baseline selected for the next drive."
+            }.onFailure { pollTrialReason.text = "Could not save trial setting; try again." }
+        }
         webhookEnabled = CheckBox(this).apply {
             text = "Send webhook to Dashcam Analyser on engine-off / sleep"
             isChecked = current.webhookEnabled
@@ -292,6 +310,13 @@ class MainActivity : Activity() {
     }
 
     private fun renderLiveStatus() {
+        val trialConfig = LoggerPreferences.load(this, false)
+        renderingPollTrial = true
+        pollTrial.isChecked = trialConfig.pollTrialEnabled
+        renderingPollTrial = false
+        pollTrialReason.text = trialConfig.pollTrialFallbackReason?.let { "${PollTrialPlan.fallbackText(it)} Check the box to re-arm." }
+            ?: if (trialConfig.pollTrialEnabled) "Trial armed for the next drive; current plan ${publishedStatus?.optInt("poll_plan_version", 7) ?: 7}."
+            else "Baseline selected for the next drive."
         liveStatus.text = LiveStatusSummary.lines(publishedStatus, System.currentTimeMillis())
             .joinToString("\n")
         liveMetrics.visibility = if (metricsExpanded) View.VISIBLE else View.GONE
@@ -341,6 +366,8 @@ class MainActivity : Activity() {
             offGraceSeconds = offGraceSeconds.text.toString().toLongOrNull() ?: -1,
             parkedIntervalSeconds = parkedIntervalSeconds.text.toString().toLongOrNull() ?: -1,
             voltageOnlyMode = voltageOnlyMode.isChecked,
+            pollTrialEnabled = LoggerPreferences.load(this, false).pollTrialEnabled,
+            pollTrialFallbackReason = LoggerPreferences.load(this, false).pollTrialFallbackReason,
             webhookEnabled = webhookEnabled.isChecked,
             webhookUrl = webhookUrl.text.toString().trim(),
             webhookApiKey = webhookApiKey.text.toString().trim(),

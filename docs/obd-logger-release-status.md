@@ -4,7 +4,7 @@ Quick orientation for the Android app that runs on the head unit. The full desig
 procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page is the
 "where are we right now" summary.
 
-## Current version
+## Installed version
 
 | | |
 |---|---|
@@ -15,6 +15,29 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 | Status schema | `status.json` schema version 7 |
 | Poll plan | 7; five-second target with measured optional-command admission |
 | Deployment | Production-signed 0.3.11/code 24 was installed in place on 22 October. The running companion's revision, version and retained configuration were verified separately from the APK. The coverage validator was deployed and verified at server revision `53346a6` that day. Both quiet-filter opt-ins remain enabled with unchanged thermal and proof gates. |
+
+## 0.3.12 polling trial
+
+The new companion implementation is 0.3.12/code 25. It has not been installed or
+physically accepted on the camera. The installed-version evidence above still
+describes 0.3.11.
+
+- An opt-in immutable poll plan 8 targets fresh speed, RPM and MAF reads every three
+  seconds. Plan 7 remains the default; slower readings retain explicit opportunities
+  and measured admission rather than being copied forward as fresh.
+- Successful reply-completion ages accompany the retained sample. Distance,
+  acceleration and fuel calculations consume their source times with plan-specific
+  continuity and hold limits; legacy bundles retain their original interpretation.
+- A failed trial records its reason, retains its interrupted segment, disables the
+  option and returns to the baseline plan through a safe connection boundary.
+- The accepting server must be deployed before the producer. See
+  [obd-three-second-trial.md](obd-three-second-trial.md) for the full procedure,
+  calculation limits and physical acceptance requirements.
+- Local validation on 22 October passed 274 Android tests, 3,320 backend tests with
+  33 platform/fixture skips, and 229 frontend tests, with lint/typecheck/build and
+  Python formatting checks passing. Source-window, missing-data and reply-time UI
+  behavior was visually checked with synthetic fixtures. These are implementation
+  checks; no physical three-second drive has been accepted.
 
 ### What changed in 0.3.11
 

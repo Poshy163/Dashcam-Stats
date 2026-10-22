@@ -34,6 +34,7 @@ from app.db.models import (
     OBDSample,
     utcnow,
 )
+from app.obd.timing import PID_FIELDS, RESPONSE_AGES_KEY, nominal_cycle_s
 
 SCHEMA_VERSION = 1
 BUNDLE_SUFFIX = ".obd2.zip"
@@ -368,7 +369,7 @@ def _number(
     return result
 
 
-def _validate_poll_timing(payload: dict[str, Any]) -> None:
+def _validate_poll_timing(payload: dict[str, Any], *, target_cycle_ms: int = 5000) -> None:
     """Accept only bounded, value-free timing windows from the Android logger."""
     required = {
         "schema_version",
@@ -392,8 +393,8 @@ def _validate_poll_timing(payload: dict[str, Any]) -> None:
     _integer(
         payload["target_cycle_ms"],
         field_name="poll_timing.target_cycle_ms",
-        minimum=5000,
-        maximum=5000,
+        minimum=target_cycle_ms,
+        maximum=target_cycle_ms,
     )
     if not isinstance(payload["flush_reason"], str) or payload["flush_reason"] not in {
         "periodic",
@@ -802,6 +803,7 @@ def _validate_manifest(
             5,
             6,
             7,
+            8,
         }:
             raise BundleError("manifest.poll_plan_version is not supported")
 
@@ -893,6 +895,7 @@ def _validate_sample(
     finished: datetime,
     previous_sequence: int | None,
     previous_at: datetime | None,
+    poll_plan_version: int | None = None,
 ) -> tuple[dict[str, Any], datetime, int]:
     if not isinstance(value, dict):
         raise BundleError("each samples.ndjson.gz line must be a JSON object")
@@ -943,7 +946,12 @@ def _validate_sample(
         ):
             raise BundleError("sample.oxygen_sensors_present must contain unique indices 1..8")
     quality = value["quality"]
-    if not isinstance(quality, dict) or set(quality) != {"transport", "parser", "missing_pids"}:
+    required_quality = {"transport", "parser", "missing_pids"}
+    if (
+        not isinstance(quality, dict)
+        or not required_quality <= quality.keys()
+        or quality.keys() - required_quality - {RESPONSE_AGES_KEY}
+    ):
         raise BundleError("sample.quality fields do not match v1")
     _text(quality["transport"], field_name="sample.quality.transport", maximum=128)
     _text(quality["parser"], field_name="sample.quality.parser", maximum=128)
@@ -951,6 +959,43 @@ def _validate_sample(
         raise BundleError("sample.quality.missing_pids must be a bounded list")
     for pid in quality["missing_pids"]:
         _integer(pid, field_name="sample.quality.missing_pids", maximum=255)
+    ages = quality.get(RESPONSE_AGES_KEY)
+    if poll_plan_version == 8 and RESPONSE_AGES_KEY not in quality:
+        raise BundleError("poll plan 8 requires sample.quality.pid_response_age_ms")
+    if RESPONSE_AGES_KEY in quality:
+        if not isinstance(ages, dict) or len(ages) > len(PID_FIELDS):
+            raise BundleError("sample.quality.pid_response_age_ms must be a bounded object")
+        for key, age in ages.items():
+            if not isinstance(key, str) or re.fullmatch(r"[0-9A-F]{2}", key) is None:
+                raise BundleError("PID response age keys must be uppercase two-digit hex")
+            pid = int(key, 16)
+            if (
+                pid not in PID_FIELDS
+                or not any(value.get(field) is not None for field in PID_FIELDS[pid])
+                or pid in quality["missing_pids"]
+                or value["ecu_data_status"] != "live"
+            ):
+                raise BundleError("PID response age must belong to a successful dynamic read")
+            _integer(age, field_name=f"sample.quality.pid_response_age_ms.{key}", maximum=60_000)
+            if captured - timedelta(milliseconds=age) < started:
+                raise BundleError("PID response timestamp lies before the manifest drive window")
+        if poll_plan_version == 8:
+            for pid in (0x0C, 0x0D, 0x10):
+                if (
+                    any(value.get(field) is not None for field in PID_FIELDS[pid])
+                    and f"{pid:02X}" not in ages
+                ):
+                    raise BundleError("successful plan 8 fast PIDs require response ages")
+            if any(
+                value.get(field) is not None
+                for field in ("estimated_fuel_rate", "estimated_fuel_consumption")
+            ) and (value.get("mass_air_flow") is None or "10" not in ages):
+                raise BundleError("plan 8 fuel estimates require a timed MAF observation")
+            if (
+                value.get("estimated_fuel_consumption") is not None
+                and value.get("vehicle_speed") is None
+            ):
+                raise BundleError("plan 8 fuel consumption requires a timed speed observation")
     return value, captured, sequence
 
 
@@ -961,6 +1006,7 @@ def iter_samples(
     started: datetime,
     finished: datetime,
     config: AppConfig | None = None,
+    poll_plan_version: int | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield validated samples without expanding the nested gzip into memory."""
     cfg = config or get_config()
@@ -996,6 +1042,7 @@ def iter_samples(
                         finished=finished,
                         previous_sequence=previous_sequence,
                         previous_at=previous_at,
+                        poll_plan_version=poll_plan_version,
                     )
                     sample_id = str(sample["sample_id"])
                     if sample_id in sample_ids:
@@ -1014,6 +1061,7 @@ def _validate_diagnostics(
     manifest_count: int,
     started: datetime,
     finished: datetime,
+    poll_plan_version: int | None = None,
 ) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
         raise BundleError("diagnostics.json must be a v1 object")
@@ -1304,7 +1352,9 @@ def _validate_diagnostics(
         elif kind == "pipeline_metrics":
             _validate_pipeline_metrics(payload)
         elif kind == "poll_timing":
-            _validate_poll_timing(payload)
+            _validate_poll_timing(
+                payload, target_cycle_ms=int(nominal_cycle_s(poll_plan_version) * 1000)
+            )
     return value
 
 
@@ -1442,6 +1492,7 @@ def validate_bundle(path: Path, *, config: AppConfig | None = None) -> Validated
                 manifest_count=int(manifest["diagnostic_count"]),
                 started=started,
                 finished=diagnostic_finished,
+                poll_plan_version=manifest.get("poll_plan_version"),
             )
             summary: dict[str, Any] | None = None
             if summary_problem is None:
@@ -1474,6 +1525,7 @@ def validate_bundle(path: Path, *, config: AppConfig | None = None) -> Validated
         started=started,
         finished=finished,
         config=cfg,
+        poll_plan_version=manifest.get("poll_plan_version"),
     ):
         count += 1
     if count != int(manifest["sample_count"]):
@@ -1505,6 +1557,7 @@ def validate_bundle(path: Path, *, config: AppConfig | None = None) -> Validated
                 started=started,
                 finished=finished,
                 config=cfg,
+                poll_plan_version=manifest.get("poll_plan_version"),
             ),
             diagnostics["events"],
         )
@@ -1763,6 +1816,7 @@ async def store_validated_bundle(session: AsyncSession, bundle: ValidatedBundle)
         drive_id=bundle.drive_id,
         started=started,
         finished=finished,
+        poll_plan_version=manifest.get("poll_plan_version"),
     )
     try:
         while sample_rows := await asyncio.to_thread(_next_sample_rows, samples, drive.id):

@@ -101,11 +101,12 @@ internal suspend fun awaitLivePollDeadline(
     cycleStartedMillis: Long,
     monotonicMillis: () -> Long,
     preempted: () -> Boolean,
+    targetMillis: Long = ObdPollPlan.TARGET_CYCLE_MILLIS,
 ) {
     var latest = cycleStartedMillis
     while (!preempted()) {
         latest = maxOf(latest, monotonicMillis())
-        val remaining = ObdPollPlan.TARGET_CYCLE_MILLIS - (latest - cycleStartedMillis)
+        val remaining = targetMillis - (latest - cycleStartedMillis)
         if (remaining <= 0) return
         delay(minOf(250L, remaining))
     }

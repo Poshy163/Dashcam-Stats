@@ -100,6 +100,8 @@ class ElmBleClient(
         private set
     val isConnected: Boolean
         get() = gattConnected
+    internal val isSessionTainted: Boolean
+        get() = commandSession.isTainted
     val lastSuccessfulResponseAtUtc: String?
         get() = responseClock.lastSuccessfulResponseAtUtc
 

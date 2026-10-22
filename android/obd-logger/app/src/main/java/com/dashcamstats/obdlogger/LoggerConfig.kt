@@ -24,6 +24,8 @@ data class LoggerConfig(
     val backupAwakeSeconds: Int = 1200,
     val idleAwakeSeconds: Int = 300,
     val webhookCredentialError: String? = null,
+    val pollTrialEnabled: Boolean = false,
+    val pollTrialFallbackReason: String? = null,
 ) {
     override fun toString(): String =
         "LoggerConfig(enabled=$enabled, ownershipTransferred=$ownershipTransferred, " +
@@ -90,6 +92,9 @@ object LoggerPreferences {
             offGraceSeconds = prefs.getLong("off_grace_seconds", 30),
             parkedIntervalSeconds = prefs.getLong("parked_interval_seconds", 30),
             voltageOnlyMode = prefs.getBoolean("voltage_only_mode", false),
+            pollTrialEnabled = prefs.getBoolean("poll_trial_enabled", false),
+            pollTrialFallbackReason = prefs.getString("poll_trial_fallback_reason", null)
+                ?.takeIf { it in PollTrialPlan.fallbackReasons },
             webhookEnabled = prefs.getBoolean("webhook_enabled", true),
             webhookUrl = if (savedUrl.isBlank()) LoggerConfig.DEFAULT_WEBHOOK_URL else savedUrl,
             webhookApiKey = savedCredential.value,
@@ -126,6 +131,21 @@ object LoggerPreferences {
             .putInt("backup_awake_seconds", config.backupAwakeSeconds)
             .putInt("idle_awake_seconds", config.idleAwakeSeconds)
         commitPreferenceUpdate(context.getSharedPreferences(NAME, Context.MODE_PRIVATE), update)
+    }
+
+    /** Called once at a new drive boundary; its result is immutable for that drive. */
+    fun pollPlanForNewDrive(context: Context, supported: Set<Int>): Int {
+        val requested = load(context, includeWebhookCredential = false).pollTrialEnabled
+        val selected = PollTrialPlan.select(requested, supported)
+        if (requested && selected != PollTrialPlan.VERSION) setPollTrial(context, false, "required_pids_unavailable")
+        return selected
+    }
+
+    fun setPollTrial(context: Context, enabled: Boolean, reason: String? = null) {
+        require(reason == null || reason in PollTrialPlan.fallbackReasons)
+        val prefs = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+        commitPreferenceUpdate(prefs, prefs.edit().putBoolean("poll_trial_enabled", enabled)
+            .putString("poll_trial_fallback_reason", if (enabled) null else reason))
     }
 
     fun disable(context: Context) {

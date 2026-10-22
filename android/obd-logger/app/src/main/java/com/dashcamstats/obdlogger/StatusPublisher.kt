@@ -83,6 +83,7 @@ data class PublicStatus(
     val transferPolicyDeferCount: Int = 0,
     val lastError: String? = null,
     val lastErrorAtUtc: String? = null,
+    val pollPlanVersion: Int = ObdPollPlan.VERSION,
 )
 
 internal const val PUBLIC_STATUS_SCHEMA_VERSION = 7
@@ -127,7 +128,7 @@ object StatusPublisher {
             .put("schema_version", PUBLIC_STATUS_SCHEMA_VERSION)
             .put("app_version_name", BuildConfig.VERSION_NAME)
             .put("app_version_code", BuildConfig.VERSION_CODE)
-            .put("poll_plan_version", ObdPollPlan.VERSION)
+            .put("poll_plan_version", status.pollPlanVersion)
             .put("build_git_sha", BuildConfig.BUILD_GIT_SHA)
             .put(
                 "capabilities",

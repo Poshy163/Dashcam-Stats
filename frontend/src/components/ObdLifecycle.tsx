@@ -28,6 +28,7 @@ export function ObdLifecycleBadge({ status }: { status: string }) {
 }
 
 export function ObdLifecycleReason({ status, reason }: { status: string; reason: string | null }) {
+  if (reason === 'poll_trial_fallback') return '3-second trial stopped; 5-second baseline selected for the next connection'
   if (status === 'saved_for_backup') return 'Recording saved at backup request'
   if (status === 'shutdown_detected') return 'Shutdown inferred from recorded signals'
   return reason?.replace(/_/g, ' ') ?? null

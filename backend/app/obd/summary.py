@@ -7,6 +7,7 @@ from typing import Any
 
 from .fuel import EstimatedFuelAccumulator
 from .schema import parse_utc, utc_text
+from .timing import MotionAccumulator, maf_cadence_s, nominal_cycle_s
 
 
 def calculate_summary(
@@ -14,18 +15,21 @@ def calculate_summary(
     samples: Iterable[dict[str, Any]],
     diagnostics: list[dict[str, Any]],
     *,
-    expected_interval_s: float = 5.0,
+    expected_interval_s: float | None = None,
 ) -> dict[str, Any]:
     start = parse_utc(str(drive["start_time_utc"]))
     finish = parse_utc(str(drive["finish_time_utc"]))
     duration_s = max(0.0, (finish - start).total_seconds())
-    distance_km = 0.0
-    idle_s = 0.0
-    fuel_estimate = EstimatedFuelAccumulator(nominal_cycle_s=expected_interval_s)
+    if expected_interval_s is None:
+        expected_interval_s = nominal_cycle_s(drive.get("poll_plan_version"))
+    require_timing = drive.get("poll_plan_version") == 8
+    motion = MotionAccumulator(expected_interval_s, require_timing=require_timing)
+    fuel_estimate = EstimatedFuelAccumulator(
+        nominal_cycle_s=expected_interval_s,
+        maf_cadence_s=maf_cadence_s(drive.get("poll_plan_version")),
+        require_timing=require_timing,
+    )
     missing_s = 0.0
-    distance_intervals = 0
-    idle_evidence = False
-    max_usable_gap = expected_interval_s * 3
     count = 0
     speed_sum = rpm_sum = 0.0
     speed_count = rpm_count = 0
@@ -39,6 +43,15 @@ def calculate_summary(
             captured_at=parse_utc(current["timestamp_utc"]),
             estimated_rate=current.get("estimated_fuel_rate"),
             ecu_data_status=current.get("ecu_data_status"),
+            quality=current.get("quality"),
+        )
+        motion.observe(
+            drive=current.get("drive_id"),
+            sequence=current.get("sequence"),
+            captured_at=parse_utc(current["timestamp_utc"]),
+            speed=current.get("vehicle_speed"),
+            rpm=current.get("engine_rpm"),
+            status=current.get("ecu_data_status"),
             quality=current.get("quality"),
         )
         speed = current.get("vehicle_speed")
@@ -66,20 +79,11 @@ def calculate_summary(
             if gap > 0:
                 if gap > expected_interval_s:
                     missing_s += gap - expected_interval_s
-                if gap <= max_usable_gap:
-                    first_speed = previous.get("vehicle_speed")
-                    if isinstance(first_speed, int | float) and isinstance(speed, int | float):
-                        distance_km += (float(first_speed) + float(speed)) / 2 * gap / 3600
-                        distance_intervals += 1
-                    first_rpm = previous.get("engine_rpm")
-                    if isinstance(first_rpm, int | float) and isinstance(first_speed, int | float):
-                        idle_evidence = True
-                        if first_rpm > 300 and first_speed < 1:
-                            idle_s += gap
         previous = current
 
     fuel_l = fuel_estimate.litres
     fuel_evidence = fuel_estimate.has_evidence
+    distance_km = motion.distance_km
     expected = max(int(duration_s // expected_interval_s) + 1 if duration_s else 0, count)
     received = min(100.0, count * 100.0 / expected) if expected else 0.0
     dtcs: set[str] = set()
@@ -95,12 +99,12 @@ def calculate_summary(
         "start_time_utc": utc_text(start),
         "finish_time_utc": utc_text(finish),
         "duration_s": duration_s,
-        "distance_km": distance_km if distance_intervals else None,
+        "distance_km": distance_km if motion.distance_intervals else None,
         "average_speed_kmh": speed_sum / speed_count if speed_count else None,
         "maximum_speed_kmh": max_speed,
         "average_rpm": rpm_sum / rpm_count if rpm_count else None,
         "maximum_rpm": max_rpm,
-        "idle_duration_s": idle_s if idle_evidence else None,
+        "idle_duration_s": motion.idle_s if motion.idle_evidence else None,
         "estimated_fuel_used_l": fuel_l if fuel_evidence else None,
         "average_fuel_consumption_l_per_100km": (
             fuel_l * 100.0 / distance_km if distance_km > 0 and fuel_evidence else None

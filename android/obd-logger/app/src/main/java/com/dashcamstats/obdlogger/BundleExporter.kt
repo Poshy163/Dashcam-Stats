@@ -324,12 +324,11 @@ class BundleExporter(
     ): JSONObject {
         val start = Instant.parse(drive.getString("start_time_utc"))
         val finish = Instant.parse(drive.getString("finish_time_utc"))
-        var distance = 0.0
-        var idle = 0.0
-        val fuelEstimate = EstimatedFuelAccumulator()
+        val trial = drive.optInt("poll_plan_version", ObdPollPlan.VERSION) == PollTrialPlan.VERSION
+        val cycleSeconds = if (trial) 3.0 else 5.0
+        val fuelEstimate = EstimatedFuelAccumulator(cycleSeconds, if (trial) 3.0 else 15.0, requireTiming = trial)
+        val motion = TimedMotionAccumulator(cycleSeconds, requireTiming = trial)
         var missing = 0.0
-        var distanceIntervals = 0
-        var idleEvidence = false
         var speedSum = 0.0
         var speedCount = 0
         var maximumSpeed: Double? = null
@@ -341,6 +340,10 @@ class BundleExporter(
         var previous: JSONObject? = null
         val sampleCount = database.forEachSample(drive.getString("drive_id")) { current ->
             val quality = JSONObject(current.getString("quality_json"))
+            check(!trial || quality.optJSONObject(PID_RESPONSE_AGES_KEY) != null) {
+                "trial sample has no valid response timing object"
+            }
+            val rowAt = Instant.parse(current.getString("timestamp_utc"))
             val missingPids = quality.optJSONArray("missing_pids")
             val missingMaf = missingPids != null && (0 until missingPids.length()).any {
                 missingPids.optInt(it, -1) == 0x10
@@ -348,10 +351,22 @@ class BundleExporter(
             fuelEstimate.observe(
                 driveId = current.getString("drive_id"),
                 sequence = current.getLong("sequence"),
-                capturedAt = Instant.parse(current.getString("timestamp_utc")),
+                capturedAt = rowAt,
                 estimatedRate = if (current.isNull("estimated_fuel_rate")) null else current.optDouble("estimated_fuel_rate"),
                 invalid = current.optString("ecu_data_status") != "live" ||
-                    quality.optString("transport", "ok") != "ok" || missingMaf,
+                    quality.optString("transport", "ok") != "ok" || missingMaf ||
+                    (quality.has(PID_RESPONSE_AGES_KEY) && quality.optJSONObject(PID_RESPONSE_AGES_KEY) == null),
+                responseAgeMillis = obdResponseAgeMillis(quality, 0x10),
+                timed = quality.has(PID_RESPONSE_AGES_KEY),
+            )
+            motion.observe(
+                drive = current.getString("drive_id"),
+                sequence = current.getLong("sequence"),
+                rowAt = rowAt,
+                speed = current.number("vehicle_speed"),
+                rpm = current.number("engine_rpm"),
+                status = current.optString("ecu_data_status"),
+                quality = quality,
             )
             current.number("vehicle_speed")?.let { speed ->
                 speedSum += speed
@@ -375,28 +390,16 @@ class BundleExporter(
                     Instant.parse(current.getString("timestamp_utc")),
                 ).toMillis() / 1000.0
                 if (gap > 0) {
-                    if (gap > 5) missing += gap - 5
-                    if (gap <= 15) {
-                        val firstSpeed = first.number("vehicle_speed")
-                        val secondSpeed = current.number("vehicle_speed")
-                        if (firstSpeed != null && secondSpeed != null) {
-                            distance += (firstSpeed + secondSpeed) / 2 * gap / 3600
-                            distanceIntervals += 1
-                        }
-                        val firstRpm = first.number("engine_rpm")
-                        if (firstRpm != null && firstSpeed != null) {
-                            idleEvidence = true
-                            if (firstRpm > 300 && firstSpeed < 1) idle += gap
-                        }
-                    }
+                    if (gap > cycleSeconds) missing += gap - cycleSeconds
                 }
             }
             previous = current
         }
         val fuel = fuelEstimate.litres
         val fuelEvidence = fuelEstimate.hasEvidence
+        val distance = motion.distanceKm
         val duration = java.time.Duration.between(start, finish).toMillis().coerceAtLeast(0) / 1000.0
-        val expected = maxOf(if (duration > 0) (duration / 5).toInt() + 1 else 0, sampleCount)
+        val expected = maxOf(if (duration > 0) (duration / cycleSeconds).toInt() + 1 else 0, sampleCount)
         val dtcs = sortedSetOf<String>()
         for (event in diagnostics) {
             if (event.getString("kind") in setOf("confirmed_dtcs", "pending_dtcs", "permanent_dtcs")) {
@@ -418,12 +421,12 @@ class BundleExporter(
             ))
             .put("interruption_reason", drive.optNullable("interruption_reason"))
             .put("duration_s", duration)
-            .put("distance_km", if (distanceIntervals > 0) distance else JSONObject.NULL)
+            .put("distance_km", if (motion.distanceIntervals > 0) distance else JSONObject.NULL)
             .put("average_speed_kmh", if (speedCount > 0) speedSum / speedCount else JSONObject.NULL)
             .put("maximum_speed_kmh", maximumSpeed ?: JSONObject.NULL)
             .put("average_rpm", if (rpmCount > 0) rpmSum / rpmCount else JSONObject.NULL)
             .put("maximum_rpm", maximumRpm ?: JSONObject.NULL)
-            .put("idle_duration_s", if (idleEvidence) idle else JSONObject.NULL)
+            .put("idle_duration_s", if (motion.idleEvidence) motion.idleSeconds else JSONObject.NULL)
             .put(
                 "estimated_fuel_used_l",
                 if (fuelEvidence) fuel else JSONObject.NULL,
@@ -513,8 +516,8 @@ class BundleExporter(
         if (!hardened) return
         val pollPlan = manifest.get("poll_plan_version")
         check(
-            (pollPlan is Int && pollPlan in 2..ObdPollPlan.VERSION) ||
-                (pollPlan is Long && pollPlan in 2L..ObdPollPlan.VERSION.toLong()),
+            (pollPlan is Int && pollPlan in 2..PollTrialPlan.VERSION) ||
+                (pollPlan is Long && pollPlan in 2L..PollTrialPlan.VERSION.toLong()),
         ) { "manifest poll plan must be a supported integer version" }
         val lastSample = manifest.instantOrNull("last_sample_at_utc")
         val lastResponse = manifest.instantOrNull("last_successful_obd_response_at_utc")

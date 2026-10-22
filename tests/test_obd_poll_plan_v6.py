@@ -45,7 +45,7 @@ def test_current_and_older_poll_plans_keep_the_hardened_bundle_contract(tmp_path
 
 
 def test_unknown_future_poll_plan_is_still_rejected(tmp_path, app_config):
-    path = make_bundle(tmp_path, manifest_patch=_hardened_fields(8))
+    path = make_bundle(tmp_path, manifest_patch=_hardened_fields(9))
     with pytest.raises(BundleError, match="poll_plan_version is not supported"):
         validate_bundle(path, config=app_config)
 

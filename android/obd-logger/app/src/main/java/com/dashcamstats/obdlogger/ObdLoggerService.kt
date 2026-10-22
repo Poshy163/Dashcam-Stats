@@ -42,6 +42,8 @@ class ObdLoggerService : Service() {
     private var worker: Job? = null
     private var client: ElmBleClient? = null
     private var currentDriveId: String? = null
+    private var currentPollPlanVersion = ObdPollPlan.VERSION
+    private val trialFallbackLatch = PollTrialFallbackLatch()
     private var lastDriveId: String? = null
     private var lastDriveFinished: String? = null
     private var lastSampleAt: String? = null
@@ -501,6 +503,7 @@ class ObdLoggerService : Service() {
         reconnecting: Boolean,
         onEcuProof: () -> Unit,
     ) {
+        trialFallbackLatch.beforeConnection { LoggerPreferences.setPollTrial(this, false, it) }
         updateNotification("Checking adapter voltage")
         publish("parked", config)
         if (reconnecting) pipelineMetrics.reconnectAttempted()
@@ -722,6 +725,7 @@ class ObdLoggerService : Service() {
         // remain inside runOneConnection for the rest of the drive. Do not let old failures keep
         // escalating the next reconnect delay toward its cap.
         onEcuProof()
+        val pollPlanVersion = LoggerPreferences.pollPlanForNewDrive(this, supported)
         val startedAt = driveClock.nowUtc()
         val driveId = uuid7(Instant.parse(startedAt).toEpochMilli())
         elm.beginDriveEvidence()
@@ -736,9 +740,11 @@ class ObdLoggerService : Service() {
                 originalTimezone = ZoneId.systemDefault().id,
                 startReason = "charging_voltage_and_checksum_valid_0100",
                 obdProtocol = "AUTO, ISO 9141-2",
+                pollPlanVersion = pollPlanVersion,
             ),
         )
         currentDriveId = driveId
+        currentPollPlanVersion = pollPlanVersion
         driveStartedElapsedMillis = SystemClock.elapsedRealtime()
         emitEvent("drive.lifecycle", "info", "started", "engine_detected", driveId)
         elm.onResponseCountSuffixDisabled = {
@@ -754,18 +760,18 @@ class ObdLoggerService : Service() {
         // twelve cycles: their answers ride along in every sample so nothing downstream has
         // to learn a new shape, and the bus time they used to cost goes to live values.
         val staticValues = linkedMapOf<String, Any>()
-        for (pid in ObdPollPlan.staticOnce.filter(supported::contains)) {
-            if (controlPresent()) break
-            try {
-                staticValues.putAll(elm.query(pid))
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: ElmProtocolException) {
-                // A malformed one-off answer is a missing static value, not a lost drive.
-                recordParserFailure(error)
-            }
-        }
         try {
+            for (pid in ObdPollPlan.staticOnce.filter(supported::contains)) {
+                if (controlPresent()) break
+                try {
+                    staticValues.putAll(elm.query(pid))
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: ElmProtocolException) {
+                    // A malformed one-off answer is a missing static value, not a lost drive.
+                    recordParserFailure(error)
+                }
+            }
             database.addDiagnostic(
                 driveId,
                 "protocol_change",
@@ -783,7 +789,9 @@ class ObdLoggerService : Service() {
             publish("ecu_online", config)
             updateNotification("Recording vehicle telemetry")
             when (
-                val exit = recordDrive(
+                val exit = if (pollPlanVersion == PollTrialPlan.VERSION) recordTrialDrive(
+                    config, elm, driveId, supported, lifecycle, deviceRoot, driveClock, staticValues,
+                ) else recordDrive(
                     config, elm, driveId, supported, lifecycle, deviceRoot, driveClock, staticValues,
                 )
             ) {
@@ -845,8 +853,14 @@ class ObdLoggerService : Service() {
                     }
                 }
             }
-        } catch (error: Exception) {
+        } catch (caught: Exception) {
+            val error = if (pollPlanVersion == PollTrialPlan.VERSION && caught !is PollTrialFallbackException &&
+                PollTrialPlan.transportFault(caught, elm.isSessionTainted)) {
+                runCatching { trialFallbackLatch.disable("transport_fault") { LoggerPreferences.setPollTrial(this, false, it) } }
+                PollTrialFallbackException("transport_fault", caught)
+            } else caught
             val reason = when (error) {
+                is PollTrialFallbackException -> "poll_trial_fallback"
                 is CancellationException -> if (
                     runCatching { LoggerPreferences.load(this).canRun }.getOrDefault(true)
                 ) {
@@ -868,7 +882,11 @@ class ObdLoggerService : Service() {
                     driveId,
                     if (error is ElmProtocolException) "parser_failure" else "connection_failure",
                     JSONObject()
-                        .put("category", if (error is ElmProtocolException) "live_pid" else "ble_or_elm")
+                        .put("category", when (error) {
+                            is PollTrialFallbackException -> "poll_trial_fallback"
+                            is ElmProtocolException -> "live_pid"
+                            else -> "ble_or_elm"
+                        })
                         .put("message", safeError(error)),
                     faultAtUtc,
                 )
@@ -957,7 +975,7 @@ class ObdLoggerService : Service() {
         val sparseDiagnosticBudget = SparseDiagnosticBudgetTracker()
         val diagnosticScheduler = SparseDiagnosticScheduler()
         val liveScheduler = LivePollScheduler(SystemClock::elapsedRealtime)
-        val pollTiming = PollTiming(driveStartedElapsedMillis, SystemClock::elapsedRealtime)
+        val pollTiming = PollTiming(driveOriginMillis = driveStartedElapsedMillis, monotonicMillis = SystemClock::elapsedRealtime)
         var timingFlushReason = "drive_end"
         var sequence = 0L
         var cadenceOverrun = false
@@ -1182,6 +1200,184 @@ class ObdLoggerService : Service() {
         }
     }
 
+    /** Separate loop keeps the established version-7 command order/admission untouched. */
+    private suspend fun recordTrialDrive(
+        config: LoggerConfig,
+        elm: ElmBleClient,
+        driveId: String,
+        supported: Set<Int>,
+        lifecycle: EngineLifecycle,
+        deviceRoot: File,
+        driveClock: MonotonicUtcClock,
+        staticValues: Map<String, Any>,
+    ): RecordingExit {
+        val scheduler = PollTrialScheduler(SystemClock::elapsedRealtime)
+        val health = PollTrialHealth()
+        val malformed = LivePidMalformedTracker()
+        val timing = PollTiming(driveStartedElapsedMillis, PollTrialPlan.TARGET_MILLIS, SystemClock::elapsedRealtime)
+        val diagnosticScan = DiagnosticScan(elm, driveId)
+        val origin = SystemClock.elapsedRealtime()
+        var diagnosticDue = origin + 15_000L
+        var sequence = 0L
+        var flushReason = "drive_end"
+        var lastVoltage: Double? = null
+        var lastVoltageAt: Long? = null
+
+        fun fallback(reason: String, cause: Throwable? = null): Nothing {
+            // Synchronous durable preference update precedes the fresh-connection recovery path.
+            runCatching { trialFallbackLatch.disable(reason) { LoggerPreferences.setPollTrial(this, false, it) } }
+            throw PollTrialFallbackException(reason, cause)
+        }
+
+        fun partial(values: Map<String, Any>, missing: List<Int>, fields: Map<Int, Set<String>>) {
+            if (values.isEmpty()) return
+            val capture = driveClock.capture()
+            val prepared = prepareTimedTrialRow(values, fields, timing.takeRowAges(capture.elapsedMillis), missing)
+            partialSampleAfterTransportFailure(driveId, sequence, capture.timestampUtc, prepared.values, prepared.missing)
+                ?.copy(pidResponseAgeMs = prepared.ages)?.let { if (persistSample(it)) timing.rowPersisted(prepared.ages) }
+        }
+
+        try {
+            while (scope.isActive) {
+                currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
+                val started = SystemClock.elapsedRealtime()
+                timing.startCycle()
+                val wallCycle = PollTrialPlan.cooldownCycle(started - origin)
+                val reserved = started >= diagnosticDue && diagnosticScan.prepareCycle(wallCycle)
+                val requested = PollTrialPlan.critical.toMutableList()
+                val values = linkedMapOf<String, Any>()
+                val decodedFields = linkedMapOf<Int, Set<String>>()
+                val missing = mutableListOf<Int>()
+                val commands = PollTrialPlan.critical.toMutableList()
+                var commandIndex = 0
+                var auxiliarySelected = false
+                try {
+                    while (true) {
+                        if (commandIndex == commands.size && !auxiliarySelected) {
+                            // Evaluate wall-clock due times after the trio, when auxiliary work
+                            // can actually start, so a 5s voltage deadline rounds to ~6s, not 9s.
+                            val auxiliary = scheduler.commands(supported).drop(PollTrialPlan.critical.size)
+                            commands.addAll(auxiliary)
+                            requested.addAll(auxiliary.filter { it >= 0 })
+                            auxiliarySelected = true
+                        }
+                        if (commandIndex == commands.size) break
+                        val pid = commands[commandIndex]
+                        currentQuiesceRequest(deviceRoot)?.let {
+                            partial(values, missing + commands.drop(commandIndex).filter { it >= 0 }, decodedFields)
+                            return RecordingExit.Quiesce(it)
+                        }
+                        commandIndex += 1
+                        val optional = pid !in PollTrialPlan.critical
+                        if (!scheduler.mayRunCommand(pid, started, reserved)) {
+                            if (pid >= 0) missing += pid
+                            continue
+                        }
+                        // Cooldowns retain their old elapsed durations, independent of the faster row rate.
+                        if (pid >= 0 && !malformed.shouldPoll(pid, wallCycle)) {
+                            timing.cooldownSkip(pid)
+                            missing += pid
+                            if (optional) scheduler.attempted(pid)
+                            continue
+                        }
+                        if (optional) scheduler.attempted(pid)
+                        val commandStarted = SystemClock.elapsedRealtime()
+                        try {
+                            if (pid == PollTrialScheduler.VOLTAGE) {
+                                elm.readVoltage()?.let {
+                                    values["adapter_voltage"] = it
+                                    lastVoltage = it
+                                    lastVoltageAt = SystemClock.elapsedRealtime()
+                                }
+                            } else {
+                                when (val result = timedLivePidPoll(pid, timing, elm::query)) {
+                                    LivePidPollResult.Missing -> { malformed.recordValid(pid); missing += pid }
+                                    is LivePidPollResult.Values -> {
+                                        malformed.recordValid(pid)
+                                        values.putAll(result.decoded)
+                                        decodedFields[pid] = result.decoded.keys.toSet()
+                                        if (pid == 0x0D) (result.decoded["vehicle_speed"] as? Number)?.toDouble()?.let {
+                                            motionJournal?.speed(it)
+                                        }
+                                    }
+                                    is LivePidPollResult.Malformed -> {
+                                        missing += pid
+                                        malformed.recordMalformed(pid, wallCycle)
+                                        recordParserFailure(result.error)
+                                        database.incrementError(driveId)
+                                        database.addDiagnostic(driveId, "parser_failure", JSONObject()
+                                            .put("category", "live_pid_%02X".format(pid))
+                                            .put("message", safeError(result.error)), driveClock.nowUtc())
+                                    }
+                                }
+                            }
+                        } finally {
+                            scheduler.observeCommand(boundedElapsedMillis(commandStarted))
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    runCatching { partial(values, missing + requested.filter { it !in timing.successfulRowPids() }, decodedFields) }
+                    throw cancelled
+                } catch (quiesce: ElmQuiesceRequestedException) {
+                    partial(values, missing + requested.filter { it !in timing.successfulRowPids() }, decodedFields)
+                    currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
+                    throw quiesce
+                } catch (error: Exception) {
+                    partial(values, missing + requested.filter { it !in timing.successfulRowPids() }, decodedFields)
+                    if (PollTrialPlan.transportFault(error, elm.isSessionTainted)) fallback("transport_fault", error)
+                    throw error
+                }
+                val tailStarted = SystemClock.elapsedRealtime()
+                values.putAll(staticValues)
+                values.putAll(ElmProtocol.estimates(values))
+                val capture = driveClock.capture()
+                val prepared = prepareTimedTrialRow(values, decodedFields, timing.takeRowAges(capture.elapsedMillis), missing)
+                val ages = prepared.ages
+                val persisted = persistSample(SampleRecord(
+                    driveId, sequence, capture.timestampUtc, prepared.values,
+                    parserQuality = if (prepared.missing.isEmpty()) "ok" else "partial",
+                    missingPids = prepared.missing, pidResponseAgeMs = ages,
+                ))
+                scheduler.observeTail(boundedElapsedMillis(tailStarted))
+                if (persisted) timing.rowPersisted(ages)
+                currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
+                // Keep the existing 15s first / 65s recurring diagnostic reservation in wall time.
+                // A bounded reserved probe may overrun; it never replaces a critical read or row.
+                if (reserved && persisted && boundedElapsedMillis(started) <= PollTrialPlan.TARGET_MILLIS) {
+                    diagnosticDue = SystemClock.elapsedRealtime() + 65_000L
+                    diagnosticScan.runOne(wallCycle, capture.timestampUtc)
+                    if (elm.isSessionTainted || !elm.isConnected) fallback("transport_fault")
+                }
+                currentQuiesceRequest(deviceRoot)?.let { return RecordingExit.Quiesce(it) }
+                val running = lifecycle.remainsRecording(SystemClock.elapsedRealtime(),
+                    prepared.values["adapter_voltage"] as? Double, prepared.values["engine_rpm"] as? Double)
+                if (!running) {
+                    timing.finishCycle(completed = persisted)
+                    return RecordingExit.EngineStopped
+                }
+                // Fresh low battery voltage plus absent/stopped RPM is shutdown evidence, not
+                // a trial failure during the existing engine-off grace period.
+                val shuttingDown = PollTrialPlan.shuttingDown(SystemClock.elapsedRealtime(), lastVoltageAt,
+                    lastVoltage, config.voltageOff, (prepared.values["engine_rpm"] as? Number)?.toDouble())
+                publish("ecu_online", config)
+                timing.finishCycle(completed = persisted)
+                emitPollTiming(driveId, timing, "periodic", driveClock)
+                // Include synchronous status and diagnostic disk work in the fallback budget.
+                if (shuttingDown) health.reset() else health.completed(boundedElapsedMillis(started), ages.keys)?.let { fallback(it) }
+                sequence += 1
+                awaitLivePollDeadline(started, SystemClock::elapsedRealtime,
+                    { !scope.isActive || currentQuiesceRequest(deviceRoot) != null }, PollTrialPlan.TARGET_MILLIS)
+            }
+            throw CancellationException("logger scope stopped")
+        } catch (error: Exception) {
+            flushReason = "partial_failure"
+            throw error
+        } finally {
+            timing.finishCycle()
+            emitPollTiming(driveId, timing, flushReason, driveClock)
+        }
+    }
+
     private fun emitPollTiming(
         driveId: String,
         timing: PollTiming,
@@ -1302,6 +1498,7 @@ class ObdLoggerService : Service() {
             finalisedAtUtc = finalisedAtUtc(),
         )
         currentDriveId = null
+        currentPollPlanVersion = ObdPollPlan.VERSION
         lastDriveId = driveId
         lastDriveFinished = finalised.finishTimeUtc
         lastSampleAt = finalised.lastSampleAtUtc
@@ -1842,6 +2039,7 @@ class ObdLoggerService : Service() {
             state = state,
             ownershipEnabled = config.ownershipTransferred,
             currentDriveId = currentDriveId,
+            pollPlanVersion = currentPollPlanVersion,
             lastDriveId = lastDriveId,
             lastDriveFinishedAtUtc = lastDriveFinished,
             ingestionRequestId = ingestionRequestId,

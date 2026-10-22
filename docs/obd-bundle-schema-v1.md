@@ -47,7 +47,7 @@ The manifest hashes the stored bytes of `samples.ndjson.gz`, `diagnostics.json` 
 atomic rename and becomes the server and receipt idempotency identity.
 
 Hardened v1 uses one other exact manifest shape: all legacy keys plus
-`poll_plan_version` (an integer from 2 through 7), `last_sample_at_utc`,
+`poll_plan_version` (an integer from 2 through 8), `last_sample_at_utc`,
 `last_successful_obd_response_at_utc`, `termination_noticed_at_utc`,
 `finalised_at_utc`, and `interruption_reason`. Lifecycle timestamps are UTC or `null` and
 ordered; an unclean hardened drive cannot claim `complete`, while a clean drive has no
@@ -57,6 +57,12 @@ legacy manifests retain the grouped phase-zero plan. Plan 7 keeps plan 6's five-
 fast, 15-second medium and 60-second slow nominal expectations while admitting optional
 due commands against the measured cycle budget. Deferred observations stay missing in
 coverage. Existing plans 2 through 6 are not reinterpreted as plan 7.
+
+Plan 8 is the opt-in three-second speed/RPM/MAF trial. Other dynamic readings have
+independent elapsed-time deadlines, not the older modulo-cycle phase cohorts.
+Fallback ends the plan-8 drive as interrupted and starts a separate baseline-plan
+drive at a safe connection boundary; a plan-8 drive never silently becomes a
+five-second drive. See [obd-three-second-trial.md](obd-three-second-trial.md).
 
 ## Units and samples
 
@@ -109,6 +115,15 @@ to 128 characters or `null`) and `oxygen_sensors_present` (unique integer indice
 plus `missing_pids` (at most 256 integer PIDs 0..255). Quality stays with the retained
 server-side raw history.
 
+New timing-aware samples additionally carry `quality.pid_response_age_ms`, a bounded
+map of uppercase two-digit hexadecimal PIDs to integer ages from 0 through 60,000 ms.
+These are successful reply-completion ages relative to the saved row UTC timestamp;
+they do not establish ECU sensor-acquisition time. Unknown keys, booleans, orphan
+ages and observations before the drive began are invalid. Plan 8 requires the map
+and timing for each successful driving/fuel reading. Legacy samples retain the
+original exact quality shape. The server must accept the new shape before a new
+producer is installed.
+
 ## Diagnostics
 
 `diagnostics.json` contains exactly `schema_version: 1`, the matching `drive_id`, and
@@ -148,7 +163,8 @@ observation timestamp without repeating full payloads.
 App 0.3.3 adds the optional diagnostic kind `poll_timing`. Its version-1 payload contains
 exactly `schema_version`, `window_index`, `window_start_elapsed_ms`, `window_duration_ms`,
 `flush_reason`, `target_cycle_ms`, `cycles_started`, `cycles_completed`, `overrun_count`,
-`cycle_work_ms`, `cycle_start_interval_ms`, and `pids`. The target remains 5,000 ms.
+`cycle_work_ms`, `cycle_start_interval_ms`, and `pids`. The target is 5,000 ms for
+baseline/legacy plans and 3,000 ms for plan 8, and must match the producing plan.
 Flush reasons are `periodic`, `drive_end`, and `partial_failure`. Window offsets use a
 drive-scoped monotonic origin; they are not UTC times or ECU measurement timestamps.
 

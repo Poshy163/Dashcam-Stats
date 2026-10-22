@@ -189,6 +189,7 @@ function VersionEvidence({
           {' · '}Poll plan {Number.isSafeInteger(logger?.pollPlanVersion) && (logger?.pollPlanVersion ?? -1) >= 0
             ? logger?.pollPlanVersion : 'not reported'}
         </div>
+        {logger?.pollPlanVersion === 8 && <p className="mt-1 text-xs text-content-muted">3-second speed, RPM and air-flow trial · last reported configuration</p>}
       </div>
       <div>
         <div className="text-xs font-medium uppercase tracking-wide text-content-faint">Backend · running server</div>

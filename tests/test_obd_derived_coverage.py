@@ -79,7 +79,7 @@ async def test_stored_derived_values_use_maf_phase_without_changing_samples_or_t
     result = await reconcile_drive_projection(db_session, drive)
 
     assert result["status"] == "ready"
-    assert drive.gap_analysis_json["projection_version"] == 5
+    assert drive.gap_analysis_json["projection_version"] == 6
     assert drive.sample_count == 7
     assert drive.estimated_fuel_used_l == pytest.approx(6 * 25 / 3600)
     assert drive.data_completeness_percentage == 100.0

@@ -41,6 +41,7 @@ data class SampleRecord(
     val transportQuality: String = "ok",
     val parserQuality: String = "ok",
     val missingPids: List<Int> = emptyList(),
+    val pidResponseAgeMs: Map<Int, Long>? = null,
 ) {
     val sampleId: String = "$driveId-$sequence"
 }
@@ -776,7 +777,7 @@ class ObdDatabase(
         }
 
     fun startDrive(record: DriveRecord) {
-        require(record.pollPlanVersion in 2..ObdPollPlan.VERSION) { "unsupported recording poll plan" }
+        require(record.pollPlanVersion in 2..PollTrialPlan.VERSION) { "unsupported recording poll plan" }
         val values = ContentValues().apply {
             put("drive_id", record.driveId)
             put("vehicle_id", record.vehicleId)
@@ -802,6 +803,12 @@ class ObdDatabase(
                 .put("transport", sample.transportQuality)
                 .put("parser", sample.parserQuality)
                 .put("missing_pids", JSONArray(sample.missingPids))
+            sample.pidResponseAgeMs?.let { ages ->
+                require(ages.keys.all { it in 0..255 } && ages.values.all { it in 0..60_000 })
+                quality.put("pid_response_age_ms", JSONObject().also { body ->
+                    ages.toSortedMap().forEach { (pid, age) -> body.put("%02X".format(pid), age) }
+                })
+            }
             val values = ContentValues().apply {
                 put("sample_id", sample.sampleId)
                 put("drive_id", sample.driveId)

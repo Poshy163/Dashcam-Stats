@@ -14,7 +14,7 @@ from app.ingest.obd_reconciliation import (
 
 
 def test_budget_plan_has_the_same_nominal_due_contract_as_five_and_six():
-    assert POLL_PLAN_VERSION == 7
+    assert POLL_PLAN_VERSION == 8
     plan, specs = specs_for_poll_plan(7)
     assert plan == 7
     assert specs == specs_for_poll_plan(5)[1] == specs_for_poll_plan(6)[1]
@@ -29,7 +29,7 @@ def test_budget_plan_has_the_same_nominal_due_contract_as_five_and_six():
     assert _POLL_PLAN_SPECS[7][1][0x01] == 5
 
 
-@pytest.mark.parametrize("value", [None, True, "7", 0, 8, 999])
+@pytest.mark.parametrize("value", [None, True, "7", 0, 9, 999])
 def test_unknown_plan_never_inherits_the_new_contract(value):
     plan, specs = specs_for_poll_plan(value)
     assert plan == 1

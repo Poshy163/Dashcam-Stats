@@ -20,11 +20,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.db.models import OBDBundle, OBDDiagnostic, OBDDrive, OBDSample, utcnow
 from app.db.session import get_session_factory
 from app.obd.fuel import EstimatedFuelAccumulator
+from app.obd.timing import (
+    MotionAccumulator,
+    maf_cadence_s,
+    nominal_cycle_s,
+    response_time,
+)
 
 log = structlog.get_logger(__name__)
 
-POLL_PLAN_VERSION = 7
-PROJECTION_VERSION = 5
+POLL_PLAN_VERSION = 8
+PROJECTION_VERSION = 6
 NOMINAL_CYCLE_S = 5.0
 GAP_TOLERANCE = 1.5
 MAX_RECORDED_GAPS = 100
@@ -43,10 +49,11 @@ class SignalSpec:
     every: int
     provenance: str = "measured"
     discrete: bool = False
+    cycle_s: float = 5.0
 
     @property
     def cadence_s(self) -> float:
-        return NOMINAL_CYCLE_S * self.every
+        return self.cycle_s * self.every
 
 
 # This is byte-for-byte the logger's ServicePolicies.kt v1 schedule. Keep the version in
@@ -228,6 +235,56 @@ POLL_PHASES_V5: dict[int, int] = {
     0x21: 1,
     0x01: 5,
 }
+_V8_FAST_NAMES = {
+    "engine_rpm",
+    "vehicle_speed",
+    "mass_air_flow",
+    "estimated_fuel_rate",
+    "estimated_fuel_consumption",
+}
+SIGNALS_V8: tuple[SignalSpec, ...] = tuple(
+    replace(
+        spec,
+        cycle_s=3.0,
+        every=(
+            1
+            if spec.provenance == "static" or spec.name in _V8_FAST_NAMES
+            else 2
+            if spec.name == "adapter_voltage"
+            else 5
+            if spec.name == "engine_load"
+            else 20
+        ),
+        tier=(
+            spec.tier
+            if spec.provenance == "static"
+            else "fast"
+            if spec.name in _V8_FAST_NAMES
+            else "medium"
+            if spec.name in {"engine_load", "adapter_voltage"}
+            else "slow"
+        ),
+    )
+    for spec in SIGNALS_V4
+)
+POLL_PHASES_V8: dict[int, int] = {
+    pid: index + 1
+    for index, pid in enumerate(
+        (
+            0x0E,
+            0x11,
+            0x03,
+            0x05,
+            0x06,
+            0x07,
+            0x0F,
+            0x14,
+            0x15,
+            0x21,
+            0x01,
+        )
+    )
+}
 _POLL_PLAN_SPECS: dict[int, tuple[tuple[SignalSpec, ...], dict[int, int]]] = {
     2: (SIGNALS_V2, POLL_PHASES_V2),
     3: (SIGNALS, POLL_PHASES_V3),
@@ -241,6 +298,7 @@ _POLL_PLAN_SPECS: dict[int, tuple[tuple[SignalSpec, ...], dict[int, int]]] = {
     # retains v6's due cohorts and nominal cadence: a deferred observation stays
     # missing rather than being carried forward or changing older plans' coverage.
     7: (SIGNALS_V4, POLL_PHASES_V5),
+    8: (SIGNALS_V8, POLL_PHASES_V8),
 }
 
 
@@ -438,6 +496,7 @@ class _Cadence:
 @dataclass(slots=True)
 class _SignalState:
     spec: SignalSpec
+    deadline_scheduled: bool = False
     cadence: _Cadence = field(default_factory=_Cadence)
     received_count: int = 0
     missing_run_count: int = 0
@@ -459,8 +518,29 @@ class _SignalState:
 
     def add(self, row: OBDSample, *, phase: int = 0) -> None:
         value = getattr(row, self.spec.attribute)
-        if value is not None:
-            self.cadence.observe(row.captured_at, self.spec.cadence_s)
+        source_pid = (
+            0x10
+            if self.spec.name in {"estimated_fuel_rate", "estimated_fuel_consumption"}
+            else self.spec.pid
+        )
+        at = (
+            response_time(
+                row.captured_at,
+                row.quality_json,
+                source_pid,
+                require_timing=self.deadline_scheduled,
+            )
+            if source_pid is not None and self.spec.provenance != "static"
+            else row.captured_at
+        )
+        if value is not None and at is not None:
+            self.cadence.observe(at, self.spec.cadence_s)
+        else:
+            value = None
+        if self.deadline_scheduled:
+            if value is not None:
+                self.received_count += 1
+            return
         if row.sequence < phase or row.sequence % self.spec.every != phase:
             return
         opportunity = (row.sequence - phase) // self.spec.every
@@ -485,9 +565,11 @@ class _SignalState:
         phase: int,
     ) -> dict[str, Any]:
         expected = _phase_opportunities(expected_cycles, self.spec.every, phase) if supported else 0
-        if supported:
+        if supported and not self.deadline_scheduled:
             self._add_missing(expected - self._next_opportunity)
         received = self.received_count if supported else self.cadence.count
+        if self.deadline_scheduled and supported:
+            received = min(received, expected)
         missing = max(0, expected - received)
         result = {
             "name": self.spec.name,
@@ -500,8 +582,12 @@ class _SignalState:
             "expected_observation_count": expected,
             "received_observation_count": received,
             "missing_observation_count": missing,
-            "missing_run_count": self.missing_run_count if supported else 0,
-            "longest_missing_run": self.longest_missing_run if supported else 0,
+            "missing_run_count": (
+                None if self.deadline_scheduled else self.missing_run_count if supported else 0
+            ),
+            "longest_missing_run": (
+                None if self.deadline_scheduled else self.longest_missing_run if supported else 0
+            ),
             "coverage_percentage": (100.0 * received / expected if expected else None),
         }
         result.update(self.cadence.result(self.spec.cadence_s))
@@ -512,6 +598,9 @@ class _SignalState:
 class _Rollup:
     """Streaming canonical summary arithmetic over immutable typed sample rows."""
 
+    nominal_cycle_s: float = 5.0
+    maf_cadence_s: float = 15.0
+    require_timing: bool = False
     sample_count: int = 0
     speed_sum: float = 0.0
     speed_count: int = 0
@@ -531,6 +620,15 @@ class _Rollup:
     previous_speed: float | None = None
     previous_rpm: float | None = None
     fuel_estimate: EstimatedFuelAccumulator = field(default_factory=EstimatedFuelAccumulator)
+    motion: MotionAccumulator = field(default_factory=MotionAccumulator)
+
+    def __post_init__(self) -> None:
+        self.fuel_estimate = EstimatedFuelAccumulator(
+            nominal_cycle_s=self.nominal_cycle_s,
+            maf_cadence_s=self.maf_cadence_s,
+            require_timing=self.require_timing,
+        )
+        self.motion = MotionAccumulator(self.nominal_cycle_s, require_timing=self.require_timing)
 
     def observe(self, row: OBDSample) -> None:
         self.sample_count += 1
@@ -580,20 +678,19 @@ class _Rollup:
         self.fuel_evidence = self.fuel_estimate.has_evidence
         self.estimated_fuel_used_l = self.fuel_estimate.litres
 
-        if self.previous_at is not None:
-            interval = (row.captured_at - self.previous_at).total_seconds()
-            if 0 < interval <= MAX_USABLE_ROLLUP_GAP_S:
-                if self.previous_speed is not None and speed is not None:
-                    self.distance_km += (self.previous_speed + speed) / 2 * interval / 3600
-                    self.distance_intervals += 1
-                if self.previous_rpm is not None and self.previous_speed is not None:
-                    self.idle_evidence = True
-                    if self.previous_rpm > 300 and self.previous_speed < 1:
-                        self.idle_duration_s += interval
-
-        self.previous_at = row.captured_at
-        self.previous_speed = speed
-        self.previous_rpm = rpm
+        self.motion.observe(
+            drive=row.drive_db_id,
+            sequence=row.sequence,
+            captured_at=row.captured_at,
+            speed=speed,
+            rpm=rpm,
+            status=row.ecu_data_status,
+            quality=row.quality_json,
+        )
+        self.distance_km = self.motion.distance_km
+        self.distance_intervals = self.motion.distance_intervals
+        self.idle_duration_s = self.motion.idle_s
+        self.idle_evidence = self.motion.idle_evidence
 
 
 def _phase_opportunities(cycles: int, every: int, phase: int) -> int:
@@ -609,10 +706,11 @@ def _expected_cycles(
     finished_at: datetime,
     sample_count: int,
     maximum_sequence: int | None,
+    cycle_s: float = NOMINAL_CYCLE_S,
 ) -> tuple[int, bool]:
     """Combine logger sequence and wall time without materialising absent cycle rows."""
     duration_s = max(0.0, (finished_at - started_at).total_seconds())
-    from_time = int(duration_s // NOMINAL_CYCLE_S) + 1 if duration_s > 0 else 0
+    from_time = int(duration_s // cycle_s) + 1 if duration_s > 0 else 0
     from_sequence = maximum_sequence + 1 if maximum_sequence is not None else 0
     uncapped = max(sample_count, from_time, from_sequence)
     return min(uncapped, MAX_EXPECTED_CYCLES), uncapped > MAX_EXPECTED_CYCLES
@@ -702,11 +800,19 @@ async def reconcile_drive_projection(
             else None
         )
         poll_plan_version, specs = specs_for_poll_plan(raw_poll_plan)
+        cycle_s = nominal_cycle_s(poll_plan_version)
         phases = _POLL_PLAN_SPECS.get(poll_plan_version, ((), {}))[1]
         missing_pids: set[int] = set()
-        signal_states = {spec.name: _SignalState(spec) for spec in specs}
+        signal_states = {
+            spec.name: _SignalState(spec, deadline_scheduled=poll_plan_version == 8)
+            for spec in specs
+        }
         transport = _Cadence()
-        rollup = _Rollup()
+        rollup = _Rollup(
+            nominal_cycle_s=cycle_s,
+            maf_cadence_s=maf_cadence_s(poll_plan_version),
+            require_timing=poll_plan_version == 8,
+        )
         shutdown = ShutdownEvidence()
         first_sample: datetime | None = None
         last_sample: datetime | None = None
@@ -729,7 +835,7 @@ async def reconcile_drive_projection(
             last_sample = (
                 sample.captured_at if last_sample is None else max(last_sample, sample.captured_at)
             )
-            transport.observe(sample.captured_at, NOMINAL_CYCLE_S)
+            transport.observe(sample.captured_at, cycle_s)
             rollup.observe(sample)
             shutdown.observe(sample)
             if previous_sequence is None:
@@ -796,6 +902,7 @@ async def reconcile_drive_projection(
             finished_at=effective_finished,
             sample_count=rollup.sample_count,
             maximum_sequence=maximum_sequence,
+            cycle_s=cycle_s,
         )
 
         signals: list[dict[str, Any]] = []
@@ -820,7 +927,7 @@ async def reconcile_drive_projection(
                 received_total += int(result["received_observation_count"])
                 expected_total += int(result["expected_observation_count"])
 
-        transport_result = transport.result(NOMINAL_CYCLE_S)
+        transport_result = transport.result(cycle_s)
         received_percentage = (
             min(100.0, 100.0 * transport.count / expected_cycles) if expected_cycles else 0.0
         )
@@ -906,7 +1013,7 @@ async def reconcile_drive_projection(
             "schema_version": 1,
             "projection_version": PROJECTION_VERSION,
             "poll_plan_version": poll_plan_version,
-            "nominal_cycle_s": NOMINAL_CYCLE_S,
+            "nominal_cycle_s": cycle_s,
             "gap_tolerance": GAP_TOLERANCE,
             "expected_cycle_count": expected_cycles,
             "expected_cycle_count_capped": expected_cycles_capped,

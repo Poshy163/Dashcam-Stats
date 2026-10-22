@@ -52,3 +52,9 @@ A faster plan requires an explicit new plan version, compatible timing/coverage
 validation for old bundles, scheduler and slow-command tests, and comparison during
 a normal drive. This graph change retains plan 7 and its five-second target, strict
 reply validation, serial command ownership and parked polling policy.
+
+The later 0.3.12 implementation adds a separate opt-in three-second plan for speed,
+RPM and MAF with reduced auxiliary cadence, response timestamps and a recorded
+fallback. It leaves the graph's read-only data path and the default five-second
+plan unchanged. See [obd-three-second-trial.md](obd-three-second-trial.md); sustained
+physical performance is still a separate acceptance step.

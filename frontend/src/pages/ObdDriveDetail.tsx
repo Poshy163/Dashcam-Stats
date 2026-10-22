@@ -10,8 +10,10 @@ import { ObdPollTiming } from '@/components/ObdPollTiming'
 import ObdFaultSummary from '@/components/ObdFaultSummary'
 import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/components/ui'
 import { api, type OBDBattery, type OBDSeriesSample } from '@/lib/api'
-import { formatDateTime, formatDuration, formatRelative, formatSpeed, formatTime, utcInputValue } from '@/lib/format'
+import { formatDateTime, formatDateTimeMillis, formatDuration, formatRelative, formatSpeed, formatTime, utcInputValue } from '@/lib/format'
 import { listPage } from '@/lib/listFilters'
+import { buildSignalTimings, deriveDrivingStats, signalSegments } from '@/lib/obdSignalTiming'
+import type { SignalTimeline } from '@/lib/obdSignalTiming'
 
 /** One metric drawn against elapsed drive time. */
 interface Series {
@@ -40,9 +42,6 @@ const PAD_L = 44
 const PAD_R = 10
 const PAD_T = 10
 const PAD_B = 22
-
-/** Fast samples beyond the documented 5 s cadence plus 50% tolerance are a gap. */
-const FAST_GAP_THRESHOLD_S = 7.5
 
 /** Only for a trace the poll plan does not name; every real signal carries its own. */
 const DEFAULT_CADENCE_S = 5
@@ -224,6 +223,8 @@ export function TimeChart({
   series,
   cadences,
   downsampled,
+  signalTimings,
+  windowBounds,
 }: {
   title: string
   unit: string
@@ -234,6 +235,8 @@ export function TimeChart({
   /** Signal name to poll cadence, straight from the drive's own `signal_metadata`. */
   cadences: Record<string, number>
   downsampled: boolean
+  signalTimings?: Record<string, SignalTimeline>
+  windowBounds?: { startS?: number; endS?: number }
 }) {
   const selectionId = useId()
   const svgRef = useRef<SVGSVGElement>(null)
@@ -245,13 +248,31 @@ export function TimeChart({
   // from something the poll plan does not name (a locally derived trace, say).
   const cadenceOf = (item: Series) =>
     (item.signal ? cadences[item.signal] : undefined) ?? DEFAULT_CADENCE_S
+  const legacyTiming: SignalTimeline = { timesIso, elapsedS, basis: timesIso.map(() => 'legacy_row'), breakBefore: elapsedS.map(() => false) }
+  const timingOf = (item: Series): SignalTimeline => item.signal && signalTimings?.[item.signal] ? signalTimings[item.signal]! : legacyTiming
+  const valueFor = (item: Series, index: number): number | null => {
+    const timing = timingOf(item)
+    const value = item.values[index]
+    return value != null && Number.isFinite(value) && timing.elapsedS[index] != null && Number.isFinite(timing.elapsedS[index]) && timing.timesIso[index] != null ? value : null
+  }
+  const observationLabel = (item: Series, index: number) => {
+    const timing = timingOf(item)
+    const at = timing.timesIso[index]
+    if (valueFor(item, index) == null || at == null) return item.values[index] == null ? 'Unavailable' : 'Response time unavailable'
+    const basis = timing.basis[index]
+    return `${basis === 'reply_completion' ? 'Reply completed' : basis === 'row_recorded' ? 'Row recorded' : 'Legacy row time'} ${formatDateTimeMillis(at)}`
+  }
 
   const drawn = series.filter((s) => s.values.some((v) => v != null))
-  const tFirst = elapsedS[0]
-  const tLast = elapsedS[elapsedS.length - 1]
-  if (drawn.length === 0 || tFirst == null || tLast == null) return null
+  const firstRow = elapsedS[0]
+  const lastRow = elapsedS[elapsedS.length - 1]
+  if (drawn.length === 0 || firstRow == null || lastRow == null) return null
+  const observedTimes = drawn.flatMap((item) => timingOf(item).elapsedS.filter((at, index): at is number => at != null && valueFor(item, index) != null))
+  const tFirst = windowBounds?.startS ?? Math.min(firstRow, ...observedTimes)
+  const tLast = windowBounds?.endS ?? Math.max(lastRow, ...observedTimes)
 
-  const all = drawn.flatMap((s) => s.values).filter((v): v is number => v != null)
+  const all = drawn.flatMap((item) => item.values.map((_, index) => valueFor(item, index))).filter((v): v is number => v != null)
+  if (all.length === 0) return <EmptyState title={`${title}: response times unavailable`} description="Values with missing or invalid reply timing are not shown at the row timestamp." />
   const rawMin = Math.min(...all)
   let min = rawMin
   let max = Math.max(...all)
@@ -276,46 +297,27 @@ export function TimeChart({
   // cadence plus its fixed tolerance: sparse traces cannot teach the UI that a long outage
   // was normal. Anything left isolated is drawn as a measured dot.
   const segments = (item: Series): { lines: string[]; dots: [number, number][] } => {
-    const values = item.values
-    const observed: { t: number; v: number }[] = []
-    values.forEach((v, i) => {
-      const t = elapsedS[i]
-      if (v != null && t != null) observed.push({ t, v })
-    })
-    if (observed.length === 0) return { lines: [], dots: [] }
-    if (downsampled) return { lines: [], dots: observed.map((point) => [x(point.t), y(point.v)]) }
-    const bridge = cadenceOf(item) * 1.5
-
+    const timing = timingOf(item)
     const lines: string[] = []
     const dots: [number, number][] = []
-    let run: { t: number; v: number }[] = []
-    const flush = () => {
-      if (run.length > 1) {
-        lines.push(run.map((o) => `${x(o.t).toFixed(1)},${y(o.v).toFixed(1)}`).join(' '))
-      } else if (run.length === 1 && run[0]) {
-        dots.push([x(run[0].t), y(run[0].v)])
-      }
-      run = []
+    for (const indices of signalSegments(item.values, timing, cadenceOf(item), downsampled)) {
+      if (indices.length > 1) lines.push(indices.map((index) => `${x(timing.elapsedS[index]!).toFixed(1)},${y(item.values[index]!).toFixed(1)}`).join(' '))
+      else if (indices[0] != null) dots.push([x(timing.elapsedS[indices[0]]!), y(item.values[indices[0]]!)])
     }
-    for (const o of observed) {
-      const previous = run[run.length - 1]
-      if (previous && o.t - previous.t > bridge) flush()
-      run.push(o)
-    }
-    flush()
     return { lines, dots }
   }
 
-  const stats = (values: (number | null)[]) => {
-    const present = values
-      .map((value, index) => ({ value, index }))
+  const stats = (item: Series) => {
+    const present = item.values
+      .map((_, index) => ({ value: valueFor(item, index), index }))
       .filter((item): item is { value: number; index: number } => item.value != null)
     const last = present[present.length - 1]
+    if (!last) return null
     return {
       min: Math.min(...present.map((item) => item.value)),
       max: Math.max(...present.map((item) => item.value)),
       last: last?.value ?? 0,
-      lastAt: last ? elapsedS[last.index] : null,
+      lastAt: timingOf(item).elapsedS[last.index] ?? null,
     }
   }
 
@@ -323,35 +325,33 @@ export function TimeChart({
     const svg = svgRef.current
     if (!svg) return
     const rect = svg.getBoundingClientRect()
+    if (rect.width <= 0) return
     const t = tFirst + (((event.clientX - rect.left) / rect.width) * CHART_W - PAD_L) * (domain / (CHART_W - PAD_L - PAD_R))
-    // Nearest sample by time. The list is sorted, so binary-search the insertion point.
-    let lo = 0
-    let hi = elapsedS.length - 1
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1
-      if ((elapsedS[mid] ?? 0) < t) lo = mid + 1
-      else hi = mid
+    // A valid reply can be saved after a selected window ends. Select the nearest
+    // actual plotted reply, rather than searching the row timestamps outside that window.
+    let nearest = Infinity
+    let index = 0
+    for (const signal of drawn) for (const [candidate, at] of timingOf(signal).elapsedS.entries()) {
+      if (at == null || valueFor(signal, candidate) == null) continue
+      const delta = Math.abs(at - t)
+      if (delta < nearest) { nearest = delta; index = candidate }
     }
-    const before = elapsedS[lo - 1]
-    const at = elapsedS[lo]
-    const index =
-      lo > 0 && before != null && at != null && t - before < at - t ? lo - 1 : lo
-    setHover(Math.max(0, Math.min(index, elapsedS.length - 1)))
+    setHover(index)
   }
 
-  const hoverT = hover != null ? elapsedS[hover] : null
+  const hoverT = hover == null ? null : drawn.map((signal) => valueFor(signal, hover) == null ? null : timingOf(signal).elapsedS[hover]).find((at) => at != null) ?? null
   const hoverClock = hover != null ? formatDateTime(timesIso[hover]) : null
-  const tooltipTitle = hoverT != null ? `${formatElapsed(hoverT)} · ${hoverClock}` : ''
+  const tooltipTitle = hoverT != null ? `Row saved ${hoverClock}` : ''
   // Never silently substitute a nearby reading. A null is a null at this sample; the
   // cadence-aware line is presentation only and carries no invented point value.
-  const valueAt = (values: (number | null)[]): number | null =>
-    hover == null ? null : (values[hover] ?? null)
   const tooltipRows =
     hover != null
       ? drawn.map((s) => ({
           label: s.label,
           colorClass: s.colorClass,
-          value: valueAt(s.values),
+          value: valueFor(s, hover),
+          at: timingOf(s).elapsedS[hover] ?? null,
+          observed: observationLabel(s, hover),
           provenance: s.provenance ?? 'measured',
           unit: s.unit ?? unit,
         }))
@@ -364,11 +364,10 @@ export function TimeChart({
         tooltipTitle.length,
         ...tooltipRows.map(
           (row) =>
-            `${row.label} ${row.value != null ? formatTick(row.value) : '—'} ${row.unit} ${row.provenance}`
-              .length,
+            Math.max(`${row.label} ${row.value != null ? formatTick(row.value) : '—'} ${row.unit} ${row.provenance}`.length, row.observed.length),
         ),
       )
-  const tooltipH = 16 + tooltipRows.length * 13
+  const tooltipH = 16 + tooltipRows.length * 26
   const tooltipX =
     hoverT != null ? (x(hoverT) > PAD_L + (CHART_W - PAD_L - PAD_R) * 0.62 ? x(hoverT) - tooltipW - 8 : x(hoverT) + 8) : 0
 
@@ -378,7 +377,9 @@ export function TimeChart({
         <h2 className="section-title">{title}</h2>
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-content-muted">
           {drawn.map((s) => {
-            const { min: lo, max: hi, last, lastAt } = stats(s.values)
+            const summary = stats(s)
+            if (!summary) return <span key={s.label}>{s.label}: response times unavailable</span>
+            const { min: lo, max: hi, last, lastAt } = summary
             const stale =
               !downsampled && lastAt != null && tLast - lastAt > cadenceOf(s) * 1.5
             const seriesUnit = s.unit ?? unit
@@ -478,7 +479,7 @@ export function TimeChart({
                 row.value != null && (
                   <circle
                     key={row.label}
-                    cx={x(hoverT)}
+                    cx={x(row.at!)}
                     cy={y(row.value)}
                     r={3}
                     fill="currentColor"
@@ -506,29 +507,36 @@ export function TimeChart({
               {tooltipTitle}
             </text>
             {tooltipRows.map((row, i) => (
-              <text
-                key={row.label}
+              <g key={row.label}><text
                 x={tooltipX + 6}
-                y={PAD_T + 25 + i * 13}
+                y={PAD_T + 25 + i * 26}
                 fontSize={10}
                 fill="currentColor"
                 className={row.colorClass}
               >
                 {row.label} {row.value != null ? `${formatTick(row.value)} ${row.unit}` : '—'} ·{' '}
                 {row.provenance}
-              </text>
+              </text><text x={tooltipX + 6} y={PAD_T + 37 + i * 26} fontSize={10} fill="currentColor" className="text-content-muted">{row.observed}</text></g>
             ))}
           </g>
         )}
       </svg>
       <div className="mt-3 space-y-2">
         <label htmlFor={selectionId} className="label">Inspect {title.toLowerCase()} samples with arrow keys</label>
-        <input id={selectionId} className="w-full accent-accent" type="range" min={0} max={elapsedS.length - 1} step={1} value={hover ?? 0} onChange={(event) => setHover(Number(event.target.value))} aria-valuetext={`${formatDateTime(timesIso[hover ?? 0])}; ${drawn.map((signal) => `${signal.label}: ${signal.values[hover ?? 0] == null ? 'unavailable' : `${formatTick(signal.values[hover ?? 0]!)} ${signal.unit ?? unit}`}`).join('; ')}`} />
-        <p className="text-xs text-content-muted" aria-live="polite">{formatDateTime(timesIso[hover ?? 0])} · {drawn.map((signal) => `${signal.label}: ${signal.values[hover ?? 0] == null ? 'unavailable' : `${formatTick(signal.values[hover ?? 0]!)} ${signal.unit ?? unit}`}`).join(' · ')}</p>
+        <input id={selectionId} className="w-full accent-accent" type="range" min={0} max={elapsedS.length - 1} step={1} value={hover ?? 0} onChange={(event) => setHover(Number(event.target.value))} aria-valuetext={drawn.map((signal) => `${signal.label}: ${valueFor(signal, hover ?? 0) == null ? 'unavailable' : `${formatTick(valueFor(signal, hover ?? 0)!)} ${signal.unit ?? unit}`}; ${observationLabel(signal, hover ?? 0)}`).join('; ')} />
+        <p className="text-xs text-content-muted" aria-live="polite">{drawn.map((signal) => `${signal.label}: ${valueFor(signal, hover ?? 0) == null ? 'unavailable' : `${formatTick(valueFor(signal, hover ?? 0)!)} ${signal.unit ?? unit}`} · ${observationLabel(signal, hover ?? 0)}`).join(' · ')}</p>
       </div>
       <details className="mt-3" onToggle={(event) => setTableOpen(event.currentTarget.open)}>
         <summary className="cursor-pointer text-sm font-medium">Sample values ({elapsedS.length.toLocaleString()} shown)</summary>
-        {tableOpen && <div className="overflow-x-auto"><table className="mt-2 w-full text-left text-xs"><caption className="sr-only">{title} samples; unavailable values were not measured at that instant.</caption><thead><tr><th scope="col" className="p-2">Recorded time</th>{drawn.map((signal) => <th scope="col" key={signal.label} className="p-2">{signal.label} ({signal.unit ?? unit})</th>)}</tr></thead><tbody>{timesIso.slice((Math.min(tablePage, Math.ceil(timesIso.length / 25)) - 1) * 25, Math.min(tablePage, Math.ceil(timesIso.length / 25)) * 25).map((time, offset) => { const index = (Math.min(tablePage, Math.ceil(timesIso.length / 25)) - 1) * 25 + offset; return <tr key={`${time}-${index}`} className="border-t border-border"><th scope="row" className="whitespace-nowrap p-2 font-normal">{formatDateTime(time)}</th>{drawn.map((signal) => <td key={signal.label} className="p-2">{signal.values[index] == null ? 'Unavailable' : formatTick(signal.values[index]!)}</td>)}</tr> })}</tbody></table><Pagination page={Math.min(tablePage, Math.ceil(timesIso.length / 25))} pages={Math.ceil(timesIso.length / 25)} total={timesIso.length} onChange={setTablePage} /></div>}
+        {tableOpen && <div className="overflow-x-auto"><table className="mt-2 w-full text-left text-xs">
+          <caption className="sr-only">{title} values and individual response times; a serialized row does not establish simultaneous measurements.</caption>
+          <thead><tr><th scope="col" className="p-2">Row saved</th>{drawn.map((signal) => <th scope="col" key={signal.label} className="p-2">{signal.label} ({signal.unit ?? unit})</th>)}</tr></thead>
+          <tbody>{timesIso.slice((Math.min(tablePage, Math.ceil(timesIso.length / 25)) - 1) * 25, Math.min(tablePage, Math.ceil(timesIso.length / 25)) * 25).map((time, offset) => {
+            const index = (Math.min(tablePage, Math.ceil(timesIso.length / 25)) - 1) * 25 + offset
+            return <tr key={`${time}-${index}`} className="border-t border-border"><th scope="row" className="whitespace-nowrap p-2 font-normal">{formatDateTime(time)}</th>
+              {drawn.map((signal) => <td key={signal.label} className="p-2">{valueFor(signal, index) == null ? 'Unavailable' : formatTick(valueFor(signal, index)!)}
+                <div className="mt-1 whitespace-nowrap text-content-faint">{observationLabel(signal, index)}</div></td>)}</tr>
+          })}</tbody></table><Pagination page={Math.min(tablePage, Math.ceil(timesIso.length / 25))} pages={Math.ceil(timesIso.length / 25)} total={timesIso.length} onChange={setTablePage} /></div>}
       </details>
     </section>
   )
@@ -567,106 +575,6 @@ function BandBars({ title, bands }: { title: string; bands: { label: string; sec
 const metric = (samples: OBDSeriesSample[], pick: (s: OBDSeriesSample) => number | null) =>
   samples.map(pick)
 
-interface DerivedStats {
-  movingAverageKmh: number | null
-  stoppedShare: number | null
-  maxAccelKmhS: number | null
-  maxBrakeKmhS: number | null
-  warmupS: number | null
-  speedBands: { label: string; seconds: number }[]
-  rpmBands: { label: string; seconds: number }[]
-}
-
-/**
- * Everything here is derived from the raw samples rather than sent by the server, so the
- * page and the stored data can never disagree. Interval time is charged to the sample
- * ending it only inside the fast-tier cadence tolerance; a dropout contributes no
- * inferred time to either endpoint's band.
- */
-function deriveStats(samples: OBDSeriesSample[], elapsedS: number[]): DerivedStats {
-  const speedBandEdges = [
-    { label: 'Stopped', match: (v: number) => v < 1 },
-    { label: '1–30 km/h', match: (v: number) => v >= 1 && v < 30 },
-    { label: '30–50 km/h', match: (v: number) => v >= 30 && v < 50 },
-    { label: '50–60 km/h', match: (v: number) => v >= 50 && v < 60 },
-    { label: '60+ km/h', match: (v: number) => v >= 60 },
-  ]
-  const rpmBandEdges = [
-    { label: 'Under 1,000', match: (v: number) => v < 1000 },
-    { label: '1,000–1,500', match: (v: number) => v >= 1000 && v < 1500 },
-    { label: '1,500–2,000', match: (v: number) => v >= 1500 && v < 2000 },
-    { label: '2,000–2,500', match: (v: number) => v >= 2000 && v < 2500 },
-    { label: '2,500+', match: (v: number) => v >= 2500 },
-  ]
-  const speedSeconds = speedBandEdges.map(() => 0)
-  const rpmSeconds = rpmBandEdges.map(() => 0)
-
-  let movingWeighted = 0
-  let movingTime = 0
-  let stoppedTime = 0
-  let speedTime = 0
-  let maxAccel: number | null = null
-  let maxBrake: number | null = null
-  let warmupS: number | null = null
-
-  for (let i = 0; i < samples.length; i += 1) {
-    const sample = samples[i]
-    const t = elapsedS[i]
-    if (!sample || t == null) continue
-
-    const prevT = i > 0 ? elapsedS[i - 1] : null
-    const interval = prevT != null ? Math.max(t - prevT, 0) : 0
-    const gap = prevT != null && interval > FAST_GAP_THRESHOLD_S
-    const dt = gap ? 0 : interval
-
-    const speed = sample.vehicleSpeedKmh
-    if (speed != null && dt > 0) {
-      speedTime += dt
-      const band = speedBandEdges.findIndex((b) => b.match(speed))
-      if (band >= 0) speedSeconds[band] = (speedSeconds[band] ?? 0) + dt
-      if (speed < 1) stoppedTime += dt
-      else {
-        movingWeighted += speed * dt
-        movingTime += dt
-      }
-      const prevSpeed = i > 0 ? samples[i - 1]?.vehicleSpeedKmh : null
-      if (!gap && prevSpeed != null && prevT != null && t > prevT) {
-        const accel = (speed - prevSpeed) / (t - prevT)
-        if (accel >= 0) maxAccel = maxAccel == null ? accel : Math.max(maxAccel, accel)
-        else maxBrake = maxBrake == null ? -accel : Math.max(maxBrake, -accel)
-      }
-    }
-
-    const rpm = sample.engineRpm
-    if (rpm != null && dt > 0) {
-      const band = rpmBandEdges.findIndex((b) => b.match(rpm))
-      if (band >= 0) rpmSeconds[band] = (rpmSeconds[band] ?? 0) + dt
-    }
-
-    const coolant = sample.coolantTemperatureC
-    if (warmupS == null && coolant != null && coolant >= 80) {
-      const first = samples[0]?.coolantTemperatureC
-      if (first != null && first < 80) warmupS = t
-    }
-  }
-
-  return {
-    movingAverageKmh: movingTime > 0 ? movingWeighted / movingTime : null,
-    stoppedShare: speedTime > 0 ? stoppedTime / speedTime : null,
-    maxAccelKmhS: maxAccel,
-    maxBrakeKmhS: maxBrake,
-    warmupS,
-    speedBands: speedBandEdges.map((band, i) => ({
-      label: band.label,
-      seconds: speedSeconds[i] ?? 0,
-    })),
-    rpmBands: rpmBandEdges.map((band, i) => ({
-      label: band.label,
-      seconds: rpmSeconds[i] ?? 0,
-    })),
-  }
-}
-
 export default function ObdDriveDetail() {
   const { driveId } = useParams()
   const [params, setParams] = useSearchParams()
@@ -697,11 +605,6 @@ export default function ObdDriveDetail() {
     return samples.map((s) => (Date.parse(s.t) - t0) / 1000)
   }, [query.data])
 
-  const derived = useMemo(
-    () => deriveStats(query.data?.sampling?.downsampled || start || end ? [] : query.data?.samples ?? [], elapsedS),
-    [query.data, elapsedS, start, end],
-  )
-
   // Signal name to poll cadence, taken from the drive's own metadata. This is per-drive
   // rather than a constant on purpose: the cadences belong to the poll plan the logger was
   // running at the time, and an older drive is entitled to different ones.
@@ -712,6 +615,18 @@ export default function ObdDriveDetail() {
     }
     return out
   }, [query.data])
+  const pollPlanVersion = query.data?.drive.gapAnalysis?.pollPlanVersion ?? 7
+  const nominalCycleS = query.data?.drive.gapAnalysis?.nominalCycleS ?? (pollPlanVersion === 8 ? 3 : 5)
+  const signalTimings = useMemo(() => buildSignalTimings(query.data?.samples ?? [], {
+    pollPlanVersion, nominalCycleS, startedAt: query.data?.drive.startedAt ?? '', start, end,
+  }), [query.data, pollPlanVersion, nominalCycleS, start, end])
+  const windowBounds = useMemo(() => {
+    const origin = Date.parse(query.data?.drive.startedAt ?? '')
+    return { startS: start ? (Date.parse(start) - origin) / 1_000 : undefined, endS: end ? (Date.parse(end) - origin) / 1_000 : undefined }
+  }, [query.data, start, end])
+  const derived = useMemo(() => deriveDrivingStats(
+    start || end ? [] : query.data?.samples ?? [], signalTimings, cadences, nominalCycleS, query.data?.sampling?.downsampled === true,
+  ), [query.data, signalTimings, cadences, nominalCycleS, start, end])
 
   if (query.isLoading) return <Spinner label="Loading drive…" className="py-24" />
   if (query.isError) return <div className="space-y-4"><ErrorState error={query.error} retry={() => query.refetch()} />{(start || end || diagnosticPage > 1) && <button className="btn" onClick={() => setParams({})}>Clear drive filters</button>}</div>
@@ -768,6 +683,9 @@ export default function ObdDriveDetail() {
           </span>
         </div>
         <ObdLifecycleExplanation status={drive.lifecycleStatus} />
+        {pollPlanVersion === 8 && <p className="mt-2 text-sm text-content-muted">3-second polling trial: speed, RPM and air flow target a three-second cycle. Other signals keep their own cadence. Recorded replies are sequential, not simultaneous.</p>}
+        {(drive.interruptionReason === 'poll_trial_fallback' || drive.stopReason === 'poll_trial_fallback') && <p className="mt-2 text-sm text-state-warn">The 3-second trial stopped; the 5-second baseline is selected for the next connection. Any baseline recording uses a separate drive; this drive keeps its original cadence.</p>}
+        {pollPlanVersion !== 8 && drive.startReason === 'poll_trial_fallback' && <p className="mt-2 text-sm text-content-muted">5-second baseline selected after the 3-second trial stopped.</p>}
         <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
           <div>
             <dt className="text-xs text-content-faint">Drive started</dt>
@@ -903,11 +821,11 @@ export default function ObdDriveDetail() {
         <StatTile
           label="Hardest acceleration"
           value={
-            derived.maxAccelKmhS != null ? `${derived.maxAccelKmhS.toFixed(1)} km/h·s` : '—'
+            derived.maxAccelKmhS != null ? `${derived.maxAccelKmhS.toFixed(1)} km/h/s` : '—'
           }
           hint={
             derived.maxBrakeKmhS != null
-              ? `hardest braking ${derived.maxBrakeKmhS.toFixed(1)} km/h·s`
+              ? `hardest braking ${derived.maxBrakeKmhS.toFixed(1)} km/h/s`
               : undefined
           }
         />
@@ -975,7 +893,7 @@ export default function ObdDriveDetail() {
                     <td className="p-2 text-content-muted">
                       {signal.provenance} · {signal.tier}
                     </td>
-                    <td className="tabular p-2">{formatDuration(signal.expectedCadenceS)}</td>
+                    <td className="tabular p-2">{signal.tier === 'static' ? 'Carried value; not polled each row' : formatDuration(signal.expectedCadenceS)}</td>
                     <td className="tabular p-2">
                       {signal.receivedObservationCount.toLocaleString()} /{' '}
                       {signal.expectedObservationCount.toLocaleString()}
@@ -1010,11 +928,12 @@ export default function ObdDriveDetail() {
         next.delete('diagnostic_page')
         setParams(next)
       }}>
-        <label><span className="label mb-1 block">From (UTC)</span><input className="input" type="datetime-local" name="start" defaultValue={utcInputValue(start)} /></label>
-        <label><span className="label mb-1 block">To (UTC)</span><input className="input" type="datetime-local" name="end" defaultValue={utcInputValue(end)} /></label>
+        <label><span className="label mb-1 block">From (UTC)</span><input className="input" type="datetime-local" step="1" name="start" defaultValue={utcInputValue(start, 'second')} /></label>
+        <label><span className="label mb-1 block">To (UTC)</span><input className="input" type="datetime-local" step="1" name="end" defaultValue={utcInputValue(end, 'second')} /></label>
         <button className="btn" type="submit">Apply time window</button>
         <button className="btn" type="button" onClick={() => setParams({})}>Whole drive</button>
         <p className="hint w-full">Drive totals describe the complete drive. Charts show the selected time window; displayed timestamps use the configured camera timezone.</p>
+        <p className="hint w-full">Each signal uses its recorded reply-completion time when available. Legacy rows without reply ages retain their row time; invalid or missing new timing stays unavailable. Fuel-per-distance estimates combine speed and air-flow replies taken in sequence.</p>
       </form>
       {(downsampled || start || end) && <p className="card p-3 text-sm" role="status">{downsampled ? `Showing ${samples.length.toLocaleString()} representative samples of ${query.data.sampling?.totalSampleCount.toLocaleString()}. Points preserve selected extrema, but omitted readings and gaps cannot be reconstructed from this view.` : 'Showing a time window of the drive.'} Adjacent-sample driving statistics are unavailable in this view. Download the original bundle for every sample.</p>}
       {samples.length < 2 ? (
@@ -1031,6 +950,8 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              signalTimings={signalTimings}
+              windowBounds={windowBounds}
               downsampled={downsampled}
               series={[
                 {
@@ -1047,6 +968,8 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              signalTimings={signalTimings}
+              windowBounds={windowBounds}
               downsampled={downsampled}
               series={[
                 {
@@ -1063,6 +986,8 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              signalTimings={signalTimings}
+              windowBounds={windowBounds}
               downsampled={downsampled}
               series={[
                 {
@@ -1085,6 +1010,8 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              signalTimings={signalTimings}
+              windowBounds={windowBounds}
               downsampled={downsampled}
               series={[
                 {
@@ -1101,6 +1028,8 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              signalTimings={signalTimings}
+              windowBounds={windowBounds}
               downsampled={downsampled}
               series={[
                 {
@@ -1123,6 +1052,8 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              signalTimings={signalTimings}
+              windowBounds={windowBounds}
               downsampled={downsampled}
               series={[
                 {
@@ -1145,6 +1076,8 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              signalTimings={signalTimings}
+              windowBounds={windowBounds}
               downsampled={downsampled}
               series={[
                 {
@@ -1162,6 +1095,8 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              signalTimings={signalTimings}
+              windowBounds={windowBounds}
               downsampled={downsampled}
               series={[
                 {
@@ -1179,6 +1114,8 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              signalTimings={signalTimings}
+              windowBounds={windowBounds}
               downsampled={downsampled}
               series={[
                 {
@@ -1201,6 +1138,8 @@ export default function ObdDriveDetail() {
               elapsedS={elapsedS}
               timesIso={timesIso}
               cadences={cadences}
+              signalTimings={signalTimings}
+              windowBounds={windowBounds}
               downsampled={downsampled}
               series={[
                 {

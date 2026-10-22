@@ -49,11 +49,15 @@ internal class MonotonicUtcClock(
         require(anchorElapsedMillis >= 0)
     }
 
+    data class Capture(val timestampUtc: String, val elapsedMillis: Long)
+
+    fun nowUtc(): String = capture().timestampUtc
+
     @Synchronized
-    fun nowUtc(): String {
+    fun capture(): Capture {
         greatestElapsedMillis = maxOf(greatestElapsedMillis, elapsedRealtimeMillis())
         val delta = (greatestElapsedMillis - anchorElapsedMillis).coerceAtLeast(0)
-        return anchorUtc.plusMillis(delta).toString()
+        return Capture(anchorUtc.plusMillis(delta).toString(), greatestElapsedMillis)
     }
 }
 

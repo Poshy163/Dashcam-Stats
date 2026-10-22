@@ -78,11 +78,16 @@ completed real transfer as separate evidence.
 
 ## Timing and accuracy
 
-The target cycle is 5 seconds; most medium signals, including MAF, are requested every
-third cycle (15 seconds). Sequential adapter requests mean a row's timestamp marks cycle
-completion, not simultaneous acquisition of every field. Sampling faster improves temporal
-resolution only if the adapter and ECU can complete the requests; it does not establish
-sensor accuracy. The bounded `poll_timing` diagnostic records per-PID request outcomes,
+The baseline plan 7 targets 5 seconds; most medium signals, including MAF, are requested
+every third cycle (15 seconds). The opt-in plan 8 trial prioritizes speed, RPM and MAF
+at a three-second target and lowers the cadence of other readings. Sequential adapter
+requests mean a row's timestamp marks cycle completion, not simultaneous acquisition
+of every field. New trial samples retain successful per-PID reply-completion ages so
+distance, acceleration and fuel calculations can use the appropriate response times.
+Legacy samples without those ages retain their original row-time interpretation.
+Sampling faster improves temporal resolution only if the adapter and ECU can complete
+the requests; it does not establish sensor accuracy. The bounded `poll_timing`
+diagnostic records per-PID request outcomes,
 request duration, age from decoded response to row creation, and cycle overruns without
 retaining responses, sensor values or vehicle identifiers. Its timing cannot establish the
 age of the ECU's underlying sensor measurement.
@@ -91,8 +96,9 @@ Fuel is explicitly an estimate derived from MAF using gasoline density and a sto
 air/fuel ratio; it is not an ECU fuel counter or a calibrated fuel measurement. Earlier
 summary arithmetic counted only the first row interval after each sparse MAF reading.
 The corrected Android exporter and server/Python summary share a bounded hold rule:
-retain the last valid rate for at most 22.5 seconds, require consecutive sequences and row
-gaps no larger than 7.5 seconds, and discard the interval ending in a failed MAF read,
+for the baseline, retain the last valid rate for at most 22.5 seconds and require
+consecutive sequences and row gaps no larger than 7.5 seconds. Trial limits are based
+on its independent row and MAF cadences. Both paths discard the interval ending in a failed MAF read,
 failed transport, unavailable ECU, or invalid rate. A new valid rate starts a new hold;
 no estimate extends beyond the last observed row. Uncovered periods remain excluded, so
 the resulting total is still a partial estimate when data is missing.
@@ -104,6 +110,9 @@ coverage on MAF's scheduled phase. Only stored non-null derived readings count t
 coverage: the bounded hold used for fuel totals does not create extra observations or
 fill missing readings. Derived signals remain separate from measured-signal completeness.
 These rules do not validate sensor calibration or remove the fuel model's assumptions.
+The trial, its recorded fallback and server-first rollout are documented in
+[obd-three-second-trial.md](obd-three-second-trial.md). A completed automated test suite
+does not demonstrate sustained three-second physical polling.
 
 As of 2026-08-30, the physical setup had demonstrated engine detection, drive close,
 bundle export, unattended collection, receipt-gated deletion, and retained raw-history
