@@ -63,6 +63,15 @@ export interface MovementManifestStatus {
   inventory?: { clipCount: number; totalBytes: number; matchedClips: number; matchedBytes: number; unmatchedClips: number; identityMismatches: number; classCounts: MovementClassTotals; classBytes: MovementClassTotals } | null
   cardIdentityVerified: boolean
   error?: string | null
+  policyAnalysis?: {
+    checkedAt: string
+    generatedAt: string | null
+    status: string
+    stale: boolean
+    clipCount: number
+    statusCounts: Record<string, number>
+    reasonCounts: Record<string, number>
+  } | null
   intentionalExclusions?: {
     policyVersion: string
     status: string

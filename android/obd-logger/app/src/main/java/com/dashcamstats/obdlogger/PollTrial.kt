@@ -74,19 +74,66 @@ internal fun prepareTimedTrialRow(
     return TimedTrialRow(values, validAges, (missing + unproved).distinct())
 }
 
+internal enum class CriticalPollOutcome { SUCCESS, MISSING, MALFORMED, COOLDOWN, UNPROVED }
+
 /** Only completed, still-running cycles count. A normal engine stop is checked first. */
 internal class PollTrialHealth {
     private var overruns = 0
     private var missing = 0
-    fun reset() { overruns = 0; missing = 0 }
-    fun completed(workMillis: Long, successfulPids: Set<Int>): String? {
+    private val missingSince = mutableMapOf<Int, Long>()
+    private val malformedRetryPending = mutableSetOf<Int>()
+
+    fun reset() {
+        overruns = 0
+        missing = 0
+        missingSince.clear()
+        malformedRetryPending.clear()
+    }
+
+    fun completed(workMillis: Long, outcomes: Map<Int, CriticalPollOutcome>, now: Long): String? {
         overruns = if (workMillis > PollTrialPlan.TARGET_MILLIS) overruns + 1 else 0
-        missing = if (!successfulPids.containsAll(PollTrialPlan.critical)) missing + 1 else 0
+        // Check before a fresh reply removes its state: a late completion must not
+        // retroactively extend a recovery window that has already expired.
+        val recoveryExpired = missingSince.values.any { now < it || now - it >= CRITICAL_RECOVERY_MILLIS }
+        var failedAttempt = false
+        for (pid in PollTrialPlan.critical) {
+            when (outcomes[pid] ?: CriticalPollOutcome.UNPROVED) {
+                CriticalPollOutcome.SUCCESS -> {
+                    missingSince.remove(pid)
+                    malformedRetryPending.remove(pid)
+                }
+                CriticalPollOutcome.COOLDOWN -> {
+                    // A parser cooldown is not another failed ECU request. Only a prior
+                    // malformed reply grants this bounded chance to make a real retry.
+                    missingSince.putIfAbsent(pid, now)
+                    if (pid !in malformedRetryPending) failedAttempt = true
+                }
+                CriticalPollOutcome.MALFORMED -> {
+                    missingSince.putIfAbsent(pid, now)
+                    malformedRetryPending.add(pid)
+                    failedAttempt = true
+                }
+                CriticalPollOutcome.MISSING, CriticalPollOutcome.UNPROVED -> {
+                    missingSince.putIfAbsent(pid, now)
+                    malformedRetryPending.remove(pid)
+                    failedAttempt = true
+                }
+            }
+        }
+        // Freeze, rather than reset, the failure streak during justified cooldowns.
+        // Other failed critical requests still count while one PID is cooling down.
+        if (missingSince.isEmpty()) missing = 0 else if (failedAttempt) missing += 1
         return when {
             overruns >= 3 -> "sustained_overrun"
-            missing >= 3 -> "critical_readings_missing"
+            missing >= 3 || recoveryExpired -> "critical_readings_missing"
             else -> null
         }
+    }
+
+    companion object {
+        // The existing first malformed-reply cooldown is ten elapsed seconds. Allow
+        // the following three-second cycle to complete a retry, never an open hold.
+        const val CRITICAL_RECOVERY_MILLIS = 15_000L
     }
 }
 

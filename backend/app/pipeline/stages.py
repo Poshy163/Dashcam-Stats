@@ -2479,7 +2479,7 @@ async def stage_summarise(
     session: AsyncSession, recording: Recording, *, progress: ProgressCallback | None = None
 ) -> StageResult:
     """Roll up counts, attach a journey, and mark the recording finished."""
-    recording.vehicle_count = int(
+    vehicle_count = int(
         (
             await session.execute(
                 select(func.count(TrackedObject.id)).where(
@@ -2489,7 +2489,7 @@ async def stage_summarise(
         ).scalar()
         or 0
     )
-    recording.plate_count = int(
+    plate_count = int(
         (
             await session.execute(
                 select(func.count(PlateObservation.id)).where(
@@ -2508,6 +2508,8 @@ async def stage_summarise(
     recording.processed_at = datetime.now(UTC)
     recording.state = RecordingState.COMPLETED
     recording.error_message = None
+    recording.vehicle_count = vehicle_count
+    recording.plate_count = plate_count
 
     # Detections and telemetry are written before the journey is known, and the pointer is
     # backfilled here -- by `assign_recording`, which calls `JourneyBuilder._attach` for

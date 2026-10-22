@@ -76,6 +76,19 @@ coverage and setup status. The Backup page labels these as observations and keep
 footage eligible. A retained diagnostic snapshot survives server restart; its original
 generation time still governs freshness.
 
+Companion 0.3.13 also publishes a bounded optional `visual.reason` in the separate
+transfer-policy manifest. The Backup page distinguishes resource refusals (processor or
+battery heat, Android thermal protection, memory pressure or missing probes) from source,
+format, hardware-decoder, image-quality and coverage failures. Older producers remain
+readable and show “reason not reported” for unavailable checks. Unknown reason strings
+are replaced with a fixed category and cannot authorize exclusion or deferral.
+The server retains only aggregate status/reason counts alongside the last observation;
+these diagnostics contain no video paths, raw exceptions or frame data and never grant
+permission to skip footage. Saved/stale diagnostics are labelled separately from current
+camera conditions. The 85 C processor and 42 C battery limits remain unchanged. Hot or
+unmeasurable cameras keep uploading normally; software reporting does not resolve the
+camera's physical heat or prove a complete quiet-clip analysis.
+
 ## Verified maintenance wake hold
 
 The Backup page can request a 5, 15 or 30 minute maintenance window while parked. The

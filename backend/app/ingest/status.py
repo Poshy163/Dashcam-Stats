@@ -66,6 +66,8 @@ class IngestStatus:
         self._lock = threading.RLock()
         self._running = False
         self._cancel = threading.Event()
+        self.cancel_reason: str | None = None
+        self.cancel_detail: str | None = None
 
         self.state: RunState = RunState.IDLE
         self.phase: Phase = Phase.IDLE
@@ -194,6 +196,8 @@ class IngestStatus:
                 return False
             self._running = True
             self._cancel.clear()
+            self.cancel_reason = None
+            self.cancel_detail = None
             self.state = RunState.RUNNING
             self.phase = Phase.CONNECTING
             self.files_total = self.files_done = 0
@@ -251,11 +255,16 @@ class IngestStatus:
                 return float("inf")
             return time.monotonic() - self._finished_at
 
-    def cancel(self) -> bool:
+    def cancel(self, *, reason: str | None = None, detail: str | None = None) -> bool:
         """Ask an in-flight pull to stop at the next read. False if nothing is running."""
         with self._lock:
             if not self._running:
                 return False
+            # Explicit Stop outranks an earlier internal safety cancellation. A later
+            # lease callback must never re-arm a visit the operator has stopped.
+            if not self._cancel.is_set() or reason is None:
+                self.cancel_reason = reason
+                self.cancel_detail = detail if reason is not None else None
             self._cancel.set()
             return True
 

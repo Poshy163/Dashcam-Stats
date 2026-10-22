@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -26,6 +27,7 @@ MAX_AGE_SECONDS = 180
 POLICY_READ_TIMEOUT_S = 6.0
 FINGERPRINT_TIMEOUT_S = 6.0
 AUDIT_TIMEOUT_S = 3.0
+DIAGNOSTICS_TIMEOUT_S = 1.5
 MAX_DEFER_SECONDS = 360
 DEFER_SLEEP_RESERVE_SECONDS = 120
 TOP_KEYS = {
@@ -121,6 +123,33 @@ class FilterResult:
 
 
 VISUAL_STATUSES = {"not_analyzed", "quiet", "activity", "unavailable", "error", "incomplete"}
+VISUAL_REASONS = {
+    "policy_not_permitted",
+    "battery_temperature_unavailable",
+    "battery_temperature_guard",
+    "system_thermal_unavailable",
+    "system_thermal_guard",
+    "memory_probe_unavailable",
+    "memory_guard",
+    "cpu_temperature_unavailable",
+    "cpu_temperature_guard",
+    "hardware_decoder_unavailable",
+    "source_unavailable",
+    "format_unsupported",
+    "decoder_failure",
+    "image_unavailable",
+    "frame_quality",
+    "visual_activity",
+    "coverage_incomplete",
+    "analysis_timeout",
+    "frame_limit",
+    "analysis_pending",
+    "clip_changed",
+    "background_priority_unavailable",
+    "analysis_storage_unavailable",
+    "unrecognized_reason",
+    "reason_not_reported",
+}
 UNSAFE_CLIP_REASONS = {
     "locked_clip",
     "orphan_partial",
@@ -134,6 +163,59 @@ UNSAFE_CLIP_REASONS = {
     "validated_speed_positive",
     "gps_confident_movement",
 }
+
+
+def analysis_summary(doc: dict[str, Any] | None, state: str) -> dict[str, Any]:
+    """Bounded advisory categories, never filenames, raw exceptions or skip permission."""
+    statuses: Counter[str] = Counter()
+    reasons: Counter[str] = Counter()
+    for entry in doc["decisions"] if doc is not None else []:
+        visual = entry["visual"]
+        statuses[visual["status"]] += 1
+        reason = visual.get("reason")
+        if reason in VISUAL_REASONS:
+            reasons[reason] += 1
+        elif visual["status"] in {"unavailable", "error", "incomplete"}:
+            reasons["reason_not_reported"] += 1
+    return {
+        "checked_at": datetime.now(UTC).isoformat(),
+        "generated_at": doc["generated_at_utc"] if doc else None,
+        "status": state,
+        "clip_count": sum(statuses.values()),
+        "status_counts": dict(statuses),
+        "reason_counts": dict(reasons),
+    }
+
+
+def validate_analysis_summary(value: Any) -> dict[str, Any]:
+    movement._keys(
+        value,
+        {"checked_at", "generated_at", "status", "clip_count", "status_counts", "reason_counts"},
+    )
+    movement._timestamp(value["checked_at"])
+    movement._timestamp(value["generated_at"], nullable=True)
+    if value["status"] not in {
+        "disabled",
+        "unsupported",
+        "missing",
+        "invalid",
+        "stale",
+        "card_mismatch",
+        "ready",
+    }:
+        raise movement.ManifestError("invalid_analysis_summary")
+    movement._integer(value["clip_count"], MAX_DECISIONS)
+    for key, allowed in (("status_counts", VISUAL_STATUSES), ("reason_counts", VISUAL_REASONS)):
+        counts = value[key]
+        if not isinstance(counts, dict) or not set(counts) <= allowed:
+            raise movement.ManifestError("invalid_analysis_summary")
+        for count in counts.values():
+            movement._integer(count, MAX_DECISIONS)
+        if sum(counts.values()) > value["clip_count"]:
+            raise movement.ManifestError("invalid_analysis_summary")
+    if sum(value["status_counts"].values()) != value["clip_count"]:
+        raise movement.ManifestError("invalid_analysis_summary")
+    return value
 
 
 def validate_policy_manifest(raw: str) -> dict[str, Any]:
@@ -216,7 +298,18 @@ def _validate_decision(decision: Any) -> None:
         raise movement.ManifestError("invalid_deferral")
     guard, visual = decision["guard"], decision["visual"]
     movement._keys(guard, GUARD_KEYS)
-    movement._keys(visual, VISUAL_KEYS)
+    movement._keys(
+        visual,
+        VISUAL_KEYS | ({"reason"} if isinstance(visual, dict) and "reason" in visual else set()),
+    )
+    # Optional diagnostics preserve old producers. Unknown/new producer categories are
+    # replaced before persistence; their presence can never confer quiet authority.
+    if (
+        "reason" in visual
+        and visual["reason"] is not None
+        and (not isinstance(visual["reason"], str) or visual["reason"] not in VISUAL_REASONS)
+    ):
+        visual["reason"] = "unrecognized_reason"
     for key in ("start_utc", "end_utc"):
         movement._timestamp(guard[key], nullable=True)
     for key in GUARD_KEYS - {"start_utc", "end_utc"}:
@@ -261,6 +354,7 @@ def _validate_decision(decision: Any) -> None:
 def _quiet_visual(visual: dict[str, Any], duration: int) -> bool:
     return bool(
         visual["status"] == "quiet"
+        and visual.get("reason") is None
         and visual["input_eos"]
         and visual["decoder_eos"]
         and visual["input_frames"] == visual["decoded_frames"] == visual["sampled_frames"]
@@ -394,6 +488,7 @@ def eligible_defer(
             and (
                 (
                     visual["status"] == "not_analyzed"
+                    and visual.get("reason") in {None, "analysis_pending"}
                     and visual["input_frames"]
                     == visual["decoded_frames"]
                     == visual["sampled_frames"]
@@ -715,6 +810,20 @@ async def filter_inventory(
     except Exception:
         selected, deferred, state = [], [], "invalid"
         log.warning("camera quiet-footage proof unavailable; copying normally")
+    # Report refusal categories separately from exclusion authority. This also works
+    # when zero clips qualify and avoids writing diagnostic rows into the media index.
+    try:
+        async with asyncio.timeout(DIAGNOSTICS_TIMEOUT_S):
+            status = movement.get_movement_status()
+            # Both helpers shield their retained file worker. A stalled local state
+            # volume may finish later, while the independent exclusion audit proceeds.
+            await movement.load_status(status)
+            status.update_policy_analysis(analysis_summary(doc, state))
+            await movement._persist_async(status)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass  # Optional diagnostics must not hold up or veto a backup.
     try:
         async with asyncio.timeout(AUDIT_TIMEOUT_S):
             await clip_exclusions.record_evaluation(

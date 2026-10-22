@@ -32,6 +32,33 @@ internal const val QUIET_ROI_ROWS = 86
 internal const val QUIET_ROI_PROFILE = "dashcam_osd_bottom4_v1"
 internal const val QUIET_MOTION_METRIC = "adjacent_rolling6_coherent3x3_v1"
 
+/** Fixed public categories only: never publish an exception, codec name, URI or file path. */
+internal enum class QuietAnalysisReason(val wire: String) {
+    POLICY_NOT_PERMITTED("policy_not_permitted"),
+    BATTERY_TEMPERATURE_UNAVAILABLE("battery_temperature_unavailable"),
+    BATTERY_TEMPERATURE_GUARD("battery_temperature_guard"),
+    SYSTEM_THERMAL_UNAVAILABLE("system_thermal_unavailable"),
+    SYSTEM_THERMAL_GUARD("system_thermal_guard"),
+    MEMORY_PROBE_UNAVAILABLE("memory_probe_unavailable"),
+    MEMORY_GUARD("memory_guard"),
+    CPU_TEMPERATURE_UNAVAILABLE("cpu_temperature_unavailable"),
+    CPU_TEMPERATURE_GUARD("cpu_temperature_guard"),
+    HARDWARE_DECODER_UNAVAILABLE("hardware_decoder_unavailable"),
+    SOURCE_UNAVAILABLE("source_unavailable"),
+    FORMAT_UNSUPPORTED("format_unsupported"),
+    DECODER_FAILURE("decoder_failure"),
+    IMAGE_UNAVAILABLE("image_unavailable"),
+    FRAME_QUALITY("frame_quality"),
+    VISUAL_ACTIVITY("visual_activity"),
+    COVERAGE_INCOMPLETE("coverage_incomplete"),
+    ANALYSIS_TIMEOUT("analysis_timeout"),
+    FRAME_LIMIT("frame_limit"),
+    ANALYSIS_PENDING("analysis_pending"),
+    CLIP_CHANGED("clip_changed"),
+    BACKGROUND_PRIORITY_UNAVAILABLE("background_priority_unavailable"),
+    ANALYSIS_STORAGE_UNAVAILABLE("analysis_storage_unavailable"),
+}
+
 /** Every decoded frame is checked for scene change and usable exposure/contrast. The known native
  * four-row timestamp overlay is excluded, never the foreground. This is not object recognition. */
 internal class QuietFrameTracker {
@@ -116,13 +143,23 @@ internal class QuietFrameTracker {
         frames++
     }
 
-    fun proof(inputFrames: Int, inputEos: Boolean, decoderEos: Boolean, status: String? = null): JSONObject {
+    fun proof(inputFrames: Int, inputEos: Boolean, decoderEos: Boolean, status: String? = null,
+              reason: QuietAnalysisReason? = null): JSONObject {
         val duration = if (frames > 1) (checkNotNull(lastPts) - checkNotNull(firstPts)).coerceAtLeast(0) / 1_000 else 0L
         val complete = inputEos && decoderEos && ptsValid && inputFrames == frames && frames >= 20 &&
             duration in 30_000..120_000 && maxGapUs <= 150_000
+        val result = status ?: when { !qualityValid && frames > 0 -> "unavailable"
+            motionFrames > 0 -> "activity"; complete -> "quiet"; else -> "incomplete" }
+        val diagnosis = reason ?: when (result) {
+            "unavailable" -> if (!qualityValid && frames > 0) QuietAnalysisReason.FRAME_QUALITY else null
+            "activity" -> QuietAnalysisReason.VISUAL_ACTIVITY
+            "incomplete" -> QuietAnalysisReason.COVERAGE_INCOMPLETE
+            "not_analyzed" -> QuietAnalysisReason.ANALYSIS_PENDING
+            "error" -> QuietAnalysisReason.DECODER_FAILURE
+            else -> null
+        }
         return JSONObject().put("algorithm_version", QUIET_ALGORITHM_VERSION)
-            .put("status", status ?: when { !qualityValid && frames > 0 -> "unavailable"
-                motionFrames > 0 -> "activity"; complete -> "quiet"; else -> "incomplete" })
+            .put("status", result).put("reason", diagnosis?.wire ?: JSONObject.NULL)
             .put("input_frames", inputFrames).put("decoded_frames", frames).put("sampled_frames", frames)
             .put("duration_ms", duration).put("covered_ms", duration).put("max_gap_ms", (maxGapUs + 999) / 1_000)
             .put("motion_frames", motionFrames)
@@ -144,28 +181,44 @@ internal class QuietFrameTracker {
 /** No frames are retained. Hardware-only, one bounded sequential read, on the indexer's IO worker.
  * Permission, thermal, memory, decode and coverage failures all preserve normal upload behavior. */
 internal open class VisualQuietAnalyzer(private val context: Context) {
-    internal fun cpuTemperatureAcceptable(): Boolean = runCatching {
-        validCpuTemperature(File("/sys/class/thermal/thermal_zone0/type").readText().trim(),
+    internal open fun cpuResourceRefusal(): QuietAnalysisReason? = runCatching {
+        cpuTemperatureRefusal(File("/sys/class/thermal/thermal_zone0/type").readText().trim(),
             File("/sys/class/thermal/thermal_zone0/temp").readText().trim().toIntOrNull())
-    }.getOrDefault(false)
+    }.getOrDefault(QuietAnalysisReason.CPU_TEMPERATURE_UNAVAILABLE)
 
-    fun resourcesAvailable(): Boolean {
+    internal open fun resourceRefusal(): QuietAnalysisReason? {
+        var probeFailure = QuietAnalysisReason.BATTERY_TEMPERATURE_UNAVAILABLE
+        return runCatching {
         val battery = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        if ((battery?.getIntExtra("temperature", 0) ?: 0) >= 420) return false
+        batteryTemperatureRefusal(if (battery?.hasExtra("temperature") == true)
+            battery.getIntExtra("temperature", Int.MIN_VALUE) else null)?.let { return@runCatching it }
+        probeFailure = QuietAnalysisReason.SYSTEM_THERMAL_UNAVAILABLE
         val power = context.getSystemService(PowerManager::class.java)
-        if (Build.VERSION.SDK_INT >= 29 && power != null &&
-            power.currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE) return false
+        if (Build.VERSION.SDK_INT >= 29) {
+            if (power == null) return@runCatching QuietAnalysisReason.SYSTEM_THERMAL_UNAVAILABLE
+            if (power.currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE)
+                return@runCatching QuietAnalysisReason.SYSTEM_THERMAL_GUARD
+        }
+        probeFailure = QuietAnalysisReason.MEMORY_PROBE_UNAVAILABLE
         val memory = ActivityManager.MemoryInfo()
-        context.getSystemService(ActivityManager::class.java)?.getMemoryInfo(memory)
-        return !memory.lowMemory && memory.availMem >= 128L * 1024 * 1024 && cpuTemperatureAcceptable()
+        val activity = context.getSystemService(ActivityManager::class.java)
+            ?: return@runCatching QuietAnalysisReason.MEMORY_PROBE_UNAVAILABLE
+        activity.getMemoryInfo(memory)
+        if (memory.lowMemory || memory.availMem < 128L * 1024 * 1024) return@runCatching QuietAnalysisReason.MEMORY_GUARD
+        cpuResourceRefusal()
+        }.getOrDefault(probeFailure)
     }
+
+    fun resourcesAvailable(): Boolean = resourceRefusal() == null
 
     open suspend fun analyze(uri: Uri, allowed: () -> Boolean): JSONObject {
         val tracker = QuietFrameTracker()
         var inputFrames = 0; var inputEos = false; var decoderEos = false
         var extractor: MediaExtractor? = null; var codec: MediaCodec? = null
+        var failure = QuietAnalysisReason.SOURCE_UNAVAILABLE
         try {
-            if (!allowed() || !resourcesAvailable()) return tracker.proof(0, false, false, "unavailable")
+            if (!allowed()) return tracker.proof(0, false, false, "unavailable", QuietAnalysisReason.POLICY_NOT_PERMITTED)
+            resourceRefusal()?.let { return tracker.proof(0, false, false, "unavailable", it) }
             val coroutine = currentCoroutineContext()
             val started = SystemClock.elapsedRealtime()
             extractor = MediaExtractor()
@@ -173,6 +226,7 @@ internal open class VisualQuietAnalyzer(private val context: Context) {
                 checkNotNull(descriptor)
                 extractor.setDataSource(descriptor.fileDescriptor)
             }
+            failure = QuietAnalysisReason.FORMAT_UNSUPPORTED
             val videoTracks = (0 until extractor.trackCount).map { it to extractor.getTrackFormat(it) }
                 .filter { it.second.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true }
             check(videoTracks.size == 1)
@@ -188,11 +242,12 @@ internal open class VisualQuietAnalyzer(private val context: Context) {
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible in capabilities.colorFormats &&
                         capabilities.isFormatSupported(format)
                 }.getOrDefault(false)
-            }?.name ?: return tracker.proof(0, false, false, "unavailable")
+            }?.name ?: return tracker.proof(0, false, false, "unavailable", QuietAnalysisReason.HARDWARE_DECODER_UNAVAILABLE)
             extractor.selectTrack(track)
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
             format.setInteger(MediaFormat.KEY_PRIORITY, 1)
             format.setFloat(MediaFormat.KEY_OPERATING_RATE, 60f)
+            failure = QuietAnalysisReason.DECODER_FAILURE
             codec = MediaCodec.createByCodecName(name)
             codec.configure(format, null, null, 0)
             codec.start()
@@ -200,9 +255,9 @@ internal open class VisualQuietAnalyzer(private val context: Context) {
             var lastResourceCheck = started
             while (!decoderEos && SystemClock.elapsedRealtime() - started < 90_000 && tracker.frames < 7_200) {
                 coroutine.ensureActive()
-                if (!allowed()) break
+                if (!allowed()) return tracker.proof(inputFrames, inputEos, false, "unavailable", QuietAnalysisReason.POLICY_NOT_PERMITTED)
                 if (SystemClock.elapsedRealtime() - lastResourceCheck >= 1_000) {
-                    if (!resourcesAvailable()) break
+                    resourceRefusal()?.let { return tracker.proof(inputFrames, inputEos, false, "unavailable", it) }
                     lastResourceCheck = SystemClock.elapsedRealtime()
                 }
                 if (!inputEos) {
@@ -225,20 +280,26 @@ internal open class VisualQuietAnalyzer(private val context: Context) {
                 val index = codec.dequeueOutputBuffer(info, 5_000)
                 if (index >= 0) try {
                     if (info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
-                        if (!cpuTemperatureAcceptable()) return tracker.proof(inputFrames, inputEos, false, "unavailable")
+                        cpuResourceRefusal()?.let { return tracker.proof(inputFrames, inputEos, false, "unavailable", it) }
+                        failure = QuietAnalysisReason.IMAGE_UNAVAILABLE
                         checkNotNull(codec.getOutputImage(index)).use { image ->
                             tracker.accept(luma(image), info.presentationTimeUs)
                         }
+                        failure = QuietAnalysisReason.DECODER_FAILURE
                         // Activity or unusable imagery already requires upload; stop wasting decoder/thermal budget.
                         if (tracker.motionFrames > 0 || !tracker.qualityValid) return tracker.proof(inputFrames, inputEos, false)
                     }
                     decoderEos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                 } finally { codec.releaseOutputBuffer(index, false) }
             }
-            return tracker.proof(inputFrames, inputEos, decoderEos)
+            return tracker.proof(inputFrames, inputEos, decoderEos, reason = when {
+                decoderEos -> null
+                tracker.frames >= 7_200 -> QuietAnalysisReason.FRAME_LIMIT
+                else -> QuietAnalysisReason.ANALYSIS_TIMEOUT
+            })
         } catch (error: Exception) {
             if (error is CancellationException) throw error
-            return tracker.proof(inputFrames, inputEos, decoderEos, "error")
+            return tracker.proof(inputFrames, inputEos, decoderEos, "error", failure)
         } finally {
             runCatching { codec?.stop() }; runCatching { codec?.release() }; runCatching { extractor?.release() }
         }
@@ -261,7 +322,16 @@ internal open class VisualQuietAnalyzer(private val context: Context) {
     }
 
     companion object {
-        internal fun validCpuTemperature(type: String?, milliC: Int?): Boolean = type == "soc-thmzone" &&
-            milliC != null && milliC in 10_000 until 85_000
+        internal fun cpuTemperatureRefusal(type: String?, milliC: Int?): QuietAnalysisReason? = when {
+            type != "soc-thmzone" || milliC == null || milliC !in 10_000..150_000 -> QuietAnalysisReason.CPU_TEMPERATURE_UNAVAILABLE
+            milliC >= 85_000 -> QuietAnalysisReason.CPU_TEMPERATURE_GUARD
+            else -> null
+        }
+        internal fun batteryTemperatureRefusal(tenthsC: Int?): QuietAnalysisReason? = when {
+            tenthsC == null || tenthsC !in -400..1_000 -> QuietAnalysisReason.BATTERY_TEMPERATURE_UNAVAILABLE
+            tenthsC >= 420 -> QuietAnalysisReason.BATTERY_TEMPERATURE_GUARD
+            else -> null
+        }
+        internal fun validCpuTemperature(type: String?, milliC: Int?): Boolean = cpuTemperatureRefusal(type, milliC) == null
     }
 }

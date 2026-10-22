@@ -51,7 +51,17 @@ measurement. Increasing its frequency does not remove the model's assumptions.
 ## Fallback and rollback
 
 Three consecutive completed cycles exceeding three seconds, or three consecutive
-cycles without the full critical set, disable the trial and record a bounded reason.
+cycles with genuinely failed critical requests, disable the trial and record a
+bounded reason. A malformed critical reply retains the existing elapsed-time
+cooldown and receives a chance to make its scheduled plain-request retry. Those
+intentional cooldown slots remain missing in the exported data; they freeze the
+missing-request counter instead of pretending to be additional failed requests.
+Other critical failures still advance that counter during the cooldown. The
+recovery allowance expires fifteen seconds after the first completed row with the
+critical reply absent;
+another malformed reply cannot extend it. A missing timing proof or an unexplained
+cooldown does not receive this allowance. A successful retained reply clears that
+PID's recovery deadline. The three-second work-overrun limit is unchanged.
 An uncertain transport failure also disables it before the safe reconnection path.
 The trial segment is retained as interrupted. A subsequent safe
 connection uses plan 7, keeping its original timing contract. A transport fault
@@ -75,7 +85,7 @@ schedule and are shown as unavailable; the older plans retain those counts.
 ## Deployment and physical acceptance
 
 1. Deploy the matching server and verify its revision and health.
-2. Install the production-signed 0.3.12 update in place, retaining configuration and
+2. Install the production-signed 0.3.13 update in place, retaining configuration and
    storage permissions. Verify the pinned signing certificate before installation.
 3. Explicitly enable the trial, then use a normal drive. No accessory-power hold
    is needed for a driving test.
@@ -84,12 +94,24 @@ schedule and are shown as unavailable; the older plans retain those counts.
 5. Verify the exported bundle, server totals and web graphs agree. A successful
    build or import does not establish sustained physical polling performance.
 
+The first physical trial on 22 October 2026 recorded seventeen rows over 57.311
+seconds before falling back to plan 7. Speed and RPM succeeded on every request;
+MAF had fourteen successful requests, one malformed reply and two intentional
+cooldown skips. The old row-based failure counter stopped the trial before its
+plain MAF retry. The follow-up recovery tests replay those retained row times and
+verify that a real retry is allowed, that rejected and skipped readings stay
+missing, and that failed retries, recovery expiry, overruns and transport faults
+still stop the trial. The three subsequent baseline segments imported correctly.
+All four camera-exported summaries matched the server's distance and fuel totals
+within floating-point rounding. Sustained three-second performance remains
+unverified; the short initial segment does not establish it.
+
 Automated validation covers timing skew, changed row delays, missing MAF, sequence
 and transport gaps, cadence-specific limits, overload fallback and unchanged
 legacy behavior. Sustained three-second performance remains unverified until the
 new package has completed a real drive.
 
-Local validation on 22 October 2026 passed 274 Android JVM tests, 3,320 backend
+Earlier 0.3.12 validation on 22 October 2026 passed 274 Android JVM tests, 3,320 backend
 tests (33 platform/fixture skips) and 229 frontend tests. Android debug lint and
 assembly, frontend typechecking/lint/production build, and Python Ruff checks and
 formatting passed. The web view was also checked with clearly labelled synthetic

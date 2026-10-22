@@ -96,6 +96,23 @@ test('disabled exclusions and later local copies are explained separately', () =
   assert.match(local, /1 of these clips also have a local copy/)
 })
 
+test('thermal refusals and decoder failures are distinguished without implying skipped footage', () => {
+  const policyAnalysis = { status: 'ready', stale: false, clipCount: 6,
+    checkedAt: new Date().toISOString(), reasonCounts: { cpuTemperatureGuard: 4, decoderFailure: 1, reasonNotReported: 1 } }
+  const html = render(MovementManifestEvidence, { data: { ...report, intentionalExclusions: { ...exclusions, currentCount: 0 }, policyAnalysis } })
+  assert.match(html, /Processor at or above the 85°C analysis limit: 4 clips/)
+  assert.match(html, /Video decoder failed: 1 clip/)
+  assert.match(html, /Companion did not report the refusal reason: 1 clip/)
+  assert.match(html, /footage without a complete quiet proof uploads normally/)
+  assert.doesNotMatch(html, /4 clips .* excluded/)
+  const stale = render(MovementManifestEvidence, { data: { ...report, intentionalExclusions: exclusions,
+    policyAnalysis: { ...policyAnalysis, stale: true } } })
+  assert.match(stale, /Last reported visual checks/)
+  assert.match(stale, /saved diagnostics, current camera conditions unverified/)
+  const failed = render(MovementManifestEvidence, { data: { ...report, intentionalExclusions: exclusions, policyAnalysis }, error: true })
+  assert.doesNotMatch(failed, /Processor at or above/)
+})
+
 test('an awake flag alone never renders as a verified maintenance lease', () => {
   const active = { active: true, verified: true, state: 'active', remainingS: 300, evidenceValidForS: 12 }
   assert.match(render(MaintenanceWakeEvidence, { data: active }), /Verified wake hold/)

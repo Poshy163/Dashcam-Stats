@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from weakref import WeakKeyDictionary
 
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, inspect, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -149,6 +150,31 @@ class _Cluster:
         return max(as_utc(r.ended_at or r.started_at) for r in self.recordings if r.started_at)
 
 
+class JourneyRefreshConflict(RuntimeError):
+    """A derived plan lost a concurrent membership/content publication race."""
+
+
+@dataclass
+class _RefreshProjection:
+    journey: SimpleNamespace
+    recordings: list[SimpleNamespace]
+    rejected_ids: set[int] = field(default_factory=set)
+    reject_quality: GpsQuality = GpsQuality.REJECTED
+    reject_reason: GpsReason = GpsReason.ISOLATED_POSITION_OUTLIER
+    stale_tracks: list[int] = field(default_factory=list)
+    stale_observations: list[int] = field(default_factory=list)
+    point_count: int = 0
+    radius_m: float | None = None
+
+
+@dataclass
+class _RefreshPlan:
+    projection: _RefreshProjection
+    expected_records: dict[int, dict]
+    expected_journey: tuple | None
+    member_ids: set[int] | None
+
+
 class JourneyBuilder:
     """Builds and refreshes journeys from the recording index."""
 
@@ -211,6 +237,23 @@ class JourneyBuilder:
 
         intentional_gaps = await self._intentional_gaps(session, movable)
         clusters = self._cluster(movable, gap, use_gps, max_jump_m, intentional_gaps)
+        # A changed cluster is rolled back and deferred independently. Keep planning
+        # snapshots detached so that rollback cannot expire a later cluster's ORM
+        # attributes and abort otherwise independent work.
+        clusters = [
+            _Cluster(
+                [
+                    SimpleNamespace(
+                        **{
+                            column.key: getattr(recording, column.key)
+                            for column in Recording.__table__.columns
+                        }
+                    )
+                    for recording in cluster.recordings
+                ]
+            )
+            for cluster in clusters
+        ]
         # Keep every old membership until its replacement commits. Deleting the library
         # before the first per-journey commit published an almost empty library and left
         # the remaining recordings orphaned if the rebuild stopped. Reusing a row also
@@ -241,6 +284,12 @@ class JourneyBuilder:
         for index, cluster in enumerate(clusters):
             recording_ids = [r.id for r in cluster.recordings]
             try:
+                with session.no_autoflush:
+                    plan = await self._prepare_refresh(
+                        session,
+                        Journey(started_at=cluster.started_at, ended_at=cluster.ended_at),
+                        recordings=cluster.recordings,
+                    )
                 # SQLite defers BEGIN until the first write. Reserve its writer for this
                 # cluster before re-reading eligibility: a SELECT followed by an
                 # unconditional attach could overwrite a concurrent manual merge.
@@ -363,11 +412,25 @@ class JourneyBuilder:
                     journey = Journey(started_at=cluster.started_at, ended_at=cluster.ended_at)
                     session.add(journey)
                     await session.flush()
-                used_ids.add(journey.id)
-                await self._attach(session, recording_ids, journey.id, recordings_only=True)
-                await self.refresh(session, journey)
+                with session.no_autoflush:
+                    await self._publish_refresh(session, journey, plan, guarded=True)
                 await commit_with_retry(session, what="rebuild journey")
+                used_ids.add(journey.id)
                 rebuilt += 1
+            except JourneyRefreshConflict:
+                # A normal worker may finish another stage while the read plan is
+                # derived. Keep that cluster's existing membership, let the next
+                # bounded maintenance pass re-plan it, and finish unrelated clusters.
+                await session.rollback()
+                deferred_ids.update(
+                    expected[row_id][0]
+                    for row_id in recording_ids
+                    if expected[row_id][0] is not None
+                )
+                log.info(
+                    "deferred a journey cluster changed during derivation",
+                    recordings=len(recording_ids),
+                )
             except BaseException:
                 # The caller may keep using its session after an interrupted rebuild.
                 # Never leave a half-published attach or failed flush waiting to commit.
@@ -380,12 +443,6 @@ class JourneyBuilder:
         removed = 0
         for journey_id in sorted(source_ids - used_ids - deferred_ids):
             try:
-                await session.execute(
-                    update(Journey)
-                    .where(Journey.id == journey_id, Journey.manual.is_(False))
-                    .values(updated_at=Journey.updated_at)
-                    .execution_options(synchronize_session=False)
-                )
                 journey = await session.scalar(
                     select(Journey)
                     .where(Journey.id == journey_id, Journey.manual.is_(False))
@@ -495,9 +552,9 @@ class JourneyBuilder:
                 break
             after = batch[-1].id
             corrected += await self._refresh_start_positions(session, batch)
-            # The flush is what makes it safe to let the batch go; without it the identity
-            # map is the only thing holding the pending updates.
-            await session.flush()
+            # End the writer transaction before reading the next batch. A flush alone
+            # kept the first changed batch's SQLite lock across the whole library.
+            await commit_with_retry(session, what="repair recording start positions")
             session.expunge_all()
         return corrected
 
@@ -676,6 +733,7 @@ class JourneyBuilder:
         )
         for journey in stale:
             await self.refresh(session, journey)
+            await commit_with_retry(session, what="repair journey rollup")
         if stale:
             log.info("recomputed journeys with stale rollups", journeys=len(stale))
         return len(stale)
@@ -895,53 +953,241 @@ class JourneyBuilder:
 
     # -- rollups -----------------------------------------------------------------------
 
-    async def refresh(self, session: AsyncSession, journey: Journey) -> Journey:
-        """Recompute a journey's aggregates from its recordings and telemetry.
+    async def refresh(
+        self,
+        session: AsyncSession,
+        journey: Journey,
+        *,
+        include_recording: Recording | None = None,
+    ) -> Journey:
+        """Derive without a writer, then atomically publish a still-current snapshot."""
+        try:
+            with session.no_autoflush:
+                plan = await self._prepare_refresh(
+                    session, journey, include_recording=include_recording
+                )
+                await self._publish_refresh(session, journey, plan)
+        except JourneyRefreshConflict:
+            # A retained caller session cannot later commit the rejected plan's dirty
+            # completion fields or its writer reservation.
+            await session.rollback()
+            raise
+        return journey
 
-        Read everything, decide everything, *then* write. The order is load-bearing rather
-        than tidy. Under SQLite a transaction holds the write lock from its first write
-        until it ends, and this method used to open one with ``_attach`` and then spend the
-        rest of its time reading -- every telemetry point of the journey, twice, plus a
-        streamed pass for distance. On a library where a rebuild refreshes forty-five
-        journeys inside one transaction that is minutes of held lock, and the workers'
-        first write of a stage (``DELETE FROM telemetry_points``, ``DELETE FROM
-        tracked_objects``) blew straight past its thirty second ``busy_timeout`` and failed
-        the whole recording. Those two statements are exactly the ones that showed up in
-        the failure log.
+    async def _recording_snapshot(
+        self, session: AsyncSession, ids: Sequence[int]
+    ) -> dict[int, dict]:
+        rows = {}
+        for start in range(0, len(ids), _ID_CHUNK):
+            result = await session.execute(
+                select(Recording.__table__).where(Recording.id.in_(ids[start : start + _ID_CHUNK]))
+            )
+            rows.update((row["id"], dict(row)) for row in result.mappings())
+        return rows
 
-        One read of the journey's telemetry now serves the outlier pass, the bounds, the
-        distance and the endpoints -- which is fewer queries than the four separate passes
-        it replaces, as well as a far shorter write.
-        """
+    async def _prepare_refresh(
+        self,
+        session: AsyncSession,
+        journey: Journey,
+        *,
+        include_recording: Recording | None = None,
+        recordings: Sequence[Recording] | None = None,
+    ) -> _RefreshPlan:
+        # Table projections do not return stale identity-map values and never mutate ORM
+        # objects. Keep the exact pre-publication row snapshots for the final CAS.
+        expected_journey = None
+        member_ids = None
+        if journey.id is not None:
+            row = (
+                await session.execute(
+                    select(Journey.updated_at, Journey.manual).where(Journey.id == journey.id)
+                )
+            ).one_or_none()
+            if row is None:
+                raise JourneyRefreshConflict("journey disappeared before refresh")
+            manual_history = inspect(journey).attrs.manual.history
+            selected_manual = (
+                manual_history.deleted[0] if manual_history.deleted else journey.manual
+            )
+            if tuple(row) != (journey.updated_at, selected_manual):
+                raise JourneyRefreshConflict("journey changed before refresh preparation")
+            expected_journey = tuple(row)
+        if recordings is None:
+            member_ids = (
+                set(
+                    (
+                        await session.scalars(
+                            select(Recording.id).where(
+                                Recording.journey_id == journey.id,
+                                Recording.ignored.is_(False),
+                                _journey_ready_recording(),
+                            )
+                        )
+                    ).all()
+                )
+                if journey.id is not None
+                else set()
+            )
+            ids = set(member_ids)
+            if include_recording is not None:
+                ids.add(include_recording.id)
+        else:
+            ids = {recording.id for recording in recordings}
+        expected = await self._recording_snapshot(session, sorted(ids))
+        if set(expected) != ids:
+            raise JourneyRefreshConflict("a recording disappeared before journey refresh")
+        if include_recording is not None and (
+            expected[include_recording.id]["journey_id"] != include_recording.journey_id
+            or expected[include_recording.id]["ignored"] != include_recording.ignored
+        ):
+            raise JourneyRefreshConflict("recording membership changed before journey refresh")
+        projected = []
+        for row_id, values in expected.items():
+            values = dict(values)
+            if include_recording is not None and row_id == include_recording.id:
+                # The completing stage's pending fields belong to this publication.
+                # Existing membership and user edits remain the database snapshot above.
+                state = inspect(include_recording)
+                values.update(
+                    {attr.key: attr.value for attr in state.attrs if attr.history.has_changes()}
+                )
+            projected.append(SimpleNamespace(**values))
+        projected.sort(
+            key=lambda row: (as_utc(row.started_at) or datetime.min.replace(tzinfo=UTC), row.id)
+        )
+        shadow = SimpleNamespace(
+            **{column.key: getattr(journey, column.key) for column in Journey.__table__.columns}
+        )
+        projection = await self._derive_refresh(session, shadow, projected)
+        return _RefreshPlan(projection, expected, expected_journey, member_ids)
+
+    async def _publish_refresh(
+        self,
+        session: AsyncSession,
+        journey: Journey,
+        plan: _RefreshPlan,
+        *,
+        guarded: bool = False,
+    ) -> None:
+        # Acquire the writer only now. A manual edit or an arriving member during the
+        # derivation must invalidate the plan, rather than be overwritten by it.
+        if not guarded:
+            if journey.id is not None:
+                expected = plan.expected_journey
+                if expected is None:
+                    raise JourneyRefreshConflict("journey refresh target changed")
+                result = await session.execute(
+                    update(Journey)
+                    .where(
+                        Journey.id == journey.id,
+                        Journey.updated_at == expected[0],
+                        Journey.manual == expected[1],
+                    )
+                    .values(updated_at=Journey.updated_at)
+                    .execution_options(synchronize_session=False)
+                )
+                if result.rowcount != 1:
+                    raise JourneyRefreshConflict("journey changed while refresh was being derived")
+            elif plan.expected_records:
+                await session.execute(
+                    update(Recording)
+                    .where(Recording.id == next(iter(plan.expected_records)))
+                    .values(journey_id=Recording.journey_id)
+                    .execution_options(synchronize_session=False)
+                )
+        current = await self._recording_snapshot(session, sorted(plan.expected_records))
+        if current != plan.expected_records:
+            raise JourneyRefreshConflict(
+                "recording changed while journey refresh was being derived"
+            )
+        if plan.member_ids is not None and journey.id is not None:
+            members = set(
+                (
+                    await session.scalars(
+                        select(Recording.id).where(
+                            Recording.journey_id == journey.id,
+                            Recording.ignored.is_(False),
+                            _journey_ready_recording(),
+                        )
+                    )
+                ).all()
+            )
+            if members != plan.member_ids:
+                raise JourneyRefreshConflict(
+                    "journey membership changed while refresh was being derived"
+                )
+        projection = plan.projection
+        shadow = projection.journey
+        for column in Journey.__table__.columns:
+            if column.key not in {"id", "manual", "title", "created_at", "updated_at"}:
+                setattr(journey, column.key, getattr(shadow, column.key))
+        updates = []
+        for projected in projection.recordings:
+            values = {
+                key: getattr(projected, key)
+                for key in (
+                    "start_lat",
+                    "start_lon",
+                    "gps_point_count",
+                    "has_gps",
+                    "gps_rejected_count",
+                )
+            }
+            recording = session.identity_map.get(session.identity_key(Recording, projected.id))
+            if recording is not None:
+                for key, value in values.items():
+                    setattr(recording, key, value)
+            elif any(
+                plan.expected_records[projected.id][key] != value for key, value in values.items()
+            ):
+                updates.append({"id": projected.id, **values})
+        await session.flush()
+        if updates:
+            await session.execute(update(Recording), updates)
+        if projection.rejected_ids:
+            await self._clear_positions(
+                session,
+                projection.rejected_ids,
+                quality=projection.reject_quality,
+                reason=projection.reject_reason,
+            )
+        for model, ids in (
+            (TrackedObject, projection.stale_tracks),
+            (PlateObservation, projection.stale_observations),
+        ):
+            if ids:
+                await session.execute(
+                    update(model)
+                    .where(model.id.in_(ids))
+                    .values(lat=None, lon=None)
+                    .execution_options(synchronize_session=False)
+                )
+        if projection.rejected_ids or projection.stale_tracks or projection.stale_observations:
+            log.info(
+                "discarded positions that cannot belong to this journey",
+                journey_id=journey.id,
+                telemetry=len(projection.rejected_ids),
+                of=projection.point_count,
+                sightings=len(projection.stale_tracks),
+                plate_observations=len(projection.stale_observations),
+                radius_km=round(projection.radius_m / 1000.0, 1) if projection.radius_m else None,
+            )
+        await self._attach(session, list(plan.expected_records), journey.id)
+        await session.flush()
+
+    async def _derive_refresh(
+        self,
+        session: AsyncSession,
+        journey: SimpleNamespace,
+        recordings: list[SimpleNamespace],
+    ) -> _RefreshProjection:
         settings = get_settings_service()
         min_move_m = float(settings.get_nowait("telemetry.min_move_metres"))
 
-        recordings = list(
-            (
-                await session.execute(
-                    select(Recording)
-                    .where(
-                        Recording.journey_id == journey.id,
-                        # The same members the journey's own page lists. `get_journey`
-                        # selects on `ignored is False` as well as the revisions
-                        # (api/routes/content.py, via `visible_revision`), and this query
-                        # did not -- so a journey holding a hidden recording counted a
-                        # member it then declined to show, and every tile derived from
-                        # this list said so: the count, the distance, the vehicle and
-                        # plate totals. Hiding damaged footage is routine here, which is
-                        # what made the two disagree in ordinary use rather than in some
-                        # corner.
-                        Recording.ignored.is_(False),
-                        _journey_ready_recording(),
-                    )
-                    .order_by(Recording.started_at.asc())
-                )
-            ).scalars()
-        )
         journey.recording_count = len(recordings)
         if not recordings:
             journey.motion_json = assess_motion([]).evidence
-            return journey
+            return _RefreshProjection(journey, recordings)
 
         starts = [as_utc(r.started_at) for r in recordings if r.started_at]
         ends = [as_utc(r.ended_at or r.started_at) for r in recordings if r.started_at]
@@ -997,7 +1243,9 @@ class JourneyBuilder:
         # Which of those coordinates cannot belong to this drive at all. Computed over
         # *every* point, so the write phase below clears every copy of a bad one; the
         # single track assembled next is only for measuring.
-        rejected_ids, centre, radius_m = self._find_outliers(points, journey.duration_s)
+        rejected_ids, centre, radius_m = await asyncio.to_thread(
+            self._find_outliers, points, journey.duration_s
+        )
 
         # The one shape the outlier pass above is structurally unable to judge: a journey
         # with no satellite lock anywhere in it, whose only "positions" are the placeholder
@@ -1024,9 +1272,11 @@ class JourneyBuilder:
             )
 
         good = [p for p in points if p.id not in rejected_ids]
-        track = self._one_track(good, recordings, front_ids)
-        motion = assess_motion(track)
-        observed_distance, observed_average = self._measure(track, min_move_m)
+        track = await asyncio.to_thread(self._one_track, good, recordings, front_ids)
+        motion = await asyncio.to_thread(assess_motion, track)
+        observed_distance, observed_average = await asyncio.to_thread(
+            self._measure, track, min_move_m
+        )
         journey.motion_json = {
             **motion.evidence,
             "observed_distance_m": observed_distance,
@@ -1139,7 +1389,9 @@ class JourneyBuilder:
             recording.has_gps = surviving > 0
             recording.gps_rejected_count = (recording.gps_rejected_count or 0) + newly_rejected
 
-        journey.distance_m, journey.avg_speed_kmh = self._measure(track, min_move_m)
+        journey.distance_m, journey.avg_speed_kmh = await asyncio.to_thread(
+            self._measure, track, min_move_m
+        )
         if motion.evidence["status"] != "moving":
             # Insufficient evidence does not establish zero movement. Show unknown
             # validated statistics and retain the observed values in the assessment.
@@ -1147,46 +1399,17 @@ class JourneyBuilder:
         journey.vehicle_count = int(counts[0] or 0)
         journey.unique_plate_count = int(counts[1] or 0)
 
-        # -- writes ----------------------------------------------------------------------
-        if rejected_ids:
-            await self._clear_positions(
-                session, rejected_ids, quality=reject_quality, reason=reject_reason
-            )
-        if stale_tracks:
-            await session.execute(
-                update(TrackedObject)
-                .where(TrackedObject.id.in_(stale_tracks))
-                .values(lat=None, lon=None)
-                .execution_options(synchronize_session=False)
-            )
-        if stale_observations:
-            await session.execute(
-                update(PlateObservation)
-                .where(PlateObservation.id.in_(stale_observations))
-                .values(lat=None, lon=None)
-                .execution_options(synchronize_session=False)
-            )
-        if rejected_ids or stale_tracks or stale_observations:
-            log.info(
-                "discarded positions that cannot belong to this journey",
-                journey_id=journey.id,
-                telemetry=len(rejected_ids),
-                of=len(points),
-                sightings=len(stale_tracks),
-                plate_observations=len(stale_observations),
-                radius_km=round(radius_m / 1000.0, 1) if radius_m else None,
-            )
-
-        # Re-point the denormalised journey ids every time, not only when a recording is
-        # first attached. The route map and the heat map's journey filter read
-        # telemetry_points.journey_id, so a journey whose telemetry was written before it
-        # existed -- or attached by a path that only set recordings.journey_id -- draws
-        # nothing at all. Idempotent, four statements, and it makes refresh the one place
-        # that puts a journey right.
-        await self._attach(session, recording_ids, journey.id)
-
-        await session.flush()
-        return journey
+        return _RefreshProjection(
+            journey,
+            recordings,
+            rejected_ids,
+            reject_quality,
+            reject_reason,
+            stale_tracks,
+            stale_observations,
+            len(points),
+            radius_m,
+        )
 
     @staticmethod
     def _one_track(points: list, recordings: list[Recording], front_ids: set[int]) -> list:
@@ -1441,6 +1664,12 @@ class JourneyBuilder:
         return round(distance, 1), avg
 
     async def assign_recording(self, session: AsyncSession, recording: Recording) -> Journey | None:
+        with session.no_autoflush:
+            return await self._assign_recording(session, recording)
+
+    async def _assign_recording(
+        self, session: AsyncSession, recording: Recording
+    ) -> Journey | None:
         """Attach one freshly processed recording to a journey.
 
         Cheaper than a full rebuild for the common case of a single new segment arriving.
@@ -1513,15 +1742,15 @@ class JourneyBuilder:
                 ended_at=as_utc(recording.ended_at or recording.started_at),
             )
             session.add(journey)
-            await session.flush()
 
         # Through _attach, not a bare assignment: the route map and the heat map's journey
         # filter read telemetry_points.journey_id, not recordings.journey_id. Setting only
         # the latter attached the recording while leaving its telemetry orphaned, so an
         # incrementally built journey had a correct recording list and an empty route.
-        await self._attach(session, [recording.id], journey.id)
-        await session.flush()
-        await self.refresh(session, journey)
+        # The new member is included in the read plan without attaching/flushing it
+        # first. Refresh publishes membership and all denormalised pointers only once
+        # its potentially large telemetry derivation has finished.
+        await self.refresh(session, journey, include_recording=recording)
         return journey
 
     # -- manual edits ------------------------------------------------------------------

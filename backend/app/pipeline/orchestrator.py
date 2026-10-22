@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.logging import get_logger
 from app.db.models import Journey, Recording, RecordingState, StageState
 from app.db.retry import commit_with_retry, is_locked_error
+from app.journeys.builder import JourneyRefreshConflict
 from app.pipeline.revisions import CURRENT_REVISIONS, INVALIDATED_REVISION, REVISION_FIELDS
 from app.pipeline.stages import STAGE_ORDER, STAGES, StageError, StageResult
 
@@ -423,7 +424,7 @@ async def run_stages(
             # the expensive mistake is the other way round, and a genuinely permanent
             # fault raises StageError with `permanent` set. `transient` is carried
             # separately so the queue can tell a database lock from a real defect.
-            report.transient = is_locked_error(exc)
+            report.transient = is_locked_error(exc) or isinstance(exc, JourneyRefreshConflict)
             recording.state = RecordingState.FAILED
             recording.error_message = report.error
             recording.error_count += 1

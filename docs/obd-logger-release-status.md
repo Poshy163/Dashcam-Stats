@@ -13,14 +13,71 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | 7 reported while parked; the three-second plan 8 trial is armed for the next drive |
-| Deployment | Production-signed 0.3.12/code 25 was installed in place on 22 October 2026, retaining configuration and permissions. The running companion's revision and version were verified separately from the APK. Both quiet-filter opt-ins remain enabled with unchanged thermal and proof gates. No physical three-second drive has been accepted. |
+| Poll plan | Latest completed segment used baseline plan 7; the physical plan 8 trial fell back after 57 seconds |
+| Deployment | Production-signed 0.3.12/code 25 was installed in place on 22 October 2026, retaining configuration and permissions. The running companion's revision and version were verified separately from the APK. Both quiet-filter opt-ins remain enabled with unchanged thermal and proof gates. Sustained three-second polling and genuine quiet exclusions remain unverified. |
+
+## 0.3.13 candidate
+
+Source version **0.3.13/code 26** addresses the issues found in the 22 October drive
+review. It has not been installed on the camera. Deploy the matching server before
+updating the production-signed companion, then explicitly re-arm the polling trial.
+A new physical drive is required to accept the polling fix, and a sufficiently cool
+camera is required to exercise quiet decoding.
+
+- Critical-reading health distinguishes an actual failed reply from a bounded,
+  intentional parser cooldown. Missing values remain missing; the parser and transport
+  validation are unchanged, and cooldown cannot defer fallback indefinitely.
+- Journey derivation and recording-position repair avoid carrying SQLite write locks
+  through expensive reads and calculations. Radio ownership and restoration remain
+  fenced and fail closed; diagnostic errors retain the preparation or lease failure
+  instead of disguising it as an operator cancellation.
+- Quiet-analysis reports retain bounded refusal reasons. Thermal/resource refusal
+  still preserves upload, with the 85 C processor and 42 C battery limits unchanged.
+  A reason is diagnostic evidence and cannot authorize an exclusion.
+
+Local 0.3.13 validation on 22 October passed 3,451 backend tests with 34 skips;
+Ruff lint and formatting passed across 304 files. All 284 Android JVM tests passed, including
+the optional private footage-grid replay, with no skips or failures. Debug/release
+lint had zero errors and 58 warnings per variant; both APK assemblies passed. All
+231 frontend tests, typecheck, lint and the production build passed. The actual
+Backup-page component was visually checked with clearly labelled synthetic refusal
+counts, including separate saved/stale wording. These checks do not establish
+physical decoder capacity or sustained three-second operation on the camera.
 
 ## 0.3.12 polling trial
 
-Companion 0.3.12/code 25 from build `6875998` is installed. Its three-second trial is
-armed for the next drive; the parked companion still reports baseline plan 7. No
-physical three-second drive has been accepted.
+Companion 0.3.12/code 25 from build `6875998` is installed. A physical drive on
+22 October exercised plan 8 from 16:53:02 to 16:53:59 Australia/Adelaide. Median
+successful response intervals were approximately 3.10 seconds for speed, 3.12 for
+RPM and 3.17 for MAF. One malformed MAF reply was followed by two intentional
+cooldown skips; the trial counted the three missing rows and fell back before its
+plain-request retry. The recorded reason was `critical_readings_missing`, not a
+sustained-overrun or speed/RPM parser failure. This is brief physical operation,
+not acceptance of sustained three-second polling.
+
+The three drives produced four verified bundles because fallback split the first
+drive. All 509 sample timestamps, quality metadata and critical readings agreed
+between the exported bundles and server series. Distance and fuel totals agreed:
+30.348 km and 2.566 L estimated. Later baseline speed/RPM median intervals were
+approximately 5.1 seconds; missing speed/RPM rows occurred at shutdown tails.
+PID 15 remained unavailable (40 malformed and two missing replies), and the retained
+combined validation error does not identify a defective vehicle sensor.
+
+Normal ignition-off backup run 592 copied 135 files / 7,680,620,244 bytes and finished
+`ok`, with Bluetooth, hotspot and logger restoration verified. Both camera streams
+have indexed clips covering the three driving intervals, with no start interval
+above 61 seconds; this is file continuity, not visual review of every frame. The
+automatic scanner found 131 new recordings with zero invalid, missing or scan errors.
+Processing began, but concurrent database-lock errors caused retries and stopped
+follow-up run 593 before copying. Its logger resumed and radios were never disabled;
+the remaining nine clips were later parked footage. The exact live lock holder was
+not established.
+
+The enabled quiet filter made no genuine exclusions. Six fresh visual results were
+unavailable before decoding any frames. Captured processor temperature reached
+97.8 C after return, above the unchanged 85 C decoder limit, but 0.3.12 did not retain
+the exact refusal reason. Do not infer successful junk removal from enablement or
+advisory movement labels.
 
 The in-place installation on 22 October 2026 retained existing configuration and
 permissions. The APK matched the pinned production signing certificate and had SHA-256
@@ -43,7 +100,7 @@ permissions. The APK matched the pinned production signing certificate and had S
   behavior was visually checked with synthetic fixtures. These are implementation
   checks; no physical three-second drive has been accepted.
 
-### Server maintenance retry update (physical acceptance pending)
+### Server maintenance retry update (deployed and physically exercised)
 
 The implementation now records explicit version-three `native_verified` provenance
 after a witnessed countdown cancellation and durable same-boot post-gesture proof.
@@ -63,8 +120,8 @@ The UI snapshot helper now serializes its accessibility ownership with an on-dev
 kernel lock, and transient heartbeat transport failures may retry within the original
 evidence budget. The Backup page explains retry prerequisites and still requires new
 server verification. All 230 frontend tests, typecheck, lint and build pass. Live
-acceptance of this maintenance fix, a resulting backup and subsequent requested sleep
-remains pending; installation of 0.3.12 alone does not verify that server-only path.
+acceptance was subsequently performed separately from the APK installation, as recorded
+below.
 
 Live investigation on 22 October reproduced a separate transport race: a normal
 5,432-byte UI snapshot became an empty successful shell reply when discovery
@@ -75,7 +132,15 @@ address guard prevents reconnects and daemon-root restarts during maintenance
 preparation and active holds. Admission closes and the guard is released before
 radio restoration, so a dead connection can still recover. Empty replies require
 complete bounded reproof; malformed nonempty replies remain refused. The resumed
-production poller and backup still need physical acceptance.
+production poller and backup were then exercised successfully on revision `09c9de8`.
+Run 591 copied 210 files / 12,683,360,592 bytes and durably finished `ok` on 22 October
+at 06:01:10 UTC. The bounded maintenance hold retained fresh verified evidence through
+the copy without an accessory-power cycle. Bluetooth, hotspot and logger restoration
+were verified before ending the hold. The guarded vendor-native sleep operation was
+sent and the camera remained offline; a post-sleep kernel suspend counter was not
+observed. Automatic backups were restored. A later normal drive cleared the
+cancellation marker and supplied a fresh native ignition-off window for run 592;
+that observation does not isolate the camera-recorded-only recovery path.
 
 ### What changed in 0.3.11
 
@@ -415,7 +480,7 @@ First integrate/review the release source in the protected signing checkout, or 
 protected build host to use the existing signing files. The original checkout may still contain
 older source and unrelated local changes: do not blindly pull, switch branches or overwrite it.
 Fresh worktrees do not contain the signing files. From the chosen source checkout, after verifying
-`app/build.gradle.kts` declares version 0.3.12/code 25:
+`app/build.gradle.kts` declares version 0.3.13/code 26:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
@@ -443,7 +508,7 @@ other settings, the metrics toggle works, and `Bundles waiting for the server` d
 next Wi-Fi window. Verify webhook events reach the server and boot recovery still works.
 
 After ingestion obtains a fresh status snapshot, `GET /api/obd/status` should report
-`app_version_name: "0.3.12"` and `app_version_code: 25` under `logger`. A cached status alone does
+`app_version_name: "0.3.13"` and `app_version_code: 26` under `logger`. A cached status alone does
 not establish the currently installed/running version.
 
 ## What is still left to do
@@ -466,9 +531,10 @@ Remaining work and physical checks:
    folder permission loss, sustained paired decoding and recording within the thermal limits,
    an actual quiet exclusion retained on the card, an activity upload, and their downstream
    scan/job state. App-UID thermal access, native countdown cancellation, fresh maintenance
-   heartbeat evidence and subsequent radio/logger restoration are verified. Planned hold
-   expiry, physical acceptance of the version-three same-boot retry and the scope of
-   the early heartbeat-loss cause still need investigation.
+   heartbeat evidence, the version-three same-boot retry and subsequent radio/logger
+   restoration are verified. The discovery transport race was reproduced and guarded;
+   that does not establish every possible cause of heartbeat loss. Planned hold expiry
+   and isolated camera-recorded-only power-cycle recovery still need physical acceptance.
    Advisory labels remain report only. Both visual-policy opt-ins were enabled on
    22 October at the operator's request, with unchanged resource and proof gates.
    The camera was above the 85 C limit; genuine exclusion, parked-activity transfer and

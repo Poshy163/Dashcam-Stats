@@ -224,9 +224,9 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                     !stopped && enabled && allowed() && wallMs() < deadline
                 } } catch (error: Exception) {
                     if (error is CancellationException) throw error
-                    emptyVisual("error")
+                    emptyVisual("error", QuietAnalysisReason.DECODER_FAILURE)
                 }
-                if (!unchanged(candidate.clip)) visual = emptyVisual("incomplete")
+                if (!unchanged(candidate.clip)) visual = emptyVisual("incomplete", QuietAnalysisReason.CLIP_CHANGED)
                 // Failure must upload rather than enter another defer after a process restart.
                 synchronized(cacheLock) {
                     cached.remove(identity); cached[identity] = JSONObject(visual.toString())
@@ -239,12 +239,12 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                 analyzeCandidate()
                 rows = evaluate(items, card, wallMs())
             } else analysisJob = analysisScope.launch(analysisDispatcher ?: ownedDecoderDispatcher.value) {
-                fun failed() {
+                fun failed(reason: QuietAnalysisReason = QuietAnalysisReason.ANALYSIS_STORAGE_UNAVAILABLE) {
                     // Cache persistence and metadata checks are optional too. A result that could
                     // not be persisted must not remain quiet in memory or escape into the logger's
                     // uncaught-coroutine handler. Disk recovery never extends its defer deadline.
                     synchronized(cacheLock) {
-                        cached.remove(identity); cached[identity] = emptyVisual("error")
+                        cached.remove(identity); cached[identity] = emptyVisual("error", reason)
                         while (cached.size > 128) cached.remove(cached.keys.first())
                     }
                     state = "unavailable"
@@ -252,8 +252,11 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                 try {
                     // Priority belongs to the dedicated thread, not a migrating IO coroutine.
                     // If the platform refused the priority change, preserve upload instead.
-                    if (analysisDispatcher == null) check(android.os.Process.getThreadPriority(
-                        android.os.Process.myTid()) >= android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                    if (analysisDispatcher == null && android.os.Process.getThreadPriority(
+                        android.os.Process.myTid()) < android.os.Process.THREAD_PRIORITY_BACKGROUND) {
+                        failed(QuietAnalysisReason.BACKGROUND_PRIORITY_UNAVAILABLE)
+                        return@launch
+                    }
                     analyzeCandidate()
                 } catch (error: Exception) {
                     if (error is CancellationException) throw error
@@ -324,13 +327,14 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
     }
 
     companion object {
-        fun emptyVisual(status: String = "not_analyzed"): JSONObject = QuietFrameTracker().proof(0, false, false, status)
+        fun emptyVisual(status: String = "not_analyzed", reason: QuietAnalysisReason? = null): JSONObject = QuietFrameTracker().proof(0, false, false, status, reason)
             .put("analysis_completed_at_utc", JSONObject.NULL)
 
         fun validVisual(proof: JSONObject): Boolean {
             val first = proof.optLong("first_pts_us", -1); val last = proof.optLong("last_pts_us", -1)
             val duration = proof.optLong("duration_ms")
             return proof.optInt("algorithm_version") == QUIET_ALGORITHM_VERSION && proof.optString("status") == "quiet" &&
+                (proof.isNull("reason") || !proof.has("reason")) &&
                 proof.optBoolean("input_eos") && proof.optBoolean("decoder_eos") && first >= 0 && last > first &&
                 proof.optInt("input_frames") == proof.optInt("decoded_frames") &&
                 proof.optInt("sampled_frames") == proof.optInt("decoded_frames") && proof.optInt("decoded_frames") >= 20 &&

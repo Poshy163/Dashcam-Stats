@@ -127,6 +127,49 @@ class ClipTransferPolicyTest {
         assertFalse(VisualQuietAnalyzer.validCpuTemperature("soc-thmzone", 79))
     }
 
+    @Test fun resourceRefusalsExplainBoundariesWithoutWeakeningThermalLimits() {
+        assertEquals(QuietAnalysisReason.CPU_TEMPERATURE_GUARD,
+            VisualQuietAnalyzer.cpuTemperatureRefusal("soc-thmzone", 97_800))
+        assertEquals(QuietAnalysisReason.CPU_TEMPERATURE_GUARD,
+            VisualQuietAnalyzer.cpuTemperatureRefusal("soc-thmzone", 85_000))
+        assertNull(VisualQuietAnalyzer.cpuTemperatureRefusal("soc-thmzone", 84_999))
+        assertEquals(QuietAnalysisReason.CPU_TEMPERATURE_UNAVAILABLE,
+            VisualQuietAnalyzer.cpuTemperatureRefusal("battery", 30_000))
+        assertEquals(QuietAnalysisReason.CPU_TEMPERATURE_UNAVAILABLE,
+            VisualQuietAnalyzer.cpuTemperatureRefusal("soc-thmzone", null))
+        assertNull(VisualQuietAnalyzer.batteryTemperatureRefusal(419))
+        assertEquals(QuietAnalysisReason.BATTERY_TEMPERATURE_GUARD,
+            VisualQuietAnalyzer.batteryTemperatureRefusal(420))
+        assertEquals(QuietAnalysisReason.BATTERY_TEMPERATURE_UNAVAILABLE,
+            VisualQuietAnalyzer.batteryTemperatureRefusal(null))
+    }
+
+    @Test fun guardedAnalysisReportsItsReasonBeforeOpeningOrDecodingVideo() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val analyzer = object : VisualQuietAnalyzer(context) {
+            override fun resourceRefusal() = QuietAnalysisReason.CPU_TEMPERATURE_GUARD
+        }
+        // This intentionally invalid URI must never be opened when a resource guard refuses.
+        val report = analyzer.analyze(Uri.parse("content://invalid/private-test.ts")) { true }
+        assertEquals("unavailable", report.getString("status"))
+        assertEquals("cpu_temperature_guard", report.getString("reason"))
+        assertEquals(0, report.getInt("decoded_frames"))
+        assertFalse(ClipTransferPolicy.validVisual(report))
+        val stopped = analyzer.analyze(Uri.parse("content://invalid/private-test.ts")) { false }
+        assertEquals("policy_not_permitted", stopped.getString("reason"))
+        assertFalse(stopped.toString().contains("private-test"))
+    }
+
+    @Test fun visualReasonsDistinguishImageQualityCoverageAndDecoderFailure() {
+        assertTrue(quiet().isNull("reason"))
+        assertFalse(ClipTransferPolicy.validVisual(quiet().put("reason", "cpu_temperature_guard")))
+        val dark = QuietFrameTracker().apply { accept(IntArray(QUIET_GRID_WIDTH * QUIET_GRID_HEIGHT), 0) }
+        assertEquals("frame_quality", dark.proof(1, false, false).getString("reason"))
+        assertEquals("coverage_incomplete", QuietFrameTracker().proof(0, false, false).getString("reason"))
+        assertEquals("decoder_failure", ClipTransferPolicy.emptyVisual("error").getString("reason"))
+        assertEquals("analysis_pending", ClipTransferPolicy.emptyVisual().getString("reason"))
+    }
+
     @Test fun productionDecoderUsesItsOwnBackgroundThreadAcrossSuspensions() = runBlocking {
         val dispatcher = quietDecoderDispatcher()
         try {

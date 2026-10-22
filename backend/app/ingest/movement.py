@@ -491,6 +491,7 @@ class MovementStatus:
         self.received_at: str | None = None
         self.checked_at: str | None = None
         self.error: str | None = None
+        self.policy_analysis: dict[str, Any] | None = None
         self.persistence_error = False
         self.persisting = False
         self.restored = False
@@ -514,7 +515,8 @@ class MovementStatus:
             )
             _keys(
                 stored,
-                {"schema_version", "received_at", "checked_at", "error", "manifest", "inventory"},
+                {"schema_version", "received_at", "checked_at", "error", "manifest", "inventory"}
+                | ({"policy_analysis"} if "policy_analysis" in stored else set()),
             )
             if type(stored["schema_version"]) is not int or stored["schema_version"] != 1:
                 return
@@ -534,6 +536,11 @@ class MovementStatus:
             }:
                 return
             inventory = stored["inventory"]
+            policy_analysis = stored.get("policy_analysis")
+            if policy_analysis is not None:
+                from app.ingest.parked_filter import validate_analysis_summary
+
+                validate_analysis_summary(policy_analysis)
             if inventory is not None:
                 _keys(inventory, set(inventory_summary(None, [], "")))
                 for key, value in inventory.items():
@@ -547,6 +554,8 @@ class MovementStatus:
                     else:
                         _integer(value, 2**63 - 1)
             with self.lock:
+                if self.policy_analysis is None:
+                    self.policy_analysis = policy_analysis
                 if self.checked_at is not None:
                     return
                 self.doc, self.inventory = doc, inventory
@@ -578,6 +587,13 @@ class MovementStatus:
             if doc is not None:
                 self.doc, self.received_at = copy.deepcopy(doc), now
 
+    def update_policy_analysis(self, summary: dict[str, Any]) -> None:
+        from app.ingest.parked_filter import validate_analysis_summary
+
+        validate_analysis_summary(summary)
+        with self.lock:
+            self.policy_analysis = copy.deepcopy(summary)
+
     def _persist(self) -> None:
         with self.lock:
             if self.persisting:
@@ -591,6 +607,7 @@ class MovementStatus:
                     "error": self.error,
                     "manifest": self.doc,
                     "inventory": self.inventory,
+                    "policy_analysis": self.policy_analysis,
                 }
             )
         raw = json.dumps(envelope, ensure_ascii=True, separators=(",", ":"))
@@ -634,6 +651,20 @@ class MovementStatus:
                     else "error"
                 )
             inventory = copy.deepcopy(self.inventory)
+            analysis = copy.deepcopy(self.policy_analysis)
+            if analysis is not None:
+                from app.ingest.parked_filter import MAX_AGE_SECONDS as POLICY_MAX_AGE_SECONDS
+
+                checked_age = (now - _timestamp(analysis["checked_at"])).total_seconds()
+                generated = _timestamp(analysis["generated_at"], nullable=True)
+                generated_age = (now - generated).total_seconds() if generated else None
+                analysis["stale"] = bool(
+                    checked_age < -30
+                    or checked_age > POLICY_MAX_AGE_SECONDS
+                    or generated_age is None
+                    or generated_age < -MAX_FUTURE_SECONDS
+                    or generated_age > POLICY_MAX_AGE_SECONDS
+                )
             if inventory and (stale or self.error):
                 inventory["class_counts"] = _empty_classes()
                 inventory["class_bytes"] = _empty_classes()
@@ -664,6 +695,7 @@ class MovementStatus:
                 "requires_live_verification": self.restored,
                 "persistence_error": self.persistence_error,
                 "error": self.error,
+                "policy_analysis": analysis,
             }
 
 

@@ -173,11 +173,9 @@ class TestRetrying:
 class TestTheJourneyRefreshDoesNotHoldTheLockAcrossItsReads:
     """The root cause of the two failures quoted at the top of this file.
 
-    Asserted on the *shape* of what ``refresh`` issues rather than on timing. A race needs
-    contention to reproduce, and a test machine with a fast local disk does not supply it --
-    the same reason the concurrency suite next door leans on a structural assertion. What
-    can be pinned exactly is the order: no write may be issued before the last read, because
-    the write is what opens the transaction that then holds the lock.
+    Large telemetry/sighting reads and derivation precede the writer. The final bounded
+    recording/membership validation is deliberately repeated after reserving it, so a
+    concurrent worker or manual edit cannot make the earlier plan authoritative.
     """
 
     async def test_every_read_happens_before_the_first_write(self, db_session):
@@ -210,11 +208,11 @@ class TestTheJourneyRefreshDoesNotHoldTheLockAcrossItsReads:
             )
         await db_session.flush()
 
-        issued: list[str] = []
+        issued = []
         real_execute = db_session.execute
 
         async def recording_execute(statement, *args, **kwargs):
-            issued.append(type(statement).__name__)
+            issued.append(statement)
             return await real_execute(statement, *args, **kwargs)
 
         db_session.execute = recording_execute  # type: ignore[method-assign]
@@ -223,13 +221,22 @@ class TestTheJourneyRefreshDoesNotHoldTheLockAcrossItsReads:
         finally:
             db_session.execute = real_execute  # type: ignore[method-assign]
 
-        writes = [i for i, kind in enumerate(issued) if kind in ("Update", "Delete")]
-        reads = [i for i, kind in enumerate(issued) if kind == "Select"]
+        writes = [
+            i
+            for i, statement in enumerate(issued)
+            if type(statement).__name__ in ("Update", "Delete")
+        ]
+        reads = [i for i, statement in enumerate(issued) if type(statement).__name__ == "Select"]
         assert reads and writes, f"refresh issued nothing recognisable: {issued}"
-        assert max(reads) < min(writes), (
-            "a read is issued after the first write, so the write transaction -- and "
-            f"SQLite's single write lock -- is held across it: {issued}"
-        )
+        first_write = min(writes)
+        assert any("telemetry_points" in str(issued[index]) for index in reads)
+        for index in reads:
+            if index > first_write:
+                statement = issued[index]
+                assert statement.get_final_froms() == [Recording.__table__], (
+                    "an expensive telemetry/sighting read held the writer during derivation"
+                )
+                assert statement.whereclause is not None, "publication validation must be bounded"
 
     async def test_a_rebuild_commits_between_journeys(self, db_session, monkeypatch):
         """Forty-five journeys refreshed inside one transaction is minutes of held lock.

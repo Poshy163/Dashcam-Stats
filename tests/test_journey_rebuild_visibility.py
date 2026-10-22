@@ -200,18 +200,18 @@ async def test_an_interrupted_cluster_rolls_back_without_orphaning_the_rest(
     after_first = dict(memberships)
     after_first[records[1].id] = journeys[0].id
     builder = JourneyBuilder()
-    real_refresh = builder.refresh
+    real_publish = builder._publish_refresh
     calls = 0
 
-    async def fail_second(session, journey):
+    async def fail_second(session, journey, plan, **kwargs):
         nonlocal calls
         calls += 1
-        await real_refresh(session, journey)
+        await real_publish(session, journey, plan, **kwargs)
         if calls == 2:
             raise RuntimeError("interrupted after attaching the second group")
         return journey
 
-    monkeypatch.setattr(builder, "refresh", fail_second)
+    monkeypatch.setattr(builder, "_publish_refresh", fail_second)
     with pytest.raises(RuntimeError, match="interrupted"):
         await builder.rebuild(db_session)
     async with get_session_factory()() as reader:
@@ -240,10 +240,13 @@ async def test_split_and_merge_converge_without_refreshing_a_temporary_mixture(
     source_id, fragment_id = source.id, fragment.id
     early_id, late_id, extra_id = early.id, late.id, extra.id
     builder = JourneyBuilder()
-    real_refresh = builder.refresh
+    real_publish = builder._publish_refresh
     refreshed = []
 
-    async def inspect_refresh(session, journey):
+    async def inspect_refresh(session, journey, plan, **kwargs):
+        # Observe the atomic publication boundary: derivation is now read-only and
+        # happens before this transaction reserves the writer.
+        await real_publish(session, journey, plan, **kwargs)
         members = set(
             (
                 await session.scalars(
@@ -253,9 +256,9 @@ async def test_split_and_merge_converge_without_refreshing_a_temporary_mixture(
         )
         assert members in ({early_id}, {late_id, extra_id})
         refreshed.append(members)
-        return await real_refresh(session, journey)
+        return journey
 
-    monkeypatch.setattr(builder, "refresh", inspect_refresh)
+    monkeypatch.setattr(builder, "_publish_refresh", inspect_refresh)
     assert await builder.rebuild(db_session) == 2
     assert refreshed == [{early_id}, {late_id, extra_id}]
     assert await _payload(db_session) == before

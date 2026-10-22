@@ -1248,6 +1248,8 @@ class ObdLoggerService : Service() {
                 val values = linkedMapOf<String, Any>()
                 val decodedFields = linkedMapOf<Int, Set<String>>()
                 val missing = mutableListOf<Int>()
+                val criticalOutcomes = PollTrialPlan.critical
+                    .associateWith { CriticalPollOutcome.UNPROVED }.toMutableMap()
                 val commands = PollTrialPlan.critical.toMutableList()
                 var commandIndex = 0
                 var auxiliarySelected = false
@@ -1277,6 +1279,7 @@ class ObdLoggerService : Service() {
                         if (pid >= 0 && !malformed.shouldPoll(pid, wallCycle)) {
                             timing.cooldownSkip(pid)
                             missing += pid
+                            if (!optional) criticalOutcomes[pid] = CriticalPollOutcome.COOLDOWN
                             if (optional) scheduler.attempted(pid)
                             continue
                         }
@@ -1291,17 +1294,23 @@ class ObdLoggerService : Service() {
                                 }
                             } else {
                                 when (val result = timedLivePidPoll(pid, timing, elm::query)) {
-                                    LivePidPollResult.Missing -> { malformed.recordValid(pid); missing += pid }
+                                    LivePidPollResult.Missing -> {
+                                        malformed.recordValid(pid)
+                                        missing += pid
+                                        if (!optional) criticalOutcomes[pid] = CriticalPollOutcome.MISSING
+                                    }
                                     is LivePidPollResult.Values -> {
                                         malformed.recordValid(pid)
                                         values.putAll(result.decoded)
                                         decodedFields[pid] = result.decoded.keys.toSet()
+                                        if (!optional) criticalOutcomes[pid] = CriticalPollOutcome.SUCCESS
                                         if (pid == 0x0D) (result.decoded["vehicle_speed"] as? Number)?.toDouble()?.let {
                                             motionJournal?.speed(it)
                                         }
                                     }
                                     is LivePidPollResult.Malformed -> {
                                         missing += pid
+                                        if (!optional) criticalOutcomes[pid] = CriticalPollOutcome.MALFORMED
                                         malformed.recordMalformed(pid, wallCycle)
                                         recordParserFailure(result.error)
                                         database.incrementError(driveId)
@@ -1333,6 +1342,9 @@ class ObdLoggerService : Service() {
                 val capture = driveClock.capture()
                 val prepared = prepareTimedTrialRow(values, decodedFields, timing.takeRowAges(capture.elapsedMillis), missing)
                 val ages = prepared.ages
+                val retainedOutcomes = criticalOutcomes.mapValues { (pid, outcome) ->
+                    if (outcome == CriticalPollOutcome.SUCCESS && pid !in ages) CriticalPollOutcome.UNPROVED else outcome
+                }
                 val persisted = persistSample(SampleRecord(
                     driveId, sequence, capture.timestampUtc, prepared.values,
                     parserQuality = if (prepared.missing.isEmpty()) "ok" else "partial",
@@ -1363,7 +1375,9 @@ class ObdLoggerService : Service() {
                 timing.finishCycle(completed = persisted)
                 emitPollTiming(driveId, timing, "periodic", driveClock)
                 // Include synchronous status and diagnostic disk work in the fallback budget.
-                if (shuttingDown) health.reset() else health.completed(boundedElapsedMillis(started), ages.keys)?.let { fallback(it) }
+                if (shuttingDown) health.reset() else health.completed(
+                    boundedElapsedMillis(started), retainedOutcomes, SystemClock.elapsedRealtime(),
+                )?.let { fallback(it) }
                 sequence += 1
                 awaitLivePollDeadline(started, SystemClock::elapsedRealtime,
                     { !scope.isActive || currentQuiesceRequest(deviceRoot) != null }, PollTrialPlan.TARGET_MILLIS)

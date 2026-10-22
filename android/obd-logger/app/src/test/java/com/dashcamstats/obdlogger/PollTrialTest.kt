@@ -13,6 +13,9 @@ import org.robolectric.RobolectricTestRunner
 @RunWith(RobolectricTestRunner::class)
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class PollTrialTest {
+    private fun criticalOutcomes(vararg changes: Pair<Int, CriticalPollOutcome>): Map<Int, CriticalPollOutcome> =
+        PollTrialPlan.critical.associateWith { CriticalPollOutcome.SUCCESS } + changes
+
     @Test fun baselineIsDefaultAndMissingRequiredPidCannotSelectTrial() {
         assertEquals(7, PollTrialPlan.select(false, PollTrialPlan.critical.toSet()))
         PollTrialPlan.critical.forEach { absent ->
@@ -81,20 +84,132 @@ class PollTrialTest {
     }
 
     @Test fun completedHealthRequiresThreeConsecutiveFailuresAndResets() {
-        val success = PollTrialPlan.critical.toSet()
+        val success = criticalOutcomes()
         val health = PollTrialHealth()
-        assertNull(health.completed(3_001, success))
-        assertNull(health.completed(3_001, success))
-        assertNull(health.completed(3_000, success))
-        repeat(2) { assertNull(health.completed(3_001, success)) }
-        assertEquals("sustained_overrun", health.completed(3_001, success))
+        assertNull(health.completed(3_001, success, 0))
+        assertNull(health.completed(3_001, success, 3_001))
+        assertNull(health.completed(3_000, success, 6_001))
+        repeat(2) { assertNull(health.completed(3_001, success, 9_002L + it * 3_001)) }
+        assertEquals("sustained_overrun", health.completed(3_001, success, 15_004))
         health.reset()
-        repeat(2) { assertNull(health.completed(1_900, success - 0x10)) }
-        assertNull(health.completed(1_900, success))
-        repeat(2) { assertNull(health.completed(1_900, success - 0x0D)) }
-        assertEquals("critical_readings_missing", health.completed(1_900, success - 0x0D))
+        val missingMaf = criticalOutcomes(0x10 to CriticalPollOutcome.MISSING)
+        repeat(2) { assertNull(health.completed(1_900, missingMaf, it * 3_000L)) }
+        assertNull(health.completed(1_900, success, 6_000))
+        val missingSpeed = criticalOutcomes(0x0D to CriticalPollOutcome.MISSING)
+        repeat(2) { assertNull(health.completed(1_900, missingSpeed, 9_000L + it * 3_000)) }
+        assertEquals("critical_readings_missing", health.completed(1_900, missingSpeed, 15_000))
         health.reset() // The normal shutdown grace period does not contribute trial failures.
-        assertNull(health.completed(1_900, success - 0x0D))
+        assertNull(health.completed(1_900, missingSpeed, 18_000))
+    }
+
+    @Test fun observedFiftySevenSecondMafFailureGetsItsScheduledPlainRetry() = runTest {
+        // Retained row end times from the 22 October drive: 14 valid MAF rows,
+        // one malformed reply, then two cooldown slots ended the old trial at 57.311s.
+        val rowEnds = listOf(3_586L, 7_434, 10_290, 13_375, 16_696, 19_972, 24_078,
+            27_876, 31_847, 34_520, 38_237, 41_785, 44_397, 48_004, 50_624, 54_066, 57_311)
+        val health = PollTrialHealth()
+        val tracker = LivePidMalformedTracker()
+        val reader = ElmLivePidReader()
+        val requests = mutableListOf<String>()
+        val missingRows = mutableListOf<Int>()
+        for ((index, endedAt) in rowEnds.withIndex()) {
+            val outcome = when {
+                index < 14 -> CriticalPollOutcome.SUCCESS
+                index == 14 -> {
+                    val malformed = runCatching {
+                        reader.queryPayload(0x10, 0x10) { command ->
+                            requests += command
+                            mafReply(checksumDelta = 1)
+                        }
+                    }.exceptionOrNull()
+                    assertTrue(malformed is ElmProtocolException)
+                    tracker.recordMalformed(0x10, PollTrialPlan.cooldownCycle(47_624))
+                    CriticalPollOutcome.MALFORMED
+                }
+                else -> {
+                    val startedAt = rowEnds[index - 1]
+                    assertFalse(tracker.shouldPoll(0x10, PollTrialPlan.cooldownCycle(startedAt)))
+                    CriticalPollOutcome.COOLDOWN
+                }
+            }
+            if (outcome != CriticalPollOutcome.SUCCESS) missingRows += index
+            // Isolate missing health from the independent sustained-work deadline.
+            assertNull(health.completed(2_934, criticalOutcomes(0x10 to outcome), endedAt))
+        }
+        assertEquals(listOf(14, 15, 16), missingRows) // No carried-forward MAF or fuel reading.
+        assertEquals(listOf("01101"), requests) // Cooldowns performed no hidden retry.
+        assertTrue(tracker.shouldPoll(0x10, PollTrialPlan.cooldownCycle(rowEnds.last())))
+        val recovered = reader.queryPayload(0x10, 0x10) { command ->
+            requests += command
+            mafReply()
+        }!!
+        assertEquals(mapOf("mass_air_flow" to 3.0), ElmProtocol.decode(0x10, recovered))
+        tracker.recordValid(0x10)
+        assertNull(health.completed(2_700, criticalOutcomes(), 60_011))
+        assertEquals(listOf("01101", "0110"), requests)
+    }
+
+    @Test fun cooldownCannotSuppressAnotherCriticalFailureOrResetItsStreak() {
+        val health = PollTrialHealth()
+        assertNull(health.completed(2_500, criticalOutcomes(0x10 to CriticalPollOutcome.MALFORMED), 0))
+        val otherFailure = criticalOutcomes(0x10 to CriticalPollOutcome.COOLDOWN, 0x0D to CriticalPollOutcome.MISSING)
+        assertNull(health.completed(2_500, otherFailure, 3_000))
+        assertEquals("critical_readings_missing", health.completed(2_500, otherFailure, 6_000))
+    }
+
+    @Test fun malformedCooldownHasAnAbsoluteBoundAndAnotherMalformedReplyCannotExtendIt() {
+        val health = PollTrialHealth()
+        assertNull(health.completed(2_500, criticalOutcomes(0x10 to CriticalPollOutcome.MALFORMED), 1_000))
+        assertNull(health.completed(2_500, criticalOutcomes(0x10 to CriticalPollOutcome.COOLDOWN), 10_999))
+        assertNull(health.completed(2_500, criticalOutcomes(0x10 to CriticalPollOutcome.MALFORMED), 11_000))
+        assertNull(health.completed(2_500, criticalOutcomes(0x10 to CriticalPollOutcome.COOLDOWN), 15_999))
+        assertEquals("critical_readings_missing", health.completed(2_500,
+            criticalOutcomes(0x10 to CriticalPollOutcome.COOLDOWN), 16_000))
+    }
+
+    @Test fun actualMissingRetryAndAbsentTimingStillCountAsFailedAttempts() {
+        val health = PollTrialHealth()
+        assertNull(health.completed(2_500, criticalOutcomes(0x10 to CriticalPollOutcome.MALFORMED), 0))
+        assertNull(health.completed(2_500, criticalOutcomes(0x10 to CriticalPollOutcome.COOLDOWN), 6_000))
+        assertNull(health.completed(2_500, criticalOutcomes(0x10 to CriticalPollOutcome.MISSING), 10_000))
+        assertEquals("critical_readings_missing", health.completed(2_500,
+            criticalOutcomes(0x10 to CriticalPollOutcome.UNPROVED), 13_000))
+        health.reset()
+        repeat(2) { assertNull(health.completed(2_500, criticalOutcomes() - 0x0C, it * 3_000L)) }
+        assertEquals("critical_readings_missing", health.completed(2_500, criticalOutcomes() - 0x0C, 6_000))
+    }
+
+    @Test fun unjustifiedCooldownIsNotARecoveryExemptionAndSlowCyclesStillFallback() {
+        val health = PollTrialHealth()
+        val cooldown = criticalOutcomes(0x10 to CriticalPollOutcome.COOLDOWN)
+        repeat(2) { assertNull(health.completed(2_500, cooldown, it * 3_000L)) }
+        assertEquals("critical_readings_missing", health.completed(2_500, cooldown, 6_000))
+        health.reset()
+        assertNull(health.completed(3_001, criticalOutcomes(0x10 to CriticalPollOutcome.MALFORMED), 0))
+        assertNull(health.completed(3_001, cooldown, 3_001))
+        assertEquals("sustained_overrun", health.completed(3_001, cooldown, 6_002))
+    }
+
+    @Test fun successfulRecoveryAndShutdownResetClearTheMissingDeadline() {
+        val health = PollTrialHealth()
+        val malformed = criticalOutcomes(0x10 to CriticalPollOutcome.MALFORMED)
+        assertNull(health.completed(2_500, malformed, 0))
+        assertNull(health.completed(2_500, criticalOutcomes(), 12_000))
+        assertNull(health.completed(2_500, malformed, 16_000))
+        assertNull(health.completed(2_500, criticalOutcomes(0x10 to CriticalPollOutcome.COOLDOWN), 30_999))
+        health.reset()
+        assertNull(health.completed(2_500, malformed, 32_000))
+    }
+
+    @Test fun lateSuccessfulReplyCannotRetroactivelyExtendRecovery() {
+        val health = PollTrialHealth()
+        assertNull(health.completed(2_500, criticalOutcomes(0x10 to CriticalPollOutcome.MALFORMED), 1_000))
+        assertEquals("critical_readings_missing", health.completed(2_500, criticalOutcomes(), 16_000))
+    }
+
+    private fun mafReply(checksumDelta: Int = 0): String {
+        val body = listOf(0x48, 0x6B, 0x10, 0x41, 0x10, 0x01, 0x2C)
+        return (body + ((body.sum() + checksumDelta) and 0xFF)).joinToString(" ") { "%02X".format(it) } + "\r>"
     }
 
     @Test fun wallClockDeadlinesDoNotCatchUpAndDeferredWorkKeepsFairPriority() {

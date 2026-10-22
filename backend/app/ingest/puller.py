@@ -318,10 +318,41 @@ async def _await_quieting_evidence(address: str, logger_status: dict | None) -> 
     return logger_status
 
 
+def _classify_cancellation(result: RunResult) -> RunResult:
+    """Keep safety stops retryable and operator Stop terminal, retaining committed work."""
+    status = get_status()
+    if status.cancel_event.is_set() and status.cancel_reason is None:
+        # Stop can arrive after an exception has already constructed ERROR/PARTIAL,
+        # including while restoration is awaited. Its terminal intent outranks that
+        # earlier classification; retain all committed counts and failure evidence.
+        result.state = RunState.CANCELLED
+        result.error = result.error or "the transfer was cancelled"
+        return result
+    if (
+        status.cancel_event.is_set()
+        and status.cancel_reason == "radio_safety_lease_lost"
+        and result.state in {RunState.CANCELLED, RunState.PARTIAL}
+    ):
+        result.state = RunState.PARTIAL if result.files or result.bytes else RunState.ERROR
+        generic = {None, "backup cancelled", "the transfer was cancelled"}
+        detail = status.cancel_detail or (
+            result.error if result.error not in generic else "the radio safety lease was lost"
+        )
+        prior = result.error
+        result.error = f"Backup stopped safely: {redact(detail)}"
+        if prior not in generic and prior != detail:
+            result.error += f"; {redact(prior)}"
+    return result
+
+
 def _radio_shutdown_hold(reason: object) -> RunResult:
     """Keep requested quieting mandatory while allowing the poller's safe retry."""
     status = get_status()
     if status.cancel_event.is_set():
+        if status.cancel_reason == "radio_safety_lease_lost":
+            # Defer classification until cleanup is complete: an operator's Stop
+            # during restoration still outranks this internal safety cancellation.
+            return RunResult(state=RunState.CANCELLED, error=redact(reason))
         return RunResult(state=RunState.CANCELLED, error="the transfer was cancelled")
     text = redact(reason or "").strip() or "radio state could not be verified"
     text = text.removeprefix("Radios left unchanged: ")
@@ -1761,6 +1792,7 @@ async def run_pull(
                 # already publish their richer result before history/sleep handling.
                 if not lifecycle.released and status.running:
                     result.seconds = time.monotonic() - started
+                    _classify_cancellation(result)
                     result.error = redact(result.error) if result.error else None
                     status.finish(result)
                     lifecycle.released = True
@@ -1797,6 +1829,13 @@ async def _run_pull_started(
     expected: dict[str, int] = {}
     initial_backlog_sizes: dict[str, int] = {}
     interrupted_error: str | None = None
+
+    def cancel_for_radio_lease_loss() -> None:
+        detail = getattr(radio_transition, "lease_loss_error", None)
+        status.cancel(
+            reason="radio_safety_lease_lost",
+            detail=redact(detail) if detail is not None else None,
+        )
 
     try:
         # Only if nobody has already looked. The presence poll describes the unit
@@ -2107,7 +2146,7 @@ async def _run_pull_started(
                     logger_status_path=get_config().obd_remote_status_file,
                     watchdog_deadline_s=int(_get("listen_timeout_s", 180)) * 2 + 120,
                     allow_zlink_rearm=bool(_get("zlink_hotspot_rearm", False)),
-                    lease_loss_callback=status.cancel,
+                    lease_loss_callback=cancel_for_radio_lease_loss,
                 )
             except radio_coordinator.TransitionBusy as exc:
                 # A second process must not inventory/copy/delete the same card while the
@@ -2756,6 +2795,7 @@ async def _run_pull_started(
             except Exception as exc:
                 log.error("could not notify scanner about committed footage", error=redact(exc))
         lifecycle = _run_lifecycle.get()
+        _classify_cancellation(result)
         result.error = redact(result.error) if result.error else None
         status.finish(result)
         if lifecycle is not None:

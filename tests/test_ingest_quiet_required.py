@@ -143,6 +143,98 @@ async def test_failed_restoration_blocks_next_attempt_until_recovery(quiet_run, 
     quiet_run.move.assert_not_awaited()
 
 
+@pytest.mark.parametrize("operator_stops", [False, True])
+async def test_lease_loss_after_quiesce_and_successful_inventory_keeps_the_actual_cause(
+    quiet_run, monkeypatch, operator_stops
+):
+    transition = Transition(quiet_run.events)
+    transition.lease_loss_error = puller.radio_coordinator.RadioTransitionError(
+        "database is locked"
+    )
+    callback = None
+
+    async def begin(**kwargs):
+        nonlocal callback
+        callback = kwargs["lease_loss_callback"]
+        return transition
+
+    async def inventory(*args):
+        # The heartbeat fails while the second inventory is awaited, after a
+        # successful quiesce. Inventory itself still returns normally.
+        if "prepare" in quiet_run.events:
+            callback()
+            if operator_stops:
+                get_status().cancel()
+        return []
+
+    monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
+    monkeypatch.setattr(puller, "inventory_remote_bundles", inventory)
+    monkeypatch.setattr(
+        puller,
+        "read_logger_status",
+        AsyncMock(
+            return_value={
+                "schema_version": 2,
+                "state": "ecu_online",
+                "ownership_enabled": True,
+                "capabilities": [puller.obd_control.CAPABILITY],
+            }
+        ),
+    )
+    result = await asyncio.wait_for(puller.run_pull(info=quiet_run.unit.info), timeout=1)
+    assert result.state is (RunState.CANCELLED if operator_stops else RunState.ERROR)
+    if not operator_stops:
+        assert "database is locked" in result.error
+        assert "cancelled" not in result.error
+    assert result.files == result.bytes == 0
+    assert quiet_run.events == ["prepare", "restore"]
+    quiet_run.move.assert_not_awaited()
+    assert not get_status().running
+    assert get_status().state is result.state
+
+
+@pytest.mark.parametrize("committed", [False, True])
+@pytest.mark.parametrize("operator_stops", [False, True])
+async def test_operator_stop_during_exception_cleanup_preserves_progress_and_prevents_retry(
+    quiet_run, monkeypatch, committed, operator_stops
+):
+    transition = Transition(quiet_run.events)
+    transition.lease_loss_error = puller.radio_coordinator.RadioTransitionError(
+        "database is locked"
+    )
+    callback = None
+
+    async def begin(**kwargs):
+        nonlocal callback
+        callback = kwargs["lease_loss_callback"]
+        return transition
+
+    async def failed_move(*args, **kwargs):
+        if committed:
+            await quiet_run.move(*args, **kwargs)
+        callback()
+        raise transition.lease_loss_error
+
+    async def restore(**kwargs):
+        quiet_run.events.append("restore")
+        if operator_stops:
+            get_status().cancel()
+        return True
+
+    transition.restore = restore
+    monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
+    monkeypatch.setattr(puller, "_move", failed_move)
+    result = await asyncio.wait_for(puller.run_pull(info=quiet_run.unit.info), timeout=1)
+    expected = RunState.PARTIAL if committed else RunState.ERROR
+    assert result.state is (RunState.CANCELLED if operator_stops else expected)
+    assert result.files == int(committed)
+    assert result.bytes == (len(quiet_run.unit.payload) if committed else 0)
+    assert "database is locked" in result.error
+    assert quiet_run.events[-1] == "restore"
+    assert get_status().state is result.state
+    assert not get_status().running
+
+
 @pytest.mark.parametrize("window", [None, 59, 60])
 async def test_unknown_or_at_most_one_minute_never_starts_transfer(
     prepared_unit, monkeypatch, window
