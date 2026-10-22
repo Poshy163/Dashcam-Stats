@@ -98,6 +98,16 @@ budget; a new countdown or invalid power proof still ends the hold. This impleme
 does not establish the cause of every earlier heartbeat loss, and physical acceptance
 of the updated helper and retry path remains pending.
 
+Discovery must also preserve the ADB session. A controlled camera test reproduced
+an empty successful UI reply when discovery disconnected the transport during the
+snapshot; the same command returned valid XML before and after that reconnect.
+Discovery therefore reuses a responsive session. A per-address guard serializes
+maintenance admission with reconnects and prevents discovery or daemon-root
+restarts from interrupting preparation or an active hold. The guard is released
+after admission closes and the lease is revoked, before radio restoration can
+need a reconnect. Empty replies trigger bounded full reproof, never admission from
+missing evidence; nonempty malformed XML and contradictory power state refuse.
+
 On 21 October 2026, server revision `fd96348` physically verified native countdown
 cancellation and a maintenance hold with fresh heartbeat evidence. Evidence was lost
 around 08:58 UTC, before the planned 09:07 UTC expiry; the exact cause is unproven and

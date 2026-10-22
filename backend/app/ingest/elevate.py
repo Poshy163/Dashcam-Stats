@@ -249,8 +249,15 @@ async def ensure_root(address: str) -> bool:
         log.debug("skipping the root elevation; the last one lost the control channel")
         return False
 
+    if adb.transport_preserved(address):
+        # An existing root session remains usable, but restarting adbd would sever
+        # the maintenance heartbeat and any in-flight fresh safety proof.
+        return await _is_root(address)
     try:
         reply = await adb.root(address)
+    except adb.TransportPreserved:
+        # Maintenance may have begun after the read-only ownership check above.
+        return await _is_root(address)
     except adb.AdbError as exc:
         # A timeout here is the interesting one: the daemon may be mid-restart. Fall
         # through to the wait rather than concluding anything, because concluding

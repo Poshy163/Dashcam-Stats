@@ -66,6 +66,17 @@ server verification. All 230 frontend tests, typecheck, lint and build pass. Liv
 acceptance of this maintenance fix, a resulting backup and subsequent requested sleep
 remains pending; installation of 0.3.12 alone does not verify that server-only path.
 
+Live investigation on 22 October reproduced a separate transport race: a normal
+5,432-byte UI snapshot became an empty successful shell reply when discovery
+disconnected ADB during the command, then became valid again after reconnecting.
+The first deployed retry held admission correctly but lost its first heartbeat
+before any files copied. Discovery now reuses responsive transports, and a shared
+address guard prevents reconnects and daemon-root restarts during maintenance
+preparation and active holds. Admission closes and the guard is released before
+radio restoration, so a dead connection can still recover. Empty replies require
+complete bounded reproof; malformed nonempty replies remain refused. The resumed
+production poller and backup still need physical acceptance.
+
 ### What changed in 0.3.11
 
 - Fresh native segments were three seconds apart. The 0.3.10 closest-peer limit was two

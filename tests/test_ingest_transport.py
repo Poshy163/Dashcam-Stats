@@ -863,6 +863,7 @@ class TestTheAdbControlChannel:
 
         monkeypatch.setattr(adb, "shell", fake_shell)
         monkeypatch.setattr(adb, "state", fake_state)
+        monkeypatch.setattr(adb, "probe_shell", lambda address: asyncio.sleep(0, result=True))
         monkeypatch.setattr(adb, "reconnect", lambda address: asyncio.sleep(0))
 
         info = await adb.describe("u:5555")

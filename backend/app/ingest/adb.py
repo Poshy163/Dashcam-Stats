@@ -26,7 +26,7 @@ import math
 import re
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.core.logging import get_logger
 from app.ingest.models import RemoteFile, UnitInfo, UnitState
@@ -70,6 +70,52 @@ SOURCE_PROBE = (
 
 class AdbError(RuntimeError):
     """An ADB control call failed. Never raised for "the unit is simply not here"."""
+
+
+class TransportPreserved(AdbError):
+    """A maintenance proof owns the existing channel; discovery must not tear it down."""
+
+
+@dataclass
+class _TransportControl:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    preservations: int = 0
+
+
+_transport_controls: dict[str, _TransportControl] = {}
+
+
+def _transport_control(address: str) -> _TransportControl:
+    return _transport_controls.setdefault(normalised_address(address), _TransportControl())
+
+
+class TransportPreservation:
+    """Idempotent ownership of a channel, independent of backup admission/lease TTLs."""
+
+    def __init__(self, control: _TransportControl) -> None:
+        self._control: _TransportControl | None = control
+
+    def release(self) -> None:
+        if self._control is not None:
+            self._control.preservations -= 1
+            self._control = None
+
+
+async def preserve_transport(address: str, *, timeout: float = 3.0) -> TransportPreservation:
+    """Wait for any existing reconnect before starting an uninterrupted proof sequence."""
+    control = _transport_control(address)
+    try:
+        async with asyncio.timeout(timeout), control.lock:
+            control.preservations += 1
+            return TransportPreservation(control)
+    except TimeoutError:
+        raise AdbError(
+            "ADB discovery is still reconnecting; maintenance was not started."
+        ) from None
+
+
+def transport_preserved(address: str) -> bool:
+    return _transport_control(address).preservations > 0
 
 
 class CardNotFound(AdbError):
@@ -262,7 +308,7 @@ async def is_listening(address: str) -> bool:
 
 
 async def reconnect(address: str, *, timeout: float = CONTROL_TIMEOUT_S) -> None:
-    """Re-establish the control channel before every cycle.
+    """Re-establish an unresponsive control channel when no maintenance proof owns it.
 
     Not optional and not paranoia. The unit reboots with the car, and the transport on this
     side goes stale while still *looking* connected -- ``get-state`` answers ``device`` for
@@ -275,8 +321,12 @@ async def reconnect(address: str, *, timeout: float = CONTROL_TIMEOUT_S) -> None
     than one, and inheriting a twenty-second ceiling would spend an entire driveway window
     inside a single attempt.
     """
-    await _adb("disconnect", address, timeout=timeout)
-    await _adb("connect", address, timeout=timeout)
+    control = _transport_control(address)
+    async with control.lock:
+        if control.preservations:
+            raise TransportPreserved("Maintenance owns the existing ADB transport.")
+        await _adb("disconnect", address, timeout=timeout)
+        await _adb("connect", address, timeout=timeout)
 
 
 #: How long adbd is given to answer a root request.
@@ -296,7 +346,11 @@ async def root(address: str) -> str:
     into a failed transfer. Both streams are returned because the client writes the
     interesting sentence to whichever it feels like depending on version.
     """
-    result = await _adb("-s", address, "root", timeout=ROOT_TIMEOUT_S)
+    control = _transport_control(address)
+    async with control.lock:
+        if control.preservations:
+            raise TransportPreserved("Maintenance owns the existing ADB transport.")
+        result = await _adb("-s", address, "root", timeout=ROOT_TIMEOUT_S)
     return f"{result.stdout} {result.stderr}".strip()
 
 
@@ -1155,10 +1209,29 @@ async def delete_if_unchanged(address: str, source: str, items: list[RemoteFile]
 
 
 async def describe(address: str, override: str = "") -> UnitInfo:
-    """One control round trip that answers "is it here, and where is the footage"."""
+    """Discover the card without interrupting a responsive or maintenance-owned channel."""
     info = UnitInfo(address=address)
-    await reconnect(address)
-    info.state = await state(address)
+    try:
+        info.state = await state(address)
+    except AdbError:
+        pass
+    responsive = info.online and await probe_shell(address)
+    if not responsive:
+        if transport_preserved(address):
+            if info.online:
+                info.state = UnitState.OFFLINE
+            return info
+        try:
+            await reconnect(address)
+        except TransportPreserved:
+            # A hold can acquire ownership while the initial read-only probe awaits.
+            # The reconnect checks the same lock before issuing either ADB command.
+            if info.online:
+                info.state = UnitState.OFFLINE
+            return info
+        info.state = await state(address)
+        if info.online and not await probe_shell(address):
+            info.state = UnitState.OFFLINE
     if info.online:
         try:
             info.source = await resolve_source(address, override)

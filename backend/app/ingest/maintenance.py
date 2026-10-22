@@ -186,6 +186,10 @@ async def _power(address: str) -> PowerProof:
         raise MaintenanceTransient(
             "power", "power_transport", "The dashcam power verification was unavailable."
         ) from exc
+    if not reply.strip():
+        raise MaintenanceTransient(
+            "power", "power_empty", "The fresh dashcam power proof was not returned."
+        )
     proof = parse_power(reply)
     if proof is None:
         code = _power_failure_code(reply)
@@ -284,6 +288,13 @@ async def _screen(address: str) -> str:
                 raise MaintenanceTransient(
                     "screen", "screen_timeout", "The dashcam screen verification timed out."
                 )
+            if not reply.strip():
+                # This unit's ADB can report a zero exit code and no stdout when
+                # another client disconnects the transport during app_process.
+                # Absence of a snapshot is never evidence of an absent countdown.
+                raise MaintenanceTransient(
+                    "screen", "screen_empty", "The fresh dashcam screen was not returned."
+                )
             return reply
     except (OSError, TimeoutError, adb.AdbError) as exc:
         raise MaintenanceTransient(
@@ -321,6 +332,7 @@ class MaintenanceController:
         self._cancelled = False
         self._cancellation_verified = False
         self._fence: ProcessFileLock | None = None
+        self._transport_preservation: adb.TransportPreservation | None = None
         self._tombstone_path = tombstone_path
         self._tombstone_loaded = False
         self._tombstone_error = False
@@ -794,9 +806,13 @@ class MaintenanceController:
             raise MaintenanceRefused("Another server process owns maintenance.")
         self._fence = fence
         try:
+            self._transport_preservation = await adb.preserve_transport(address)
             return await self._start(address, duration_s)
         except BaseException:
             if self._fence is fence and self._state != "restoring":
+                if self._transport_preservation is not None:
+                    self._transport_preservation.release()
+                    self._transport_preservation = None
                 fence.release()
                 self._fence = None
             raise
@@ -966,6 +982,12 @@ class MaintenanceController:
                 )
         from app.ingest import puller
 
+        # Admission is closed and the exact-token revocation was attempted above.
+        # Restoration may need to reconnect a genuinely dead channel, so it must
+        # not inherit the preservation that protected active heartbeat evidence.
+        if self._transport_preservation is not None:
+            self._transport_preservation.release()
+            self._transport_preservation = None
         restored = False
         with contextlib.suppress(Exception):
             restored = await asyncio.wait_for(puller.stop_for_maintenance(), timeout=120.0)
