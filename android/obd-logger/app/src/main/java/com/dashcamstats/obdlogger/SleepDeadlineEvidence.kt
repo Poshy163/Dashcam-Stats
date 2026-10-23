@@ -40,8 +40,11 @@ internal fun readSleepBootIdentity(context: Context): SleepBootIdentity {
     return SleepBootIdentity(uuid, count)
 }
 
-/** An OFF sample alone is never an edge. Invalid continuity requires a new ON sample. */
-internal class SleepDeadlineTracker {
+/**
+ * An OFF sample alone is never an edge. App-private checkpoints preserve the same bounded
+ * continuity across an ordinary process restart/update; they cannot widen it or start a timer.
+ */
+internal class SleepDeadlineTracker(private val store: SleepDeadlineCheckpointStore? = null) {
     private data class Sample(
         val boot: SleepBootIdentity,
         val started: Long,
@@ -52,8 +55,15 @@ internal class SleepDeadlineTracker {
 
     private var previous: Sample? = null
     private var evidence: SleepDeadlineEvidence? = null
+    private var loadCheckpoint = store != null
+    private val storeLock = Any()
+    private var generation = 0L
+    private var persistenceRequested = false
+    private var lastQueuedCheckpoint: SleepDeadlineCheckpoint? = null
+    private var pendingSnapshotInvalidation: Persistence? = null
 
-    @Synchronized
+    private data class Persistence(val generation: Long, val checkpoint: SleepDeadlineCheckpoint?)
+
     fun observe(
         boot: SleepBootIdentity,
         startedElapsedMillis: Long,
@@ -61,13 +71,55 @@ internal class SleepDeadlineTracker {
         ignitionOn: Boolean?,
         windowSeconds: Int?,
     ) {
+        flushPendingInvalidation()
+        val shouldLoad = synchronized(this) {
+            if (loadCheckpoint) { loadCheckpoint = false; true } else false
+        }
+        val checkpoint = if (shouldLoad) synchronized(storeLock) {
+            runCatching { store?.read() }.getOrNull()
+        } else null
+        val update = synchronized(this) {
+            observeLocked(boot, startedElapsedMillis, finishedElapsedMillis, ignitionOn, windowSeconds,
+                shouldLoad, checkpoint)
+        }
+        persist(update)
+    }
+
+    private fun observeLocked(
+        boot: SleepBootIdentity,
+        startedElapsedMillis: Long,
+        finishedElapsedMillis: Long,
+        ignitionOn: Boolean?,
+        windowSeconds: Int?,
+        shouldLoad: Boolean,
+        checkpoint: SleepDeadlineCheckpoint?,
+    ): Persistence? {
         if (
             !boot.valid || startedElapsedMillis < 0 || finishedElapsedMillis < startedElapsedMillis ||
             finishedElapsedMillis - startedElapsedMillis > DEADLINE_CAPTURE_MAX_MS ||
             ignitionOn == null || windowSeconds == null || windowSeconds !in 1..3_600
         ) {
-            invalidate()
-            return
+            return invalidate()
+        }
+        var invalidation: Persistence? = null
+        if (shouldLoad) {
+            if (checkpoint != null && checkpoint.valid && checkpoint.boot == boot &&
+                startedElapsedMillis >= checkpoint.finishedElapsedMillis &&
+                finishedElapsedMillis - checkpoint.finishedElapsedMillis <= DEADLINE_OBSERVATION_MAX_AGE_MS &&
+                windowSeconds == checkpoint.observedWindowSeconds &&
+                (checkpoint.offLowerElapsedMillis == null || finishedElapsedMillis <
+                    checkpoint.offLowerElapsedMillis + checkNotNull(checkpoint.windowSeconds) * 1_000L)
+            ) {
+                previous = Sample(
+                    checkpoint.boot, checkpoint.startedElapsedMillis, checkpoint.finishedElapsedMillis,
+                    checkpoint.ignitionOn, checkpoint.observedWindowSeconds,
+                )
+                evidence = checkpoint.evidence
+            } else {
+                // A read failure, reboot, changed property or missed observation is not permission
+                // to infer an edge. Only a newly observed ON can seed subsequent timing.
+                invalidation = invalidate()
+            }
         }
         val old = previous?.takeIf {
             it.boot == boot && startedElapsedMillis >= it.finished &&
@@ -81,28 +133,72 @@ internal class SleepDeadlineTracker {
                 old.started, finishedElapsedMillis, minOf(old.window, windowSeconds),
             )
             else -> evidence
+        }?.takeUnless {
+            val lower = it.offLowerElapsedMillis
+            val seconds = it.windowSeconds
+            lower != null && seconds != null && finishedElapsedMillis >= lower + seconds * 1_000L
         }
         evidence = SleepDeadlineEvidence(
             boot.bootId, boot.bootCount, finishedElapsedMillis, ignitionOn,
             edge?.offLowerElapsedMillis, edge?.offUpperElapsedMillis, edge?.windowSeconds,
         )
         previous = Sample(boot, startedElapsedMillis, finishedElapsedMillis, ignitionOn, windowSeconds)
+        val current = checkNotNull(evidence)
+        return queuePersistence(if (boot.bootId != null && current.offLowerElapsedMillis != null) {
+            SleepDeadlineCheckpoint(
+                boot, startedElapsedMillis, finishedElapsedMillis, ignitionOn, windowSeconds,
+                current.offLowerElapsedMillis, current.offUpperElapsedMillis, current.windowSeconds,
+            )
+        } else null) ?: invalidation
     }
 
-    @Synchronized
     fun snapshot(nowElapsedMillis: Long): SleepDeadlineEvidence? {
-        val last = previous ?: return null
-        if (
-            nowElapsedMillis < last.finished ||
-            nowElapsedMillis - last.finished > DEADLINE_OBSERVATION_MAX_AGE_MS
-        ) {
-            invalidate()
+        return synchronized(this) {
+            val last = previous ?: return null
+            if (nowElapsedMillis < last.finished ||
+                nowElapsedMillis - last.finished > DEADLINE_OBSERVATION_MAX_AGE_MS
+            ) {
+                // A status/BLE caller never waits for storage. An expired/future checkpoint is
+                // already inadmissible to a new process; the IO worker commits its revocation.
+                pendingSnapshotInvalidation = invalidate()
+            }
+            evidence
         }
-        return evidence
     }
 
-    private fun invalidate() {
+    fun flushPendingInvalidation() {
+        val invalidation = synchronized(this) {
+            pendingSnapshotInvalidation.also { pendingSnapshotInvalidation = null }
+        }
+        persist(invalidation)
+    }
+
+    private fun invalidate(): Persistence? {
+        loadCheckpoint = false
         previous = null
         evidence = null
+        return queuePersistence(null)
+    }
+
+    private fun queuePersistence(checkpoint: SleepDeadlineCheckpoint?): Persistence? {
+        if (store == null || (persistenceRequested && checkpoint == lastQueuedCheckpoint)) return null
+        persistenceRequested = true
+        lastQueuedCheckpoint = checkpoint
+        return Persistence(++generation, checkpoint)
+    }
+
+    private fun persist(update: Persistence?) {
+        if (update == null) return
+        synchronized(storeLock) {
+            if (synchronized(this) { generation != update.generation }) return
+            // Disk transactions run on the controller's existing IO worker, outside the tracker
+            // state monitor: a routine BLE/status snapshot cannot queue behind an fsync.
+            if (runCatching { store?.write(update.checkpoint) }.isFailure) {
+                synchronized(this) {
+                    if (generation == update.generation) invalidate()
+                }
+                runCatching { store?.write(null) }
+            }
+        }
     }
 }

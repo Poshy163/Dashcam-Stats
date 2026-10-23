@@ -121,8 +121,13 @@ Fresh native OFF, fresh companion OFF proof and the exact same boot UUID are
 required. The proof's `off_lower_elapsed_ms`, the start of its last actual ON sample,
 must be strictly after that barrier. Repeated OFF observations cannot qualify an older
 cycle: they refresh observation time while preserving its original lower/upper bounds
-and captured window. Invalid continuity or a new companion process requires another
-observed ON before it can create an edge.
+and captured window. Companion 0.3.17 saves that genuine edge in an atomic, app-private
+checkpoint excluded from Android backup. A brief process restart or package update can
+restore it only after a fresh OFF/property read on the exact same kernel boot, within
+the existing 15-second observation-continuity budget. The original captured deadline
+cannot advance. Invalid, stale or missing checkpoints still require a new observed ON
+before another edge; unknown reads and fresh ON invalidate saved OFF proof. A checkpoint
+never clears a maintenance cancellation marker using a preceding cycle.
 
 Clearing compares the full expected marker, including its generation and bound, so
 concurrent cancellation or baseline updates cannot be erased. Legacy markers first

@@ -8,18 +8,62 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.15** (`versionCode` 28), installed in place on 23 October 2026 |
-| Source | `e8981bc78d823807cdb920c8df423366a6d3dbb6` (`android/obd-logger/`), verified in the running companion and installed APK |
+| Version | **0.3.16** (`versionCode` 29), installed in place on 23 October 2026 |
+| Source | `01845c417bddc4c8f66db6d8cadc718413b6136b` (`android/obd-logger/`), verified in the running companion and installed APK |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | The re-armed three-second plan 8 trial lasted both latest drives: 18m46s/369 samples and 25m27s/499 samples, without fallback |
-| Deployment | Production-signed 0.3.15/code 28 was installed in place on 23 October, retaining app identity, runtime permissions, folder access, ownership and quiet filtering. Installed APK bytes, the production signer, fresh status and matching server revision were verified. Actual quiet exclusions remain unverified. |
+| Poll plan | Three-second trial remains armed for the next drive; parked operation correctly reports plan 7. The previous two 0.3.15 drives sustained plan 8 without fallback. |
+| Deployment | Installed APK bytes, production signer, matching server revision and fresh 0.3.16 status verified. App identity, runtime permissions, read-only folder access, ownership, trial and quiet filtering were retained. Both cameras created new segments. Restarting the companion lost native deadline evidence; a verified maintenance hold subsequently admitted backup without an accessory-power cycle. Actual quiet exclusions remain unverified. |
 
-## 0.3.16 MAF and pre-transfer analysis candidate
+## 0.3.17 durable sleep-timing candidate
+
+Source version **0.3.17/code 30** preserves a genuine observed native ON to OFF edge
+across brief app restarts and package updates. A bounded, versioned checkpoint is
+stored atomically in app-private storage excluded from Android backup. Restore needs
+the same kernel boot UUID and boot count, a fresh known native OFF read, unchanged
+last-observed property and monotonic continuity within the existing 15-second limit.
+The original OFF bounds and captured window remain fixed; a restart never starts a
+new timer or extends its deadline.
+
+Missing, malformed, stale, expired or mismatched checkpoints preserve unknown timing.
+Fresh ON, unknown power/window reads, clock rollback and reboot invalidate saved OFF
+proof. The existing maintenance cancellation marker remains authoritative; a saved
+pre-cancellation edge cannot clear it. No old shell-writable status file or movement
+journal is imported as native deadline authority, and the status wire schema is unchanged.
+
+The first update from 0.3.16 cannot reconstruct an already-lost checkpoint. Recovery
+of the current backup uses the existing verified, bounded maintenance lease; future
+native recovery requires a genuine recorded edge. Durable restart/update acceptance
+is separate from successful copying under that temporary lease.
+
+The one-time recovery completed without an accessory-power cycle: durable backup
+run 616 finished OK at 10:07:21 UTC on 23 October, copying 44 files / 2,258,492,692
+bytes at an average 6.94 MB/s. Increasing transfer counters and the new history row
+were verified independently. Bluetooth, hotspot and logger restoration all passed,
+with no recovery debt. This verifies the bounded maintenance path, not restoration
+of a cancelled native timer. The current 0.3.16 server already accepts the unchanged
+v1 proof contract used by the new checkpoint.
+
+After that completed run, the temporary lease lost its screen heartbeat and was
+revoked with `screen_timeout`; it did not reach normal expiry. The camera remained
+parked with Bluetooth, hotspot and logger restored, no active transfer and no radio
+recovery debt. Later footage remains behind the unknown-native-deadline gate until
+another independently verified maintenance lease or the next genuine drive edge.
+
+Validation passed locally: 3,651 backend tests (77 platform/fixture skips), 333 Android
+tests and 240 frontend tests. Ruff, frontend typecheck/lint/build, debug/release Android
+lint and both APK builds passed; Android lint retained its existing 58 warnings and
+zero errors. Twenty new Android cases cover exact restart bounds, corrupted records,
+revocation, write failure and slow-storage concurrency; seven backend contract cases
+verify fresh re-emission without deadline extension. Independent source review passed.
+Positive physical checkpoint continuity still needs an actual new native OFF edge;
+the already-cancelled 0.3.16 window cannot supply that acceptance evidence.
+
+## 0.3.16 installed and physical review
 
 Source version **0.3.16/code 29** addresses the remaining 0.3.15 drive findings.
-It is not installed. Deploy the matching server before the companion update.
+It was installed after the matching server was deployed.
 
 - Plan 8 grants MAF one retry on the next scheduled row after its first strictly
   rejected, prompt-complete reply. The rejected row remains missing, no extra command
@@ -46,7 +90,17 @@ watchdog scripts were executed under the available POSIX shell. The scheduling t
 exercise full paired proofs before any quiesce/copy, bounded fallback, completed-chunk
 restoration, current versus historical refusals and exact backlog with camera filters.
 
-Physical acceptance still requires the new companion, real malformed-MAF recovery,
+The production-signed APK was installed in place with SHA-256
+`a7cacf714391e6285a7052f9073145c054e80e2ae2f24f4b3d68fcc5bb9797c2`.
+The installed APK matched those bytes and the pinned production certificate. A
+same-process, read-only verification confirmed the armed trial, retained ownership,
+one persisted read grant and zero write grants; its temporary helper was removed.
+All 20 immutable export artifacts were retained. The native countdown remained
+visible after installation, but the restarted app had no in-memory OFF bounds and
+the server correctly withheld further radio quieting. No native timer was inferred
+from the configured 1,200-second property.
+
+Physical acceptance still requires real malformed-MAF recovery,
 native deadline/restoration checks, actual quiet exclusions retained on the card and
 their downstream scanner/processing omission. Local tests and historical replay do
 not establish those future device outcomes.
@@ -630,7 +684,7 @@ First integrate/review the release source in the protected signing checkout, or 
 protected build host to use the existing signing files. The original checkout may still contain
 older source and unrelated local changes: do not blindly pull, switch branches or overwrite it.
 Fresh worktrees do not contain the signing files. From the chosen source checkout, after verifying
-`app/build.gradle.kts` declares version 0.3.16/code 29:
+`app/build.gradle.kts` declares version 0.3.17/code 30:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
@@ -658,7 +712,7 @@ other settings, the metrics toggle works, and `Bundles waiting for the server` d
 next Wi-Fi window. Verify webhook events reach the server and boot recovery still works.
 
 After ingestion obtains a fresh status snapshot, `GET /api/obd/status` should report
-`app_version_name: "0.3.16"` and `app_version_code: 29` under `logger`. A cached status alone does
+`app_version_name: "0.3.17"` and `app_version_code: 30` under `logger`. A cached status alone does
 not establish the currently installed/running version.
 
 ## What is still left to do

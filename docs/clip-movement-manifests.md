@@ -214,9 +214,15 @@ records and unresolved version-two or version-three markers with a `null` bound 
 use this legacy baseline path. Fresh live native ON or a verified new boot retain their existing
 recovery paths.
 
-Restart, unknown reads or observation gaps cannot manufacture a cycle. The companion
-starts with no tracker history after a process restart; any previously written status
-still has its original monotonic freshness limit. The existing five-second poll is a
+Restart, unknown reads or observation gaps cannot manufacture a cycle. Companion
+0.3.17 stores a bounded, versioned checkpoint in atomic app-private storage excluded
+from Android backup. A restart/update can restore only the exact original edge after
+a fresh known OFF/property read on the same kernel boot UUID and boot count, within
+the existing 15-second observation-continuity limit. Saved bounds/window never advance;
+repeated restarts consume the original native window. Corrupt, expired, mismatched or
+missing state and unknown reads preserve the unknown-deadline gate. Shell-writable
+public status and the movement journal cannot seed this checkpoint. Earlier companions
+started with no tracker history after restart. The existing five-second poll is a
 nominal delay after each read, not a guarantee that every short ignition pulse will be
 captured, and Wi-Fi connectivity alone proves no transition. Missing or rejected proof
 continues to block ordinary countdown admission. Accepted proof supplies only the
@@ -241,4 +247,5 @@ acquisition, expiry, connectivity loss and radio restoration. Software tests alo
 not establish those device-specific results or make footage filtering safe.
 For the recovery update, separately verify a short cycle captured by the companion
 while the server misses live ON, rejection of the preceding cycle, recovery across a
-server restart, and fail-closed behaviour after a companion restart or evidence gap.
+server restart, brief companion restart/update continuity, and fail-closed behaviour
+after corrupt/expired checkpoints, reboot, unknown reads or an evidence gap.

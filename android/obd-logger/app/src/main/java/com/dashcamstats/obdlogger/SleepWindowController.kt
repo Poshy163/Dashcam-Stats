@@ -14,6 +14,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
 import java.util.concurrent.TimeUnit
 
 internal const val ACTIVE_SLEEP_WINDOW_SECONDS = 1200
@@ -325,10 +326,13 @@ internal class AdaptiveSleepWindowController(
     private val observation: (SleepWindowControllerObservation) -> Unit = {},
     private val elapsedMillis: () -> Long = SystemClock::elapsedRealtime,
     private val bootIdentity: () -> SleepBootIdentity = { readSleepBootIdentity(context) },
+    deadlineStore: SleepDeadlineCheckpointStore? = AtomicSleepDeadlineCheckpointStore(
+        File(context.noBackupFilesDir, "sleep-deadline-v1.json"),
+    ),
 ) {
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
     private val transactionLock = Any()
-    private val deadlineTracker = SleepDeadlineTracker()
+    private val deadlineTracker = SleepDeadlineTracker(deadlineStore)
     private val reconciler = SleepWindowReconciler(
         property,
         transactionLock,
@@ -535,6 +539,7 @@ internal class AdaptiveSleepWindowController(
         // The same monitor covers policy transactions. The first OFF property read must
         // precede any ACC-off policy write; retries cannot interleave with this snapshot.
         val observed = synchronized(transactionLock) {
+            deadlineTracker.flushPendingInvalidation()
             val started = elapsedMillis()
             val boot = runCatching(bootIdentity).getOrNull() ?: SleepBootIdentity(null, null)
             val on = runCatching(accState::readAccOn).getOrNull()
