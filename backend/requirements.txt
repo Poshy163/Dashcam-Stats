@@ -8,6 +8,8 @@
 fastapi>=0.142.1,<0.143
 # Explicit floor for the audited file/range and multipart request fixes.
 starlette>=1.7.0,<2
+# FastAPI uses this API; retain the patched tracestate parser floor.
+opentelemetry-api>=1.45.1,<2
 uvicorn[standard]>=0.54.0,<0.55
 python-multipart>=0.0.32,<0.1
 

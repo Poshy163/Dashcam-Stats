@@ -13,6 +13,7 @@ authors = [{ name = "Joshua Leaper" }]
 dependencies = [
     "fastapi>=0.142.1,<0.143",
     "starlette>=1.7.0,<2",
+    "opentelemetry-api>=1.45.1,<2",
     "uvicorn[standard]>=0.54.0,<0.55",
     "python-multipart>=0.0.32,<0.1",
     "SQLAlchemy[asyncio]>=2.1.1,<2.2",

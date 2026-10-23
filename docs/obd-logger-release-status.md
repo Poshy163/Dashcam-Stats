@@ -56,6 +56,11 @@ components were visually checked with clearly labelled synthetic timing data.
 These checks do not establish physical BLE recovery or sustained decoder/polling
 performance on the new companion.
 
+The release dependency audit identified the existing OpenTelemetry API 1.45.0
+tracestate parsing advisory. Runtime and development locks now pin the patched
+1.45.1 release with an explicit source floor; the runtime, development and build
+locks pass the dependency audit without exclusions.
+
 ## 0.3.14 installed and 23 October review
 
 Source version **0.3.14/code 27** implements the operator's 95 C/100 C request. It
