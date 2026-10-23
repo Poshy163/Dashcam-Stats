@@ -16,8 +16,8 @@ import shutil
 import time
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from app.config import get_config
@@ -76,6 +76,7 @@ class _RunLifecycle:
     started_at: datetime
     released: bool = False
     policy_fingerprint_checks: int = 0
+    analysis_released: set[str] = field(default_factory=set)
 
 
 # Status clears its start and can admit a successor before history writes finish.
@@ -100,6 +101,16 @@ QUIET_EVIDENCE_RETRY_S = 2.0
 # at most three. Do not start either when its normal bound would exceed the grace.
 _QUIET_EVIDENCE_PROBE_BUDGET_S = 5.0
 _EVENT_SYNC_AWAIT_GRACE_SECONDS = 0.25
+
+# The first parked pair becomes eligible only after the two-minute ignition margin
+# and a closed segment. This opportunity is anchored to the REAL OFF edge, never
+# to an ingest trigger. Later paired candidates keep their own existing deadlines.
+QUIET_ANALYSIS_FIRST_WINDOW_S = 480.0
+QUIET_ANALYSIS_MAX_WAIT_S = 180.0
+QUIET_ANALYSIS_RECHECK_S = 10.0
+QUIET_ANALYSIS_PROBE_TIMEOUT_S = 20.0
+QUIET_ANALYSIS_NATIVE_RESERVE_S = 240.0
+QUIET_ANALYSIS_BATCH_CHECK_S = 30.0
 
 # One bounded recovery budget for normal cleanup and later reconciliation. Hotspot
 # attestation alone permits three 15-second reads; the old 30-second total could cancel
@@ -318,6 +329,19 @@ async def _await_quieting_evidence(address: str, logger_status: dict | None) -> 
     return logger_status
 
 
+_NATIVE_WINDOW_END_MESSAGE = (
+    "The native sleep window is ending; remaining footage stays on the card."
+)
+
+
+def _cancel_for_radio_stop(error: object) -> None:
+    expected_end = isinstance(error, radio_coordinator.RadioWindowEnding)
+    get_status().cancel(
+        reason="native_sleep_window_ending" if expected_end else "radio_safety_lease_lost",
+        detail=_NATIVE_WINDOW_END_MESSAGE if expected_end else redact(error) if error else None,
+    )
+
+
 def _classify_cancellation(result: RunResult) -> RunResult:
     """Keep safety stops retryable and operator Stop terminal, retaining committed work."""
     status = get_status()
@@ -327,6 +351,27 @@ def _classify_cancellation(result: RunResult) -> RunResult:
         # earlier classification; retain all committed counts and failure evidence.
         result.state = RunState.CANCELLED
         result.error = result.error or "the transfer was cancelled"
+        return result
+    if (
+        status.cancel_event.is_set()
+        and status.cancel_reason == "native_sleep_window_ending"
+        and result.state in {RunState.CANCELLED, RunState.PARTIAL, RunState.ERROR}
+    ):
+        expected = result.error in {
+            None,
+            "backup cancelled",
+            "the transfer was cancelled",
+            _NATIVE_WINDOW_END_MESSAGE,
+        }
+        result.state = (
+            RunState.PARTIAL
+            if result.files or result.bytes
+            else RunState.IDLE
+            if expected
+            else RunState.ERROR
+        )
+        if expected:
+            result.error = _NATIVE_WINDOW_END_MESSAGE
         return result
     if (
         status.cancel_event.is_set()
@@ -349,7 +394,7 @@ def _radio_shutdown_hold(reason: object) -> RunResult:
     """Keep requested quieting mandatory while allowing the poller's safe retry."""
     status = get_status()
     if status.cancel_event.is_set():
-        if status.cancel_reason == "radio_safety_lease_lost":
+        if status.cancel_reason in {"radio_safety_lease_lost", "native_sleep_window_ending"}:
             # Defer classification until cleanup is complete: an operator's Stop
             # during restoration still outranks this internal safety cancellation.
             return RunResult(state=RunState.CANCELLED, error=redact(reason))
@@ -830,6 +875,7 @@ async def _move(
     lease: radio_coordinator.RadioTransition | None = None,
     chunk_size: int = 5,
     on_chunk_completed: Callable[[list[RemoteFile]], Awaitable[None]] | None = None,
+    yield_after_chunk: Callable[[], Awaitable[bool]] | None = None,
 ) -> transport.TransferResult:
     """Stream *files* off the unit into *staging*, in bounded chunks per directory.
 
@@ -941,6 +987,14 @@ async def _move(
                 # a link that has already gone would spend what is left of the window on a
                 # connection that cannot be answered.
                 break
+            if yield_after_chunk is not None:
+                yield_batch = await yield_after_chunk()
+                if lease is not None:
+                    lease.raise_if_lease_lost()
+                if yield_batch:
+                    # An intentional batch boundary, not cancellation or a failed copy.
+                    # The caller retains the unrequested remainder as ordinary backlog.
+                    return transferred
         if not transferred.complete or status.cancel_event.is_set():
             break
     return transferred
@@ -1158,7 +1212,208 @@ async def _filter_parked_inventory(
     )
     if lifecycle is not None:
         lifecycle.policy_fingerprint_checks += filtered.fingerprint_checks
+        released = [
+            item for item, _ in filtered.deferred if item.name in lifecycle.analysis_released
+        ]
+        if released:
+            # A completed/bounded opportunity is never renewed inside a bulk batch.
+            # This only restores ordinary upload; it grants no exclusion authority.
+            filtered.files.extend(released)
+            filtered.deferred = [
+                (item, until)
+                for item, until in filtered.deferred
+                if item.name not in lifecycle.analysis_released
+            ]
     return filtered
+
+
+def _logger_can_analyze(logger: dict | None) -> bool:
+    """The published counterpart of the companion's parked/unquieted decoder gate."""
+    if not isinstance(logger, dict):
+        return False
+    try:
+        age = (
+            datetime.now(UTC) - movement._timestamp(logger.get("updated_at_utc"))
+        ).total_seconds()
+    except (movement.ManifestError, TypeError, ValueError):
+        return False
+    return bool(
+        -30 <= age <= 30
+        and parked_filter.CAPABILITY in (logger.get("capabilities") or [])
+        and logger.get("movement_state") == "ready"
+        and logger.get("transfer_policy_enabled") is True
+        and logger.get("transfer_policy_state") in {"ready", "scanning", "waiting"}
+        and logger.get("acc_state_known") is True
+        and logger.get("acc_on") is False
+        and logger.get("engine_running") is False
+        and logger.get("head_unit_state") == "awake"
+        and logger.get("current_drive_id") is None
+        and logger.get("ingestion_sleep_hold_known") is True
+        and logger.get("ingestion_sleep_hold") is False
+    )
+
+
+def _analysis_native_budget(snapshot: dict) -> tuple[datetime, float] | None:
+    """Only a fresh, real native OFF timer can fund an optional analysis handoff."""
+    remaining = snapshot.get("sleep_countdown_remaining_s")
+    if (
+        snapshot.get("unit_observation_fresh") is not True
+        or snapshot.get("ignition_state") != "off"
+        or snapshot.get("sleep_countdown_source") != "estimated"
+        or type(remaining) not in {int, float}
+        or not QUIET_ANALYSIS_NATIVE_RESERVE_S < remaining <= 3600
+    ):
+        return None
+    try:
+        off_at = movement._timestamp(snapshot.get("ignition_off_at"))
+    except (movement.ManifestError, TypeError, ValueError):
+        return None
+    if off_at > datetime.now(UTC):
+        return None
+    return off_at, float(remaining)
+
+
+async def _quiet_analysis_handoff(
+    info: UnitInfo,
+    sources: list[str],
+    remote: list[RemoteFile],
+    logger: dict | None,
+    filtered: parked_filter.FilterResult,
+    *,
+    footage: Path,
+    seen: set[str],
+) -> tuple[list[RemoteFile], dict | None, parked_filter.FilterResult, bool]:
+    """Yield BEFORE any ingestion lease so the parked camera can finish full proofs.
+
+    The first opportunity is fixed to the real OFF edge, including across triggers
+    and server restarts. Later paired pending clips use their unchanged end+6min
+    deadline and a shorter monotonic cap. No call here quiesces, extends sleep or
+    treats a pending/failed analysis as permission to omit footage.
+    """
+    status = get_status()
+    if (
+        not bool(_get("skip_parked_footage", False))
+        or not bool(_get("quiet_radios", False))
+        or not _logger_can_analyze(logger)
+        or not filtered.analysis_ready
+    ):
+        return remote, logger, filtered, False
+    budget = _analysis_native_budget(status.snapshot())
+    if budget is None:
+        return remote, logger, filtered, False
+    off_at, native_remaining = budget
+    now = datetime.now(UTC)
+    first_until = off_at + timedelta(seconds=QUIET_ANALYSIS_FIRST_WINDOW_S)
+    # A staggered pair may appear after four minutes; keep the whole first
+    # opportunity available, always ending at the same original OFF+480 ceiling.
+    anticipate = (now - off_at).total_seconds() < QUIET_ANALYSIS_FIRST_WINDOW_S
+    pending_until = min((until for _, until in filtered.deferred), default=None)
+    if pending_until is None and not anticipate:
+        return remote, logger, filtered, False
+    until = (
+        first_until
+        if anticipate
+        else min(pending_until, now + timedelta(seconds=QUIET_ANALYSIS_MAX_WAIT_S))
+    )
+    if pending_until is not None:
+        until = min(until, pending_until)
+    until = min(until, now + timedelta(seconds=native_remaining - QUIET_ANALYSIS_NATIVE_RESERVE_S))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + (until - now).total_seconds()
+    waited = False
+    saw_pending = bool(filtered.deferred)
+    try:
+        while deadline - loop.time() > 0 and not status.cancel_event.is_set():
+            pending = await asyncio.to_thread(
+                _with_deferred_backlog, DeltaPlan(), filtered, footage, seen, time.time()
+            )
+            status.set_policy_deferred(pending)
+            terminal = await asyncio.to_thread(
+                delta,
+                [
+                    item
+                    for item in filtered.analysis_terminal_files
+                    if (start := filtered.analysis_terminal_starts.get(item.name)) is not None
+                    and start >= off_at + timedelta(seconds=120)
+                ],
+                footage,
+                skip_active_s=0,
+                camera="both",
+                already_seen=seen,
+            )
+            if not filtered.deferred and terminal.files:
+                break  # A local/unrelated terminal clip cannot starve a valid pending pair.
+            # If everything is already local there is no bulk phase to starve the
+            # decoder. Let the ordinary idle path release the run immediately.
+            ordinary = await asyncio.to_thread(
+                delta, filtered.files, footage, skip_active_s=0, camera="both", already_seen=seen
+            )
+            if not ordinary.files and not filtered.deferred:
+                break
+            status.set_phase(Phase.ANALYSING)
+            status.set_analysis_wait(
+                until.isoformat(), "pending_analysis" if saw_pending else "awaiting_parked_clip"
+            )
+            waited = True
+            wake = min(deadline, loop.time() + QUIET_ANALYSIS_RECHECK_S)
+            while loop.time() < wake and not status.cancel_event.is_set():
+                await asyncio.sleep(min(0.25, wake - loop.time()))
+            if status.cancel_event.is_set() or deadline - loop.time() <= 0:
+                break
+            try:
+                async with asyncio.timeout(
+                    min(QUIET_ANALYSIS_PROBE_TIMEOUT_S, deadline - loop.time())
+                ):
+                    observation, latest_logger, latest_remote = await asyncio.gather(
+                        adb.runtime_observation(
+                            info.address, logger_status_path=get_config().obd_remote_status_file
+                        ),
+                        read_logger_status(info.address, get_config().obd_remote_status_file),
+                        adb.inventory_all(info.address, sources),
+                    )
+                    if observation is None:
+                        status.unit_observation_failed()
+                        break
+                    if status.observe_unit_runtime(observation):
+                        break
+                    remote, logger = latest_remote, latest_logger
+                    budget = _analysis_native_budget(status.snapshot())
+                    if budget is None or not _logger_can_analyze(logger):
+                        break
+                    latest_off, native_remaining = budget
+                    if abs((latest_off - off_at).total_seconds()) > 2:
+                        break  # A new/revised OFF edge is not a renewed wait budget.
+                    deadline = min(
+                        deadline, loop.time() + native_remaining - QUIET_ANALYSIS_NATIVE_RESERVE_S
+                    )
+                    until = min(
+                        until, datetime.now(UTC) + timedelta(seconds=max(0, deadline - loop.time()))
+                    )
+                    filtered = await _filter_parked_inventory(info, remote, logger)
+                    if not filtered.analysis_ready:
+                        break
+                    if filtered.deferred:
+                        saw_pending = True
+                        next_until = min(until for _, until in filtered.deferred)
+                        until = min(until, next_until)
+                        deadline = min(
+                            deadline, loop.time() + (until - datetime.now(UTC)).total_seconds()
+                        )
+                    elif saw_pending:
+                        break  # Quiet proofs or ordinary upload resolved this opportunity.
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Optional analysis cannot veto normal footage backup.
+                break
+    finally:
+        lifecycle = _run_lifecycle.get()
+        if waited and lifecycle is not None:
+            lifecycle.analysis_released.update(item.name for item, _ in filtered.deferred)
+        status.set_analysis_wait(None, None)
+        if waited:
+            status.set_phase(Phase.SCANNING)
+    return remote, logger, filtered, waited
 
 
 def _with_deferred_backlog(
@@ -1832,10 +2087,7 @@ async def _run_pull_started(
 
     def cancel_for_radio_lease_loss() -> None:
         detail = getattr(radio_transition, "lease_loss_error", None)
-        status.cancel(
-            reason="radio_safety_lease_lost",
-            detail=redact(detail) if detail is not None else None,
-        )
+        _cancel_for_radio_stop(detail)
 
     try:
         # Only if nobody has already looked. The presence poll describes the unit
@@ -1980,6 +2232,29 @@ async def _run_pull_started(
                 # A diagnostic regression must still fail open for footage backup.
                 log.warning("movement manifest observation failed; footage will continue")
         filtered_inventory = await _filter_parked_inventory(info, remote, movement_logger)
+        (
+            remote,
+            movement_logger,
+            filtered_inventory,
+            analysis_waited,
+        ) = await _quiet_analysis_handoff(
+            info,
+            sources,
+            remote,
+            movement_logger,
+            filtered_inventory,
+            footage=footage,
+            seen=await removed,
+        )
+        if status.cancel_event.is_set():
+            result = RunResult(state=RunState.CANCELLED)
+            return result
+        if analysis_waited:
+            # Inventory and clock samples obtained before a bounded handoff have aged.
+            # Revalidate the transfer policy and read a new clock offset before delta.
+            filtered_inventory = await _filter_parked_inventory(
+                info, remote, movement_logger, refresh_logger=True
+            )
         remote = filtered_inventory.files
         status.set_phase(Phase.PREPARING)
         # Off the event loop: this stats every candidate against the footage share, which
@@ -1988,7 +2263,7 @@ async def _run_pull_started(
         # car appears -- the regression commit da2850a exists to prevent.
         # Carried as an offset rather than an absolute, so the listing's own duration
         # cannot age the reading: the guard is judged at the moment the delta runs.
-        unit_now = await clock
+        unit_now = await adb.unit_clock(info.address) if analysis_waited else await clock
         skew = (unit_now - time.time()) if unit_now is not None else 0.0
         if abs(skew) >= 5.0:
             log.info(
@@ -2001,7 +2276,7 @@ async def _run_pull_started(
             remote,
             footage,
             skip_active_s=int(_get("skip_active_seconds", 15)),
-            camera=str(_get("camera_filter", "both")),
+            camera="both",
             already_seen=await removed,
             newest_first=str(_get("transfer_order", "oldest_first")) == "newest_first",
             now=time.time() + skew,
@@ -2021,6 +2296,9 @@ async def _run_pull_started(
             item.name: item.size
             for item in [*plan.files, *(item for item, _ in filtered_inventory.deferred)]
         }
+        camera = str(_get("camera_filter", "both"))
+        if camera != "both":
+            plan.files = [item for item in plan.files if item.name.endswith(f"_{camera}.ts")]
         # A second opinion on which files are still open, from two sizes rather than one
         # timestamp. Only when there is something to fetch, so an idle window still costs
         # exactly one listing.
@@ -2028,14 +2306,22 @@ async def _run_pull_started(
             await _drop_still_growing(info, plan, sources)
         status.plan(plan)
         try:
-            remote_obd = await obd_inventory
+            remote_obd = (
+                await inventory_remote_bundles(info.address, get_config().obd_remote_ready_dir)
+                if analysis_waited
+                else await obd_inventory
+            )
         except Exception as exc:
             remote_obd = []
             obd_inventory_ok = False
             log.warning("could not inventory OBD exports; footage will continue", error=redact(exc))
         previous_logger = get_obd_transfer_status().snapshot()["logger"]
         try:
-            observed_logger = await obd_logger
+            observed_logger = (
+                await read_logger_status(info.address, get_config().obd_remote_status_file)
+                if analysis_waited
+                else await obd_logger
+            )
         except Exception as exc:
             observed_logger = {
                 "state": "status_unavailable",
@@ -2342,10 +2628,22 @@ async def _run_pull_started(
                 await radio_transition.capture_and_quiet()
                 radio_transition.raise_if_lease_lost()
             except Exception as exc:
+                # The controller can witness the native deadline before the heartbeat
+                # translates it. Preserve only that explicit typed proof; an identical
+                # message from an unproven/dead watchdog remains a safety failure.
+                if isinstance(exc, radios.WatchdogWindowEnding):
+                    exc = radio_coordinator.RadioWindowEnding(exc.recovery_state)
+                window_ending = isinstance(exc, radio_coordinator.RadioWindowEnding)
+                if window_ending:
+                    _cancel_for_radio_stop(exc)
                 log.warning(
                     "could not safely quiet radios; restoring before transfer", error=redact(exc)
                 )
-                reason = status.radio_quieting_hold_reason or str(exc)
+                reason = (
+                    _NATIVE_WINDOW_END_MESSAGE
+                    if window_ending
+                    else status.radio_quieting_hold_reason or str(exc)
+                )
                 restored = await _restore_radio_transition(radio_transition, error=exc)
                 radio_transition = None
                 result = _radio_shutdown_hold(
@@ -2374,6 +2672,74 @@ async def _run_pull_started(
         chunk_size = int(_get("chunk_size", 5))
         expected = {item.name: item.size for item in plan.files}
         wanted = list(plan.files)
+        analysis_batch_yielded = False
+        analysis_yield_plan = DeltaPlan()
+        analysis_new_backlog: dict[str, int] = {}
+        last_analysis_check = asyncio.get_running_loop().time()
+
+        def _note_analysis_backlog(
+            candidate_plan: DeltaPlan, candidate_inventory: parked_filter.FilterResult
+        ) -> None:
+            # A pair can close after the arrival inventory. Preserve those new
+            # files in the total backlog as well as the separate pending count.
+            for item in [
+                *candidate_plan.files,
+                *(item for item, _ in candidate_inventory.deferred),
+            ]:
+                if item.name not in initial_backlog_sizes and item.name not in expected:
+                    analysis_new_backlog[item.name] = item.size
+
+        async def _yield_for_new_analysis() -> bool:
+            nonlocal analysis_batch_yielded, analysis_yield_plan, last_analysis_check
+            if not bool(_get("skip_parked_footage", False)) or not quiet_requested:
+                return False
+            now = asyncio.get_running_loop().time()
+            if now - last_analysis_check < QUIET_ANALYSIS_BATCH_CHECK_S:
+                return False
+            last_analysis_check = now
+            if _analysis_native_budget(status.snapshot()) is None:
+                return False
+            try:
+                async with asyncio.timeout(QUIET_ANALYSIS_PROBE_TIMEOUT_S):
+                    latest = await _filter_parked_inventory(
+                        info,
+                        await adb.inventory_all(info.address, sources),
+                        movement_logger,
+                        refresh_logger=True,
+                    )
+                    if not latest.analysis_ready:
+                        return False
+                    remaining_plan = await asyncio.to_thread(
+                        delta,
+                        latest.files,
+                        footage,
+                        skip_active_s=int(_get("skip_active_seconds", 15)),
+                        camera="both",
+                        already_seen=await removed,
+                        now=time.time() + skew,
+                    )
+                    analysis_yield_plan = await asyncio.to_thread(
+                        _with_deferred_backlog,
+                        remaining_plan,
+                        latest,
+                        footage,
+                        await removed,
+                        time.time() + skew,
+                        camera=str(_get("camera_filter", "both")),
+                    )
+                    if not analysis_yield_plan.policy_deferred_files:
+                        return False
+                    _note_analysis_backlog(analysis_yield_plan, latest)
+                    status.set_policy_deferred(analysis_yield_plan)
+                    analysis_batch_yielded = True
+                    log.info(
+                        "ending the footage batch to release a bounded on-camera analysis opportunity"
+                    )
+                    return True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return False  # Optional observation never interrupts an ordinary backup.
 
         async def _commit_and_reclaim_chunk(chunk: list[RemoteFile]) -> None:
             chunk_expected = {item.name: item.size for item in chunk}
@@ -2408,6 +2774,7 @@ async def _run_pull_started(
                 lease=radio_transition,
                 chunk_size=chunk_size,
                 on_chunk_completed=pipeline.submit,
+                yield_after_chunk=_yield_for_new_analysis,
             )
         except BaseException:
             # The window shut or the lease went. Whatever is queued has not been committed,
@@ -2446,7 +2813,7 @@ async def _run_pull_started(
         # second listing to fail on. Stops the first time nothing new has appeared.
         sweeps = int(_get("sweep_passes", 2))
         for _ in range(max(0, sweeps)):
-            if not transferred.complete or status.cancel_event.is_set():
+            if analysis_batch_yielded or not transferred.complete or status.cancel_event.is_set():
                 break
             status.set_phase(Phase.SCANNING)
             sweep_inventory = await _filter_parked_inventory(
@@ -2461,7 +2828,7 @@ async def _run_pull_started(
                 sweep_inventory.files,
                 footage,
                 skip_active_s=int(_get("skip_active_seconds", 15)),
-                camera=str(_get("camera_filter", "both")),
+                camera="both",
                 already_seen=await removed,
                 newest_first=str(_get("transfer_order", "oldest_first")) == "newest_first",
                 now=time.time() + skew,
@@ -2476,6 +2843,13 @@ async def _run_pull_started(
                 camera=str(_get("camera_filter", "both")),
             )
             status.set_policy_deferred(more)
+            if more.policy_deferred_files and quiet_requested and sweep_inventory.analysis_ready:
+                analysis_batch_yielded = True
+                analysis_yield_plan = more
+                _note_analysis_backlog(more, sweep_inventory)
+                break  # Restore the logger before starting another sweep of ordinary footage.
+            if camera != "both":
+                more.files = [item for item in more.files if item.name.endswith(f"_{camera}.ts")]
             if more.files:
                 await _drop_still_growing(info, more, sources)
             if more.files:
@@ -2532,6 +2906,7 @@ async def _run_pull_started(
         if (
             bool(_get("rescue_partials", True))
             and transferred.complete
+            and not analysis_batch_yielded
             and not status.cancel_event.is_set()
         ):
             try:
@@ -2558,6 +2933,23 @@ async def _run_pull_started(
                 wanted.extend(rescued)
                 committed = [*committed, *rescued_names]
                 expected.update(rescued_sizes)
+
+        if analysis_batch_yielded:
+            plan.backlog_files += len(analysis_new_backlog)
+            plan.backlog_bytes += sum(analysis_new_backlog.values())
+            delivered = set(transferred.files) | set(committed)
+            wanted = [item for item in wanted if item.name in delivered]
+            status.plan(
+                DeltaPlan(
+                    files=wanted,
+                    backlog_files=plan.backlog_files,
+                    backlog_bytes=plan.backlog_bytes,
+                    active_skipped=plan.active_skipped,
+                    policy_deferred_files=analysis_yield_plan.policy_deferred_files,
+                    policy_deferred_bytes=analysis_yield_plan.policy_deferred_bytes,
+                    policy_deferred_until_utc=analysis_yield_plan.policy_deferred_until_utc,
+                )
+            )
 
         state = (
             RunState.OK
@@ -2690,6 +3082,11 @@ async def _run_pull_started(
         result.state = RunState.CANCELLED
         result.error = "backup cancelled"
         raise
+    except radio_coordinator.RadioWindowEnding:
+        interrupted_error = _NATIVE_WINDOW_END_MESSAGE
+        result = RunResult(state=RunState.ERROR, error=interrupted_error)
+        status.cancel(reason="native_sleep_window_ending", detail=interrupted_error)
+        log.info("ending the pull before native sleep; preserving remaining footage")
     except adb.AdbError as exc:
         interrupted_error = redact(exc)
         result = RunResult(state=RunState.ERROR, error=interrupted_error)
@@ -2727,6 +3124,15 @@ async def _run_pull_started(
                     seconds=result.seconds,
                     error="radio restoration remains pending and will be retried",
                 )
+            elif not restored and status.cancel_reason == "native_sleep_window_ending":
+                detail = "radio restoration remains pending and will be retried"
+                if interrupted_error is not None:
+                    interrupted_error = f"{interrupted_error}; {detail}"
+                else:
+                    result.error = f"{result.error or _NATIVE_WINDOW_END_MESSAGE}; {detail}"
+                    result.state = (
+                        RunState.PARTIAL if result.files or result.bytes else RunState.ERROR
+                    )
 
         if interrupted_error is not None:
             # Restore the driver's radios first. Then preserve and count every

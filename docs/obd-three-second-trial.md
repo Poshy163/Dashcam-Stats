@@ -152,6 +152,26 @@ the interval. Camera-reported missing time remains separately labelled, since it
 definition can differ by exporter version and old discarded values cannot be recovered
 from the derived projection alone.
 
+### 0.3.15 physical result and 0.3.16 MAF retry
+
+The two 23 October 0.3.15 drives sustained plan 8 for 18m46s/369 rows and
+25m27s/499 rows. Median fresh speed/RPM/MAF intervals were 3.02-3.03 seconds;
+no trial fallback, command timeout or connection loss occurred. All 868 samples
+persisted. Four malformed MAF requests per drive still caused 12-15-second gaps:
+the first malformed-PID backoff used two five-second buckets, independent of the
+three-second row cadence. The rejected response bytes were not retained, so these
+captures do not establish a specific checksum, framing or parser defect.
+
+Companion 0.3.16 opts only plan-8 MAF into a single next-scheduled-opportunity retry.
+The row sequence prevents a second command in the failed row even when consecutive
+rows share a five-second bucket. A first refused reply remains missing and uses the
+existing plain-syntax path; a repeated refusal returns to the existing exponential
+backoff. Success resets the breaker. ISO source/mode/PID/length/checksum validation,
+strict transport ownership, the 15-second health bound and sustained-overrun fallback
+are unchanged. There is no retry of an uncertain critical timeout and no extra
+same-cycle request. A successful next-row retry still leaves an honest roughly
+six-second interval between valid MAF readings; hardware acceptance needs a new drive.
+
 Earlier 0.3.12 validation on 22 October 2026 passed 274 Android JVM tests, 3,320 backend
 tests (33 platform/fixture skips) and 229 frontend tests. Android debug lint and
 assembly, frontend typechecking/lint/production build, and Python Ruff checks and

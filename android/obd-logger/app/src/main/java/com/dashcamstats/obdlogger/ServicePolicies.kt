@@ -471,26 +471,37 @@ data class MalformedPidDecision(
 )
 
 /**
- * Per-PID circuit breaker. A transient malformed response is retried after a short cooldown;
- * repeated strict-parser failures back off exponentially to a bounded one-minute cadence.
+ * Per-PID circuit breaker. The trial may grant MAF one next-scheduled-opportunity retry after
+ * a prompt-complete parser refusal. A distinct row token prevents retrying in the same row,
+ * even though adjacent three-second rows may share the elapsed five-second cooldown bucket.
+ * All other and repeated strict-parser failures retain bounded exponential backoff.
  */
 internal class LivePidMalformedTracker(
     private val baseCooldownCycles: Long = 2,
     private val maximumCooldownCycles: Long = 12,
+    nextOpportunityRetryPids: Set<Int> = emptySet(),
 ) {
-    private data class State(val failures: Int, val retryAtCycle: Long)
+    private data class State(val failures: Int, val retryAtCycle: Long, val afterOpportunity: Long? = null)
     private val states = mutableMapOf<Int, State>()
+    private val nextOpportunityRetryPids = nextOpportunityRetryPids.toSet()
 
     init {
         require(baseCooldownCycles >= 1)
         require(maximumCooldownCycles >= baseCooldownCycles)
+        require(nextOpportunityRetryPids.all { it == 0x10 }) // Only the trial's measured MAF gap is opted in.
     }
 
-    fun shouldPoll(pid: Int, cycle: Long): Boolean =
-        states[pid]?.let { cycle >= it.retryAtCycle } ?: true
+    fun shouldPoll(pid: Int, cycle: Long, opportunity: Long = cycle): Boolean =
+        states[pid]?.let {
+            cycle >= it.retryAtCycle && (it.afterOpportunity == null || opportunity > it.afterOpportunity)
+        } ?: true
 
-    fun recordMalformed(pid: Int, cycle: Long): MalformedPidDecision {
+    fun recordMalformed(pid: Int, cycle: Long, opportunity: Long = cycle): MalformedPidDecision {
         val failures = ((states[pid]?.failures ?: 0) + 1).coerceAtMost(30)
+        if (failures == 1 && pid in nextOpportunityRetryPids) {
+            states[pid] = State(failures, cycle, afterOpportunity = opportunity)
+            return MalformedPidDecision(failures, cycle)
+        }
         val shift = (failures - 1).coerceAtMost(20)
         val cooldown = (baseCooldownCycles shl shift).coerceAtMost(maximumCooldownCycles)
         val retryAt = if (cycle > Long.MAX_VALUE - cooldown) Long.MAX_VALUE else cycle + cooldown

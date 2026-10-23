@@ -1224,7 +1224,7 @@ class ObdLoggerService : Service() {
     ): RecordingExit {
         val scheduler = PollTrialScheduler(SystemClock::elapsedRealtime)
         val health = PollTrialHealth()
-        val malformed = LivePidMalformedTracker()
+        val malformed = LivePidMalformedTracker(nextOpportunityRetryPids = setOf(0x10))
         val timing = PollTiming(driveStartedElapsedMillis, PollTrialPlan.TARGET_MILLIS, SystemClock::elapsedRealtime)
         fun quiesceRequest() = timing.measureStage(PollCycleStage.QUIESCE_CHECKS) {
             currentQuiesceRequest(deviceRoot)
@@ -1291,8 +1291,8 @@ class ObdLoggerService : Service() {
                             if (pid >= 0) missing += pid
                             continue
                         }
-                        // Cooldowns retain their old elapsed durations, independent of the faster row rate.
-                        if (pid >= 0 && !malformed.shouldPoll(pid, wallCycle)) {
+                        // Repeated/other-PID cooldowns keep their elapsed durations; first malformed MAF retries next row.
+                        if (pid >= 0 && !malformed.shouldPoll(pid, wallCycle, opportunity = sequence)) {
                             timing.cooldownSkip(pid)
                             missing += pid
                             if (!optional) criticalOutcomes[pid] = CriticalPollOutcome.COOLDOWN
@@ -1329,7 +1329,7 @@ class ObdLoggerService : Service() {
                                     is LivePidPollResult.Malformed -> {
                                         missing += pid
                                         if (!optional) criticalOutcomes[pid] = CriticalPollOutcome.MALFORMED
-                                        malformed.recordMalformed(pid, wallCycle)
+                                        malformed.recordMalformed(pid, wallCycle, opportunity = sequence)
                                         recordParserFailure(result.error)
                                         database.incrementError(driveId)
                                         database.addDiagnostic(driveId, "parser_failure", JSONObject()

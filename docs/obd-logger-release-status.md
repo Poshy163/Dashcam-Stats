@@ -8,15 +8,50 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.14** (`versionCode` 27), installed in place on 22 October 2026 |
-| Source | `a21efb0b561d5d43e78fe476d73646bd47278bb9` (`android/obd-logger/`), verified in the running companion and installed APK |
+| Version | **0.3.15** (`versionCode` 28), installed in place on 23 October 2026 |
+| Source | `e8981bc78d823807cdb920c8df423366a6d3dbb6` (`android/obd-logger/`), verified in the running companion and installed APK |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | The 23 October three-second trial fell back to plan 7 after sustained cycle overruns; the following five segments used plan 7 |
-| Deployment | Production-signed 0.3.14/code 27 was installed in place on 22 October, retaining app identity, runtime permissions, folder access, ownership and quiet filtering. The APK hash, fresh companion status and matching server revision were verified. The 23 October review still found no genuine quiet exclusions or sustained three-second operation. |
+| Poll plan | The re-armed three-second plan 8 trial lasted both latest drives: 18m46s/369 samples and 25m27s/499 samples, without fallback |
+| Deployment | Production-signed 0.3.15/code 28 was installed in place on 23 October, retaining app identity, runtime permissions, folder access, ownership and quiet filtering. Installed APK bytes, the production signer, fresh status and matching server revision were verified. Actual quiet exclusions remain unverified. |
 
-## 0.3.15 recovery and timing candidate
+## 0.3.16 MAF and pre-transfer analysis candidate
+
+Source version **0.3.16/code 29** addresses the remaining 0.3.15 drive findings.
+It is not installed. Deploy the matching server before the companion update.
+
+- Plan 8 grants MAF one retry on the next scheduled row after its first strictly
+  rejected, prompt-complete reply. The rejected row remains missing, no extra command
+  is added to that row, and repeated failures retain the exponential backoff and
+  existing health/fallback limits. Other PIDs and baseline polling are unchanged.
+  This removes the artificial first-error ten-second cooldown; it cannot guarantee
+  that an adapter's next reply will be valid or eliminate all estimated-fuel gaps.
+- An owned native sleep deadline produces a distinct orderly window-ending stop.
+  Positive generation, process identity and monotonic deadline/restoration evidence
+  are required. No ending/restoring watchdog is treated as healthy or renewed;
+  unproven loss, stale/malformed evidence and failed restoration remain failures.
+  Committed footage is retained, the rest stays pending, and explicit Cancel wins.
+- Opted-in parked analysis receives a bounded opportunity before radio quieting and
+  bulk copying. The Backup page exposes the analysis phase and its absolute cutoff.
+  The individual clip-end-plus-six-minute deadline, paired full-frame/EOS proof,
+  thermal/resource checks and safe-upload fallback remain in force.
+
+Local validation on 23 October passed **3,644 backend tests** with 77 Windows
+platform/fixture skips, **313 Android JVM tests** with no skips, and **240 frontend
+tests**. Ruff lint/format, frontend typecheck/lint/production build, all three locked
+Python dependency audits and the npm audit passed. Both Android APK variants assembled;
+debug/release lint reported zero errors and 58 existing warnings each. Generated
+watchdog scripts were executed under the available POSIX shell. The scheduling tests
+exercise full paired proofs before any quiesce/copy, bounded fallback, completed-chunk
+restoration, current versus historical refusals and exact backlog with camera filters.
+
+Physical acceptance still requires the new companion, real malformed-MAF recovery,
+native deadline/restoration checks, actual quiet exclusions retained on the card and
+their downstream scanner/processing omission. Local tests and historical replay do
+not establish those future device outcomes.
+
+## 0.3.15 installed and physical review
 
 Source version **0.3.15/code 28** addresses the physical 23 October findings. Deploy
 the matching server before installing the companion: new poll-timing diagnostics use
@@ -42,9 +77,27 @@ schema 2 with bounded, exclusive cycle-stage timing; schema 1 remains supported.
   Camera-reported missing time and the server's threshold-based definition are
   labelled separately; unavailable historical producer values remain unavailable.
 
-This source candidate is not installed. A new drive and naturally cool paired-clip
-analysis are required to verify sustained polling, firmware-profile matching,
-recording continuity, actual quiet skips and the downstream omission path.
+The signed APK was installed on 23 October. All five native firmware identity fields
+matched the narrow compatibility profile. The camera initially reported 106.255 C
+and Android CRITICAL, correctly retaining the analysis block. Cooling diagnostics
+reached the matching server, and expired cooling results returned to ordinary upload.
+The three-second trial was re-armed through the app's existing preference API with
+same-process read-back; the temporary signed helper was removed and the native
+countdown was preserved. APK SHA-256:
+`13f3dbf9db30aeb6ab9884b0b7c69ed25e30b53796d338087a2bdd3ecffddb4f`.
+
+The two following drives sustained plan 8 with median fresh speed/RPM/MAF intervals
+of 3.02-3.03 seconds, no command timeouts, no connection losses and all 868 samples
+persisted. Independent production-accumulator replay exactly matched camera and
+server distance and estimated fuel. Four malformed MAF replies per drive still
+caused 12-15-second gaps; the second drive reported three slow row intervals with
+6.192 seconds of excess. A backup retained 145 files/8.557 GB before losing watchdog
+proof; a later retry completed 42 files/2.518 GB successfully. Quiet exclusions were
+still zero. With the camera later at 80.485 C/SEVERE, long backups continued to block
+analysis and consume the six-minute clip deadline. The first drive's 47 video clips
+were fully processed; the second drive's processing was still incomplete at review.
+Naturally cool paired analysis, actual quiet skips and their downstream omission
+path remain physical acceptance work.
 
 Local validation on 23 October passed **3,506 backend tests** with 33 platform/fixture
 skips, **307 Android JVM tests** with no skips, and **238 frontend tests**. Ruff
@@ -577,7 +630,7 @@ First integrate/review the release source in the protected signing checkout, or 
 protected build host to use the existing signing files. The original checkout may still contain
 older source and unrelated local changes: do not blindly pull, switch branches or overwrite it.
 Fresh worktrees do not contain the signing files. From the chosen source checkout, after verifying
-`app/build.gradle.kts` declares version 0.3.14/code 27:
+`app/build.gradle.kts` declares version 0.3.16/code 29:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
@@ -605,7 +658,7 @@ other settings, the metrics toggle works, and `Bundles waiting for the server` d
 next Wi-Fi window. Verify webhook events reach the server and boot recovery still works.
 
 After ingestion obtains a fresh status snapshot, `GET /api/obd/status` should report
-`app_version_name: "0.3.14"` and `app_version_code: 27` under `logger`. A cached status alone does
+`app_version_name: "0.3.16"` and `app_version_code: 29` under `logger`. A cached status alone does
 not establish the currently installed/running version.
 
 ## What is still left to do

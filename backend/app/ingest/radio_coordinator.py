@@ -74,6 +74,18 @@ class RadioTransitionError(RuntimeError):
     """A safe, fully-restorable radio transition could not be completed."""
 
 
+class RadioWindowEnding(RadioTransitionError):
+    """A positively witnessed native sleep deadline requires an orderly transfer stop."""
+
+    reason_code = "native_sleep_deadline"
+
+    def __init__(self, recovery_state: str = "deadline_approaching") -> None:
+        if recovery_state not in {"deadline_approaching", "restoring", "unit_report"}:
+            raise ValueError("invalid radio window-ending state")
+        self.recovery_state = recovery_state
+        super().__init__("native sleep deadline is ending the backup window")
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -141,9 +153,14 @@ class RadioTransition:
     def _signal_lease_loss(self, error: object) -> None:
         if self._lease_lost_event.is_set():
             return
-        lease_error = RadioTransitionError(
-            f"durable ingest radio lease was lost: {_error_text(error)}"
-        )
+        if isinstance(error, RadioWindowEnding):
+            lease_error = error
+        elif isinstance(error, radios.WatchdogWindowEnding):
+            lease_error = RadioWindowEnding(error.recovery_state)
+        else:
+            lease_error = RadioTransitionError(
+                f"durable ingest radio lease was lost: {_error_text(error)}"
+            )
         self._lease_loss_error = lease_error
         self._lease_lost_event.set()
         if self.lease_loss_callback is not None:
@@ -153,6 +170,46 @@ class RadioTransition:
                 log.error(
                     "could not signal pull cancellation after lease loss", error=_error_text(exc)
                 )
+
+    async def _classify_watchdog_stop(self, error: object) -> object:
+        if isinstance(error, (RadioWindowEnding, radios.WatchdogWindowEnding)):
+            return error
+        # The detached process can finish and clean its private artifacts before this
+        # health poll. Only this transition's token-authenticated, recent pre-sleep
+        # report is positive evidence of that normal ending; absence remains failure.
+        async with session_scope() as session:
+            row = await session.scalar(
+                select(IngestRadioTransition).where(
+                    IngestRadioTransition.id == self.id,
+                    IngestRadioTransition.active.is_(True),
+                    IngestRadioTransition.lease_owner == self.lease_owner,
+                )
+            )
+        if (
+            row is not None
+            and row.restore_evidence_source == "unit"
+            and row.unit_sleep_reported_at is not None
+            and 0
+            <= (_now() - row.unit_sleep_reported_at).total_seconds()
+            <= radios.WATCHDOG_SLEEP_GUARD_S + radios.WATCHDOG_SERVER_STOP_RESERVE_S
+        ):
+            return RadioWindowEnding("unit_report")
+        return error
+
+    async def _signal_watchdog_stop(self, error: object) -> None:
+        try:
+            error = await self._classify_watchdog_stop(error)
+        except Exception:
+            # A failed report read cannot turn missing watchdog proof into permission.
+            pass
+        self._signal_lease_loss(error)
+        if isinstance(self._lease_loss_error, RadioWindowEnding):
+            log.info(
+                "native sleep deadline is ending the backup window",
+                recovery_state=self._lease_loss_error.recovery_state,
+            )
+        else:
+            log.error("radio watchdog health proof failed", error=_error_text(error))
 
     def start_heartbeat(self) -> None:
         if self._heartbeat_task is None:
@@ -181,8 +238,7 @@ class RadioTransition:
                 # safe, even if the bulk socket is still moving bytes. Reuse the durable
                 # lease-loss path so the pull is cancelled and normal restoration starts
                 # while the watchdog's last proven monotonic lease still has headroom.
-                self._signal_lease_loss(exc)
-                log.error("radio watchdog health proof failed", error=_error_text(exc))
+                await self._signal_watchdog_stop(exc)
                 return
             try:
                 if self._radios_quiet and not await self.controller.quiet_state_verified():
@@ -192,8 +248,7 @@ class RadioTransition:
                         raise RadioTransitionError("radio shutdown could no longer be verified")
             except Exception as exc:
                 if self._radios_quiet:
-                    self._signal_lease_loss(exc)
-                    log.error("radio shutdown proof failed during transfer", error=_error_text(exc))
+                    await self._signal_watchdog_stop(exc)
                     return
             try:
                 await self._renew_logger_quiesce()
@@ -556,8 +611,14 @@ class RadioTransition:
         self.raise_if_lease_lost()
         if self._closed or self._restoring_task is not None or not self._radios_quiet:
             raise RadioTransitionError("radio shutdown has not been verified for footage transfer")
-        if not await self.controller.quiet_state_verified():
-            self._signal_lease_loss("radio shutdown could no longer be verified")
+        try:
+            quiet = await self.controller.quiet_state_verified()
+        except radios.WatchdogWindowEnding as exc:
+            await self._signal_watchdog_stop(exc)
+            self.raise_if_lease_lost()
+            raise AssertionError("window ending must stop the transfer") from exc
+        if not quiet:
+            await self._signal_watchdog_stop("radio shutdown could no longer be verified")
         self.raise_if_lease_lost()
 
     async def restore(self, *, error: object | None = None) -> bool:
@@ -575,6 +636,15 @@ class RadioTransition:
             self._restoring_task = asyncio.current_task()
             try:
                 effective_error = error or self._lease_loss_error
+                if isinstance(effective_error, (RadioWindowEnding, radios.WatchdogWindowEnding)):
+                    # The copying window ended normally. Restoration still has to pass
+                    # every baseline/logger check; any failure there remains recovery.
+                    effective_error = (
+                        self._lease_loss_error
+                        if self._lease_loss_error is not None
+                        and not isinstance(self._lease_loss_error, RadioWindowEnding)
+                        else None
+                    )
                 result = await self._restore(error=effective_error)
                 self._restore_result = result
                 return result

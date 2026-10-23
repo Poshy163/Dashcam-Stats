@@ -241,6 +241,32 @@ test('a startup hold with unknown inventory is Waiting, keeps manual pull availa
   assert.equal(root.root.findAllByType('button').find(button => button.children.includes('Pull now')).props.disabled, false)
 })
 
+test('on-camera analysis is a running preparation phase, with no copying or completion claim', async t => {
+  const root = await mountBackup(t, status({
+    state: 'running', phase: 'analysing', backlogKnown: true,
+    backlogFiles: 4, backlogBytes: 240_000_000,
+  }))
+  assert.equal(root.root.findByProps({ label: 'Status' }).props.value, 'Analysing parked clips before copying')
+  const rendered = JSON.stringify(root.toJSON())
+  assert.doesNotMatch(rendered, /Up to date|Backup completed|Copying now/)
+  assert.equal(root.root.findAllByType('button').filter(button => button.children.includes('Pull now')).length, 0)
+  assert.equal(root.root.findAllByType('button').find(button => button.children.includes('Cancel')).props.disabled, false)
+})
+
+test('analysis waiting explains its bounded cutoff while safety holds retain priority', async t => {
+  const data = status({
+    state: 'running', phase: 'analysing', analysisWaitReason: 'awaiting_parked_clip',
+    analysisWaitUntilUtc: '2026-10-01T03:40:00Z',
+  })
+  const root = await mountBackup(t, data)
+  assert.match(root.root.findByProps({ label: 'Status' }).props.hint, /Waiting for paired parked clips/)
+  assert.match(root.root.findByProps({ label: 'Status' }).props.hint, /Analysis cutoff:/)
+  const held = await mountBackup(t, {
+    ...data, radioQuietingHold: true, radioQuietingHoldReason: 'Sleep timing needs verification.',
+  })
+  assert.equal(held.root.findByProps({ label: 'Status' }).props.hint, 'Sleep timing needs verification.')
+})
+
 test('idle becomes Up to date only after known empty inventory; a hold still wins', async t => {
   for (const [overrides, label] of [
     [{}, 'Waiting for backup'],

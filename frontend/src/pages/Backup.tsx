@@ -48,6 +48,7 @@ const PHASES: Record<IngestStatus['phase'], string> = {
   idle: 'Waiting',
   connecting: 'Connecting to the dashcam',
   scanning: 'Reading the memory card',
+  analysing: 'Analysing parked clips before copying',
   preparing: 'Working out what to copy',
   transferring: 'Copying',
   verifying: 'Checking what arrived',
@@ -406,6 +407,11 @@ export default function Backup() {
               ? { label: data.phase === 'idle' ? 'Preparing backup' : PHASES[data.phase], tone: 'busy' as const }
               : STATES[data.state] ?? STATES.idle
           : { label: 'Checking', tone: 'busy' as const }
+  const analysisDeadline = data?.analysisWaitUntilUtc && Number.isFinite(Date.parse(data.analysisWaitUntilUtc))
+    ? formatDateTime(data.analysisWaitUntilUtc) : null
+  const analysisHint = data?.analysisWaitReason === 'awaiting_parked_clip'
+    ? 'Waiting for paired parked clips. Copying resumes when checks finish or this analysis window ends.'
+    : 'Checking parked clips on the camera. Copying resumes when checks finish or this analysis window ends.'
   const statusHint = status.isError
     ? data ? 'Last known values; waiting for a successful refresh' : 'Waiting for a successful status check'
     : stopping
@@ -424,7 +430,11 @@ export default function Backup() {
             : ['restoring_radios', 'resuming_obd'].includes(transition?.phase ?? '')
               ? 'Verifying the original radio state'
               : 'Making the radio transition safe'
-      : hold?.reason ?? (running && data ? PHASES[data.phase] : undefined)
+      : hold?.reason ?? (running && data
+        ? data.phase === 'analysing'
+          ? `${analysisHint}${analysisDeadline ? ` Analysis cutoff: ${analysisDeadline}.` : ''}`
+          : PHASES[data.phase]
+        : undefined)
   const backlogKnown = data?.backlogKnown === true
   const freeHint = data?.destinationFreeBytes != null ? ` · ${formatBytes(data.destinationFreeBytes)} free on the server` : ''
   const backlogHint = backlogKnown && data

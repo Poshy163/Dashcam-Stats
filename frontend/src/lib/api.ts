@@ -236,7 +236,7 @@ export interface IngestStatus {
    * Where a running transfer currently is. Separate from `state`, which says how a run
    * ended.
    */
-  phase: 'idle' | 'connecting' | 'scanning' | 'preparing' | 'transferring' | 'verifying'
+  phase: 'idle' | 'connecting' | 'scanning' | 'analysing' | 'preparing' | 'transferring' | 'verifying'
   /** A stop is acknowledged; the run retains ownership until shutdown and cleanup settle. */
   cancellationRequested?: boolean
   unitOnline: boolean
@@ -261,6 +261,8 @@ export interface IngestStatus {
   policyDeferredFiles?: number
   policyDeferredBytes?: number
   policyDeferredUntilUtc?: string | null
+  analysisWaitUntilUtc?: string | null
+  analysisWaitReason?: 'awaiting_parked_clip' | 'pending_analysis' | null
   /** The unit's WiFi frequency in MHz as last read by the band gate; null when unknown. */
   wifiFrequencyMhz: number | null
   /** True while a transfer is being held waiting for a 5 GHz link. */

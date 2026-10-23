@@ -37,6 +37,38 @@ Excluded files stay on the memory card. They are never marked copied, reclaimed 
 verified-backup deletion path, or counted as backed up. The recorder's own eventual loop
 overwriting still applies. Disable either policy option to make them eligible again.
 
+## Analysis before copying
+
+The server changes accompanying companion 0.3.16 give an opted-in parked camera a bounded analysis
+opportunity before claiming the ingestion lease. The Backup page displays **Analysing
+parked clips before copying**, its reason and the latest permitted finish time. During
+this phase the logger is not quiesced, radios are not quieted and no bulk footage copy
+starts. The existing camera resource guards and complete paired-view proof requirements
+still decide whether a clip can be excluded.
+
+The first opportunity ends no later than eight minutes after the actual recorded
+ignition-OFF edge. That anchor is retained across repeated runs and server restarts;
+starting another backup cannot create another eight-minute allowance. Later pending
+clips can wait at most three minutes, and their original clip-end-plus-six-minute
+deadline always wins. Both opportunities leave at least four minutes of native sleep
+time for transfer and restoration. The server refreshes power, logger and inventory
+evidence while waiting and can only shorten the initial deadline.
+
+The handoff requires both quiet-footage opt-ins, radio coordination, fresh native OFF
+evidence and an awake compatible logger without an active drive or ingestion hold.
+Activity or a terminal refusal resolves the affected opportunity; an unrelated or
+already-uploaded activity clip cannot block a valid pending pair. Unsupported or stale
+evidence, insufficient headroom, expiry or an operator cancellation ends the wait. A
+refusal or timeout preserves ordinary upload; pending analysis never counts as quiet
+evidence.
+
+If a new eligible paired candidate appears during a long backup, the server finishes
+the current copy chunk, retains the ordinary backlog and restores the logger and radios.
+The next run can use the candidate's remaining original deadline. The decoder never
+runs concurrently with the ingestion hold, and the handoff does not extend native sleep
+or change accessory-power state. Previously uploaded or expired clips are not made
+newly eligible by this scheduling change.
+
 ## Visual check and resource limits
 
 The hardware decoder reads one clip at a time at background priority, without keeping

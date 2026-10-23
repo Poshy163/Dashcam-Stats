@@ -81,7 +81,7 @@ import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
@@ -183,6 +183,9 @@ WATCHDOG_LEASE_RECOVERY_MARGIN_S = 90.0
 #: verification window (up to 4 seconds for its final readbacks), and at most 19 seconds
 #: for three reports. The bounded courtesy screen change follows the report.
 WATCHDOG_SLEEP_GUARD_S = 60
+# Let the server stop copying before the independent on-unit restore starts. This
+# consumes an already-witnessed deadline; it never extends the vendor's timer.
+WATCHDOG_SERVER_STOP_RESERVE_S = 15
 WATCHDOG_RADIO_COMMAND_S = 6
 WATCHDOG_VERIFY_S = 10
 
@@ -818,10 +821,19 @@ class WatchdogHandle:
 
     token: str
     pid: int
+    sleep_deadline_uptime_s: int | None = field(default=None, compare=False, repr=False)
+    sleep_guard_s: int = field(default=WATCHDOG_SLEEP_GUARD_S, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not _WATCHDOG_TOKEN.fullmatch(self.token) or self.pid < 0:
             raise ValueError("invalid detached watchdog identity")
+        if self.sleep_deadline_uptime_s is not None and (
+            type(self.sleep_deadline_uptime_s) is not int
+            or not 0 <= self.sleep_deadline_uptime_s <= 2**53 - 1
+        ):
+            raise ValueError("invalid watchdog device deadline")
+        if type(self.sleep_guard_s) is not int or not 0 <= self.sleep_guard_s <= 600:
+            raise ValueError("invalid watchdog sleep guard")
 
     @property
     def script_path(self) -> str:
@@ -846,6 +858,28 @@ class WatchdogHandle:
     @property
     def expiry_claim_path(self) -> str:
         return f"{self.ready_path}.expired"
+
+    @property
+    def restoring_path(self) -> str:
+        return f"{self.script_path}.restoring"
+
+
+class WatchdogWindowEnding(RuntimeError):
+    """Positive owned deadline/restoration evidence; transfer must stop, never renew."""
+
+    reason_code = "native_sleep_deadline"
+
+    def __init__(
+        self,
+        recovery_state: str,
+        *,
+        watchdog_handle: WatchdogHandle | None = None,
+    ) -> None:
+        if recovery_state not in {"deadline_approaching", "restoring"}:
+            raise ValueError("invalid watchdog window-ending state")
+        self.recovery_state = recovery_state
+        self.watchdog_handle = watchdog_handle
+        super().__init__("native sleep deadline is ending the backup window")
 
 
 def _new_watchdog_handle(*, pid: int = 0) -> WatchdogHandle:
@@ -1062,7 +1096,7 @@ def _watchdog_sleep_guard_functions(
     ceiling = (
         f'left="$(({deadline} - {int(guard_s)} - now))"; '
         '[ "$left" -lt "$remaining" ] && { remaining="$left"; '
-        '[ "$left" -gt 0 ] || reason=pre_sleep; }; '
+        f'[ "$left" -gt 0 ] || {{ reason=pre_sleep; native_sleep_deadline={deadline}; }}; }}; '
         if deadline is not None
         else ""
     )
@@ -1087,7 +1121,8 @@ def _watchdog_sleep_guard_functions(
         '[ -n "$acc_off_at" ] || { acc_off_at="$((now - acc_elapsed))"; acc_elapsed=0; }; '
         f'left="$((acc_off_at + window - {int(guard_s)} - now))"; '
         '[ "$left" -lt "$remaining" ] && { remaining="$left"; '
-        '[ "$left" -gt 0 ] || reason=pre_sleep; }; return 0; }; '
+        '[ "$left" -gt 0 ] || { reason=pre_sleep; native_sleep_deadline="$((acc_off_at + window))"; }; }; '
+        "return 0; }; "
     )
 
 
@@ -1114,6 +1149,7 @@ def _watchdog_owner_cleanup_command(
             handle.lease_path,
             handle.lease_partial_path,
             handle.expiry_claim_path,
+            handle.restoring_path,
         )
     )
     command = (
@@ -1188,7 +1224,7 @@ def _watchdog_cleanup_command(*, prove: bool = False) -> str:
         f"rm -f '{FLAG_PATH}' '{WATCHDOG_ACTIVE_PATH}' '{WATCHDOG_ACTIVE_PARTIAL_PATH}'; "
         'if [ "$valid" -eq 1 ]; then '
         'rm -f "$script" "$script.partial" "$script.ready" "$script.lease" '
-        '"$script.lease.partial" "$script.ready.expired"; fi; '
+        '"$script.lease.partial" "$script.ready.expired" "$script.restoring"; fi; '
         f"rm -f {legacy_artifacts}"
     )
     if prove:
@@ -1374,15 +1410,26 @@ async def _arm_watchdog(
         f'if [ "$current" = "{owned_state}" ]; then '
         f"rm -f '{WATCHDOG_ACTIVE_PATH}' '{WATCHDOG_ACTIVE_PARTIAL_PATH}' "
         f"'{ready_path}' '{lease_path}' '{lease_partial_path}' "
-        f"'{expiry_claim_path}' '{script_path}' '{script_partial_path}'; fi; }}; "
+        f"'{expiry_claim_path}' '{candidate.restoring_path}' '{script_path}' '{script_partial_path}'; fi; }}; "
     )
     from app.ingest.maintenance import get_controller as get_maintenance_controller
     from app.ingest.status import get_status
 
     # Reporting is optional (for example an HTTPS-only origin), recovery timing is not.
+    sleep_deadline = get_status().sleep_deadline_uptime_s()
+    deadlines = [
+        value
+        for value in (sleep_deadline, report.sleep_deadline_uptime_s if report else None)
+        if value is not None
+    ]
+    candidate = replace(
+        candidate,
+        sleep_deadline_uptime_s=min(deadlines) if deadlines else None,
+        sleep_guard_s=report.guard_s if report else WATCHDOG_SLEEP_GUARD_S,
+    )
     guard_functions = _watchdog_sleep_guard_functions(
         report,
-        sleep_deadline_uptime_s=get_status().sleep_deadline_uptime_s(),
+        sleep_deadline_uptime_s=sleep_deadline,
         maintenance_required=get_maintenance_controller().snapshot()["active"] is True,
     )
     report_functions = _watchdog_report_functions(
@@ -1396,7 +1443,7 @@ async def _arm_watchdog(
     # finds the unit's own sleep arriving sooner, and the claim below re-reads through the
     # same function so a deadline that moved cannot be claimed and then walked back.
     remaining_now = (
-        "remaining_now() { "
+        'remaining_now() { reason=lease_expired; native_sleep_deadline=""; '
         'now="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; '
         f"expiry=\"$(cat '{lease_path}' 2>/dev/null)\"; "
         'case "$now:$expiry" in "":*|*:""|*[!0-9:]*) remaining=0; return 0;; esac; '
@@ -1410,7 +1457,7 @@ async def _arm_watchdog(
         'reason=lease_expired; acc_off_at=""; '
         f"acc_elapsed={int(report.acc_off_elapsed_s) if report is not None else 0}; "
         f"{guard_functions}{remaining_now}{report_functions}{cleanup_owned}"
-        f"rm -f '{lease_partial_path}' '{expiry_claim_path}'; "
+        f"rm -f '{lease_partial_path}' '{expiry_claim_path}' '{candidate.restoring_path}'; "
         f"(set -C; printf '%s %s\\n' \"$token\" \"$$\" > '{WATCHDOG_ACTIVE_PATH}') "
         "2>/dev/null || exit 1; "
         f"chmod 600 '{WATCHDOG_ACTIVE_PATH}' || {{ cleanup_owned; exit 1; }}; "
@@ -1439,6 +1486,13 @@ async def _arm_watchdog(
         'if [ "$remaining" -gt 0 ]; then '
         f"mv -f '{expiry_claim_path}' '{ready_path}' "
         "2>/dev/null || exit 0; continue; fi; "
+        # Publish a generation-owned, monotonic native-deadline claim before removing
+        # readiness. The marker authorises stopping, never another transfer or renewal.
+        'if [ "$reason" = pre_sleep ] && [ -n "$native_sleep_deadline" ] && '
+        '[ "$now" -lt "$native_sleep_deadline" ]; then '
+        f"printf 'pre_sleep %s %s\\n' \"$now\" \"$native_sleep_deadline\" > '{expiry_claim_path}' && "
+        f"chmod 600 '{expiry_claim_path}' && "
+        f"mv -f '{expiry_claim_path}' '{candidate.restoring_path}'; fi; "
         f"rm -f '{ready_path}' '{lease_path}' '{lease_partial_path}' "
         f"'{expiry_claim_path}'; break; done; "
         f"if [ -f '{FLAG_PATH}' ] && "
@@ -1466,14 +1520,19 @@ async def _arm_watchdog(
         while time.monotonic() < deadline:
             reply = await adb.shell(
                 address,
-                _watchdog_probe_command(candidate),
+                _watchdog_probe_command(candidate, include_ending_pid=True),
                 timeout=RADIO_TIMEOUT_S,
             )
+            _watchdog_ending_reply(reply, watchdog_handle=candidate, require_pid=True)
             if reply.strip().isdigit():
-                return WatchdogHandle(candidate.token, int(reply.strip()))
+                return replace(candidate, pid=int(reply.strip()))
             await asyncio.sleep(0.1)
         await _discard_watchdog_candidate(address, candidate)
         return None
+    except WatchdogWindowEnding:
+        # This exact generation is already restoring or must restore imminently.
+        # Keep its independent process alive until the controller verifies the baseline.
+        raise
     except asyncio.CancelledError:
         with contextlib.suppress(Exception):
             await asyncio.shield(_discard_watchdog_candidate(address, candidate))
@@ -1484,23 +1543,108 @@ async def _arm_watchdog(
         return None
 
 
-def _watchdog_probe_command(handle: WatchdogHandle) -> str:
-    """Prove that the detached PID still owns the armed, unexpired lease."""
+def _watchdog_window_ending_output(
+    handle: WatchdogHandle, state: str, *, include_pid: bool = False
+) -> str:
+    """Publish stop-only evidence with the same live generation's final identity."""
+    return (
+        "cmdline=\"$(tr '\\000' ' ' < \"/proc/$pid/cmdline\" 2>/dev/null)\"; "
+        f'case "$cmdline" in *"{handle.script_path}"*) ;; *) exit 0;; esac; '
+        'kill -0 "$pid" 2>/dev/null && '
+        f'[ "$(cat \'{WATCHDOG_ACTIVE_PATH}\' 2>/dev/null)" = "{handle.token} $pid" ] '
+        "|| exit 0; "
+        + (
+            f"printf 'window_ending:{state}:%s' \"$pid\"; exit 0; "
+            if include_pid
+            else f"printf window_ending:{state}; exit 0; "
+        )
+    )
 
+
+def _watchdog_restoring_check(handle: WatchdogHandle, *, include_pid: bool = False) -> str:
+    """Read only after live PID/cmdline/ownership proof and a fresh device uptime."""
+    deadline_match = (
+        f'[ "$3" = "{handle.sleep_deadline_uptime_s}" ] && '
+        if handle.sleep_deadline_uptime_s is not None
+        else ""
+    )
+    return (
+        f"if [ -e '{handle.restoring_path}' ]; then "
+        f"claim=\"$(cat '{handle.restoring_path}' 2>/dev/null)\"; set -- $claim; "
+        '[ "$#" -eq 3 ] && [ "$1" = pre_sleep ] || exit 0; '
+        'case "$2:$3" in "":*|*:""|*[!0-9:]*) exit 0;; esac; '
+        '[ "${#2}" -le 15 ] && [ "${#3}" -le 15 ] || exit 0; '
+        + deadline_match
+        + '[ "$2" -le "$now" ] && [ "$3" -gt "$now" ] && '
+        '[ "$(($3 - $2))" -gt 0 ] && [ "$(($3 - $2))" -le 600 ] || exit 0; '
+        + _watchdog_window_ending_output(handle, "restoring", include_pid=include_pid)
+        + "fi; "
+    )
+
+
+def _watchdog_deadline_check(handle: WatchdogHandle, *, include_pid: bool = False) -> str:
+    """An already attested ceiling can stop copying early, never extend a lease."""
+    deadline = handle.sleep_deadline_uptime_s
+    if deadline is None:
+        return ""
+    from app.ingest.maintenance import watchdog_maintenance_functions
+
+    return (
+        # A real device-attested maintenance hold also overrides this ceiling in
+        # the native watchdog. A stale/server-only claim may never do so here.
+        "remaining=2147483647; "
+        + watchdog_maintenance_functions()
+        + "if ! maintenance_valid; then "
+        f'[ "$now" -lt {deadline} ] || exit 0; '
+        f'if [ "$now" -ge {max(0, deadline - handle.sleep_guard_s - WATCHDOG_SERVER_STOP_RESERVE_S)} ]; '
+        "then "
+        + _watchdog_window_ending_output(handle, "deadline_approaching", include_pid=include_pid)
+        + "fi; fi; "
+    )
+
+
+def _watchdog_ending_reply(
+    reply: str,
+    *,
+    watchdog_handle: WatchdogHandle | None = None,
+    require_pid: bool = False,
+) -> None:
+    value = reply.strip()
+    if require_pid:
+        match = re.fullmatch(
+            r"window_ending:(restoring|deadline_approaching):([1-9][0-9]{0,9})", value
+        )
+        if match is None or watchdog_handle is None or int(match[2]) > 2**31 - 1:
+            return
+        raise WatchdogWindowEnding(
+            match[1], watchdog_handle=replace(watchdog_handle, pid=int(match[2]))
+        )
+    if value in {"window_ending:restoring", "window_ending:deadline_approaching"}:
+        raise WatchdogWindowEnding(value.partition(":")[2], watchdog_handle=watchdog_handle)
+
+
+def _watchdog_probe_command(handle: WatchdogHandle, *, include_ending_pid: bool = False) -> str:
+    """Prove readiness or a positive, finite native window-ending transition."""
     expected_pid = f'[ "$pid" = "{handle.pid}" ] || exit 0; ' if handle.pid > 0 else ""
     return (
         f"state=\"$(cat '{WATCHDOG_ACTIVE_PATH}' 2>/dev/null)\"; "
         'token="${state%% *}"; pid="${state#* }"; '
         f'[ "$token" = "{handle.token}" ] || exit 0; '
-        'case "$pid" in ""|*[!0-9]*) exit 0;; esac; ' + expected_pid + f"[ -f '{FLAG_PATH}' ] && "
-        f"[ \"$(cat '{handle.ready_path}' 2>/dev/null)\" = armed ] && "
-        f"[ -s '{handle.lease_path}' ] && kill -0 \"$pid\" 2>/dev/null || exit 0; "
+        'case "$pid" in ""|*[!0-9]*) exit 0;; esac; '
+        + expected_pid
+        + f"[ -f '{FLAG_PATH}' ] && kill -0 \"$pid\" 2>/dev/null || exit 0; "
         "cmdline=\"$(tr '\\000' ' ' < \"/proc/$pid/cmdline\" 2>/dev/null)\"; "
         f'case "$cmdline" in *"{handle.script_path}"*) ;; *) exit 0;; esac; '
         'now="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; '
+        'case "$now" in ""|*[!0-9]*) exit 0;; esac; '
+        + _watchdog_restoring_check(handle, include_pid=include_ending_pid)
+        + f"[ \"$(cat '{handle.ready_path}' 2>/dev/null)\" = armed ] && "
+        f"[ -s '{handle.lease_path}' ] || exit 0; "
         f"expiry=\"$(cat '{handle.lease_path}' 2>/dev/null)\"; "
         'case "$now:$expiry" in "":*|*:""|*[!0-9:]*) exit 0;; esac; '
-        '[ "$expiry" -gt "$now" ] || exit 0; printf "%s" "$pid"; exit 0'
+        '[ "$expiry" -gt "$now" ] || exit 0; '
+        + _watchdog_deadline_check(handle, include_pid=include_ending_pid)
+        + 'printf "%s" "$pid"; exit 0'
     )
 
 
@@ -1514,6 +1658,7 @@ async def _watchdog_is_armed(address: str, handle: WatchdogHandle) -> bool | Non
         )
     except adb.AdbError:
         return None
+    _watchdog_ending_reply(reply, watchdog_handle=handle)
     return reply.strip() == str(handle.pid)
 
 
@@ -1529,13 +1674,18 @@ async def _renew_watchdog_lease(
         f"state=\"$(cat '{WATCHDOG_ACTIVE_PATH}' 2>/dev/null)\"; "
         f'[ "$state" = "{handle.token} {handle.pid}" ] || exit 0; '
         f'pid="{handle.pid}"; '
-        f"[ -f '{FLAG_PATH}' ] && kill -0 \"$pid\" 2>/dev/null && "
-        f"[ \"$(cat '{handle.ready_path}' 2>/dev/null)\" = armed ] || exit 0; "
+        f"[ -f '{FLAG_PATH}' ] && kill -0 \"$pid\" 2>/dev/null || exit 0; "
         "cmdline=\"$(tr '\\000' ' ' < \"/proc/$pid/cmdline\" 2>/dev/null)\"; "
         f'case "$cmdline" in *"{handle.script_path}"*) ;; *) exit 0;; esac; '
         'now="$(cut -d. -f1 /proc/uptime 2>/dev/null)"; '
         'case "$now" in ""|*[!0-9]*) exit 1;; esac; '
-        f'expiry="$((now + {lease_ttl_s}))"; umask 077; '
+        + _watchdog_restoring_check(handle)
+        + f"[ \"$(cat '{handle.ready_path}' 2>/dev/null)\" = armed ] || exit 0; "
+        f"expiry=\"$(cat '{handle.lease_path}' 2>/dev/null)\"; "
+        'case "$expiry" in ""|*[!0-9]*) exit 0;; esac; '
+        '[ "$expiry" -gt "$now" ] || exit 0; '
+        + _watchdog_deadline_check(handle)
+        + f'expiry="$((now + {lease_ttl_s}))"; umask 077; '
         f"rm -f '{handle.lease_partial_path}'; "
         f"printf '%s\\n' \"$expiry\" > '{handle.lease_partial_path}' && "
         f"chmod 600 '{handle.lease_partial_path}' && "
@@ -1552,6 +1702,7 @@ async def _renew_watchdog_lease(
         reply = await adb.shell(address, command, timeout=RADIO_TIMEOUT_S)
     except adb.AdbError:
         return None
+    _watchdog_ending_reply(reply, watchdog_handle=handle)
     return reply.strip() == "renewed"
 
 
@@ -1567,6 +1718,7 @@ class WatchdogLeaseProof:
 
     valid_until: float = 0.0
     confirmed_at: float = 0.0
+    window_ending_state: str | None = None
 
     def renewed(self, started: float, deadline_s: int) -> None:
         # Use request start, not receipt: time spent awaiting ADB is already spent.
@@ -1579,7 +1731,8 @@ class WatchdogLeaseProof:
     def permits_retry(self) -> bool:
         now = time.monotonic()
         return (
-            now < self.confirmed_at + WATCHDOG_UNVERIFIED_GRACE_S
+            self.window_ending_state is None
+            and now < self.confirmed_at + WATCHDOG_UNVERIFIED_GRACE_S
             and now + WATCHDOG_LEASE_RECOVERY_MARGIN_S < self.valid_until
         )
 
@@ -1599,6 +1752,14 @@ async def _watchdog_renewal_loop(
         started = time.monotonic()
         try:
             renewed = await _renew_watchdog_lease(address, deadline_s, watchdog)
+        except WatchdogWindowEnding as exc:
+            if proof is not None:
+                proof.window_ending_state = exc.recovery_state
+            lost.set()
+            log.info(
+                "native sleep window is ending radio quieting", recovery_state=exc.recovery_state
+            )
+            return
         except Exception:
             renewed = False
         if renewed is True:
@@ -1612,6 +1773,14 @@ async def _watchdog_renewal_loop(
         started = time.monotonic()
         try:
             renewed = await _renew_watchdog_lease(address, deadline_s, watchdog)
+        except WatchdogWindowEnding as exc:
+            if proof is not None:
+                proof.window_ending_state = exc.recovery_state
+            lost.set()
+            log.info(
+                "native sleep window is ending radio quieting", recovery_state=exc.recovery_state
+            )
+            return
         except Exception:
             renewed = False
         if renewed is True:
@@ -1877,9 +2046,9 @@ class RadioController:
 
     async def _ensure_watchdog_locked(self, *, marker: str) -> bool:
         if self._watchdog is not None:
-            if self._watchdog_lost.is_set() or not await _watchdog_is_armed(
-                self.address, self._watchdog
-            ):
+            if self._watchdog_proof.window_ending_state is not None:
+                raise WatchdogWindowEnding(self._watchdog_proof.window_ending_state)
+            if self._watchdog_lost.is_set() or not await self._probe_watchdog(self._watchdog):
                 log.error("the detached radio watchdog is no longer alive")
                 self._watchdog_lost.set()
                 return False
@@ -1897,6 +2066,7 @@ class RadioController:
             return True
         await self._stop_watchdog_renewal()
         self._watchdog_lost.clear()
+        self._watchdog_proof = WatchdogLeaseProof()
         await _persist_marker(marker)
         try:
             await _remove_flag(self.address)
@@ -1905,16 +2075,26 @@ class RadioController:
             log.warning("could not create the radio watchdog flag; leaving radios on")
             return False
         armed_started = time.monotonic()
-        self._watchdog = await _arm_watchdog(
-            self.address,
-            self.watchdog_deadline_s,
-            restore_bluetooth=self._bluetooth_baseline != "off",
-            hotspot_baseline=self._hotspot_baseline,
-            hotspot_capsule_path=self._hotspot_capsule_path,
-            hotspot_restore_mode=self._hotspot_restore_mode,
-            expected_interface=self._hotspot_interface,
-            report=self.report,
-        )
+        try:
+            self._watchdog = await _arm_watchdog(
+                self.address,
+                self.watchdog_deadline_s,
+                restore_bluetooth=self._bluetooth_baseline != "off",
+                hotspot_baseline=self._hotspot_baseline,
+                hotspot_capsule_path=self._hotspot_capsule_path,
+                hotspot_restore_mode=self._hotspot_restore_mode,
+                expected_interface=self._hotspot_interface,
+                report=self.report,
+            )
+        except WatchdogWindowEnding as exc:
+            if exc.watchdog_handle is None or exc.watchdog_handle.pid <= 0:
+                raise RuntimeError("window-ending watchdog identity was not proved") from exc
+            self._watchdog = exc.watchdog_handle
+            self._watchdog_proof.window_ending_state = exc.recovery_state
+            self._watchdog_lost.set()
+            # Stop-only adoption keeps independent recovery alive. Normal verified
+            # restoration will later stand down this exact generation; never renew it.
+            raise
         if self._watchdog is None:
             # Candidate cleanup is generation-scoped. A newer server process may have
             # published its watchdog while this launch was in flight, so neither the
@@ -1955,6 +2135,14 @@ class RadioController:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await renewal
 
+    async def _probe_watchdog(self, watchdog: WatchdogHandle) -> bool | None:
+        try:
+            return await _watchdog_is_armed(self.address, watchdog)
+        except WatchdogWindowEnding as exc:
+            self._watchdog_proof.window_ending_state = exc.recovery_state
+            self._watchdog_lost.set()
+            raise
+
     async def watchdog_healthy(self) -> bool:
         """Positively verify the detached recovery process while ingest is active."""
 
@@ -1962,10 +2150,12 @@ class RadioController:
             watchdog = self._watchdog
             if watchdog is None:
                 return True
+            if self._watchdog_proof.window_ending_state is not None:
+                raise WatchdogWindowEnding(self._watchdog_proof.window_ending_state)
             if self._watchdog_lost.is_set():
                 return False
             started = time.monotonic()
-            first = await _watchdog_is_armed(self.address, watchdog)
+            first = await self._probe_watchdog(watchdog)
             if first is True:
                 self._watchdog_proof.probed(started)
                 return True
@@ -1973,7 +2163,7 @@ class RadioController:
             # bulk transfer, while still detecting a dead PID far inside its finite lease.
             await asyncio.sleep(WATCHDOG_RENEW_RETRY_S)
             started = time.monotonic()
-            healthy = await _watchdog_is_armed(self.address, watchdog)
+            healthy = await self._probe_watchdog(watchdog)
             if healthy is True:
                 self._watchdog_proof.probed(started)
                 return True
@@ -2002,6 +2192,8 @@ class RadioController:
         must positively be a connected station, and Bluetooth must be off.
         """
         async with _lock:
+            if self._watchdog_proof.window_ending_state is not None:
+                raise WatchdogWindowEnding(self._watchdog_proof.window_ending_state)
             bluetooth_on, interfaces, station_transport = await asyncio.gather(
                 _bluetooth_is_on(self.address),
                 _ap_interfaces(self.address),
@@ -2394,7 +2586,14 @@ class RadioQuiet:
             return
         if await _set_bluetooth(self.address, enable=False, before_attempt=new_quieting_allowed):
             log.info("turned the unit's Bluetooth off for the transfer")
-            self._watchdog = await _arm_watchdog(self.address, self.watchdog_deadline_s)
+            try:
+                self._watchdog = await _arm_watchdog(self.address, self.watchdog_deadline_s)
+            except WatchdogWindowEnding as exc:
+                if exc.watchdog_handle is None or exc.watchdog_handle.pid <= 0:
+                    raise RuntimeError("window-ending watchdog identity was not proved") from exc
+                self._watchdog = exc.watchdog_handle
+                self._watchdog_lost.set()
+                raise
             self._start_watchdog_renewal()
         else:
             if not new_quieting_allowed():

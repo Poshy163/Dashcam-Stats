@@ -87,6 +87,21 @@ still protect OBD data in that case. The server retains the transition and retri
 verification and logger resume when the same unit becomes reachable; it never treats a
 reboot as proof that either radio recovered.
 
+Release 0.3.16 distinguishes a positively identified native-window ending from a lost
+watchdog. The server stops new work 15 seconds before the watchdog's existing 60-second
+pre-sleep recovery boundary. This requires the owned generation, live PID and matching
+command line, and the fixed native monotonic deadline. A short-lived restoring marker
+or a correlated pre-sleep report can also identify expected restoration. Such evidence
+stops transfer and renewal immediately; it never certifies a healthy or extended lease.
+
+The server still verifies all radio and logger restoration obligations. Only a verified
+restoration can close an expected ending successfully. Committed files remain counted,
+and untransferred footage remains on the card. Missing readiness without positive
+restoration evidence, a dead or mismatched process, stale or malformed markers, an
+expired lease, and restoration failures remain safety failures. An explicit operator
+Stop retains its own cancellation outcome. No sleep timer, ignition record or native
+deadline is rewritten.
+
 After every durable pre-change checkpoint, the server proves the on-unit watchdog is armed.
 Then, from inside the radio lock and immediately before the first radio command, it re-reads
 the exact correlated OBD request and acknowledgement and requires the remaining Android

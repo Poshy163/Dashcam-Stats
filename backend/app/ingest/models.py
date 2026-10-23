@@ -51,6 +51,7 @@ class Phase(str, Enum):
     IDLE = "idle"
     CONNECTING = "connecting"
     SCANNING = "scanning"
+    ANALYSING = "analysing"
     PREPARING = "preparing"
     TRANSFERRING = "transferring"
     VERIFYING = "verifying"

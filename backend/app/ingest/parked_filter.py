@@ -120,6 +120,11 @@ class FilterResult:
     deferred: list[tuple[RemoteFile, datetime]] = field(default_factory=list)
     skipped: list[RemoteFile] = field(default_factory=list)
     fingerprint_checks: int = 0
+    # Internal scheduling hints only. These hints cannot authorize an omission or a defer.
+    analysis_ready: bool = False
+    analysis_terminal: bool = False
+    analysis_terminal_files: list[RemoteFile] = field(default_factory=list)
+    analysis_terminal_starts: dict[str, datetime] = field(default_factory=dict)
 
 
 VISUAL_STATUSES = {"not_analyzed", "quiet", "activity", "unavailable", "error", "incomplete"}
@@ -872,6 +877,46 @@ async def filter_inventory(
         entry["clip"]["relative_path"]: movement._timestamp(entry["defer_until_utc"])
         for entry in deferred
     }
+    # Give the optional decoder a chance before bulk quiescence, but do not spend
+    # that opportunity on a current terminal heat/probe/source/imagery refusal.
+    # Expired historical refusals do not describe the camera's present resources.
+    now = datetime.now(UTC)
+
+    def terminal_candidate(entry: dict) -> bool:
+        clip, guard = entry["clip"], entry["guard"]
+        start = movement._timestamp(clip["start_utc"], nullable=True)
+        end = movement._timestamp(clip["end_utc"], nullable=True)
+        first = movement._timestamp(guard["start_utc"], nullable=True)
+        last = movement._timestamp(guard["end_utc"], nullable=True)
+        return bool(
+            entry["decision"] == "upload"
+            and entry["reason"] in {"visual_activity", "analysis_error", "visual_incomplete"}
+            and entry["visual"]["status"] in {"unavailable", "error", "incomplete", "activity"}
+            and not clip["locked"]
+            and clip["time_quality"] == "bounded"
+            and movement._effective_class(clip) == "acc_off_candidate"
+            and _no_movement(clip)
+            and start is not None
+            and end is not None
+            and first is not None
+            and last is not None
+            and first <= start - timedelta(seconds=120)
+            and last >= end
+            and _guard_off(guard)
+            and end <= now < end + timedelta(seconds=MAX_DEFER_SECONDS)
+        )
+
+    terminal_proofs = (
+        _matched_proofs(
+            doc,
+            remote,
+            source,
+            terminal_candidate,
+        )
+        if state == "ready" and doc is not None
+        else []
+    )
+    terminal_paths = {entry["clip"]["relative_path"] for entry in terminal_proofs}
     return FilterResult(
         [item for item in remote if _relative_path(item, source) not in skipped | held.keys()],
         [
@@ -881,4 +926,15 @@ async def filter_inventory(
         ],
         [item for item in remote if _relative_path(item, source) in skipped],
         fingerprint_checks=checks,
+        analysis_ready=state == "ready",
+        analysis_terminal=bool(terminal_paths),
+        analysis_terminal_files=[
+            item for item in remote if _relative_path(item, source) in terminal_paths
+        ],
+        analysis_terminal_starts={
+            item.name: movement._timestamp(entry["clip"]["start_utc"])
+            for entry in terminal_proofs
+            for item in remote
+            if _relative_path(item, source) == entry["clip"]["relative_path"]
+        },
     )

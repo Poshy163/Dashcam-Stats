@@ -91,6 +91,8 @@ class IngestStatus:
         self.policy_deferred_files = 0
         self.policy_deferred_bytes = 0
         self.policy_deferred_until_utc: str | None = None
+        self.analysis_wait_until_utc: str | None = None
+        self.analysis_wait_reason: str | None = None
         #: The unit's WiFi frequency in MHz as last read by the band gate, whether a
         #: transfer is currently being held for it, and why. Cleared when the unit leaves:
         #: the reading describes a link that no longer exists, and the next arrival may
@@ -207,6 +209,8 @@ class IngestStatus:
             self.policy_deferred_files = 0
             self.policy_deferred_bytes = 0
             self.policy_deferred_until_utc = None
+            self.analysis_wait_until_utc = None
+            self.analysis_wait_reason = None
             self.current_file = None
             self.last_error = None
             # A run that has actually begun is not being held for anything. Both holds are
@@ -235,6 +239,8 @@ class IngestStatus:
             self._running = False
             self.state = result.state
             self.phase = Phase.IDLE
+            self.analysis_wait_until_utc = None
+            self.analysis_wait_reason = None
             self.current_file = None
             self.last_error = result.error
             if result.state is RunState.OK and result.files:
@@ -303,6 +309,22 @@ class IngestStatus:
     def set_phase(self, phase: Phase) -> None:
         with self._lock:
             self.phase = phase
+            if phase is not Phase.ANALYSING:
+                self.analysis_wait_until_utc = None
+                self.analysis_wait_reason = None
+
+    def set_analysis_wait(self, until_utc: str | None, reason: str | None) -> None:
+        if until_utc is None and reason is None:
+            until = None
+        else:
+            if reason not in {"awaiting_parked_clip", "pending_analysis"} or until_utc is None:
+                raise ValueError("invalid analysis wait")
+            until = datetime.fromisoformat(until_utc.replace("Z", "+00:00"))
+            if until.tzinfo is None:
+                raise ValueError("analysis wait must have a timezone")
+        with self._lock:
+            self.analysis_wait_until_utc = until.astimezone(UTC).isoformat() if until else None
+            self.analysis_wait_reason = reason
 
     def account_for_retry(self, discarded_bytes: int) -> None:
         """Keep remaining-work estimates honest when partial stream bytes must be re-read."""
@@ -1013,6 +1035,8 @@ class IngestStatus:
                 "policy_deferred_files": self.policy_deferred_files,
                 "policy_deferred_bytes": self.policy_deferred_bytes,
                 "policy_deferred_until_utc": self.policy_deferred_until_utc,
+                "analysis_wait_until_utc": self.analysis_wait_until_utc,
+                "analysis_wait_reason": self.analysis_wait_reason,
                 "wifi_frequency_mhz": self.wifi_frequency_mhz,
                 "wifi_band_hold": self.wifi_band_hold,
                 "wifi_band_hold_reason": self.wifi_band_hold_reason,
