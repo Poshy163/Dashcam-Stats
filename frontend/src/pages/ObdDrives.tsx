@@ -136,9 +136,13 @@ export default function ObdDrives() {
                     {drive.dataCompletenessPercentage != null && (
                       <div className="text-xs text-content-faint">
                         {Math.round(drive.dataCompletenessPercentage)}% signal coverage ·{' '}
-                        {drive.gapCount} cadence gaps
+                        {drive.gapCount} gaps within recording
                       </div>
                     )}
+                    {drive.recordingGapBefore && <div className="mt-1 text-xs text-state-warn">
+                      {drive.recordingGapBefore.observationIntervalS.toFixed(1)} s since previous recording&apos;s observation
+                      {drive.recordingGapBefore.classification === 'likely_reconnect' ? ' · likely reconnect' : ' · continuity unconfirmed'}
+                    </div>}
                   </td>
                   <td className="p-2">
                     {drive.dtcsObserved.length > 0 ? (

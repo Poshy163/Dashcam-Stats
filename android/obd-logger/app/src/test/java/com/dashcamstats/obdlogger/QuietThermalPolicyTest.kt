@@ -17,6 +17,7 @@ class QuietThermalPolicyTest {
         var sensor: String? = "soc-thmzone"
         var battery: Int? = 419
         var thermalStatus: Int? = PowerManager.THERMAL_STATUS_MODERATE
+        var verifiedFirmware = false
         var memoryRefusal: QuietAnalysisReason? = null
         val probes = mutableListOf<String>()
 
@@ -26,7 +27,7 @@ class QuietThermalPolicyTest {
         }
         override fun systemResourceRefusal(): QuietAnalysisReason? {
             probes += "system"
-            return VisualQuietAnalyzer.systemThermalRefusal(thermalStatus)
+            return VisualQuietAnalyzer.systemThermalRefusal(thermalStatus, verifiedFirmware)
         }
         override fun memoryResourceRefusal(): QuietAnalysisReason? {
             probes += "memory"
@@ -78,6 +79,52 @@ class QuietThermalPolicyTest {
             assertEquals(QuietAnalysisReason.SYSTEM_THERMAL_GUARD, VisualQuietAnalyzer.systemThermalRefusal(status))
         for (status in listOf(null, -1, PowerManager.THERMAL_STATUS_SHUTDOWN + 1))
             assertEquals(QuietAnalysisReason.SYSTEM_THERMAL_UNAVAILABLE, VisualQuietAnalyzer.systemThermalRefusal(status))
+    }
+
+    @Test fun verifiedQ30FirmwarePermitsOnlySevereAndStillUsesMeasuredCpuAndOtherResources() {
+        val analyzer = analyzer()
+        analyzer.thermalStatus = PowerManager.THERMAL_STATUS_SEVERE
+        analyzer.temperature = 79_735
+        assertEquals(QuietAnalysisReason.SYSTEM_THERMAL_GUARD, analyzer.resourceRefusal())
+        analyzer.verifiedFirmware = true
+        assertNull(analyzer.resourceRefusal())
+        analyzer.temperature = 95_000
+        assertEquals(QuietAnalysisReason.CPU_TEMPERATURE_GUARD, analyzer.resourceRefusal())
+        assertNull(analyzer.resourceRefusal(QuietThermalPhase.DECODING))
+        analyzer.temperature = 100_000
+        assertEquals(QuietAnalysisReason.CPU_TEMPERATURE_HARD_LIMIT,
+            analyzer.resourceRefusal(QuietThermalPhase.DECODING))
+        analyzer.temperature = null
+        assertEquals(QuietAnalysisReason.CPU_TEMPERATURE_UNAVAILABLE, analyzer.resourceRefusal())
+        analyzer.temperature = 79_735
+        analyzer.battery = 420
+        assertEquals(QuietAnalysisReason.BATTERY_TEMPERATURE_GUARD, analyzer.resourceRefusal())
+        analyzer.battery = 419
+        analyzer.memoryRefusal = QuietAnalysisReason.MEMORY_GUARD
+        assertEquals(QuietAnalysisReason.MEMORY_GUARD, analyzer.resourceRefusal())
+        for (status in PowerManager.THERMAL_STATUS_CRITICAL..PowerManager.THERMAL_STATUS_SHUTDOWN)
+            assertEquals(QuietAnalysisReason.SYSTEM_THERMAL_GUARD,
+                VisualQuietAnalyzer.systemThermalRefusal(status, true))
+        for (status in listOf(null, -1, 7)) assertEquals(QuietAnalysisReason.SYSTEM_THERMAL_UNAVAILABLE,
+            VisualQuietAnalyzer.systemThermalRefusal(status, true))
+    }
+
+    @Test fun firmwareCompatibilityRequiresEveryVerifiedReleaseIdentityField() {
+        val display = "QC_Q30_1025HJYEFPSL_U_Q30_MB_1025_CarCharger_user_2026060112"
+        val model = "Q30_1025HJYEFPSL_U"
+        val hardware = "uis7861_6h10"
+        val prefix = "UNISOC/uis7861_6h10_Natv/uis7861_6h10:14/UP1A.231005.007/"
+        val fingerprint = prefix + "2026060112:user/release-keys"
+        fun matches(d: String? = display, m: String? = model, h: String? = hardware,
+                    sdk: Int = 34, f: String? = fingerprint) = QuietFirmwareThermalProfile.matches(d, m, h, sdk, f)
+        assertTrue(matches())
+        for (value in listOf(null, "", "$display-new")) assertFalse(matches(d = value))
+        for (value in listOf(null, "", "$model-new")) assertFalse(matches(m = value))
+        for (value in listOf(null, "", "$hardware-new")) assertFalse(matches(h = value))
+        for (value in listOf(33, 35)) assertFalse(matches(sdk = value))
+        for (value in listOf(null, "", "other/" + fingerprint, prefix + ":user/release-keys",
+            prefix + "2026060112:userdebug/test-keys", prefix + "bad/:user/release-keys"))
+            assertFalse(matches(f = value))
     }
 
     @Test fun policyAndOrderedResourceRefusalsHappenBeforeOpeningVideo() = runTest {

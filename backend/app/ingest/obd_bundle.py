@@ -385,11 +385,16 @@ def _validate_poll_timing(payload: dict[str, Any], *, target_cycle_ms: int = 500
         "cycle_start_interval_ms",
         "pids",
     }
-    if set(payload) != required:
-        raise BundleError("diagnostic poll_timing fields do not match v1")
-    _integer(
-        payload["schema_version"], field_name="poll_timing.schema_version", minimum=1, maximum=1
+    version = _integer(
+        payload.get("schema_version"),
+        field_name="poll_timing.schema_version",
+        minimum=1,
+        maximum=2,
     )
+    if version == 2:
+        required.add("cycle_stages_ms")
+    if set(payload) != required:
+        raise BundleError("diagnostic poll_timing fields do not match their version")
     _integer(
         payload["target_cycle_ms"],
         field_name="poll_timing.target_cycle_ms",
@@ -450,6 +455,30 @@ def _validate_poll_timing(payload: dict[str, Any], *, target_cycle_ms: int = 500
     for name in ("cycle_work_ms", "cycle_start_interval_ms"):
         if timing(payload[name], name) > payload["cycles_started"]:
             raise BundleError("diagnostic poll_timing cycle timing count is inconsistent")
+    if version == 2:
+        stages = payload["cycle_stages_ms"]
+        stage_names = {
+            "critical_requests",
+            "auxiliary_requests",
+            "quiesce_checks",
+            "persistence",
+            "diagnostics",
+            "status_publish",
+            "scheduler_other",
+        }
+        if not isinstance(stages, dict) or set(stages) != stage_names:
+            raise BundleError("diagnostic poll_timing stage names are invalid")
+        work = payload["cycle_work_ms"]
+        for name, value in stages.items():
+            if timing(value, name) != work["count"]:
+                raise BundleError("diagnostic poll_timing stage count is inconsistent")
+            if value["max_ms"] > work["max_ms"] or value["total_ms"] > work["total_ms"]:
+                raise BundleError("diagnostic poll_timing stage exceeds cycle work")
+        if (
+            min(sum(value["total_ms"] for value in stages.values()), 1_000_000_000_000)
+            != work["total_ms"]
+        ):
+            raise BundleError("diagnostic poll_timing stages do not account for cycle work")
     pids = payload["pids"]
     if not isinstance(pids, list) or len(pids) > 18:
         raise BundleError("diagnostic poll_timing PID list exceeds its bound")

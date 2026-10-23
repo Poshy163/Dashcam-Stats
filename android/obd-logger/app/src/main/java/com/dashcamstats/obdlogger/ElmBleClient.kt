@@ -23,7 +23,7 @@ import java.util.UUID
 
 open class ElmException(message: String) : RuntimeException(message)
 class ElmConnectionTimeoutException(message: String) : ElmException(message)
-class ElmCommandTimeoutException(message: String) : ElmException(message)
+class ElmCommandTimeoutException(message: String, val promptRecovered: Boolean = false) : ElmException(message)
 class ElmQuiesceRequestedException : ElmException("ingestion quiesce requested")
 class ElmCommandRejectedException(message: String) : ElmException(message)
 data class DtcQueryResult(val codes: List<String>, val status: String)
@@ -257,6 +257,15 @@ class ElmBleClient(
     }
 
     suspend fun command(value: String, timeoutMillis: Long = 6_000): String = commandMutex.withLock {
+        executeCommand(value, timeoutMillis)
+    }
+
+    private suspend fun executeCommand(
+        value: String,
+        timeoutMillis: Long,
+        recoverOptionalTimeout: Boolean = false,
+        recordResponseClock: Boolean = true,
+    ): String {
         val category = commandWriteGate.authorize(value)
         if (category == null) {
             metrics.commandBlocked()
@@ -277,19 +286,38 @@ class ElmBleClient(
         response = CompletableDeferred()
         target.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         target.value = "$command\r".toByteArray(Charsets.US_ASCII)
-        try {
+        return try {
             if (!activeGatt.writeCharacteristic(target)) {
                 commandSession.taint()
                 throw ElmException("FFF1 write was rejected")
             }
             metrics.commandSent()
             try {
-                commandSession.awaitResponse(response!!, command, timeoutMillis).also {
+                commandSession.awaitResponse(
+                    response!!, command, timeoutMillis,
+                    optionalRecovery = if (!recoverOptionalTimeout) null else OptionalCommandRecovery(
+                        abort = {
+                            // Space interrupts busy OBD processing and is ignored if idle.
+                            // It cannot repeat a PID request as a bare CR would. Keep the
+                            // original response owner until its prompt, then discard it.
+                            target.value = byteArrayOf(OPTIONAL_COMMAND_ABORT_CHARACTER.code.toByte())
+                            if (!activeGatt.writeCharacteristic(target)) {
+                                throw ElmException("optional command abort write was rejected")
+                            }
+                        },
+                        confirm = {
+                            // Echo-off is already applied during initialization. Reasserting
+                            // that known, idempotent adapter command provides a strict OK
+                            // marker without resetting the ECU protocol or touching the bus.
+                            executeCommand("ATE0", 1_000, recordResponseClock = false)
+                        },
+                    ),
+                ).also {
                     metrics.commandCompleted(
                         durationMillis = SystemClock.elapsedRealtime() - startedAt,
                         voltageCommand = command == ElmAdapterCommandPlan.parkedVoltageProbe,
                     )
-                    responseClock.responseCompleted(utcNow())
+                    if (recordResponseClock) responseClock.responseCompleted(utcNow())
                 }
             } catch (error: ElmCommandTimeoutException) {
                 metrics.commandTimedOut()
@@ -374,6 +402,22 @@ class ElmBleClient(
         // without tainting the connection; the poller records it as missing and continues. A
         // missing prompt, overflow, failed write or disconnect is still tainted in command().
         return livePidReader.queryPayload(pid, source) { requested -> command(requested) }
+    }
+
+    /** Only auxiliary live PIDs may discard a timed-out reply after a proven prompt drain. */
+    suspend fun queryOptional(pid: Int): Map<String, Any> {
+        require(pid !in PollTrialPlan.critical)
+        if (pid !in ElmProtocol.pidLengths) return emptyMap()
+        val source = ecuSource ?: throw ElmException("ECU source is not learned")
+        return try {
+            val payload = livePidReader.queryPayload(pid, source) { requested ->
+                commandMutex.withLock { executeCommand(requested, 6_000, recoverOptionalTimeout = true) }
+            } ?: return emptyMap()
+            ElmProtocol.decode(pid, payload)
+        } catch (error: ElmCommandTimeoutException) {
+            if (error.promptRecovered) livePidReader.recoveredTimeout(pid)
+            throw error
+        }
     }
 
     suspend fun queryDtcs(mode: Int): List<String> {

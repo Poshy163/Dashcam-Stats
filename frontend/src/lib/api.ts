@@ -449,6 +449,21 @@ export interface OBDBundle {
   warnings: string[]
 }
 
+export interface OBDRecordingGap {
+  previousDriveId: string
+  nextDriveId: string
+  previousObservationAt: string
+  nextObservationAt: string
+  observationIntervalS: number
+  nominalIntervalS: number
+  unobservedExcessS: number
+  classification: 'likely_reconnect' | 'unconfirmed_interruption'
+  interruptionReason: string
+  movingBefore: boolean | null
+  movingAfter: boolean | null
+  timestampBasis: 'response_completion' | 'row_observation'
+}
+
 export interface OBDDriveSummary {
   driveId: string
   vehicleId: string
@@ -506,6 +521,12 @@ export interface OBDDriveSummary {
   bundleError: string | null
   validationWarnings: string[]
   gapAnalysis?: OBDGapAnalysis | null
+  recordingGapBefore?: OBDRecordingGap | null
+  recordingGapAfter?: OBDRecordingGap | null
+  gapScope?: 'within_segment'
+  missingDataDurationDefinition?: string
+  producerMissingDataDurationS?: number | null
+  producerMissingDataDurationDefinition?: string
 }
 
 export interface OBDCadenceQuality {

@@ -17,6 +17,42 @@ class PollTimingTest {
     private fun pid(body: JSONObject, index: Int = 0) = body.getJSONArray("pids").getJSONObject(index)
 
     @Test
+    fun stageDistributionsAccountForExclusiveCycleWorkIncludingExceptionsAndResidual() {
+        var clock = 0L
+        val timing = PollTiming { clock }
+        repeat(2) { index ->
+            timing.startCycle()
+            timing.measureStage(PollCycleStage.QUIESCE_CHECKS) { clock += 11 }
+            timing.measureStage(PollCycleStage.CRITICAL_REQUESTS) { clock += 1800 }
+            timing.measureStage(PollCycleStage.AUXILIARY_REQUESTS) { clock += 600 }
+            runCatching { timing.measureStage(PollCycleStage.PERSISTENCE) {
+                clock += 40
+                if (index == 0) throw IllegalStateException("disk failure")
+            } }
+            timing.measureStage(PollCycleStage.DIAGNOSTICS) { clock += 20 }
+            timing.measureStage(PollCycleStage.STATUS_PUBLISH) { clock += 30 }
+            clock += 100
+            timing.finishCycle(completed = index == 1)
+        }
+        // Idle/preemption checks outside a cycle never enter its work totals.
+        timing.measureStage(PollCycleStage.QUIESCE_CHECKS) { clock += 999 }
+        val body = timing.drain("drive_end")!!
+        assertEquals(2, body.getInt("schema_version"))
+        val stages = body.getJSONObject("cycle_stages_ms")
+        assertEquals(PollCycleStage.entries.map { it.field }.toSet(), stages.keys().asSequence().toSet())
+        var total = 0L
+        PollCycleStage.entries.forEach {
+            val stage = stages.getJSONObject(it.field)
+            assertEquals(2, stage.getInt("count"))
+            total += stage.getLong("total_ms")
+        }
+        assertEquals(body.getJSONObject("cycle_work_ms").getLong("total_ms"), total)
+        assertEquals(200L, stages.getJSONObject("scheduler_other").getLong("total_ms"))
+        assertEquals(80L, stages.getJSONObject("persistence").getLong("total_ms"))
+        assertEquals(1, body.getInt("cycles_completed"))
+    }
+
+    @Test
     fun actualPollingWrapperSeparatesEveryOutcomeAndNeverExportsResponseData() = runTest {
         var clock = 100L
         val timing = PollTiming { clock }

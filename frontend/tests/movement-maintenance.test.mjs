@@ -115,6 +115,17 @@ test('thermal refusals and decoder failures are distinguished without implying s
   assert.doesNotMatch(failed, /Processor temperature guard|Processor temperature reached/)
 })
 
+test('cooling retries explain the wait without claiming quiet proof or an exclusion', () => {
+  const html = render(MovementManifestEvidence, { data: { ...report,
+    intentionalExclusions: { ...exclusions, currentCount: 0 },
+    policyAnalysis: { status: 'ready', stale: false, clipCount: 2,
+      checkedAt: new Date().toISOString(), reasonCounts: { resourceCooldown: 2 } },
+  } })
+  assert.match(html, /Cooling before a bounded analysis retry: 2 clips/)
+  assert.match(html, /footage without a complete quiet proof uploads normally/)
+  assert.doesNotMatch(html, /2 clips .* excluded/)
+})
+
 test('an awake flag alone never renders as a verified maintenance lease', () => {
   const active = { active: true, verified: true, state: 'active', remainingS: 300, evidenceValidForS: 12 }
   assert.match(render(MaintenanceWakeEvidence, { data: active }), /Verified wake hold/)

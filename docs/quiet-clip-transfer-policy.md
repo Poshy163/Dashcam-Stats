@@ -49,18 +49,32 @@ the proof and validated by the server. Version 1 proofs cannot authorize an excl
 All frames must meet exposure and contrast checks. The decoder has a 90-second wall
 budget and stops for renewed ignition, ingestion or memory pressure. Companion 0.3.14
 starts or restarts analysis only below 95 C; a running analysis stops when a resource
-check observes 100 C or more. It permits Android's moderate thermal status and stops
-at severe or worse. CPU temperature is checked before each decoded frame; full resource
+check observes 100 C or more. Generic Android firmware permits moderate thermal status
+and stops at severe or worse. Companion 0.3.15 adds a narrowly pinned compatibility
+profile for the retained Q30 firmware: exact display build, model, hardware, SDK and
+fingerprint family must match. That profile permits aggregate SEVERE only with valid
+measured CPU checks; CRITICAL or worse and unknown status still refuse wherever the
+Android thermal-status API is available. A changed or
+unknown build keeps the generic rule. CPU temperature is checked before each decoded frame; full resource
 checks are scheduled about once per second and again before accepting a complete quiet
 result. This software policy does not control the physical temperature between
 observations. Battery temperature of 42 C or more,
 missing or invalid thermal probes, and the existing memory limits still refuse analysis.
-Firmware thermal protection remains active. Resource-policy cache version 2 prevents
-old 85 C/moderate refusals from being reused after the update; visual algorithm version
-2 and its proof requirements are unchanged. Earlier companions used the 85 C limit.
-Refused or interrupted analysis preserves ordinary upload; an incomplete check cannot
-authorize exclusion. Start/restart admission applies to future analysis attempts; it
-does not add automatic retries of already refused clips or another transfer deferral.
+Firmware thermal protection remains active; no OS status override or threshold setting
+is written. The profile addresses the observed firmware aggregate SEVERE at measured
+79.735 C, not a general claim that Android thermal status is incorrect. Resource-policy
+cache version 3 invalidates earlier cached refusals; visual algorithm version 2 and its
+proof requirements are unchanged. Companions before 0.3.14 used the 85 C limit.
+
+Companion 0.3.15 retries only transient CPU/system/battery heat or memory-pressure
+refusals with no observed activity. A persisted four-attempt per-clip budget and shared
+30/60/120-second backoff prevent cycling through every hot clip. The existing six-minute
+clip-end deadline is never extended, including after process restart or clock rollback.
+While eligible, the zero-frame `not_analyzed/resource_cooldown` report explains the
+bounded wait; it is not quiet evidence. A retry starts the complete analysis again.
+Exhaustion, expiry, insufficient sleep headroom, driving, backup or unsafe evidence keeps
+ordinary upload. Completed activity, darkness, decoder faults and unknown probes are not
+cooling retries. Refused or interrupted analysis cannot authorize exclusion.
 These limits preserve recording priority and still require
 physical validation of both recording streams under sustained analysis.
 

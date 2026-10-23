@@ -118,11 +118,14 @@ object IngestionQuiesceFiles {
     fun readRequest(
         deviceRoot: File,
         nowUtc: Instant = Instant.now(),
+        cleanupAbsentMarkers: Boolean = true,
     ): IngestionRequestRead {
         val control = controlRoot(deviceRoot)
         val request = requestFile(deviceRoot)
         if (!Files.exists(request.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-            cleanupExpiredMarkers(control)
+            // Polling checks this before every command. An absent request needs only its
+            // presence check; normal outer reads perform the unrelated stale-marker cleanup.
+            if (cleanupAbsentMarkers) cleanupExpiredMarkers(control)
             return IngestionRequestRead.Absent
         }
         return runCatching { parseRequestFile(request, control) }.fold(

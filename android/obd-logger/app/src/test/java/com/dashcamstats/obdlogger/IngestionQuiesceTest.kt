@@ -18,6 +18,27 @@ import java.time.Instant
 @RunWith(RobolectricTestRunner::class)
 class IngestionQuiesceTest {
     @Test
+    fun liveFastAbsentReadDefersOnlyMarkerCleanupAndStillParsesNewRequests() {
+        val root = Files.createTempDirectory("obd-quiesce-fast-absent").toFile()
+        try {
+            val control = IngestionQuiesceFiles.controlRoot(root).apply { mkdirs() }
+            val expired = File(control, "ingestion-request.json.expired").apply { writeText("old") }
+            val bootExpired = File(control, "ingestion-request.json.boot-expired").apply { writeText("old") }
+            val now = Instant.parse("2026-08-30T00:00:20Z")
+            assertEquals(IngestionRequestRead.Absent,
+                IngestionQuiesceFiles.readRequest(root, now, cleanupAbsentMarkers = false))
+            assertTrue(expired.exists()); assertTrue(bootExpired.exists())
+            writeRequest(root, validRequest())
+            assertTrue(IngestionQuiesceFiles.readRequest(root, now, cleanupAbsentMarkers = false) is IngestionRequestRead.Valid)
+            writeRequest(root, "{invalid")
+            assertTrue(IngestionQuiesceFiles.readRequest(root, now, cleanupAbsentMarkers = false) is IngestionRequestRead.Invalid)
+            IngestionQuiesceFiles.requestFile(root).delete()
+            assertEquals(IngestionRequestRead.Absent, IngestionQuiesceFiles.readRequest(root, now))
+            assertFalse(expired.exists()); assertFalse(bootExpired.exists())
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test
     fun strictRequestParsesAndExtraDuplicateOrMalformedFieldsBlockWithoutAck() {
         val root = Files.createTempDirectory("obd-quiesce-request").toFile()
         try {

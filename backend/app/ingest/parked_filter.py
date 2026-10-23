@@ -146,6 +146,7 @@ VISUAL_REASONS = {
     "frame_limit",
     "analysis_pending",
     "clip_changed",
+    "resource_cooldown",
     "background_priority_unavailable",
     "analysis_storage_unavailable",
     "unrecognized_reason",
@@ -489,7 +490,7 @@ def eligible_defer(
             and (
                 (
                     visual["status"] == "not_analyzed"
-                    and visual.get("reason") in {None, "analysis_pending"}
+                    and visual.get("reason") in {None, "analysis_pending", "resource_cooldown"}
                     and visual["input_frames"]
                     == visual["decoded_frames"]
                     == visual["sampled_frames"]

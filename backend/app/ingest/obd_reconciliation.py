@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -37,6 +38,38 @@ MAX_RECORDED_GAPS = 100
 MAX_CADENCE_VALUES = 20_000
 MAX_EXPECTED_CYCLES = 2**63 - 1
 MAX_USABLE_ROLLUP_GAP_S = NOMINAL_CYCLE_S * 3
+# The Android optional-only recovery path retains the legacy diagnostic wire kind.
+# Its explicit successful prompt resynchronisation is not a disconnected session.
+# Keep this allowlist aligned with ElmProtocol.pidLengths minus speed/RPM/MAF;
+# malformed, unknown and critical-PID categories remain ordinary failure evidence.
+_RECOVERED_OPTIONAL_TIMEOUT_CATEGORIES = frozenset(
+    f"optional_pid_{pid:02X}_timeout_recovered"
+    for pid in (
+        0x01,
+        0x03,
+        0x04,
+        0x05,
+        0x06,
+        0x07,
+        0x0E,
+        0x0F,
+        0x11,
+        0x13,
+        0x14,
+        0x15,
+        0x1C,
+        0x20,
+        0x21,
+    )
+)
+
+
+def _connection_failure_is_loss(row: OBDDiagnostic) -> bool:
+    if row.kind != "connection_failure":
+        return False
+    payload = row.payload_json if isinstance(row.payload_json, dict) else {}
+    category = payload.get("category")
+    return not (isinstance(category, str) and category in _RECOVERED_OPTIONAL_TIMEOUT_CATEGORIES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -779,6 +812,17 @@ async def reconcile_drive_projection(
         # Retained only so existing callers do not need a coordinated signature change.
         # Producer summaries are evidence, never the canonical relational projection.
         _ = summary_source
+        prior_analysis = (
+            drive.gap_analysis_json if isinstance(drive.gap_analysis_json, dict) else {}
+        )
+        producer_summary = prior_analysis.get("producer_summary")
+        if drive.summary_source == "producer" and isinstance(drive.summary_json, dict):
+            missing = drive.summary_json.get("missing_data_duration_s")
+            if type(missing) in {int, float} and math.isfinite(missing) and missing >= 0:
+                # Keep this explicitly producer-reported: older exporters did not all
+                # use the server's 1.5x threshold. Existing derived rows cannot recover
+                # a discarded producer value without reading their immutable bundle.
+                producer_summary = {"missing_data_duration_s": missing}
         bundle = await session.get(OBDBundle, drive.bundle_id)
         if bundle is None:
             raise ValueError("drive references a missing OBD bundle")
@@ -956,7 +1000,7 @@ async def reconcile_drive_projection(
             )
         )
         connection_loss_count = max(
-            sum(1 for row in diagnostics if row.kind == "connection_failure"),
+            sum(1 for row in diagnostics if _connection_failure_is_loss(row)),
             1 if drive.stop_reason == "connection_lost" else 0,
         )
         dtcs = _observed_dtcs(diagnostics)
@@ -1033,6 +1077,8 @@ async def reconcile_drive_projection(
                 "shutdown_sample_at": _iso(shutdown.stopped_at),
             },
         }
+        if isinstance(producer_summary, dict):
+            gap_analysis["producer_summary"] = producer_summary
         projection_document = {
             "projection_version": PROJECTION_VERSION,
             "lifecycle_status": lifecycle,

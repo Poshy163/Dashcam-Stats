@@ -111,6 +111,47 @@ and transport gaps, cadence-specific limits, overload fallback and unchanged
 legacy behavior. Sustained three-second performance remains unverified until the
 new package has completed a real drive.
 
+## 23 October findings and 0.3.15 follow-up
+
+The 0.3.14 trial recorded 14 rows over 46.410 seconds. All 42 critical requests
+succeeded. Median reply intervals were speed 3.090 s, RPM 3.078 s and MAF 3.085 s,
+but five cycles exceeded the target and the final three consecutive overruns caused
+`sustained_overrun` fallback. Subsequent segments used plan 7. Two engine-load request
+timeouts then separated moving observations by 35.069 s and 24.601 s; the zero
+within-segment gap counts did not describe those recording boundaries.
+
+The 0.3.15 source removes redundant control-file cleanup from active polling while
+still checking for a new handoff request at each boundary. It computes expensive
+rolling metric snapshots only when a status write is due. A timed-out optional PID
+remains missing and enters cooldown; polling continues only after bounded strict
+adapter-local prompt synchronization discards the late original response. Failure
+to prove synchronization still taints and reconnects the transport. Critical PID
+timeouts retain their existing reconnect behavior. The trial is not automatically
+re-armed and the three-second overrun protection remains active.
+
+The abort character is a space, not a carriage return: the latter can repeat a
+completed command when its prompt was merely delayed. This follows the adapter's
+[documented communication behavior](https://www.elmelectronics.com/wp-content/uploads/2017/01/ELM327DS.pdf#page=9).
+Strict independent ATE0/OK and quiet-boundary checks remain required; documented
+behavior alone does not establish that a particular adapter clone will recover.
+
+Poll timing schema 2 reports exclusive critical-request, auxiliary-request, handoff,
+persistence, diagnostic, status-publish and residual-work distributions. They account
+for recorded cycle work and exclude cadence sleep; diagnostic-window flush overhead
+after cycle accounting is not independently attributed to those stages. Deploy the
+matching server before installing 0.3.15; old schema-1 windows remain readable.
+
+The API and drive UI now show short, evidence-based gaps between adjacent interrupted
+recordings separately from within-recording gaps. Logger and vehicle identities must
+match, a compatible unclean interruption must precede the next segment, and intervals
+must exceed 1.5 times the larger nominal cadence but not 120 seconds. Known shutdown,
+deliberate backup, overlap and missing identity do not create reconnect evidence.
+Moving observations on both sides are labelled likely reconnect; other admissible
+boundaries remain explicitly unconfirmed. Neither distance nor fuel is filled across
+the interval. Camera-reported missing time remains separately labelled, since its
+definition can differ by exporter version and old discarded values cannot be recovered
+from the derived projection alone.
+
 Earlier 0.3.12 validation on 22 October 2026 passed 274 Android JVM tests, 3,320 backend
 tests (33 platform/fixture skips) and 229 frontend tests. Android debug lint and
 assembly, frontend typechecking/lint/production build, and Python Ruff checks and

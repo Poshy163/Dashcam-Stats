@@ -32,7 +32,7 @@ internal const val QUIET_ROI_ROWS = 86
 internal const val QUIET_ROI_PROFILE = "dashcam_osd_bottom4_v1"
 internal const val QUIET_MOTION_METRIC = "adjacent_rolling6_coherent3x3_v1"
 // Resource admission/continuation changed; an older refusal must not suppress a new analysis.
-internal const val QUIET_RESOURCE_POLICY_VERSION = 2
+internal const val QUIET_RESOURCE_POLICY_VERSION = 3
 
 internal enum class QuietThermalPhase { ADMISSION, DECODING }
 
@@ -59,6 +59,7 @@ internal enum class QuietAnalysisReason(val wire: String) {
     ANALYSIS_TIMEOUT("analysis_timeout"),
     FRAME_LIMIT("frame_limit"),
     ANALYSIS_PENDING("analysis_pending"),
+    RESOURCE_COOLDOWN("resource_cooldown"),
     CLIP_CHANGED("clip_changed"),
     BACKGROUND_PRIORITY_UNAVAILABLE("background_priority_unavailable"),
     ANALYSIS_STORAGE_UNAVAILABLE("analysis_storage_unavailable"),
@@ -218,7 +219,9 @@ internal open class VisualQuietAnalyzer(private val context: Context) {
 
     internal open fun systemResourceRefusal(): QuietAnalysisReason? = runCatching {
         if (Build.VERSION.SDK_INT >= 29) {
-            systemThermalRefusal(context.getSystemService(PowerManager::class.java)?.currentThermalStatus)
+            systemThermalRefusal(context.getSystemService(PowerManager::class.java)?.currentThermalStatus,
+                QuietFirmwareThermalProfile.matches(Build.DISPLAY, Build.MODEL, Build.HARDWARE,
+                    Build.VERSION.SDK_INT, Build.FINGERPRINT))
         } else null
     }.getOrDefault(QuietAnalysisReason.SYSTEM_THERMAL_UNAVAILABLE)
 
@@ -379,9 +382,10 @@ internal open class VisualQuietAnalyzer(private val context: Context) {
             phase == QuietThermalPhase.ADMISSION && milliC >= 95_000 -> QuietAnalysisReason.CPU_TEMPERATURE_GUARD
             else -> null
         }
-        internal fun systemThermalRefusal(status: Int?): QuietAnalysisReason? = when {
+        internal fun systemThermalRefusal(status: Int?, verifiedFirmware: Boolean = false): QuietAnalysisReason? = when {
             status == null || status !in PowerManager.THERMAL_STATUS_NONE..PowerManager.THERMAL_STATUS_SHUTDOWN -> QuietAnalysisReason.SYSTEM_THERMAL_UNAVAILABLE
-            status >= PowerManager.THERMAL_STATUS_SEVERE -> QuietAnalysisReason.SYSTEM_THERMAL_GUARD
+            status >= PowerManager.THERMAL_STATUS_CRITICAL -> QuietAnalysisReason.SYSTEM_THERMAL_GUARD
+            status == PowerManager.THERMAL_STATUS_SEVERE && !verifiedFirmware -> QuietAnalysisReason.SYSTEM_THERMAL_GUARD
             else -> null
         }
         internal fun batteryTemperatureRefusal(tenthsC: Int?): QuietAnalysisReason? = when {

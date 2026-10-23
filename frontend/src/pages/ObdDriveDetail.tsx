@@ -7,6 +7,7 @@ import Spinner from '@/components/Spinner'
 import { ObdLifecycleBadge, ObdLifecycleExplanation, ObdLifecycleReason } from '@/components/ObdLifecycle'
 import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
 import { ObdPollTiming } from '@/components/ObdPollTiming'
+import { ObdRecordingGaps } from '@/components/ObdRecordingGaps'
 import ObdFaultSummary from '@/components/ObdFaultSummary'
 import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/components/ui'
 import { api, type OBDBattery, type OBDSeriesSample } from '@/lib/api'
@@ -728,7 +729,7 @@ export default function ObdDriveDetail() {
             <dd className="mt-0.5 tabular">{drive.connectionLossCount.toLocaleString()}</dd>
           </div>
           <div>
-            <dt className="text-xs text-content-faint">Transport gap duration</dt>
+            <dt className="text-xs text-content-faint">Transport gaps within this recording</dt>
             <dd className="mt-0.5 tabular">
               {formatDuration(
                 drive.gapAnalysis?.transport.totalGapDurationS ?? drive.missingDataDurationS,
@@ -839,7 +840,7 @@ export default function ObdDriveDetail() {
           }
         />
         <StatTile
-          label="Data gaps"
+          label="Gaps within this recording"
           value={
             drive.gapCount > 0 ? drive.gapCount.toLocaleString() : 'none'
           }
@@ -858,6 +859,11 @@ export default function ObdDriveDetail() {
         />
       </div>
 
+      <ObdRecordingGaps drive={drive} />
+      {drive.producerMissingDataDurationS != null && <p className="text-xs text-content-muted">
+        Camera-reported missing time: {formatDuration(drive.producerMissingDataDurationS)}.
+        {' '}This uses the camera&apos;s own definition and can differ from the server&apos;s within-recording gap threshold.
+      </p>}
       {battery && <BatteryCard battery={battery} />}
 
       {drive.gapAnalysis && (

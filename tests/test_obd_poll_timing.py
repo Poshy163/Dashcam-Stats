@@ -134,3 +134,74 @@ def test_empty_final_window_is_valid(payload):
         pids=[],
     )
     _validate_poll_timing(payload)
+
+
+STAGES = (
+    "critical_requests",
+    "auxiliary_requests",
+    "quiesce_checks",
+    "persistence",
+    "diagnostics",
+    "status_publish",
+    "scheduler_other",
+)
+
+
+def with_stages(payload):
+    payload["schema_version"] = 2
+    payload["cycle_stages_ms"] = {name: timing(2, 0, 0, 0, 0) for name in STAGES}
+    payload["cycle_stages_ms"]["critical_requests"] = timing(2, 2400, 2450, 2450, 4800)
+    payload["cycle_stages_ms"]["scheduler_other"] = timing(2, 1750, 1750, 1750, 3500)
+    return payload
+
+
+def test_version_two_exclusive_cycle_stages_pass_import_without_changing_old_windows(payload):
+    original = deepcopy(with_stages(payload))
+    assert validate_event(payload)["events"][0]["payload"] == original
+    _validate_poll_timing(payload)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda p: p["cycle_stages_ms"].update(raw_response=timing()),
+        lambda p: p["cycle_stages_ms"].pop("persistence"),
+        lambda p: p["cycle_stages_ms"].update(persistence="private"),
+        lambda p: p["cycle_stages_ms"].update(persistence=timing(1, 0, 0, 0, 0)),
+        lambda p: p["cycle_stages_ms"].update(persistence=timing(2, 1, 1, 1, 2)),
+        lambda p: p["cycle_stages_ms"]["critical_requests"].update(total_ms=4900),
+        lambda p: p["cycle_stages_ms"]["critical_requests"].update(max_ms=5000),
+        lambda p: p.update(schema_version=3),
+        lambda p: p.update(schema_version=1),
+    ],
+)
+def test_version_two_stage_accounting_rejects_ambiguous_or_unbounded_costs(payload, mutation):
+    with_stages(payload)
+    mutation(payload)
+    with pytest.raises(BundleError):
+        validate_event(payload)
+
+
+def test_version_two_empty_and_saturated_stage_windows_remain_bounded(payload):
+    with_stages(payload)
+    payload.update(
+        cycles_started=0,
+        cycles_completed=0,
+        cycle_work_ms=timing(),
+        cycle_start_interval_ms=timing(),
+        pids=[],
+    )
+    payload["cycle_stages_ms"] = {name: timing() for name in STAGES}
+    _validate_poll_timing(payload)
+    payload.update(
+        cycles_started=1_000_000,
+        cycles_completed=1_000_000,
+        cycle_work_ms=timing(1_000_000, 2_000_000, 2_000_000, 2_000_000, 1_000_000_000_000),
+    )
+    payload["cycle_stages_ms"] = {
+        name: timing(1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000_000_000)
+        if name in {"critical_requests", "scheduler_other"}
+        else timing(1_000_000, 0, 0, 0, 0)
+        for name in STAGES
+    }
+    _validate_poll_timing(payload)

@@ -21,9 +21,19 @@ const labels: Record<number, string> = {
   33: 'Distance with MIL',
 }
 
+const stageLabels: Record<string, string> = {
+  criticalRequests: 'Speed, RPM and airflow requests',
+  auxiliaryRequests: 'Other requests and adapter voltage',
+  quiesceChecks: 'Backup handoff checks',
+  persistence: 'Saving observations',
+  diagnostics: 'Diagnostic scan',
+  statusPublish: 'Status updates',
+  schedulerOther: 'Other cycle work',
+}
+
 /** API conversion has already changed payload keys to camelCase. */
 export function ObdPollTiming({ payload }: { payload: Record<string, unknown> }) {
-  if (payload.schemaVersion !== 1 || !Array.isArray(payload.pids)) {
+  if (![1, 2].includes(payload.schemaVersion as number) || !Array.isArray(payload.pids)) {
     return <span>Timing details unavailable for this format.</span>
   }
   const cycle = object(payload.cycleWorkMs)
@@ -73,6 +83,24 @@ export function ObdPollTiming({ payload }: { payload: Record<string, unknown> })
           })}
         </tbody>
       </table>
+      {payload.schemaVersion === 2 && <div aria-label="Polling cycle work breakdown">
+        <p className="my-2">Measured cycle work by stage. Waiting for the next scheduled cycle is excluded.</p>
+        <table className="my-2 w-full text-left">
+          <thead className="text-content-muted"><tr>
+            <th className="p-2 font-medium">Stage</th>
+            <th className="p-2 font-medium">Median / p95</th>
+            <th className="p-2 font-medium">Maximum</th>
+          </tr></thead>
+          <tbody>{Object.entries(stageLabels).map(([key, label]) => {
+            const stage = object(object(payload.cycleStagesMs)[key])
+            return <tr key={key} className="border-t border-border">
+              <td className="p-2">{label}</td>
+              <td className="tabular p-2">{milliseconds(stage.medianMs)} / {milliseconds(stage.p95Ms)}</td>
+              <td className="tabular p-2">{milliseconds(stage.maxMs)}</td>
+            </tr>
+          })}</tbody>
+        </table>
+      </div>}
     </details>
   )
 }

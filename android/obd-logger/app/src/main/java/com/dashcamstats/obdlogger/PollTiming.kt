@@ -49,6 +49,12 @@ internal enum class PollOutcome(val field: String) {
     TIMEOUT("timeouts"), TRANSPORT_ERROR("transport_errors"), CANCELLED("cancelled"),
 }
 
+internal enum class PollCycleStage(val field: String) {
+    CRITICAL_REQUESTS("critical_requests"), AUXILIARY_REQUESTS("auxiliary_requests"),
+    QUIESCE_CHECKS("quiesce_checks"), PERSISTENCE("persistence"), DIAGNOSTICS("diagnostics"),
+    STATUS_PUBLISH("status_publish"), SCHEDULER_OTHER("scheduler_other"),
+}
+
 /**
  * Drive-scoped, single-owner aggregates. Retains no response, value, wall clock or identity.
  * A request includes existing pacing, mutex wait and parsing. Age starts at decoded query
@@ -86,6 +92,8 @@ internal class PollTiming(
     private var intervals = PollTimingDistribution()
     private val pids = linkedMapOf<Int, PidTiming>()
     private val rowCompletions = linkedMapOf<Int, Long>()
+    private val activeStages = linkedMapOf<PollCycleStage, Long>()
+    private var stages = PollCycleStage.entries.associateWith { PollTimingDistribution() }
 
     fun now(): Long {
         highWater = maxOf(highWater, monotonicMillis().coerceAtLeast(0))
@@ -96,6 +104,7 @@ internal class PollTiming(
         check(activeCycle == null)
         val at = now()
         rowCompletions.clear()
+        activeStages.clear()
         if (cyclesStarted >= POLL_TIMING_COUNT_LIMIT) return
         previousCycle?.let { intervals.observe(at - it) }
         previousCycle = at
@@ -105,11 +114,33 @@ internal class PollTiming(
 
     fun finishCycle(completed: Boolean = false) {
         val start = activeCycle ?: return
-        val duration = now() - start
+        val duration = (now() - start).coerceAtMost(POLL_TIMING_OBSERVATION_LIMIT)
         work.observe(duration)
+        var remaining = duration
+        PollCycleStage.entries.filter { it != PollCycleStage.SCHEDULER_OTHER }.forEach { stage ->
+            val elapsed = (activeStages[stage] ?: 0L).coerceIn(0L, remaining)
+            stages.getValue(stage).observe(elapsed)
+            remaining -= elapsed
+        }
+        stages.getValue(PollCycleStage.SCHEDULER_OTHER).observe(remaining)
         if (completed) cyclesCompleted += 1
         if (duration > targetCycleMillis) overruns += 1
         activeCycle = null
+        activeStages.clear()
+    }
+
+    /** Stages must not nest. The bounded finish reconciliation preserves exclusive totals. */
+    fun observeStage(stage: PollCycleStage, startedAt: Long) {
+        require(stage != PollCycleStage.SCHEDULER_OTHER)
+        if (activeCycle == null) return
+        val elapsed = (now() - startedAt).coerceIn(0, POLL_TIMING_OBSERVATION_LIMIT)
+        activeStages[stage] = ((activeStages[stage] ?: 0) + elapsed)
+            .coerceAtMost(POLL_TIMING_OBSERVATION_LIMIT)
+    }
+
+    fun <T> measureStage(stage: PollCycleStage, block: () -> T): T {
+        val started = now()
+        return try { block() } finally { observeStage(stage, started) }
     }
 
     fun recordRequest(pid: Int, startedAt: Long, outcome: PollOutcome) {
@@ -151,7 +182,7 @@ internal class PollTiming(
         if (reason == "periodic" && at - windowStart < 60_000) return null
         if (cyclesStarted == 0L && pids.isEmpty()) return null
         val body = JSONObject()
-            .put("schema_version", 1)
+            .put("schema_version", 2)
             .put("window_index", windowIndex)
             .put("window_start_elapsed_ms", (windowStart - origin).coerceAtMost(POLL_TIMING_TIME_LIMIT))
             .put("window_duration_ms", (at - windowStart).coerceAtMost(POLL_TIMING_TIME_LIMIT))
@@ -162,6 +193,9 @@ internal class PollTiming(
             .put("overrun_count", overruns)
             .put("cycle_work_ms", work.json())
             .put("cycle_start_interval_ms", intervals.json())
+            .put("cycle_stages_ms", JSONObject().also { body ->
+                PollCycleStage.entries.forEach { body.put(it.field, stages.getValue(it).json()) }
+            })
             .put("pids", JSONArray(pids.toSortedMap().map { (pid, stats) -> stats.json(pid) }))
         windowIndex = (windowIndex + 1).coerceAtMost(POLL_TIMING_COUNT_LIMIT)
         windowStart = at
@@ -170,6 +204,7 @@ internal class PollTiming(
         overruns = 0
         work = PollTimingDistribution()
         intervals = PollTimingDistribution()
+        stages = PollCycleStage.entries.associateWith { PollTimingDistribution() }
         pids.clear()
         rowCompletions.clear()
         return body
@@ -200,6 +235,12 @@ internal suspend fun timedLivePidPoll(
     } catch (error: Exception) {
         timing.recordRequest(pid, startedAt, PollOutcome.TRANSPORT_ERROR)
         throw error
+    } finally {
+        timing.observeStage(
+            if (pid in PollTrialPlan.critical) PollCycleStage.CRITICAL_REQUESTS
+            else PollCycleStage.AUXILIARY_REQUESTS,
+            startedAt,
+        )
     }
     timing.recordRequest(
         pid,

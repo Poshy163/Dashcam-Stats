@@ -569,7 +569,7 @@ async def test_fingerprint_shell_matches_native_sample_algorithm_on_real_bytes(
             digest.update(body[offset : offset + 16384])
         clip["fingerprint"]["digest"] = digest.hexdigest()
 
-    async def local_shell(_address, command, **_kwargs):
+    async def local_shell(_address, command, **kwargs):
         process = await asyncio.create_subprocess_exec(
             str(shell),
             "-c",
@@ -577,7 +577,9 @@ async def test_fingerprint_shell_matches_native_sample_algorithm_on_real_bytes(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        output, error = await asyncio.wait_for(process.communicate(), 3)
+        # Exercise the same bounded deadline as production; a shorter test-only
+        # budget also counted Git Bash startup under a concurrent Windows build.
+        output, error = await asyncio.wait_for(process.communicate(), kwargs["timeout"])
         assert process.returncode == 0, error.decode()
         return output.decode()
 

@@ -223,6 +223,9 @@ class PipelineMetrics(
     fun radioShutdownObserved() = increment("radio_shutdowns")
 
     @Synchronized
+    fun voltageProbeSnapshot(): VoltageProbeSnapshot? = lastVoltageProbe
+
+    @Synchronized
     fun snapshot(): PipelineMetricsSnapshot {
         val observationWindow = (monotonicMillis() - startedAtMillis).coerceAtLeast(1L)
         val timings = linkedMapOf(

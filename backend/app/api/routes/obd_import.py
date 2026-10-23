@@ -50,6 +50,7 @@ from app.ingest.obd_storage import (
 )
 from app.ingest.obd_transfer import get_obd_transfer_status
 from app.obd import battery
+from app.obd.recording_gaps import missing_duration_metadata, recording_gap_context
 from app.obd.timing import pid_is_missing, response_time, row_is_live
 
 router = APIRouter(prefix="/api/obd", tags=["obd"])
@@ -119,7 +120,9 @@ def _logger_event(row: OBDLoggerEvent) -> dict[str, object]:
     }
 
 
-def _drive(row: OBDDrive, *, include_quality: bool = False) -> dict[str, object]:
+def _drive(
+    row: OBDDrive, *, include_quality: bool = False, recording_context=None
+) -> dict[str, object]:
     bundle = row.bundle
     result: dict[str, object] = {
         "drive_id": row.drive_id,
@@ -190,6 +193,9 @@ def _drive(row: OBDDrive, *, include_quality: bool = False) -> dict[str, object]
         "storage_status": bundle.state,
         "bundle_error": bundle.last_error,
         "validation_warnings": bundle.validation_warnings or [],
+        **missing_duration_metadata(row),
+        "recording_gap_before": None,
+        **(recording_context or {}),
     }
     if include_quality:
         result["gap_analysis"] = row.gap_analysis_json
@@ -354,8 +360,9 @@ async def list_drives(session: SessionDep, page: PaginationDep) -> dict[str, obj
         .scalars()
         .all()
     )
+    contexts = await recording_gap_context(session, rows)
     return {
-        "items": [_drive(row) for row in rows],
+        "items": [_drive(row, recording_context=contexts[row.id]) for row in rows],
         "total": total,
         "page": page.page,
         "page_size": page.page_size,
@@ -457,8 +464,9 @@ async def drive_for_journey(journey_id: RowId, session: SessionDep) -> dict[str,
         ).total_seconds()
         if overlap > best_overlap:
             best, best_overlap = row, overlap
+    contexts = await recording_gap_context(session, [best]) if best else {}
     return {
-        "drive": _drive(best) if best else None,
+        "drive": _drive(best, recording_context=contexts[best.id]) if best else None,
         "overlap_s": best_overlap if best else None,
     }
 
@@ -634,8 +642,9 @@ async def drive_series(
         .scalars()
         .all()
     )
+    contexts = await recording_gap_context(session, [drive], include_after=True)
     return {
-        "drive": _drive(drive, include_quality=True),
+        "drive": _drive(drive, include_quality=True, recording_context=contexts[drive.id]),
         "journey": await _journey_for_drive(session, drive),
         "units": drive.units,
         "signal_metadata": [
@@ -701,9 +710,10 @@ async def reprocess_drive(drive_id: str, session: SessionDep) -> dict[str, objec
     if drive is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "OBD drive was not found")
     result = await reconcile_drive_projection(session, drive)
+    contexts = await recording_gap_context(session, [drive], include_after=True)
     return {
         "result": result,
-        "drive": _drive(drive, include_quality=True),
+        "drive": _drive(drive, include_quality=True, recording_context=contexts[drive.id]),
     }
 
 

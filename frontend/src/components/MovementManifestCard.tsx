@@ -41,6 +41,7 @@ const analysisReasons: Record<string, string> = {
   clipChanged: 'Clip changed during analysis',
   backgroundPriorityUnavailable: 'Background decoder priority unavailable',
   analysisStorageUnavailable: 'Analysis result could not be saved',
+  resourceCooldown: 'Cooling before a bounded analysis retry',
   unrecognizedReason: 'Companion reported an unrecognized analysis reason',
   reasonNotReported: 'Companion did not report the refusal reason',
 }

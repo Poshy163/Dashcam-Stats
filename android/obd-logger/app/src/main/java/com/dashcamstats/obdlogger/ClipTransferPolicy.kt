@@ -95,6 +95,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         .getBoolean(QUIET_FILTER_ENABLED, false)
     private val cacheFile = File(context.filesDir, "quiet-analysis-v2.json")
     private val cached = linkedMapOf<String, JSONObject>()
+    private var resourceRetry = QuietResourceRetry()
     private val cacheLock = Any()
     private val attempted = mutableMapOf<String, Long>()
     private var analysisJob: Job? = null
@@ -105,7 +106,9 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
     init {
         runCatching {
             if (cacheFile.length() in 1..MOVEMENT_REPORT_MAX_BYTES.toLong()) {
-                val rows = JSONObject(cacheFile.readText()).getJSONArray("entries")
+                val saved = JSONObject(cacheFile.readText())
+                resourceRetry = QuietResourceRetry.fromJson(saved.optJSONObject("resource_retry"))
+                val rows = saved.getJSONArray("entries")
                 for (i in 0 until min(rows.length(), 128)) {
                     val row = rows.getJSONObject(i)
                     if (row.getString("key").matches(Regex("[a-f0-9]{64}")))
@@ -135,7 +138,13 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         return items.map { item ->
             val clip = item.clip
             val body = JSONObject(item.body.toString())
-            val visual = card?.let { synchronized(cacheLock) { cached[key(item, it)] } } ?: emptyVisual()
+            val visual = card?.let { synchronized(cacheLock) {
+                val identity = key(item, it)
+                cached[identity]?.let { value ->
+                    if (item.boundEndMs != null && resourceRetry.pending(identity, value, now, item.boundEndMs + 360_000))
+                        emptyVisual(reason = QuietAnalysisReason.RESOURCE_COOLDOWN) else value
+                }
+            } } ?: emptyVisual()
             val completeVisual = validVisual(visual)
             val measured = visual.optLong("duration_ms")
             val end = if (completeVisual && item.startMs != null) item.startMs + measured else item.boundEndMs
@@ -189,7 +198,11 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                         unchanged: (MovementClip) -> Boolean) {
         sequence++
         val present = if (card == null) emptySet() else items.map { key(it, card) }.toSet()
-        synchronized(cacheLock) { if (cached.keys.retainAll(present)) saveCache() }
+        synchronized(cacheLock) {
+            val clockRollback = resourceRetry.advance(wallMs())
+            resourceRetry.retain(present)
+            if (cached.keys.retainAll(present) || clockRollback) saveCache()
+        }
         attempted.keys.retainAll(present)
         state = if (enabled) "waiting" else "disabled"
         var rows = evaluate(items, card, wallMs())
@@ -209,7 +222,10 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         // retain transfer without preventing the independent analysis from ever running.
         val candidate = if (stopped || !enabled || card == null || !allowed() || analysisJob?.isActive == true) null else items
             .filter { it.stable && it.freshFingerprint && it.clip.size <= 256L * 1024 * 1024 &&
-                synchronized(cacheLock) { cached[key(it, card)] == null } && rows.any { row ->
+                it.boundEndMs != null && synchronized(cacheLock) {
+                    val identity = key(it, card)
+                    resourceRetry.ready(identity, cached[identity], wallMs(), it.boundEndMs + 360_000)
+                } && rows.any { row ->
                     row.optString("decision") == "defer" &&
                         row.getJSONObject("clip").optString("relative_path") == it.clip.relativePath } }
             .minByOrNull { attempted[key(it, card)] ?: 0L }
@@ -227,10 +243,12 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                     emptyVisual("error", QuietAnalysisReason.DECODER_FAILURE)
                 }
                 if (!unchanged(candidate.clip)) visual = emptyVisual("incomplete", QuietAnalysisReason.CLIP_CHANGED)
-                // Failure must upload rather than enter another defer after a process restart.
+                // Persist bounded resource retries; other failures remain ordinary uploads after restart.
                 synchronized(cacheLock) {
+                    resourceRetry.record(identity, visual, wallMs())
                     cached.remove(identity); cached[identity] = JSONObject(visual.toString())
                     while (cached.size > 128) cached.remove(cached.keys.first())
+                    resourceRetry.retain(cached.keys)
                     saveCache()
                 }
             }
@@ -245,6 +263,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                     // uncaught-coroutine handler. Disk recovery never extends its defer deadline.
                     synchronized(cacheLock) {
                         cached.remove(identity); cached[identity] = emptyVisual("error", reason)
+                        resourceRetry.retain(cached.keys - identity)
                         while (cached.size > 128) cached.remove(cached.keys.first())
                     }
                     state = "unavailable"
@@ -313,7 +332,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
     }
 
     private fun saveCache() = synchronized(cacheLock) { atomicJson(cacheFile,
-        JSONObject().put("entries", JSONArray(cached.map { (key, visual) ->
+        JSONObject().put("resource_retry", resourceRetry.json()).put("entries", JSONArray(cached.map { (key, visual) ->
             JSONObject().put("key", key).put("visual", visual) }))) }
 
     fun stop() {

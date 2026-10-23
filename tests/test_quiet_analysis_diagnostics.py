@@ -73,11 +73,39 @@ def test_pending_diagnostics_may_not_hide_a_refusal_by_deferring():
     for reason, allowed in [
         (None, True),
         ("analysis_pending", True),
+        ("resource_cooldown", True),
         ("cpu_temperature_guard", False),
         ("unrecognized_reason", False),
     ]:
         entry["visual"]["reason"] = reason
         assert parked_filter.eligible_defer(entry, now=now, native_remaining_s=1_000) is allowed
+
+
+def test_cooling_retry_cannot_create_skip_authority_or_extend_deadline():
+    doc = make_deferred_policy()
+    entry = doc["decisions"][0]
+    now = datetime.now(UTC)
+    entry["visual"]["reason"] = "resource_cooldown"
+    parsed = parked_filter.validate_policy_manifest(json.dumps(doc))
+    cooling = parsed["decisions"][0]
+    assert parked_filter.eligible_defer(cooling, now=now, native_remaining_s=1_000)
+    assert not parked_filter.eligible_skip(cooling)
+    assert not parked_filter.eligible_defer(cooling, now=now, native_remaining_s=5)
+    expired = movement._timestamp(cooling["defer_until_utc"])
+    assert not parked_filter.eligible_defer(cooling, now=expired, native_remaining_s=1_000)
+    cooling["defer_until_utc"] = (expired + timedelta(seconds=1)).isoformat()
+    assert not parked_filter.eligible_defer(cooling, now=now, native_remaining_s=1_000)
+
+
+def test_cooling_retry_with_any_previous_frame_or_activity_proof_uploads_normally():
+    doc = make_deferred_policy()
+    entry = doc["decisions"][0]
+    entry["visual"]["reason"] = "resource_cooldown"
+    now = datetime.now(UTC)
+    for field, value in [("decoded_frames", 1), ("motion_frames", 1), ("input_eos", True)]:
+        changed = copy.deepcopy(entry)
+        changed["visual"][field] = value
+        assert not parked_filter.eligible_defer(changed, now=now, native_remaining_s=1_000)
 
 
 def test_summary_survives_restart_without_publishing_paths_or_raw_proofs(tmp_path):

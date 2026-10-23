@@ -24,6 +24,15 @@ async def migrated(app_config):
     await dispose_engine()
 
 
+@pytest.fixture
+async def standalone_migration_engine(app_config):
+    """Dispose the global engine reopened after a standalone Alembic migration."""
+    try:
+        yield
+    finally:
+        await dispose_engine()
+
+
 class TestMigrations:
     async def test_upgrade_creates_every_declared_table(self, migrated):
         engine = get_engine()
@@ -167,7 +176,7 @@ class TestMigrations:
             assert bool(result.scalar())
 
     async def test_0015_backfills_legacy_unclean_completion_without_rewriting_manifest(
-        self, app_config
+        self, app_config, standalone_migration_engine
     ):
         import asyncio
         from datetime import UTC, datetime, timedelta

@@ -8,15 +8,55 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.13** (`versionCode` 26), installed in place on 22 October 2026 |
-| Source | `1e3fb244306663ffe750c1433b3384db55459b89` (`android/obd-logger/`), verified in the running companion and installed APK |
+| Version | **0.3.14** (`versionCode` 27), installed in place on 22 October 2026 |
+| Source | `a21efb0b561d5d43e78fe476d73646bd47278bb9` (`android/obd-logger/`), verified in the running companion and installed APK |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | Parked plan 7; the three-second trial was explicitly re-armed for the next drive after the 0.3.13 update |
-| Deployment | Production-signed 0.3.13/code 26 was installed in place on 22 October 2026, retaining app identity, runtime permissions, folder access, ownership and quiet filtering. The installed APK bytes, fresh companion status, successful webhook and matching server revision were verified separately. Sustained three-second polling and genuine quiet exclusions remain unverified. |
+| Poll plan | The 23 October three-second trial fell back to plan 7 after sustained cycle overruns; the following five segments used plan 7 |
+| Deployment | Production-signed 0.3.14/code 27 was installed in place on 22 October, retaining app identity, runtime permissions, folder access, ownership and quiet filtering. The APK hash, fresh companion status and matching server revision were verified. The 23 October review still found no genuine quiet exclusions or sustained three-second operation. |
 
-## 0.3.14 thermal-policy candidate
+## 0.3.15 recovery and timing candidate
+
+Source version **0.3.15/code 28** addresses the physical 23 October findings. Deploy
+the matching server before installing the companion: new poll-timing diagnostics use
+schema 2 with bounded, exclusive cycle-stage timing; schema 1 remains supported.
+
+- A narrowly pinned profile for the known Q30 firmware allows aggregate Android
+  SEVERE only while the measured SoC admission/continuation checks permit work.
+  Generic firmware still refuses SEVERE, and CRITICAL or worse and unknown status
+  are refused wherever Android exposes the thermal-status API. The 95 C admission and 100 C observed hard stop, battery,
+  memory, recording and backup checks remain. No firmware thermal setting is changed.
+- Transient resource refusals receive a persisted, bounded cooling retry budget with
+  increasing delays and the original six-minute deadline. Exhausted, expired,
+  uncertain or non-resource failures upload normally. Cache policy 3 invalidates the
+  previous permanently cached thermal refusals; complete paired quiet proof is still
+  required for an exclusion.
+- Active polling avoids redundant control-file cleanup and unnecessary metric
+  snapshots. Optional request timeouts may recover only after strict prompt
+  synchronization; uncertain transports still reconnect. The trial keeps its
+  three-second target and fallback safeguards and is not automatically re-armed.
+- Derived API/UI evidence identifies bounded gaps between adjacent interrupted
+  recordings separately from within-recording cadence gaps. It does not join trips,
+  invent observations or integrate distance/fuel through an unobserved interval.
+  Camera-reported missing time and the server's threshold-based definition are
+  labelled separately; unavailable historical producer values remain unavailable.
+
+This source candidate is not installed. A new drive and naturally cool paired-clip
+analysis are required to verify sustained polling, firmware-profile matching,
+recording continuity, actual quiet skips and the downstream omission path.
+
+Local validation on 23 October passed **3,506 backend tests** with 33 platform/fixture
+skips, **307 Android JVM tests** with no skips, and **238 frontend tests**. Ruff
+lint/format, frontend typecheck/lint/production build, Android debug/release lint
+(zero errors, 58 warnings per variant) and both APK assemblies passed. Private
+replay imported the six actual 0.3.14 bundles in reverse order: all three boundary
+gaps were exposed while distance and fuel totals remained unchanged. Actual UI
+components were visually checked with clearly labelled synthetic timing data.
+These checks do not establish physical BLE recovery or sustained decoder/polling
+performance on the new companion.
+
+## 0.3.14 installed and 23 October review
 
 Source version **0.3.14/code 27** implements the operator's 95 C/100 C request. It
 starts or restarts visual analysis below 95 C and stops running analysis when a
@@ -32,7 +72,16 @@ separate 95 C/100 C reference lines explicitly labelled as the 0.3.14 policy; hi
 85 C refusals are not relabelled as 95 C. These limits are a software policy, not a
 manufacturer rating or a guarantee that the physical sensor cannot overshoot between
 checks. Sustained paired analysis and recording at the raised limits require a new
-physical acceptance test. This candidate has not yet been installed.
+physical acceptance test. The signed update was installed and verified on 22 October.
+
+The 23 October check found 14 visual attempts refused by Android's thermal guard
+before decoding any frame, and zero current or historical exclusions. A direct SoC
+reading of 79.735 C was below 95 C while aggregate Android status remained SEVERE.
+The three-second trial recorded 14 rows over 46.410 seconds, with all 42 critical
+requests successful, before `sustained_overrun` fallback. Two subsequent engine-load
+timeouts split moving observations with 35.069 s and 24.601 s intervals that were
+absent from the within-segment gap counts. All six bundles imported and camera/server
+distance and fuel totals matched; matching arithmetic does not fill those gaps.
 
 Local validation on 22 October passed all 290 Android JVM tests, including the
 private footage-grid replay, with no failures or skips. Debug/release lint had zero

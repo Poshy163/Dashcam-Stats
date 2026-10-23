@@ -86,12 +86,16 @@ The server retains only aggregate status/reason counts alongside the last observ
 these diagnostics contain no video paths, raw exceptions or frame data and never grant
 permission to skip footage. Saved/stale diagnostics are labelled separately from current
 camera conditions. Companion 0.3.14 starts/restarts analysis below 95 C and stops running
-analysis at an observed 100 C; Android severe-or-worse status also stops it. Earlier
+analysis at an observed 100 C; generic Android severe-or-worse status also stops it. Earlier
 companions used 85 C and refused moderate status. The 42 C battery limit, memory and
 missing-probe checks remain. The bounded `cpu_temperature_hard_limit` reason identifies
 the new running stop; the older `cpu_temperature_guard` remains readable without
-claiming a particular threshold for historical checks. Hot or unmeasurable cameras keep
-uploading normally; software reporting does not resolve the camera's physical heat or
+claiming a particular threshold for historical checks. Companion 0.3.15 permits aggregate
+SEVERE only for the pinned Q30 firmware identity; CRITICAL or worse and unknown probes
+remain refused. Its persisted bounded cooling retries use `resource_cooldown` as a
+zero-frame, non-authoritative pending reason, within the original six-minute deadline.
+Expired/exhausted retries and unmeasurable cameras upload normally; software reporting
+does not resolve the camera's physical heat or
 prove a complete quiet-clip analysis.
 
 ## Verified maintenance wake hold

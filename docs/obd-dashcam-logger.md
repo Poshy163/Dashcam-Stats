@@ -421,6 +421,14 @@ No response text, sensor values, vehicle identity or addresses enter `poll_timin
 `pipeline_metrics.polling_duty_cycle_percent` keeps its existing definition; use the new cycle work
 and cadence distributions to assess whether faster polling has measured headroom.
 
+Companion 0.3.15 extends this diagnostic to payload schema 2 with bounded exclusive
+`cycle_stages_ms` distributions. The fixed stages identify critical and auxiliary
+requests, handoff checks, persistence, diagnostic work, status publishing and residual
+cycle work. They account for recorded cycle work without raw values or messages;
+cadence sleep and the later diagnostic-window flush are outside stage attribution.
+Deploy the accepting server before the companion update. Schema-1 windows and the
+outer version-one bundle contract remain supported.
+
 Every terminal drive also receives a bounded `pipeline_metrics` diagnostic covering command,
 notification/fragment/frame, timeout, checksum/parser, sample/persistence/drop, BLE disconnect,
 failure-triggered reconnect and direct-path queue depth counters without raw payloads.

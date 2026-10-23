@@ -34,6 +34,12 @@ software policy references, not manufacturer temperature ratings. Readings above
 remain visible, including the approximately 107 C measured on 22 October. Graphing does
 not change the camera's thermal settings.
 
+Companion 0.3.15 retains these measured CPU limits and adds bounded cooling retries.
+Only the pinned Q30 firmware profile permits aggregate Android SEVERE below the CPU
+limits; generic builds still refuse SEVERE, and CRITICAL or worse remains refused.
+The chart measures CPU temperature, not the aggregate Android thermal state, so a
+point below 95 C alone does not establish analysis eligibility or a quiet exclusion.
+
 ## OBD polling assessment
 
 Poll plan 7 targets five seconds. The latest eight-minute drive had typical start

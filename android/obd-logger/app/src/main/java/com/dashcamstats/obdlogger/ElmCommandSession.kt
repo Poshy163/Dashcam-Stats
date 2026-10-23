@@ -3,6 +3,7 @@ package com.dashcamstats.obdlogger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import java.io.ByteArrayOutputStream
 import java.time.Instant
@@ -72,8 +73,9 @@ internal class ElmResponseAssembler(private val maximumBytes: Int = 8192) {
 }
 
 /**
- * Owns command response state. A timeout, malformed stream or uncertain write remains tainted
- * across disconnect; only completion of a genuinely fresh GATT connection makes commands legal.
+ * Owns command response state. An uncertain timeout, malformed stream or uncertain write remains
+ * tainted across disconnect. Only an explicitly bounded optional-command drain can avoid that
+ * taint, and only after its original prompt and a separate adapter confirmation are proven.
  */
 internal class ElmCommandSession(maximumResponseBytes: Int = 8192) {
     private val assembler = ElmResponseAssembler(maximumResponseBytes)
@@ -139,13 +141,49 @@ internal class ElmCommandSession(maximumResponseBytes: Int = 8192) {
         // Deliberately preserve isTainted. A fresh GATT connection is the only reset boundary.
     }
 
+    @Synchronized
+    private fun requirePromptBoundary() {
+        if (isTainted || waitingForPrompt) throw ElmException("optional command recovery lost its prompt boundary")
+    }
+
     suspend fun awaitResponse(
         pending: CompletableDeferred<String>,
         command: String,
         timeoutMillis: Long,
+        optionalRecovery: OptionalCommandRecovery? = null,
     ): String = try {
         withTimeout(timeoutMillis) { pending.await() }
     } catch (_: TimeoutCancellationException) {
+        if (optionalRecovery != null) {
+            try {
+                withTimeout(OPTIONAL_RECOVERY_LIMIT_MILLIS) {
+                    // Retain ownership of the timed-out command. Its eventual reply is
+                    // discarded, including an otherwise valid PID value.
+                    if (!pending.isCompleted) optionalRecovery.abort()
+                    pending.await()
+                    requirePromptBoundary()
+                    delay(OPTIONAL_RECOVERY_SETTLE_MILLIS)
+                    requirePromptBoundary()
+                    val confirmation = optionalRecovery.confirm()
+                    if (!isOptionalRecoveryConfirmation(confirmation)) {
+                        throw ElmException("optional command recovery confirmation was invalid")
+                    }
+                    delay(OPTIONAL_RECOVERY_SETTLE_MILLIS)
+                    requirePromptBoundary()
+                }
+            } catch (cancelled: CancellationException) {
+                taint()
+                if (cancelled !is TimeoutCancellationException) throw cancelled
+                throw ElmCommandTimeoutException("optional command prompt recovery timed out")
+            } catch (error: Exception) {
+                taint()
+                throw error
+            }
+            throw ElmCommandTimeoutException(
+                "optional command timed out; prompt resynchronised and reading omitted",
+                promptRecovered = true,
+            )
+        }
         taint()
         throw ElmCommandTimeoutException("timed out waiting for prompt from $command")
     } catch (cancelled: CancellationException) {
@@ -155,6 +193,23 @@ internal class ElmCommandSession(maximumResponseBytes: Int = 8192) {
         taint()
         throw error
     }
+}
+
+internal const val OPTIONAL_RECOVERY_LIMIT_MILLIS = 2_000L
+internal const val OPTIONAL_RECOVERY_SETTLE_MILLIS = 200L
+// ELM327 data sheet, Communicating with the ELM327: any received character
+// interrupts OBD processing; spaces are ignored as input when idle. Never use CR,
+// which repeats the preceding command if its prompt is merely delayed in BLE.
+internal const val OPTIONAL_COMMAND_ABORT_CHARACTER = ' '
+internal data class OptionalCommandRecovery(
+    val abort: suspend () -> Unit,
+    val confirm: suspend () -> String,
+)
+
+internal fun isOptionalRecoveryConfirmation(response: String): Boolean {
+    if (!response.endsWith('>')) return false
+    val lines = response.dropLast(1).split('\r', '\n').map(String::trim).filter(String::isNotEmpty)
+    return lines == listOf("OK") || lines == listOf("ATE0", "OK")
 }
 
 /**
@@ -181,6 +236,11 @@ internal class ElmLivePidReader(private val suffixDisabled: () -> Unit = {}) {
 
     @Synchronized
     private fun usePlainRequest(pid: Int): Boolean = plainRequestPids.add(pid)
+
+    @Synchronized
+    fun recoveredTimeout(pid: Int) {
+        plainRequestPids.add(pid)
+    }
 
     suspend fun queryPayload(
         pid: Int,

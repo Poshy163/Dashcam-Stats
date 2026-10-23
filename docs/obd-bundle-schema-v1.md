@@ -186,6 +186,17 @@ server before the new Android producer. Periodic windows emit no more than once 
 and stop after 64 windows per drive; a final bounded window covers subsequent observations.
 There are at most 65 polling-timing records per drive.
 
+App 0.3.15 emits poll-timing payload schema 2. It retains every schema-1 field and
+adds exactly `cycle_stages_ms`, an object with the fixed keys `critical_requests`,
+`auxiliary_requests`, `quiesce_checks`, `persistence`, `diagnostics`, `status_publish`
+and `scheduler_other`. Each value is the same bounded distribution shape above and
+has the same count as `cycle_work_ms`. Stages are exclusive per recorded cycle;
+their total milliseconds sum to cycle work, with the same 10^12 saturation bound.
+No stage maximum or total may exceed recorded work. Cadence sleep is excluded;
+post-cycle diagnostic-window flush overhead is not separately attributed. Stage
+names cannot carry arbitrary labels or raw data. Both schema versions remain
+accepted, while an unrecognized version or inconsistent stage accounting is rejected.
+
 ## Summary and implementation limits
 
 Legacy `summary.json` has exactly these keys: `schema_version`, `drive_id`, `start_time_utc`,
