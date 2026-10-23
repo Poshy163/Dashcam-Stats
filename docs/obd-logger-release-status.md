@@ -8,15 +8,15 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.16** (`versionCode` 29), installed in place on 23 October 2026 |
-| Source | `01845c417bddc4c8f66db6d8cadc718413b6136b` (`android/obd-logger/`), verified in the running companion and installed APK |
+| Version | **0.3.17** (`versionCode` 30), installed in place on 23 October 2026 |
+| Source | `990e7f323f78943507d4b47e2ce88bf5fe6666a6` (`android/obd-logger/`), verified in the running companion and installed APK |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
 | Poll plan | Three-second trial remains armed for the next drive; parked operation correctly reports plan 7. The previous two 0.3.15 drives sustained plan 8 without fallback. |
-| Deployment | Installed APK bytes, production signer, matching server revision and fresh 0.3.16 status verified. App identity, runtime permissions, read-only folder access, ownership, trial and quiet filtering were retained. Both cameras created new segments. Restarting the companion lost native deadline evidence; a verified maintenance hold subsequently admitted backup without an accessory-power cycle. Actual quiet exclusions remain unverified. |
+| Deployment | Installed APK bytes, production signer and fresh 0.3.17 status verified. App identity, runtime permissions, read-only folder access, ownership, trial and quiet filtering were retained. Both cameras kept recording and rolled new segments. The 0.3.16 server received the new status and supports its unchanged proof contract. The private checkpoint was readable with a valid revocation tombstone; the already-lost native edge was correctly kept unknown. Actual quiet exclusions and positive restart continuity after a new edge remain unverified. |
 
-## 0.3.17 durable sleep-timing candidate
+## 0.3.17 installed and durable sleep timing
 
 Source version **0.3.17/code 30** preserves a genuine observed native ON to OFF edge
 across brief app restarts and package updates. A bounded, versioned checkpoint is
@@ -59,6 +59,19 @@ revocation, write failure and slow-storage concurrency; seven backend contract c
 verify fresh re-emission without deadline extension. Independent source review passed.
 Positive physical checkpoint continuity still needs an actual new native OFF edge;
 the already-cancelled 0.3.16 window cannot supply that acceptance evidence.
+
+Production-signed 0.3.17 was subsequently installed in place. The installed APK
+matched SHA-256 `a9010928507c5db5a5466c34c98a4f76e80cfb59ec71435cc31f70d7a95c4500`
+and the pinned production certificate. The kernel boot, app UID, runtime grants and
+all 20 immutable export artifacts were preserved. Fresh companion and server status
+reported the new source/version, ready movement analysis and ready quiet filtering.
+Both camera streams grew and rolled new segments. Same-process read-only verification
+confirmed retained ownership, enabled three-second trial with no fallback, webhook,
+quiet filtering, one persisted read grant and zero write grants. The private no-backup
+checkpoint existed with a valid checksum and revocation tombstone, as expected without
+a new edge; the temporary verification helper was removed without restarting the app.
+The complete source CI and tested-image publication passed in run
+[`39938107753`](https://github.com/Poshy163/Dashcam-Stats/actions/runs/39938107753).
 
 ## 0.3.16 installed and physical review
 
