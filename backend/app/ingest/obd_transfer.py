@@ -1342,7 +1342,8 @@ async def _sync_remote_bundles(
         if ingest_status is not None:
             ingest_status.extend_plan(
                 # OBD files count in the live progress but not in the footage backlog.
-                DeltaPlan(files=pending)
+                DeltaPlan(files=pending),
+                scope="obd",
             )
         host = info.address.split(":", 1)[0]
         port = int(ingest_setting("data_port", 9000))

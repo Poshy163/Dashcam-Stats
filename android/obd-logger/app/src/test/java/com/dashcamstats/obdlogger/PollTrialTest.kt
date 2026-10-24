@@ -86,11 +86,11 @@ class PollTrialTest {
     @Test fun completedHealthRequiresThreeConsecutiveFailuresAndResets() {
         val success = criticalOutcomes()
         val health = PollTrialHealth()
-        assertNull(health.completed(3_001, success, 0))
-        assertNull(health.completed(3_001, success, 3_001))
-        assertNull(health.completed(3_000, success, 6_001))
-        repeat(2) { assertNull(health.completed(3_001, success, 9_002L + it * 3_001)) }
-        assertEquals("sustained_overrun", health.completed(3_001, success, 15_004))
+        assertNull(health.completed(3_501, success, 0))
+        assertNull(health.completed(3_501, success, 3_501))
+        assertNull(health.completed(3_000, success, 7_001))
+        repeat(2) { assertNull(health.completed(3_501, success, 10_502L + it * 3_501)) }
+        assertEquals("sustained_overrun", health.completed(3_501, success, 17_504))
         health.reset()
         val missingMaf = criticalOutcomes(0x10 to CriticalPollOutcome.MISSING)
         repeat(2) { assertNull(health.completed(1_900, missingMaf, it * 3_000L)) }
@@ -100,6 +100,138 @@ class PollTrialTest {
         assertEquals("critical_readings_missing", health.completed(1_900, missingSpeed, 15_000))
         health.reset() // The normal shutdown grace period does not contribute trial failures.
         assertNull(health.completed(1_900, missingSpeed, 18_000))
+    }
+
+    @Test fun measuredThreeSecondTargetMissesStayVisibleWithoutDisablingHealthyTrial() {
+        var at = 0L
+        val health = PollTrialHealth()
+        val timing = PollTiming(targetCycleMillis = PollTrialPlan.TARGET_MILLIS) { at }
+        // The latest 320-row drive had no transport timeout. Its final 3.058s work
+        // cycle included a 672ms sparse diagnostic and used to latch the trial off.
+        repeat(320) {
+            timing.startCycle()
+            timing.measureStage(PollCycleStage.CRITICAL_REQUESTS) { at += 1_906 }
+            timing.measureStage(PollCycleStage.QUIESCE_CHECKS) { at += 408 }
+            timing.measureStage(PollCycleStage.DIAGNOSTICS) { at += 672 }
+            at += 72
+            timing.finishCycle(completed = true)
+            assertNull(health.completed(3_058, criticalOutcomes(), at))
+        }
+        val body = timing.drain("drive_end")!!
+        assertEquals(3_000L, body.getLong("target_cycle_ms"))
+        assertEquals(320L, body.getLong("overrun_count"))
+        assertEquals(3_058L, body.getJSONObject("cycle_work_ms").getLong("max_ms"))
+    }
+
+    @Test fun jitterAllowanceNeverExemptsMissingReadingsOrRepeatedSlowTrio() {
+        val health = PollTrialHealth()
+        val missingMaf = criticalOutcomes(0x10 to CriticalPollOutcome.MISSING)
+        repeat(2) { assertNull(health.completed(3_058, missingMaf, it * 3_058L)) }
+        assertEquals("critical_readings_missing", health.completed(3_058, missingMaf, 6_116))
+        health.reset()
+        // Three genuine 1.2s ECU reads already exceed the health ceiling, even
+        // with no optional/diagnostic request and all response values present.
+        repeat(2) { assertNull(health.completed(3_700, criticalOutcomes(), it * 3_700L)) }
+        assertEquals("sustained_overrun", health.completed(3_700, criticalOutcomes(), 7_400))
+    }
+
+    @Test fun healthMarginBoundaryResetsOverloadStreakWithoutChangingTarget() {
+        val health = PollTrialHealth()
+        repeat(2) { assertNull(health.completed(3_501, criticalOutcomes(), it * 3_501L)) }
+        assertNull(health.completed(3_500, criticalOutcomes(), 10_502))
+        repeat(2) { assertNull(health.completed(3_501, criticalOutcomes(), 14_003L + it * 3_501L)) }
+        assertEquals("sustained_overrun", health.completed(3_501, criticalOutcomes(), 21_005))
+        assertEquals(3_000L, PollTrialPlan.TARGET_MILLIS)
+        assertEquals(3_500L, PollTrialPlan.HEALTH_WORK_LIMIT_MILLIS)
+    }
+
+    @Test fun absentQuiesceChecksCollapseOnlyForOneHundredMillisAndNewSessionsReadAgain() {
+        var at = 0L
+        var reads = 0
+        var request: IngestionRequestRead? = null
+        val read = { reads++; request }
+        val reader = TrialQuiesceReader({ at }, read)
+        assertNull(reader.read())
+        at = 99
+        assertNull(reader.read())
+        assertEquals(1, reads)
+        request = IngestionRequestRead.Invalid("bounded fixture")
+        at = 100
+        assertSame(request, reader.read())
+        assertSame(request, reader.read()) // Invalid/active requests never use the cache.
+        assertEquals(3, reads)
+        request = null
+        assertNull(reader.read())
+        assertNull(TrialQuiesceReader({ at }, read).read()) // New connection/session.
+        assertEquals(5, reads)
+        at = 99 // Monotonic regression must force a fresh check as well.
+        assertNull(reader.read())
+        assertEquals(6, reads)
+    }
+
+    @Test fun activeQuiesceAndReadFailuresAreNeverCached() {
+        var at = 0L
+        var reads = 0
+        var fail = false
+        val active = IngestionRequestRead.Valid(IngestionRequest("fixture", "2026-10-24T00:00:00Z", "2026-10-24T00:01:00Z"))
+        var request: IngestionRequestRead? = null
+        val reader = TrialQuiesceReader({ at }) {
+            reads++
+            if (fail) error("read failure")
+            request
+        }
+        assertNull(reader.read())
+        at = 100
+        fail = true
+        assertThrows(IllegalStateException::class.java) { reader.read() }
+        fail = false
+        request = active
+        assertSame(active, reader.read())
+        assertSame(active, reader.read())
+        assertEquals(4, reads)
+    }
+
+    @Test fun slowQuiesceMetadataDoesNotExtendAbsentProofLifetime() {
+        var at = 0L
+        var reads = 0
+        val reader = TrialQuiesceReader({ at }) { reads++; at += 100; null }
+        assertNull(reader.read())
+        assertEquals(100L, at)
+        assertNull(reader.read()) // No additional cached lifetime after the slow read.
+        assertEquals(2, reads)
+    }
+
+    @Test fun diagnosticAdmissionUsesFullTailAndDeferredReservationsDoNotStarveAuxiliaryWork() {
+        var at = 0L
+        val scheduler = PollTrialScheduler { at }
+        repeat(3) { scheduler.observeCommand(636) }
+        scheduler.observeTail(40)
+        val schedule = PollTrialDiagnosticSchedule(at)
+        at = 15_000
+        assertTrue(schedule.reserve(at, true))
+        // Primary + quiesce/persistence consumed 2.386s before the old 672ms
+        // probe began. It cannot fit, even before learning a more expensive tail.
+        at += 2_386
+        assertFalse(scheduler.mayRun(15_000))
+        schedule.observedReservation(at, attempted = false)
+        assertFalse(schedule.reserve(18_000, true))
+        at = 19_900
+        assertTrue(scheduler.mayRunCommand(0x04, 18_000, diagnosticReserved = false))
+        assertFalse(schedule.reserve(32_385, true))
+        assertTrue(schedule.reserve(32_386, true))
+        schedule.observedReservation(32_386, attempted = true)
+        assertFalse(schedule.reserve(97_385, true))
+        assertTrue(schedule.reserve(97_386, true))
+        assertFalse(schedule.reserve(97_386, false))
+        // The actual complete non-diagnostic tail, rather than SQLite alone,
+        // must reserve room for status/quiesce/timing writes before another probe.
+        at = 2_100
+        val fullTailScheduler = PollTrialScheduler { at }
+        fullTailScheduler.observeCommand(636)
+        fullTailScheduler.observeTail(40)
+        assertTrue(fullTailScheduler.mayRun(0))
+        fullTailScheduler.observeTail(300)
+        assertFalse(fullTailScheduler.mayRun(0))
     }
 
     @Test fun observedFiftySevenSecondMafFailureGetsItsScheduledPlainRetry() = runTest {
@@ -185,9 +317,9 @@ class PollTrialTest {
         repeat(2) { assertNull(health.completed(2_500, cooldown, it * 3_000L)) }
         assertEquals("critical_readings_missing", health.completed(2_500, cooldown, 6_000))
         health.reset()
-        assertNull(health.completed(3_001, criticalOutcomes(0x10 to CriticalPollOutcome.MALFORMED), 0))
-        assertNull(health.completed(3_001, cooldown, 3_001))
-        assertEquals("sustained_overrun", health.completed(3_001, cooldown, 6_002))
+        assertNull(health.completed(3_501, criticalOutcomes(0x10 to CriticalPollOutcome.MALFORMED), 0))
+        assertNull(health.completed(3_501, cooldown, 3_501))
+        assertEquals("sustained_overrun", health.completed(3_501, cooldown, 7_002))
     }
 
     @Test fun successfulRecoveryAndShutdownResetClearTheMissingDeadline() {

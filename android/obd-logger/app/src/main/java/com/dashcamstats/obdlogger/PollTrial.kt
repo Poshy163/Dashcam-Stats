@@ -4,13 +4,18 @@ package com.dashcamstats.obdlogger
 internal object PollTrialPlan {
     const val VERSION = 8
     const val TARGET_MILLIS = 3_000L
+    // The target remains three seconds. The measured healthy drive ran at ~3.03s,
+    // and a 3.058s diagnostic cycle used to disable it after only three small misses.
+    // Allow bounded scheduling/storage jitter below one normal ~650ms ECU request;
+    // repeated work above this separate ceiling still requires a fresh baseline session.
+    const val HEALTH_WORK_LIMIT_MILLIS = TARGET_MILLIS + 500L
     val critical = listOf(0x0D, 0x0C, 0x10)
     val optional = listOf(0x04, 0x0E, 0x11, 0x03, 0x05, 0x06, 0x07, 0x0F, 0x14, 0x15, 0x21, 0x01)
     val fallbackReasons = setOf("required_pids_unavailable", "sustained_overrun", "critical_readings_missing", "transport_fault")
 
     fun fallbackText(reason: String): String = when (reason) {
         "required_pids_unavailable" -> "The vehicle did not advertise all required readings; baseline selected."
-        "sustained_overrun" -> "Readings repeatedly exceeded three seconds; baseline selected for the next connection."
+        "sustained_overrun" -> "Cycle work repeatedly exceeded the trial health budget; baseline selected for the next connection."
         "critical_readings_missing" -> "Speed, RPM or airflow readings were repeatedly missing; baseline selected for the next connection."
         "transport_fault" -> "The adapter connection became uncertain; baseline selected for a fresh connection."
         else -> "Baseline selected."
@@ -78,20 +83,22 @@ internal enum class CriticalPollOutcome { SUCCESS, MISSING, MALFORMED, COOLDOWN,
 
 /** Only completed, still-running cycles count. A normal engine stop is checked first. */
 internal class PollTrialHealth {
-    private var overruns = 0
+    private var overloadStreak = 0
     private var missing = 0
     private val missingSince = mutableMapOf<Int, Long>()
     private val malformedRetryPending = mutableSetOf<Int>()
 
     fun reset() {
-        overruns = 0
+        overloadStreak = 0
         missing = 0
         missingSince.clear()
         malformedRetryPending.clear()
     }
 
     fun completed(workMillis: Long, outcomes: Map<Int, CriticalPollOutcome>, now: Long): String? {
-        overruns = if (workMillis > PollTrialPlan.TARGET_MILLIS) overruns + 1 else 0
+        // PollTiming separately counts every >3s target miss. A harmless target miss
+        // is not the same as sustained overload, and never suppresses missing-PID health.
+        overloadStreak = if (workMillis > PollTrialPlan.HEALTH_WORK_LIMIT_MILLIS) overloadStreak + 1 else 0
         // Check before a fresh reply removes its state: a late completion must not
         // retroactively extend a recovery window that has already expired.
         val recoveryExpired = missingSince.values.any { now < it || now - it >= CRITICAL_RECOVERY_MILLIS }
@@ -124,7 +131,7 @@ internal class PollTrialHealth {
         // Other failed critical requests still count while one PID is cooling down.
         if (missingSince.isEmpty()) missing = 0 else if (failedAttempt) missing += 1
         return when {
-            overruns >= 3 -> "sustained_overrun"
+            overloadStreak >= 3 -> "sustained_overrun"
             missing >= 3 || recoveryExpired -> "critical_readings_missing"
             else -> null
         }
@@ -134,6 +141,43 @@ internal class PollTrialHealth {
         // The existing first malformed-reply cooldown is ten elapsed seconds. Allow
         // the following three-second cycle to complete a retry, never an open hold.
         const val CRITICAL_RECOVERY_MILLIS = 15_000L
+    }
+}
+
+/** Collapse only adjacent absent-file checks, never an active/invalid handoff or a new session. */
+internal class TrialQuiesceReader(
+    private val monotonicMillis: () -> Long,
+    private val readRequest: () -> IngestionRequestRead?,
+) {
+    private var absentAt: Long? = null
+
+    fun read(): IngestionRequestRead? {
+        val at = monotonicMillis()
+        if (absentAt?.let { at - it in 0 until ABSENCE_CACHE_MILLIS } == true) return null
+        absentAt = null // Exceptions/uncertain reads must not preserve an absence cache.
+        val request = readRequest()
+        // Metadata latency consumes the budget, rather than extending stale absence
+        // by another 100ms after a slow removable-storage presence check completes.
+        if (request == null) absentAt = at
+        return request
+    }
+
+    companion object { const val ABSENCE_CACHE_MILLIS = 100L }
+}
+
+/** A deferred fault probe keeps its queue but cannot reserve every subsequent live cycle. */
+internal class PollTrialDiagnosticSchedule(originMillis: Long) {
+    private var due = originMillis + RETRY_MILLIS
+
+    fun reserve(now: Long, workPending: Boolean): Boolean = workPending && now >= due
+
+    fun observedReservation(now: Long, attempted: Boolean) {
+        due = now + if (attempted) INTERVAL_MILLIS else RETRY_MILLIS
+    }
+
+    companion object {
+        const val RETRY_MILLIS = 15_000L
+        const val INTERVAL_MILLIS = 65_000L
     }
 }
 

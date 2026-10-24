@@ -7,6 +7,7 @@ import java.io.File
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlin.time.Duration.Companion.minutes
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.test.runTest
 import org.json.JSONArray
@@ -29,6 +30,7 @@ class QuietCoolingPublisherTest {
         val journal: MotionJournal
         var allowed = true
         var analyses = 0
+        val analyzedPaths = mutableListOf<String>()
         var response: () -> JSONObject = { quiet() }
         val analyzer: VisualQuietAnalyzer
 
@@ -43,7 +45,7 @@ class QuietCoolingPublisherTest {
                 arrayOf(start + offset, start + offset, journal.sessionId, "one", "acc", 0, zone))
             analyzer = object : VisualQuietAnalyzer(context) {
                 override suspend fun analyze(uri: Uri, allowed: () -> Boolean): JSONObject {
-                    assertTrue(allowed()); analyses++; return response()
+                    assertTrue(allowed()); analyses++; analyzedPaths += checkNotNull(uri.lastPathSegment); return response()
                 }
             }
         }
@@ -111,7 +113,7 @@ class QuietCoolingPublisherTest {
         }
     }
 
-    @Test fun expiryReleasesCoolingAndNoFurtherAnalysisRunsAfterFixedDeadline() = runTest {
+    @Test fun transferExpiryReleasesUploadWhileCoolingContinuesOnlyWithinFixedAnalysisHorizon() = runTest {
         Fixture(backgroundScope).use { f ->
             val items = listOf(f.item(0), f.item(1))
             f.response = { ClipTransferPolicy.emptyVisual("unavailable", QuietAnalysisReason.CPU_TEMPERATURE_GUARD) }
@@ -120,10 +122,132 @@ class QuietCoolingPublisherTest {
             assertEquals(1, f.analyses); assertEquals(2, policy.deferCount)
             f.now = f.start + 390_000
             repeat(20) { policy.publish(items, f.card, "ready", false) { true } }
-            assertEquals(1, f.analyses)
+            assertEquals(2, f.analyses)
             assertEquals(0, policy.deferCount); assertEquals(0, policy.skipCount); assertEquals(2, policy.uploadCount)
             val visual = f.report().getJSONArray("decisions").getJSONObject(0).getJSONObject("visual")
-            assertEquals("cpu_temperature_guard", visual.getString("reason"))
+            assertEquals("resource_cooldown", visual.getString("reason"))
+            f.now = f.start + 30_000 + QUIET_ANALYSIS_RETRY_MS
+            repeat(20) { policy.publish(items, f.card, "ready", false) { true } }
+            assertEquals(2, f.analyses)
+            assertEquals(0, policy.deferCount); assertEquals(2, policy.uploadCount)
+            policy.stop()
+        }
+    }
+
+    @Test fun coolingAfterTransferDeadlineCanCompleteFreshPairedProofWithoutRenewingAnyHold() = runTest {
+        Fixture(backgroundScope).use { f ->
+            val items = listOf(f.item(0), f.item(1))
+            f.response = { ClipTransferPolicy.emptyVisual("unavailable", QuietAnalysisReason.SYSTEM_THERMAL_GUARD) }
+            var policy = f.policy()
+            policy.publish(items, f.card, "ready", false) { true }
+            val originalDeadline = f.report().getJSONArray("decisions").getJSONObject(0).getString("defer_until_utc")
+            f.now = f.start + 600_000
+            policy.stop(); policy = f.policy()
+            policy.publish(items, f.card, "ready", false) { true }
+            assertEquals(2, f.analyses)
+            assertEquals(0, policy.deferCount); assertEquals(0, policy.skipCount); assertEquals(2, policy.uploadCount)
+            repeat(2) { assertTrue(f.report().getJSONArray("decisions").getJSONObject(it).isNull("defer_until_utc")) }
+            f.now += 60_000
+            f.response = { quiet() }
+            repeat(2) { policy.publish(items, f.card, "ready", false) { true } }
+            assertEquals(4, f.analyses); assertEquals(2, policy.skipCount); assertEquals(0, policy.deferCount)
+            val decisions = f.report().getJSONArray("decisions")
+            repeat(2) {
+                val row = decisions.getJSONObject(it)
+                assertTrue(ClipTransferPolicy.validVisual(row.getJSONObject("visual")))
+                assertTrue(row.isNull("defer_until_utc"))
+            }
+            assertEquals(Instant.ofEpochMilli(f.start + 390_000).toString(), originalDeadline)
+            // Expiry did not authorize a changed peer or erase an actual activity decision.
+            policy.publish(items, f.card, "ready", false) { it.relativePath != items[1].clip.relativePath }
+            assertEquals(0, policy.skipCount); assertEquals(2, policy.uploadCount)
+            policy.stop()
+        }
+    }
+
+    @Test fun schedulerCompletesOppositeViewBeforeSpendingCoolOpportunityOnNewUnpairedClips() = runTest {
+        Fixture(backgroundScope).use { f ->
+            val first = f.item(0)
+            val later = f.item(0, f.start + 60_000)
+            val peer = f.item(1)
+            val policy = f.policy()
+            // Order deliberately places the opposite view behind another candidate.
+            val items = listOf(first, later, peer)
+            policy.publish(items, f.card, "ready", false) { true }
+            policy.publish(items, f.card, "ready", false) { true }
+            assertEquals(listOf(first.clip.name, peer.clip.name), f.analyzedPaths)
+            assertEquals(2, policy.skipCount)
+            policy.stop()
+        }
+    }
+
+    @Test fun guardedParkedFingerprintGetsPriorityButLockedUnknownAndMovingClipsDoNot() = runTest {
+        Fixture(backgroundScope).use { f ->
+            val item = f.item(0)
+            val policy = f.policy()
+            fun eligible(clip: MovementClip = item.clip, start: Long? = item.startMs,
+                         end: Long? = item.boundEndMs, classification: String = "acc_off_candidate") =
+                policy.fingerprintCandidate(clip, start, end, classification, f.now)
+            assertTrue(eligible())
+            assertFalse(eligible(item.clip.copy(locked = true)))
+            assertFalse(eligible(item.clip.copy(orphan = true)))
+            assertFalse(eligible(start = null))
+            assertFalse(eligible(classification = "moving_observed"))
+            assertFalse(eligible(classification = "unknown"))
+            f.now = f.start + 30_000 + QUIET_ANALYSIS_RETRY_MS
+            assertFalse(eligible())
+            policy.stop()
+        }
+    }
+
+    @Test fun fullCacheEvictionCannotLoopDecodeButRemovedOrChangedIdentityIsReconsideredSafely() = runTest(timeout = 3.minutes) {
+        Fixture(backgroundScope).use { f ->
+            val items = (0..128).map { f.item(0, f.start + it * 1_000) }
+            f.response = { ClipTransferPolicy.emptyVisual("unavailable", QuietAnalysisReason.HARDWARE_DECODER_UNAVAILABLE) }
+            val policy = f.policy()
+            // Grow the real retained inventory so the first attempted identity remains present
+            // while all 129 results enter the 128-entry cache. This avoids 129 redundant full-card
+            // rewrites, without seeding cache internals or bypassing the publisher's eviction.
+            for (count in 1..items.size) policy.publish(items.take(count), f.card, "ready", false) { true }
+            assertEquals(129, f.analyses)
+            assertEquals(128, JSONObject(f.cache.readText()).getJSONArray("entries").length())
+            repeat(3) { policy.publish(items, f.card, "ready", false) { true } }
+            assertEquals(129, f.analyses) // First terminal identity was evicted; it still has been attempted.
+            assertEquals(0, policy.skipCount)
+            policy.publish(items.drop(1), f.card, "ready", false) { true }
+            policy.publish(items, f.card, "ready", false) { true }
+            assertEquals(130, f.analyses) // Reappearing metadata is a new opportunity, with no inherited quiet proof.
+            val original = items.first()
+            val changed = original.copy(clip = original.clip.copy(size = original.clip.size + 1),
+                body = JSONObject(original.body.toString()).put("size_bytes", original.clip.size + 1)
+                    .put("fingerprint", JSONObject(original.body.getJSONObject("fingerprint").toString())
+                        .put("digest", "c".repeat(64))))
+            policy.publish(listOf(changed) + items.drop(1), f.card, "ready", false) { true }
+            assertEquals(131, f.analyses)
+            assertEquals(0, policy.skipCount)
+            policy.stop()
+        }
+    }
+
+    @Test fun fullCardDecoderOnlySpendsAnAttemptOnAClipRetainedInThePublishedReport() = runTest {
+        Fixture(backgroundScope).use { f ->
+            f.now = f.start + 500_000
+            val items = (255 downTo 0).flatMap { index -> listOf(f.item(0, f.start + index * 1_000),
+                f.item(1, f.start + index * 1_000)) }
+            f.response = {
+                val report = f.report()
+                assertTrue(report.getBoolean("truncated"))
+                val rows = report.getJSONArray("decisions")
+                val paths = (0 until rows.length()).map {
+                    rows.getJSONObject(it).getJSONObject("clip").getString("relative_path").substringAfterLast('/')
+                }
+                assertTrue(f.analyzedPaths.last() in paths)
+                ClipTransferPolicy.emptyVisual("unavailable", QuietAnalysisReason.HARDWARE_DECODER_UNAVAILABLE)
+            }
+            val policy = f.policy()
+            policy.publish(items, f.card, "ready", false) { true }
+            assertEquals(1, f.analyses)
+            assertEquals(0, policy.skipCount)
             policy.stop()
         }
     }
@@ -134,7 +258,7 @@ class QuietCoolingPublisherTest {
                 f.item(1, f.start + index * 30_000)) }
             f.now = f.start + 350_000
             val former = items.map { item ->
-                val oldKey = movementHash("$QUIET_POLICY_VERSION/$QUIET_ALGORITHM_VERSION/resources-2/${f.card}/" +
+                val oldKey = movementHash("$QUIET_POLICY_VERSION/$QUIET_ALGORITHM_VERSION/resources-3/${f.card}/" +
                     "${item.clip.relativePath}/${item.clip.size}/${item.clip.mtime}/" +
                     item.body.getJSONObject("fingerprint").getString("digest"))
                 JSONObject().put("key", oldKey).put("visual", ClipTransferPolicy.emptyVisual(

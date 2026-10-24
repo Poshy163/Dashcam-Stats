@@ -15,9 +15,12 @@ cycle (normally six seconds on the trial), and retain the engine-stop safeguards
 Optional requests use measured remaining time, with fair
 overdue selection rather than a catch-up burst. A target is not a promise that an
 adapter or ECU can complete the work; missed readings and overruns remain visible.
-Sparse diagnostic steps use a bounded reservation after fifteen seconds and then
-at least sixty-five seconds between steps. This can make a full diagnostic scan
-slower; a reserved step can exceed the nominal row target and remains visible.
+Sparse diagnostic steps first become due after fifteen seconds. From 0.3.18, they
+run only when a measured command and the full post-primary tail reserve fit the
+remaining target. Deferred reservations retry after fifteen seconds, leaving
+auxiliary opportunities between them; actual probes retain at least sixty-five
+seconds between steps. This can make a full diagnostic scan slower. Unanticipated
+overruns remain visible; scheduled optional work never replaces a critical reading.
 
 The option starts disabled. Normal operation continues to use plan 7's five-second
 target and nominal fifteen-second MAF rotation. Enabling or disabling the option
@@ -50,8 +53,9 @@ measurement. Increasing its frequency does not remove the model's assumptions.
 
 ## Fallback and rollback
 
-Three consecutive completed cycles exceeding three seconds, or three consecutive
-cycles with genuinely failed critical requests, disable the trial and record a
+From 0.3.18, three consecutive completed, still-running cycles exceeding a separate
+3,500 ms health budget, or three consecutive cycles with genuinely failed critical
+requests, disable the trial and record a
 bounded reason. A malformed critical reply retains the existing elapsed-time
 cooldown and receives a chance to make its scheduled plain-request retry. Those
 intentional cooldown slots remain missing in the exported data; they freeze the
@@ -61,7 +65,10 @@ recovery allowance expires fifteen seconds after the first completed row with th
 critical reply absent;
 another malformed reply cannot extend it. A missing timing proof or an unexplained
 cooldown does not receive this allowance. A successful retained reply clears that
-PID's recovery deadline. The three-second work-overrun limit is unchanged.
+PID's recovery deadline. The target remains 3,000 ms: all target misses are still
+counted in timing diagnostics. The separate 500 ms health margin tolerates bounded
+scheduling and storage jitter; exactly 3,500 ms resets the overload streak. Earlier
+companions used 3,000 ms for both target and fallback.
 An uncertain transport failure also disables it before the safe reconnection path.
 The trial segment is retained as interrupted. A subsequent safe
 connection uses plan 7, keeping its original timing contract. A transport fault
@@ -85,7 +92,7 @@ schedule and are shown as unavailable; the older plans retain those counts.
 ## Deployment and physical acceptance
 
 1. Deploy the matching server and verify its revision and health.
-2. Install the production-signed 0.3.14 update in place, retaining configuration and
+2. Install the production-signed 0.3.18 update in place, retaining configuration and
    storage permissions. Verify the pinned signing certificate before installation.
 3. Explicitly enable the trial, then use a normal drive. No accessory-power hold
    is needed for a driving test.
@@ -108,8 +115,8 @@ unverified; the short initial segment does not establish it.
 
 Automated validation covers timing skew, changed row delays, missing MAF, sequence
 and transport gaps, cadence-specific limits, overload fallback and unchanged
-legacy behavior. Sustained three-second performance remains unverified until the
-new package has completed a real drive.
+legacy behavior. Each newer package still needs a real drive to establish its
+physical performance; later observations are recorded below.
 
 ## 23 October findings and 0.3.15 follow-up
 
@@ -180,3 +187,33 @@ data: missing replies remain unavailable, per-PID times differ from row times,
 and a reply at 9.8 seconds saved in a row at 12 seconds remains visible in a window
 ending at 10 seconds. These checks are separate from APK installation and physical
 camera/ECU acceptance.
+
+## 24 October findings and 0.3.18 follow-up
+
+The latest 0.3.17 drive retained 320 rows over roughly sixteen minutes. Speed,
+RPM and MAF had 319, 320 and 318 retained readings, with median reply intervals
+3.029, 3.030 and 3.032 seconds. Two malformed MAF replies recovered on their next
+scheduled row; valid-MAF intervals were 5.987 and 6.159 seconds. No command timeout,
+transport error, sequence hole or duplicate was found. Producer, server and an
+independent replay agreed on distance and estimated fuel across all three reviewed
+drives (993 rows).
+
+The latest drive nevertheless selected baseline at 16:07:02.710 Adelaide after
+three completed cycles slightly above 3,000 ms. The final cycle took 3,058 ms,
+including 1,906 ms critical requests, 408 ms handoff checks and 672 ms diagnostics.
+The vehicle was stationary with idle RPM; accessory OFF followed about three
+seconds later. This is evidence of an over-sensitive work threshold and optional
+work overhead, rather than transport loss or moving-distance loss.
+
+0.3.18 retains raw three-second target accounting while applying the separate
+3,500 ms health limit described above. Its optional scheduler learns quiesce,
+status and timing-write cost as part of the full tail, separately accounts for
+diagnostic commands, and requires both reserves to fit before a fault probe.
+Adjacent absent handoff checks may share an absence for no more than 100 ms from
+the start of the original read; slow storage consumes that interval. Active or
+uncertain requests, exceptions, clock rollback and new sessions require fresh reads.
+The existing 15-second missing-critical recovery, malformed-MAF retry and strict
+transport safeguards remain. The package does not automatically re-arm the sticky
+fallback. New tests cover bounded jitter, true sustained overload, diagnostic
+deferral fairness and the handoff cache; physical acceptance requires installation
+and a newly armed drive.

@@ -28,21 +28,50 @@ class QuietResourceRetryTest {
         assertTrue(restored.ready(first, refused(), 91_000, 361_000))
     }
 
-    @Test fun fourthRefusalIsTerminalAndNeitherExpiryNorRestartCreatesANewBudget() {
+    @Test fun fourthInterruptedDecodeIsTerminalAndNeitherExpiryNorRestartCreatesANewBudget() {
         var retry = QuietResourceRetry()
         val deadline = 361_000L
+        val interrupted = refused().put("input_frames", 2).put("decoded_frames", 1)
         for ((index, at) in listOf(1_000L, 31_000L, 91_000L, 211_000L).withIndex()) {
-            retry.record(first, refused(), at)
+            retry.record(first, interrupted, at)
             retry = QuietResourceRetry.fromJson(JSONObject(retry.json().toString()))
-            assertEquals(index < 3, retry.pending(first, refused(), at, deadline))
+            assertEquals(index < 3, retry.pending(first, interrupted, at, deadline))
         }
-        assertFalse(retry.ready(first, refused(), 331_000, deadline))
-        assertFalse(retry.pending(first, refused(), deadline, deadline))
+        assertFalse(retry.ready(first, interrupted, 331_000, deadline))
+        assertFalse(retry.pending(first, interrupted, deadline, deadline))
         assertFalse(retry.ready(other, null, deadline, deadline))
         val expired = QuietResourceRetry()
         expired.record(first, refused(), deadline - 1)
         assertFalse(expired.pending(first, refused(), deadline, deadline))
         assertFalse(expired.ready(first, refused(), deadline + 120_000, deadline))
+    }
+
+    @Test fun hotAdmissionProbesStayRateLimitedWithoutSpendingDecodeBudgetAcrossRestart() {
+        var retry = QuietResourceRetry()
+        val deadline = 24L * 60 * 60 * 1_000
+        var at = 1_000L
+        repeat(12) { index ->
+            retry.record(first, refused(), at)
+            retry = QuietResourceRetry.fromJson(JSONObject(retry.json().toString()))
+            assertTrue(retry.pending(first, refused(), at, deadline))
+            val delay = when (index) { 0 -> 30_000; 1 -> 60_000; else -> 120_000 }
+            assertFalse(retry.ready(first, refused(), at + delay - 1, deadline))
+            assertFalse(retry.ready(other, null, at + delay - 1, deadline))
+            at += delay
+            assertTrue(retry.ready(first, refused(), at, deadline))
+        }
+        assertEquals(0, retry.json().getJSONArray("attempts").getJSONObject(0).getInt("count"))
+        assertFalse(retry.pending(first, refused(), deadline, deadline))
+    }
+
+    @Test fun queuedInputWithoutOutputStillSpendsDecodeBudgetAndHotProbeCannotRearmIt() {
+        val retry = QuietResourceRetry()
+        val queued = refused().put("input_frames", 1)
+        for (at in listOf(1_000L, 31_000L, 91_000L, 211_000L)) retry.record(first, queued, at)
+        retry.record(first, refused(), 331_000)
+        assertFalse(retry.ready(first, refused(), 451_000, 1_000_000))
+        assertEquals(QuietResourceRetry.MAX_ATTEMPTS,
+            retry.json().getJSONArray("attempts").getJSONObject(0).getInt("count"))
     }
 
     @Test fun onlyKnownResourceRefusalsWithoutObservedActivityCanRetry() {

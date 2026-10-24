@@ -28,6 +28,10 @@ import kotlin.math.min
 internal const val QUIET_FILTER_ENABLED = "parked_quiet_filter_enabled"
 private const val GUARD_PADDING_MS = 122_000L // 120s ignition margin plus filename timestamp uncertainty.
 internal const val QUIET_POLICY_VERSION = "parked_visual_quiet_v1"
+internal const val QUIET_TRANSFER_DEFER_MS = 360_000L
+// Cooling may outlast the transfer hold. Background retries never extend that hold or keep
+// the recorder awake, but may still prove a retained clip before a later backup opportunity.
+internal const val QUIET_ANALYSIS_RETRY_MS = 24L * 60 * 60 * 1_000
 
 internal data class PolicyClip(val clip: MovementClip, val body: JSONObject, val stable: Boolean,
     val freshFingerprint: Boolean, val uri: Uri, val startMs: Long?, val boundEndMs: Long?)
@@ -124,12 +128,22 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
 
     @Volatile var deferCount = 0; private set
 
-    private fun guard(item: PolicyClip, end: Long?, observedThrough: Long?): JSONObject {
-        val lower = item.startMs?.minus(GUARD_PADDING_MS)
+    private fun guard(start: Long?, end: Long?, observedThrough: Long?): JSONObject {
+        val lower = start?.minus(GUARD_PADDING_MS)
         val upper = end?.plus(GUARD_PADDING_MS)?.let { if (observedThrough == null) it else min(it, observedThrough) }
         return ParkedGuard.assess(lower, upper,
             if (lower != null && upper != null) journal.between(lower, upper) else emptyList(),
             lower != null && upper != null && journal.evidenceHealthy(lower, upper), ZoneId.systemDefault().id)
+    }
+
+    internal fun fingerprintCandidate(clip: MovementClip, start: Long?, end: Long?, classification: String,
+                                      now: Long): Boolean {
+        if (!enabled || clip.locked || clip.orphan || clip.size > 256L * 1024 * 1024 ||
+            !clip.relativePath.startsWith("DCIM/Video/") || start == null || end == null ||
+            end - start !in 30_000..120_000 || now < end || now >= end + QUIET_ANALYSIS_RETRY_MS ||
+            classification !in setOf("acc_off_candidate", "sampled_stationary")) return false
+        val observedThrough = journal.latestAccWallMs()?.coerceAtMost(now) ?: return false
+        return observedThrough >= end && ParkedGuard.valid(guard(start, end, observedThrough))
     }
 
     private fun evaluate(items: List<PolicyClip>, card: String?, now: Long): MutableList<JSONObject> {
@@ -141,7 +155,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
             val visual = card?.let { synchronized(cacheLock) {
                 val identity = key(item, it)
                 cached[identity]?.let { value ->
-                    if (item.boundEndMs != null && resourceRetry.pending(identity, value, now, item.boundEndMs + 360_000))
+                    if (item.boundEndMs != null && resourceRetry.pending(identity, value, now, item.boundEndMs + QUIET_ANALYSIS_RETRY_MS))
                         emptyVisual(reason = QuietAnalysisReason.RESOURCE_COOLDOWN) else value
                 }
             } } ?: emptyVisual()
@@ -160,10 +174,10 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                 .put("classification", assessment.classification).put("reasons", JSONArray(assessment.reasons))
                 .put("coverage", assessment.coverage).put("evidence", assessment.evidence)
                 .put("analysis_status", if (assessment.classification == "unknown") "unknown" else "complete")
-            val past = if (active) guard(item, end, observedThrough)
+            val past = if (active) guard(item.startMs, end, observedThrough)
                 else ParkedGuard.assess(null, null, emptyList(), false, ZoneId.systemDefault().id)
-            val full = if (active) guard(item, end, null) else past
-            val deadline = end?.plus(360_000)
+            val full = if (active) guard(item.startMs, end, null) else past
+            val deadline = end?.plus(QUIET_TRANSFER_DEFER_MS)
             val readable = !item.body.getJSONArray("reasons").toString().contains("file_unreadable")
             var decision = "upload"
             val reason = when {
@@ -216,26 +230,45 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         recheckQuietIdentities()
         // Expose bounded pending decisions before a slow decoder starts. This closes the normal
         // backup race without holding arbitrary unknown footage or resetting its deadline.
-        writeReport(rows, card, reportState, truncated)
+        val publishedPaths = writeReport(rows, card, reportState, truncated)
         // Scheduling uses this clip's own evidence, before transfer pairing. Staggered
         // camera segments may need two opposite-view witnesses; a missing witness must
         // retain transfer without preventing the independent analysis from ever running.
+        val now = wallMs()
         val candidate = if (stopped || !enabled || card == null || !allowed() || analysisJob?.isActive == true) null else items
-            .filter { it.stable && it.freshFingerprint && it.clip.size <= 256L * 1024 * 1024 &&
-                it.boundEndMs != null && synchronized(cacheLock) {
+            .filter { it.clip.relativePath in publishedPaths && it.stable && it.freshFingerprint &&
+                it.clip.size <= 256L * 1024 * 1024 &&
+                it.boundEndMs != null && now >= it.boundEndMs && synchronized(cacheLock) {
                     val identity = key(it, card)
-                    resourceRetry.ready(identity, cached[identity], wallMs(), it.boundEndMs + 360_000)
+                    // A terminal result evicted from the bounded cache must not be decoded again
+                    // every card rotation. A restart may reconsider it, with the same fixed horizon.
+                    (cached.containsKey(identity) || !attempted.containsKey(identity)) &&
+                        resourceRetry.ready(identity, cached[identity], now, it.boundEndMs + QUIET_ANALYSIS_RETRY_MS)
                 } && rows.any { row ->
-                    row.optString("decision") == "defer" &&
+                    (row.optString("decision") == "defer" || row.optString("reason") == "visual_required") &&
                         row.getJSONObject("clip").optString("relative_path") == it.clip.relativePath } }
-            .minByOrNull { attempted[key(it, card)] ?: 0L }
+            .minWithOrNull(compareBy<PolicyClip>(
+                { if (now < checkNotNull(it.boundEndMs) + QUIET_TRANSFER_DEFER_MS) 0 else 1 },
+                // Finish the opposite view of a proven clip before starting many unpaired views.
+                { candidate -> if (rows.any { row -> row.optString("decision") == "skip" &&
+                    validVisual(row.getJSONObject("visual")) &&
+                    row.getJSONObject("clip").optString("camera_key") != candidate.clip.camera &&
+                    runCatching {
+                        val peer = row.getJSONObject("clip")
+                        Instant.parse(peer.getString("start_utc")).toEpochMilli() < checkNotNull(candidate.boundEndMs) &&
+                            Instant.parse(peer.getString("end_utc")).toEpochMilli() > checkNotNull(candidate.startMs)
+                    }.getOrDefault(false) }) 0 else 1 },
+                { attempted[key(it, card)] ?: 0L },
+                { checkNotNull(it.boundEndMs) },
+                { it.clip.relativePath },
+            ))
         if (candidate != null && card != null) {
             currentCoroutineContext().ensureActive()
             state = "scanning"
             val identity = key(candidate, card)
             attempted[identity] = sequence
             suspend fun analyzeCandidate() {
-                val deadline = checkNotNull(candidate.boundEndMs) + 360_000
+                val deadline = checkNotNull(candidate.boundEndMs) + QUIET_ANALYSIS_RETRY_MS
                 var visual = try { analyzer.analyze(candidate.uri) {
                     !stopped && enabled && allowed() && wallMs() < deadline
                 } } catch (error: Exception) {
@@ -293,7 +326,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         writeReport(rows, card, reportState, truncated)
     }
 
-    private fun writeReport(baseRows: List<JSONObject>, card: String?, reportState: String, truncated: Boolean) {
+    private fun writeReport(baseRows: List<JSONObject>, card: String?, reportState: String, truncated: Boolean): Set<String> {
         val active = enabled
         // Keep own qualification immutable. Repeated publication/truncation must not
         // recursively turn a quiet boundary witness into missing evidence for its peer.
@@ -329,6 +362,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         deferCount = rows.count { it.optString("decision") == "defer" }
         uploadCount = rows.size - skipCount - deferCount
         root()?.let { atomicJson(File(it, "movement/transfer-policy.json"), output) }
+        return rows.map { it.getJSONObject("clip").getString("relative_path") }.toSet()
     }
 
     private fun saveCache() = synchronized(cacheLock) { atomicJson(cacheFile,
@@ -427,7 +461,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                     retain(); continue
                 }
                 if (qualification == "defer" || peers.any { own(it) == "defer" }) {
-                    val deadline = end + 360_000
+                    val deadline = end + QUIET_TRANSFER_DEFER_MS
                     if (now >= deadline) retain()
                     else row.put("decision", "defer").put("reason", if (qualification == "skip") "analysis_pending" else
                         original.optString("reason").takeUnless { it == "peer_analysis_pending" } ?: "analysis_pending")

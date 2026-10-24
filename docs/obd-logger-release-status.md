@@ -13,8 +13,71 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | Three-second trial remains armed for the next drive; parked operation correctly reports plan 7. The previous two 0.3.15 drives sustained plan 8 without fallback. |
-| Deployment | Installed APK bytes, production signer and fresh 0.3.17 status verified. App identity, runtime permissions, read-only folder access, ownership, trial and quiet filtering were retained. Both cameras kept recording and rolled new segments. The 0.3.16 server received the new status and supports its unchanged proof contract. The private checkpoint was readable with a valid revocation tombstone; the already-lost native edge was correctly kept unknown. Actual quiet exclusions and positive restart continuity after a new edge remain unverified. |
+| Poll plan | The latest 24 October drive used plan 8, then selected baseline after three small work-budget overruns near shutdown. The fallback remains selected until explicitly re-armed; parked operation reports plan 7. |
+| Deployment | Installed APK bytes, production signer and fresh 0.3.17 status verified. Identity, grants, ownership and quiet filtering were retained. A genuine new OFF edge on 24 October cleared the old cancellation gate and normal backup completed; its original timing bounds stayed fixed through subsequent chunks. Actual quiet exclusions and restart continuity across a deliberately tested process restart remain unverified. |
+
+## 0.3.18 candidate: polling, cooling retries and backup accounting
+
+Source version **0.3.18/code 31** addresses the 24 October drive review. It is a
+release candidate; it has not been installed or physically driven, and does not
+automatically re-arm a previously disabled trial.
+
+- Plan 8 still targets 3,000 ms and reports every raw target miss. Its separate
+  health budget permits 500 ms of scheduling/storage margin; three consecutive
+  completed, still-running cycles above 3,500 ms select baseline for the next
+  connection. Missing-reading recovery and transport-fault safeguards remain.
+  Optional diagnostics must fit the measured command plus full post-primary tail
+  reserve. Deferred probes retry after 15 seconds, leaving auxiliary opportunities
+  between reservations; actual probes retain the 65-second cadence. Only adjacent
+  absent handoff checks can share a result for at most 100 ms, including read latency.
+- Quiet policy cache version 4 separates the existing six-minute transfer hold from
+  a fixed 24-hour background-analysis horizon measured from clip end. A naturally
+  available safe idle window may analyse retained footage after cooling; this grants
+  no wake lease and never renews the upload hold. Zero-input/zero-output thermal
+  refusals retain persisted cooling backoff without consuming the four started-decode
+  attempts. Current transfer windows, paired-view completion and candidates retained
+  in the bounded report receive priority. Terminal results are not repeatedly decoded
+  when the 128-entry proof cache evicts them during a large-card scan.
+- Backup accounting preserves OBD and footage plans separately, unions completed
+  identities into replanned totals, and makes completion callbacks idempotent.
+  Retry-byte accounting survives replans. The observed 87-completed/80-total case
+  now retains all seven OBD bundles as well as the 80 footage files. Footage backlog,
+  durable history and raw tar-stream versus payload-byte semantics are unchanged.
+
+The 95 C admission, 100 C observed running stop and Android CRITICAL/unknown guards
+remain. At the measured 104 C/CRITICAL state, decoding must still be refused. Locked,
+active, uncertain, stale, changed or incompletely witnessed footage uploads normally;
+complete fresh paired full-frame/EOS proof remains necessary to skip a quiet clip.
+Already copied footage is not hidden or deleted.
+
+Local validation passed **3,668 backend tests** (77 Windows platform/fixture skips),
+**347 Android tests** (no skips) and **240 frontend tests**. Ruff, frontend
+typecheck/lint/build, npm audit, workflow actionlint, both Android APK builds and
+debug/release lint passed; Android lint retained 58 existing warnings and zero
+errors per variant. The large-card eviction test initially exceeded the default
+one-minute coroutine-test limit; its real inventory now grows progressively and
+passed in 41 seconds with an explicit bounded three-minute fixture timeout.
+Nine backend regressions verify valid paired proofs after 10 minutes, one hour and
+23 hours of cooling, and reject stale, changed, incomplete or active evidence without
+renewing the original hold. Counter tests cover real OBD bundles, repeated handoffs,
+retries and completion callbacks. Independent polling/counter and quiet-policy source
+reviews passed. CI's ffmpeg package cache is now keyed by distribution, architecture
+and runner image to prevent replaying Ubuntu 24.04 packages on a 26.04 runner.
+
+The latest physical 0.3.17 drive retained 320 rows: 319 speed, 320 RPM and 318 MAF
+readings, with median fresh intervals of 3.029/3.030/3.032 seconds. Both malformed
+MAF replies recovered on the next scheduled row; there were no command timeouts or
+transport failures. Camera, server and independent replay agreed on 14.649971944 km
+and estimated 1.265352021 L. Three work cycles just above the old 3,000 ms threshold
+caused fallback while stationary, about three seconds before actual accessory OFF.
+The new health-budget and scheduling behavior require a new installed trial to
+establish physical performance.
+
+Normal backup run 619 completed 87 files / 4,505,697,497 bytes at 16.51 MB/s; later
+chunks also completed with Bluetooth, hotspot and logger restored. Quiet exclusions
+remained zero because the camera was hot. Tests establish the conservative late-proof
+and scanner contracts; an actual quiet exclusion retained on the card and omitted
+from downstream processing still needs physical acceptance in a safe cool window.
 
 ## 0.3.17 installed and durable sleep timing
 
@@ -697,7 +760,7 @@ First integrate/review the release source in the protected signing checkout, or 
 protected build host to use the existing signing files. The original checkout may still contain
 older source and unrelated local changes: do not blindly pull, switch branches or overwrite it.
 Fresh worktrees do not contain the signing files. From the chosen source checkout, after verifying
-`app/build.gradle.kts` declares version 0.3.17/code 30:
+`app/build.gradle.kts` declares version 0.3.18/code 31:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
@@ -725,7 +788,7 @@ other settings, the metrics toggle works, and `Bundles waiting for the server` d
 next Wi-Fi window. Verify webhook events reach the server and boot recovery still works.
 
 After ingestion obtains a fresh status snapshot, `GET /api/obd/status` should report
-`app_version_name: "0.3.17"` and `app_version_code: 30` under `logger`. A cached status alone does
+`app_version_name: "0.3.18"` and `app_version_code: 31` under `logger`. A cached status alone does
 not establish the currently installed/running version.
 
 ## What is still left to do
@@ -754,8 +817,8 @@ Remaining work and physical checks:
    and isolated camera-recorded-only power-cycle recovery still need physical acceptance.
    Advisory labels remain report only. Both visual-policy opt-ins were enabled on
    22 October at the operator's request, with unchanged resource and proof gates.
-   The camera was above the 85 C limit; genuine exclusion, parked-activity transfer and
-   sustained paired-decoder acceptance remain unverified.
+   On 22 October the camera was above the then-current 85 C limit; genuine exclusion,
+   parked-activity transfer and sustained paired-decoder acceptance remain unverified.
 6. **Recording continuity** — an earlier parked 21 October inspection found an unchanged
    rear active file despite live preview. After the 0.3.10 installation and front decode
    probe, both cameras' native active files independently rolled and grew. This verifies

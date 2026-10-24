@@ -3,7 +3,7 @@ package com.dashcamstats.obdlogger
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Bounded opportunities within the original six-minute clip deadline, never a new deadline.
+/** Bounded opportunities within a caller-supplied fixed horizon, never a new deadline.
  * Both per-identity attempts and the shared cooling window survive a process restart.
  * A shared window prevents cycling through a full card's hot clips every indexer tick.
  */
@@ -45,7 +45,10 @@ internal class QuietResourceRetry {
             refusalStreak = (refusalStreak + 1).coerceAtMost(3)
             val delayMs = 30_000L shl (refusalStreak - 1)
             val after = now.coerceAtMost(Long.MAX_VALUE - delayMs) + delayMs
-            val count = ((attempts[key]?.count ?: 0) + 1).coerceAtMost(MAX_ATTEMPTS)
+            // Hot admission probes return before opening video and have no frame progress.
+            // Preserve a later opportunity; queued input or decoded output spends an attempt.
+            val started = visual.optInt("input_frames", -1) > 0 || visual.optInt("decoded_frames", -1) > 0
+            val count = ((attempts[key]?.count ?: 0) + if (started) 1 else 0).coerceAtMost(MAX_ATTEMPTS)
             attempts.remove(key)
             attempts[key] = Attempt(count, after)
             cooldownUntilMs = after
@@ -88,7 +91,7 @@ internal class QuietResourceRetry {
                 for (i in 0 until rows.length()) {
                     val row = rows.getJSONObject(i)
                     val key = row.getString("key").also { require(it.matches(Regex("[a-f0-9]{64}"))) }
-                    val count = row.getInt("count").also { require(it in 1..MAX_ATTEMPTS) }
+                    val count = row.getInt("count").also { require(it in 0..MAX_ATTEMPTS) }
                     val after = row.getLong("after_ms").also { require(it >= 0 && it <= observedAtMs + 120_000L) }
                     require(attempts.put(key, Attempt(count, after)) == null)
                 }

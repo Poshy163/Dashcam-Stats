@@ -248,10 +248,11 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
         val output = mutableListOf<JSONObject>()
         val policyClips = mutableListOf<PolicyClip>()
         scanNumber += 1
-        val fingerprintCandidates = sorted.filter { seen["$cardId/${it.relativePath}"] == (it.size to it.mtime) }
-            .sortedBy { fingerprintScan["$cardId/${it.relativePath}/${it.size}/${it.mtime}"] ?: 0L }
-            .take(8).map { "$cardId/${it.relativePath}/${it.size}/${it.mtime}" }.toSet()
-        for (clip in sorted) {
+        data class Inspection(val clip: MovementClip, val stable: Boolean, val start: Long?, val end: Long?,
+                              val bounded: Boolean, val timeSafe: Boolean, val assessment: MotionAssessment,
+                              val fingerprintEligible: Boolean)
+        val inspectedAt = System.currentTimeMillis()
+        val inspections = sorted.map { clip ->
             currentCoroutineContext().ensureActive()
             val key = "$cardId/${clip.relativePath}"
             val stable = seen[key] == (clip.size to clip.mtime)
@@ -267,6 +268,23 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
             val evidenceHealthy = bounded && journal.evidenceHealthy(checkNotNull(start), checkNotNull(end))
             val assessment = MovementClassifier.assess(start.takeIf { timeSafe }, end.takeIf { timeSafe },
                 observations, clip.locked, clip.orphan, evidenceHealthy)
+            Inspection(clip, stable, start, end, bounded, timeSafe, assessment,
+                stable && transferPolicy.fingerprintCandidate(clip, start, end, assessment.classification, inspectedAt))
+        }
+        // A full card used to spend nearly the whole six-minute opportunity refreshing
+        // locked, moving and old files. Keep fair refreshes, with guarded parked clips first.
+        val fingerprintCandidates = inspections.filter { it.stable }
+            .sortedWith(compareBy<Inspection> { when {
+                !it.fingerprintEligible -> 2
+                inspectedAt < checkNotNull(it.end) + QUIET_TRANSFER_DEFER_MS -> 0
+                else -> 1
+            } }
+                .thenBy { fingerprintScan["$cardId/${it.clip.relativePath}/${it.clip.size}/${it.clip.mtime}"] ?: 0L })
+            .take(8).map { "$cardId/${it.clip.relativePath}/${it.clip.size}/${it.clip.mtime}" }.toSet()
+        for (inspection in inspections) {
+            currentCoroutineContext().ensureActive()
+            val (clip, stable, start, end, bounded, timeSafe, assessment) = inspection
+            val key = "$cardId/${clip.relativePath}"
             val reasons = assessment.reasons.toMutableList()
             if (!stable) reasons += "file_unstable"
             if (bounded && !timeSafe) reasons += "clock_ambiguous"

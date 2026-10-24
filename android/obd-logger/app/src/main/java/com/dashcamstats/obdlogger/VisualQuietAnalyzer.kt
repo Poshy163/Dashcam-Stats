@@ -32,7 +32,7 @@ internal const val QUIET_ROI_ROWS = 86
 internal const val QUIET_ROI_PROFILE = "dashcam_osd_bottom4_v1"
 internal const val QUIET_MOTION_METRIC = "adjacent_rolling6_coherent3x3_v1"
 // Resource admission/continuation changed; an older refusal must not suppress a new analysis.
-internal const val QUIET_RESOURCE_POLICY_VERSION = 3
+internal const val QUIET_RESOURCE_POLICY_VERSION = 4
 
 internal enum class QuietThermalPhase { ADMISSION, DECODING }
 

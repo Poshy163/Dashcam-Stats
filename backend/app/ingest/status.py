@@ -79,6 +79,12 @@ class IngestStatus:
         self.files_done = 0
         self.bytes_total = 0
         self.bytes_done = 0
+        # Transport identities are flat basenames. Footage can be replanned after
+        # space filtering or an analysis handoff; independent OBD work must survive
+        # that replacement, as must completed files and bytes spent on a retry.
+        self._plans: dict[str, dict[str, int]] = {}
+        self._completed_files: dict[str, int] = {}
+        self._retry_bytes = 0
         self.current_file: str | None = None
         self.backlog_files = 0
         self.backlog_bytes = 0
@@ -204,6 +210,9 @@ class IngestStatus:
             self.phase = Phase.CONNECTING
             self.files_total = self.files_done = 0
             self.bytes_total = self.bytes_done = 0
+            self._plans.clear()
+            self._completed_files.clear()
+            self._retry_bytes = 0
             self.backlog_known = False
             self.active_skipped = 0
             self.policy_deferred_files = 0
@@ -280,25 +289,41 @@ class IngestStatus:
 
     # -- progress ------------------------------------------------------------------------
 
+    def _update_plan_totals(self) -> None:
+        files = {}
+        for plan in self._plans.values():
+            files.update(plan)
+        # A later inventory may omit files already transferred or reclaimed. They
+        # still belong to this run, with the size accepted when transfer completed.
+        files.update(self._completed_files)
+        self.files_total = len(files)
+        self.bytes_total = sum(files.values()) + self._retry_bytes
+
     def plan(self, plan: DeltaPlan) -> None:
+        """Replace pending footage without erasing other work already in this run."""
         with self._lock:
-            self.files_total = len(plan.files)
-            self.bytes_total = plan.bytes
+            self._plans["footage"] = {item.name: item.size for item in plan.files}
+            self._update_plan_totals()
             self.backlog_files = plan.backlog_files
             self.backlog_bytes = plan.backlog_bytes
             self.backlog_known = True
             self.active_skipped = plan.active_skipped
             self.set_policy_deferred(plan)
 
-    def extend_plan(self, plan: DeltaPlan) -> None:
+    def extend_plan(self, plan: DeltaPlan, *, scope: str = "footage") -> None:
         """Grow the run's totals for a sweep: recordings found by re-checking the card
         partway through, copied in the same run. Totals only -- the progress bar keeps
-        counting up rather than resetting -- and the backlog is left to the final reckoning."""
+        counting up rather than resetting -- and the backlog is left to the final reckoning.
+
+        OBD exports have a separate scope because replacing the footage plan cannot
+        remove them. Repeated inventories merge by transport identity, not by count.
+        """
         with self._lock:
-            self.files_total += len(plan.files)
-            self.bytes_total += plan.bytes
-            self.active_skipped = plan.active_skipped
-            self.set_policy_deferred(plan)
+            self._plans.setdefault(scope, {}).update({item.name: item.size for item in plan.files})
+            self._update_plan_totals()
+            if scope == "footage":
+                self.active_skipped = plan.active_skipped
+                self.set_policy_deferred(plan)
 
     def set_policy_deferred(self, plan: DeltaPlan) -> None:
         with self._lock:
@@ -329,7 +354,8 @@ class IngestStatus:
     def account_for_retry(self, discarded_bytes: int) -> None:
         """Keep remaining-work estimates honest when partial stream bytes must be re-read."""
         with self._lock:
-            self.bytes_total += max(0, discarded_bytes)
+            self._retry_bytes += max(0, discarded_bytes)
+            self._update_plan_totals()
 
     def set_backlog(self, files: int, size: int) -> None:
         with self._lock:
@@ -811,7 +837,12 @@ class IngestStatus:
         # next one started -- reading, to anyone watching, as though the transfer had gone
         # backwards.
         with self._lock:
-            self.files_done += 1
+            if name not in self._completed_files:
+                self._completed_files[name] = next(
+                    (plan[name] for plan in self._plans.values() if name in plan), 0
+                )
+                self.files_done = len(self._completed_files)
+                self._update_plan_totals()
             self.current_file = None
 
     # -- reporting -----------------------------------------------------------------------

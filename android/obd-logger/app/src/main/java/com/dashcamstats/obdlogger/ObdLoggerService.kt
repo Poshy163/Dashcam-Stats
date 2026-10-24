@@ -1226,12 +1226,13 @@ class ObdLoggerService : Service() {
         val health = PollTrialHealth()
         val malformed = LivePidMalformedTracker(nextOpportunityRetryPids = setOf(0x10))
         val timing = PollTiming(driveStartedElapsedMillis, PollTrialPlan.TARGET_MILLIS, SystemClock::elapsedRealtime)
+        val quiesceReader = TrialQuiesceReader(SystemClock::elapsedRealtime) { currentQuiesceRequest(deviceRoot) }
         fun quiesceRequest() = timing.measureStage(PollCycleStage.QUIESCE_CHECKS) {
-            currentQuiesceRequest(deviceRoot)
+            quiesceReader.read()
         }
         val diagnosticScan = DiagnosticScan(elm, driveId)
         val origin = SystemClock.elapsedRealtime()
-        var diagnosticDue = origin + 15_000L
+        val diagnosticSchedule = PollTrialDiagnosticSchedule(origin)
         var sequence = 0L
         var flushReason = "drive_end"
         var lastVoltage: Double? = null
@@ -1259,7 +1260,7 @@ class ObdLoggerService : Service() {
                 val started = SystemClock.elapsedRealtime()
                 timing.startCycle()
                 val wallCycle = PollTrialPlan.cooldownCycle(started - origin)
-                val reserved = started >= diagnosticDue && diagnosticScan.prepareCycle(wallCycle)
+                val reserved = diagnosticSchedule.reserve(started, diagnosticScan.prepareCycle(wallCycle))
                 val requested = PollTrialPlan.critical.toMutableList()
                 val values = linkedMapOf<String, Any>()
                 val decodedFields = linkedMapOf<Int, Set<String>>()
@@ -1376,18 +1377,22 @@ class ObdLoggerService : Service() {
                     parserQuality = if (prepared.missing.isEmpty()) "ok" else "partial",
                     missingPids = prepared.missing, pidResponseAgeMs = ages,
                 )) }
-                scheduler.observeTail(boundedElapsedMillis(tailStarted))
                 if (persisted) timing.rowPersisted(ages)
                 quiesceRequest()?.let { return RecordingExit.Quiesce(it) }
-                // Keep the existing 15s first / 65s recurring diagnostic reservation in wall time.
-                // A bounded reserved probe may overrun; it never replaces a critical read or row.
-                if (reserved && persisted && boundedElapsedMillis(started) <= PollTrialPlan.TARGET_MILLIS) {
-                    diagnosticDue = SystemClock.elapsedRealtime() + 65_000L
+                // Read-only fault probes must fit the measured command + full post-primary
+                // tail reserve. A deferred queue retries after 15s, leaving auxiliary slots
+                // available between reservations; an actual probe keeps the 65s cadence.
+                var diagnosticMillis = 0L
+                val diagnosticAllowed = reserved && persisted && scheduler.mayRun(started)
+                if (reserved) diagnosticSchedule.observedReservation(SystemClock.elapsedRealtime(), diagnosticAllowed)
+                if (diagnosticAllowed) {
                     val diagnosticStarted = timing.now()
                     try {
                         diagnosticScan.runOne(wallCycle, capture.timestampUtc)
                     } finally {
                         timing.observeStage(PollCycleStage.DIAGNOSTICS, diagnosticStarted)
+                        diagnosticMillis = boundedElapsedMillis(diagnosticStarted)
+                        scheduler.observeCommand(diagnosticMillis)
                     }
                     if (elm.isSessionTainted || !elm.isConnected) fallback("transport_fault")
                 }
@@ -1405,6 +1410,9 @@ class ObdLoggerService : Service() {
                 timing.measureStage(PollCycleStage.STATUS_PUBLISH) { publish("ecu_online", config) }
                 timing.finishCycle(completed = persisted)
                 emitPollTiming(driveId, timing, "periodic", driveClock)
+                // Include quiesce, status and timing writes, rather than learning only
+                // the sample's SQLite write. The separately timed fault command is not tail.
+                scheduler.observeTail((boundedElapsedMillis(tailStarted) - diagnosticMillis).coerceAtLeast(0))
                 // Include synchronous status and diagnostic disk work in the fallback budget.
                 if (shuttingDown) health.reset() else health.completed(
                     boundedElapsedMillis(started), retainedOutcomes, SystemClock.elapsedRealtime(),

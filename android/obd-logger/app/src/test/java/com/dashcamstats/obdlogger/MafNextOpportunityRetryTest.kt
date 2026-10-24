@@ -180,10 +180,10 @@ class MafNextOpportunityRetryTest {
             assertEquals(1, commands)
         }
         val health = PollTrialHealth()
-        assertNull(health.completed(3_001, outcomes(CriticalPollOutcome.MALFORMED), 0))
-        assertNull(health.completed(3_001, outcomes(CriticalPollOutcome.SUCCESS), 3_000))
+        assertNull(health.completed(3_501, outcomes(CriticalPollOutcome.MALFORMED), 0))
+        assertNull(health.completed(3_501, outcomes(CriticalPollOutcome.SUCCESS), 3_501))
         assertEquals("sustained_overrun",
-            health.completed(3_001, outcomes(CriticalPollOutcome.SUCCESS), 6_000))
+            health.completed(3_501, outcomes(CriticalPollOutcome.SUCCESS), 7_002))
         val session = ElmCommandSession().apply { freshConnection(); beginCommand() }
         val timeout = runCatching {
             session.awaitResponse(kotlinx.coroutines.CompletableDeferred(), "0110", 1)

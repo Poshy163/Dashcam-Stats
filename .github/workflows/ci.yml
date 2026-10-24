@@ -58,12 +58,22 @@ jobs:
       # alone pulls tens of megabytes of package lists, and ffmpeg drags in most of the
       # Debian media stack behind it: together they were 38-68s of a 3.4 minute job, spent
       # fetching bytes that are identical from one run to the next.
+      # Native packages cannot be replayed across runner distributions/images.
+      # The old Linux-only key restored Ubuntu 24.04 packages on 26.04 and forced
+      # a long dependency repair before any application tests could start.
+      - name: Identify the runner package platform
+        id: ffmpeg_host
+        run: |
+          set -eu
+          . /etc/os-release
+          printf 'id=%s-%s-%s-%s\n' "$ID" "$VERSION_ID" "$(dpkg --print-architecture)" "${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
       - name: Restore the ffmpeg packages
         id: ffmpeg-cache
         uses: actions/cache@v4
         with:
           path: ~/ffmpeg-debs
-          key: ffmpeg-debs-${{ runner.os }}-v1
+          key: ffmpeg-debs-${{ steps.ffmpeg_host.outputs.id }}-v2
 
       - name: Install ffmpeg
         run: |

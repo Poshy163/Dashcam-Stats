@@ -98,6 +98,26 @@ Expired/exhausted retries and unmeasurable cameras upload normally; software rep
 does not resolve the camera's physical heat or
 prove a complete quiet-clip analysis.
 
+Companion 0.3.18 separates the unchanged six-minute transfer hold from a fixed
+24-hour background-analysis horizon, both measured from the original clip end.
+A retained, still guarded parked clip may be analysed in a naturally available
+safe idle window after it cools. This does not grant a wake lease, renew a deadline
+or postpone ordinary upload after the original hold expires. Resource probes with
+no queued input and no decoded frames retain the persisted 30/60/120-second
+cooling backoff without exhausting the four actual started-decode attempts.
+Started decoding consumes that budget; terminal results are not retried merely
+because the bounded proof cache evicts them. Removed or changed identities can
+receive a fresh conservative evaluation.
+
+Active transfer windows, paired-view completion and fresh parked fingerprints get
+priority. Decoder candidates must appear in the actual bounded preliminary report;
+pairing is checked again after final report truncation. Cache policy 4 invalidates
+older cached refusals. The 95 C admission/100 C stop, CRITICAL and unknown thermal
+refusals, battery, memory, recording and backup guards remain unchanged. Later
+analysis still needs unchanged identity, full-frame/EOS quiet proof, fresh logger
+and report evidence and a complete opposite-camera witness. Missing or stale proof
+uploads normally; no copied footage is retroactively hidden or deleted.
+
 ## Verified maintenance wake hold
 
 The Backup page can request a 5, 15 or 30 minute maintenance window while parked. The

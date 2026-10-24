@@ -110,6 +110,25 @@ cooling retries. Refused or interrupted analysis cannot authorize exclusion.
 These limits preserve recording priority and still require
 physical validation of both recording streams under sustained analysis.
 
+Companion 0.3.18 uses resource-policy cache version 4 and separates cooling analysis
+from upload deferral. The transfer deadline stays fixed at clip end plus six minutes;
+an otherwise guarded retained clip can receive background analysis for at most
+24 hours from that original clip end. This grants no wake lease or additional
+server wait. A safe result can be used before a later upload opportunity; footage
+already uploaded remains visible and is processed normally.
+
+Zero-input/zero-decoded-frame admission refusals keep the shared persisted cooling
+backoff without consuming one of the four started-decode attempts. Queued input or
+decoded output spends an attempt. Completed or terminal results do not restart
+when the bounded proof cache evicts them during the same process; only present
+identities are tracked, and changed identities are evaluated conservatively anew.
+Restart may reconsider a result within the same fixed horizon, with all guards
+still required. Fresh six-minute candidates and opposite-view completion receive
+priority over older retries; decoder candidates must survive preliminary report
+truncation. Full pairing is checked again on the final bounded report. Expired,
+unsafe or insufficient evidence always preserves ordinary upload. The thermal
+thresholds, recording priority and complete paired proof contract are unchanged.
+
 ## Scanning, processing and journeys
 
 Successful backup commits notify the scanner, coalesced after the batch. Existing scanner

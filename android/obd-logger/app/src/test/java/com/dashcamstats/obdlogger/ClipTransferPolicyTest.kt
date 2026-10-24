@@ -478,7 +478,7 @@ class ClipTransferPolicyTest {
         File(context.filesDir, "quiet-analysis-v2.json.partial").delete()
         asynchronous.stop()
         File(context.filesDir, "quiet-analysis-v2.json").delete()
-        val expired = ClipTransferPolicy(context, journal, { root }, { true }, fake, { clock() + 600_000 })
+        val expired = ClipTransferPolicy(context, journal, { root }, { true }, fake, { clock() + QUIET_ANALYSIS_RETRY_MS })
         expired.publish(items, "b".repeat(64), "ready", false) { true }
         assertEquals(0, expired.deferCount); assertEquals(0, expired.skipCount); assertEquals(2, analyses)
         policy.publish(items.map { it.copy(freshFingerprint = false) }, "b".repeat(64), "ready", false) { true }

@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -396,6 +397,78 @@ async def test_verified_pair_is_audited_before_omission_and_never_becomes_backlo
     result = puller.delta([], tmp_path, skip_active_s=15, camera="both")
     assert result.files == [] and result.backlog_files == result.backlog_bytes == 0
     assert policy_inventory(policy.doc) == policy.remote, "camera files were never removed"
+
+
+def make_late_cooled_policy(delay_s):
+    """Cooling can delay full decoding without renewing the transfer deferral."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    end = now - timedelta(seconds=delay_s + 1)
+    start = end - timedelta(seconds=60)
+    local = start.astimezone(ZoneInfo("Australia/Adelaide")).replace(tzinfo=None)
+    doc = make_policy()
+    doc.update(generated_at_utc=now.isoformat(), producer_version="0.3.18")
+    for entry in doc["decisions"]:
+        clip = entry["clip"]
+        clip.update(
+            relative_path=f"DCIM/Video/{local:%Y%m%d%H%M%S}_{clip['camera_key']}.ts",
+            local_start=local.isoformat(),
+            start_utc=start.isoformat(),
+            end_utc=end.isoformat(),
+            mtime_ms=int(end.timestamp() * 1000),
+        )
+        entry["guard"].update(
+            start_utc=(start - timedelta(seconds=122)).isoformat(),
+            end_utc=(end + timedelta(seconds=122)).isoformat(),
+        )
+        entry["visual"]["analysis_completed_at_utc"] = (now - timedelta(seconds=1)).isoformat()
+    return doc
+
+
+@pytest.mark.parametrize("delay_s", [600, 3600, 23 * 3600])
+async def test_later_cooling_can_prove_a_pair_without_renewing_deferral(policy, tmp_path, delay_s):
+    install_policy(policy, make_late_cooled_policy(delay_s))
+    assert await filtered(policy) == []
+    assert len(policy.result.skipped) == 2
+    assert policy.result.deferred == []
+    assert policy.record.await_args.kwargs["excluded"] == policy.doc["decisions"]
+    assert policy_inventory(policy.doc) == policy.remote
+    assert list(tmp_path.iterdir()) == [], "an exclusion never creates a local backup file"
+
+
+@pytest.mark.parametrize("change", ["stale", "size", "missing_peer", "partial_decode", "activity"])
+async def test_late_cooling_never_weakens_current_pair_or_identity_checks(policy, change):
+    doc = make_late_cooled_policy(3600)
+    if change == "stale":
+        doc["generated_at_utc"] = (datetime.now(UTC) - timedelta(seconds=181)).isoformat()
+        # Keep the original proof in the past as well; freshness alone must refuse it.
+        for entry in doc["decisions"]:
+            entry["visual"]["analysis_completed_at_utc"] = (
+                datetime.now(UTC) - timedelta(seconds=182)
+            ).isoformat()
+    elif change == "partial_decode":
+        doc["decisions"][0]["visual"]["decoder_eos"] = False
+    elif change == "activity":
+        doc["decisions"][0]["visual"].update(status="activity", motion_frames=1)
+    install_policy(policy, doc)
+    if change == "size":
+        policy.remote[0] = replace(policy.remote[0], size=policy.remote[0].size + 1)
+    elif change == "missing_peer":
+        policy.remote = policy.remote[:1]
+    assert await filtered(policy) == policy.remote
+    assert policy.result.skipped == []
+
+
+async def test_late_background_retry_cannot_extend_an_expired_upload_deferral(policy):
+    now = datetime.now(UTC)
+    doc = make_deferred_policy(now=now - timedelta(minutes=20))
+    doc.update(generated_at_utc=now.isoformat(), producer_version="0.3.18")
+    deadlines = [entry["defer_until_utc"] for entry in doc["decisions"]]
+    for entry in doc["decisions"]:
+        entry["visual"]["reason"] = "resource_cooldown"
+    install_policy(policy, doc)
+    assert await filtered(policy, native_remaining_s=900) == policy.remote
+    assert policy.result.deferred == policy.result.skipped == []
+    assert [entry["defer_until_utc"] for entry in policy.doc["decisions"]] == deadlines
 
 
 @pytest.mark.parametrize("server,camera", [(False, True), (True, False), (False, False)])
