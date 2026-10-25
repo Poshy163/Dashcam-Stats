@@ -84,6 +84,8 @@ data class PublicStatus(
     val lastError: String? = null,
     val lastErrorAtUtc: String? = null,
     val pollPlanVersion: Int = ObdPollPlan.VERSION,
+    val trialSettings: JSONObject? = null,
+    val restartEvidence: BootDiagnosticsSnapshot? = null,
 )
 
 internal const val PUBLIC_STATUS_SCHEMA_VERSION = 7
@@ -129,6 +131,8 @@ object StatusPublisher {
             .put("app_version_name", BuildConfig.VERSION_NAME)
             .put("app_version_code", BuildConfig.VERSION_CODE)
             .put("poll_plan_version", status.pollPlanVersion)
+            .put("trial_settings", status.trialSettings ?: JSONObject.NULL)
+            .put("restart_evidence", status.restartEvidence?.toJson() ?: JSONObject.NULL)
             .put("build_git_sha", BuildConfig.BUILD_GIT_SHA)
             .put(
                 "capabilities",
@@ -143,6 +147,8 @@ object StatusPublisher {
                         "sleep_deadline_evidence_v1",
                         "clip_movement_manifest_v1",
                         "clip_transfer_policy_v1",
+                        "poll_trial_settings_v1",
+                        "restart_evidence_v1",
                     ),
                 ),
             )

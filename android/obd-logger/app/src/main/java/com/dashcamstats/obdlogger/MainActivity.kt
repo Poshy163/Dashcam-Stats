@@ -41,6 +41,8 @@ class MainActivity : Activity() {
     private lateinit var voltageOnlyMode: CheckBox
     private lateinit var pollTrial: CheckBox
     private lateinit var pollTrialReason: TextView
+    private lateinit var pollTrialApply: Button
+    private lateinit var pollTrialDraft: TrialSettingsDraft
     private lateinit var webhookEnabled: CheckBox
     private lateinit var webhookUrl: EditText
     private lateinit var webhookApiKey: EditText
@@ -210,16 +212,21 @@ class MainActivity : Activity() {
             text = "Trial: 3-second speed / RPM / MAF (applies next drive; automatic fallback)"
             isChecked = current.pollTrialEnabled
         }
+        pollTrialDraft = TrialSettingsDraft(LoggerPreferences.pollTrialSnapshot(this))
         layout.addView(pollTrial)
         pollTrialReason = TextView(this).apply {
             text = current.pollTrialFallbackReason?.let { "${PollTrialPlan.fallbackText(it)} Check the box to re-arm." } ?: "Baseline polling is the default."
         }
         layout.addView(pollTrialReason)
+        pollTrialApply = Button(this).apply {
+            text = "Apply trial setting"
+            setOnClickListener { applyTrialSetting() }
+        }
+        layout.addView(pollTrialApply)
         pollTrial.setOnCheckedChangeListener { _, checked ->
             if (renderingPollTrial) return@setOnCheckedChangeListener
-            runCatching { LoggerPreferences.setPollTrial(this, checked) }.onSuccess {
-                pollTrialReason.text = if (checked) "Trial armed for the next drive." else "Baseline selected for the next drive."
-            }.onFailure { pollTrialReason.text = "Could not save trial setting; try again." }
+            pollTrialDraft.select(checked)
+            renderTrialSetting()
         }
         webhookEnabled = CheckBox(this).apply {
             text = "Send webhook to Dashcam Analyser on engine-off / sleep"
@@ -310,13 +317,7 @@ class MainActivity : Activity() {
     }
 
     private fun renderLiveStatus() {
-        val trialConfig = LoggerPreferences.load(this, false)
-        renderingPollTrial = true
-        pollTrial.isChecked = trialConfig.pollTrialEnabled
-        renderingPollTrial = false
-        pollTrialReason.text = trialConfig.pollTrialFallbackReason?.let { "${PollTrialPlan.fallbackText(it)} Check the box to re-arm." }
-            ?: if (trialConfig.pollTrialEnabled) "Trial armed for the next drive; current plan ${publishedStatus?.optInt("poll_plan_version", 7) ?: 7}."
-            else "Baseline selected for the next drive."
+        renderTrialSetting()
         liveStatus.text = LiveStatusSummary.lines(publishedStatus, System.currentTimeMillis())
             .joinToString("\n")
         liveMetrics.visibility = if (metricsExpanded) View.VISIBLE else View.GONE
@@ -324,6 +325,38 @@ class MainActivity : Activity() {
             else "Show metrics and sleep details"
         if (metricsExpanded) {
             liveMetrics.text = LiveStatusSummary.detailLines(publishedStatus).joinToString("\n")
+        }
+    }
+
+    private fun renderTrialSetting() {
+        val stored = LoggerPreferences.pollTrialSnapshot(this)
+        pollTrialDraft.refresh(stored)
+        renderingPollTrial = true
+        pollTrial.isChecked = pollTrialDraft.selected
+        renderingPollTrial = false
+        pollTrialApply.isEnabled = pollTrialDraft.dirty || stored.storageState == "unavailable"
+        pollTrialReason.text = when {
+            stored.storageState == "unavailable" -> "The saved trial setting is unavailable. Baseline is selected; explicitly apply your choice to recover."
+            pollTrialDraft.dirty && pollTrialDraft.base.token != stored.token ->
+                "Trial state changed while this choice was pending. Apply will reload the current state for review."
+            pollTrialDraft.dirty -> "Selection pending. Tap Apply trial setting to save it for the next drive."
+            stored.fallbackReason != null -> "${PollTrialPlan.fallbackText(stored.fallbackReason)} Check the box and apply to re-arm."
+            stored.enabled -> "Trial armed for the next drive; current plan ${publishedStatus?.optInt("poll_plan_version", 7) ?: 7}."
+            else -> "Baseline selected for the next drive."
+        }
+    }
+
+    private fun applyTrialSetting() {
+        try {
+            pollTrialDraft.apply(TrialSettings.repository(this))
+            renderTrialSetting()
+        } catch (_: StaleTrialSettingsException) {
+            pollTrialDraft.reload(LoggerPreferences.pollTrialSnapshot(this))
+            renderTrialSetting()
+            pollTrialReason.text = "Trial state changed. Review the current setting, choose again and apply."
+        } catch (_: TrialSettingsStorageException) {
+            renderTrialSetting()
+            pollTrialReason.text = "Could not save the trial setting. Baseline remains selected; retry Apply when storage is available."
         }
     }
 

@@ -49,7 +49,7 @@ class LivePollSchedulerTest {
                     }
                 }
                 clock += 150L
-                scheduler.observePrimaryTail(150L)
+                scheduler.observeTail(150L)
 
                 assertEquals(critical + listOf(null), commands.take(4))
                 assertTrue(values.keys.containsAll(critical))
@@ -65,8 +65,12 @@ class LivePollSchedulerTest {
 
             assertTrue(deferred > 0)
             val optional = (0L..11L).flatMap { ObdPollPlan.requestedPids(it, supported) }.toSet() - critical.toSet()
-            assertEquals(optional, seen.keys - critical.toSet())
-            optional.forEach { pid ->
+            // At850ms only one optional command fits. Fuel gets that slot when due;
+            // coolant/intake/slow21 share its nominal phase and remain honestly missing.
+            val admitted = if (commandMillis == 850L) optional - setOf(0x05, 0x0F, 0x21) else optional
+            assertEquals(admitted, seen.keys - critical.toSet())
+            assertEquals((0L..119L).filter { it % 3 == 1L }, seen.getValue(0x10))
+            admitted.forEach { pid ->
                 val attempts = seen.getValue(pid)
                 assertTrue("PID $pid starved at $commandMillis ms", attempts.size >= 3)
                 assertTrue("PID $pid unfairly delayed", attempts.zipWithNext().all { (a, b) -> b - a <= 24 })
@@ -79,7 +83,7 @@ class LivePollSchedulerTest {
         var clock = 0L
         val scheduler = LivePollScheduler { clock }
         repeat(4) { scheduler.observeCommand(610L) }
-        scheduler.observePrimaryTail(800L)
+        scheduler.observeTail(800L)
         val cycle = scheduler.beginCycle(0, ObdPollPlan.requestedPids(0, supported), 0L)
         repeat(3) { assertTrue(cycle.next() is LivePollStep.QueryPid) }
         assertEquals(LivePollStep.ReadVoltage, cycle.next())
@@ -117,13 +121,16 @@ class LivePollSchedulerTest {
                     }
                 }
                 clock += tailMillis
-                scheduler.observePrimaryTail(tailMillis)
+                scheduler.observeTail(tailMillis)
                 assertTrue("slow row tail overran at $index", clock - started <= 5_000L)
                 assertTrue(commands <= if (tailMillis == 1_500L) 5 else 6)
                 clock = started + 5_000L
             }
             val optional = (0L..11L).flatMap { ObdPollPlan.requestedPids(it, supported) }.toSet() - critical.toSet()
-            assertTrue(optional.all { (attempts[it] ?: 0) >= 3 })
+            val admitted = if (tailMillis == 1_500L) optional - setOf(0x05, 0x0F, 0x21) else optional
+            assertTrue(admitted.all { (attempts[it] ?: 0) >= 3 })
+            assertEquals(40, attempts[0x10])
+            if (tailMillis == 1_500L) assertTrue((optional - admitted).all { (attempts[it] ?: 0) == 0 })
         }
     }
 
@@ -132,7 +139,7 @@ class LivePollSchedulerTest {
         val clock = 2_440L
         val scheduler = LivePollScheduler { clock }
         scheduler.observeCommand(10_000L)
-        scheduler.observePrimaryTail(10_000L)
+        scheduler.observeTail(10_000L)
         fun firstOptional(): LivePollStep {
             val cycle = scheduler.beginCycle(0, ObdPollPlan.requestedPids(0, supported), 0)
             repeat(4) { cycle.next() }
@@ -142,7 +149,7 @@ class LivePollSchedulerTest {
         repeat(16) { scheduler.observeCommand(610L) }
         assertTrue(scheduler.requiredCommandMillis() < 1_000L)
         assertTrue(firstOptional() is LivePollStep.Deferred) // slow row reserve still protects persistence
-        repeat(16) { scheduler.observePrimaryTail(150L) }
+        repeat(16) { scheduler.observeTail(150L) }
         assertTrue(firstOptional() is LivePollStep.QueryPid)
     }
 
@@ -177,7 +184,7 @@ class LivePollSchedulerTest {
     }
 
     @Test
-    fun sparseScanStillFinishesAndItsSlowReservedCyclesRemainHonestOverruns() {
+    fun reservedDiagnosticsFitTheWholeCycleAndKeepEveryDueMafOpportunity() {
         var clock = 0L
         val live = LivePollScheduler { clock }
         val sparse = SparseDiagnosticScheduler()
@@ -186,45 +193,61 @@ class LivePollSchedulerTest {
         val scan = listOf("readiness", "confirmed_dtcs", "pending_dtcs", "permanent_dtcs", "dtc_scan_complete")
         scan.forEach(queue::add)
         val completed = mutableListOf<String>()
+        val mafCycles = mutableListOf<Long>()
         val scanCycles = mutableListOf<Long>()
-        var overruns = 0
-        repeat(60) { index ->
+        repeat(100) { index ->
             val sequence = index.toLong()
             val started = clock
             val reserved = sparse.reserveCycle(sequence, !queue.isEmpty)
-            val cycle = live.beginCycle(sequence, ObdPollPlan.requestedPids(sequence, supported, reserved), started)
-            var attempts = 0
+            val due = ObdPollPlan.requestedPids(sequence, supported, reserved)
+            val cycle = live.beginCycle(sequence, due, started)
             while (true) {
                 when (val step = cycle.next()) {
                     LivePollStep.Complete -> break
-                    LivePollStep.ReadVoltage -> { clock += 610L; live.observeCommand(610L) }
+                    LivePollStep.ReadVoltage -> { clock += 650L; live.observeCommand(650L); budget.observeCommand(650L) }
                     is LivePollStep.QueryPid -> {
-                        attempts += 1
                         cycle.attempted(step.pid)
-                        clock += 610L
-                        live.observeCommand(610L)
+                        if (step.pid == 0x10) mafCycles += sequence
+                        clock += 650L
+                        live.observeCommand(650L)
+                        budget.observeCommand(650L)
                     }
                     is LivePollStep.Deferred -> Unit
                     is LivePollStep.Interrupted -> error("unexpected interruption")
                 }
             }
-            clock += 150L // the primary row is already persisted before diagnostics
-            live.observePrimaryTail(150L)
-            if (ObdPollPlan.mayRunSparseDiagnostic(clock - started, budget.requiredBudgetMillis(), reserved)) {
+            clock += 150L // already-spent parsing and durable primary-row work
+            if (ObdPollPlan.mayRunSparseDiagnostic(clock - started, budget.requiredBudgetMillis(),
+                    live.remainingTailMillis(150L))) {
                 queue.take(sequence)?.let {
                     completed += it
                     scanCycles += sequence
                     sparse.observeAttempt(sequence)
-                    assertEquals(3, attempts)
-                    clock += 6_000L
+                    assertTrue(sequence % 3 != 1L) // MAF wins this slot when both cannot fit.
+                    clock += 650L
+                    budget.observeCommand(650L)
                 }
             }
-            if (clock - started > 5_000L) overruns += 1
-            clock = maxOf(clock, started + 5_000L)
+            clock += 100L // status/handoff/timing writes still have their reserve
+            live.observeTail(250L)
+            assertTrue("reserved work overran at $sequence", clock - started <= 5_000L)
+            clock = started + 5_000L
         }
         assertEquals(scan, completed)
-        assertEquals(listOf(3L, 16L, 29L, 42L, 55L), scanCycles)
-        assertEquals(scan.size, overruns)
+        assertEquals(listOf(3L, 29L, 42L, 68L, 81L), scanCycles)
+        assertEquals((0L..99L).filter { it % 3 == 1L }, mafCycles)
+    }
+
+    @Test
+    fun tailBudgetCountsOnlyOutstandingWorkAndKeepsAPostSampleFloor() {
+        val live = LivePollScheduler { 0L }
+        assertEquals(1_350L, live.remainingTailMillis(150L)) // unknown initial aggregate is conservative
+        live.observeTail(850L)
+        assertEquals(750L, live.remainingTailMillis(200L)) // full learned aggregate plus100, less actual spent
+        assertEquals(100L, live.remainingTailMillis(2_000L)) // no fabricated zero-cost completion
+        assertEquals(950L, live.remainingTailMillis(-100L))
+        assertTrue(ObdPollPlan.mayRunSparseDiagnostic(2_750, 1_550, live.remainingTailMillis(250L)))
+        assertFalse(ObdPollPlan.mayRunSparseDiagnostic(2_751, 1_550, live.remainingTailMillis(250L)))
     }
 
     @Test

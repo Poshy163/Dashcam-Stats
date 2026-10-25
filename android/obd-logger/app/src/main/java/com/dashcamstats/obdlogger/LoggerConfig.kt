@@ -81,6 +81,7 @@ object LoggerPreferences {
             }
         }
         val savedUrl = prefs.getString("webhook_url", LoggerConfig.DEFAULT_WEBHOOK_URL)?.trim().orEmpty()
+        val trial = pollTrialSnapshot(context)
         return LoggerConfig(
             enabled = prefs.getBoolean("enabled", false),
             ownershipTransferred = prefs.getBoolean("ownership_transferred", false),
@@ -92,9 +93,8 @@ object LoggerPreferences {
             offGraceSeconds = prefs.getLong("off_grace_seconds", 30),
             parkedIntervalSeconds = prefs.getLong("parked_interval_seconds", 30),
             voltageOnlyMode = prefs.getBoolean("voltage_only_mode", false),
-            pollTrialEnabled = prefs.getBoolean("poll_trial_enabled", false),
-            pollTrialFallbackReason = prefs.getString("poll_trial_fallback_reason", null)
-                ?.takeIf { it in PollTrialPlan.fallbackReasons },
+            pollTrialEnabled = trial.enabled,
+            pollTrialFallbackReason = trial.fallbackReason,
             webhookEnabled = prefs.getBoolean("webhook_enabled", true),
             webhookUrl = if (savedUrl.isBlank()) LoggerConfig.DEFAULT_WEBHOOK_URL else savedUrl,
             webhookApiKey = savedCredential.value,
@@ -143,10 +143,10 @@ object LoggerPreferences {
 
     fun setPollTrial(context: Context, enabled: Boolean, reason: String? = null) {
         require(reason == null || reason in PollTrialPlan.fallbackReasons)
-        val prefs = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
-        commitPreferenceUpdate(prefs, prefs.edit().putBoolean("poll_trial_enabled", enabled)
-            .putString("poll_trial_fallback_reason", if (enabled) null else reason))
+        TrialSettings.repository(context).change(enabled, reason)
     }
+
+    internal fun pollTrialSnapshot(context: Context): TrialSettingsSnapshot = TrialSettings.repository(context).snapshot()
 
     fun disable(context: Context) {
         synchronized(preferenceWriteLock) {

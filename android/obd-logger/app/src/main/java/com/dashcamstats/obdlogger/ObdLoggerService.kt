@@ -58,6 +58,7 @@ class ObdLoggerService : Service() {
     private var collaboratorsInitialized = false
     private val statusWriteGate = StatusWriteGate()
     private var sleepWindowController: AdaptiveSleepWindowController? = null
+    @Volatile private var bootDiagnostics: BootDiagnostics? = null
     private lateinit var eventJournal: AppEventJournal
     private lateinit var eventEmitter: AppEventEmitter
     private val eventProjectionRetryQueued = AtomicBoolean(false)
@@ -156,6 +157,16 @@ class ObdLoggerService : Service() {
                         observation = ::recordSleepWindowObservation,
                     ).also { it.start() }
                 }.getOrNull()
+                // Advisory startup history is independent of the native OFF tracker.
+                // Do not put exit-history or private-file IO ahead of foreground or sleep recovery.
+                scope.launch {
+                    runCatching {
+                        BootDiagnostics(applicationContext).also {
+                            bootDiagnostics = it
+                            it.observeServiceStart()
+                        }
+                    }
+                }
             }
         }
     }
@@ -1123,7 +1134,6 @@ class ObdLoggerService : Service() {
                     ),
                 ) }
                 if (samplePersisted) pollTiming.rowPersisted(rowAges)
-                liveScheduler.observePrimaryTail(boundedElapsedMillis(primaryTailStarted))
                 // A cycle where every requested PID went unanswered is the bus being silent,
                 // not a slow sample. One such cycle is ordinary -- a single dropped frame, a
                 // reconnect -- so recovery waits for a run of them.
@@ -1138,14 +1148,15 @@ class ObdLoggerService : Service() {
                 }
                 quiesceRequest()?.let { return RecordingExit.Quiesce(it) }
                 val liveCycleElapsed = SystemClock.elapsedRealtime() - cycleStarted
-                // Persist the primary sample before any diagnostic work. Normal cycles need their
-                // learned spare budget; a rare reservation has already omitted the rotating PIDs.
-                // One bounded step can then progress even if its conservative reserve exceeds the
-                // five-second target. The primary work must still finish within that target.
+                // A reservation frees optional live work without displacing due MAF. The fault
+                // command and the still-outstanding full tail must fit the same five-second cycle;
+                // already measured parse/persist work is not charged twice.
                 val diagnosticBudgetMillis = sparseDiagnosticBudget.requiredBudgetMillis()
+                var diagnosticMillis = 0L
                 val diagnosticAllowed = samplePersisted && busSilentCycles == 0 &&
                     ObdPollPlan.mayRunSparseDiagnostic(
-                        liveCycleElapsed, diagnosticBudgetMillis, diagnosticReserved,
+                        liveCycleElapsed, diagnosticBudgetMillis,
+                        liveScheduler.remainingTailMillis(boundedElapsedMillis(primaryTailStarted)),
                     )
                 if (diagnosticAllowed) {
                     val diagnosticStarted = SystemClock.elapsedRealtime()
@@ -1155,9 +1166,8 @@ class ObdLoggerService : Service() {
                         }
                     } finally {
                         pollTiming.observeStage(PollCycleStage.DIAGNOSTICS, diagnosticStarted)
-                        sparseDiagnosticBudget.observeCommand(
-                            boundedElapsedMillis(diagnosticStarted),
-                        )
+                        diagnosticMillis = boundedElapsedMillis(diagnosticStarted)
+                        sparseDiagnosticBudget.observeCommand(diagnosticMillis)
                     }
                 }
                 quiesceRequest()?.let { return RecordingExit.Quiesce(it) }
@@ -1195,6 +1205,7 @@ class ObdLoggerService : Service() {
                 pollTiming.measureStage(PollCycleStage.STATUS_PUBLISH) { publish("ecu_online", config) }
                 pollTiming.finishCycle(completed = samplePersisted)
                 emitPollTiming(driveId, pollTiming, "periodic", driveClock)
+                liveScheduler.observeTail((boundedElapsedMillis(primaryTailStarted) - diagnosticMillis).coerceAtLeast(0))
                 awaitLivePollDeadline(
                     cycleStartedMillis = cycleStarted,
                     monotonicMillis = SystemClock::elapsedRealtime,
@@ -2102,6 +2113,8 @@ class ObdLoggerService : Service() {
             ownershipEnabled = config.ownershipTransferred,
             currentDriveId = currentDriveId,
             pollPlanVersion = currentPollPlanVersion,
+            trialSettings = LoggerPreferences.pollTrialSnapshot(this).json(),
+            restartEvidence = bootDiagnostics?.snapshot(),
             lastDriveId = lastDriveId,
             lastDriveFinishedAtUtc = lastDriveFinished,
             ingestionRequestId = ingestionRequestId,

@@ -572,9 +572,13 @@ object ObdPollPlan {
         diagnosticReserved: Boolean = false,
     ): List<Int> = buildList {
         addAll(fast)
-        // A rare diagnostic reservation replaces the rotating work; it never replaces
-        // speed/RPM/load or adds another full live cycle's worth of ECU commands.
-        if (diagnosticReserved) return@buildList
+        // A diagnostic reservation can replace other rotating work, but not a due MAF
+        // opportunity: dropping that rotation produced artificial ~30s fuel gaps.
+        // MAF still has to fit the ordinary live scheduler's command + tail reserve.
+        if (diagnosticReserved) {
+            if (sequence % 3 == 1L) add(0x10)
+            return@buildList
+        }
         // Preserve the 3-cycle cadence for every non-critical live PID without letting one
         // cycle issue the whole schedule. The slow PIDs retain their 12-cycle cadence and use
         // separated phases.
@@ -603,23 +607,20 @@ object ObdPollPlan {
     }
 
     /**
-     * Optional diagnostic work may only consume the command budget learned from this live ELM
-     * session. Reserved cycles have already omitted the rotating PIDs. They may spend one
-     * bounded command after the primary sample, even when the conservative reserve would
-     * exceed the five-second target, but never after the primary work itself overruns.
+     * A reservation frees optional live work, not extra time. A diagnostic may run only
+     * when its measured command reserve and outstanding post-sample tail fit the same
+     * five-second target. The caller subtracts only tail work already measured this cycle.
      */
     fun mayRunSparseDiagnostic(
         liveCycleElapsedMillis: Long,
         requiredCommandBudgetMillis: Long,
-        diagnosticReserved: Boolean = false,
+        remainingTailBudgetMillis: Long,
     ): Boolean =
-        if (diagnosticReserved) {
-            liveCycleElapsedMillis in 0..TARGET_CYCLE_MILLIS &&
-                requiredCommandBudgetMillis in 1..SparseDiagnosticScheduler.MAXIMUM_COMMAND_BUDGET_MILLIS
-        } else {
+        liveCycleElapsedMillis in 0..TARGET_CYCLE_MILLIS &&
             requiredCommandBudgetMillis in 1..TARGET_CYCLE_MILLIS &&
-                liveCycleElapsedMillis in 0..(TARGET_CYCLE_MILLIS - requiredCommandBudgetMillis)
-        }
+            remainingTailBudgetMillis in 100..TARGET_CYCLE_MILLIS &&
+            requiredCommandBudgetMillis <= TARGET_CYCLE_MILLIS - liveCycleElapsedMillis &&
+            remainingTailBudgetMillis <= TARGET_CYCLE_MILLIS - liveCycleElapsedMillis - requiredCommandBudgetMillis
 }
 
 /**
@@ -654,18 +655,18 @@ internal class SparseDiagnosticScheduler {
 
 /**
  * Conservative, connection-local budget for one optional ELM command. Live and diagnostic
- * command timings feed the same high-water mark. A two-times multiplier plus a fixed margin
+ * command timings feed the same bounded high-water window. A two-times multiplier plus a fixed margin
  * accounts for larger multi-frame diagnostic replies without cancelling an in-flight command.
- * A slow command keeps opportunistic work deferred; the scheduler separately reserves a
- * bounded slot so that this conservative high-water mark cannot suppress all fault reads.
+ * A slow command keeps optional work deferred until sixteen genuine observations replace
+ * it. A reserved slot never bypasses that budget or the live-cycle target.
  */
 internal class SparseDiagnosticBudgetTracker(
-    private val minimumBudgetMillis: Long = 2_000L,
+    private val minimumBudgetMillis: Long = 1_500L,
     private val maximumBudgetMillis: Long = 6_000L,
     private val multiplier: Long = 2L,
     private val marginMillis: Long = 250L,
 ) {
-    private var observedWorstMillis = 0L
+    private val recentCommands = ArrayDeque<Long>()
 
     init {
         require(minimumBudgetMillis >= 1)
@@ -675,16 +676,19 @@ internal class SparseDiagnosticBudgetTracker(
     }
 
     fun observeCommand(durationMillis: Long) {
-        observedWorstMillis = maxOf(observedWorstMillis, durationMillis.coerceAtLeast(1L))
+        if (recentCommands.size == HISTORY_SIZE) recentCommands.removeFirst()
+        recentCommands.addLast(durationMillis.coerceAtLeast(1L))
     }
 
     fun requiredBudgetMillis(): Long {
-        if (observedWorstMillis == 0L) return maximumBudgetMillis
-        val scaled = if (observedWorstMillis > (Long.MAX_VALUE - marginMillis) / multiplier) {
+        val worst = recentCommands.maxOrNull() ?: return maximumBudgetMillis
+        val scaled = if (worst > (Long.MAX_VALUE - marginMillis) / multiplier) {
             Long.MAX_VALUE
         } else {
-            observedWorstMillis * multiplier + marginMillis
+            worst * multiplier + marginMillis
         }
         return scaled.coerceIn(minimumBudgetMillis, maximumBudgetMillis)
     }
+
+    companion object { private const val HISTORY_SIZE = 16 }
 }

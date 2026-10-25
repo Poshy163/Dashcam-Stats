@@ -399,20 +399,20 @@ class EngineGateTest {
     fun exhaustedLiveCycleBudgetDefersSparseDiagnosticWithoutDequeuingIt() {
         val budget = SparseDiagnosticBudgetTracker()
         assertEquals(6_000L, budget.requiredBudgetMillis())
-        assertFalse(ObdPollPlan.mayRunSparseDiagnostic(0, budget.requiredBudgetMillis()))
+        assertFalse(ObdPollPlan.mayRunSparseDiagnostic(0, budget.requiredBudgetMillis(), 100))
 
         budget.observeCommand(700)
-        assertEquals(2_000L, budget.requiredBudgetMillis())
-        assertTrue(ObdPollPlan.mayRunSparseDiagnostic(3_000, budget.requiredBudgetMillis()))
-        assertFalse(ObdPollPlan.mayRunSparseDiagnostic(3_001, budget.requiredBudgetMillis()))
+        assertEquals(1_650L, budget.requiredBudgetMillis())
+        assertTrue(ObdPollPlan.mayRunSparseDiagnostic(3_250, budget.requiredBudgetMillis(), 100))
+        assertFalse(ObdPollPlan.mayRunSparseDiagnostic(3_251, budget.requiredBudgetMillis(), 100))
 
         budget.observeCommand(2_900)
         assertEquals(6_000L, budget.requiredBudgetMillis())
-        assertFalse(ObdPollPlan.mayRunSparseDiagnostic(0, budget.requiredBudgetMillis()))
+        assertFalse(ObdPollPlan.mayRunSparseDiagnostic(0, budget.requiredBudgetMillis(), 100))
 
         val queue = OneStepPerCycleQueue<String>()
         queue.add("readiness")
-        if (ObdPollPlan.mayRunSparseDiagnostic(0, budget.requiredBudgetMillis())) queue.take(0)
+        if (ObdPollPlan.mayRunSparseDiagnostic(0, budget.requiredBudgetMillis(), 100)) queue.take(0)
         assertEquals("readiness", queue.take(1))
     }
 

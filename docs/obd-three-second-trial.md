@@ -92,7 +92,7 @@ schedule and are shown as unavailable; the older plans retain those counts.
 ## Deployment and physical acceptance
 
 1. Deploy the matching server and verify its revision and health.
-2. Install the production-signed 0.3.18 update in place, retaining configuration and
+2. Install the production-signed 0.3.19 update in place, retaining configuration and
    storage permissions. Verify the pinned signing certificate before installation.
 3. Explicitly enable the trial, then use a normal drive. No accessory-power hold
    is needed for a driving test.
@@ -217,3 +217,41 @@ transport safeguards remain. The package does not automatically re-arm the stick
 fallback. New tests cover bounded jitter, true sustained overload, diagnostic
 deferral fairness and the handoff cache; physical acceptance requires installation
 and a newly armed drive.
+
+## 25 October review and 0.3.19 follow-up
+
+Four 0.3.18 trial recordings retained 450 rows with speed/RPM medians of 3.00-3.01
+seconds. Of 427 operating rows, all had speed/RPM and 422 had MAF. Five malformed MAF
+replies all recovered on the next scheduled row. The later three recordings used
+baseline plan 7. Same-process read-only inspection found the trial preference OFF and
+no saved fallback reason. Automatic disable paths always supply a named reason, while
+the old checkbox/API path could store OFF without one. Missing historic change evidence
+prevents attributing this to an automatic fallback, a reboot or an operator action.
+
+0.3.19 gives trial state its own checksummed atomic private record, a bounded eight-change
+audit and an explicit Apply action guarded by the last rendered revision. A stale form
+cannot re-arm a newer fallback. A one-time conservative migration preserves the current
+choice; unavailable or corrupted state reports a problem rather than silently presenting
+ordinary OFF or recovering an old armed preference. Named fallback persistence uses an
+independent safety barrier. Warm status/poll reads are cached; general settings saves
+cannot rewrite trial intent. An existing OFF choice still needs explicit re-arming after
+installation. The dashboard exposes last reported intent separately from the immutable
+active poll plan, with original change time unknown where it was never captured.
+
+Baseline plan 7's latest drive had eight roughly thirty-second valid-MAF gaps: seven
+fault reservations omitted the rotating MAF opportunity and one reply was malformed.
+0.3.19 retains due MAF on reserved cycles and puts it first among budget-checked optional
+live requests after fast PIDs and voltage. Optional diagnostics must fit the command
+reserve plus the remaining full tail within five seconds. Their multi-frame duration
+history is separate from the single-frame live reserve and ages out after sixteen genuine
+observations. A bus that cannot fit the work defers diagnostics or other auxiliary readings;
+the target is not a guarantee of complete auxiliary coverage. No extra retry, catch-up
+burst, stale-value fill or versioned calculation change is introduced. Captured-sequence
+tests retain all 86 nominal MAF opportunities and keep the one malformed reply missing.
+
+Two restart boundaries (74.140 seconds with moving observations and 77.585 seconds with
+stationary observations) and boot count 25 to 27 establish interruptions, not their cause.
+The accessible reason was generic `reboot`; crash and pstore evidence was empty. The new
+startup journal distinguishes future app restarts, updates and kernel boots, records bounded
+firmware/own-app exit categories, and keeps generic reboot cause unknown. It is diagnostic
+only and cannot establish ignition, extend a timer or authorize backup.

@@ -8,19 +8,76 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.17** (`versionCode` 30), installed in place on 23 October 2026 |
-| Source | `990e7f323f78943507d4b47e2ce88bf5fe6666a6` (`android/obd-logger/`), verified in the running companion and installed APK |
+| Version | **0.3.18** (`versionCode` 31), installed in place on 24 October 2026 |
+| Source | `13ce90916009633d9bab67eff7446716749efb92` (`android/obd-logger/`), verified in the running companion and installed APK |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | The latest 24 October drive used plan 8, then selected baseline after three small work-budget overruns near shutdown. The fallback remains selected until explicitly re-armed; parked operation reports plan 7. |
-| Deployment | Installed APK bytes, production signer and fresh 0.3.17 status verified. Identity, grants, ownership and quiet filtering were retained. A genuine new OFF edge on 24 October cleared the old cancellation gate and normal backup completed; its original timing bounds stayed fixed through subsequent chunks. Actual quiet exclusions and restart continuity across a deliberately tested process restart remain unverified. |
+| Poll plan | Four post-update recordings sustained plan 8; the latest three used baseline plan 7. Read-only same-process inspection on 25 October found the trial option OFF with no fallback reason. Its historical change has no audit and cannot be attributed to overload, a reboot or an operator. |
+| Deployment | APK hash and production signer verified; UID, runtime grants, one read-only card grant, ownership, webhook, filtering and 20 immutable exports preserved. The original OFF bounds and private checkpoint survived the actual update. Both camera streams continued recording. Actual quiet exclusions and the causes of two later native reboots remain unverified. |
 
-## 0.3.18 candidate: polling, cooling retries and backup accounting
+## 0.3.19 candidate: durable trial intent, MAF priority and startup evidence
+
+Source version **0.3.19/code 32** addresses the 25 October review. It has not been
+installed or physically driven.
+
+- Trial intent has a separate, versioned, checksummed, atomically replaced record
+  in app-private no-backup storage. One conservative migration retains the existing
+  choice and any named fallback; a migrated missing/corrupt record cannot import an
+  old armed preference. Unavailable storage is reported explicitly. A bounded
+  eight-change audit records source, revision and known change time. Warm polling
+  reads use the validated in-process snapshot without repeated file IO or writes.
+  The checkbox stages a choice; explicit Apply performs a revision-checked update,
+  so an old form cannot clear a newer fallback. A committed named health fallback
+  remains sticky across restarts. A separate fallback barrier protects an old armed
+  primary record when its replacement write fails. Failure of all independent
+  storage writes cannot durably record new intent through power loss; the current
+  process reports the failure and retains its existing connection safety latch.
+- Baseline plan 7 retains its nominal fifteen-second MAF opportunities during fault
+  diagnostic reservations. Due MAF is the first budget-checked optional request
+  after speed/RPM/load and ATRV. Diagnostics must fit their measured command budget
+  and the remaining full post-primary tail within five seconds. Diagnostic replies
+  have a separate budget so a long multi-frame reply cannot starve single-frame MAF.
+  Outlier reservations age out after sixteen genuine observations. On a persistently
+  slow adapter, other auxiliary work and optional fault scans can be deferred.
+  Missing replies stay missing; no extra retries, copied-forward values, catch-up
+  burst, poll-plan version change or calculation change is introduced.
+- A separate bounded startup journal distinguishes app process restart, package
+  update and a newly observed kernel boot. It records at most eight sanitized
+  observations, firmware reason categories and temporally correlated own-app exit
+  categories where Android supports them. Its cached public snapshot exposes no
+  additional boot UUID, process token, raw property, stack trace or exception text.
+  Generic `reboot` remains an unknown physical cause. The asynchronous observer runs
+  after foreground admission independently of native sleep recovery; it grants no
+  ignition edge, wake lease or countdown authority.
+- The server independently validates optional `trial_settings` and
+  `restart_evidence` objects. Invalid advisory objects are omitted while ordinary
+  status and backup remain usable. The dashboard shows the last reported trial
+  state, bounded change history and startup observations, keeping saved intent,
+  active poll plan, app exit and device reboot distinct. Older companions explicitly
+  show that these diagnostics were not reported.
+
+The historical OFF/no-reason state cannot be reconstructed. Installing this candidate
+retains that current baseline choice until an operator explicitly re-arms the trial.
+Thermal limits, locked/activity/uncertain upload protection, read-only card access and
+native sleep admission remain unchanged. New persistence, MAF and startup behavior
+requires physical acceptance after installation; the old reboot cause remains unknown.
+
+Local validation passed: **3,704 backend tests** (77 platform/optional skips),
+**406 Android tests** and **245 frontend tests**, plus Python formatting/lint,
+frontend type checking/lint/production build, workflow lint, both APK builds and
+Android debug/release lint. Android lint reports zero errors and 61 warnings per
+variant; the three additional warnings cover guarded optional property reflection
+and two dynamic UI strings. The actual Kotlin public-status fixture passed both
+server validators unchanged. The bounded diagnostics panel was also reviewed in
+a synthetic browser preview. Independent reviews approved persistence, scheduling
+and diagnostic boundaries. These checks do not establish physical-device behavior.
+
+## 0.3.18 installed: physical review on 25 October
 
 Source version **0.3.18/code 31** addresses the 24 October drive review. It is a
-release candidate; it has not been installed or physically driven, and does not
-automatically re-arm a previously disabled trial.
+verified installed release. Its three-second trial was explicitly re-armed after
+installation; the package does not automatically re-arm a previously disabled trial.
 
 - Plan 8 still targets 3,000 ms and reports every raw target miss. Its separate
   health budget permits 500 ms of scheduling/storage margin; three consecutive
@@ -78,6 +135,40 @@ chunks also completed with Bluetooth, hotspot and logger restored. Quiet exclusi
 remained zero because the camera was hot. Tests establish the conservative late-proof
 and scanner contracts; an actual quiet exclusion retained on the card and omitted
 from downstream processing still needs physical acceptance in a safe cool window.
+
+The following seven recordings contained 821 contiguous samples with no sequence
+holes or duplicate IDs. Bundle/member hashes and 14,778 mapped server-series values
+matched; independent replay agreed with producer/server distance, estimated fuel and
+idle time. The four trial segments supplied 450 rows, including 427 operating rows:
+speed/RPM were present in all 427, MAF in 422. All five malformed MAF replies recovered
+on the next row, with 6.000-6.060-second valid-reading gaps. Median speed/RPM cadence
+was 3.00-3.01 seconds. Four raw target misses were recorded, including one isolated
+4.185-second cycle; recovered segments lacked final timing flushes, so their tails
+are incomplete evidence.
+
+The latest 14:05 Adelaide drive instead used plan 7: 259 rows, 15.032736667 km and
+estimated 1.314614043 L. Its eight roughly thirty-second MAF gaps comprised seven
+optional diagnostic reservations and one malformed reply. Fuel integration covered
+about 91.3% of the observed row span; matching arithmetic is not complete or calibrated
+fuel measurement. A 74.140-second restart boundary had moving observations on both
+sides on 24 October; a 77.585-second morning boundary had stationary observations.
+Boot count rose from 25 at installation to 27. The retained reason was generic
+`reboot`, with empty accessible crash/pstore evidence, so power, thermal, firmware and
+app causes cannot be established retrospectively.
+
+Quiet exclusions remained zero. At 86.875 C the CPU was below the admission ceiling,
+but Android CRITICAL independently refused decoding. BatteryService reported no
+physical battery; the thermal HAL's 65 C battery category is not a verified battery
+temperature. Three earlier activity results retained ordinary upload. The processing
+queue continued with four running jobs and zero failures.
+
+Backup remained enabled throughout the review and implementation. Runs 630-633
+completed 140 files / 7,493,446,744 bytes. Run 634 copied another four files /
+245,305,972 bytes and reported zero backlog, then its history was marked partial after
+cleanup acknowledgement was interrupted near the native window's end. The later
+radio snapshot reported restoration verified and no recovery required. The camera
+went offline; no operator pause, cancellation, wake hold or forced sleep was applied
+during this review.
 
 ## 0.3.17 installed and durable sleep timing
 
@@ -760,7 +851,7 @@ First integrate/review the release source in the protected signing checkout, or 
 protected build host to use the existing signing files. The original checkout may still contain
 older source and unrelated local changes: do not blindly pull, switch branches or overwrite it.
 Fresh worktrees do not contain the signing files. From the chosen source checkout, after verifying
-`app/build.gradle.kts` declares version 0.3.18/code 31:
+`app/build.gradle.kts` declares version 0.3.19/code 32:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
@@ -788,7 +879,7 @@ other settings, the metrics toggle works, and `Bundles waiting for the server` d
 next Wi-Fi window. Verify webhook events reach the server and boot recovery still works.
 
 After ingestion obtains a fresh status snapshot, `GET /api/obd/status` should report
-`app_version_name: "0.3.18"` and `app_version_code: 31` under `logger`. A cached status alone does
+`app_version_name: "0.3.19"` and `app_version_code: 32` under `logger`. A cached status alone does
 not establish the currently installed/running version.
 
 ## What is still left to do

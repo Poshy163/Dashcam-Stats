@@ -377,12 +377,50 @@ export interface IngestRun {
   error: string | null
 }
 
+export interface OBDTrialChange {
+  revision: number
+  enabled: boolean
+  fallbackReason: string | null
+  source: 'legacy_migration' | 'operator' | 'health' | 'unknown'
+  changedAtUtc: string | null
+}
+
+export interface OBDTrialSettings extends OBDTrialChange {
+  schemaVersion: number
+  storageState: 'ready' | 'unavailable'
+  error: string | null
+  legacyKeyPresent: boolean
+  recentChanges: OBDTrialChange[]
+}
+
+export interface OBDRestartObservation {
+  transition: string
+  observedAtUtc: string | null
+  bootCount: number | null
+  bootCountDelta: number | null
+  bootReason: string
+  bootReasonSource: string
+  causeConfidence: 'reported' | 'unknown'
+  previousProcessExit: string | null
+  previousProcessExitAtUtc?: string | null
+  appVersionCode?: number
+  buildGitSha?: string
+}
+
+export interface OBDRestartEvidence extends OBDRestartObservation {
+  schemaVersion: number
+  storageState: 'pending' | 'ready' | 'invalid' | 'read_failed' | 'write_failed' | 'probe_unavailable'
+  history: OBDRestartObservation[]
+}
+
 export interface OBDLoggerStatus {
   schemaVersion?: number
   loggerVersion?: string
   appVersionName?: string
   appVersionCode?: number
   pollPlanVersion?: number
+  trialSettings?: OBDTrialSettings | null
+  restartEvidence?: OBDRestartEvidence | null
   buildGitSha?: string
   capabilities?: string[]
   state?: string

@@ -3,6 +3,7 @@ import { cn } from '@/lib/cn'
 import { formatDateTime, formatRelative } from '@/lib/format'
 import { loggerEvidenceFreshness, loggerTimestampMillis } from '@/lib/obdLoggerPresentation'
 import type { OBDLoggerStatus } from '@/lib/api'
+import { CompanionDiagnostics } from '@/components/CompanionDiagnostics'
 
 type Tone = 'default' | 'ok' | 'warn' | 'error' | 'busy'
 
@@ -233,8 +234,9 @@ export function ObdLoggerCard({
     return () => clearInterval(timer)
   }, [])
   const freshness = loggerEvidenceFreshness(logger?.updatedAtUtc, unitOnline, nowMs)
-  const versions = <VersionEvidence logger={logger} backendInfo={backendInfo}
+  const versions = <><VersionEvidence logger={logger} backendInfo={backendInfo}
     backendInfoLoading={backendInfoLoading} backendInfoError={backendInfoError} backendCheckedAt={backendCheckedAt} />
+    <CompanionDiagnostics logger={logger} /></>
   if (!logger) {
     return (
       <section className="card mb-6 px-5 py-4" aria-label="OBD logger state">

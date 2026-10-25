@@ -12,7 +12,9 @@ internal sealed interface LivePollStep {
 
 /**
  * Admission, not a faster bus or a longer target. Critical PIDs and ATRV precede optional work.
- * Each optional command must fit its measured pacing-inclusive reserve plus a persistence tail.
+ * Due MAF has first claim on the budget after critical PIDs and voltage; other optional
+ * work remains fair by last attempt. Every optional command must fit its measured
+ * pacing-inclusive reserve plus the full non-command tail.
  * Only this cycle's nominally due PIDs are eligible; a deferral never creates a catch-up burst.
  */
 internal class LivePollScheduler(private val monotonicMillis: () -> Long) {
@@ -24,7 +26,8 @@ internal class LivePollScheduler(private val monotonicMillis: () -> Long) {
     fun beginCycle(sequence: Long, requestedPids: List<Int>, startedAtMillis: Long): Cycle {
         val critical = requestedPids.filter { ObdPollPlan.tier(it) == "fast" }
         val optional = requestedPids.filter { ObdPollPlan.tier(it) != "fast" }
-            .sortedBy { lastAttempts[it] ?: Long.MIN_VALUE }
+            .sortedWith(compareBy<Int> { if (it == 0x10) 0 else 1 }
+                .thenBy { lastAttempts[it] ?: Long.MIN_VALUE })
         return Cycle(sequence, startedAtMillis, critical + listOf(null) + optional)
     }
 
@@ -35,15 +38,21 @@ internal class LivePollScheduler(private val monotonicMillis: () -> Long) {
     /** Whole request duration, including existing inter-command pacing and mutex waits. */
     fun observeCommand(durationMillis: Long) = retain(recentCommands, durationMillis)
 
-    fun observePrimaryTail(durationMillis: Long) = retain(recentTails, durationMillis)
+    /** Full non-command tail, including persistence, handoff, status and timing writes. */
+    fun observeTail(durationMillis: Long) = retain(recentTails, durationMillis)
 
     fun requiredCommandMillis(): Long = if (recentCommands.isEmpty()) INITIAL_COMMAND_MILLIS
         else conservativeReserve(recentCommands.max(), MINIMUM_COMMAND_MILLIS)
 
-    // Tail is already the observed aggregate of parsing/estimation and row persistence.
+    // Tail is already the observed aggregate of parsing/estimation, persistence and
+    // post-sample handoff/status/timing work; diagnostics are separately timed commands.
     // Avoid multiplying both independent reserves until a fitting optional request starves.
     private fun requiredTailMillis(): Long = if (recentTails.isEmpty()) INITIAL_TAIL_MILLIS
         else maxOf(MINIMUM_TAIL_MILLIS, recentTails.max() + 100L)
+
+    /** Do not reserve already-completed parsing/persistence twice when admitting diagnostics. */
+    fun remainingTailMillis(completedTailMillis: Long): Long =
+        (requiredTailMillis() - completedTailMillis.coerceAtLeast(0L)).coerceAtLeast(MINIMUM_POST_SAMPLE_MILLIS)
 
     private fun retain(window: ArrayDeque<Long>, durationMillis: Long) {
         if (window.size == HISTORY_SIZE) window.removeFirst()
@@ -92,6 +101,7 @@ internal class LivePollScheduler(private val monotonicMillis: () -> Long) {
         private const val INITIAL_TAIL_MILLIS = 1_500L
         private const val MINIMUM_COMMAND_MILLIS = 750L
         private const val MINIMUM_TAIL_MILLIS = 500L
+        private const val MINIMUM_POST_SAMPLE_MILLIS = 100L
         private const val MAXIMUM_OBSERVATION_MILLIS = 60_000L
     }
 }

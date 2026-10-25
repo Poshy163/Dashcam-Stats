@@ -28,6 +28,7 @@ from app.core.process_lock import ProcessFileLock, try_acquire
 from app.db.models import OBDBundle, OBDBundleState, utcnow
 from app.db.session import session_scope
 from app.ingest import adb, transport
+from app.ingest.logger_diagnostics import clean_restart_evidence, clean_trial_settings
 from app.ingest.models import DeltaPlan, RemoteFile, UnitInfo, ingest_setting
 from app.ingest.obd_bundle import (
     SAFE_DRIVE_ID,
@@ -201,6 +202,8 @@ _LOGGER_KEYS = frozenset(
         "app_version_name",
         "app_version_code",
         "poll_plan_version",
+        "trial_settings",
+        "restart_evidence",
         "build_git_sha",
         "state",
         "ownership_enabled",
@@ -454,6 +457,14 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
             metrics = _clean_logger_metrics(item)
             if metrics is not None:
                 clean[key] = metrics
+        elif key in {"trial_settings", "restart_evidence"}:
+            diagnostic = (
+                clean_trial_settings(item)
+                if key == "trial_settings"
+                else clean_restart_evidence(item)
+            )
+            if diagnostic is not None:
+                clean[key] = diagnostic
         elif key == "app_version_name":
             if isinstance(item, str) and _LOGGER_APP_VERSION_RE.fullmatch(item):
                 clean[key] = item

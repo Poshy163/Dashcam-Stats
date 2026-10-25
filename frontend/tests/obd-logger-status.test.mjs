@@ -41,6 +41,69 @@ function markup(props = {}) {
   } finally { Date.now = originalNow }
 }
 
+const trialSettings = (overrides = {}) => ({
+  schemaVersion: 1, enabled: true, fallbackReason: null, revision: 2,
+  source: 'operator', changedAtUtc: at(), storageState: 'ready', error: null,
+  legacyKeyPresent: true, recentChanges: [], ...overrides,
+})
+
+test('saved trial intent remains separate from the active or parked poll plan', () => {
+  const html = markup({ logger: logger({ pollPlanVersion: 7, trialSettings: trialSettings() }) })
+  assert.match(html, /Poll plan 7/)
+  assert.match(html, /Trial setting · last reported/)
+  assert.match(html, /Armed for the next drive/)
+  assert.match(html, /Explicit apply/)
+  assert.match(html, /The active drive keeps its recorded poll plan/)
+})
+
+test('named fallback, explicit baseline and imported unknown-time history stay distinct', () => {
+  const html = markup({ logger: logger({ trialSettings: trialSettings({
+    enabled: false, fallbackReason: 'critical_readings_missing', source: 'health',
+    recentChanges: [{ revision: 1, enabled: false, fallbackReason: null,
+      source: 'legacy_migration', changedAtUtc: null }],
+  }) }) })
+  assert.match(html, /Fallback: Critical readings missing/)
+  assert.match(html, /Automatic fallback/)
+  assert.match(html, /Imported existing setting/)
+  assert.match(html, /Original change time unavailable/)
+  const off = markup({ logger: logger({ trialSettings: trialSettings({ enabled: false }) }) })
+  assert.match(off, /Baseline selected/)
+  assert.doesNotMatch(off, /Automatic fallback/)
+})
+
+test('unavailable settings never masquerade as an operator disable or an armed trial', () => {
+  const html = markup({ logger: logger({ trialSettings: trialSettings({
+    storageState: 'unavailable', source: 'unknown', changedAtUtc: null, error: 'corrupt_record', enabled: false,
+  }) }) })
+  assert.match(html, /Setting unavailable; baseline protected/)
+  assert.match(html, /Source unavailable/)
+  assert.doesNotMatch(html, /Armed for the next drive|Explicit apply/)
+})
+
+test('generic firmware reboot remains an observation with unknown physical cause', () => {
+  const html = markup({ logger: logger({ restartEvidence: {
+    schemaVersion: 1, storageState: 'ready', transition: 'kernel_boot',
+    observedAtUtc: at(), bootCount: 27, bootCountDelta: 1, bootReason: 'reboot',
+    bootReasonSource: 'sys_boot_reason', causeConfidence: 'unknown',
+    previousProcessExit: 'not_recorded', history: [],
+  } }) })
+  assert.match(html, /New device boot observed/)
+  assert.match(html, /Physical cause unknown/)
+  assert.doesNotMatch(html, /thermal caused|verified cause|crash caused/i)
+})
+
+test('old companions and unrecognised category strings stay bounded and explicitly unavailable', () => {
+  assert.match(markup(), /Not reported by this companion/)
+  const html = markup({ logger: logger({
+    trialSettings: trialSettings({ source: 'constructor', fallbackReason: '<private-exception>' }),
+    restartEvidence: { storageState: 'ready', transition: 'constructor', observedAtUtc: 'private timestamp',
+      causeConfidence: 'unknown' },
+  }) })
+  assert.match(html, /Reason unavailable|Source unavailable/)
+  assert.match(html, /Startup continuity unavailable/)
+  assert.doesNotMatch(html, /private-exception|private timestamp|function Object/)
+})
+
 test('producer freshness handles stale, absent, invalid, timezone-less and future reports', () => {
   assert.equal(loggerEvidenceFreshness(at(-90_000), true, observedAt).current, true)
   assert.equal(loggerEvidenceFreshness(at(-90_001), true, observedAt).label, 'Logger status stale')
