@@ -75,7 +75,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -83,7 +83,7 @@ from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
 from app.db.models import UnitLogEntry, utcnow
 from app.db.retry import is_locked_error
-from app.db.session import session_scope
+from app.db.session import get_engine, session_scope
 from app.ingest import adb
 
 log = get_logger(__name__)
@@ -234,12 +234,12 @@ class ParsedLine:
         # so transport fields cannot be its identity.  Legacy lines deliberately retain
         # the normal full-line hash rather than guessing equivalence from their text.
         sample_id = None
-        if self.tag == "CarPlayTiming":
+        if self.tag in {"CarPlayTiming", "DashcamTemperature"}:
             match = re.search(r"(?:^|\s)sample=([A-Za-z0-9_-]{1,96})(?:\s|$)", self.message)
             if match:
                 sample_id = match.group(1)
         material = (
-            f"CarPlayTiming|{sample_id}"
+            f"{self.tag}|{sample_id}"
             if sample_id is not None
             else f"{self.occurred_at.isoformat()}|{self.pid}|{self.tid}|{self.tag}|{self.message}"
         )
@@ -464,7 +464,9 @@ async def _prune(session: AsyncSession) -> None:
         await session.execute(delete(UnitLogEntry).where(UnitLogEntry.id.in_(victims)))
 
 
-async def store(entries: list[ParsedLine]) -> tuple[int, int]:
+async def store(
+    entries: list[ParsedLine], *, busy_timeout_ms: int | None = None
+) -> tuple[int, int]:
     """Insert unseen lines or complete truncated sampler copies: (accepted, duplicate).
 
     Deduplication is left to the unique index rather than a read-then-write check: the
@@ -499,8 +501,9 @@ async def store(entries: list[ParsedLine]) -> tuple[int, int]:
         & (func.length(incoming) > func.length(UnitLogEntry.message))
         & (func.substr(incoming, 1, func.length(UnitLogEntry.message)) == UnitLogEntry.message),
     )
-    accepted = 0
-    async with session_scope() as session:
+
+    async def write_rows(session):
+        accepted = 0
         for offset in range(0, len(rows), STORE_BATCH_SIZE):
             # Core executemany binds one row at a time inside the driver, so a full
             # capture needs hundreds of awaited calls rather than tens of thousands.
@@ -509,6 +512,35 @@ async def store(entries: list[ParsedLine]) -> tuple[int, int]:
         # Commit retention and new rows together. A failed prune must not leave a
         # partially reported import or remove the previously committed generation.
         await _prune(session)
+        return accepted
+
+    if busy_timeout_ms is None:
+        async with session_scope() as session:
+            accepted = await write_rows(session)
+    else:
+        if type(busy_timeout_ms) is not int or not 0 <= busy_timeout_ms <= 1000:
+            raise ValueError("invalid optional diagnostic database timeout")
+        # Optional temperature refresh must not occupy a SQLite worker for the normal
+        # thirty-second busy wait. Timeout is connection-local and restored before reuse.
+        async with get_engine().connect() as connection:
+            previous_timeout = None
+            try:
+                if connection.dialect.name == "sqlite":
+                    previous_timeout = int(await connection.scalar(text("PRAGMA busy_timeout")))
+                    await connection.exec_driver_sql(f"PRAGMA busy_timeout={busy_timeout_ms}")
+                    await connection.exec_driver_sql("BEGIN IMMEDIATE")
+                accepted = await write_rows(connection)
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
+            finally:
+                if previous_timeout is not None:
+                    try:
+                        await connection.exec_driver_sql(f"PRAGMA busy_timeout={previous_timeout}")
+                    except BaseException:
+                        await connection.invalidate()
+                        raise
     return accepted, len(rows) - accepted
 
 

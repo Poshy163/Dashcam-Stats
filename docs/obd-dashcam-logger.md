@@ -24,6 +24,13 @@ the baseline poll plan. Deploy the matching server first. See
 [obd-three-second-trial.md](obd-three-second-trial.md) for activation, rollback and
 physical acceptance; it does not establish a live web telemetry stream.
 
+Companion 0.3.20 adds bounded on-device SoC temperature history owned by the enabled
+foreground service, including its normal boot/update recovery. Capture is independent
+of OBD quiescing and the server-deployed CarPlay sampler. It records only while the
+device naturally runs; it neither holds the camera awake nor extends a sleep window.
+See [dashcam-temperature-capture.md](dashcam-temperature-capture.md) for the storage
+contract, import path and capture-versus-import health evidence.
+
 ## Why it is an APK
 
 The verified unit is a locked, unrooted UIS7861 head unit running Android 14 (SDK 34). The

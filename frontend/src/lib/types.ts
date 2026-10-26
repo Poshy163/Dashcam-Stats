@@ -709,11 +709,25 @@ export interface CarPlayTimingOut {
 
 export type DashcamTemperatureQuality = 'valid' | 'unavailable' | 'invalid'
 
+/** Advisory capture health, separate from the time a saved reading reached the server. */
+export interface DashcamTemperatureCapture {
+  schemaVersion: 1
+  source: 'companion_temperature_v1'
+  sensor: 'soc-thmzone'
+  state: 'starting' | 'running' | 'sensor_unavailable' | 'storage_unavailable' | 'clock_unavailable'
+  lastCapturedAtUtc: string | null
+  lastCapturedElapsedMs: number | null
+  intervalMs: 30000
+  retainedReadings: number
+  error: 'sensor_unavailable' | 'journal_unavailable' | 'mirror_unavailable' | 'clock_unavailable' | null
+}
+
 export interface DashcamTemperatureObservation {
   occurredAt: string
   socC: number | null
   sessionId: string | null
   quality: DashcamTemperatureQuality
+  source?: 'companion_temperature_v1' | 'carplay_timing'
 }
 
 export interface DashcamTemperaturePoint extends DashcamTemperatureObservation {
@@ -722,9 +736,9 @@ export interface DashcamTemperaturePoint extends DashcamTemperatureObservation {
   kind: 'min' | 'max' | 'last'
 }
 
-/** Retained timing-capture observations; reading this history never probes the camera. */
+/** Retained camera observations; reading this history never probes or wakes the camera. */
 export interface DashcamTemperatureHistory {
-  source: 'retained_carplay_timing'
+  source: 'retained_carplay_timing' | 'retained_device_temperature'
   sensor: 'soc-thmzone'
   hours: number
   rangeStart: string
@@ -740,6 +754,9 @@ export interface DashcamTemperatureHistory {
   outputTruncated: boolean
   truncated: boolean
   points: DashcamTemperaturePoint[]
+  companionObservationCount?: number
+  legacyObservationCount?: number
+  collector?: (DashcamTemperatureCapture & { checkedAtUtc?: string | null }) | null
 }
 
 export type SettingType = 'bool' | 'int' | 'float' | 'string' | 'select' | 'path' | 'bytes'

@@ -25,6 +25,83 @@ TRIAL_ERRORS = frozenset(
 )
 
 
+def clean_temperature_capture(value: Any) -> dict[str, Any] | None:
+    """A bounded capture-health snapshot, never authority to keep the camera awake."""
+    try:
+        row = _object(
+            value,
+            {
+                "schema_version",
+                "source",
+                "sensor",
+                "state",
+                "last_captured_at_utc",
+                "last_captured_elapsed_ms",
+                "interval_ms",
+                "retained_readings",
+                "error",
+            },
+        )
+        if (
+            type(row["schema_version"]) is not int
+            or row["schema_version"] != 1
+            or row["source"] != "companion_temperature_v1"
+            or row["sensor"] != "soc-thmzone"
+            or type(row["interval_ms"]) is not int
+            or row["interval_ms"] != 30_000
+        ):
+            return None
+        _choice(
+            row["state"],
+            frozenset(
+                {
+                    "starting",
+                    "running",
+                    "sensor_unavailable",
+                    "storage_unavailable",
+                    "clock_unavailable",
+                }
+            ),
+        )
+        _choice(
+            row["error"],
+            frozenset(
+                {
+                    "sensor_unavailable",
+                    "journal_unavailable",
+                    "mirror_unavailable",
+                    "clock_unavailable",
+                }
+            ),
+            nullable=True,
+        )
+        captured = _timestamp(row["last_captured_at_utc"])
+        elapsed = row["last_captured_elapsed_ms"]
+        if (captured is None) != (elapsed is None):
+            return None
+        if elapsed is not None:
+            _integer(elapsed, 2**53 - 1)
+        retained = _integer(row["retained_readings"], 8192)
+        if row["state"] == "running" and (
+            captured is None or not retained or row["error"] is not None
+        ):
+            return None
+        if row["state"] == "sensor_unavailable" and row["error"] != "sensor_unavailable":
+            return None
+        if row["state"] == "clock_unavailable" and (
+            captured is not None or row["error"] != "clock_unavailable"
+        ):
+            return None
+        if row["state"] == "storage_unavailable" and row["error"] not in {
+            "journal_unavailable",
+            "mirror_unavailable",
+        }:
+            return None
+        return dict(row)
+    except (ValueError, TypeError, KeyError, OverflowError):
+        return None
+
+
 def _object(value: Any, keys: set[str]) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != keys:
         raise ValueError("invalid diagnostic shape")

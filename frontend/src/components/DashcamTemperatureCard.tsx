@@ -6,7 +6,7 @@ import Spinner from '@/components/Spinner'
 import { EmptyState, ErrorState, Pagination } from '@/components/ui'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
-import { QUIET_ANALYSIS_HARD_STOP_C, QUIET_ANALYSIS_START_C, temperatureHistoryIsOld, temperatureSegments, temperatureValue } from '@/lib/dashcamTemperature'
+import { QUIET_ANALYSIS_HARD_STOP_C, QUIET_ANALYSIS_START_C, temperatureCapturePresentation, temperatureHistoryIsOld, temperatureSegments, temperatureValue } from '@/lib/dashcamTemperature'
 import { formatDateTime, formatShortDateTime, formatTime } from '@/lib/format'
 import type { DashcamTemperatureHistory } from '@/lib/types'
 
@@ -17,6 +17,34 @@ const RIGHT = 18
 const TOP = 16
 const BOTTOM = 28
 const reading = (value: number | null | undefined) => value == null || !Number.isFinite(value) ? 'Unavailable' : `${value.toFixed(1)} °C`
+const captureSource = (source: string | undefined) => source === 'companion_temperature_v1' ? 'Companion temperature capture'
+  : source === 'carplay_timing' ? 'Legacy timing diagnostics' : 'Not reported'
+
+function TemperatureCaptureEvidence({ data, nowMs, error }: { data: DashcamTemperatureHistory; nowMs: number; error: boolean }) {
+  const capture = temperatureCapturePresentation(data, nowMs, error)
+  const count = (value: number | undefined) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString() : null
+  const companionCount = count(data.companionObservationCount)
+  const legacyCount = count(data.legacyObservationCount)
+  const collector = capture.recognised ? data.collector : null
+  return (
+    <div className="mt-3 rounded border border-border px-3 py-2 text-xs" aria-label="Temperature capture and import evidence">
+      <p className="text-content-muted">History source: {data.source === 'retained_device_temperature'
+        ? <>companion temperature capture{companionCount !== null && <> ({companionCount} observations)</>}{data.legacyObservationCount != null && data.legacyObservationCount > 0 && legacyCount !== null && <> and legacy timing diagnostics ({legacyCount} observations)</>}.</>
+        : data.source === 'retained_carplay_timing' ? <>legacy timing diagnostics{legacyCount !== null && <> ({legacyCount} observations)</>}.</>
+          : 'not reported.'}</p>
+      <p role="status" className={cn('mt-1 font-medium', capture.warning ? 'text-state-warn' : 'text-content')}>{capture.label}</p>
+      <p className="mt-1 text-content-muted">{capture.detail}</p>
+      {collector && <>
+        <dl className="mt-2 grid gap-x-5 gap-y-1 sm:grid-cols-3">
+          <div><dt className="text-content-faint">Last captured on camera</dt><dd>{formatDateTime(collector.lastCapturedAtUtc)}</dd></div>
+          <div><dt className="text-content-faint">Server last checked capture</dt><dd>{formatDateTime(collector.checkedAtUtc)}</dd></div>
+          <div><dt className="text-content-faint">Last reported retained on camera</dt><dd>{collector.retainedReadings.toLocaleString()} observations</dd></div>
+        </dl>
+        <p className="mt-2 text-content-muted">The companion samples every 30 seconds while its logger is enabled and the camera is awake, including during backup. Capture starts with the logger after reboot and does not prevent sleep. Saved readings sync later when the camera is reachable.</p>
+      </>}
+    </div>
+  )
+}
 
 function TemperatureChart({ data }: { data: DashcamTemperatureHistory }) {
   const id = useId()
@@ -105,9 +133,9 @@ function TemperatureChart({ data }: { data: DashcamTemperatureHistory }) {
         <summary className="cursor-pointer text-content-muted">View observed temperatures</summary>
         {tableOpen && <div className="overflow-x-auto"><table className="mt-2 w-full text-left text-xs">
           <caption className="sr-only">Retained dashcam processor temperature observations</caption>
-          <thead><tr><th scope="col">Captured at</th><th scope="col">SoC temperature</th><th scope="col">Quality</th></tr></thead>
+          <thead><tr><th scope="col">Captured at</th><th scope="col">SoC temperature</th><th scope="col">Quality</th><th scope="col">Capture source</th></tr></thead>
           <tbody>{points.slice((currentPage - 1) * 25, currentPage * 25).map((item, index) => <tr key={`${item.occurredAt}:${item.segmentId}:${index}`}>
-            <td className="py-1 pr-3">{formatDateTime(item.occurredAt)}</td><td className="tabular pr-3">{reading(temperatureValue(item))}</td><td>{item.quality}</td></tr>)}</tbody>
+            <td className="py-1 pr-3">{formatDateTime(item.occurredAt)}</td><td className="tabular pr-3">{reading(temperatureValue(item))}</td><td className="pr-3">{item.quality}</td><td>{captureSource(item.source)}</td></tr>)}</tbody>
         </table><Pagination page={currentPage} pages={pages} total={points.length} onChange={setPage} /></div>}
       </details>
     </>
@@ -120,6 +148,7 @@ export function DashcamTemperatureEvidence({ data, error = false, nowMs = Date.n
   return (
     <>
       {error && <p role="alert" className="mt-3 text-sm text-state-warn">Temperature refresh failed. Showing previously loaded historical captures; current temperature is unknown.</p>}
+      <TemperatureCaptureEvidence data={data} nowMs={nowMs} error={error} />
       <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
         <div><div className="label text-xs">Last captured</div><div className="tabular text-xl font-semibold">{reading(temperatureValue(latest))}</div>
           <div className="text-xs text-content-muted">{latest ? formatDateTime(latest.occurredAt) : 'No observation in this range'}</div>
@@ -130,7 +159,7 @@ export function DashcamTemperatureEvidence({ data, error = false, nowMs = Date.n
       </div>
       <p className="mt-3 text-xs text-content-faint">{formatDateTime(data.rangeStart)} – {formatDateTime(data.rangeEnd)} · {data.uniqueObservationCount.toLocaleString()} captured observations.</p>
       {data.truncated && <p role="status" className="mt-2 text-sm text-state-warn">History is incomplete because a capture limit was reached. Statistics describe the available observations.{data.outputTruncated ? ' Displayed points are unconnected because some observations were omitted.' : ''}</p>}
-      {data.points.length === 0 ? <EmptyState title="No temperature history in this range" description="History appears when retained on-device timing captures contain camera temperature. Offline periods and uncaptured time remain blank." />
+      {data.points.length === 0 ? <EmptyState title="No temperature history in this range" description="History appears when saved on-device temperature observations reach the server. Sleep, missing captures and delayed imports remain blank." />
         : <TemperatureChart data={data} />}
     </>
   )
@@ -146,7 +175,7 @@ export function DashcamTemperatureCard() {
           className={cn('rounded px-3 py-1 text-sm', range === hours ? 'bg-surface text-content shadow-sm' : 'bg-surface-sunken text-content-muted hover:text-content')}
           aria-pressed={range === hours} onClick={() => setHours(range)}>{range === 168 ? '7 d' : `${range} h`}</button>)}</div>
       </div>
-      <p className="mt-1 text-sm text-content-muted">Camera processor (SoC), °C — separate from engine coolant. Stored on-device timing captures; gaps mean no capture was available. These historical observations are not continuous monitoring.</p>
+      <p className="mt-1 text-sm text-content-muted">Camera processor (SoC), °C — separate from engine coolant. Stored on-device observations; blank periods can mean sleep, missing captures or delayed imports. These historical observations are not continuous monitoring.</p>
       {query.isPending && <Spinner label="Loading temperature history…" />}
       {query.data ? <DashcamTemperatureEvidence key={hours} data={query.data} error={query.isError} nowMs={Math.max(query.dataUpdatedAt, Date.now())} />
         : query.isError && <ErrorState title="Could not load temperature history" error={query.error} retry={() => void query.refetch()} />}

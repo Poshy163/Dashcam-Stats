@@ -34,6 +34,19 @@ class CompanionDiagnosticStatusTest {
         val report = StatusPublisher.buildStatusJson(PublicStatus("starting", true), 0)
         assertTrue(report.isNull("trial_settings"))
         assertTrue(report.isNull("restart_evidence"))
+        assertTrue(report.isNull("temperature_capture"))
         assertTrue(report.isNull("sleep_deadline_evidence"))
+    }
+
+    @Test fun temperatureCaptureEvidenceCannotGrantPowerOrIngestionAuthority() {
+        val row = TemperatureReading(1, "1".repeat(32), "2026-10-26T01:00:00Z", 1000, 75400)
+        val capture = TemperatureCaptureSnapshot("running", row, 1)
+        val report = StatusPublisher.buildStatusJson(PublicStatus("parked", true, temperatureCapture = capture.json()), 0)
+        assertEquals("companion_temperature_v1", report.getJSONObject("temperature_capture").getString("source"))
+        assertTrue(report.getJSONArray("capabilities").toString().contains("temperature_history_v1"))
+        assertFalse(report.getBoolean("acc_state_known"))
+        assertFalse(report.getBoolean("ingestion_sleep_hold_known"))
+        assertTrue(report.isNull("sleep_deadline_evidence"))
+        assertFalse(report.getJSONObject("temperature_capture").has("session_id"))
     }
 }

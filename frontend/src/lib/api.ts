@@ -10,6 +10,7 @@ import type {
   AuthSession,
   AuthState,
   CarPlayTimingOut,
+  DashcamTemperatureCapture,
   DashcamTemperatureHistory,
   Heatmap,
   HeatmapFilters,
@@ -421,6 +422,7 @@ export interface OBDLoggerStatus {
   pollPlanVersion?: number
   trialSettings?: OBDTrialSettings | null
   restartEvidence?: OBDRestartEvidence | null
+  temperatureCapture?: DashcamTemperatureCapture | null
   buildGitSha?: string
   capabilities?: string[]
   state?: string

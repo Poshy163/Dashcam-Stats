@@ -59,6 +59,7 @@ class ObdLoggerService : Service() {
     private val statusWriteGate = StatusWriteGate()
     private var sleepWindowController: AdaptiveSleepWindowController? = null
     @Volatile private var bootDiagnostics: BootDiagnostics? = null
+    private var temperatureCapture: TemperatureCapture? = null
     private lateinit var eventJournal: AppEventJournal
     private lateinit var eventEmitter: AppEventEmitter
     private val eventProjectionRetryQueued = AtomicBoolean(false)
@@ -157,6 +158,12 @@ class ObdLoggerService : Service() {
                         observation = ::recordSleepWindowObservation,
                     ).also { it.start() }
                 }.getOrNull()
+                // Temperature evidence has its own supervised lifetime. It is not a
+                // child of the OBD worker, so reloads and ingestion quiescing cannot
+                // stop it. Neither startup nor recovery changes native sleep admission.
+                temperatureCapture = runCatching {
+                    TemperatureCapture.create(applicationContext, scope).also { it.start() }
+                }.getOrNull()
                 // Advisory startup history is independent of the native OFF tracker.
                 // Do not put exit-history or private-file IO ahead of foreground or sleep recovery.
                 scope.launch {
@@ -237,6 +244,8 @@ class ObdLoggerService : Service() {
         retryWakeSignals.close()
         sleepWindowController?.close()
         sleepWindowController = null
+        temperatureCapture?.close()
+        temperatureCapture = null
         synchronized(movementLifecycleLock) {
             movementStopping = true
             passiveMotion?.stop()
@@ -2115,6 +2124,7 @@ class ObdLoggerService : Service() {
             pollPlanVersion = currentPollPlanVersion,
             trialSettings = LoggerPreferences.pollTrialSnapshot(this).json(),
             restartEvidence = bootDiagnostics?.snapshot(),
+            temperatureCapture = temperatureCapture?.snapshot()?.json(),
             lastDriveId = lastDriveId,
             lastDriveFinishedAtUtc = lastDriveFinished,
             ingestionRequestId = ingestionRequestId,

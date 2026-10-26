@@ -28,7 +28,11 @@ from app.core.process_lock import ProcessFileLock, try_acquire
 from app.db.models import OBDBundle, OBDBundleState, utcnow
 from app.db.session import session_scope
 from app.ingest import adb, transport
-from app.ingest.logger_diagnostics import clean_restart_evidence, clean_trial_settings
+from app.ingest.logger_diagnostics import (
+    clean_restart_evidence,
+    clean_temperature_capture,
+    clean_trial_settings,
+)
 from app.ingest.models import DeltaPlan, RemoteFile, UnitInfo, ingest_setting
 from app.ingest.obd_bundle import (
     SAFE_DRIVE_ID,
@@ -204,6 +208,7 @@ _LOGGER_KEYS = frozenset(
         "poll_plan_version",
         "trial_settings",
         "restart_evidence",
+        "temperature_capture",
         "build_git_sha",
         "state",
         "ownership_enabled",
@@ -448,6 +453,11 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
     }
     for key, item in value.items():
         if key not in _LOGGER_KEYS:
+            continue
+        if key == "temperature_capture":
+            capture = clean_temperature_capture(item)
+            if capture is not None:
+                clean[key] = capture
             continue
         if key == "capabilities":
             capabilities = _clean_logger_capabilities(item)

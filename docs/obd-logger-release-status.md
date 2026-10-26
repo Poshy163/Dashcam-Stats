@@ -8,18 +8,54 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.18** (`versionCode` 31), installed in place on 24 October 2026 |
-| Source | `13ce90916009633d9bab67eff7446716749efb92` (`android/obd-logger/`), verified in the running companion and installed APK |
+| Version | **0.3.19** (`versionCode` 32), installed in place on 26 October 2026 |
+| Source | `8282c8ec9b9837495cf035a1fefdb27657ade216` (`android/obd-logger/`), verified in the running companion, installed APK readback and server |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | Four post-update recordings sustained plan 8; the latest three used baseline plan 7. Read-only same-process inspection on 25 October found the trial option OFF with no fallback reason. Its historical change has no audit and cannot be attributed to overload, a reboot or an operator. |
-| Deployment | APK hash and production signer verified; UID, runtime grants, one read-only card grant, ownership, webhook, filtering and 20 immutable exports preserved. The original OFF bounds and private checkpoint survived the actual update. Both camera streams continued recording. Actual quiet exclusions and the causes of two later native reboots remain unverified. |
+| Poll plan | The durable settings record migrated the existing trial OFF choice, revision 1, with no fallback reason. No automatic re-arm was performed. A new physical drive is required to accept the 0.3.19 scheduling changes. |
+| Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, previously granted permissions, ownership and the original OFF bounds survived the update. Both cameras continued recording, and automatic backup resumed with the new companion. Restart evidence reports generic firmware `reboot`, with unknown physical cause. |
 
-## 0.3.19 candidate: durable trial intent, MAF priority and startup evidence
+## 0.3.20 candidate: companion-owned temperature capture
 
-Source version **0.3.19/code 32** addresses the 25 October review. It has not been
-installed or physically driven.
+Source version **0.3.20/code 33** adds a lightweight temperature collector to the
+existing admitted foreground service. It starts through normal boot/update service
+recovery, independently of the OBD polling worker and ingestion quiescing. It does
+not acquire a wake lock or change native sleep, radios or recorder state. Capture
+requires the logger service to be enabled and permitted; force-stop and disabled
+service states are not continuous capture.
+
+Thirty-second awake observations have a bounded private journal and a read-only
+removable-storage mirror. The server imports changed, integrity-checked chunks
+while parked, including during a footage backup. Capture time, import time and
+missing sensor readings remain distinct. Legacy CarPlay temperature history stays
+available, without inventing values across gaps. See
+[dashcam-temperature-capture.md](dashcam-temperature-capture.md) for the protocol,
+retention, recovery boundaries and physical acceptance checks.
+
+The investigation on 26 October confirmed that the existing shell sampler retained
+no temperature observation between **10:37:28 am and 7:27:27 pm Adelaide time**.
+Device uptime places a boot around 10:38 am. The shell sampler had no local boot
+launcher; its new session began on returning home. During the later online session,
+the sampler stayed alive through the 0.3.19 installation, with a maximum observed
+temperature interval of 83 seconds. Stale graph readings in that session were
+consistent with delayed imports, rather than the sampler stopping.
+
+Local validation passed: **3,745 backend tests** (78 platform/optional skips),
+**426 Android tests** and **253 frontend tests**. Python formatting/lint, frontend
+type checking/lint/production build, both APK builds and Android debug/release lint
+also passed. Android lint retains 61 warnings per variant and reports zero errors.
+The real Kotlin-generated manifest, chunk digests, three readings across two
+sessions and nullable sensor evidence passed the Python validators unchanged.
+Independent review covered recovery fairness, clock correction, valid legacy
+fallback, SQLite timeout restoration and native power/OBD separation. The new
+capture/import panel was visually checked with explicitly synthetic data. Device
+installation and physical boot/backup acceptance remain separate from these checks.
+
+## 0.3.19 installed: durable trial intent, MAF priority and startup evidence
+
+Source version **0.3.19/code 32** addresses the 25 October review. It was installed
+on 26 October; physical drive acceptance remains pending.
 
 - Trial intent has a separate, versioned, checksummed, atomically replaced record
   in app-private no-backup storage. One conservative migration retains the existing
@@ -57,8 +93,8 @@ installed or physically driven.
   active poll plan, app exit and device reboot distinct. Older companions explicitly
   show that these diagnostics were not reported.
 
-The historical OFF/no-reason state cannot be reconstructed. Installing this candidate
-retains that current baseline choice until an operator explicitly re-arms the trial.
+The historical OFF/no-reason state cannot be reconstructed. This installed release
+retains the current baseline choice until an operator explicitly re-arms the trial.
 Thermal limits, locked/activity/uncertain upload protection, read-only card access and
 native sleep admission remain unchanged. New persistence, MAF and startup behavior
 requires physical acceptance after installation; the old reboot cause remains unknown.
@@ -851,7 +887,7 @@ First integrate/review the release source in the protected signing checkout, or 
 protected build host to use the existing signing files. The original checkout may still contain
 older source and unrelated local changes: do not blindly pull, switch branches or overwrite it.
 Fresh worktrees do not contain the signing files. From the chosen source checkout, after verifying
-`app/build.gradle.kts` declares version 0.3.19/code 32:
+`app/build.gradle.kts` declares version 0.3.20/code 33:
 
 ```powershell
 $env:OBD_PRODUCTION_SIGNING = "true"
@@ -879,7 +915,7 @@ other settings, the metrics toggle works, and `Bundles waiting for the server` d
 next Wi-Fi window. Verify webhook events reach the server and boot recovery still works.
 
 After ingestion obtains a fresh status snapshot, `GET /api/obd/status` should report
-`app_version_name: "0.3.19"` and `app_version_code: 32` under `logger`. A cached status alone does
+`app_version_name: "0.3.20"` and `app_version_code: 33` under `logger`. A cached status alone does
 not establish the currently installed/running version.
 
 ## What is still left to do

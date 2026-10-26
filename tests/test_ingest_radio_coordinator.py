@@ -444,6 +444,12 @@ class FakeController:
 
 @pytest.fixture
 def fake_controller(monkeypatch):
+    from app.ingest import status as status_module
+
+    # Other ingest tests may leave a completed run's cancellation flag set in this
+    # worker. Ownership tests need their own visit state; the real cancellation gate
+    # remains active and can still be exercised explicitly within a test.
+    monkeypatch.setattr(status_module, "_status", status_module.IngestStatus())
     # These tests exercise ownership and recovery independently of admission policy.
     # The denied-admission cases below explicitly remove this available-time budget.
     monkeypatch.setattr(radio_coordinator.radios, "new_quieting_allowed", lambda: True)
@@ -465,6 +471,32 @@ def fake_controller(monkeypatch):
 
     monkeypatch.setattr(radio_coordinator.radios, "read_device_boot_id", boot_id)
     return FakeController
+
+
+async def test_fresh_controller_visit_still_refuses_explicit_cancellation(
+    db_session, fake_controller
+):
+    from app.ingest.status import get_status
+
+    assert not get_status().cancel_event.is_set()
+    transition = await radio_coordinator.begin(
+        trigger="manual",
+        address="unit:5555",
+        logger_status=None,
+        logger_status_path="/safe/status.json",
+        watchdog_deadline_s=120,
+    )
+    transition.controller.capture = AsyncMock(
+        side_effect=AssertionError("cancelled visit must not read or disable radios")
+    )
+    try:
+        get_status().cancel(reason="operator")
+        with pytest.raises(radio_coordinator.RadioTransitionError):
+            await transition.capture_and_quiet()
+        transition.controller.capture.assert_not_called()
+        assert not any("disable" in call for call in transition.controller.calls)
+    finally:
+        await transition.close()
 
 
 async def test_insufficient_sleep_budget_never_claims_radios(

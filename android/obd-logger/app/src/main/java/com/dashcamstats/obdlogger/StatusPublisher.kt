@@ -86,6 +86,7 @@ data class PublicStatus(
     val pollPlanVersion: Int = ObdPollPlan.VERSION,
     val trialSettings: JSONObject? = null,
     val restartEvidence: BootDiagnosticsSnapshot? = null,
+    val temperatureCapture: JSONObject? = null,
 )
 
 internal const val PUBLIC_STATUS_SCHEMA_VERSION = 7
@@ -133,6 +134,7 @@ object StatusPublisher {
             .put("poll_plan_version", status.pollPlanVersion)
             .put("trial_settings", status.trialSettings ?: JSONObject.NULL)
             .put("restart_evidence", status.restartEvidence?.toJson() ?: JSONObject.NULL)
+            .put("temperature_capture", status.temperatureCapture ?: JSONObject.NULL)
             .put("build_git_sha", BuildConfig.BUILD_GIT_SHA)
             .put(
                 "capabilities",
@@ -149,6 +151,7 @@ object StatusPublisher {
                         "clip_transfer_policy_v1",
                         "poll_trial_settings_v1",
                         "restart_evidence_v1",
+                        "temperature_history_v1",
                     ),
                 ),
             )

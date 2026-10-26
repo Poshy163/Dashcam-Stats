@@ -35,6 +35,7 @@ from app.ingest import (
     puller,
     radio_coordinator,
     radios,
+    temperature_capture,
     unit_logs,
     wifi_startup,
 )
@@ -132,6 +133,7 @@ class IngestPoller:
         await health.shutdown()
         await unit_logs.shutdown()
         await carplay_timing.shutdown()
+        await temperature_capture.shutdown()
         await wifi_startup.shutdown()
         await band.shutdown()
         log.info("ingest poller stopped")
@@ -427,6 +429,7 @@ class IngestPoller:
                     # Read-only and independently throttled, with an ignition-off gate.
                     # A long footage copy must not hide the drive's retained timing log.
                     carplay_timing.recover_on_unit_present(self._address())
+                    temperature_capture.on_unit_present(self._address())
                     await asyncio.sleep(self._online_interval())
                     continue
 
@@ -511,6 +514,7 @@ class IngestPoller:
                     health.on_unit_present(self._address())
                     unit_logs.on_unit_present(self._address())
                     carplay_timing.on_unit_present(self._address())
+                    temperature_capture.on_unit_present(self._address())
                     wifi_startup.on_unit_present(self._address())
                     band.on_unit_present(self._address())
                     await asyncio.sleep(self._online_interval())
@@ -642,6 +646,7 @@ class IngestPoller:
                     health.on_unit_present(info.address)
                     unit_logs.on_unit_present(info.address)
                     carplay_timing.on_unit_present(info.address)
+                    temperature_capture.on_unit_present(info.address)
                     wifi_startup.on_unit_present(info.address)
                     band.on_unit_present(info.address)
             except asyncio.CancelledError:

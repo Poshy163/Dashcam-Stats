@@ -12,7 +12,7 @@ import math
 import re
 from bisect import bisect_left
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -34,6 +34,9 @@ class Observation:
     quality: str
     signature: str
     copied: bool
+    source: str = "carplay_timing"
+    sequence: int | None = None
+    elapsed_ms: int | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -41,6 +44,7 @@ class Observation:
             "soc_c": self.soc_c,
             "session_id": self.session_id,
             "quality": self.quality,
+            "source": self.source,
         }
 
 
@@ -53,6 +57,23 @@ def parse_observation(occurred_at: datetime, message: str) -> Observation | None
     fields = dict(pairs)
     if "soc" not in fields:
         return None
+    companion = fields.get("source") == "companion_temperature_v1"
+    if "source" in fields and not companion:
+        return None
+    sequence = elapsed = None
+    if companion:
+        try:
+            if (
+                tail != "event=temperature_capture"
+                or fields.get("sensor") != "soc-thmzone"
+                or not re.fullmatch(r"[0-9a-f]{32}", fields.get("session", ""))
+            ):
+                return None
+            sequence, elapsed = int(fields["sequence"]), int(fields["elapsed_ms"])
+            if not 1 <= sequence <= 2**53 - 1 or not 0 <= elapsed <= 2**53 - 1:
+                return None
+        except (KeyError, ValueError):
+            return None
     if any(
         fields.get(key, "soc-thmzone") != "soc-thmzone"
         for key in ("sensor", "soc_sensor", "temperature_sensor")
@@ -78,6 +99,9 @@ def parse_observation(occurred_at: datetime, message: str) -> Observation | None
         "soc_sensor",
         "temperature_sensor",
         "context_age_ms",
+        "source",
+        "sequence",
+        "elapsed_ms",
     }:
         quality, value = "invalid", None
     session = fields.get("session")
@@ -101,6 +125,9 @@ def parse_observation(occurred_at: datetime, message: str) -> Observation | None
         quality,
         signature,
         "context_age_ms" in fields or tail.startswith("layer=") or tail == "no video surface",
+        "companion_temperature_v1" if companion else "carplay_timing",
+        sequence,
+        elapsed,
     )
 
 
@@ -130,7 +157,50 @@ def _unique(observations: list[Observation]) -> list[Observation]:
             if index < len(times) and times[index] <= item.occurred_at.timestamp() + 120:
                 continue
             result.append(item)
-    return sorted(result, key=lambda item: (item.occurred_at, item.session_id or ""))
+    # The independent collector is the preferred sensor source when both transports
+    # observed the same interval. Keep legacy coverage outside its observed intervals.
+    companion_times = sorted(
+        item.occurred_at.timestamp()
+        for item in result
+        if item.source == "companion_temperature_v1" and item.soc_c is not None
+    )
+    preferred = []
+    for item in result:
+        if item.source == "carplay_timing" and companion_times:
+            index = bisect_left(companion_times, item.occurred_at.timestamp() - 15)
+            if (
+                index < len(companion_times)
+                and companion_times[index] <= item.occurred_at.timestamp() + 15
+            ):
+                continue
+        preferred.append(item)
+    # A wall-clock correction cannot create a forward line between readings that were
+    # captured in reverse UTC order. Session subsegments preserve that discontinuity.
+    by_session: dict[str, list[Observation]] = defaultdict(list)
+    for item in preferred:
+        if item.source == "companion_temperature_v1" and item.session_id:
+            by_session[item.session_id].append(item)
+    segmented = {}
+    for items in by_session.values():
+        previous = None
+        segment = 0
+        for item in sorted(items, key=lambda value: value.sequence or 0):
+            if previous is not None and (
+                item.occurred_at <= previous.occurred_at
+                or (item.elapsed_ms or 0) <= (previous.elapsed_ms or 0)
+                or abs(
+                    (item.occurred_at - previous.occurred_at).total_seconds()
+                    - ((item.elapsed_ms or 0) - (previous.elapsed_ms or 0)) / 1000
+                )
+                > GAP_THRESHOLD_S
+            ):
+                segment += 1
+            previous = item
+            segmented[id(item)] = replace(item, session_id=f"{item.session_id}-clock-{segment}")
+    return sorted(
+        [segmented.get(id(item), item) for item in preferred],
+        key=lambda item: (item.occurred_at, item.session_id or ""),
+    )
 
 
 def history(
@@ -211,7 +281,9 @@ def history(
             key=lambda point: point["occurred_at"],
         )
     return {
-        "source": "retained_carplay_timing",
+        "source": "retained_device_temperature"
+        if any(item.source == "companion_temperature_v1" for item in observations)
+        else "retained_carplay_timing",
         "sensor": "soc-thmzone",
         "hours": hours,
         "range_start": range_start,
@@ -222,6 +294,10 @@ def history(
         "minimum_c": minimum.soc_c if minimum else None,
         "maximum_c": maximum.soc_c if maximum else None,
         "unique_observation_count": len(observations),
+        "companion_observation_count": sum(
+            item.source == "companion_temperature_v1" for item in observations
+        ),
+        "legacy_observation_count": sum(item.source == "carplay_timing" for item in observations),
         "source_row_count": len(rows),
         "input_truncated": input_truncated,
         "output_truncated": output_truncated,

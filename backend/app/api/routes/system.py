@@ -68,7 +68,7 @@ from app.db.models import (
 )
 from app.db.session import current_revision
 from app.hardware.detect import detect_hardware_async
-from app.ingest import carplay_timing, temperature_history
+from app.ingest import carplay_timing, temperature_capture, temperature_history
 from app.pipeline.orchestrator import expand_stages, invalidate_recordings
 from app.pipeline.revisions import outdated_stages
 from app.retention import current_usage, evaluate_safety, plan_idle, plan_parked
@@ -788,7 +788,7 @@ async def unit_temperature_history(
                 select(UnitLogEntry)
                 .options(load_only(UnitLogEntry.occurred_at, UnitLogEntry.message))
                 .where(
-                    UnitLogEntry.tag == carplay_timing.TAG,
+                    UnitLogEntry.tag.in_((carplay_timing.TAG, temperature_capture.TAG)),
                     UnitLogEntry.message.contains("soc="),
                     # A copied context just inside the range may belong to a direct
                     # observation just outside it. Read a bounded attribution margin.
@@ -802,13 +802,17 @@ async def unit_temperature_history(
         ).all()
     )
     truncated = len(rows) > temperature_history.MAX_INPUT_ROWS
-    return temperature_history.history(
+    result = temperature_history.history(
         rows[: temperature_history.MAX_INPUT_ROWS],
         hours=hours,
         range_start=start,
         range_end=end,
         input_truncated=truncated,
     )
+    collector = temperature_capture.collector_snapshot()
+    if collector is not None:
+        result["collector"] = collector
+    return result
 
 
 @router.get("/unit-logs/tags", summary="Tags present in the collected unit log")

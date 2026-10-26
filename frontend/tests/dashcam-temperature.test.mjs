@@ -32,6 +32,12 @@ const data = (overrides = {}) => ({
   points: [point(0, 80), point(30, 175, { kind: 'max' }), point(60, 107.02)], ...overrides,
 })
 const markup = (value, extra = {}) => renderToStaticMarkup(React.createElement(DashcamTemperatureEvidence, { data: value, nowMs: base + 60_000, ...extra }))
+const collector = (overrides = {}) => ({
+  schemaVersion: 1, source: 'companion_temperature_v1', sensor: 'soc-thmzone', state: 'running',
+  lastCapturedAtUtc: point(60, 70).occurredAt, lastCapturedElapsedMs: 60_000,
+  checkedAtUtc: point(60, 70).occurredAt, intervalMs: 30_000, retainedReadings: 12, error: null,
+  ...overrides,
+})
 const text = root => JSON.stringify(root.toJSON())
 async function flush() { await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) }) }
 
@@ -100,6 +106,94 @@ test('historical and failed refreshes keep observations visible without claiming
   assert.match(html, /Temperature refresh failed/)
   assert.match(html, /Historical reading · current temperature unknown/)
   assert.match(html, /<svg/)
+})
+
+test('legacy history remains usable without implying boot recovery or a running collector', () => {
+  const html = markup(data())
+  assert.match(html, /History source: legacy timing diagnostics/)
+  assert.match(html, /On-device capture state not reported/)
+  assert.match(html, /does not prove continuous capture/)
+  assert.doesNotMatch(html, /On-device capture recently confirmed|Capture starts with the logger after reboot/)
+  assert.match(html, /107\.0 °C/)
+})
+
+test('new history distinguishes on-camera capture, server check and mixed provenance', () => {
+  const html = markup(data({ source: 'retained_device_temperature', companionObservationCount: 3, legacyObservationCount: 2, collector: collector() }))
+  assert.match(html, /companion temperature capture \(3 observations\) and legacy timing diagnostics \(2 observations\)/)
+  assert.match(html, /On-device capture recently confirmed/)
+  assert.match(html, /Last captured on camera/)
+  assert.match(html, /Server last checked capture/)
+  assert.match(html, /Last reported retained on camera/)
+  assert.match(html, /12 observations/)
+  assert.match(html, /every 30 seconds while its logger is enabled and the camera is awake, including during backup/)
+  assert.match(html, /does not prevent sleep/)
+  assert.match(html, /not a live temperature reading/)
+})
+
+test('stale checks and stalled capture timestamps cannot keep a running label current', () => {
+  const stale = markup(data({ collector: collector() }), { nowMs: base + 180_000 })
+  assert.match(stale, /Capture report is stale · current capture unknown/)
+  assert.doesNotMatch(stale, /On-device capture recently confirmed/)
+  const stalled = markup(data({ collector: collector({ checkedAtUtc: point(180, 70).occurredAt }) }), { nowMs: base + 180_000 })
+  assert.match(stalled, /No recent captured sample · current capture unknown/)
+  assert.match(stalled, /collector reported running, but its latest captured timestamp is missing, old or invalid/)
+  assert.doesNotMatch(stalled, /On-device capture recently confirmed/)
+  const failed = markup(data({ collector: collector() }), { error: true })
+  assert.match(failed, /Temperature refresh failed/)
+  assert.match(failed, /Capture report is stale · current capture unknown/)
+})
+
+test('capture resource failures preserve prior observations and never invent temperatures', () => {
+  const unavailable = markup(data({ collector: collector({ state: 'sensor_unavailable', error: 'sensor_unavailable' }), latest: point(60, null) }))
+  assert.match(unavailable, /Sensor unavailable in the last report/)
+  assert.match(unavailable, /Last captured<\/div><div[^>]*>Unavailable<\/div>/)
+  assert.match(unavailable, /175\.0 °C/)
+  assert.doesNotMatch(unavailable, /On-device capture recently confirmed|>0\.0 °C/)
+  for (const error of ['journal_unavailable', 'mirror_unavailable']) {
+    const storage = markup(data({ collector: collector({ state: 'storage_unavailable', error }) }))
+    assert.match(storage, /Temperature storage unavailable in the last report/)
+    assert.match(storage, /Some captured readings may not have been saved or made available for import/)
+    assert.match(storage, /107\.0 °C/)
+  }
+  const starting = markup(data({ collector: collector({ state: 'starting', lastCapturedAtUtc: null }) }))
+  assert.match(starting, /On-device collector starting in the last report/)
+  assert.doesNotMatch(starting, /On-device capture recently confirmed/)
+})
+
+test('unknown metadata, invalid counts and future evidence do not become current capture claims', () => {
+  for (const override of [{ state: 'private exception text' }, { source: 'private exception text' }, { error: 'private exception text' }, { schemaVersion: 2 }, { retainedReadings: 8193 }]) {
+    const html = markup(data({ source: 'retained_device_temperature', companionObservationCount: NaN, legacyObservationCount: -1, collector: collector(override) }))
+    assert.match(html, /On-device capture report not recognised/)
+    assert.doesNotMatch(html, /private exception text|NaN observations|-1 observations|On-device capture recently confirmed/)
+  }
+  const futureCheck = markup(data({ collector: collector({ checkedAtUtc: point(121, 70).occurredAt }) }))
+  assert.match(futureCheck, /Capture report is stale · current capture unknown/)
+  const futureCapture = markup(data({ collector: collector({ lastCapturedAtUtc: point(121, 70).occurredAt }) }))
+  assert.match(futureCapture, /No recent captured sample · current capture unknown/)
+})
+
+test('an unavailable camera clock is distinct from missing capture and does not fabricate graph timestamps', () => {
+  const html = markup(data({ source: 'retained_device_temperature', collector: collector({ state: 'clock_unavailable', error: 'clock_unavailable', lastCapturedAtUtc: null, lastCapturedElapsedMs: null }) }))
+  assert.match(html, /Camera time unavailable in the last report/)
+  assert.match(html, /could not be given a reliable capture time and are excluded from this graph/)
+  assert.match(html, /Earlier timestamped observations remain visible/)
+  assert.match(html, /107\.0 °C/)
+  assert.doesNotMatch(html, /On-device capture recently confirmed|On-device capture report not recognised|1970/)
+})
+
+test('the semantic observations table identifies each known capture source without exposing unknown values', async t => {
+  let root
+  await act(async () => { root = create(React.createElement(DashcamTemperatureEvidence, {
+    data: data({ points: [point(0, 70, { source: 'companion_temperature_v1' }), point(30, 71, { source: 'carplay_timing' }), point(60, 72, { source: 'private source text' })] }), nowMs: base + 60_000,
+  })) })
+  t.after(async () => act(async () => root.unmount()))
+  await act(async () => root.root.findByType('details').props.onToggle({ currentTarget: { open: true } }))
+  assert.match(text(root), /Capture source/)
+  const rows = root.root.findByType('tbody').findAllByType('tr')
+  assert.equal(rows[0].findAllByType('td').at(-1).children.join(''), 'Companion temperature capture')
+  assert.equal(rows[1].findAllByType('td').at(-1).children.join(''), 'Legacy timing diagnostics')
+  assert.equal(rows[2].findAllByType('td').at(-1).children.join(''), 'Not reported')
+  assert.doesNotMatch(text(root), /private source text/)
 })
 
 test('latest unavailable capture is not silently replaced by an earlier valid reading', () => {
@@ -261,4 +355,38 @@ test('range changes use read-only history API and refresh errors retain cached c
   assert.match(text(root), /Temperature refresh failed/)
   assert.match(text(root), /175\.0 °C/)
   assert.equal(root.root.findAllByType('svg').length, 1)
+})
+
+test('history API maps companion capture and import evidence without extra device requests', async t => {
+  const previousFetch = globalThis.fetch
+  const previousNow = Date.now
+  Date.now = () => base + 60_000
+  const requests = []
+  globalThis.fetch = async (url, init = {}) => {
+    const request = new URL(url, 'http://localhost')
+    requests.push(request.pathname)
+    assert.equal(init.method ?? 'GET', 'GET')
+    assert.equal(request.pathname, '/api/unit-logs/temperature')
+    return new Response(JSON.stringify({
+      source: 'retained_device_temperature', sensor: 'soc-thmzone', hours: 24,
+      range_start: point(0, 70).occurredAt, range_end: point(3600, 70).occurredAt,
+      bucket_s: 300, gap_threshold_s: 90, latest: { occurred_at: point(60, 70).occurredAt, soc_c: 70, quality: 'valid', session_id: 'first', source: 'companion_temperature_v1' },
+      minimum_c: 70, maximum_c: 70, unique_observation_count: 1, source_row_count: 1,
+      input_truncated: false, output_truncated: false, truncated: false, points: [],
+      companion_observation_count: 1, legacy_observation_count: 0,
+      collector: { schema_version: 1, source: 'companion_temperature_v1', sensor: 'soc-thmzone', state: 'running', last_captured_at_utc: point(60, 70).occurredAt,
+        last_captured_elapsed_ms: 60_000, checked_at_utc: point(60, 70).occurredAt, interval_ms: 30_000, retained_readings: 12, error: null },
+    }), { status: 200 })
+  }
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } })
+  let root
+  await act(async () => { root = create(React.createElement(QueryClientProvider, { client }, React.createElement(DashcamTemperatureCard))) })
+  t.after(async () => { await act(async () => root.unmount()); client.clear(); globalThis.fetch = previousFetch; Date.now = previousNow })
+  await flush()
+  assert.match(text(root), /On-device capture recently confirmed/)
+  assert.match(text(root), /companion temperature capture/)
+  assert.match(text(root), /Server last checked capture/)
+  assert.match(text(root), /Last captured on camera/)
+  assert.match(text(root), /12/)
+  assert.deepEqual(requests, ['/api/unit-logs/temperature'])
 })
