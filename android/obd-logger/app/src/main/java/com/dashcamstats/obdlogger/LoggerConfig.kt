@@ -148,6 +148,14 @@ object LoggerPreferences {
 
     internal fun pollTrialSnapshot(context: Context): TrialSettingsSnapshot = TrialSettings.repository(context).snapshot()
 
+    /** Persist an explicit stop without validating or replacing the caller's unsaved draft. */
+    internal fun disablePersisted(context: Context) {
+        synchronized(preferenceWriteLock) {
+            val preferences = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+            commitPreferenceUpdate(preferences, preferences.edit().putBoolean("enabled", false))
+        }
+    }
+
     fun disable(context: Context) {
         synchronized(preferenceWriteLock) {
             context.getSharedPreferences(NAME, Context.MODE_PRIVATE).edit()

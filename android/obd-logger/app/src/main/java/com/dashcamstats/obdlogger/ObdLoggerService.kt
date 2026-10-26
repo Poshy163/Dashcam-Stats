@@ -20,7 +20,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -39,8 +38,12 @@ class ObdLoggerService : Service() {
     private val eventScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var database: ObdDatabase
     private lateinit var exporter: BundleExporter
-    private var worker: Job? = null
+    private val loggerWorker = LoggerWorkerCoordinator(scope) {
+        client?.disconnect(false)
+        client = null
+    }
     private var client: ElmBleClient? = null
+    @Volatile
     private var currentDriveId: String? = null
     private var currentPollPlanVersion = ObdPollPlan.VERSION
     private val trialFallbackLatch = PollTrialFallbackLatch()
@@ -191,29 +194,12 @@ class ObdLoggerService : Service() {
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
             }
         }
-        when (
-            serviceWorkerDecision(
-                workerActive = worker?.isActive == true,
-                configurationReloadRequested = intent?.action == ACTION_RELOAD_CONFIGURATION,
-            )
-        ) {
-            ServiceWorkerDecision.START -> {
-                pendingStartupRecoveryReason = startupRecoveryReason(
-                    intent?.getStringExtra(EXTRA_STARTUP_RECOVERY_REASON),
-                )
-                worker = scope.launch { initializeAndRunLogger() }
-            }
-            ServiceWorkerDecision.RESTART_FOR_CONFIGURATION -> {
-                val previous = checkNotNull(worker)
-                worker = scope.launch {
-                    previous.cancelAndJoin()
-                    client?.disconnect(false)
-                    client = null
-                    pendingStartupRecoveryReason = "process_terminated"
-                    if (collaboratorsInitialized) runLogger() else initializeAndRunLogger()
-                }
-            }
-            ServiceWorkerDecision.KEEP_RUNNING -> Unit
+        val startupReason = startupRecoveryReason(
+            intent?.getStringExtra(EXTRA_STARTUP_RECOVERY_REASON),
+        )
+        loggerWorker.request(intent?.action == ACTION_RELOAD_CONFIGURATION) { restarting ->
+            pendingStartupRecoveryReason = if (restarting) "process_terminated" else startupReason
+            if (restarting && collaboratorsInitialized) runLogger() else initializeAndRunLogger()
         }
         return START_STICKY
     }
@@ -235,7 +221,7 @@ class ObdLoggerService : Service() {
         } else {
             eventScope.cancel()
         }
-        worker?.cancel()
+        loggerWorker.close()
         client?.closeNow()
         if (retryWakeReceiverRegistered) {
             runCatching { unregisterReceiver(retryWakeReceiver) }
@@ -346,7 +332,7 @@ class ObdLoggerService : Service() {
             var retryMayBePreemptedByIngestion = false
             try {
                 if (!recovered) {
-                    val recoveredDrives = database.recoverInterrupted(recoveryReason)
+                    val recoveredDrives = recoverInterruptedDrives(recoveryReason)
                     for (drive in recoveredDrives) {
                         database.addDiagnostic(
                             drive.driveId,
@@ -515,6 +501,17 @@ class ObdLoggerService : Service() {
                 }
             }
         }
+    }
+
+    private fun recoverInterruptedDrives(recoveryReason: String): List<DriveFinalization> {
+        val recoveredDrives = database.recoverInterrupted(recoveryReason)
+        // A previous finalisation can fail after the drive became current in memory. Only a
+        // successful DB recovery proves no recording remains; then release the parked-analysis
+        // gate and discard timing/plan state belonging to that terminal drive.
+        currentDriveId = null
+        currentPollPlanVersion = ObdPollPlan.VERSION
+        driveStartedElapsedMillis = null
+        return recoveredDrives
     }
 
     private suspend fun runOneConnection(

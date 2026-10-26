@@ -767,6 +767,49 @@ class ObdDatabaseRetentionTest {
         }
     }
 
+    @Test
+    fun recoveryPagesAcrossDistinctFinishTimesWithTheSameSqliteSortKey() {
+        val root = File(context.cacheDir, "export-recovery-rounded-page-${System.nanoTime()}").apply {
+            resolve("ready").mkdirs()
+            resolve("receipts").mkdirs()
+        }
+        try {
+            val finish = Instant.parse("2025-01-01T01:00:00Z")
+            val driveIds = (200..264).map { index ->
+                createRecordingDrive(index)
+                val driveId = "drive-%02d".format(index)
+                // Distinct canonical instants share SQLite's rounded julianday() sort key.
+                database.finishDrive(
+                    driveId,
+                    "engine_stopped",
+                    true,
+                    finish.plusNanos((index - 199) * 1_000L).toString(),
+                )
+                database.recordVerifiedExport(driveId, digest(index))
+                driveId
+            }
+            database.readableDatabase.rawQuery(
+                "SELECT COUNT(DISTINCT finish_time_utc),COUNT(DISTINCT julianday(finish_time_utc)) FROM drives",
+                null,
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(65, cursor.getInt(0))
+                assertEquals(1, cursor.getInt(1))
+            }
+            val exporter = BundleExporter(context, database, deviceRoot = { root })
+
+            assertEquals(65, exporter.reconcileMissingExports())
+            for (driveId in driveIds) {
+                val drive = database.drive(driveId)
+                assertEquals("waiting_for_backup", drive.getString("export_status"))
+                assertTrue(drive.isNull("bundle_sha256"))
+            }
+            assertEquals(0, exporter.reconcileMissingExports())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     private fun createCompletedDrive(index: Int, exported: Boolean) {
         createRecordingDrive(index)
         val finished = Instant.parse("2025-01-01T00:00:00Z").plusSeconds(index.toLong()).toString()

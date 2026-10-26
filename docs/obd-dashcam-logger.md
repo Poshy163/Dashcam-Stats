@@ -31,6 +31,14 @@ device naturally runs; it neither holds the camera awake nor extends a sleep win
 See [dashcam-temperature-capture.md](dashcam-temperature-capture.md) for the storage
 contract, import path and capture-versus-import health evidence.
 
+Companion 0.3.21 also hardens settings and recovery. Configuration reloads wait for
+the actual previous logger to finish; repeated Apply requests coalesce. Invalid
+drafts preserve the saved logger configuration, while explicit OFF saves only the
+disabled setting. Trial-setting storage runs away from the UI thread and retains
+revision-checked fallback protection. Successful interrupted-drive recovery clears
+stale active-drive state, and export reconciliation uses consistent pagination for
+equal SQLite timestamp sort keys.
+
 ## Why it is an APK
 
 The verified unit is a locked, unrooted UIS7861 head unit running Android 14 (SDK 34). The

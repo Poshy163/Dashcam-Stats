@@ -455,6 +455,12 @@ class TrialSettingsTest {
             val apply = MainActivity::class.java.getDeclaredField("pollTrialApply").apply { isAccessible = true }
                 .get(activity) as Button
             assertTrue(apply.isEnabled); apply.performClick()
+            val savedLimit = System.nanoTime() + 5_000_000_000L
+            while (!LoggerPreferences.load(context, false).pollTrialEnabled) {
+                Shadows.shadowOf(Looper.getMainLooper()).idle()
+                check(System.nanoTime() < savedLimit)
+                Thread.sleep(10)
+            }
             assertTrue(LoggerPreferences.load(context, false).pollTrialEnabled)
         } finally { controller.pause().stop().destroy() }
     }

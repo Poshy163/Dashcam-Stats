@@ -510,22 +510,6 @@ class EngineGateTest {
     }
 
     @Test
-    fun savedConfigurationRestartsAnActiveWorkerBeforeApplyingNewPolicy() {
-        assertEquals(
-            ServiceWorkerDecision.RESTART_FOR_CONFIGURATION,
-            serviceWorkerDecision(workerActive = true, configurationReloadRequested = true),
-        )
-        assertEquals(
-            ServiceWorkerDecision.KEEP_RUNNING,
-            serviceWorkerDecision(workerActive = true, configurationReloadRequested = false),
-        )
-        assertEquals(
-            ServiceWorkerDecision.START,
-            serviceWorkerDecision(workerActive = false, configurationReloadRequested = true),
-        )
-    }
-
-    @Test
     fun databaseInitializationIsGatedBehindForegroundPromotion() {
         val gate = ForegroundFirstStartupGate()
         var databaseInitialized = false

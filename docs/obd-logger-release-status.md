@@ -16,7 +16,43 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 | Poll plan | The durable settings record migrated the existing trial OFF choice, revision 1, with no fallback reason. No automatic re-arm was performed. A new physical drive is required to accept the 0.3.19 scheduling changes. |
 | Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, previously granted permissions, ownership and the original OFF bounds survived the update. Both cameras continued recording, and automatic backup resumed with the new companion. Restart evidence reports generic firmware `reboot`, with unknown physical cause. |
 
-## 0.3.20 candidate: companion-owned temperature capture
+## 0.3.21 candidate: settings and recovery hardening
+
+Source version **0.3.21/code 34** includes the 0.3.20 temperature collector below
+and addresses the pre-install app audit:
+
+- Within a running service, configuration reloads wait for the old logger's finalization and
+  coalesce into the latest replacement. They cannot cancel an intermediate join
+  and start a second logger while the original is still cleaning up.
+- Invalid unsaved settings leave the saved logger running. Explicit OFF bypasses
+  invalid drafts, durably disables only the logger and preserves other stored
+  settings, including an unreadable webhook credential. A committed save or OFF
+  issues its service action even if the setup screen closes during disk IO;
+  service-action failures are distinguished from settings-write failures.
+- Trial-setting reads and writes run on the IO dispatcher. Pending Apply is
+  guarded, captures an immutable revision-checked choice, and cannot clear a newer
+  health fallback or let an older refresh overwrite its result. Save-error and
+  stale-choice notices survive ordinary status refreshes until reviewed or changed.
+- Successful interrupted-drive recovery clears stale in-memory active-drive
+  identity and timing, allowing parked analysis to become eligible again without
+  another drive or service restart.
+- Export-recovery pagination now compares timestamps using the same SQLite sort
+  key as its ordering, preserving all entries across a page boundary even when
+  distinct sub-millisecond instants round to the same value.
+
+Local validation passed **442 Android tests**, with no failures, errors or skips,
+plus debug/release builds and lint. Lint reports zero errors and 62 warnings per
+variant. Regressions exercise blocked old-worker cleanup, transient SQLite
+finalization/recovery failures with retained samples, all 65 export-recovery rows
+across a page boundary, stale trial fallback, UI responsiveness, persistent error
+notices, Activity destruction during a real settings commit and denied service
+starts. Independent review covered lifecycle, settings and storage behavior.
+
+Installation remains deferred until the camera is awake. The installed version is
+still 0.3.19; native sleep admission, backup settings, thermal limits and the saved
+trial choice are unchanged. Device and physical-drive acceptance remain pending.
+
+## 0.3.20 included: companion-owned temperature capture
 
 Source version **0.3.20/code 33** adds a lightweight temperature collector to the
 existing admitted foreground service. It starts through normal boot/update service

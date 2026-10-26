@@ -2,6 +2,7 @@ package com.dashcamstats.obdlogger
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
@@ -20,8 +21,10 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -63,6 +66,12 @@ class MainActivity : Activity() {
     private var credentialLoadError: String? = null
     private var saving = false
     private var renderingPollTrial = false
+    private var applyingTrial = false
+    private var trialRefreshGeneration = 0L
+    private var trialApplyNotice: String? = null
+    private var trialNoticeSnapshot: TrialSettingsSnapshot? = null
+    private lateinit var storedTrial: TrialSettingsSnapshot
+    private lateinit var savedConfiguration: LoggerConfig
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -71,16 +80,20 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(TextView(this).apply { text = "Loading logger configuration…" })
         activityScope.launch {
-            val current = withContext(Dispatchers.IO) {
-                runCatching { LoggerPreferences.load(this@MainActivity) }.getOrNull()
+            val initial = withContext(Dispatchers.IO) {
+                runCatching {
+                    LoggerPreferences.load(this@MainActivity) to LoggerPreferences.pollTrialSnapshot(this@MainActivity)
+                }.getOrNull()
             }
-            if (current == null) {
+            if (initial == null) {
                 setContentView(TextView(this@MainActivity).apply {
                     text = "Logger configuration could not be loaded. Reopen the app to try again."
                 })
                 return@launch
             }
-            createConfigurationForm(current)
+            savedConfiguration = initial.first
+            storedTrial = initial.second
+            createConfigurationForm(initial.first)
             if (foreground) startStatusRefresh()
         }
     }
@@ -169,7 +182,7 @@ class MainActivity : Activity() {
                     .putBoolean(MOVEMENT_GPS_ENABLED, checked).apply()
                 if (checked) requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION,
                     Manifest.permission.ACCESS_COARSE_LOCATION), 101)
-                else if (LoggerPreferences.load(this@MainActivity, false).canRun) startLogger()
+                else startLogger()
             }
         })
         layout.addView(Button(this).apply {
@@ -212,7 +225,7 @@ class MainActivity : Activity() {
             text = "Trial: 3-second speed / RPM / MAF (applies next drive; automatic fallback)"
             isChecked = current.pollTrialEnabled
         }
-        pollTrialDraft = TrialSettingsDraft(LoggerPreferences.pollTrialSnapshot(this))
+        pollTrialDraft = TrialSettingsDraft(storedTrial)
         layout.addView(pollTrial)
         pollTrialReason = TextView(this).apply {
             text = current.pollTrialFallbackReason?.let { "${PollTrialPlan.fallbackText(it)} Check the box to re-arm." } ?: "Baseline polling is the default."
@@ -225,6 +238,8 @@ class MainActivity : Activity() {
         layout.addView(pollTrialApply)
         pollTrial.setOnCheckedChangeListener { _, checked ->
             if (renderingPollTrial) return@setOnCheckedChangeListener
+            trialApplyNotice = null
+            trialNoticeSnapshot = null
             pollTrialDraft.select(checked)
             renderTrialSetting()
         }
@@ -277,6 +292,7 @@ class MainActivity : Activity() {
         })
         layout.addView(status)
         setContentView(ScrollView(this).apply { addView(layout) })
+        renderLiveStatus()
     }
 
     override fun onResume() {
@@ -303,13 +319,18 @@ class MainActivity : Activity() {
         refreshJob?.cancel()
         refreshJob = activityScope.launch {
             while (isActive) {
-                publishedStatus = withContext(Dispatchers.IO) {
+                val generation = trialRefreshGeneration
+                val refreshed = withContext(Dispatchers.IO) {
                     val roots = listOfNotNull(
                         runCatching { DeviceFiles.removableRootOrNull(this@MainActivity) }.getOrNull(),
                         runCatching { DeviceFiles.fallbackStatusRoot(this@MainActivity) }.getOrNull(),
                     )
-                    LiveStatusSummary.readPublishedStatus(roots, System.currentTimeMillis())
+                    LiveStatusSummary.readPublishedStatus(roots, System.currentTimeMillis()) to
+                        LoggerPreferences.pollTrialSnapshot(this@MainActivity)
                 }
+                publishedStatus = refreshed.first
+                // A refresh started before Apply must not replace its newer result.
+                if (!applyingTrial && generation == trialRefreshGeneration) storedTrial = refreshed.second
                 renderLiveStatus()
                 delay(LIVE_STATUS_REFRESH_MILLIS)
             }
@@ -329,13 +350,17 @@ class MainActivity : Activity() {
     }
 
     private fun renderTrialSetting() {
-        val stored = LoggerPreferences.pollTrialSnapshot(this)
+        val stored = storedTrial
+        if (trialNoticeSnapshot != stored) trialApplyNotice = null
         pollTrialDraft.refresh(stored)
         renderingPollTrial = true
         pollTrial.isChecked = pollTrialDraft.selected
         renderingPollTrial = false
-        pollTrialApply.isEnabled = pollTrialDraft.dirty || stored.storageState == "unavailable"
+        pollTrial.isEnabled = !applyingTrial
+        pollTrialApply.isEnabled = !applyingTrial && (pollTrialDraft.dirty || stored.storageState == "unavailable")
         pollTrialReason.text = when {
+            applyingTrial -> "Saving trial setting…"
+            trialApplyNotice != null -> trialApplyNotice
             stored.storageState == "unavailable" -> "The saved trial setting is unavailable. Baseline is selected; explicitly apply your choice to recover."
             pollTrialDraft.dirty && pollTrialDraft.base.token != stored.token ->
                 "Trial state changed while this choice was pending. Apply will reload the current state for review."
@@ -347,18 +372,42 @@ class MainActivity : Activity() {
     }
 
     private fun applyTrialSetting() {
-        try {
-            pollTrialDraft.apply(TrialSettings.repository(this))
+        if (applyingTrial) return
+        val selected = pollTrialDraft.selected
+        val expected = pollTrialDraft.base
+        applyingTrial = true
+        trialApplyNotice = null
+        trialNoticeSnapshot = null
+        trialRefreshGeneration++
+        renderTrialSetting()
+        activityScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                val repository = TrialSettings.repository(this@MainActivity)
+                try {
+                    TrialApplyOutcome(repository.change(selected, null, expected))
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    TrialApplyOutcome(runCatching { repository.snapshot() }.getOrNull(), error)
+                }
+            }
+            applyingTrial = false
+            trialRefreshGeneration++
+            outcome.snapshot?.let { storedTrial = it }
+            if (outcome.error == null || outcome.error is StaleTrialSettingsException) {
+                pollTrialDraft.reload(storedTrial)
+            }
+            trialApplyNotice = when (outcome.error) {
+                null -> null
+                is StaleTrialSettingsException ->
+                    "Trial state changed. Review the current setting, choose again and apply."
+                else -> "Could not save the trial setting. Review the current state and retry Apply when storage is available."
+            }
+            trialNoticeSnapshot = storedTrial.takeIf { trialApplyNotice != null }
             renderTrialSetting()
-        } catch (_: StaleTrialSettingsException) {
-            pollTrialDraft.reload(LoggerPreferences.pollTrialSnapshot(this))
-            renderTrialSetting()
-            pollTrialReason.text = "Trial state changed. Review the current setting, choose again and apply."
-        } catch (_: TrialSettingsStorageException) {
-            renderTrialSetting()
-            pollTrialReason.text = "Could not save the trial setting. Baseline remains selected; retry Apply when storage is available."
         }
     }
+
+    private data class TrialApplyOutcome(val snapshot: TrialSettingsSnapshot?, val error: Exception? = null)
 
     private fun showCredentialError(message: String?) {
         credentialError.text = when (message) {
@@ -388,6 +437,10 @@ class MainActivity : Activity() {
 
     private fun saveAndApply() {
         if (saving) return
+        if (!enabled.isChecked) {
+            disableSavedLogger()
+            return
+        }
         val config = LoggerConfig(
             enabled = enabled.isChecked,
             ownershipTransferred = ownership.isChecked,
@@ -399,8 +452,8 @@ class MainActivity : Activity() {
             offGraceSeconds = offGraceSeconds.text.toString().toLongOrNull() ?: -1,
             parkedIntervalSeconds = parkedIntervalSeconds.text.toString().toLongOrNull() ?: -1,
             voltageOnlyMode = voltageOnlyMode.isChecked,
-            pollTrialEnabled = LoggerPreferences.load(this, false).pollTrialEnabled,
-            pollTrialFallbackReason = LoggerPreferences.load(this, false).pollTrialFallbackReason,
+            pollTrialEnabled = storedTrial.enabled,
+            pollTrialFallbackReason = storedTrial.fallbackReason,
             webhookEnabled = webhookEnabled.isChecked,
             webhookUrl = webhookUrl.text.toString().trim(),
             webhookApiKey = webhookApiKey.text.toString().trim(),
@@ -438,42 +491,90 @@ class MainActivity : Activity() {
         }
         saving = true
         status.text = "Saving settings…"
+        val appContext = applicationContext
         activityScope.launch {
-            try {
-                withContext(Dispatchers.IO) { LoggerPreferences.save(this@MainActivity, config) }
+            val applied = try {
+                // Persistence and its runtime action are one operation. Closing the form must
+                // not leave a committed setting unapplied after a slow disk write completes.
+                withContext(NonCancellable + Dispatchers.IO) {
+                    LoggerPreferences.save(appContext, config)
+                    when {
+                        !config.ownershipTransferred -> RuntimeApplyOutcome(
+                            actionFailed = runCatching {
+                                stopSavedLogger(appContext, config.ownershipTransferred)
+                            }.isFailure,
+                        )
+                        !hasLoggerPermissions(appContext) -> RuntimeApplyOutcome(needsPermissions = true)
+                        else -> RuntimeApplyOutcome(actionFailed = runCatching { reloadSavedLogger(appContext) }.isFailure)
+                    }
+                }
             } catch (error: WebhookCredentialStorageException) {
                 showCredentialError(error.message)
                 status.text = "Settings were not saved. Unlock the device and re-enter the webhook API key to try again. Existing logging continues."
+                return@launch
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                status.text = "Settings were not saved. Retry when storage is available. Existing logging continues."
                 return@launch
             } finally {
                 saving = false
             }
             credentialLoadError = config.webhookCredentialError
+            savedConfiguration = config
             showCredentialError(credentialLoadError)
-            if (config.enabled && config.ownershipTransferred) {
+            if (applied.actionFailed) {
+                status.text = "Settings saved, but the logger could not be updated. Reopen the app and retry Save and apply."
+            } else if (applied.needsPermissions) {
                 requestNeededPermissions()
             } else {
-                stopService(Intent(this@MainActivity, ObdLoggerService::class.java))
-                withContext(Dispatchers.IO) {
-                    runCatching {
-                        StatusPublisher.publish(
-                            this@MainActivity, PublicStatus("disabled", config.ownershipTransferred),
-                        )
-                    }
-                }
-                status.text = "Logger disabled"
+                status.text = if (config.ownershipTransferred) "Logger starting" else "Logger disabled"
             }
         }
     }
 
     private fun rejectConfiguration(message: String) {
-        LoggerPreferences.disable(this)
-        enabled.isChecked = false
-        stopService(Intent(this, ObdLoggerService::class.java))
-        runCatching {
-            StatusPublisher.error(this, ownership.isChecked, "invalid_configuration", message)
+        // Invalid edits are only a draft; the last saved configuration keeps running.
+        status.text = "$message. Settings were not saved; existing logging continues."
+    }
+
+    private fun disableSavedLogger() {
+        saving = true
+        status.text = "Stopping logger…"
+        val appContext = applicationContext
+        val ownershipTransferred = savedConfiguration.ownershipTransferred
+        activityScope.launch {
+            val stopped = try {
+                // Do not rewrite invalid drafts or an unreadable webhook credential just to stop.
+                withContext(NonCancellable + Dispatchers.IO) {
+                    LoggerPreferences.disablePersisted(appContext)
+                    runCatching { stopSavedLogger(appContext, ownershipTransferred) }.isSuccess
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                status.text = "Could not save the disabled setting. Existing logging continues; retry when storage is available."
+                return@launch
+            } finally {
+                saving = false
+            }
+            savedConfiguration = savedConfiguration.copy(enabled = false)
+            status.text = if (stopped) "Logger disabled. Other unsaved edits were not applied."
+                else "Disabled setting saved, but the logger could not be stopped. Retry Save and apply."
         }
-        status.text = "$message; logger disabled"
+    }
+
+    private data class RuntimeApplyOutcome(val needsPermissions: Boolean = false, val actionFailed: Boolean = false)
+
+    private fun stopSavedLogger(context: Context, ownershipTransferred: Boolean) {
+        context.stopService(Intent(context, ObdLoggerService::class.java))
+        runCatching { StatusPublisher.publish(context, PublicStatus("disabled", ownershipTransferred)) }
+    }
+
+    private fun reloadSavedLogger(context: Context) {
+        val service = Intent(context, ObdLoggerService::class.java).setAction(
+            ObdLoggerService.ACTION_RELOAD_CONFIGURATION,
+        ).putExtra(EXTRA_MOVEMENT_FROM_VISIBLE_ACTIVITY, MovementActivityVisibility.visible)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(service)
+        else context.startService(service)
     }
 
     private fun requestNeededPermissions() {
@@ -498,7 +599,7 @@ class MainActivity : Activity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 101) {
-            if (LoggerPreferences.load(this, false).canRun) startLogger()
+            startLogger()
             status.text = "Passive GPS is optional. Missing permission leaves ACC and OBD movement reporting active."
             return
         }
@@ -520,17 +621,21 @@ class MainActivity : Activity() {
     }
 
     private fun startLogger() {
-        val config = LoggerPreferences.load(this, includeWebhookCredential = false)
-        if (!config.canRun) {
-            status.text = "Ownership, valid adapter address, vehicle ID and logger ID are required"
-            return
+        activityScope.launch {
+            val config = withContext(Dispatchers.IO) {
+                runCatching { LoggerPreferences.load(this@MainActivity, includeWebhookCredential = false) }.getOrNull()
+            }
+            if (config == null) {
+                status.text = "Saved settings could not be loaded. Retry when storage is available."
+                return@launch
+            }
+            if (!config.canRun) {
+                status.text = "Ownership, valid adapter address, vehicle ID and logger ID are required"
+                return@launch
+            }
+            status.text = if (runCatching { reloadSavedLogger(applicationContext) }.isSuccess) "Logger starting"
+                else "Saved settings loaded, but the logger could not start. Reopen the app and retry Save and apply."
         }
-        val service = Intent(this, ObdLoggerService::class.java).setAction(
-            ObdLoggerService.ACTION_RELOAD_CONFIGURATION,
-        ).putExtra(EXTRA_MOVEMENT_FROM_VISIBLE_ACTIVITY, true)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(service)
-        else startService(service)
-        status.text = "Logger starting"
     }
 
     @Deprecated("Activity result API remains supported on the head unit")

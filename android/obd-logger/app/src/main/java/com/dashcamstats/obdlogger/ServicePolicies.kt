@@ -6,17 +6,6 @@ import java.time.Instant
 
 enum class ServiceStartupDecision { START, STOP_DISABLED, STOP_PERMISSION_REQUIRED }
 
-enum class ServiceWorkerDecision { START, RESTART_FOR_CONFIGURATION, KEEP_RUNNING }
-
-internal fun serviceWorkerDecision(
-    workerActive: Boolean,
-    configurationReloadRequested: Boolean,
-): ServiceWorkerDecision = when {
-    workerActive && configurationReloadRequested -> ServiceWorkerDecision.RESTART_FOR_CONFIGURATION
-    workerActive -> ServiceWorkerDecision.KEEP_RUNNING
-    else -> ServiceWorkerDecision.START
-}
-
 /**
  * Consecutive fully-unanswered poll cycles that mean the vehicle bus has gone silent.
  *

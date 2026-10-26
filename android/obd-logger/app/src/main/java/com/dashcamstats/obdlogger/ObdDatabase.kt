@@ -1238,7 +1238,7 @@ class ObdDatabase(
         val pageClause = if (afterFinishedAtUtc == null) "" else {
             """
               AND (julianday(finish_time_utc)>julianday(?)
-                   OR (finish_time_utc=? AND drive_id>?))
+                   OR (julianday(finish_time_utc)=julianday(?) AND drive_id>?))
             """.trimIndent()
         }
         val arguments = if (afterFinishedAtUtc == null) {
