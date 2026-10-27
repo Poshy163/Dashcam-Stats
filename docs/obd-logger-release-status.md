@@ -8,15 +8,23 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.19** (`versionCode` 32), installed in place on 26 October 2026 |
-| Source | `8282c8ec9b9837495cf035a1fefdb27657ade216` (`android/obd-logger/`), verified in the running companion, installed APK readback and server |
+| Version | **0.3.21** (`versionCode` 34), installed in place on 27 October 2026 |
+| Source | `b89848e4cca3a9edf6613d3994f249a919fc2d2f` (`android/obd-logger/`), verified in the running companion, installed APK readback and server |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | The durable settings record migrated the existing trial OFF choice, revision 1, with no fallback reason. No automatic re-arm was performed. A new physical drive is required to accept the 0.3.19 scheduling changes. |
-| Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, previously granted permissions, ownership and the original OFF bounds survived the update. Both cameras continued recording, and automatic backup resumed with the new companion. Restart evidence reports generic firmware `reboot`, with unknown physical cause. |
+| Poll plan | The existing trial OFF choice, revision 1 and no fallback reason were preserved. No automatic re-arm was performed. New-drive scheduling acceptance remains pending. |
+| Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, permissions, ownership, stored drive identity and original OFF bounds survived. Both cameras continued recording. Temperature capture advanced during OBD quiescing, and matching readings reached the server. Automatic backup resumed and completed with verified radio restoration. Restart evidence records `package_update` on the same kernel boot; no physical reboot test was performed. |
 
-## 0.3.21 candidate: settings and recovery hardening
+## Server update: verified existing-copy cleanup
+
+The server can verify older same-name/size candidates with full content hashes before
+removing their card copies. Bounded cleanup retains independent durable preservation
+through remote deletion, leaves changed or unverified footage intact, and runs after
+ordinary copying and radio restoration. It needs a server redeploy and no companion
+update. See [verified-duplicate-cleanup.md](verified-duplicate-cleanup.md).
+
+## 0.3.21 installed: settings and recovery hardening
 
 Source version **0.3.21/code 34** includes the 0.3.20 temperature collector below
 and addresses the pre-install app audit:
@@ -48,9 +56,12 @@ across a page boundary, stale trial fallback, UI responsiveness, persistent erro
 notices, Activity destruction during a real settings commit and denied service
 starts. Independent review covered lifecycle, settings and storage behavior.
 
-Installation remains deferred until the camera is awake. The installed version is
-still 0.3.19; native sleep admission, backup settings, thermal limits and the saved
-trial choice are unchanged. Device and physical-drive acceptance remain pending.
+Installed on 27 October. The camera captured valid temperature observations about
+30 seconds apart, including during a real OBD-quiesced backup, with exact timestamp
+and value matches in server history. The follow-up backup completed 14 files and
+verified logger/radio restoration. Native sleep admission, backup settings, thermal
+limits and the saved trial choice were preserved. Physical kernel-reboot, next-drive
+and sustained quiet-analysis acceptance remain separate pending checks.
 
 ## 0.3.20 included: companion-owned temperature capture
 

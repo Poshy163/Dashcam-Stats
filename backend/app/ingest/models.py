@@ -104,14 +104,11 @@ class DeltaPlan:
     policy_deferred_files: int = 0
     policy_deferred_bytes: int = 0
     policy_deferred_until_utc: str | None = None
-    #: Recordings the card still holds that the library already has, byte-for-byte.
-    #:
-    #: Not fetched -- that is the point of the delta -- but with delete-after-verify on they
-    #: are still the card's to give back. Without this the only files ever reclaimed were
-    #: the ones a run happened to copy itself, so everything copied before the setting was
-    #: switched on stayed on the card for good, and the card stayed full of footage that was
-    #: already safely in the library.
+    #: Legacy field, deliberately empty: a size match is never deletion authority.
     already_local: list[RemoteFile] = field(default_factory=list)
+    #: Closed recordings with a same-name, same-size local candidate. Full independent
+    #: content verification and durable preservation are required before any remote unlink.
+    duplicate_candidates: list[RemoteFile] = field(default_factory=list)
 
     @property
     def bytes(self) -> int:

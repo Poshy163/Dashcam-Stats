@@ -4431,6 +4431,7 @@ class TestReclaimingSpaceAlreadyBackedUp:
 
         assert [i.name for i in plan.files] == ["20260812120100_camera_0.ts"]
         assert plan.already_local == []
+        assert [i.name for i in plan.duplicate_candidates] == ["20260812120000_camera_0.ts"]
 
     def test_a_short_local_copy_is_refetched_not_reclaimed(self, tmp_path):
         """The size check is the whole guarantee. A truncated local copy is not a copy."""
@@ -4448,6 +4449,7 @@ class TestReclaimingSpaceAlreadyBackedUp:
 
         assert [i.name for i in plan.files] == ["20260812120000_camera_0.ts"]
         assert plan.already_local == []
+        assert plan.duplicate_candidates == []
 
     def test_an_unmounted_share_reclaims_nothing(self, tmp_path):
         """An absent mount looks like an empty directory, so nothing matches — the card
@@ -4463,6 +4465,7 @@ class TestReclaimingSpaceAlreadyBackedUp:
         )
 
         assert plan.already_local == []
+        assert plan.duplicate_candidates == []
 
     def test_a_reused_name_with_different_same_size_content_is_not_reclaimed(self, tmp_path):
         name = "20260812120000_camera_0.ts"
@@ -4478,6 +4481,7 @@ class TestReclaimingSpaceAlreadyBackedUp:
         )
 
         assert plan.already_local == []
+        assert [item.name for item in plan.duplicate_candidates] == [name]
         assert plan.files == [], "same size should not force a needless re-download"
 
     def test_the_camera_filter_never_reclaims_an_unproven_other_lens(self, tmp_path):
@@ -4494,6 +4498,24 @@ class TestReclaimingSpaceAlreadyBackedUp:
         )
 
         assert plan.already_local == []
+        assert plan.duplicate_candidates == []
+
+    def test_active_or_deliberately_removed_files_are_not_duplicate_candidates(self, tmp_path):
+        active = "20260812120000_camera_0.ts"
+        removed = "20260812115900_camera_0.ts"
+        for name in (active, removed):
+            (tmp_path / name).write_bytes(b"payload")
+        plan = delta(
+            [RemoteFile(active, 7, 95), RemoteFile(removed, 7, 20)],
+            tmp_path,
+            skip_active_s=15,
+            camera="both",
+            already_seen={removed},
+            now=100,
+        )
+        assert plan.active_skipped == 1
+        assert plan.files == []
+        assert plan.duplicate_candidates == []
 
     async def test_reclaim_groups_by_directory_and_reports_what_went(self, monkeypatch):
         from app.ingest import adb, puller

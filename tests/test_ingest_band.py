@@ -131,6 +131,35 @@ class TestParsing:
 
 
 class TestTheGate:
+    @pytest.mark.parametrize(
+        ("policy", "reply", "allowed"),
+        [
+            ("require_5ghz", _STATUS_5G, True),
+            ("require_5ghz", _STATUS_24G, False),
+            ("require_5ghz", "", False),
+            ("prefer_5ghz", _STATUS_24G, True),
+        ],
+    )
+    async def test_cleanup_checks_policy_without_any_radio_adjustment(
+        self, unit_shell, monkeypatch, policy, reply, allowed
+    ):
+        from unittest.mock import AsyncMock
+
+        unit_shell.settings.values["ingest.wifi_band"] = policy
+        unit_shell.replies["cmd wifi status"] = reply
+        nudge = AsyncMock()
+        kick = AsyncMock()
+        scan = AsyncMock()
+        monkeypatch.setattr(band, "_maybe_nudge_selection", nudge)
+        monkeypatch.setattr(band, "_maybe_kick_to_fast_band", kick)
+        monkeypatch.setattr(band, "_5g_visible", scan)
+
+        assert await band.gate("u:5555", allow_adjustments=False) is allowed
+        assert unit_shell.commands == ["cmd wifi status"]
+        nudge.assert_not_awaited()
+        kick.assert_not_awaited()
+        scan.assert_not_awaited()
+
     async def test_policy_any_asks_the_unit_nothing(self, unit_shell):
         assert await band.gate("u:5555")
         assert unit_shell.commands == []

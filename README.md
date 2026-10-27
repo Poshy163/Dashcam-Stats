@@ -184,6 +184,11 @@ What that means in practice:
   produces a truncated file that looks complete.
 - **Nothing is deleted from the card** unless you explicitly enable it, and then only
   after a verified copy has been committed.
+- **Older duplicates receive a full content check before cleanup.** Matching filename
+  and size only identifies a candidate. A bounded pass verifies complete SHA-256 hashes
+  and retains an independent durable server copy through deletion; uncertain or changed
+  files stay protected. See [verified duplicate cleanup](docs/verified-duplicate-cleanup.md)
+  for limits and recovery evidence. This server update needs no companion APK change.
 - **The unit's other radios can get out of the way.** Turn on **Turn off Bluetooth and
   the hotspot while copying** and they are switched off while recordings are moving —
   they share the unit's single-stream WiFi chip, and the transfer already runs at that

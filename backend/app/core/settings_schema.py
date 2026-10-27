@@ -1687,10 +1687,9 @@ SETTINGS: tuple[SettingDef, ...] = (
         "bool",
         False,
         "ingest",
-        "Off by default. A file is only ever removed from the card once a byte-complete "
-        "copy of it is in the footage directory — including recordings copied by an "
-        "earlier run, so switching this on reclaims the space taken by everything already "
-        "backed up rather than only by what is copied from now on.",
+        "Off by default. New files are removed only after a complete, durable server copy. "
+        "Older duplicates require a full content match first. Cleanup is bounded and "
+        "defers when verification fails or the camera's remaining awake window is too short.",
         dangerous=True,
         requires="ingest.enabled",
     ),

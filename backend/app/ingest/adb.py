@@ -1208,6 +1208,158 @@ async def delete_if_unchanged(address: str, source: str, items: list[RemoteFile]
     return sum(line.strip() == "deleted" for line in reply.splitlines())
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedRemoteFile:
+    """A full-content proof bound to one unit, directory and pinned file identity."""
+
+    address: str
+    source: str
+    name: str
+    size: int
+    mtime: int
+    identity: str
+    sha256: str
+
+
+_VERIFIED_STAT_FORMAT = "%d|%i|%s|%Y|%Z|%y|%z"
+_VERIFIED_TIMESTAMP = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{9} [+-]\d{4}"
+_VERIFIED_IDENTITY = re.compile(
+    rf"\d{{1,20}}\|\d{{1,20}}\|\d{{1,20}}\|\d{{1,20}}\|\d{{1,20}}\|"
+    rf"{_VERIFIED_TIMESTAMP}\|{_VERIFIED_TIMESTAMP}"
+)
+_VERIFIED_SHA256 = re.compile(r"[0-9a-f]{64}")
+_VERIFIED_DIRECTORY = re.compile(r"/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*")
+
+
+def _verified_remote_inputs(source: str, item: RemoteFile) -> tuple[str, str]:
+    if not _VERIFIED_DIRECTORY.fullmatch(source) or any(
+        part in {".", ".."} for part in source.split("/")
+    ):
+        raise AdbError("refusing an unsafe verified-delete source path")
+    if item.directory and item.directory != source:
+        raise AdbError("verified-delete source does not match the inventory")
+    name = _checked(item.name)
+    if (
+        type(item.size) is not int
+        or item.size <= 0
+        or type(item.mtime) is not int
+        or item.mtime < 0
+    ):
+        raise AdbError("verified-delete requires a nonempty inventoried recording")
+    return source, name
+
+
+def _matches_verified_identity(identity: str, item: RemoteFile) -> bool:
+    if not _VERIFIED_IDENTITY.fullmatch(identity):
+        return False
+    _device, inode, size, mtime, _ctime, _modified, _changed = identity.split("|")
+    return int(inode) > 0 and int(size) == item.size and int(mtime) == item.mtime
+
+
+def _pinned_remote_probe(name: str) -> str:
+    # /proc/$$ names the owning shell, including when stat/sha256sum run in children.
+    # Opening an fd pins the hashed inode if the recorder replaces its pathname.
+    return (
+        f"[ -f '{name}' ] && [ ! -L '{name}' ] || exit 0; "
+        f"before=$(stat -c '{_VERIFIED_STAT_FORMAT}' '{name}' 2>/dev/null) || exit 0; "
+        f"exec 7<'{name}' || exit 0; "
+        f"[ \"$(stat -L -c '{_VERIFIED_STAT_FORMAT}' /proc/$$/fd/7 2>/dev/null)\" "
+        '= "$before" ] || exit 0; '
+    )
+
+
+def _pinned_remote_unchanged(name: str) -> str:
+    return (
+        f"[ -f '{name}' ] && [ ! -L '{name}' ] && "
+        f"[ \"$(stat -c '{_VERIFIED_STAT_FORMAT}' '{name}' 2>/dev/null)\" = \"$before\" ] && "
+        f"[ \"$(stat -L -c '{_VERIFIED_STAT_FORMAT}' /proc/$$/fd/7 2>/dev/null)\" "
+        '= "$before" ]'
+    )
+
+
+async def verify_remote_file(
+    address: str,
+    source: str,
+    item: RemoteFile,
+    expected_sha256: str,
+    *,
+    timeout: float = 10.0,
+) -> VerifiedRemoteFile | None:
+    """Hash one pinned regular file fully; this read-only phase never deletes anything.
+
+    Unsupported stat precision, command failure, mutation or timeout preserves the file.
+    The caller must revalidate its pinned local copy before passing this proof to deletion.
+    """
+    source, name = _verified_remote_inputs(source, item)
+    if not _VERIFIED_SHA256.fullmatch(expected_sha256):
+        raise AdbError("verified-delete requires an exact SHA-256 digest")
+    if not math.isfinite(timeout) or timeout <= 0:
+        return None
+    command = (
+        f"cd '{source}' || exit 0; "
+        + _pinned_remote_probe(name)
+        + "sum=$(sha256sum <&7 2>/dev/null) || exit 0; "
+        + f'[ "$sum" = "{expected_sha256}  -" ] || exit 0; '
+        + _pinned_remote_unchanged(name)
+        + f" && printf 'dashcam-verified:%s\\n{expected_sha256}\\n' \"$before\"; exit 0"
+    )
+    try:
+        reply = await shell(address, command, timeout=timeout)
+    except (AdbError, TimeoutError):
+        return None
+    lines = reply.splitlines()
+    if len(lines) != 2 or not lines[0].startswith("dashcam-verified:"):
+        return None
+    identity = lines[0].removeprefix("dashcam-verified:")
+    if lines[1] != expected_sha256 or not _matches_verified_identity(identity, item):
+        return None
+    return VerifiedRemoteFile(
+        normalised_address(address), source, name, item.size, item.mtime, identity, expected_sha256
+    )
+
+
+async def delete_verified_remote_file(
+    address: str,
+    source: str,
+    item: RemoteFile,
+    verified: VerifiedRemoteFile,
+    *,
+    timeout: float = 10.0,
+) -> bool:
+    """Recheck one full-hash proof after local verification, then unlink that member.
+
+    A second full hash catches rewrites even when FAT timestamps have coarse precision;
+    the pinned inode and before/after metadata checks also reject path replacement.
+    A shell stat/unlink still has the platform's inherent final pathname race; callers
+    restrict this to closed recordings while retaining their verified local copy.
+    """
+    source, name = _verified_remote_inputs(source, item)
+    if (
+        (verified.address, verified.source, verified.name, verified.size, verified.mtime)
+        != (normalised_address(address), source, name, item.size, item.mtime)
+        or not _VERIFIED_SHA256.fullmatch(verified.sha256)
+        or not _matches_verified_identity(verified.identity, item)
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        return False
+    command = (
+        f"cd '{source}' || exit 0; "
+        + _pinned_remote_probe(name)
+        + f'[ "$before" = "{verified.identity}" ] || exit 0; '
+        + "sum=$(sha256sum <&7 2>/dev/null) || exit 0; "
+        + f'[ "$sum" = "{verified.sha256}  -" ] || exit 0; '
+        + _pinned_remote_unchanged(name)
+        + f" && rm -f '{name}' && printf 'dashcam-verified-deleted\\n'; exit 0"
+    )
+    try:
+        return (
+            await shell(address, command, timeout=timeout)
+        ).strip() == "dashcam-verified-deleted"
+    except (AdbError, TimeoutError):
+        return False
+
+
 async def describe(address: str, override: str = "") -> UnitInfo:
     """Discover the card without interrupting a responsive or maintenance-owned channel."""
     info = UnitInfo(address=address)

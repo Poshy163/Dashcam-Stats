@@ -30,6 +30,7 @@ from app.core.settings_service import get_settings_service
 from app.ingest import (
     adb,
     band,
+    duplicate_cleanup,
     elevate,
     movement,
     obd_control,
@@ -676,6 +677,62 @@ async def _reclaim(
     return removed
 
 
+async def _cleanup_existing_duplicates(
+    info: UnitInfo,
+    footage: Path,
+    candidates: list[RemoteFile],
+    *,
+    clock_known: bool,
+    storage_safe: bool,
+    admitted: bool,
+    result: RunResult,
+    status: IngestStatus,
+) -> None:
+    """Optional cleanup after transfer and radio restoration, under this run's ownership."""
+    if (
+        not candidates
+        or not admitted
+        or not bool(_get("delete_after_verify", False))
+        or not clock_known
+        or not storage_safe
+        or result.state not in (RunState.OK, RunState.IDLE)
+        or status.cancel_event.is_set()
+    ):
+        return
+    remaining = status.sleep_countdown_remaining_s()
+    if remaining is None or remaining <= 15:
+        return
+    try:
+        # No hashing/deletion may compete with restoration or a different radio owner.
+        if await asyncio.wait_for(radio_coordinator.pending_recovery_address(), timeout=3):
+            return
+        if status.cancel_event.is_set():
+            return
+        status.set_phase(Phase.VERIFYING)
+        cleaned = await duplicate_cleanup.cleanup_verified_duplicates(
+            info,
+            footage,
+            candidates,
+            native_remaining=status.sleep_countdown_remaining_s,
+            cancelled=status.cancel_event.is_set,
+        )
+        log.info(
+            "checked existing server copies before camera duplicate cleanup",
+            attempted_files=cleaned.attempted_files,
+            verified_files=cleaned.verified_files,
+            deleted_files=cleaned.deleted_files,
+            deleted_bytes=cleaned.deleted_bytes,
+            retained_preservations=cleaned.retained_preservations,
+            skipped_files=cleaned.skipped_files,
+            stop_reason=cleaned.stop_reason,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # A cleanup fault retains camera files; it cannot fail an already durable backup.
+        log.warning("camera duplicate cleanup deferred", error_category=type(exc).__name__)
+
+
 def _group_names(names: list[str], where: dict[str, str]) -> dict[str, list[str]]:
     """Bucket committed filenames by the directory they came from.
 
@@ -1167,11 +1224,10 @@ def delta(
         except OSError:
             same = False
         if same:
-            # Skip the redundant download, but do not classify this remote object as safe
-            # to delete. The footage transport preserves neither remote mtime nor a digest/
-            # receipt, so a same-size local filename cannot prove it contains the current
-            # remote bytes when the recorder reuses a name. Only this run's committed
-            # inventory is eligible for reclaim.
+            # This is an unverified candidate, never permission to unlink. The optional
+            # cleanup pass compares full hashes and preserves a durable independent copy.
+            if camera == "both" or item.name.endswith(f"_{camera}.ts"):
+                plan.duplicate_candidates.append(item)
             continue
 
         plan.backlog_files += 1
@@ -2084,6 +2140,10 @@ async def _run_pull_started(
     expected: dict[str, int] = {}
     initial_backlog_sizes: dict[str, int] = {}
     interrupted_error: str | None = None
+    duplicate_candidates: list[RemoteFile] = []
+    duplicate_clock_known = False
+    duplicate_safety: asyncio.Task | None = None
+    duplicate_cleanup_admitted = False
 
     def cancel_for_radio_lease_loss() -> None:
         detail = getattr(radio_transition, "lease_loss_error", None)
@@ -2170,6 +2230,7 @@ async def _run_pull_started(
         # that series is worth hundreds of milliseconds -- which is footage, at 34 MB/s.
         removed = _preflight(preflight, _deliberately_removed())
         safety = _preflight(preflight, _footage_is_safe_to_write(footage))
+        duplicate_safety = safety
         cleaned = asyncio.create_task(
             asyncio.to_thread(_clean, staging), name="ingest-staging-clean"
         )
@@ -2264,6 +2325,7 @@ async def _run_pull_started(
         # Carried as an offset rather than an absolute, so the listing's own duration
         # cannot age the reading: the guard is judged at the moment the delta runs.
         unit_now = await adb.unit_clock(info.address) if analysis_waited else await clock
+        duplicate_clock_known = unit_now is not None
         skew = (unit_now - time.time()) if unit_now is not None else 0.0
         if abs(skew) >= 5.0:
             log.info(
@@ -2299,6 +2361,11 @@ async def _run_pull_started(
         camera = str(_get("camera_filter", "both"))
         if camera != "both":
             plan.files = [item for item in plan.files if item.name.endswith(f"_{camera}.ts")]
+        duplicate_candidates = [
+            item
+            for item in plan.duplicate_candidates
+            if camera == "both" or item.name.endswith(f"_{camera}.ts")
+        ]
         # A second opinion on which files are still open, from two sizes rather than one
         # timestamp. Only when there is something to fetch, so an idle window still costs
         # exactly one listing.
@@ -2346,6 +2413,14 @@ async def _run_pull_started(
             return result
 
         if not plan.files and not remote_obd:
+            if (
+                duplicate_candidates
+                and duplicate_clock_known
+                and bool(_get("delete_after_verify", False))
+            ):
+                # Cleanup-only runs honor the band policy without nudging Wi-Fi,
+                # restarting adbd, quiescing the logger or creating a radio lease.
+                duplicate_cleanup_admitted = await band.gate(info.address, allow_adjustments=False)
             result = RunResult(state=RunState.IDLE)
             return result
 
@@ -2546,6 +2621,7 @@ async def _run_pull_started(
                 return result
 
         if not plan.files:
+            duplicate_cleanup_admitted = True
             if obd_result is not None and (obd_result.copied or obd_result.duplicates):
                 result = RunResult(
                     state=RunState.OK,
@@ -2657,6 +2733,7 @@ async def _run_pull_started(
         if status.cancel_event.is_set():
             result = RunResult(state=RunState.CANCELLED)
             return result
+        duplicate_cleanup_admitted = True
         status.set_phase(Phase.TRANSFERRING)
         if not continuation:
             # A radio hold is not a started copy. Notifications remain asynchronous
@@ -3181,12 +3258,32 @@ async def _run_pull_started(
         # Any preflight nobody got as far as needing -- an idle window, a share that failed
         # its checks. Collected rather than abandoned, so a short run cannot leave a task
         # complaining that its result was never retrieved.
+        duplicate_storage_safe = False
+        if (
+            duplicate_safety is not None
+            and duplicate_safety.done()
+            and not duplicate_safety.cancelled()
+        ):
+            with contextlib.suppress(Exception):
+                duplicate_storage_safe = bool(duplicate_safety.result()[0])
         for task in preflight:
             task.cancel()
         if preflight:
             await asyncio.gather(*preflight, return_exceptions=True)
         for task in staging_cleanup_tasks:
             await _join_staging_cleanup(task)
+
+        if info is not None:
+            await _cleanup_existing_duplicates(
+                info,
+                footage,
+                duplicate_candidates,
+                clock_known=duplicate_clock_known,
+                storage_safe=duplicate_storage_safe,
+                admitted=duplicate_cleanup_admitted,
+                result=result,
+                status=status,
+            )
 
         if result.seconds <= 0:
             result.seconds = time.monotonic() - started

@@ -377,7 +377,7 @@ async def _5g_visible(address: str, ssid: str) -> bool | None:
     return parse_scan_for_5g(reply, ssid)
 
 
-async def gate(address: str) -> bool:
+async def gate(address: str, *, allow_adjustments: bool = True) -> bool:
     """Whether the transfer may start. Called once per run, before a byte moves.
 
     Every path that cannot positively say "the band is wrong" lets the transfer proceed —
@@ -397,10 +397,18 @@ async def gate(address: str) -> bool:
     # re-evaluating so it does not slide back. The move itself takes a scan cycle or two,
     # so this run may still read 2.4 -- under `require` the thirty-second re-check catches
     # the result, and under `prefer` the following window does.
-    await _maybe_nudge_selection(address)
+    if allow_adjustments:
+        await _maybe_nudge_selection(address)
 
     frequency, ssid = await read_link(address)
     if frequency is None:
+        if not allow_adjustments and policy == "require_5ghz":
+            _publish(
+                None,
+                held=True,
+                reason="Could not verify the required 5GHz band; duplicate cleanup is deferred.",
+            )
+            return False
         _publish(None, held=False, reason=None)
         log.warning(
             "could not read the unit's WiFi band; transferring anyway rather than "
@@ -414,7 +422,8 @@ async def gate(address: str) -> bool:
     # On the slow radio, and the unit itself cannot be made to leave it. If the operator has
     # given this app their access point, ask it to drop the unit so it re-associates and
     # picks the strongest radio -- which at every measured parking spot is the 5 GHz one.
-    frequency = await _maybe_kick_to_fast_band(address, frequency)
+    if allow_adjustments:
+        frequency = await _maybe_kick_to_fast_band(address, frequency)
     if frequency is None:
         _publish(
             None,
@@ -445,7 +454,7 @@ async def gate(address: str) -> bool:
     # Holding. Worth one scan to tell the two very different causes apart, because they
     # have different fixes and the operator can act on neither without being told which
     # one they have.
-    visible = await _5g_visible(address, ssid)
+    visible = await _5g_visible(address, ssid) if allow_adjustments else None
     if visible is True:
         detail = (
             "your network is on 5GHz and in range, but the unit associated on 2.4GHz and "
