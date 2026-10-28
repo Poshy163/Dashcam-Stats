@@ -286,6 +286,10 @@ class ObdLoggerService : Service() {
                                 val sleep = sleepWindowController?.snapshot()
                                 journal.parkedNow() && sleep?.ingestionStateKnown == true &&
                                     !sleep.ingestionRequestActive && currentDriveId == null
+                            }, workMode = {
+                                val sleep = sleepWindowController?.snapshot()
+                                clipIndexWorkMode(journal.parkedNow(), currentDriveId != null,
+                                    sleep?.ingestionStateKnown == true, sleep?.ingestionRequestActive == true)
                             })
                             passiveMotion = PassiveMotionObserver(applicationContext, journal).also { observer ->
                                 // A background restart requires background location permission.
@@ -2260,7 +2264,10 @@ class ObdLoggerService : Service() {
 
     private fun recordSleepWindowObservation(value: SleepWindowControllerObservation) {
         when (value) {
-            is SleepWindowControllerObservation.AccRead -> motionJournal?.acc(value.on)
+            is SleepWindowControllerObservation.AccRead -> {
+                motionJournal?.acc(value.on)
+                clipIndexer?.notifyWorkModeChanged()
+            }
             SleepWindowControllerObservation.DeadlineUpdated -> scheduleSleepStatusPublish()
             is SleepWindowControllerObservation.Wifi -> emitEvent(
                 kind = "network.wifi",

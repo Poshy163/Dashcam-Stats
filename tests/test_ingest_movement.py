@@ -603,10 +603,13 @@ async def test_inspection_timeout_can_update_unknown_ram_while_initial_disk_load
     assert blocked.store.doc is None and blocked.store.snapshot()["error"] == "read_timeout"
 
 
+@pytest.mark.parametrize(
+    "report_status", ["directory_required", "driving_or_power_unknown", "ingestion_deferred"]
+)
 async def test_api_exposes_directory_requirement_and_only_reads_cached_state(
-    client, monkeypatch, tmp_path, manifest
+    client, monkeypatch, tmp_path, manifest, report_status
 ):
-    manifest.update(card_id=None, status="directory_required", clips=[])
+    manifest.update(card_id=None, status=report_status, clips=[])
     movement.validate_manifest(json.dumps(manifest))
     store = movement.MovementStatus(tmp_path / "last.json")
     store.observe(manifest, verified_inventory(manifest, [], ""), None)
@@ -616,19 +619,24 @@ async def test_api_exposes_directory_requirement_and_only_reads_cached_state(
     response = await client.get("/api/ingest/movement-status")
     assert response.status_code == 200
     body = response.json()
-    assert body["report_status"] == "directory_required"
+    assert body["report_status"] == report_status
     assert body["report_only"] and not body["transfer_filtering"]
     shell.assert_not_awaited()
 
 
-async def test_new_companion_movement_capability_and_fields_reach_obd_status(client, monkeypatch):
+@pytest.mark.parametrize(
+    "movement_state", ["directory_required", "driving_or_power_unknown", "ingestion_deferred"]
+)
+async def test_new_companion_movement_capability_and_fields_reach_obd_status(
+    client, monkeypatch, movement_state
+):
     raw = {
         "schema_version": 5,
         "state": "parked",
         "app_version_name": "0.3.9",
         "app_version_code": 22,
         "capabilities": [movement.CAPABILITY],
-        "movement_state": "directory_required",
+        "movement_state": movement_state,
         "movement_clip_count": 0,
         "movement_gps_state": "permission_required",
         "movement_report_only": True,
@@ -649,7 +657,7 @@ async def test_new_companion_movement_capability_and_fields_reach_obd_status(cli
         transfer.set_logger(clean)
         response = await client.get("/api/obd/status")
         assert response.status_code == 200
-        assert response.json()["logger"]["movement_state"] == "directory_required"
+        assert response.json()["logger"]["movement_state"] == movement_state
         assert movement.CAPABILITY in response.json()["logger"]["capabilities"]
     finally:
         transfer.set_logger(previous)

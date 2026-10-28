@@ -46,10 +46,18 @@ The private SQLite journal is separate from immutable OBD bundles and bounded to
 days or 100,000 observations. Optional observations batch for up to ten seconds to reduce
 flash writes; normal service shutdown drains accepted observations within a bounded wait.
 Persisted gap ranges keep affected windows unknown after queue or storage failures, while
-later fully observed windows can recover. The clip indexer runs at background priority,
-waiting up to one minute after a completed scan while the visual policy is disabled, or
-five seconds while it is enabled. Visual decoding runs separately on a dedicated
-background thread, so a slow decode does not block metadata and policy refreshes.
+later fully observed windows can recover. The clip indexer runs at background priority.
+From companion 0.3.22, full scans require fresh ignition-OFF evidence, no active
+drive and a known inactive ingestion request. While parked, the next scan waits
+up to one minute with the visual policy disabled, or five seconds while enabled.
+Driving or unknown ignition permits only a bounded metadata refresh at most once
+per minute, without per-clip history queries, fingerprints or routine report writes.
+An active or unknown ingestion request pauses optional indexing. Power and movement
+observations continue independently, and entering the parked mode wakes a full scan
+without waiting for the driving interval. Leaving parked invalidates published policy
+authority; a partial scan cannot publish incomplete quiet evidence as fresh proof.
+Visual decoding runs separately on a dedicated background thread, so a slow decode
+does not block metadata and policy refreshes.
 The advisory report reads directory metadata and bounded content samples for file
 fingerprints. Whole-video visual analysis belongs to the separate opt-in policy.
 A file must be unchanged across scans before receiving usable timing evidence.

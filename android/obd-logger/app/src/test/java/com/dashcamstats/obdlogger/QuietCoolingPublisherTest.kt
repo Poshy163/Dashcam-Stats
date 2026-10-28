@@ -10,6 +10,8 @@ import java.time.format.DateTimeFormatter
 import kotlin.time.Duration.Companion.minutes
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.StandardTestDispatcher
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -18,6 +20,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
 @RunWith(RobolectricTestRunner::class)
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class QuietCoolingPublisherTest {
     private class Fixture(scope: CoroutineScope) : AutoCloseable {
         val context = ApplicationProvider.getApplicationContext<Context>()
@@ -109,6 +112,34 @@ class QuietCoolingPublisherTest {
             repeat(rows.length()) { assertTrue(ClipTransferPolicy.validVisual(rows.getJSONObject(it).getJSONObject("visual"))) }
             policy.publish(items, f.card, "ready", false) { it.camera == "camera_0" }
             assertEquals(0, policy.skipCount)
+            policy.stop()
+        }
+    }
+
+    @Test fun indexingAdmissionLossDuringDecodeCanRetryWithoutPersistingTerminalFailure() = runTest {
+        Fixture(backgroundScope).use { f ->
+            val items = listOf(f.item(0), f.item(1))
+            var indexingAllowed = true
+            f.response = { indexingAllowed = false; quiet() }
+            val policy = ClipTransferPolicy(f.context, f.journal, { f.root }, { f.allowed }, f.analyzer,
+                { f.now }, backgroundScope, analysisDispatcher = StandardTestDispatcher(testScheduler),
+                indexingAllowed = { indexingAllowed })
+            policy.publish(items, f.card, "ready", false) { true }
+            val deadline = f.report().getJSONArray("decisions").getJSONObject(0).getString("defer_until_utc")
+            runCurrent()
+            assertEquals(1, f.analyses)
+            assertFalse(f.cache.exists())
+            indexingAllowed = true
+            f.response = { quiet() }
+            repeat(2) {
+                policy.publish(items, f.card, "ready", false) { true }
+                runCurrent()
+            }
+            policy.publish(items, f.card, "ready", false) { true }
+            assertEquals(3, f.analyses)
+            assertEquals(2, policy.skipCount)
+            assertEquals(Instant.ofEpochMilli(f.start + 30_000 + QUIET_TRANSFER_DEFER_MS).toString(), deadline)
+            assertFalse(f.cache.readText().contains("analysis_storage_unavailable"))
             policy.stop()
         }
     }

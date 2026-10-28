@@ -8,9 +8,15 @@ case "$SEQUENCE" in ''|*[!0-9]*) exit 2;; esac
 [ -n "$LOGFILE" ] || exit 2
 case "$PRIO" in v|d|i|w|e) ;; *) PRIO=w;; esac
 LOCK=/data/local/tmp/.dashcam_cpt_codec_capture.lock
+GUARD=/data/local/tmp/.dashcam_cpt_codec_capture.guard
+LEGACY_SCRIPT=/data/local/tmp/dashcam_carplay_codec.sh
+umask 077
 SELFSTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$$/stat" 2>/dev/null)
 TOKEN="$$:${SELFSTART:-unknown}:$SESSION:$SEQUENCE"
+PIPE="$LOCK/pipe-$$-${SELFSTART:-unknown}"
+SUMMARYFILE="$LOCK/summary-$$-${SELFSTART:-unknown}"
 STATUS=unavailable; ATRACERC=na; OWNED=0; STARTED=0
+LOCKSTATUS=not_attempted; GUARDED=0; CREATED=0; LOCKID=; GUARDID=
 ATRACEPID=; AWKPID=; WATCHPID=; TRACEPATH=; SUMMARY=
 clock_ms() { awk '{printf "%.0f",$1*1000}' /proc/uptime 2>/dev/null; }
 STARTMS=$(clock_ms); STARTMS=${STARTMS:-0}
@@ -23,8 +29,213 @@ read_state() {
 }
 owns_lock() {
   [ "$OWNED" = 1 ] || return 1
+  owns_workspace || return 1
   read owner < "$LOCK/owner" 2>/dev/null
   [ "$owner" = "$TOKEN" ]
+}
+owns_workspace() {
+  [ "$CREATED" = 1 ] && [ "$GUARDED" = 1 ] && [ ! -L "$LOCK" ] &&
+    [ "$(stat -c '%d:%i' "$LOCK" 2>/dev/null)" = "$LOCKID" ] &&
+    [ ! -L "$GUARD" ] && [ "$(stat -c '%d:%i:%u:%a' "$GUARD" 2>/dev/null)" = "$GUARDID" ]
+}
+safe_members() {
+  for member in "$LOCK"/* "$LOCK"/.[!.]* "$LOCK"/..?*; do
+    [ -e "$member" ] || [ -L "$member" ] || continue
+    [ ! -L "$member" ] || return 1
+    case "$member" in
+      "$LOCK/owner"|"$LOCK/summary") [ -f "$member" ] || return 1;;
+      "$LOCK/pipe") [ -p "$member" ] || return 1;;
+      "$LOCK/pipe-"*|"$LOCK/summary-"*)
+        suffix=${member##*/}; suffix=${suffix#*-}
+        member_pid=${suffix%%-*}; member_start=${suffix#*-}
+        [ "$suffix" = "$member_pid-$member_start" ] || return 1
+        case "$member_pid" in ''|*[!0-9]*) return 1;; esac
+        case "$member_start" in ''|*[!0-9]*) return 1;; esac
+        case "$member" in "$LOCK/pipe-"*) [ -p "$member" ] || return 1;; *) [ -f "$member" ] || return 1;; esac;;
+      *) return 1;;
+    esac
+  done
+}
+remove_members() {
+  safe_members || return 1
+  for member in "$LOCK"/* "$LOCK"/.[!.]* "$LOCK"/..?*; do
+    [ -e "$member" ] || [ -L "$member" ] || continue
+    rm -f "$member" || return 1
+  done
+}
+legacy_helpers_absent() {
+  # A stalled pre-flock initializer can be older than its normal capture window.
+  # Age alone is never proof. Do not signal it or reclaim its ambiguous workspace.
+  LEGACYSTATUS=legacy_owner_unknown
+  [ -r /proc/1/stat ] || return 1
+  read scan_start ignored < /proc/uptime || return 1
+  scan_start=${scan_start%%.*}; scanned=0
+  for process in /proc/[0-9]*; do
+    [ "$process" != "/proc/$$" ] || continue
+    scanned=$((scanned+1)); [ "$scanned" -le 512 ] || return 1
+    read scan_now ignored < /proc/uptime || return 1
+    scan_now=${scan_now%%.*}
+    [ "$((scan_now-scan_start))" -le 2 ] || return 1
+    comm=
+    if ! read comm < "$process/comm" 2>/dev/null; then
+      [ ! -d "$process" ] && continue
+      return 1
+    fi
+    case "$comm" in sh|mksh|bash|dash|ash|busybox|dashcam_carplay*|atrace) ;; *) continue;; esac
+    process_uid=$(awk '$1=="Uid:" {print $3;exit}' "$process/status" 2>/dev/null)
+    if [ -z "$process_uid" ]; then [ ! -d "$process" ] && continue; return 1; fi
+    [ "$process_uid" = "$CAPTUREUID" ] || continue
+    process_start=$(awk '{sub(/^.*\) /,"");print $20}' "$process/stat" 2>/dev/null)
+    case "$process_start" in ''|*[!0-9]*) [ ! -d "$process" ] && continue; return 1;; esac
+    arguments=$({ head -c 65537 "$process/cmdline" 2>/dev/null || printf '\000codec_read_failed\000'; printf '\000codec_read_end'; } | tr '\000' '\n') || {
+      [ ! -d "$process" ] && continue
+      return 1
+    }
+    case "$arguments" in *codec_read_failed*) [ ! -d "$process" ] && continue; return 1;; esac
+    case "$arguments" in *"
+codec_read_end") arguments=${arguments%"
+codec_read_end"};; *) return 1;; esac
+    [ "${#arguments}" -le 65536 ] || return 1
+    actual_start=$(awk '{sub(/^.*\) /,"");print $20}' "$process/stat" 2>/dev/null)
+    if [ "$actual_start" != "$process_start" ]; then
+      [ ! -d "$process" ] && continue
+      return 1
+    fi
+    if [ "$comm" = atrace ]; then LEGACYSTATUS=legacy_atrace_active; return 1; fi
+    case "
+$arguments
+" in *"
+$0
+"*|*"
+$LEGACY_SCRIPT
+"*) LEGACYSTATUS=legacy_helper_active; return 1;; esac
+  done
+}
+valid_owner() {
+  oldpid=${previous_owner%%:*}; rest=${previous_owner#*:}
+  oldstart=${rest%%:*}; rest=${rest#*:}
+  oldsession=${rest%%:*}; oldsequence=${rest#*:}
+  [ "$previous_owner" = "$oldpid:$oldstart:$oldsession:$oldsequence" ] || return 1
+  case "$oldpid" in ''|0|*[!0-9]*) return 1;; esac
+  case "$oldstart" in ''|*[!0-9]*) return 1;; esac
+  case "$oldsession" in ''|*[!A-Za-z0-9_.-]*) return 1;; esac
+  case "$oldsequence" in ''|*[!0-9]*) return 1;; esac
+}
+acquire_guard() {
+  # The inode is permanent. Unlinking a flock file would let a second invocation
+  # lock a replacement inode while the first capture still owns the original.
+  if [ ! -e "$GUARD" ] && [ ! -L "$GUARD" ]; then
+    (set -C; : > "$GUARD") 2>/dev/null || :
+  fi
+  [ -f "$GUARD" ] && [ ! -L "$GUARD" ] || {
+    LOCKSTATUS=unsafe_guard; STATUS=lock_unavailable; return 1;
+  }
+  GUARDID=$(stat -c '%d:%i:%u:%a' "$GUARD" 2>/dev/null)
+  case "$GUARDID" in ''|*[!0-9:]*) LOCKSTATUS=unsafe_guard; STATUS=lock_unavailable; return 1;; esac
+  case "$GUARDID" in *":$CAPTUREUID:600") ;; *)
+    LOCKSTATUS=unsafe_guard; STATUS=lock_unavailable; return 1;; esac
+  # Reading the stable regular file does not truncate or rewrite another owner.
+  { exec 8< "$GUARD"; } 2>/dev/null || {
+    LOCKSTATUS=guard_unavailable; STATUS=lock_unavailable; return 1;
+  }
+  [ "$(stat -L -c '%d:%i:%u:%a' /proc/$$/fd/8 2>/dev/null)" = "$GUARDID" ] || {
+    LOCKSTATUS=unsafe_guard; STATUS=lock_unavailable; return 1;
+  }
+  flock -n 8 2>/dev/null || { LOCKSTATUS=guard_busy; STATUS=capture_busy; return 1; }
+  [ ! -L "$GUARD" ] && [ "$(stat -c '%d:%i:%u:%a' "$GUARD" 2>/dev/null)" = "$GUARDID" ] || {
+    LOCKSTATUS=unsafe_guard; STATUS=lock_unavailable; return 1;
+  }
+  GUARDED=1
+}
+acquire_workspace() {
+  LOCKSTATUS=acquired
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    [ -d "$LOCK" ] && [ ! -L "$LOCK" ] || {
+      LOCKSTATUS=unsafe_workspace; STATUS=lock_unavailable; return 1;
+    }
+    attributes=$(stat -c '%u:%a' "$LOCK" 2>/dev/null)
+    case "$attributes" in "$CAPTUREUID":7[0145][0145]) ;; *)
+      LOCKSTATUS=unsafe_workspace; STATUS=lock_unavailable; return 1;; esac
+    [ -r "$LOCK" ] && [ -w "$LOCK" ] && [ -x "$LOCK" ] && safe_members || {
+      LOCKSTATUS=unsafe_workspace; STATUS=lock_unavailable; return 1;
+    }
+    previous_id=$(stat -c '%d:%i' "$LOCK" 2>/dev/null)
+    previous_owner=
+    if [ -e "$LOCK/owner" ]; then
+      permissions=$(stat -c '%u:%a' "$LOCK/owner" 2>/dev/null)
+      case "$permissions" in "$CAPTUREUID":[46][04][04]) ;; *)
+        LOCKSTATUS=owner_unreadable; STATUS=lock_owner_unavailable; return 1;; esac
+      [ -r "$LOCK/owner" ] || {
+        LOCKSTATUS=owner_unreadable; STATUS=lock_owner_unavailable; return 1;
+      }
+      previous_owner=$(awk 'NR==1 && length($0)<=200 {value=$0} NR>1 {bad=1;exit} END {if(!bad)print value}' "$LOCK/owner" 2>/dev/null) || {
+        LOCKSTATUS=owner_unreadable; STATUS=lock_owner_unavailable; return 1;
+      }
+      LOCKSTATUS=recovered_malformed_owner
+    else
+      LOCKSTATUS=recovered_missing_owner
+    fi
+    if valid_owner; then
+      if [ -d "/proc/$oldpid" ]; then
+        actual_start=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$oldpid/stat" 2>/dev/null)
+        case "$actual_start" in ''|*[!0-9]*)
+          LOCKSTATUS=owner_unknown; STATUS=lock_owner_unavailable; return 1;; esac
+        if [ "$actual_start" = "$oldstart" ]; then
+          LOCKSTATUS=live_owner; STATUS=capture_busy; return 1
+        fi
+      elif [ ! -r /proc/1/stat ]; then
+        LOCKSTATUS=owner_unknown; STATUS=lock_owner_unavailable; return 1
+      fi
+      LOCKSTATUS=recovered_dead_owner
+    else
+      # A partial token naming an extant process is still unknown ownership,
+      # never evidence that its directory is safe to take.
+      case "$oldpid" in ''|0|*[!0-9]*) ;;
+        *) if [ -d "/proc/$oldpid" ]; then
+          LOCKSTATUS=owner_unknown; STATUS=lock_owner_unavailable; return 1
+        fi;;
+      esac
+      # Legacy initializers did not use the kernel guard. Do not take a young
+      # empty/partial directory from an invocation still publishing its owner.
+      changed=$(stat -c '%Y' "$LOCK" 2>/dev/null); now=$(date +%s 2>/dev/null)
+      case "$changed:$now" in ''|*[!0-9:]*)
+        LOCKSTATUS=owner_unknown; STATUS=lock_owner_unavailable; return 1;; esac
+      [ -n "$changed" ] && [ -n "$now" ] && [ "$now" -ge "$changed" ] && [ "$((now-changed))" -ge 30 ] || {
+        LOCKSTATUS=initializing; STATUS=capture_busy; return 1;
+      }
+    fi
+    # A recorded dead parent does not prove its legacy producer/parser children
+    # exited. They never held the new guard and may not have enabled tracing yet.
+    legacy_helpers_absent || { LOCKSTATUS=$LEGACYSTATUS; STATUS=lock_owner_unavailable; return 1; }
+    read_state
+    [ "$STATE" = 0 ] && [ "$TRACER" = nop ] || {
+      LOCKSTATUS=trace_changed; STATUS=trace_busy_or_unavailable; return 1;
+    }
+    [ ! -L "$LOCK" ] && [ "$(stat -c '%d:%i' "$LOCK" 2>/dev/null)" = "$previous_id" ] && safe_members || {
+      LOCKSTATUS=recovery_failed; STATUS=lock_recovery_failed; return 1;
+    }
+    current_owner=
+    if [ -e "$LOCK/owner" ]; then
+      current_owner=$(awk 'NR==1 && length($0)<=200 {value=$0} NR>1 {bad=1;exit} END {if(!bad)print value}' "$LOCK/owner" 2>/dev/null) || {
+        LOCKSTATUS=recovery_failed; STATUS=lock_recovery_failed; return 1;
+      }
+    fi
+    [ "$current_owner" = "$previous_owner" ] || {
+      LOCKSTATUS=recovery_failed; STATUS=lock_recovery_failed; return 1;
+    }
+    # Serialized by the permanent flock, never an unguarded stale-owner rm.
+    remove_members && rmdir "$LOCK" 2>/dev/null && mkdir "$LOCK" 2>/dev/null || {
+      LOCKSTATUS=recovery_failed; STATUS=lock_recovery_failed; return 1;
+    }
+  fi
+  LOCKID=$(stat -c '%d:%i' "$LOCK" 2>/dev/null)
+  case "$LOCKID" in ''|*[!0-9:]*) LOCKSTATUS=initialization_failed; STATUS=lock_initialization_failed; return 1;; esac
+  CREATED=1
+  printf '%s\n' "$TOKEN" > "$LOCK/owner" || {
+    LOCKSTATUS=initialization_failed; STATUS=lock_initialization_failed; return 1;
+  }
+  OWNED=1
+  owns_lock || { LOCKSTATUS=initialization_failed; STATUS=lock_initialization_failed; return 1; }
 }
 finish() {
   trap - EXIT TERM INT
@@ -36,7 +247,9 @@ finish() {
     kill -KILL "$ATRACEPID" 2>/dev/null
     wait "$ATRACEPID" 2>/dev/null
   fi
-  if [ -n "$AWKPID" ]; then kill "$AWKPID" 2>/dev/null; wait "$AWKPID" 2>/dev/null; fi
+  # Its independent timeout also covers a child blocked opening an orphan FIFO.
+  # Do not kill the timeout supervisor and leave its parser child unbounded.
+  if [ -n "$AWKPID" ]; then wait "$AWKPID" 2>/dev/null; fi
   read_state
   if [ "$STARTED" = 1 ] && owns_lock && [ "$STATE" = 1 ] && [ "$TRACER" = nop ]; then
     # Only this live invocation may clean up its interrupted capture. Skipped
@@ -51,19 +264,20 @@ finish() {
   ENDMS=$(clock_ms); ENDMS=${ENDMS:-$STARTMS}
   ELAPSED=$((ENDMS-STARTMS))
   [ "$ELAPSED" -ge 0 ] || ELAPSED=0
-  if owns_lock && [ -r "$LOCK/summary" ]; then read SUMMARY < "$LOCK/summary"; fi
+  if owns_lock && [ -r "$SUMMARYFILE" ]; then read SUMMARY < "$SUMMARYFILE"; fi
   # The parser's output is a fixed whitelist of numeric fields. Error captures
   # retain counts/health flags, but cannot expose partially healthy latency.
   if [ "$STATUS" != ok ]; then
     SUMMARY=$(printf '%s\n' "$SUMMARY" | sed 's/codec_latency_med_ms=[^ ]*/codec_latency_med_ms=na/;s/codec_latency_p95_ms=[^ ]*/codec_latency_p95_ms=na/;s/codec_latency_max_ms=[^ ]*/codec_latency_max_ms=na/')
   fi
-  MESSAGE="sample=$SESSION-codec-$SEQUENCE session=$SESSION schema=6 | event=codec_capture codec_capture_status=$STATUS codec_capture_start_ms=$STARTMS codec_capture_end_ms=$ENDMS codec_capture_ms=$ELAPSED codec_trace_off=$OFF codec_atrace_rc=$ATRACERC $SUMMARY"
+  MESSAGE="sample=$SESSION-codec-$SEQUENCE session=$SESSION schema=6 | event=codec_capture codec_capture_status=$STATUS codec_lock_status=$LOCKSTATUS codec_capture_start_ms=$STARTMS codec_capture_end_ms=$ENDMS codec_capture_ms=$ELAPSED codec_trace_off=$OFF codec_atrace_rc=$ATRACERC $SUMMARY"
   printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$MESSAGE" >> "$LOGFILE"
   log -p "$PRIO" -t CarPlayTiming "$MESSAGE" 2>/dev/null
-  if owns_lock; then
-    rm -f "$LOCK/pipe" "$LOCK/summary" "$LOCK/owner"
+  if owns_workspace && safe_members; then
+    remove_members
     rmdir "$LOCK" 2>/dev/null
   fi
+  exec 8<&-
 }
 trap finish EXIT
 trap 'STATUS=interrupted; exit 0' TERM INT
@@ -73,45 +287,25 @@ for path in /sys/kernel/tracing /sys/kernel/debug/tracing; do
 done
 read_state
 if [ "$STATE" != 0 ] || [ "$TRACER" != nop ]; then STATUS=trace_busy_or_unavailable; exit 0; fi
-for tool in atrace awk timeout mkfifo; do
+for tool in atrace awk timeout mkfifo flock stat id cat tr head; do
   command -v "$tool" >/dev/null 2>&1 || { STATUS=tool_unavailable; exit 0; }
 done
+CAPTUREUID=$(id -u 2>/dev/null)
+case "$CAPTUREUID:$SELFSTART" in ''|*[!0-9:]*) STATUS=lock_unavailable; LOCKSTATUS=identity_unavailable; exit 0;; esac
+[ -n "$CAPTUREUID" ] && [ -n "$SELFSTART" ] || { STATUS=lock_unavailable; LOCKSTATUS=identity_unavailable; exit 0; }
 set -- $(pidof com.zjinnova.zlink 2>/dev/null)
 [ "$#" = 1 ] || { STATUS=zlink_missing_or_ambiguous; exit 0; }
 ZPID=$1
 case "$ZPID" in ''|*[!0-9]*) STATUS=zlink_missing_or_ambiguous; exit 0;; esac
 ZSTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$ZPID/stat" 2>/dev/null)
 case "$ZSTART" in ''|*[!0-9]*) STATUS=zlink_identity_unavailable; exit 0;; esac
-if ! mkdir "$LOCK" 2>/dev/null; then
-  # A reboot/forced kill can leave this fixed directory. Recover only a recorded
-  # owner proven dead (or its PID demonstrably reused), while tracing is off.
-  read previous_owner < "$LOCK/owner" 2>/dev/null
-  oldpid=${previous_owner%%:*}; rest=${previous_owner#*:}; oldstart=${rest%%:*}
-  dead=0
-  case "$oldpid:$oldstart" in ''|*[!0-9:]*) ;;
-    *)
-      if [ ! -d "/proc/$oldpid" ]; then dead=1
-      else
-        actual_start=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$oldpid/stat" 2>/dev/null)
-        case "$actual_start" in ''|*[!0-9]*) ;; *) [ "$actual_start" = "$oldstart" ] || dead=1;; esac
-      fi;;
-  esac
-  read_state
-  read current_owner < "$LOCK/owner" 2>/dev/null
-  if [ "$dead" = 1 ] && [ "$STATE" = 0 ] && [ "$TRACER" = nop ] && [ "$current_owner" = "$previous_owner" ]; then
-    rm -f "$LOCK/pipe" "$LOCK/summary" "$LOCK/owner"
-    rmdir "$LOCK" 2>/dev/null
-  fi
-  mkdir "$LOCK" 2>/dev/null || { STATUS=capture_busy; exit 0; }
-fi
-OWNED=1
-printf '%s\n' "$TOKEN" > "$LOCK/owner"
-mkfifo "$LOCK/pipe" || { STATUS=pipe_failed; exit 0; }
+acquire_guard && acquire_workspace || exit 0
+mkfifo "$PIPE" || { STATUS=pipe_failed; exit 0; }
 # Recheck after acquiring our guard; never start over an already active tracer.
 read_state
 if [ "$STATE" != 0 ] || [ "$TRACER" != nop ]; then STATUS=trace_busy_or_unavailable; exit 0; fi
 
-awk -v zpid="$ZPID" '
+CODEC_PROGRAM=$(cat <<'CODEC_AWK'
 # BEGIN_CODEC_AWK
 function quantile(p, rank, lo, hi) {
   if (!matches) return "na"
@@ -237,11 +431,21 @@ END {
   printf " codec_dequeue_output_n=%d codec_release_output_n=%d codec_render_output_n=%d\n",dequeue_output_n,release_output_n,render_output_n
 }
 # END_CODEC_AWK
-' < "$LOCK/pipe" > "$LOCK/summary" 2>/dev/null &
+CODEC_AWK
+)
+(
+  # Close the guard before opening the FIFO, and put that potentially blocking
+  # open inside the timeout's child. SIGKILL of the parent cannot wedge the lock
+  # or leak a parser waiting forever for a producer that was never launched.
+  exec 8<&-
+  exec timeout -s KILL 10 sh -c 'exec awk -v zpid="$1" "$2" < "$3" > "$4"' codec "$ZPID" "$CODEC_PROGRAM" "$PIPE" "$SUMMARYFILE"
+) 2>/dev/null &
 AWKPID=$!
 STARTMS=$(clock_ms); STARTMS=${STARTMS:-0}
+read_state
+if [ "$STATE" != 0 ] || [ "$TRACER" != nop ]; then STATUS=trace_busy_or_unavailable; exit 0; fi
 STARTED=1
-atrace -t 5 -b 2048 gfx video > "$LOCK/pipe" 2>/dev/null &
+atrace -t 5 -b 2048 gfx video > "$PIPE" 2>/dev/null &
 ATRACEPID=$!
 ATRACESTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$ATRACEPID/stat" 2>/dev/null)
 AWKSTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$AWKPID/stat" 2>/dev/null)
@@ -254,7 +458,7 @@ AWKSTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$AWKPID/stat" 2>/dev/null)
   sleep_pid=
   # ATRACERC is collected before the parent clears this watchdog. The parent
   # reaps this watchdog before releasing the lock or starting another capture.
-  for owned_child in "$ATRACEPID:$ATRACESTART" "$AWKPID:$AWKSTART"; do
+  for owned_child in "$ATRACEPID:$ATRACESTART"; do
     child_pid=${owned_child%%:*}; child_start=${owned_child#*:}
     [ -n "$child_pid" ] && [ -n "$child_start" ] || continue
     actual_start=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$child_pid/stat" 2>/dev/null)
@@ -272,8 +476,8 @@ STATUS=ok
 [ "$AWKRC" = 0 ] || STATUS=parser_error
 ZEND=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$ZPID/stat" 2>/dev/null)
 [ "$ZEND" = "$ZSTART" ] || STATUS=process_changed
-if [ -r "$LOCK/summary" ]; then
-  read SUMMARY < "$LOCK/summary"
+if [ -r "$SUMMARYFILE" ]; then
+  read SUMMARY < "$SUMMARYFILE"
   case "$SUMMARY" in
     codec_stats_status=ok\ *) ;;
     codec_stats_status=no_markers\ *) [ "$STATUS" != ok ] || STATUS=no_markers;;

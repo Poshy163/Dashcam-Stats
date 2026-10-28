@@ -101,7 +101,7 @@ internal object LiveStatusSummary {
         out += "Bundles waiting for the server: $pending"
         if (status.optBoolean("movement_report_only", false)) {
             val movement = allowedText(status, "movement_state", setOf("starting", "ready", "directory_required",
-                "directory_unavailable", "storage_unavailable", "scan_failed"))
+                "directory_unavailable", "storage_unavailable", "scan_failed", "driving_or_power_unknown", "ingestion_deferred"))
             out += "Movement report: $movement · ${counter(status, "movement_clip_count")} clips (advisory only)"
         }
         if (status.has("transfer_policy_enabled")) out += "Quiet footage filter: " +

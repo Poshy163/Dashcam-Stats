@@ -64,6 +64,275 @@ def native_observation(*, age=300, remaining=900):
     )
 
 
+def starting_logger(**changes):
+    return ready_logger(
+        movement_state="driving_or_power_unknown", transfer_policy_state="unavailable", **changes
+    )
+
+
+async def test_fresh_off_indexer_startup_refetches_inventory_and_policy_before_handoff(
+    prepared_unit, monkeypatch
+):
+    unit = prepared_unit
+    unit.options.update(skip_parked_footage=True, quiet_radios=True)
+    state = get_status()
+    state.observe_unit_runtime(native_observation(age=1, remaining=1199))
+    initial = list(unit.inventory.return_value)
+    latest = [RemoteFile("20261028000100_camera_0.ts", 10, 0)]
+    monkeypatch.setattr(puller, "QUIET_INDEXER_RECHECK_S", 0.001)
+    monkeypatch.setattr(
+        puller.adb,
+        "runtime_observation",
+        AsyncMock(return_value=native_observation(age=1, remaining=1199)),
+    )
+    monkeypatch.setattr(puller, "read_logger_status", AsyncMock(return_value=ready_logger()))
+    inventory = AsyncMock(return_value=latest)
+    monkeypatch.setattr(puller.adb, "inventory_all", inventory)
+    completed = parked_filter.FilterResult([], analysis_ready=True)
+    refilter = AsyncMock(return_value=completed)
+    monkeypatch.setattr(puller, "_filter_parked_inventory", refilter)
+    begin = AsyncMock(side_effect=AssertionError("startup wait must not quiesce"))
+    monkeypatch.setattr(puller.radio_coordinator, "begin", begin)
+
+    result = await asyncio.wait_for(
+        puller._quiet_analysis_handoff(
+            unit.info,
+            [unit.info.source],
+            initial,
+            starting_logger(),
+            parked_filter.FilterResult(initial),
+            footage=unit.path.parent,
+            seen=set(),
+        ),
+        1,
+    )
+    assert result[0] == latest
+    assert result[1]["movement_state"] == "ready"
+    assert result[2] is completed and result[3] is True
+    inventory.assert_awaited_once_with(unit.info.address, [unit.info.source])
+    refilter.assert_awaited_once_with(unit.info, latest, result[1])
+    begin.assert_not_awaited()
+    assert state.snapshot()["analysis_wait_until_utc"] is None
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"acc_on": True},
+        {"acc_state_known": False},
+        {"current_drive_id": "active"},
+        {"engine_running": True},
+        {"ingestion_sleep_hold": True},
+        {"ingestion_sleep_hold_known": False},
+        {"transfer_policy_enabled": False},
+        {"capabilities": []},
+        {"head_unit_state": "sleeping"},
+        {"updated_at_utc": (datetime.now(UTC) - timedelta(seconds=31)).isoformat()},
+    ],
+)
+def test_startup_grace_requires_same_fresh_parked_admission(changes):
+    assert puller._logger_indexer_starting(starting_logger())
+    assert not puller._logger_can_analyze(starting_logger())
+    assert not puller._logger_indexer_starting(starting_logger(**changes))
+
+
+async def test_persistent_startup_state_expires_at_original_off_without_renewal(
+    prepared_unit, monkeypatch
+):
+    unit = prepared_unit
+    state = get_status()
+    off_at = datetime.now(UTC)
+    real_loop = asyncio.get_running_loop()
+
+    class ClockLoop:
+        offset = 0.0
+
+        def time(self):
+            return real_loop.time() + self.offset
+
+    clock = ClockLoop()
+
+    class ClockAsyncio:
+        def get_running_loop(self):
+            return clock
+
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+    class ClockDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) + timedelta(seconds=clock.offset)
+
+    monkeypatch.setattr(puller, "asyncio", ClockAsyncio())
+    monkeypatch.setattr(puller, "datetime", ClockDateTime)
+    monkeypatch.setattr(puller, "_analysis_native_budget", lambda _: (off_at, 900.0))
+    monkeypatch.setattr(puller, "QUIET_INDEXER_RECHECK_S", 0.005)
+    monkeypatch.setattr(state, "observe_unit_runtime", Mock(return_value=False))
+    refresh = AsyncMock(return_value=native_observation())
+    monkeypatch.setattr(puller.adb, "runtime_observation", refresh)
+
+    async def still_unready(*_args):
+        # Advance both clocks past the fixed OFF+10 boundary after a real successful
+        # unready-status probe, rather than relying on host scheduling within 60 ms.
+        clock.offset = puller.QUIET_INDEXER_STARTUP_WINDOW_S + 1
+        return starting_logger()
+
+    monkeypatch.setattr(puller, "read_logger_status", AsyncMock(side_effect=still_unready))
+    inventory = AsyncMock(
+        side_effect=AssertionError("unready indexer cannot authorize inventory/filter")
+    )
+    monkeypatch.setattr(puller.adb, "inventory_all", inventory)
+    remote = list(unit.inventory.return_value)
+    filtered = parked_filter.FilterResult(remote)
+    first = await asyncio.wait_for(
+        puller._await_parked_indexer(
+            unit.info, [unit.info.source], remote, starting_logger(), filtered
+        ),
+        1,
+    )
+    assert first[-1] is True
+    calls = refresh.await_count
+    assert calls > 0
+    second = await puller._await_parked_indexer(
+        unit.info, [unit.info.source], remote, starting_logger(), filtered
+    )
+    assert second[-1] is False
+    assert refresh.await_count == calls
+    inventory.assert_not_awaited()
+
+
+@pytest.mark.parametrize("next_state", ["on", "expired", "failed"])
+async def test_startup_grace_power_window_or_probe_failure_uploads_normally(
+    prepared_unit, monkeypatch, next_state
+):
+    unit = prepared_unit
+    state = get_status()
+    state.observe_unit_runtime(native_observation(age=1, remaining=1199))
+    observation = (
+        RuntimeObservation("boot", 1001, "on", 1200)
+        if next_state == "on"
+        else native_observation(age=1, remaining=239)
+        if next_state == "expired"
+        else None
+    )
+    monkeypatch.setattr(puller, "QUIET_INDEXER_RECHECK_S", 0.001)
+    monkeypatch.setattr(puller.adb, "runtime_observation", AsyncMock(return_value=observation))
+    monkeypatch.setattr(puller, "read_logger_status", AsyncMock(return_value=starting_logger()))
+    inventory = AsyncMock(side_effect=AssertionError("lost admission must keep ordinary upload"))
+    monkeypatch.setattr(puller.adb, "inventory_all", inventory)
+    remote = list(unit.inventory.return_value)
+    filtered = parked_filter.FilterResult(remote)
+    result = await asyncio.wait_for(
+        puller._await_parked_indexer(
+            unit.info, [unit.info.source], remote, starting_logger(), filtered
+        ),
+        1,
+    )
+    assert result[0] == remote and result[2] is filtered and result[-1] is True
+    inventory.assert_not_awaited()
+
+
+async def test_stop_during_startup_grace_does_not_probe_or_claim(prepared_unit, monkeypatch):
+    unit = prepared_unit
+    state = get_status()
+    state.observe_unit_runtime(native_observation(age=1, remaining=1199))
+    state.try_begin()
+    monkeypatch.setattr(puller, "QUIET_INDEXER_RECHECK_S", 0.1)
+    refresh = AsyncMock(side_effect=AssertionError("cancelled startup cannot probe"))
+    monkeypatch.setattr(puller.adb, "runtime_observation", refresh)
+    remote = list(unit.inventory.return_value)
+    task = asyncio.create_task(
+        puller._await_parked_indexer(
+            unit.info,
+            [unit.info.source],
+            remote,
+            starting_logger(),
+            parked_filter.FilterResult(remote),
+        )
+    )
+    while state.phase is not Phase.ANALYSING:
+        assert not task.done()
+        await asyncio.sleep(0)
+    state.cancel()
+    assert (await asyncio.wait_for(task, 1))[-1] is True
+    refresh.assert_not_awaited()
+    assert state.snapshot()["analysis_wait_until_utc"] is None
+
+
+async def test_startup_policy_refetch_cannot_outlive_original_grace(prepared_unit, monkeypatch):
+    unit = prepared_unit
+    state = get_status()
+    off_at = datetime.now(UTC)
+    monkeypatch.setattr(puller, "_analysis_native_budget", lambda _: (off_at, 900.0))
+    monkeypatch.setattr(state, "observe_unit_runtime", Mock(return_value=False))
+    monkeypatch.setattr(puller, "QUIET_INDEXER_RECHECK_S", 0.001)
+    monkeypatch.setattr(
+        puller.adb, "runtime_observation", AsyncMock(return_value=native_observation())
+    )
+    monkeypatch.setattr(puller, "read_logger_status", AsyncMock(return_value=ready_logger()))
+    monkeypatch.setattr(puller.adb, "inventory_all", AsyncMock(return_value=[]))
+    cancelled = asyncio.Event()
+    timeouts = []
+    real_timeout = asyncio.timeout
+
+    def record_timeout(delay):
+        timeout = real_timeout(delay)
+        timeouts.append((delay, timeout))
+        return timeout
+
+    monkeypatch.setattr(puller.asyncio, "timeout", record_timeout)
+
+    async def blocked_policy(*_args):
+        assert len(timeouts) == 2
+        probe_delay, probe_timeout = timeouts[0]
+        policy_delay, policy_timeout = timeouts[1]
+        assert 0 < policy_delay <= probe_delay <= puller.QUIET_INDEXER_STARTUP_WINDOW_S
+        assert policy_timeout.when() == pytest.approx(probe_timeout.when(), abs=0.01)
+        # Expire the actual production timeout only after the blocked operation has
+        # started. A busy test runner cannot spend the tiny grace before this checkpoint.
+        policy_timeout.reschedule(asyncio.get_running_loop().time())
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(puller, "_filter_parked_inventory", blocked_policy)
+    remote = list(unit.inventory.return_value)
+    filtered = parked_filter.FilterResult(remote)
+    result = await asyncio.wait_for(
+        puller._await_parked_indexer(
+            unit.info, [unit.info.source], remote, starting_logger(), filtered
+        ),
+        15,
+    )
+    assert cancelled.is_set()
+    assert result[0] == remote and result[2] is filtered and result[-1] is True
+    assert state.snapshot()["analysis_wait_until_utc"] is None
+
+
+@pytest.mark.parametrize("skip,quiet", [(False, True), (True, False), (False, False)])
+async def test_startup_grace_requires_both_existing_optins(prepared_unit, monkeypatch, skip, quiet):
+    unit = prepared_unit
+    unit.options.update(skip_parked_footage=skip, quiet_radios=quiet)
+    get_status().observe_unit_runtime(native_observation(age=1, remaining=1199))
+    refresh = AsyncMock(side_effect=AssertionError("disabled startup grace must not probe"))
+    monkeypatch.setattr(puller.adb, "runtime_observation", refresh)
+    remote = list(unit.inventory.return_value)
+    filtered = parked_filter.FilterResult(remote)
+    result = await puller._quiet_analysis_handoff(
+        unit.info,
+        [unit.info.source],
+        remote,
+        starting_logger(),
+        filtered,
+        footage=unit.path.parent,
+        seen=set(),
+    )
+    assert result[-1] is False
+    refresh.assert_not_awaited()
+
+
 def current_policy():
     # The complete past/post guards already exist; only visual analysis is pending.
     doc = make_deferred_policy(now=datetime.now(UTC) - timedelta(seconds=150))

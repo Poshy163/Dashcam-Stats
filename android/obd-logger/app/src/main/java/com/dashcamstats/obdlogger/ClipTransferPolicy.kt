@@ -21,6 +21,7 @@ import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.util.concurrent.Executors
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -91,7 +92,8 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
     private val wallMs: () -> Long = System::currentTimeMillis,
     private val analysisScope: CoroutineScope? = null,
     private val afterAnalysis: () -> Unit = {},
-    private val analysisDispatcher: CoroutineDispatcher? = null) {
+    private val analysisDispatcher: CoroutineDispatcher? = null,
+    private val indexingAllowed: () -> Boolean = { true }) {
     @Volatile var state = "disabled"; private set
     @Volatile var skipCount = 0; private set
     @Volatile var uploadCount = 0; private set
@@ -101,8 +103,10 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
     private val cached = linkedMapOf<String, JSONObject>()
     private var resourceRetry = QuietResourceRetry()
     private val cacheLock = Any()
-    private val attempted = mutableMapOf<String, Long>()
+    private val attempted = ConcurrentHashMap<String, Long>()
     private var analysisJob: Job? = null
+    @Volatile private var indexingSuspended = false
+    @Volatile private var analysisIdentity: String? = null
     private val ownedDecoderDispatcher = lazy { quietDecoderDispatcher() }
     @Volatile private var stopped = false
     private var sequence = 0L
@@ -147,9 +151,11 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
     }
 
     private fun evaluate(items: List<PolicyClip>, card: String?, now: Long): MutableList<JSONObject> {
+        ensureIndexingAllowed()
         val active = enabled
         val observedThrough = journal.latestAccWallMs()?.coerceAtMost(now)
         return items.map { item ->
+            ensureIndexingAllowed()
             val clip = item.clip
             val body = JSONObject(item.body.toString())
             val visual = card?.let { synchronized(cacheLock) {
@@ -210,6 +216,8 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
 
     suspend fun publish(items: List<PolicyClip>, card: String?, reportState: String, truncated: Boolean,
                         unchanged: (MovementClip) -> Boolean) {
+        ensureIndexingAllowed()
+        indexingSuspended = false
         sequence++
         val present = if (card == null) emptySet() else items.map { key(it, card) }.toSet()
         synchronized(cacheLock) {
@@ -222,6 +230,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         var rows = evaluate(items, card, wallMs())
         fun recheckQuietIdentities() {
             for (row in rows) if (row.optString("decision") == "skip") {
+                ensureIndexingAllowed()
                 val item = items.singleOrNull { it.clip.relativePath == row.getJSONObject("clip").optString("relative_path") }
                 if (item == null || !unchanged(item.clip)) row.put("decision", "upload")
                     .put("reason", "unstable_or_unreadable").put("defer_until_utc", JSONObject.NULL)
@@ -266,15 +275,18 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
             currentCoroutineContext().ensureActive()
             state = "scanning"
             val identity = key(candidate, card)
+            analysisIdentity = identity
             attempted[identity] = sequence
             suspend fun analyzeCandidate() {
                 val deadline = checkNotNull(candidate.boundEndMs) + QUIET_ANALYSIS_RETRY_MS
                 var visual = try { analyzer.analyze(candidate.uri) {
-                    !stopped && enabled && allowed() && wallMs() < deadline
+                    !stopped && !indexingSuspended && enabled && allowed() && wallMs() < deadline
                 } } catch (error: Exception) {
-                    if (error is CancellationException) throw error
+                    if (error is CancellationException || error is ClipIndexWorkDeferred) throw error
                     emptyVisual("error", QuietAnalysisReason.DECODER_FAILURE)
                 }
+                currentCoroutineContext().ensureActive()
+                ensureIndexingAllowed()
                 if (!unchanged(candidate.clip)) visual = emptyVisual("incomplete", QuietAnalysisReason.CLIP_CHANGED)
                 // Persist bounded resource retries; other failures remain ordinary uploads after restart.
                 synchronized(cacheLock) {
@@ -287,7 +299,10 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
             }
             if (analysisScope == null) {
                 // Deterministic publisher harness uses the identical analysis path inline.
-                analyzeCandidate()
+                try { analyzeCandidate() } catch (error: ClipIndexWorkDeferred) {
+                    attempted.remove(identity)
+                    throw error
+                }
                 rows = evaluate(items, card, wallMs())
             } else analysisJob = analysisScope.launch(analysisDispatcher ?: ownedDecoderDispatcher.value) {
                 fun failed(reason: QuietAnalysisReason = QuietAnalysisReason.ANALYSIS_STORAGE_UNAVAILABLE) {
@@ -312,7 +327,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                     analyzeCandidate()
                 } catch (error: Exception) {
                     if (error is CancellationException) throw error
-                    failed()
+                    if (error is ClipIndexWorkDeferred) attempted.remove(identity) else failed()
                 } finally {
                     try { afterAnalysis() } catch (error: Exception) {
                         if (error is CancellationException) throw error
@@ -326,7 +341,33 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         writeReport(rows, card, reportState, truncated)
     }
 
-    private fun writeReport(baseRows: List<JSONObject>, card: String?, reportState: String, truncated: Boolean): Set<String> {
+    private fun ensureIndexingAllowed() {
+        if (!indexingAllowed()) throw ClipIndexWorkDeferred()
+    }
+
+    /** Safe from the ACC observer: cancellation and flags only, with no storage work. */
+    fun pauseIndexing() {
+        indexingSuspended = true
+        analysisJob?.cancel()
+    }
+
+    /** Revoke public decisions without discarding durable visual proofs or retry history. */
+    fun suspendIndexing(reason: String): Boolean {
+        pauseIndexing()
+        analysisIdentity?.let { attempted.remove(it) }
+        val destination = root()
+        if (destination == null) {
+            state = "unavailable"; skipCount = 0; deferCount = 0; uploadCount = 0
+            return false
+        }
+        writeReport(emptyList(), null, reason, true, requireIndexing = false, destination = destination)
+        return true
+    }
+
+    private fun writeReport(baseRows: List<JSONObject>, card: String?, reportState: String,
+                            truncated: Boolean, requireIndexing: Boolean = true,
+                            destination: File? = root()): Set<String> {
+        if (requireIndexing) ensureIndexingAllowed()
         val active = enabled
         // Keep own qualification immutable. Repeated publication/truncation must not
         // recursively turn a quiet boundary witness into missing evidence for its peer.
@@ -361,7 +402,8 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         skipCount = rows.count { it.optString("decision") == "skip" }
         deferCount = rows.count { it.optString("decision") == "defer" }
         uploadCount = rows.size - skipCount - deferCount
-        root()?.let { atomicJson(File(it, "movement/transfer-policy.json"), output) }
+        if (requireIndexing) ensureIndexingAllowed()
+        destination?.let { atomicJson(File(it, "movement/transfer-policy.json"), output) }
         return rows.map { it.getJSONObject("clip").getString("relative_path") }.toSet()
     }
 

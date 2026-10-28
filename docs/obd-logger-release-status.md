@@ -24,6 +24,38 @@ through remote deletion, leaves changed or unverified footage intact, and runs a
 ordinary copying and radio restoration. It needs a server redeploy and no companion
 update. See [verified-duplicate-cleanup.md](verified-duplicate-cleanup.md).
 
+## 0.3.22 candidate: driving workload and diagnostic recovery
+
+Source version **0.3.22/code 35** reduces optional clip-indexing work while the
+car is in use. Immediate movement and power observations continue. Full clip
+assessment, fingerprints and report publication require fresh parked evidence;
+bounded driving metadata refreshes run on a slower cadence. A parked transition
+wakes the normal analysis path promptly, and interrupted scans cannot publish
+fresh skip decisions from incomplete evidence.
+
+The matching server update fixes the CarPlay codec diagnostic guard. A persistent
+kernel file lock serializes capture and recovery, while validated stale workspace
+metadata can be recovered without deleting a new owner's files. Active owners,
+active tracing and unreadable or unsafe filesystem state are preserved. Capture
+outcome and lock status are reported separately; a skipped capture never means
+zero decoder latency.
+
+Deploy the server for the diagnostic helper update, and install the production-signed
+0.3.22 APK for the indexing change. Neither change alters the saved OBD trial choice,
+native sleep timing, recorder controls or backup enablement. Device installation,
+recovery of the actual retained lock, and a subsequent CarPlay drive comparison
+remain physical acceptance checks. These changes do not establish a fix for the
+phone-to-screen lag observed on 28 October.
+
+Local validation passed **3,854 backend tests** (144 platform/optional skips),
+**450 Android tests** including the saved private-grid replay, and **254 frontend
+tests**. Both APK assemblies and debug/release lint passed with zero lint errors
+and the existing 62 warnings per variant. Python formatting/lint and frontend
+type checking/lint/production build passed. Executable Linux `sh`/`mksh` recovery,
+contention and crash fixtures are mandatory in CI; their Windows skips are explicit.
+Independent review covered capture ownership, interrupted indexing, cache retention
+and the bounded pre-backup readiness wait.
+
 ## 0.3.21 installed: settings and recovery hardening
 
 Source version **0.3.21/code 34** includes the 0.3.20 temperature collector below

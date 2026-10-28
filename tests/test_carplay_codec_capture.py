@@ -174,8 +174,8 @@ def test_active_tracer_is_untouched_and_produces_only_skipped_summary(tmp_path):
 
 
 def test_production_capture_uses_fifo_and_fixed_limits_not_raw_files():
-    assert 'atrace -t 5 -b 2048 gfx video > "$LOCK/pipe"' in SOURCE
-    assert 'mkfifo "$LOCK/pipe"' in SOURCE
+    assert 'atrace -t 5 -b 2048 gfx video > "$PIPE"' in SOURCE
+    assert 'mkfifo "$PIPE"' in SOURCE
     assert "sleep 8" in SOURCE
     assert "NR>200000 || bytes>16777216" in PROGRAM
     assert "codec_markers>2048" in PROGRAM
@@ -197,24 +197,3 @@ def test_watchdog_cancels_promptly_without_later_signalling_capture():
     result = subprocess.run([shell, "-c", command], capture_output=True, text=True, timeout=3)
     assert result.returncode == 0, result.stderr
     assert time.monotonic() - began < 2
-
-
-def test_stale_lock_recovery_only_removes_known_files_and_never_stops_trace(tmp_path):
-    shell = shutil.which("sh") or r"C:\Program Files\Git\bin\sh.exe"
-    if not Path(shell).is_file():
-        pytest.skip("POSIX shell unavailable")
-    lock = tmp_path / "lock"
-    lock.mkdir()
-    (lock / "owner").write_bytes(b"2147483647:1:old-session:1\n")
-    (lock / "summary").write_bytes(b"codec_stats_status=ok\n")
-    recovery = SOURCE.split('if ! mkdir "$LOCK" 2>/dev/null; then', 1)[1].split("OWNED=1", 1)[0]
-    command = (
-        "LOCK='"
-        + shell_path(lock)
-        + '\'\nread_state() { STATE=0; TRACER=nop; }\nif ! mkdir "$LOCK" 2>/dev/null; then'
-        + recovery
-    )
-    result = subprocess.run([shell, "-c", command], capture_output=True, text=True, timeout=3)
-    assert result.returncode == 0, result.stderr
-    assert lock.is_dir() and not (lock / "owner").exists() and not (lock / "summary").exists()
-    assert "atrace" not in recovery

@@ -7,6 +7,8 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import android.os.ParcelFileDescriptor
 import android.os.CancellationSignal
+import android.os.SystemClock
+import android.os.OperationCanceledException
 import android.database.Cursor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
@@ -41,6 +43,19 @@ internal const val MOVEMENT_REPORT_MAX_CLIPS = 512
 internal const val MOVEMENT_TREE_PREFERENCES = "clip_movement"
 internal const val MOVEMENT_TREE_URI = "dcim_tree_uri"
 internal const val MOVEMENT_GPS_ENABLED = "passive_gps_enabled"
+internal const val DRIVING_METADATA_INTERVAL_MS = 60_000L
+internal const val DRIVING_METADATA_MAX_ROWS = 128
+
+internal enum class ClipIndexWorkMode { PARKED, DRIVING_OR_UNKNOWN, INGESTION }
+
+internal fun clipIndexWorkMode(parkedNow: Boolean, driveActive: Boolean,
+                              ingestionKnown: Boolean, ingestionActive: Boolean): ClipIndexWorkMode = when {
+    !ingestionKnown || ingestionActive -> ClipIndexWorkMode.INGESTION
+    !parkedNow || driveActive -> ClipIndexWorkMode.DRIVING_OR_UNKNOWN
+    else -> ClipIndexWorkMode.PARKED
+}
+
+internal class ClipIndexWorkDeferred : IllegalStateException()
 
 internal data class MotionAssessment(val classification: String, val reasons: List<String>,
     val coverage: JSONObject, val evidence: JSONObject)
@@ -166,28 +181,39 @@ internal object MovementTreeAccess {
 internal class ClosedClipIndexer(private val context: Context, private val journal: MotionJournal,
                                  scope: CoroutineScope,
                                  canAnalyze: () -> Boolean = { false },
+                                 private val workMode: () -> ClipIndexWorkMode = { ClipIndexWorkMode.PARKED },
+                                 private val elapsedMs: () -> Long = SystemClock::elapsedRealtime,
                                  private val reportRoot: () -> File? = { DeviceFiles.removableRootOrNull(context) }) {
     @Volatile var state = "directory_required"
         private set
     @Volatile var clipCount = 0
         private set
     private val wake = Channel<Unit>(Channel.CONFLATED)
-    val transferPolicy = ClipTransferPolicy(context, journal, reportRoot, canAnalyze,
-        analysisScope = scope, afterAnalysis = { wake.trySend(Unit) })
     private val seen = mutableMapOf<String, Pair<Long, Long>>()
     private val fingerprints = mutableMapOf<String, JSONObject>()
     private val fingerprintScan = mutableMapOf<String, Long>()
     private val unreadable = mutableSetOf<String>()
     private var scanNumber = 0L
     private var directoryTruncated = false
+    private var lastDrivingMetadataMs: Long? = null
+    private var deferredPublication: ClipIndexWorkMode? = null
+    @Volatile private var observedWorkMode: ClipIndexWorkMode? = null
+    @Volatile private var workGeneration = 0L
+    @Volatile private var fullScanGeneration = 0L
     private val queryCancellations = ConcurrentHashMap.newKeySet<CancellationSignal>()
     @Volatile private var stopping = false
+    val transferPolicy = ClipTransferPolicy(context, journal, reportRoot, canAnalyze,
+        analysisScope = scope, afterAnalysis = { wake.trySend(Unit) },
+        indexingAllowed = { workMode() == ClipIndexWorkMode.PARKED && workGeneration == fullScanGeneration })
     private val preferences = context.getSharedPreferences(MOVEMENT_TREE_PREFERENCES, Context.MODE_PRIVATE)
     private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == QUIET_FILTER_ENABLED || key == MOVEMENT_TREE_URI) wake.trySend(Unit)
     }
     init { preferences.registerOnSharedPreferenceChangeListener(preferenceListener) }
     private val worker: Job = scope.launch {
+        // Revoke a prior process's public policy before the startup grace if power or
+        // ingestion is not yet known. No card walk or journal query is needed for this.
+        if (workMode() != ClipIndexWorkMode.PARKED) deferWork(workMode())
         delay(5_000)
         while (isActive) {
             val priority = android.os.Process.getThreadPriority(android.os.Process.myTid())
@@ -195,37 +221,118 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
                 try { scan() } catch (error: Exception) {
                     if (error is CancellationException) throw error
-                    state = "scan_failed"; runCatching { publish(emptyList(), null, true) }
+                    if (workMode() != ClipIndexWorkMode.PARKED) deferWork(workMode())
+                    else { state = "scan_failed"; runCatching { publish(emptyList(), null, true) } }
                 }
             } finally { android.os.Process.setThreadPriority(priority) }
-            withTimeoutOrNull(if (transferPolicy.enabled) 5_000L else 60_000L) { wake.receive() }
+            val interval = if (workMode() == ClipIndexWorkMode.PARKED && transferPolicy.enabled) 5_000L
+                else DRIVING_METADATA_INTERVAL_MS
+            withTimeoutOrNull(interval) { wake.receive() }
         }
     }
 
-    private fun children(tree: Uri, parentId: String): List<Array<Any>> {
+    private fun children(tree: Uri, parentId: String, limit: Int = 4096,
+                         requireParked: Boolean = true): List<Array<Any>> {
+        if (requireParked) ensureFullWorkAllowed()
         val uri = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId)
         return query(uri, arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
             DocumentsContract.Document.COLUMN_SIZE, DocumentsContract.Document.COLUMN_LAST_MODIFIED,
-            DocumentsContract.Document.COLUMN_MIME_TYPE)) { cursor -> buildList {
-            while (cursor.moveToNext() && size < 4096) add(arrayOf(cursor.getString(0),
+            DocumentsContract.Document.COLUMN_MIME_TYPE),
+            sortOrder = if (requireParked) null else "${DocumentsContract.Document.COLUMN_DISPLAY_NAME} DESC") { cursor -> buildList {
+            while (size < limit && cursor.moveToNext()) add(arrayOf(cursor.getString(0),
                 cursor.getString(1), cursor.getLong(2), cursor.getLong(3), cursor.getString(4)))
-            if (size >= 4096) directoryTruncated = true
+            if (size >= limit) directoryTruncated = true
         } }
     }
 
-    private fun <T> query(uri: Uri, columns: Array<String>, read: (Cursor) -> T): T {
+    private fun <T> query(uri: Uri, columns: Array<String>, sortOrder: String? = null,
+                          read: (Cursor) -> T): T {
         if (stopping) throw CancellationException("Clip indexer stopped")
         val cancellation = CancellationSignal()
         queryCancellations.add(cancellation)
         if (stopping) cancellation.cancel()
         try {
-            return checkNotNull(context.contentResolver.query(uri, columns, null, null, null, cancellation))
-                .use(read)
+            return checkNotNull(context.contentResolver.query(uri, columns, null, null, sortOrder, cancellation)).use(read)
+        } catch (_: OperationCanceledException) {
+            if (stopping) throw CancellationException("Clip indexer stopped")
+            throw ClipIndexWorkDeferred()
         } finally { queryCancellations.remove(cancellation) }
     }
 
     internal suspend fun scan() {
+        val mode = workMode()
+        observedWorkMode = mode
+        try {
+            if (mode != ClipIndexWorkMode.PARKED) {
+                deferWork(mode)
+                if (mode == ClipIndexWorkMode.DRIVING_OR_UNKNOWN) refreshDrivingMetadata()
+                return
+            }
+            scanParked()
+        } catch (_: ClipIndexWorkDeferred) { deferWork(workMode()) }
+    }
+
+    private fun ensureFullWorkAllowed() {
+        if (stopping) throw CancellationException("Clip indexer stopped")
+        if (workMode() != ClipIndexWorkMode.PARKED || workGeneration != fullScanGeneration)
+            throw ClipIndexWorkDeferred()
+    }
+
+    /** Called after the existing ACC observation; this never performs disk or provider IO. */
+    fun notifyWorkModeChanged() {
+        val mode = workMode()
+        if (observedWorkMode == mode) return
+        observedWorkMode = mode
+        workGeneration++
+        if (mode != ClipIndexWorkMode.PARKED) {
+            transferPolicy.pauseIndexing()
+            queryCancellations.forEach { it.cancel() }
+        }
+        wake.trySend(Unit)
+    }
+
+    private fun deferWork(mode: ClipIndexWorkMode) {
+        state = if (mode == ClipIndexWorkMode.INGESTION) "ingestion_deferred" else "driving_or_power_unknown"
+        if (deferredPublication != mode) {
+            // This small one-time revocation is the only deferred-mode fsync. Reusing
+            // old skip/defer decisions or republishing cached rows would be unsafe.
+            try {
+                if (transferPolicy.suspendIndexing(state)) deferredPublication = mode
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                state = "storage_unavailable"
+            }
+        }
+    }
+
+    private fun refreshDrivingMetadata() {
+        val now = elapsedMs()
+        if (lastDrivingMetadataMs?.let { now >= it && now - it < DRIVING_METADATA_INTERVAL_MS } == true) return
+        lastDrivingMetadataMs = now
+        val tree = MovementTreeAccess.selected(context) ?: return
+        val treeId = DocumentsContract.getTreeDocumentId(tree)
+        val cardId = movementHash(treeId.substringBefore(':'))
+        fun remember(row: Array<Any>, prefix: String, locked: Boolean) {
+            parseClip(row, prefix, locked)?.let { seen["$cardId/${it.relativePath}"] = it.size to it.mtime }
+            while (seen.size > 12_288) seen.remove(seen.keys.first())
+        }
+        for (row in children(tree, treeId, DRIVING_METADATA_MAX_ROWS, false)) {
+            if (stopping || workMode() != ClipIndexWorkMode.DRIVING_OR_UNKNOWN) return
+            val name = row[1] as String
+            if (name in listOf("Video", "LockVideo") && row[4] == DocumentsContract.Document.MIME_TYPE_DIR) {
+                for (child in children(tree, row[0] as String, DRIVING_METADATA_MAX_ROWS, false))
+                    if (workMode() == ClipIndexWorkMode.DRIVING_OR_UNKNOWN && !stopping)
+                        remember(child, "DCIM/$name/", name == "LockVideo") else return
+            } else remember(row, "DCIM/", false)
+        }
+        // A bounded listing is not an absence proof. Do not prune historical seen,
+        // fingerprints or visual results; the next parked full pass reconciles them.
+    }
+
+    private suspend fun scanParked() {
+        fullScanGeneration = workGeneration
+        ensureFullWorkAllowed()
         val tree = MovementTreeAccess.selected(context)
         if (tree == null) { state = "directory_required"; publish(emptyList(), null, false); return }
         val treeId = DocumentsContract.getTreeDocumentId(tree)
@@ -254,6 +361,7 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
         val inspectedAt = System.currentTimeMillis()
         val inspections = sorted.map { clip ->
             currentCoroutineContext().ensureActive()
+            ensureFullWorkAllowed()
             val key = "$cardId/${clip.relativePath}"
             val stable = seen[key] == (clip.size to clip.mtime)
             val next = entries.asSequence().filter { it.camera == clip.camera && it.localStart > clip.localStart }
@@ -283,6 +391,7 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
             .take(8).map { "$cardId/${it.clip.relativePath}/${it.clip.size}/${it.clip.mtime}" }.toSet()
         for (inspection in inspections) {
             currentCoroutineContext().ensureActive()
+            ensureFullWorkAllowed()
             val (clip, stable, start, end, bounded, timeSafe, assessment) = inspection
             val key = "$cardId/${clip.relativePath}"
             val reasons = assessment.reasons.toMutableList()
@@ -291,7 +400,10 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
             val fingerprintKey = "$key/${clip.size}/${clip.mtime}"
             var fingerprint = fingerprints[fingerprintKey]
             if (stable && fingerprintKey in fingerprintCandidates) {
-                fingerprint = runCatching { fingerprint(tree, clip) }.getOrNull()
+                fingerprint = try { fingerprint(tree, clip) } catch (error: Exception) {
+                    if (error is CancellationException || error is ClipIndexWorkDeferred) throw error
+                    null
+                }
                 fingerprintScan[fingerprintKey] = scanNumber
                 if (fingerprint != null) { fingerprints[fingerprintKey] = fingerprint; unreadable.remove(fingerprintKey) }
                 else { fingerprints.remove(fingerprintKey); unreadable.add(fingerprintKey) }
@@ -314,11 +426,13 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
                 DocumentsContract.buildDocumentUriUsingTree(tree, clip.id),
                 start, end)
         }
+        ensureFullWorkAllowed()
         seen.clear(); entries.forEach { seen["$cardId/${it.relativePath}"] = it.size to it.mtime }
         val present = entries.map { "$cardId/${it.relativePath}/${it.size}/${it.mtime}" }.toSet()
         fingerprints.keys.retainAll(present); fingerprintScan.keys.retainAll(present); unreadable.retainAll(present)
         state = "ready"; clipCount = output.size
         publish(output, cardId, directoryTruncated || entries.size > output.size, policyClips)
+        deferredPublication = null
     }
 
     private fun unchanged(tree: Uri, clip: MovementClip): Boolean {
@@ -329,6 +443,7 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
     }
 
     private fun fingerprint(tree: Uri, clip: MovementClip): JSONObject {
+        ensureFullWorkAllowed()
         val uri = DocumentsContract.buildDocumentUriUsingTree(tree, clip.id)
         check(unchanged(tree, clip))
         val digest = MessageDigest.getInstance("SHA-256")
@@ -337,12 +452,14 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
         ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { input ->
             val channel = input.channel
             for (offset in listOf(0L, ((clip.size - 16_384) / 2).coerceAtLeast(0), (clip.size - 16_384).coerceAtLeast(0)).distinct()) {
+                ensureFullWorkAllowed()
                 channel.position(offset)
                 val buffer = ByteBuffer.allocate(min(16_384L, clip.size - offset).toInt())
                 while (buffer.hasRemaining()) check(channel.read(buffer) > 0)
                 digest.update(buffer.array())
             }
         }
+        ensureFullWorkAllowed()
         check(unchanged(tree, clip))
         return JSONObject().put("algorithm", "sha256-sampled-v1").put("sample_bytes", 16_384)
             .put("digest", digest.digest().joinToString("") { "%02x".format(it) })
@@ -361,9 +478,11 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
 
     private suspend fun publish(clips: List<JSONObject>, cardId: String?, truncated: Boolean,
                                 policyClips: List<PolicyClip> = emptyList()) {
+        ensureFullWorkAllowed()
         val root = reportRoot()
         if (root == null) { state = "storage_unavailable"; clipCount = 0; return }
         val bounds = runCatching { journal.bounds() }.getOrDefault(null to null)
+        ensureFullWorkAllowed()
         val report = JSONObject().put("schema_version", 1).put("source_id", journal.sourceId)
             .put("card_id", cardId ?: JSONObject.NULL).put("session_id", journal.sessionId).put("boot_id", journal.bootId)
             .put("generated_at_utc", Instant.now().toString()).put("producer_version", BuildConfig.VERSION_NAME)
@@ -374,12 +493,14 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
             val array = report.getJSONArray("clips"); array.remove(array.length() - 1); report.put("truncated", true)
         }
         clipCount = report.getJSONArray("clips").length()
+        ensureFullWorkAllowed()
         val directory = File(root, "movement").apply { mkdirs() }
         val partial = File(directory, "report.json.partial")
         FileOutputStream(partial).use { it.write(report.toString().toByteArray(Charsets.UTF_8)); it.fd.sync() }
         Files.move(partial.toPath(), File(directory, "report.json").toPath(),
             StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
         val tree = MovementTreeAccess.selected(context)
+        ensureFullWorkAllowed()
         transferPolicy.publish(policyClips, cardId, state, report.getBoolean("truncated")) { clip ->
             tree != null && runCatching { unchanged(tree, clip) }.getOrDefault(false)
         }

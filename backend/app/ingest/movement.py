@@ -41,6 +41,8 @@ REPORT_STATUSES = {
     "directory_unavailable",
     "storage_unavailable",
     "scan_failed",
+    "driving_or_power_unknown",
+    "ingestion_deferred",
 }
 REASONS = {
     "validated_speed_positive",

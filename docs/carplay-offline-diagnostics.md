@@ -1,5 +1,29 @@
 # Offline CarPlay delay diagnostics
 
+## Diagnostic capture guard recovery
+
+The server-deployed codec helper uses a stable kernel `flock` descriptor to
+serialize capture and workspace recovery. The guard file is never unlinked, so
+competing helpers cannot acquire different lock files at the same path. Owned
+children are reaped before release; abnormal process exit releases the kernel
+lock when the last inheriting descriptor closes.
+
+Legacy capture-directory metadata is inspected only while holding that guard.
+A valid live owner, an active tracer, unknown ownership or unsafe filesystem state
+prevents recovery. Stale or incomplete workspace initialization has a bounded
+grace period before conservative recovery. Missing or malformed legacy ownership
+requires at least thirty seconds of age. Every recovery also checks for surviving
+legacy helpers or trace producers; this check is bounded to 512 processes and a
+short time budget, with incomplete inspection retaining the workspace.
+`codec_lock_status` distinguishes
+lock health from `codec_capture_status`; skipped captures retain unavailable
+latency. In particular, a busy capture guard is not proof of decoder overload.
+
+Deploying the server makes the updated helper available through the existing
+sampler installation path. Recovery of the camera's actual retained workspace
+and improved measurement coverage still require device acceptance. This change
+does not measure phone-render timestamps or prove a CarPlay latency fix.
+
 ## GPS acquisition and provider freshness (schemas 7–8)
 
 Schema 7 adds `gps_context` events to the same bounded offline log and

@@ -285,9 +285,10 @@ class ClipTransferPolicyTest {
         // Exercise the actual report writer with a full-card projection. Only output
         // bounds and witness safety are asserted, independent of its trimming strategy.
         val writer = ClipTransferPolicy::class.java.getDeclaredMethod("writeReport", List::class.java,
-            String::class.java, String::class.java, Boolean::class.javaPrimitiveType)
+            String::class.java, String::class.java, Boolean::class.javaPrimitiveType,
+            Boolean::class.javaPrimitiveType, File::class.java)
         writer.isAccessible = true
-        writer.invoke(policy, rows, "b".repeat(64), "ready", false)
+        writer.invoke(policy, rows, "b".repeat(64), "ready", false, true, root)
         val file = File(root, "movement/transfer-policy.json")
         val report = JSONObject(file.readText())
         assertTrue(file.length() <= MOVEMENT_REPORT_MAX_BYTES)

@@ -16,6 +16,8 @@ const setupMessages: Record<string, string> = {
   directory_unavailable: 'The selected footage folder is unavailable. Reconnect the card or select its DCIM folder again in the companion.',
   storage_unavailable: 'The companion cannot publish a report until the memory card is available.',
   scan_failed: 'The companion could not finish reading clip metadata. Footage remains eligible for normal backup.',
+  driving_or_power_unknown: 'Full clip analysis is waiting for confirmed parked conditions. Power and movement observations continue.',
+  ingestion_deferred: 'Clip indexing is paused for backup coordination. Unverified footage remains eligible for normal backup.',
 }
 
 const analysisReasons: Record<string, string> = {

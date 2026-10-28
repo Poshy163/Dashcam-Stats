@@ -46,6 +46,14 @@ this phase the logger is not quiesced, radios are not quieted and no bulk footag
 starts. The existing camera resource guards and complete paired-view proof requirements
 still decide whether a clip can be excluded.
 
+Companion 0.3.22 defers full indexing during driving. To avoid claiming the backup
+lease just before its first parked scan, the matching server permits the two
+explicit indexing-deferred states a short readiness grace. It ends at the original
+observed ignition-OFF plus ten seconds and still requires a fresh parked, awake
+logger with no active drive or ingestion request, both opt-ins and the native
+transfer reserve. Retries cannot renew it. Ready evidence enters the ordinary
+analysis opportunity below; timeout, cancellation or unsafe evidence uploads normally.
+
 The first opportunity ends no later than eight minutes after the actual recorded
 ignition-OFF edge. That anchor is retained across repeated runs and server restarts;
 starting another backup cannot create another eight-minute allowance. Later pending

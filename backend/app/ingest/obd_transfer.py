@@ -514,6 +514,8 @@ async def read_logger_status(address: str, path: str) -> dict[str, Any] | None:
                 "directory_unavailable",
                 "storage_unavailable",
                 "scan_failed",
+                "driving_or_power_unknown",
+                "ingestion_deferred",
             }:
                 clean[key] = item
         elif key == "movement_gps_state":

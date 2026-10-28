@@ -689,11 +689,43 @@ def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
             "zlink_missing_or_ambiguous",
             "zlink_identity_unavailable",
             "capture_busy",
+            "lock_unavailable",
+            "lock_owner_unavailable",
+            "lock_recovery_failed",
+            "lock_initialization_failed",
             "pipe_failed",
             "atrace_error",
             "parser_error",
             "invalid_trace",
             "summary_missing",
+        }
+        else None
+    )
+    lock_status = fields.get("codec_lock_status", "")
+    result["codec_lock_status"] = (
+        lock_status
+        if lock_status
+        in {
+            "not_attempted",
+            "acquired",
+            "recovered_dead_owner",
+            "recovered_missing_owner",
+            "recovered_malformed_owner",
+            "guard_busy",
+            "guard_unavailable",
+            "unsafe_guard",
+            "unsafe_workspace",
+            "owner_unreadable",
+            "owner_unknown",
+            "legacy_owner_unknown",
+            "legacy_helper_active",
+            "legacy_atrace_active",
+            "live_owner",
+            "initializing",
+            "trace_changed",
+            "recovery_failed",
+            "initialization_failed",
+            "identity_unavailable",
         }
         else None
     )

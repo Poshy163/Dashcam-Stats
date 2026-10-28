@@ -63,6 +63,17 @@ test('directory setup and truncated reports explain incomplete coverage without 
   assert.doesNotMatch(partial, /saved|deleted/)
 })
 
+test('deferred indexing states explain the wait without showing old classification totals', () => {
+  for (const [reportStatus, message] of [
+    ['driving_or_power_unknown', /waiting for confirmed parked conditions/],
+    ['ingestion_deferred', /paused for backup coordination/],
+  ]) {
+    const html = render(MovementManifestEvidence, { data: { ...report, reportStatus } })
+    assert.match(html, message)
+    assert.doesNotMatch(html, />19</)
+  }
+})
+
 const exclusions = {
   policyVersion: 'parked_visual_quiet_v1', status: 'ready', policyEnabled: true,
   stale: false, currentCount: 2, currentBytes: 1000, locallyIndexedCount: 0,

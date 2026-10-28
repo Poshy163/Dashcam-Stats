@@ -39,6 +39,13 @@ revision-checked fallback protection. Successful interrupted-drive recovery clea
 stale active-drive state, and export reconciliation uses consistent pagination for
 equal SQLite timestamp sort keys.
 
+Companion 0.3.22 reduces optional clip-indexing work during driving while retaining
+immediate movement and ignition observations. Full assessment and fingerprinting
+resume promptly with fresh parked evidence. Its matching server update recovers
+stale CarPlay diagnostic workspaces under a kernel file lock and reports lock
+health separately from decoder measurements. See the
+[release status](obd-logger-release-status.md) for deployment and physical checks.
+
 ## Why it is an APK
 
 The verified unit is a locked, unrooted UIS7861 head unit running Android 14 (SDK 34). The

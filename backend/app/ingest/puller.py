@@ -112,6 +112,8 @@ QUIET_ANALYSIS_RECHECK_S = 10.0
 QUIET_ANALYSIS_PROBE_TIMEOUT_S = 20.0
 QUIET_ANALYSIS_NATIVE_RESERVE_S = 240.0
 QUIET_ANALYSIS_BATCH_CHECK_S = 30.0
+QUIET_INDEXER_STARTUP_WINDOW_S = 10.0
+QUIET_INDEXER_RECHECK_S = 1.0
 
 # One bounded recovery budget for normal cleanup and later reconciliation. Hotspot
 # attestation alone permits three 15-second reads; the old 30-second total could cancel
@@ -1329,6 +1331,91 @@ def _analysis_native_budget(snapshot: dict) -> tuple[datetime, float] | None:
     return off_at, float(remaining)
 
 
+def _logger_indexer_starting(logger: dict | None) -> bool:
+    """New deferred states may earn a brief wait, never decoder or exclusion authority."""
+    if (
+        not isinstance(logger, dict)
+        or logger.get("movement_state") not in {"driving_or_power_unknown", "ingestion_deferred"}
+        or logger.get("transfer_policy_state") != "unavailable"
+    ):
+        return False
+    # Reuse the unchanged admission checks without treating this projection as readiness.
+    # Only a subsequent real status can pass _logger_can_analyze for ordinary handoff.
+    return _logger_can_analyze(
+        {**logger, "movement_state": "ready", "transfer_policy_state": "waiting"}
+    )
+
+
+async def _await_parked_indexer(
+    info: UnitInfo,
+    sources: list[str],
+    remote: list[RemoteFile],
+    logger: dict | None,
+    filtered: parked_filter.FilterResult,
+) -> tuple[list[RemoteFile], dict | None, parked_filter.FilterResult, bool]:
+    """Let the first parked pass finish only until the original OFF+10s boundary."""
+    status = get_status()
+    budget = _analysis_native_budget(status.snapshot())
+    if not remote or not _logger_indexer_starting(logger) or budget is None:
+        return remote, logger, filtered, False
+    off_at, native_remaining = budget
+    now = datetime.now(UTC)
+    until = min(
+        off_at + timedelta(seconds=QUIET_INDEXER_STARTUP_WINDOW_S),
+        now + timedelta(seconds=native_remaining - QUIET_ANALYSIS_NATIVE_RESERVE_S),
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + (until - now).total_seconds()
+    waited = False
+    try:
+        while deadline > loop.time() and not status.cancel_event.is_set():
+            status.set_phase(Phase.ANALYSING)
+            status.set_analysis_wait(until.isoformat(), "awaiting_parked_clip")
+            waited = True
+            wake = min(deadline, loop.time() + QUIET_INDEXER_RECHECK_S)
+            while loop.time() < wake and not status.cancel_event.is_set():
+                await asyncio.sleep(min(0.25, wake - loop.time()))
+            if status.cancel_event.is_set() or deadline <= loop.time():
+                break
+            async with asyncio.timeout(deadline - loop.time()):
+                observation, latest_logger = await asyncio.gather(
+                    adb.runtime_observation(
+                        info.address, logger_status_path=get_config().obd_remote_status_file
+                    ),
+                    read_logger_status(info.address, get_config().obd_remote_status_file),
+                )
+                if observation is None:
+                    status.unit_observation_failed()
+                    break
+                if status.observe_unit_runtime(observation):
+                    break
+                logger = latest_logger
+                budget = _analysis_native_budget(status.snapshot())
+                if budget is None or abs((budget[0] - off_at).total_seconds()) > 2:
+                    break
+                deadline = min(deadline, loop.time() + budget[1] - QUIET_ANALYSIS_NATIVE_RESERVE_S)
+                if _logger_can_analyze(logger):
+                    # The initial card listing/policy predate this wait. Refresh both within
+                    # the same original grace; a late/failed proof simply uploads normally.
+                    async with asyncio.timeout(max(0, deadline - loop.time())):
+                        latest_remote = await adb.inventory_all(info.address, sources)
+                        latest_filtered = await _filter_parked_inventory(
+                            info, latest_remote, logger
+                        )
+                    return latest_remote, logger, latest_filtered, waited
+                if not _logger_indexer_starting(logger):
+                    break
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass  # Optional startup observation cannot veto ordinary footage backup.
+    finally:
+        status.set_analysis_wait(None, None)
+        if waited:
+            status.set_phase(Phase.SCANNING)
+    return remote, logger, filtered, waited
+
+
 async def _quiet_analysis_handoff(
     info: UnitInfo,
     sources: list[str],
@@ -1347,16 +1434,20 @@ async def _quiet_analysis_handoff(
     treats a pending/failed analysis as permission to omit footage.
     """
     status = get_status()
-    if (
-        not bool(_get("skip_parked_footage", False))
-        or not bool(_get("quiet_radios", False))
-        or not _logger_can_analyze(logger)
-        or not filtered.analysis_ready
-    ):
+    if not bool(_get("skip_parked_footage", False)) or not bool(_get("quiet_radios", False)):
         return remote, logger, filtered, False
+    remote, logger, filtered, startup_waited = await _await_parked_indexer(
+        info,
+        sources,
+        remote,
+        logger,
+        filtered,
+    )
+    if not _logger_can_analyze(logger) or not filtered.analysis_ready:
+        return remote, logger, filtered, startup_waited
     budget = _analysis_native_budget(status.snapshot())
     if budget is None:
-        return remote, logger, filtered, False
+        return remote, logger, filtered, startup_waited
     off_at, native_remaining = budget
     now = datetime.now(UTC)
     first_until = off_at + timedelta(seconds=QUIET_ANALYSIS_FIRST_WINDOW_S)
@@ -1365,7 +1456,7 @@ async def _quiet_analysis_handoff(
     anticipate = (now - off_at).total_seconds() < QUIET_ANALYSIS_FIRST_WINDOW_S
     pending_until = min((until for _, until in filtered.deferred), default=None)
     if pending_until is None and not anticipate:
-        return remote, logger, filtered, False
+        return remote, logger, filtered, startup_waited
     until = (
         first_until
         if anticipate
@@ -1376,7 +1467,7 @@ async def _quiet_analysis_handoff(
     until = min(until, now + timedelta(seconds=native_remaining - QUIET_ANALYSIS_NATIVE_RESERVE_S))
     loop = asyncio.get_running_loop()
     deadline = loop.time() + (until - now).total_seconds()
-    waited = False
+    waited = startup_waited
     saw_pending = bool(filtered.deferred)
     try:
         while deadline - loop.time() > 0 and not status.cancel_event.is_set():
