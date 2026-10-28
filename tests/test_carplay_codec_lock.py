@@ -57,7 +57,7 @@ def process_exited(pid):
 
 
 @pytest.fixture(params=["sh", "mksh"])
-def capture(tmp_path, request):
+def capture(tmp_path, request, codec_process_contract):
     if os.name == "nt":
         pytest.skip("Linux /proc and kernel flock fixture is unavailable on Windows")
     shell = shutil.which(request.param)
@@ -143,6 +143,7 @@ log() {{ :; }}
             self.checkpoint = checkpoint
             self.inherited, self.producer_pids = inherited, producer_pids
             self.tools = tools
+            self.process_contract = codec_process_contract
 
         def write(self, altered=None, prefix=""):
             script.write_text("#!/bin/sh\n" + prelude + prefix + (altered or text))
@@ -234,15 +235,38 @@ fi
 
     case = Capture()
     case.write()
-    yield case
-    for process in processes:
-        if process.poll() is None:
-            process.kill()
-        try:
-            process.communicate(timeout=3)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate(timeout=3)
+    try:
+        yield case
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            try:
+                process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=3)
+        if producer_pids.exists():
+            for pid in producer_pids.read_text().splitlines():
+                wait_for(lambda pid=int(pid): process_exited(pid))
+
+
+@pytest.fixture
+def codec_process_contract(tmp_path_factory, request):
+    if os.name == "nt":
+        pytest.skip("Linux /proc and kernel flock fixture is unavailable on Windows")
+    import fcntl
+
+    # Private trace directories still share this UID and /proc with other xdist
+    # workers. Their intentional atrace actors must not invalidate another case's
+    # real process-absence proof. Hold one per-run lease through child teardown.
+    directory = tmp_path_factory.getbasetemp()
+    if hasattr(request.config, "workerinput"):
+        directory = directory.parent
+    path = directory / "codec-process-contract.lock"
+    with path.open("a+b") as descriptor:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield path
 
 
 @pytest.mark.parametrize(
@@ -399,6 +423,76 @@ def test_dead_parent_token_does_not_authorize_recovery_over_pending_legacy_atrac
     finally:
         process.terminate()
         process.wait(timeout=3)
+
+
+def test_global_atrace_starting_between_migration_proofs_refuses_then_recovers(capture):
+    capture.legacy()
+    before = (capture.lock / "owner").read_bytes()
+    gate = capture.script.parent / "directory-gate"
+    entered = capture.script.parent / "directory-entered"
+    ready = capture.script.parent / "foreign-atrace-ready"
+    gate.touch()
+    real_chmod = shutil.which("chmod")
+    chmod = capture.tools / "chmod"
+    chmod.write_text(
+        f"#!/bin/sh\n'{real_chmod}' \"$@\" 8<&8 || exit $?\n"
+        f"if [ \"$2\" = /proc/self/fd/7 ] && [ -e '{gate}' ]; then\n"
+        f" : > '{entered}'; while [ -e '{gate}' ]; do sleep .01 8<&8; done\nfi\n"
+    )
+    actor = None
+    first = capture.launch(1)
+    try:
+        wait_for(entered.exists)
+        actor = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import ctypes,pathlib,time; ctypes.CDLL(None).prctl(15,b'atrace',0,0,0); "
+                f"pathlib.Path({str(ready)!r}).touch(); time.sleep(30)",
+            ]
+        )
+        wait_for(ready.exists)
+        gate.unlink()
+        _out, error = first.communicate(timeout=10)
+        assert first.returncode == 0, error
+        row = capture.rows()[-1]
+        assert row["codec_capture_status"] == "lock_recovery_failed"
+        assert row["codec_lock_status"] == "recovery_failed"
+        assert (capture.lock / "owner").read_bytes() == before
+        assert (capture.lock / "owner").stat().st_mode & 0o777 == 0o666
+        assert not capture.calls.exists() and actor.poll() is None
+    finally:
+        gate.unlink(missing_ok=True)
+        if actor is not None:
+            actor.terminate()
+            actor.wait(timeout=3)
+    assert capture.run(2)["codec_capture_status"] == "ok"
+
+
+def test_fixture_process_contract_is_held_without_inheriting_it_into_children(capture):
+    script = """import fcntl,os,pathlib,sys
+path=sys.argv[1]
+for descriptor in pathlib.Path('/proc/self/fd').iterdir():
+    try:
+        assert os.readlink(descriptor) != path
+    except FileNotFoundError:
+        pass
+with open(path,'rb') as stream:
+    try:
+        fcntl.flock(stream,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError:
+        print('fixture_contract_held')
+    else:
+        raise AssertionError('fixture contract was not held')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(capture.process_contract)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "fixture_contract_held"
 
 
 @pytest.mark.parametrize(
