@@ -8,13 +8,13 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.21** (`versionCode` 34), installed in place on 27 October 2026 |
-| Source | `b89848e4cca3a9edf6613d3994f249a919fc2d2f` (`android/obd-logger/`), verified in the running companion, installed APK readback and server |
+| Version | **0.3.22** (`versionCode` 35), installed in place on 28 October 2026 |
+| Source | `57c95731a81a2c2066833bc0ecc9b2d20fc22e7b` (`android/obd-logger/`), verified in the running companion, installed APK readback and matching deployed server |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | The existing trial OFF choice, revision 1 and no fallback reason were preserved. No automatic re-arm was performed. New-drive scheduling acceptance remains pending. |
-| Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, permissions, ownership, stored drive identity and original OFF bounds survived. Both cameras continued recording. Temperature capture advanced during OBD quiescing, and matching readings reached the server. Automatic backup resumed and completed with verified radio restoration. Restart evidence records `package_update` on the same kernel boot; no physical reboot test was performed. |
+| Poll plan | The existing trial OFF choice, revision 1 and no fallback reason were preserved. The next drive used the baseline plan; it does not validate the three-second trial. No automatic re-arm was performed. |
+| Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, permissions, folder access, stored drive identity and original OFF bounds survived. Both camera files advanced and temperature history continued. Parked indexing resumed after ingestion, and automatic backups completed with verified radio restoration. Restart evidence records `package_update` on the same kernel boot; no physical reboot test was performed. Diagnostic workspace recovery has a separate acceptance blocker below. |
 
 ## Server update: verified existing-copy cleanup
 
@@ -24,7 +24,7 @@ through remote deletion, leaves changed or unverified footage intact, and runs a
 ordinary copying and radio restoration. It needs a server redeploy and no companion
 update. See [verified-duplicate-cleanup.md](verified-duplicate-cleanup.md).
 
-## 0.3.22 candidate: driving workload and diagnostic recovery
+## 0.3.22 installed: driving workload and diagnostic recovery
 
 Source version **0.3.22/code 35** reduces optional clip-indexing work while the
 car is in use. Immediate movement and power observations continue. Full clip
@@ -40,14 +40,30 @@ active tracing and unreadable or unsafe filesystem state are preserved. Capture
 outcome and lock status are reported separately; a skipped capture never means
 zero decoder latency.
 
-Deploy the server for the diagnostic helper update, and install the production-signed
-0.3.22 APK for the indexing change. Neither change alters the saved OBD trial choice,
-native sleep timing, recorder controls or backup enablement. Device installation,
-recovery of the actual retained lock, and a subsequent CarPlay drive comparison
-remain physical acceptance checks. These changes do not establish a fix for the
-phone-to-screen lag observed on 28 October.
+The production-signed 0.3.22 APK and matching server were verified on 28 October.
+Neither change alters the saved OBD trial choice, native sleep timing, recorder
+controls or backup enablement. Installation exposed two diagnostic recovery
+blockers: the camera had about 530 processes against the helper's 512-PID scan
+limit, and its legacy workspace retained the old helper's `777/666` permissions.
+A guarded administrative preparation refused before changing those permissions;
+the workspace contents and inodes were preserved. Actual retained-lock recovery
+and a subsequent CarPlay drive comparison remain separate acceptance checks.
+These changes do not establish a fix for the phone-to-screen lag observed on
+28 October.
 
-Local validation passed **3,854 backend tests** (144 platform/optional skips),
+The server follow-up replaces the per-process external-command scan with bounded
+shell-builtin inspection, allowing Android inventories above 512 PIDs without
+removing the time or candidate limits. Known legacy permissions can be prepared
+under the stable guard with pinned identities and preserved contents; active,
+unreadable or unsafe workspaces remain blocked. Limit refusals now distinguish
+inventory size, candidate count and elapsed time in the timing API. See
+[diagnostic capture guard recovery](carplay-offline-diagnostics.md#diagnostic-capture-guard-recovery).
+This follow-up needs a server deployment, not another APK. Recovery of the actual
+camera workspace and a successful normal CarPlay capture still require live
+acceptance after deployment; the blocked captures from the previous drive cannot
+be reconstructed.
+
+For the original 0.3.22 release, local validation passed **3,854 backend tests** (144 platform/optional skips),
 **450 Android tests** including the saved private-grid replay, and **254 frontend
 tests**. Both APK assemblies and debug/release lint passed with zero lint errors
 and the existing 62 warnings per variant. Python formatting/lint and frontend

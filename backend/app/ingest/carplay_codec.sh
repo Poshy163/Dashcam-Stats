@@ -11,6 +11,7 @@ LOCK=/data/local/tmp/.dashcam_cpt_codec_capture.lock
 GUARD=/data/local/tmp/.dashcam_cpt_codec_capture.guard
 LEGACY_SCRIPT=/data/local/tmp/dashcam_carplay_codec.sh
 umask 077
+LC_ALL=C; export LC_ALL
 SELFSTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$$/stat" 2>/dev/null)
 TOKEN="$$:${SELFSTART:-unknown}:$SESSION:$SEQUENCE"
 PIPE="$LOCK/pipe-$$-${SELFSTART:-unknown}"
@@ -39,9 +40,11 @@ owns_workspace() {
     [ ! -L "$GUARD" ] && [ "$(stat -c '%d:%i:%u:%a' "$GUARD" 2>/dev/null)" = "$GUARDID" ]
 }
 safe_members() {
+  member_count=0
   for member in "$LOCK"/* "$LOCK"/.[!.]* "$LOCK"/..?*; do
     [ -e "$member" ] || [ -L "$member" ] || continue
-    [ ! -L "$member" ] || return 1
+    member_count=$((member_count+1)); [ "$member_count" -le 16 ] || return 1
+    [ ! -L "$member" ] && [ "$(stat -c '%u:%h' "$member" 2>/dev/null)" = "$CAPTUREUID:1" ] || return 1
     case "$member" in
       "$LOCK/owner"|"$LOCK/summary") [ -f "$member" ] || return 1;;
       "$LOCK/pipe") [ -p "$member" ] || return 1;;
@@ -63,57 +66,88 @@ remove_members() {
     rm -f "$member" 8<&8 || return 1
   done
 }
+scan_clock() {
+  read uptime_value ignored < /proc/uptime || return 1
+  seconds=${uptime_value%%.*}; fraction=${uptime_value#*.}000
+  fraction=${fraction%${fraction#???}}
+  case "$seconds:$fraction" in ''|*[!0-9:]*) return 1;; esac
+  [ -n "$seconds" ] && [ "${#fraction}" = 3 ] || return 1
+  SCAN_SECONDS=$seconds; SCAN_MILLIS=$((1$fraction-1000))
+}
+scan_budget() {
+  scan_clock || return 1
+  scan_elapsed=$(((SCAN_SECONDS-scan_start_seconds)*1000+SCAN_MILLIS-scan_start_millis))
+  if [ "$scan_elapsed" -lt 0 ] || [ "$scan_elapsed" -gt 4000 ]; then
+    LEGACYSTATUS=legacy_scan_timeout; return 1
+  fi
+}
+read_process_uid() {
+  PROCESS_UID=
+  while read -r field real effective saved filesystem ignored; do
+    if [ "$field" = Uid: ]; then
+      case "$real:$effective:$saved:$filesystem" in ''|*[!0-9:]*) return 1;; esac
+      [ -n "$real" ] && [ -n "$effective" ] && [ -n "$saved" ] && [ -n "$filesystem" ] && [ -z "$ignored" ] || return 1
+      PROCESS_UID=$effective; return 0
+    fi
+  done < "$1/status" 2>/dev/null
+  return 1
+}
+read_process_identity() {
+  IFS= read -r process_stat < "$1/stat" 2>/dev/null || return 1
+  case "$process_stat" in *') '*) process_fields=${process_stat##*) };; *) return 1;; esac
+  set -- $process_fields
+  [ "$#" -ge 20 ] || return 1
+  PROCESS_STATE=$1
+  case "$PROCESS_STATE" in [A-Za-z]) ;; *) return 1;; esac
+  shift 19; PROCESS_START=$1
+  case "$PROCESS_START" in ''|*[!0-9]*) return 1;; esac
+}
+read_process_arguments() {
+  PROCESS_ARGUMENTS=$({ head -c 65537 "$1/cmdline" 2>/dev/null || printf '\000codec_read_failed\000'; printf '\000codec_read_end'; } | tr '\000' '\n') || return 1
+  case "$PROCESS_ARGUMENTS" in *codec_read_failed*) return 1;; esac
+  case "$PROCESS_ARGUMENTS" in *"
+codec_read_end") PROCESS_ARGUMENTS=${PROCESS_ARGUMENTS%"
+codec_read_end"};; *) return 1;; esac
+  [ "${#PROCESS_ARGUMENTS}" -le 65536 ]
+}
 legacy_helpers_absent() {
-  # A stalled pre-flock initializer can be older than its normal capture window.
-  # Age alone is never proof. Do not signal it or reclaim its ambiguous workspace.
+  # Only stale-workspace recovery needs this proof. Enumerating unrelated Android
+  # tasks uses builtins, not a fork per PID; argv work is bounded to our live UID.
   LEGACYSTATUS=legacy_owner_unknown
   [ -r /proc/1/stat ] || return 1
-  read scan_start ignored < /proc/uptime || return 1
-  scan_start=${scan_start%%.*}; scanned=0
+  scan_clock || return 1
+  scan_start_seconds=$SCAN_SECONDS; scan_start_millis=$SCAN_MILLIS; scanned=0; candidates=0
   for process in /proc/[0-9]*; do
     [ "$process" != "/proc/$$" ] || continue
-    scanned=$((scanned+1)); [ "$scanned" -le 512 ] || return 1
-    read scan_now ignored < /proc/uptime || return 1
-    scan_now=${scan_now%%.*}
-    [ "$((scan_now-scan_start))" -le 2 ] || return 1
+    scanned=$((scanned+1)); [ "$scanned" -le 4096 ] || { LEGACYSTATUS=legacy_scan_limit; return 1; }
+    scan_budget || return 1
+    if ! read_process_uid "$process"; then [ ! -d "$process" ] && continue; return 1; fi
+    [ "$PROCESS_UID" = "$CAPTUREUID" ] || continue
+    if ! read_process_identity "$process"; then [ ! -d "$process" ] && continue; return 1; fi
+    case "$PROCESS_STATE" in Z|X) continue;; esac
+    candidates=$((candidates+1)); [ "$candidates" -le 128 ] || { LEGACYSTATUS=legacy_candidate_limit; return 1; }
+    process_start=$PROCESS_START
     comm=
-    if ! read comm < "$process/comm" 2>/dev/null; then
-      [ ! -d "$process" ] && continue
-      return 1
+    if ! IFS= read -r comm < "$process/comm" 2>/dev/null; then
+      [ ! -d "$process" ] && continue; return 1
     fi
-    case "$comm" in sh|mksh|bash|dash|ash|busybox|toybox|dashcam_carplay*|atrace|timeout|rm|rmdir|mkdir|mkfifo|unlink|mv) ;; *) continue;; esac
-    process_uid=$(awk '$1=="Uid:" {print $3;exit}' "$process/status" 2>/dev/null)
-    if [ -z "$process_uid" ]; then [ ! -d "$process" ] && continue; return 1; fi
-    [ "$process_uid" = "$CAPTUREUID" ] || continue
-    process_start=$(awk '{sub(/^.*\) /,"");if($1=="Z" || $1=="X")print "exited";else print $20}' "$process/stat" 2>/dev/null)
-    [ "$process_start" != exited ] || continue
-    case "$process_start" in ''|*[!0-9]*) [ ! -d "$process" ] && continue; return 1;; esac
-    arguments=$({ head -c 65537 "$process/cmdline" 2>/dev/null || printf '\000codec_read_failed\000'; printf '\000codec_read_end'; } | tr '\000' '\n') || {
-      [ ! -d "$process" ] && continue
-      return 1
-    }
-    case "$arguments" in *codec_read_failed*) [ ! -d "$process" ] && continue; return 1;; esac
-    case "$arguments" in *"
-codec_read_end") arguments=${arguments%"
-codec_read_end"};; *) return 1;; esac
-    [ "${#arguments}" -le 65536 ] || return 1
-    actual_start=$(awk '{sub(/^.*\) /,"");if($1=="Z" || $1=="X")print "exited";else print $20}' "$process/stat" 2>/dev/null)
-    [ "$actual_start" != exited ] || continue
-    if [ "$actual_start" != "$process_start" ]; then
-      [ ! -d "$process" ] && continue
-      return 1
-    fi
+    # Inspect every same-UID argv: an unrelated comm is not an exec-stability proof.
+    if ! read_process_arguments "$process"; then [ ! -d "$process" ] && continue; return 1; fi
+    arguments=$PROCESS_ARGUMENTS
+    if ! read_process_arguments "$process"; then [ ! -d "$process" ] && continue; return 1; fi
+    [ "$arguments" = "$PROCESS_ARGUMENTS" ] || return 1
+    if ! read_process_identity "$process"; then [ ! -d "$process" ] && continue; return 1; fi
+    case "$PROCESS_STATE" in Z|X) continue;; esac
+    [ "$PROCESS_START" = "$process_start" ] || return 1
     actual_comm=
-    if ! read actual_comm < "$process/comm" 2>/dev/null; then
-      [ ! -d "$process" ] && continue
-      return 1
+    if ! IFS= read -r actual_comm < "$process/comm" 2>/dev/null; then
+      [ ! -d "$process" ] && continue; return 1
     fi
-    # start ticks survive exec. A shell becoming rm/atrace during the bounded
-    # argv read is ambiguous even though its PID/start identity did not change.
     [ "$actual_comm" = "$comm" ] || return 1
+    if ! read_process_uid "$process"; then [ ! -d "$process" ] && continue; return 1; fi
+    [ "$PROCESS_UID" = "$CAPTUREUID" ] || return 1
+    scan_budget || return 1
     if [ "$comm" = atrace ]; then LEGACYSTATUS=legacy_atrace_active; return 1; fi
-    # A killed legacy parent can leave an already-exec'd mutation child whose
-    # argv no longer contains the helper path. Do not race its pending unlink.
     case "$comm" in rm|rmdir|mkdir|mkfifo|unlink|mv|busybox|toybox)
       case "
 $arguments
@@ -143,6 +177,43 @@ $0
 $LEGACY_SCRIPT
 "*) LEGACYSTATUS=legacy_helper_active; return 1;; esac
   done
+  # The final candidate/read must not silently spend more than the fixed budget.
+  scan_budget
+}
+
+read_owner_record() {
+  owner_meta=$(stat -c '%d:%i:%u:%h:%s:%Y' "$LOCK/owner" 2>/dev/null) || return 1
+  # Derive length from the exact snapshot validated against the pinned FD, not
+  # a separate earlier stat that could precede an appended NUL byte.
+  owner_size_fields=${owner_meta%:*}; owner_size=${owner_size_fields##*:}
+  case "$owner_size" in ''|*[!0-9]*) return 1;; esac
+  [ "$owner_size" -le 201 ] || return 1
+  # Pin and validate before reading. Both the open and the bounded byte read are
+  # timed; a FIFO replacement cannot hang recovery or grow an awk record in RAM.
+  owner_framed=$(timeout -s KILL 1 sh -c '
+    exec 9< "$1" || exit 1
+    [ ! -L "$1" ] && [ -f /proc/self/fd/9 ] &&
+      [ "$(stat -L -c "%d:%i:%u:%h:%s:%Y" /proc/self/fd/9 9<&9)" = "$2" ] || exit 1
+    head -c 201 /proc/self/fd/9 9<&9 || exit 1
+    [ ! -L "$1" ] && [ "$(stat -c "%d:%i:%u:%h:%s:%Y" "$1")" = "$2" ] &&
+      [ "$(stat -L -c "%d:%i:%u:%h:%s:%Y" /proc/self/fd/9 9<&9)" = "$2" ] || exit 1
+    printf "\ncodec_owner_read_end"
+  ' codec_owner "$LOCK/owner" "$owner_meta" 8<&8 2>/dev/null) || return 1
+  case "$owner_framed" in *"
+codec_owner_read_end") OWNER_RECORD=${owner_framed%"
+codec_owner_read_end"};; *) return 1;; esac
+  owner_newline=0
+  case "$OWNER_RECORD" in *"
+") OWNER_RECORD=${OWNER_RECORD%"
+"}; owner_newline=1;; esac
+  case "$OWNER_RECORD" in *"
+"*) return 1;; esac
+  # Shell substitutions discard NUL bytes. Never let a torn binary record turn
+  # into a valid token and bypass the malformed-owner initialization grace.
+  if [ "$owner_size" -ne "$((${#OWNER_RECORD}+owner_newline))" ]; then
+    OWNER_RECORD=malformed_binary_owner
+  fi
+  [ "${#OWNER_RECORD}" -le 200 ]
 }
 valid_owner() {
   oldpid=${previous_owner%%:*}; rest=${previous_owner#*:}
@@ -160,7 +231,7 @@ acquire_guard() {
   if [ ! -e "$GUARD" ] && [ ! -L "$GUARD" ]; then
     (set -C; : > "$GUARD") 2>/dev/null || :
   fi
-  [ -f "$GUARD" ] && [ ! -L "$GUARD" ] || {
+  [ -f "$GUARD" ] && [ ! -L "$GUARD" ] && [ "$(stat -c '%h' "$GUARD" 2>/dev/null)" = 1 ] || {
     LOCKSTATUS=unsafe_guard; STATUS=lock_unavailable; return 1;
   }
   GUARDID=$(stat -c '%d:%i:%u:%a' "$GUARD" 2>/dev/null)
@@ -182,14 +253,125 @@ acquire_guard() {
   }
   GUARDED=1
 }
+legacy_layout() {
+  # This is the exact pre-guard layout, not permission normalization for arbitrary
+  # trees. A previous interrupted tightening may have left only the owner at 666.
+  for legacy_member in "$LOCK"/* "$LOCK"/.[!.]* "$LOCK"/..?*; do
+    [ -e "$legacy_member" ] || [ -L "$legacy_member" ] || continue
+    [ ! -L "$legacy_member" ] || return 1
+    case "$legacy_member" in
+      "$LOCK/owner") [ -f "$legacy_member" ] || return 1
+        case "$(stat -c '%u:%h:%a' "$legacy_member" 2>/dev/null)" in "$CAPTUREUID":1:666|"$CAPTUREUID":1:600) ;; *) return 1;; esac;;
+      "$LOCK/summary") [ -f "$legacy_member" ] &&
+        [ "$(stat -c '%u:%h:%a' "$legacy_member" 2>/dev/null)" = "$CAPTUREUID:1:666" ] || return 1;;
+      "$LOCK/pipe") [ -p "$legacy_member" ] &&
+        [ "$(stat -c '%u:%h:%a' "$legacy_member" 2>/dev/null)" = "$CAPTUREUID:1:666" ] || return 1;;
+      *) return 1;;
+    esac
+  done
+  [ -f "$LOCK/owner" ] && [ -f "$LOCK/summary" ] && [ -p "$LOCK/pipe" ] || return 1
+  legacy_owner_size=$(stat -c '%s' "$LOCK/owner" 2>/dev/null)
+  legacy_summary_size=$(stat -c '%s' "$LOCK/summary" 2>/dev/null)
+  case "$legacy_owner_size:$legacy_summary_size" in ''|*[!0-9:]*) return 1;; esac
+  [ -n "$legacy_owner_size" ] && [ -n "$legacy_summary_size" ] &&
+    [ "$legacy_owner_size" -le 200 ] && [ "$legacy_summary_size" -le 8192 ]
+}
+legacy_manifest() {
+  stat -c '%d:%i:%u:%h:%s:%Y' "$LOCK/owner" "$LOCK/summary" "$LOCK/pipe" 2>/dev/null
+}
+legacy_member_worker() {
+  timeout -s KILL 4 sh -c '
+  lock=$1; guard=$2; guard_id=$3; directory=$4
+  owner=$5; summary=$6; pipe=$7; trace=$8; operation=$9
+  shift 9; directory_mode=$1; expected=$2
+  exec 9< "$lock/owner" || exit 1
+  exec 6< "$lock/summary" || exit 1
+  matches() {
+    [ ! -L "$lock" ] && [ ! -L "$lock/owner" ] && [ ! -L "$lock/summary" ] && [ ! -L "$lock/pipe" ] &&
+    [ -f /proc/self/fd/9 ] && [ -f /proc/self/fd/6 ] && [ -p "$lock/pipe" ] &&
+    [ "$(stat -c "%d:%i:%u:%a" "$lock" 2>/dev/null)" = "$directory:$directory_mode" ] &&
+    [ "$(stat -L -c "%d:%i:%u" /proc/self/fd/7 7<&7 2>/dev/null)" = "$directory" ] &&
+    [ "$(stat -L -c "%d:%i:%u:%h:%s:%Y" /proc/self/fd/9 9<&9 2>/dev/null)" = "$owner" ] &&
+    [ "$(stat -L -c "%d:%i:%u:%h:%s:%Y" /proc/self/fd/6 6<&6 2>/dev/null)" = "$summary" ] &&
+    [ "$(stat -c "%d:%i:%u:%h:%s:%Y" "$lock/owner" 2>/dev/null)" = "$owner" ] &&
+    [ "$(stat -c "%d:%i:%u:%h:%s:%Y" "$lock/summary" 2>/dev/null)" = "$summary" ] &&
+    [ "$(stat -c "%d:%i:%u:%h:%s:%Y" "$lock/pipe" 2>/dev/null)" = "$pipe" ] &&
+    [ ! -L "$guard" ] && [ "$(stat -c "%d:%i:%u:%a" "$guard" 2>/dev/null)" = "$guard_id" ]
+  }
+  trace_off() {
+    read state < "$trace/tracing_on" 2>/dev/null && read tracer < "$trace/current_tracer" 2>/dev/null &&
+      [ "$state" = 0 ] && [ "$tracer" = nop ]
+  }
+  hashes() { timeout -s KILL 1 sha256sum /proc/self/fd/9 /proc/self/fd/6 9<&9 6<&6 8<&8 2>/dev/null; }
+  matches || exit 1
+  before=$(hashes) || exit 1
+  matches && trace_off || exit 1
+  if [ "$operation" = hash ]; then printf "%s\n" "$before"; exit 0; fi
+  [ "$operation" = tighten ] && [ "$before" = "$expected" ] || exit 1
+  chmod 600 /proc/self/fd/9 9<&9 8<&8 || exit 1
+  after=$(hashes) || exit 1
+  matches && [ "$after" = "$before" ] && trace_off || exit 1
+  ' legacy "$LOCK" "$GUARD" "$GUARDID" "$legacy_directory" "$legacy_owner" "$legacy_summary" "$legacy_pipe" "$TRACEPATH" "$1" "$2" "$3" 7<&7 8<&8
+}
+tighten_legacy_permissions() {
+  for legacy_tool in chmod sha256sum; do command -v "$legacy_tool" >/dev/null 2>&1 || return 1; done
+  legacy_mode=$(stat -c '%a' "$LOCK" 2>/dev/null)
+  case "$legacy_mode:$(stat -c '%a' "$LOCK/owner" 2>/dev/null)" in
+    777:666|700:666) ;; *) return 1;;
+  esac
+  legacy_layout || return 1
+  changed=$(stat -c '%Y' "$LOCK" 2>/dev/null); now=$(date +%s 2>/dev/null)
+  case "$changed:$now" in ''|*[!0-9:]*) return 1;; esac
+  [ -n "$changed" ] && [ -n "$now" ] && [ "$now" -ge "$changed" ] && [ "$((now-changed))" -ge 30 ] || return 1
+  legacy_directory=$(stat -c '%d:%i:%u' "$LOCK" 2>/dev/null) || return 1
+  [ "$legacy_directory" = "$previous_id:$CAPTUREUID" ] || return 1
+  legacy_members=$(legacy_manifest) || return 1
+  legacy_owner=$(stat -c '%d:%i:%u:%h:%s:%Y' "$LOCK/owner" 2>/dev/null) || return 1
+  legacy_summary=$(stat -c '%d:%i:%u:%h:%s:%Y' "$LOCK/summary" 2>/dev/null) || return 1
+  legacy_pipe=$(stat -c '%d:%i:%u:%h:%s:%Y' "$LOCK/pipe" 2>/dev/null) || return 1
+  legacy_ok=0
+  # The trailing /. requires a directory: a FIFO substitution cannot block this
+  # readonly pin. Its identity must still match before any chmod is attempted.
+  if { exec 7< "$LOCK/."; } 2>/dev/null; then
+    if [ "$(stat -L -c '%d:%i:%u' /proc/self/fd/7 7<&7 2>/dev/null)" = "$legacy_directory" ] &&
+        [ ! -L "$LOCK" ] && [ "$(stat -c '%d:%i:%u' "$LOCK" 2>/dev/null)" = "$legacy_directory" ] &&
+        legacy_layout && [ "$(legacy_manifest)" = "$legacy_members" ]; then
+      read_state
+      if [ "$STATE" = 0 ] && [ "$TRACER" = nop ] &&
+          legacy_content=$(legacy_member_worker hash "$legacy_mode" "") && chmod 700 /proc/self/fd/7 7<&7 8<&8 &&
+          legacy_layout && [ "$(legacy_manifest)" = "$legacy_members" ] &&
+          [ "$(stat -c '%d:%i:%u:%a' "$LOCK" 2>/dev/null)" = "$legacy_directory:700" ] &&
+          legacy_helpers_absent; then
+        read_state
+        if [ "$STATE" = 0 ] && [ "$TRACER" = nop ]; then
+          # Only this bounded child opens possibly substituted members. It has
+          # no process-discovery exemption and never writes their contents. Both
+          # pins are checked before the first hash; chmod targets the pinned FD.
+          if legacy_member_worker tighten 700 "$legacy_content"; then
+            if legacy_layout && [ "$(legacy_manifest)" = "$legacy_members" ] &&
+                [ "$(stat -c '%d:%i:%u:%a' "$LOCK" 2>/dev/null)" = "$legacy_directory:700" ] &&
+                [ "$(stat -c '%a' "$LOCK/owner" 2>/dev/null)" = 600 ]; then
+              read_state
+              [ "$STATE" != 0 ] || [ "$TRACER" != nop ] || legacy_ok=1
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+  exec 7<&-
+  [ "$legacy_ok" = 1 ]
+}
+
 acquire_workspace() {
   LOCKSTATUS=acquired
   if ! mkdir "$LOCK" 8<&8 2>/dev/null; then
     [ -d "$LOCK" ] && [ ! -L "$LOCK" ] || {
       LOCKSTATUS=unsafe_workspace; STATUS=lock_unavailable; return 1;
     }
+    legacy_permissions=0
     attributes=$(stat -c '%u:%a' "$LOCK" 2>/dev/null)
-    case "$attributes" in "$CAPTUREUID":7[0145][0145]) ;; *)
+    case "$attributes" in "$CAPTUREUID":777) legacy_permissions=1;; "$CAPTUREUID":7[0145][0145]) ;; *)
       LOCKSTATUS=unsafe_workspace; STATUS=lock_unavailable; return 1;; esac
     [ -r "$LOCK" ] && [ -w "$LOCK" ] && [ -x "$LOCK" ] && safe_members || {
       LOCKSTATUS=unsafe_workspace; STATUS=lock_unavailable; return 1;
@@ -198,17 +380,21 @@ acquire_workspace() {
     previous_owner=
     if [ -e "$LOCK/owner" ]; then
       permissions=$(stat -c '%u:%a' "$LOCK/owner" 2>/dev/null)
-      case "$permissions" in "$CAPTUREUID":[46][04][04]) ;; *)
+      case "$permissions" in "$CAPTUREUID":666) legacy_permissions=1;; "$CAPTUREUID":[46][04][04]) ;; *)
         LOCKSTATUS=owner_unreadable; STATUS=lock_owner_unavailable; return 1;; esac
       [ -r "$LOCK/owner" ] || {
         LOCKSTATUS=owner_unreadable; STATUS=lock_owner_unavailable; return 1;
       }
-      previous_owner=$(awk 'NR==1 && length($0)<=200 {value=$0} NR>1 {bad=1;exit} END {if(!bad)print value}' "$LOCK/owner" 2>/dev/null) || {
+      read_owner_record || {
         LOCKSTATUS=owner_unreadable; STATUS=lock_owner_unavailable; return 1;
       }
+      previous_owner=$OWNER_RECORD
       LOCKSTATUS=recovered_malformed_owner
     else
       LOCKSTATUS=recovered_missing_owner
+    fi
+    if [ "$legacy_permissions" = 1 ] && ! legacy_layout; then
+      LOCKSTATUS=unsafe_workspace; STATUS=lock_unavailable; return 1
     fi
     if valid_owner; then
       if [ -d "/proc/$oldpid" ]; then
@@ -242,6 +428,9 @@ acquire_workspace() {
     # A recorded dead parent does not prove its legacy producer/parser children
     # exited. They never held the new guard and may not have enabled tracing yet.
     legacy_helpers_absent || { LOCKSTATUS=$LEGACYSTATUS; STATUS=lock_owner_unavailable; return 1; }
+    if [ "$legacy_permissions" = 1 ] && ! tighten_legacy_permissions; then
+      LOCKSTATUS=recovery_failed; STATUS=lock_recovery_failed; return 1
+    fi
     read_state
     [ "$STATE" = 0 ] && [ "$TRACER" = nop ] || {
       LOCKSTATUS=trace_changed; STATUS=trace_busy_or_unavailable; return 1;
@@ -251,9 +440,10 @@ acquire_workspace() {
     }
     current_owner=
     if [ -e "$LOCK/owner" ]; then
-      current_owner=$(awk 'NR==1 && length($0)<=200 {value=$0} NR>1 {bad=1;exit} END {if(!bad)print value}' "$LOCK/owner" 2>/dev/null) || {
+      read_owner_record || {
         LOCKSTATUS=recovery_failed; STATUS=lock_recovery_failed; return 1;
       }
+      current_owner=$OWNER_RECORD
     fi
     [ "$current_owner" = "$previous_owner" ] || {
       LOCKSTATUS=recovery_failed; STATUS=lock_recovery_failed; return 1;

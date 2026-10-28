@@ -19,8 +19,34 @@ A valid live owner, an active tracer, unknown ownership or unsafe filesystem sta
 prevents recovery. Stale or incomplete workspace initialization has a bounded
 grace period before conservative recovery. Missing or malformed legacy ownership
 requires at least thirty seconds of age. Every recovery also checks for surviving
-legacy helpers or trace producers; this check is bounded to 512 processes and a
-short time budget, with incomplete inspection retaining the workspace.
+legacy helpers or trace producers. The scan uses shell builtins for process UID
+and lifetime inspection, avoiding an external command for every Android kernel or
+system task. It has a 4,096-process inventory limit, a 128-live-candidate limit and
+a four-second elapsed-time budget. Every live process with the capture UID has its
+bounded arguments and lifetime rechecked; incomplete inspection retains the
+workspace. The refusal reasons `legacy_scan_limit`, `legacy_candidate_limit` and
+`legacy_scan_timeout` distinguish these limits from unreadable ownership.
+Owner records are read through a timed, byte-limited reader; binary/torn records
+remain malformed and cannot bypass the thirty-second initializer grace period.
+
+Old helpers inherited `777` directory and `666` owner-file modes. The new helper
+can prepare only that exact legacy workspace layout, or finish its interrupted
+`700/666` preparation, while holding the stable guard. It checks ownership,
+single-link regular files/FIFO, exact members, age, process absence and inactive
+tracing. Pinned file descriptors anchor the directory and owner permission
+changes; identity and content checks surround them. Unknown files, symlinks,
+hardlinks, active owners and ambiguous process state remain blocked. Permission
+preparation neither starts tracing nor changes the retained file contents; normal
+stale-workspace recovery performs its own checks afterward.
+
+Readonly member opening, hashing and owner-permission changes run in bounded
+workers. The worker validates its pinned files before reading them, captures a
+digest baseline before directory tightening, and compares it before and after the
+owner change. Each worker has a four-second deadline and each hash operation a
+one-second timeout. A FIFO substitution, slow read or interrupted tightening
+therefore leaves a blocked, retryable workspace rather than an unbounded helper.
+These scans and migration workers run only for retained stale workspaces; an
+ordinary fresh capture does not pay their recovery cost.
 `codec_lock_status` distinguishes
 lock health from `codec_capture_status`; skipped captures retain unavailable
 latency. In particular, a busy capture guard is not proof of decoder overload.

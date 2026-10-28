@@ -54,6 +54,22 @@ def clean():
     carplay_timing.reset_for_tests()
 
 
+@pytest.mark.parametrize(
+    "reason", ["legacy_scan_limit", "legacy_scan_timeout", "legacy_candidate_limit"]
+)
+def test_bounded_codec_recovery_refusals_remain_visible_without_latency(reason):
+    row = carplay_timing.parse_event(
+        datetime.now(UTC),
+        "schema=6 | event=codec_capture codec_capture_status=lock_owner_unavailable "
+        f"codec_lock_status={reason} codec_trace_off=1 codec_latency_med_ms=na",
+    )
+    assert row is not None
+    assert row["codec_lock_status"] == reason
+    assert row["codec_capture_status"] == "lock_owner_unavailable"
+    assert row["codec_trace_off"] == 1
+    assert row["codec_latency_med_ms"] is None
+
+
 @pytest.mark.parametrize("ignition", ["off", "on", "unknown"])
 @pytest.mark.parametrize("running", [False, True])
 async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off(
