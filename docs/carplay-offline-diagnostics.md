@@ -8,6 +8,12 @@ competing helpers cannot acquire different lock files at the same path. Owned
 children are reaped before release; abnormal process exit releases the kernel
 lock when the last inheriting descriptor closes.
 
+Android's `mksh` can mark persistent shell descriptors close-on-exec. The helper
+therefore passes the guard descriptor explicitly to external lock, producer,
+watchdog, trace-stop and workspace-mutation commands. The parser closes it before
+opening its unique FIFO. Executable tests use real external-command stubs, so
+shell-function inheritance cannot hide a missing descriptor handoff.
+
 Legacy capture-directory metadata is inspected only while holding that guard.
 A valid live owner, an active tracer, unknown ownership or unsafe filesystem state
 prevents recovery. Stale or incomplete workspace initialization has a bounded

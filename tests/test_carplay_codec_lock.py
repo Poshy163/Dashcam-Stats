@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -52,6 +53,10 @@ def capture(tmp_path, request):
     logfile = tmp_path / "log"
     checkpoint = tmp_path / "checkpoint"
     script = tmp_path / "codec.sh"
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    inherited = tmp_path / "inherited-fds"
+    producer_pids = tmp_path / "producer-pids"
     processes = []
     text = SOURCE.replace(
         "LOCK=/data/local/tmp/.dashcam_cpt_codec_capture.lock", f"LOCK='{lock}'"
@@ -60,11 +65,35 @@ def capture(tmp_path, request):
         "for path in /sys/kernel/tracing /sys/kernel/debug/tracing; do",
         f"for path in '{trace}'; do",
     ).replace("timeout -s KILL 10 sh", "timeout -s KILL ${PARSER_TIMEOUT:-10} sh")
-    prelude = f"""
+    prelude = """
 pidof() {{ printf '%s\\n' "$$"; }}
 log() {{ :; }}
-atrace() {{
-  if [ "$1" = --async_stop ]; then printf 'stop\\n' >> '{calls}'; return 0; fi
+""".replace("{{", "{").replace("}}", "}")
+    for command in ("flock", "mkdir", "rmdir", "rm", "mkfifo"):
+        executable = shutil.which(command)
+        assert executable, f"{command} required for executable codec safety checks"
+        stub = tools / command
+        stub.write_text(
+            f"#!/bin/sh\n[ /proc/$$/fd/8 -ef '{guard}' ] || exit 98\n"
+            f"printf '{command}\\n' >> '{inherited}'\nexec '{executable}' \"$@\" 8<&8\n"
+        )
+        stub.chmod(0o700)
+    # This must be an executable, not a shell function: mksh closes an exec-opened
+    # fd unless the actual external command receives explicit passthrough.
+    atrace = tools / "atrace"
+    atrace.write_text(f"""#!/bin/sh
+  [ /proc/$$/fd/8 -ef '{guard}' ] || exit 98
+  if [ "$1" = --async_stop ]; then
+    printf 'stop\\n' >> '{calls}'
+    if [ -n "${{STOP_GATE:-}}" ]; then
+      : > "$STOP_READY"
+      while [ -e "$STOP_GATE" ]; do sleep 0.01 8<&8; done
+    fi
+    printf '0\\n' > '{trace / "tracing_on"}'
+    exit 0
+  fi
+  ZPID=$PPID
+  printf '%s\\n' "$$" >> '{producer_pids}'
   printf 'start\\n' >> '{calls}'
   printf '# entries-in-buffer/entries-written: 4/4\\n'
   printf 'trace-11 ( %s) [000] .... 1.000000: tracing_mark_write: B|%s|CCodecBufferChannel::queue(c2.unisoc.avc.decoder#1@ts=1000)\\n' "$ZPID" "$ZPID"
@@ -75,20 +104,23 @@ atrace() {{
     : > "$PRODUCER_READY"
     attempt=0
     while [ -e "$PRODUCER_GATE" ] && [ "$attempt" -lt 1000 ]; do
-      attempt=$((attempt+1)); sleep 0.01
+      attempt=$((attempt+1)); sleep 0.01 8<&8
     done
-    [ ! -e "$PRODUCER_GATE" ] || return 1
+    [ ! -e "$PRODUCER_GATE" ] || exit 1
   else
-    sleep 0.05
+    sleep 0.05 8<&8
   fi
-}}
-"""
+  if [ "${{LEAVE_TRACE_ON:-0}}" = 1 ]; then printf '1\\n' > '{trace / "tracing_on"}'; fi
+""")
+    atrace.chmod(0o700)
 
     class Capture:
         def __init__(self):
             self.lock, self.guard, self.calls = lock, guard, calls
             self.trace, self.log, self.script = trace, logfile, script
             self.checkpoint = checkpoint
+            self.inherited, self.producer_pids = inherited, producer_pids
+            self.tools = tools
 
         def write(self, altered=None, prefix=""):
             script.write_text("#!/bin/sh\n" + prelude + prefix + (altered or text))
@@ -99,7 +131,11 @@ atrace() {{
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                env={**os.environ, **(env or {})},
+                env={
+                    **os.environ,
+                    **(env or {}),
+                    "PATH": f"{tools}:{(env or {}).get('PATH', os.environ['PATH'])}",
+                },
             )
             processes.append(process)
             return process
@@ -169,6 +205,15 @@ def test_stale_workspace_recovers_without_stopping_trace(capture, owner, reason)
     assert capture.calls.read_text() == "start\n"
     assert not capture.lock.exists()
     assert capture.guard.is_file()  # The stable exclusion inode is never unlinked.
+
+
+def test_real_external_commands_receive_the_same_guard_descriptor(capture):
+    row = capture.run()
+    assert row["codec_capture_status"] == "ok"
+    assert capture.producer_pids.read_text().strip()
+    assert {"flock", "mkdir", "mkfifo", "rm", "rmdir"} <= set(
+        capture.inherited.read_text().splitlines()
+    )
 
 
 def test_young_unpublished_owner_is_not_stolen(capture):
@@ -297,6 +342,83 @@ def test_dead_parent_token_does_not_authorize_recovery_over_pending_legacy_atrac
         process.wait(timeout=3)
 
 
+@pytest.mark.parametrize(
+    ("comm", "arguments", "reason"),
+    [
+        ("rm", ["OWNER"], "legacy_workspace_active"),
+        ("toybox", ["rm", "OWNER"], "legacy_workspace_active"),
+        ("timeout", ["1", "atrace", "--async_stop"], "legacy_atrace_active"),
+    ],
+)
+def test_dead_parent_does_not_hide_already_execed_legacy_mutation_children(
+    capture, comm, arguments, reason
+):
+    ready = capture.script.parent / "legacy-child-ready"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            f"import ctypes,pathlib,time; ctypes.CDLL(None).prctl(15,{comm.encode()!r},0,0,0); "
+            f"pathlib.Path({str(ready)!r}).touch(); time.sleep(30)",
+            *[str(capture.lock / "owner") if arg == "OWNER" else arg for arg in arguments],
+        ]
+    )
+    try:
+        wait_for(ready.exists)
+        capture.stale("2147483647:1:old:1\n")
+        assert capture.run()["codec_lock_status"] == reason
+        assert process.poll() is None and not capture.calls.exists()
+    finally:
+        process.terminate()
+        process.wait(timeout=3)
+
+
+def test_exec_during_legacy_argv_read_is_ambiguous_even_with_unchanged_start_ticks(capture):
+    ready = capture.script.parent / "comm-ready"
+    change = capture.script.parent / "comm-change"
+    changed = capture.script.parent / "comm-changed"
+    entered = capture.script.parent / "head-entered"
+    gate = capture.script.parent / "head-gate"
+    gate.touch()
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import ctypes,pathlib,time; libc=ctypes.CDLL(None); libc.prctl(15,b'sh',0,0,0); "
+            f"pathlib.Path({str(ready)!r}).touch(); "
+            f"\nwhile not pathlib.Path({str(change)!r}).exists(): time.sleep(.01)\n"
+            f"libc.prctl(15,b'rm',0,0,0); pathlib.Path({str(changed)!r}).touch(); time.sleep(30)",
+            str(capture.lock / "owner"),
+        ]
+    )
+    actual_head = shutil.which("head")
+    head = capture.tools / "head"
+    head.write_text(
+        f'#!/bin/sh\nif [ "$3" = /proc/{child.pid}/cmdline ]; then\n'
+        f"  : > '{entered}'\n  while [ -e '{gate}' ]; do sleep 0.01; done\nfi\n"
+        f"exec '{actual_head}' \"$@\"\n"
+    )
+    head.chmod(0o700)
+    capture.stale("2147483647:1:old:1\n")
+    try:
+        wait_for(ready.exists)
+        started = start_identity(child.pid)
+        process = capture.launch()
+        wait_for(entered.exists)
+        change.touch()
+        wait_for(changed.exists)
+        gate.unlink()
+        _out, error = process.communicate(timeout=5)
+        assert process.returncode == 0, error
+        assert start_identity(child.pid) == started
+        assert capture.rows()[-1]["codec_lock_status"] == "legacy_owner_unknown"
+        assert capture.lock.exists() and not capture.calls.exists()
+    finally:
+        gate.unlink(missing_ok=True)
+        child.terminate()
+        child.wait(timeout=3)
+
+
 def test_two_reclaimers_cannot_remove_each_others_live_workspace(capture):
     capture.stale("2147483647:1:old:1\n")
     gate = capture.script.parent / "recovery-gate"
@@ -401,17 +523,20 @@ def test_parent_crash_cannot_release_guard_while_owned_producer_is_alive(capture
     text = (
         capture.script.read_text()
         .replace(
-            "sleep 8 &",
+            "sleep 8 8<&8 &",
             'if [ -n "${PRODUCER_GATE:-}" ]; then\n'
             '    while [ -e "$PRODUCER_GATE" ]; do sleep 0.01; done\n'
-            "    sleep 0.01 &\n  else\n    sleep 8 &\n  fi",
+            "    sleep 0.01 8<&8 &\n  else\n    sleep 8 8<&8 &\n  fi",
         )
-        .replace("WATCHPID=$!", f"WATCHPID=$!\n: > '{watchdog_ready}'")
+        .replace("WATCHPID=$!", f"WATCHPID=$!\nprintf '%s\\n' \"$WATCHPID\" > '{watchdog_ready}'")
     )
     capture.script.write_text(text)
     first = capture.launch(1, {"PRODUCER_GATE": str(gate), "PRODUCER_READY": str(ready)})
     try:
         wait_for(lambda: ready.exists() and watchdog_ready.exists())
+        watchdog_pid = int(watchdog_ready.read_text())
+        os.kill(watchdog_pid, signal.SIGTERM)
+        wait_for(lambda: process_exited(watchdog_pid))
         first.kill()
         first.wait(timeout=3)
         row = capture.run(2)
@@ -434,6 +559,42 @@ def test_parent_crash_cannot_release_guard_while_owned_producer_is_alive(capture
     row = capture.run(3)
     assert row["codec_lock_status"] == "recovered_dead_owner"
     assert row["codec_capture_status"] == "ok"
+
+
+def test_async_stop_child_keeps_guard_after_parent_crash(capture):
+    capture.script.write_text(
+        capture.script.read_text().replace(
+            "timeout 1 atrace --async_stop", "timeout 10 atrace --async_stop"
+        )
+    )
+    gate = capture.script.parent / "stop-gate"
+    ready = capture.script.parent / "stop-ready"
+    gate.touch()
+    first = capture.launch(
+        1, {"LEAVE_TRACE_ON": "1", "STOP_GATE": str(gate), "STOP_READY": str(ready)}
+    )
+    try:
+        wait_for(ready.exists)
+        first.kill()
+        first.wait(timeout=3)
+        # The old stop can still complete later even after tracing became idle.
+        (capture.trace / "tracing_on").write_text("0\n")
+        assert capture.run(2)["codec_lock_status"] == "guard_busy"
+    finally:
+        gate.unlink(missing_ok=True)
+
+    import fcntl
+
+    def guard_released():
+        with capture.guard.open("rb") as descriptor:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                return False
+
+    wait_for(guard_released)
+    assert capture.run(3)["codec_capture_status"] == "ok"
 
 
 def test_partial_owner_publication_failure_cleans_only_its_workspace(capture):

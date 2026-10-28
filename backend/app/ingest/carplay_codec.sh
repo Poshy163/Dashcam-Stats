@@ -60,7 +60,7 @@ remove_members() {
   safe_members || return 1
   for member in "$LOCK"/* "$LOCK"/.[!.]* "$LOCK"/..?*; do
     [ -e "$member" ] || [ -L "$member" ] || continue
-    rm -f "$member" || return 1
+    rm -f "$member" 8<&8 || return 1
   done
 }
 legacy_helpers_absent() {
@@ -81,11 +81,12 @@ legacy_helpers_absent() {
       [ ! -d "$process" ] && continue
       return 1
     fi
-    case "$comm" in sh|mksh|bash|dash|ash|busybox|dashcam_carplay*|atrace) ;; *) continue;; esac
+    case "$comm" in sh|mksh|bash|dash|ash|busybox|toybox|dashcam_carplay*|atrace|timeout|rm|rmdir|mkdir|mkfifo|unlink|mv) ;; *) continue;; esac
     process_uid=$(awk '$1=="Uid:" {print $3;exit}' "$process/status" 2>/dev/null)
     if [ -z "$process_uid" ]; then [ ! -d "$process" ] && continue; return 1; fi
     [ "$process_uid" = "$CAPTUREUID" ] || continue
-    process_start=$(awk '{sub(/^.*\) /,"");print $20}' "$process/stat" 2>/dev/null)
+    process_start=$(awk '{sub(/^.*\) /,"");if($1=="Z" || $1=="X")print "exited";else print $20}' "$process/stat" 2>/dev/null)
+    [ "$process_start" != exited ] || continue
     case "$process_start" in ''|*[!0-9]*) [ ! -d "$process" ] && continue; return 1;; esac
     arguments=$({ head -c 65537 "$process/cmdline" 2>/dev/null || printf '\000codec_read_failed\000'; printf '\000codec_read_end'; } | tr '\000' '\n') || {
       [ ! -d "$process" ] && continue
@@ -96,12 +97,44 @@ legacy_helpers_absent() {
 codec_read_end") arguments=${arguments%"
 codec_read_end"};; *) return 1;; esac
     [ "${#arguments}" -le 65536 ] || return 1
-    actual_start=$(awk '{sub(/^.*\) /,"");print $20}' "$process/stat" 2>/dev/null)
+    actual_start=$(awk '{sub(/^.*\) /,"");if($1=="Z" || $1=="X")print "exited";else print $20}' "$process/stat" 2>/dev/null)
+    [ "$actual_start" != exited ] || continue
     if [ "$actual_start" != "$process_start" ]; then
       [ ! -d "$process" ] && continue
       return 1
     fi
+    actual_comm=
+    if ! read actual_comm < "$process/comm" 2>/dev/null; then
+      [ ! -d "$process" ] && continue
+      return 1
+    fi
+    # start ticks survive exec. A shell becoming rm/atrace during the bounded
+    # argv read is ambiguous even though its PID/start identity did not change.
+    [ "$actual_comm" = "$comm" ] || return 1
     if [ "$comm" = atrace ]; then LEGACYSTATUS=legacy_atrace_active; return 1; fi
+    # A killed legacy parent can leave an already-exec'd mutation child whose
+    # argv no longer contains the helper path. Do not race its pending unlink.
+    case "$comm" in rm|rmdir|mkdir|mkfifo|unlink|mv|busybox|toybox)
+      case "
+$arguments
+" in *"
+$LOCK
+"*|*"
+$LOCK/"*) LEGACYSTATUS=legacy_workspace_active; return 1;; esac;;
+    esac
+    case "$comm" in timeout|busybox|toybox)
+      case "
+$arguments
+" in *"
+--async_stop
+"*) case "
+$arguments
+" in *"
+atrace
+"*|*"
+/system/bin/atrace
+"*) LEGACYSTATUS=legacy_atrace_active; return 1;; esac;; esac;;
+    esac
     case "
 $arguments
 " in *"
@@ -141,7 +174,9 @@ acquire_guard() {
   [ "$(stat -L -c '%d:%i:%u:%a' /proc/$$/fd/8 2>/dev/null)" = "$GUARDID" ] || {
     LOCKSTATUS=unsafe_guard; STATUS=lock_unavailable; return 1;
   }
-  flock -n 8 2>/dev/null || { LOCKSTATUS=guard_busy; STATUS=capture_busy; return 1; }
+  # mksh keeps exec-opened descriptors close-on-exec unless the command receives
+  # an explicit redirection. Pass the existing open description, not a new inode.
+  flock -n 8 8<&8 2>/dev/null || { LOCKSTATUS=guard_busy; STATUS=capture_busy; return 1; }
   [ ! -L "$GUARD" ] && [ "$(stat -c '%d:%i:%u:%a' "$GUARD" 2>/dev/null)" = "$GUARDID" ] || {
     LOCKSTATUS=unsafe_guard; STATUS=lock_unavailable; return 1;
   }
@@ -149,7 +184,7 @@ acquire_guard() {
 }
 acquire_workspace() {
   LOCKSTATUS=acquired
-  if ! mkdir "$LOCK" 2>/dev/null; then
+  if ! mkdir "$LOCK" 8<&8 2>/dev/null; then
     [ -d "$LOCK" ] && [ ! -L "$LOCK" ] || {
       LOCKSTATUS=unsafe_workspace; STATUS=lock_unavailable; return 1;
     }
@@ -224,7 +259,7 @@ acquire_workspace() {
       LOCKSTATUS=recovery_failed; STATUS=lock_recovery_failed; return 1;
     }
     # Serialized by the permanent flock, never an unguarded stale-owner rm.
-    remove_members && rmdir "$LOCK" 2>/dev/null && mkdir "$LOCK" 2>/dev/null || {
+    remove_members && rmdir "$LOCK" 8<&8 2>/dev/null && mkdir "$LOCK" 8<&8 2>/dev/null || {
       LOCKSTATUS=recovery_failed; STATUS=lock_recovery_failed; return 1;
     }
   fi
@@ -254,7 +289,7 @@ finish() {
   if [ "$STARTED" = 1 ] && owns_lock && [ "$STATE" = 1 ] && [ "$TRACER" = nop ]; then
     # Only this live invocation may clean up its interrupted capture. Skipped
     # captures and stale-lock recovery never issue an atrace stop command.
-    timeout 1 atrace --async_stop >/dev/null 2>&1
+    timeout 1 atrace --async_stop 8<&8 >/dev/null 2>&1
     read_state
   fi
   OFF=na
@@ -275,7 +310,7 @@ finish() {
   log -p "$PRIO" -t CarPlayTiming "$MESSAGE" 2>/dev/null
   if owns_workspace && safe_members; then
     remove_members
-    rmdir "$LOCK" 2>/dev/null
+    rmdir "$LOCK" 8<&8 2>/dev/null
   fi
   exec 8<&-
 }
@@ -300,7 +335,7 @@ case "$ZPID" in ''|*[!0-9]*) STATUS=zlink_missing_or_ambiguous; exit 0;; esac
 ZSTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$ZPID/stat" 2>/dev/null)
 case "$ZSTART" in ''|*[!0-9]*) STATUS=zlink_identity_unavailable; exit 0;; esac
 acquire_guard && acquire_workspace || exit 0
-mkfifo "$PIPE" || { STATUS=pipe_failed; exit 0; }
+mkfifo "$PIPE" 8<&8 || { STATUS=pipe_failed; exit 0; }
 # Recheck after acquiring our guard; never start over an already active tracer.
 read_state
 if [ "$STATE" != 0 ] || [ "$TRACER" != nop ]; then STATUS=trace_busy_or_unavailable; exit 0; fi
@@ -445,14 +480,14 @@ STARTMS=$(clock_ms); STARTMS=${STARTMS:-0}
 read_state
 if [ "$STATE" != 0 ] || [ "$TRACER" != nop ]; then STATUS=trace_busy_or_unavailable; exit 0; fi
 STARTED=1
-atrace -t 5 -b 2048 gfx video > "$PIPE" 2>/dev/null &
+atrace -t 5 -b 2048 gfx video 8<&8 > "$PIPE" 2>/dev/null &
 ATRACEPID=$!
 ATRACESTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$ATRACEPID/stat" 2>/dev/null)
 AWKSTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$AWKPID/stat" 2>/dev/null)
 (
   sleep_pid=
   trap '[ -z "$sleep_pid" ] || { kill "$sleep_pid" 2>/dev/null; wait "$sleep_pid" 2>/dev/null; }; exit 0' TERM INT
-  sleep 8 &
+  sleep 8 8<&8 &
   sleep_pid=$!
   wait "$sleep_pid" || exit 0
   sleep_pid=
@@ -466,7 +501,7 @@ AWKSTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$AWKPID/stat" 2>/dev/null)
     # Never signal a recycled PID at the overall eight-second deadline.
     [ "$actual_start" = "$child_start" ] && kill -KILL "$child_pid" 2>/dev/null
   done
-) &
+) 8<&8 &
 WATCHPID=$!
 wait "$ATRACEPID"; ATRACERC=$?; ATRACEPID=
 wait "$AWKPID"; AWKRC=$?; AWKPID=

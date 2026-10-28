@@ -174,8 +174,8 @@ def test_active_tracer_is_untouched_and_produces_only_skipped_summary(tmp_path):
 
 
 def test_production_capture_uses_fifo_and_fixed_limits_not_raw_files():
-    assert 'atrace -t 5 -b 2048 gfx video > "$PIPE"' in SOURCE
-    assert 'mkfifo "$PIPE"' in SOURCE
+    assert 'atrace -t 5 -b 2048 gfx video 8<&8 > "$PIPE"' in SOURCE
+    assert 'mkfifo "$PIPE" 8<&8' in SOURCE
     assert "sleep 8" in SOURCE
     assert "NR>200000 || bytes>16777216" in PROGRAM
     assert "codec_markers>2048" in PROGRAM
@@ -189,7 +189,7 @@ def test_watchdog_cancels_promptly_without_later_signalling_capture():
         pytest.skip("POSIX shell unavailable")
     watcher = SOURCE.split("(\n  sleep_pid=", 1)[1].split("WATCHPID=$!", 1)[0]
     command = (
-        "sleep 30 &\nATRACEPID=$!\n(\n  sleep_pid="
+        "exec 8</dev/null\nsleep 30 &\nATRACEPID=$!\n(\n  sleep_pid="
         + watcher
         + 'WATCHPID=$!\nsleep 0.1\nkill "$WATCHPID"\nwait "$WATCHPID"\nkill -0 "$ATRACEPID"\nalive=$?\nkill "$ATRACEPID"\nwait "$ATRACEPID" 2>/dev/null\nexit "$alive"\n'
     )

@@ -720,6 +720,7 @@ def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
             "legacy_owner_unknown",
             "legacy_helper_active",
             "legacy_atrace_active",
+            "legacy_workspace_active",
             "live_owner",
             "initializing",
             "trace_changed",

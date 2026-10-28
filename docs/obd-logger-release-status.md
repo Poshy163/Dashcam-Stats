@@ -53,6 +53,9 @@ tests**. Both APK assemblies and debug/release lint passed with zero lint errors
 and the existing 62 warnings per variant. Python formatting/lint and frontend
 type checking/lint/production build passed. Executable Linux `sh`/`mksh` recovery,
 contention and crash fixtures are mandatory in CI; their Windows skips are explicit.
+The helper also passed 84 focused checks in an isolated local Linux container,
+including real `sh` and `mksh` execution with no skipped checks. This caught and
+corrected Android-shell descriptor inheritance before image publication.
 Independent review covered capture ownership, interrupted indexing, cache retention
 and the bounded pre-backup readiness wait.
 
