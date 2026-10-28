@@ -20,9 +20,29 @@ SOURCE = (Path(__file__).resolve().parents[1] / "backend/app/ingest/carplay_code
 
 def wait_for(predicate, seconds=5):
     deadline = time.monotonic() + seconds
-    while not predicate():
+    while True:
+        value = predicate()
+        if value:
+            return value
         assert time.monotonic() < deadline, "fixture process did not reach its bounded checkpoint"
         time.sleep(0.01)
+
+
+def numeric_record(path, fields):
+    """A created/truncated file is not a published PID checkpoint yet."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None
+    values = text.split()
+    if (
+        not text.endswith("\n")
+        or len(values) != fields
+        or not all(value.isascii() and value.isdigit() for value in values)
+    ):
+        return None
+    numbers = tuple(map(int, values))
+    return numbers if numbers[0] > 0 else None
 
 
 def start_identity(pid):
@@ -210,7 +230,7 @@ def test_stale_workspace_recovers_without_stopping_trace(capture, owner, reason)
 def test_real_external_commands_receive_the_same_guard_descriptor(capture):
     row = capture.run()
     assert row["codec_capture_status"] == "ok"
-    assert capture.producer_pids.read_text().strip()
+    assert numeric_record(capture.producer_pids, 1)
     assert {"flock", "mkdir", "mkfifo", "rm", "rmdir"} <= set(
         capture.inherited.read_text().splitlines()
     )
@@ -454,8 +474,7 @@ def test_two_reclaimers_cannot_remove_each_others_live_workspace(capture):
 def test_parent_crash_releases_guard_and_orphan_parser_is_bounded(capture, stage):
     capture.stop_before(stage)
     process = capture.launch(1, {"PAUSE_CAPTURE": "1", "PARSER_TIMEOUT": "1"})
-    wait_for(capture.checkpoint.exists)
-    _pid, parser_pid = map(int, capture.checkpoint.read_text().split())
+    _pid, parser_pid = wait_for(lambda: numeric_record(capture.checkpoint, 2))
     process.kill()
     process.wait(timeout=3)
     row = capture.run(2)
@@ -493,8 +512,8 @@ def test_delayed_orphan_parser_cannot_open_the_next_captures_fifo(capture):
     producer_ready = binary / "producer-ready"
     producer_gate.touch()
     try:
-        wait_for(lambda: capture.checkpoint.exists() and entered.exists())
-        _pid, parser_pid = map(int, capture.checkpoint.read_text().split())
+        wait_for(entered.exists)
+        _pid, parser_pid = wait_for(lambda: numeric_record(capture.checkpoint, 2))
         first.kill()
         first.wait(timeout=3)
         second = capture.launch(
@@ -533,8 +552,8 @@ def test_parent_crash_cannot_release_guard_while_owned_producer_is_alive(capture
     capture.script.write_text(text)
     first = capture.launch(1, {"PRODUCER_GATE": str(gate), "PRODUCER_READY": str(ready)})
     try:
-        wait_for(lambda: ready.exists() and watchdog_ready.exists())
-        watchdog_pid = int(watchdog_ready.read_text())
+        wait_for(ready.exists)
+        (watchdog_pid,) = wait_for(lambda: numeric_record(watchdog_ready, 1))
         os.kill(watchdog_pid, signal.SIGTERM)
         wait_for(lambda: process_exited(watchdog_pid))
         first.kill()
