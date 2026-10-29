@@ -101,6 +101,14 @@ export interface MaintenanceWakeStatus {
   requiresIgnitionCycle: boolean
 }
 
+export interface CarPlayTraceStatus {
+  requested: boolean
+  expiresAt: string | null
+  remainingS: number
+  passiveEnabled: boolean
+  unitOnline: boolean | null
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -918,6 +926,9 @@ export const api = {
 
   ingest: {
     status: () => request<IngestStatus>('/ingest/status'),
+    carplayTraceStatus: () => request<CarPlayTraceStatus>('/ingest/carplay-trace'),
+    startCarplayTrace: (durationS = 900) => post<CarPlayTraceStatus>('/ingest/carplay-trace', { durationS }),
+    stopCarplayTrace: () => request<CarPlayTraceStatus>('/ingest/carplay-trace', { method: 'DELETE' }),
     movementStatus: () => request<MovementManifestStatus>('/ingest/movement-status'),
     maintenanceStatus: () => request<MaintenanceWakeStatus>('/ingest/maintenance'),
     startMaintenance: (durationS: number) => post<MaintenanceWakeStatus>('/ingest/maintenance', { durationS }),

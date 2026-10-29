@@ -19,6 +19,11 @@ liveness line, and the CarPlay timing sampler.  Everything else is never written
 reading-side filter below still applies, because ``log.tag`` does not gate the kernel
 buffer and a raised tag can still be noisy.
 
+WindowManager keeps fatal failures by default; its measured layout-error flood requires
+an explicit diagnostic opt-in. A small device receipt tracks only our per-tag overrides,
+including their original values. Reconciliation survives server restarts and partial
+updates without resetting unrelated application logging preferences.
+
 **Why a filter is the whole design.**  Measured on the live unit: at warning level and
 above the log runs at roughly 22 KiB/s — about 80 MB an hour — and 79% of it is two tags,
 ``ParamSet`` and ``isp_alg_fw``, which are the camera ISP printing its tuning parameters
@@ -71,6 +76,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import shlex
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -92,6 +98,13 @@ log = get_logger(__name__)
 #: user can write, and it is the same directory the recording watcher already uses.
 REMOTE_LOG = "/data/local/tmp/dashcam_unitlog.log"
 REMOTE_PID = "/data/local/tmp/dashcam_unitlog.pid"
+REMOTE_LEVELS = "/data/local/tmp/.dashcam_unitlog.levels"
+REMOTE_LEVEL_GUARD = "/data/local/tmp/.dashcam_unitlog.levels.guard"
+MAX_MANAGED_TAGS = 64
+MAX_LEVEL_RECEIPT_BYTES = 16_384
+_LEVEL_HEADER = "dashcam_unit_log_levels_v1"
+_LEVEL_READ_COMPLETE = "__DASHCAM_UNIT_LOG_LEVELS_READ_V1__"
+_LEVEL_APPLIED = "__DASHCAM_UNIT_LOG_LEVELS_APPLIED_V1__"
 
 #: Rotation ceiling on the unit: ``ROTATE_KIB`` per file, ``ROTATE_COUNT`` rotations kept,
 #: so the capture can never occupy more than roughly (count + 1) x size on the card.
@@ -115,11 +128,11 @@ DENY_KEY = "ingest.unit_log_silenced_tags"
 #: measured cost of doing otherwise.  Each is raised to error level on every arming,
 #: because ``log.tag.<tag>`` does not persist across a reboot.
 ALLOW_KEY = "ingest.unit_log_allowed_tags"
+WINDOW_MANAGER_ERRORS_KEY = "ingest.unit_log_windowmanager_errors"
 DEFAULT_ALLOW_TAGS: tuple[str, ...] = (
     "AndroidRuntime",
     "DEBUG",
     "ActivityManager",
-    "WindowManager",
     "lowmemorykiller",
     "UnisocWatchdog",
     "ThermalManagerService",
@@ -130,6 +143,7 @@ DEFAULT_ALLOW_TAGS: tuple[str, ...] = (
     "zj",
     "System.err",
 )
+LEGACY_ALLOW_TAGS = (*DEFAULT_ALLOW_TAGS, "WindowManager")
 STATUS_KEY = "ingest.unit_log_status"
 
 #: Tags silenced by default.  Every entry was measured on this firmware rather than
@@ -186,9 +200,11 @@ _LINE = re.compile(
 )
 
 #: A tag safe to hand to the unit's shell inside a filter spec.  Vendor tags legitimately
-#: contain dots, dashes, underscores, ``@`` and digits; anything else is refused rather
-#: than quoted, because a tag list is configuration and never needs shell metacharacters.
-_SAFE_TAG = re.compile(r"^[A-Za-z0-9_.@:+-]{1,64}$")
+#: contain dots, dashes, underscores, ``@`` and digits. Property names cannot contain
+#: consecutive/trailing dots or ``+``; a colon would change logcat's filter grammar.
+#: Keep the complete ``log.tag.`` property within our conservative 64-character bound.
+_SAFE_TAG = re.compile(r"^(?!.*\.\.)[A-Za-z0-9_@-](?:[A-Za-z0-9_.@-]{0,54}[A-Za-z0-9_@-])?$")
+_SAFE_LEVEL = re.compile(r"^[A-Za-z0-9_]{1,32}$")
 
 #: Longest message stored.  Vendor stack dumps can run to kilobytes per line and the tail
 #: is never the informative part.
@@ -308,16 +324,235 @@ def capture_command() -> str:
     after every arrival does not re-import the backlog it already consumed.
     """
     buffers = " ".join(f"-b {name}" for name in BUFFERS)
-    silenced = " ".join(f"{tag}:S" for tag in silenced_tags())
+    denied = silenced_tags()
+    silenced = " ".join(f"{tag}:S" for tag in denied if tag != "WindowManager")
+    window_level = "E" if _window_manager_errors_enabled() else "F"
+    if "WindowManager" in denied:
+        window_level = "S"
     return (
         f"logcat {buffers} -v threadtime -v year -v UTC -T 1 "
         f"-f {REMOTE_LOG} -r {ROTATE_KIB} -n {ROTATE_COUNT} "
-        f"{silenced} '*:{CAPTURE_LEVEL}'"
+        f"{silenced} WindowManager:{window_level} '*:{CAPTURE_LEVEL}'"
     )
 
 
+def _window_manager_errors_enabled() -> bool:
+    try:
+        return get_settings_service().get_nowait(WINDOW_MANAGER_ERRORS_KEY) is True
+    except Exception:
+        return False
+
+
+def writer_levels() -> dict[str, str]:
+    """The on-device policy, including old persisted allowlists and deny precedence.
+
+    WindowManager's layout failure loop can generate hundreds of errors per second.
+    Fatal failures remain visible; error logging requires its separate diagnostic opt-in,
+    even when an old stored default allowlist still contains WindowManager.
+    """
+    levels = dict.fromkeys(allowed_tags(), "E")
+    levels["WindowManager"] = "E" if _window_manager_errors_enabled() else "F"
+    levels.update(dict.fromkeys(silenced_tags(), "S"))
+    if len(levels) > MAX_MANAGED_TAGS:
+        raise ValueError("too many managed unit-log tags")
+    return levels
+
+
+@dataclass(frozen=True)
+class _ManagedLevel:
+    original: str
+    previous: str
+    target: str
+
+
+def _parse_level_receipt(raw: str) -> tuple[str | None, dict[str, _ManagedLevel]]:
+    """Validate every record before any property is changed; never inspect all log tags.
+
+    A pending receipt records both the prior and intended levels. It is written before
+    setprop, so an interrupted command/server restart can reconcile either state. The
+    saved original is restored only while the property still has one of our levels.
+    """
+    if len(raw.encode("utf-8")) > MAX_LEVEL_RECEIPT_BYTES + 512:
+        raise ValueError("oversized unit-log level receipt")
+    lines = raw.splitlines()
+    if not lines or lines[-1] != _LEVEL_READ_COMPLETE:
+        raise ValueError("incomplete unit-log level receipt")
+    if lines == ["absent", _LEVEL_READ_COMPLETE]:
+        return None, {}
+    if len(lines) < 3 or lines[1] != _LEVEL_HEADER:
+        raise ValueError("invalid unit-log level receipt")
+    metadata = lines[0].split()
+    if len(metadata) != 3 or metadata[0] != "present":
+        raise ValueError("invalid unit-log level metadata")
+    identity, digest = metadata[1:]
+    if not re.fullmatch(r"[0-9]+(?::[0-9]+){5}", identity) or not re.fullmatch(
+        r"[0-9a-f]{64}", digest
+    ):
+        raise ValueError("invalid unit-log level identity")
+    _device, _inode, _uid, mode, links, size = identity.split(":")
+    if mode != "600" or links != "1" or not 0 < int(size) <= MAX_LEVEL_RECEIPT_BYTES:
+        raise ValueError("unsafe unit-log level receipt")
+    body = "\n".join(lines[1:-1]) + "\n"
+    if (
+        len(body.encode("ascii")) != int(size)
+        or hashlib.sha256(body.encode("ascii")).hexdigest() != digest
+    ):
+        raise ValueError("changed unit-log level receipt")
+    records: dict[str, _ManagedLevel] = {}
+    for line in lines[2:-1]:
+        fields = line.split(" ")
+        if len(fields) != 4 or not _SAFE_TAG.fullmatch(fields[0]):
+            raise ValueError("invalid unit-log managed tag")
+        tag, *values = fields
+        if tag in records or any(
+            value != "-" and not _SAFE_LEVEL.fullmatch(value) for value in values
+        ):
+            raise ValueError("invalid unit-log managed level")
+        records[tag] = _ManagedLevel(*values)
+        if len(records) > MAX_MANAGED_TAGS:
+            raise ValueError("too many prior unit-log tags")
+    return f"{identity} {digest}", records
+
+
+def _level_receipt_read_command() -> str:
+    return f"""
+unitlog_levels={shlex.quote(REMOTE_LEVELS)}
+if [ -e "$unitlog_levels" ] || [ -L "$unitlog_levels" ]; then
+  [ -f "$unitlog_levels" ] && [ ! -L "$unitlog_levels" ] || exit 1
+  unitlog_meta=$(stat -c '%d:%i:%u:%a:%h:%s' "$unitlog_levels") || exit 1
+  unitlog_uid=$(id -u) || exit 1
+  case "$unitlog_meta" in *:*) ;; *) exit 1;; esac
+  unitlog_owner=$(stat -c '%u:%a:%h' "$unitlog_levels") || exit 1
+  [ "$unitlog_owner" = "$unitlog_uid:600:1" ] || exit 1
+  unitlog_size=$(stat -c '%s' "$unitlog_levels") || exit 1
+  [ "$unitlog_size" -gt 0 ] && [ "$unitlog_size" -le {MAX_LEVEL_RECEIPT_BYTES} ] || exit 1
+  unitlog_digest=$(timeout 2 sha256sum "$unitlog_levels") || exit 1
+  unitlog_digest=${{unitlog_digest%% *}}
+  printf 'present %s %s\\n' "$unitlog_meta" "$unitlog_digest"
+  timeout 2 head -c {MAX_LEVEL_RECEIPT_BYTES + 1} "$unitlog_levels" || exit 1
+  [ "$(stat -c '%d:%i:%u:%a:%h:%s' "$unitlog_levels")" = "$unitlog_meta" ] || exit 1
+else
+  printf 'absent\\n'
+fi
+printf '{_LEVEL_READ_COMPLETE}\\n'
+""".strip()
+
+
+def _level_setup_command(
+    levels: dict[str, str], token: str | None, previous: dict[str, _ManagedLevel]
+) -> str:
+    tags = sorted(set(levels) | set(previous) | set(LEGACY_ALLOW_TAGS))
+    if len(tags) > MAX_MANAGED_TAGS:
+        raise ValueError("too many reconciled unit-log tags")
+    if any(not _SAFE_TAG.fullmatch(tag) for tag in tags) or any(
+        value not in {"E", "F", "S"} for value in levels.values()
+    ):
+        raise ValueError("unsafe unit-log writer policy")
+    records = []
+    for tag in tags:
+        prior = previous.get(tag)
+        records.append(
+            " ".join(
+                (
+                    tag,
+                    prior.original if prior else "-",
+                    prior.previous if prior else "-",
+                    prior.target if prior else "-",
+                    levels.get(tag, "absent"),
+                    "1" if prior else "0",
+                    "1" if tag in LEGACY_ALLOW_TAGS else "0",
+                )
+            )
+        )
+    expected = shlex.quote(token or "absent")
+    return f"""
+umask 077
+unitlog_levels={shlex.quote(REMOTE_LEVELS)}
+unitlog_guard={shlex.quote(REMOTE_LEVEL_GUARD)}
+unitlog_uid=$(id -u) || exit 1
+read unitlog_started unitlog_ignored < /proc/uptime || exit 1
+unitlog_started=${{unitlog_started%%.*}}
+unitlog_budget() {{
+  read unitlog_now unitlog_ignored < /proc/uptime || return 1
+  unitlog_now=${{unitlog_now%%.*}}
+  [ "$((unitlog_now-unitlog_started))" -ge 0 ] && [ "$((unitlog_now-unitlog_started))" -lt 12 ]
+}}
+if [ ! -e "$unitlog_guard" ] && [ ! -L "$unitlog_guard" ]; then
+  (set -C; : > "$unitlog_guard") 2>/dev/null || exit 1
+fi
+[ -f "$unitlog_guard" ] && [ ! -L "$unitlog_guard" ] || exit 1
+[ "$(stat -c '%u:%a:%h' "$unitlog_guard")" = "$unitlog_uid:600:1" ] || exit 1
+unitlog_guard_id=$(stat -c '%d:%i' "$unitlog_guard") || exit 1
+exec 8< "$unitlog_guard" || exit 1
+flock -n 8 8<&8 || exit 1
+[ "$(stat -L -c '%d:%i:%u:%a:%h' /proc/self/fd/8 8<&8)" = "$unitlog_guard_id:$unitlog_uid:600:1" ] || exit 1
+[ ! -L "$unitlog_guard" ] && [ "$(stat -c '%d:%i' "$unitlog_guard")" = "$unitlog_guard_id" ] || exit 1
+if [ -e "$unitlog_levels" ] || [ -L "$unitlog_levels" ]; then
+  [ -f "$unitlog_levels" ] && [ ! -L "$unitlog_levels" ] || exit 1
+  unitlog_meta=$(stat -c '%d:%i:%u:%a:%h:%s' "$unitlog_levels") || exit 1
+  unitlog_digest=$(timeout 2 sha256sum "$unitlog_levels" 8<&8) || exit 1
+  unitlog_digest=${{unitlog_digest%% *}}
+  [ "$unitlog_meta $unitlog_digest" = {expected} ] || exit 1
+else
+  [ {expected} = absent ] || exit 1
+fi
+unitlog_plan=$(mktemp "$unitlog_levels.plan.XXXXXXXX") || exit 1
+unitlog_pending=; unitlog_final=
+trap 'rm -f "$unitlog_plan" "$unitlog_pending" "$unitlog_final"' EXIT
+unitlog_pending=$(mktemp "$unitlog_levels.pending.XXXXXXXX") || exit 1
+unitlog_final=$(mktemp "$unitlog_levels.final.XXXXXXXX") || exit 1
+printf '{_LEVEL_HEADER}\\n' > "$unitlog_pending" || exit 1
+while IFS=' ' read -r unitlog_tag unitlog_original unitlog_previous unitlog_target unitlog_desired unitlog_managed unitlog_legacy; do
+  unitlog_budget || exit 1
+  unitlog_current=$(timeout 2 getprop "log.tag.$unitlog_tag") || exit 1
+  [ -n "$unitlog_current" ] || unitlog_current=-
+  case "$unitlog_current" in *[!A-Za-z0-9_]* ) [ "$unitlog_current" = - ] || exit 1;; esac
+  [ "${{#unitlog_current}}" -le 32 ] || exit 1
+  unitlog_ours=0
+  if [ "$unitlog_managed" = 1 ] && {{ [ "$unitlog_current" = "$unitlog_previous" ] || [ "$unitlog_current" = "$unitlog_target" ]; }}; then
+    unitlog_ours=1
+  else
+    unitlog_original=$unitlog_current
+  fi
+  if [ "$unitlog_managed" = 0 ] && [ "$unitlog_legacy" = 1 ] && [ "$unitlog_current" = E ]; then
+    unitlog_original=-
+    unitlog_ours=1
+  fi
+  unitlog_keep=1
+  if [ "$unitlog_desired" = absent ]; then
+    [ "$unitlog_ours" = 1 ] || continue
+    unitlog_desired=$unitlog_original
+    unitlog_keep=0
+  fi
+  printf '%s %s %s %s\\n' "$unitlog_tag" "$unitlog_original" "$unitlog_current" "$unitlog_desired" >> "$unitlog_pending" || exit 1
+  printf '%s %s %s %s %s\\n' "$unitlog_tag" "$unitlog_original" "$unitlog_current" "$unitlog_desired" "$unitlog_keep" >> "$unitlog_plan" || exit 1
+done <<'DASHCAM_UNITLOG_DESIRED_V1'
+{chr(10).join(records)}
+DASHCAM_UNITLOG_DESIRED_V1
+mv -f "$unitlog_pending" "$unitlog_levels" 8<&8 || exit 1
+timeout 2 setprop persist.log.tag S 8<&8 || exit 1
+printf '{_LEVEL_HEADER}\\n' > "$unitlog_final" || exit 1
+while IFS=' ' read -r unitlog_tag unitlog_original unitlog_before unitlog_target unitlog_keep; do
+  unitlog_budget || exit 1
+  unitlog_current=$(timeout 2 getprop "log.tag.$unitlog_tag") || exit 1
+  [ -n "$unitlog_current" ] || unitlog_current=-
+  [ "$unitlog_current" = "$unitlog_before" ] || exit 1
+  unitlog_value=$unitlog_target
+  [ "$unitlog_value" != - ] || unitlog_value=
+  timeout 2 setprop "log.tag.$unitlog_tag" "$unitlog_value" 8<&8 || exit 1
+  [ "$(timeout 2 getprop "log.tag.$unitlog_tag")" = "$unitlog_value" ] || exit 1
+  if [ "$unitlog_keep" = 1 ]; then
+    printf '%s %s %s %s\\n' "$unitlog_tag" "$unitlog_original" "$unitlog_target" "$unitlog_target" >> "$unitlog_final" || exit 1
+  fi
+done < "$unitlog_plan"
+mv -f "$unitlog_final" "$unitlog_levels" 8<&8 || exit 1
+timeout 2 setprop ctl.start logd 8<&8 || exit 1
+printf '{_LEVEL_APPLIED}\\n'
+""".strip()
+
+
 async def ensure_logging(address: str) -> bool:
-    """Raise the allowed tags under the vendor's blanket silence, and start ``logd``.
+    """Reconcile only our writer overrides, verify them, and start ``logd``.
 
     True when ``logd`` is running afterwards.  ``persist.log.tag=S`` is the vendor's own
     default and is re-asserted here so a unit that was ever left unsuppressed is put
@@ -326,16 +561,19 @@ async def ensure_logging(address: str) -> bool:
     proper is refused ("Must be root"); setting ``ctl.start`` works because the shell
     user holds that permission for this service.
     """
-    raise_tags = " ".join(f"setprop log.tag.{tag} E;" for tag in allowed_tags())
     try:
-        await adb.shell(
-            address,
-            f"setprop persist.log.tag S; {raise_tags} setprop ctl.start logd; sleep 1; "
-            "getprop init.svc.logd",
-            timeout=UNIT_LOG_TIMEOUT_S,
+        levels = writer_levels()
+        raw = await adb.shell(address, _level_receipt_read_command(), timeout=UNIT_LOG_TIMEOUT_S)
+        token, previous = _parse_level_receipt(raw or "")
+        applied = await adb.shell(
+            address, _level_setup_command(levels, token, previous), timeout=UNIT_LOG_TIMEOUT_S
         )
+        if (applied or "").strip() != _LEVEL_APPLIED:
+            raise ValueError("unit-log writer verification incomplete")
+        # Starting an existing daemon is idempotent. A fresh start can need a moment.
+        await asyncio.sleep(1)
         state = await adb.shell(address, "getprop init.svc.logd", timeout=UNIT_LOG_TIMEOUT_S)
-    except adb.AdbError as exc:
+    except (adb.AdbError, ValueError, UnicodeError) as exc:
         log.warning("could not re-enable logging on the unit", error=str(exc))
         return False
     running = (state or "").strip() == "running"

@@ -16,7 +16,7 @@ SELFSTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$$/stat" 2>/dev/null)
 TOKEN="$$:${SELFSTART:-unknown}:$SESSION:$SEQUENCE"
 PIPE="$LOCK/pipe-$$-${SELFSTART:-unknown}"
 SUMMARYFILE="$LOCK/summary-$$-${SELFSTART:-unknown}"
-STATUS=unavailable; ATRACERC=na; OWNED=0; STARTED=0
+STATUS=unavailable; ATRACERC=na; OWNED=0; STARTED=0; WATCHDOGFIRED=0
 LOCKSTATUS=not_attempted; GUARDED=0; CREATED=0; LOCKID=; GUARDID=
 ATRACEPID=; AWKPID=; WATCHPID=; TRACEPATH=; SUMMARY=
 clock_ms() { awk '{printf "%.0f",$1*1000}' /proc/uptime 2>/dev/null; }
@@ -462,11 +462,20 @@ acquire_workspace() {
   OWNED=1
   owns_lock || { LOCKSTATUS=initialization_failed; STATUS=lock_initialization_failed; return 1; }
 }
+reap_watchdog() {
+  [ -n "$WATCHPID" ] || return 0
+  kill "$WATCHPID" 2>/dev/null
+  wait "$WATCHPID"; WATCHRC=$?
+  # Only the committed deadline path uses this reserved exit status. An atrace
+  # SIGKILL exit alone does not identify which actor stopped its process.
+  [ "$WATCHRC" != 124 ] || WATCHDOGFIRED=1
+  WATCHPID=
+}
 finish() {
   trap - EXIT TERM INT
   # Reap every owned child before releasing the lock. No delayed atrace process
   # or watchdog may later stop a subsequent capture after a sampler restart.
-  if [ -n "$WATCHPID" ]; then kill "$WATCHPID" 2>/dev/null; wait "$WATCHPID" 2>/dev/null; fi
+  reap_watchdog
   if [ -n "$ATRACEPID" ]; then
     kill "$ATRACEPID" 2>/dev/null
     kill -KILL "$ATRACEPID" 2>/dev/null
@@ -495,7 +504,7 @@ finish() {
   if [ "$STATUS" != ok ]; then
     SUMMARY=$(printf '%s\n' "$SUMMARY" | sed 's/codec_latency_med_ms=[^ ]*/codec_latency_med_ms=na/;s/codec_latency_p95_ms=[^ ]*/codec_latency_p95_ms=na/;s/codec_latency_max_ms=[^ ]*/codec_latency_max_ms=na/')
   fi
-  MESSAGE="sample=$SESSION-codec-$SEQUENCE session=$SESSION schema=6 | event=codec_capture codec_capture_status=$STATUS codec_lock_status=$LOCKSTATUS codec_capture_start_ms=$STARTMS codec_capture_end_ms=$ENDMS codec_capture_ms=$ELAPSED codec_trace_off=$OFF codec_atrace_rc=$ATRACERC $SUMMARY"
+  MESSAGE="sample=$SESSION-codec-$SEQUENCE session=$SESSION schema=6 | event=codec_capture codec_capture_status=$STATUS codec_lock_status=$LOCKSTATUS codec_capture_start_ms=$STARTMS codec_capture_end_ms=$ENDMS codec_capture_ms=$ELAPSED codec_trace_off=$OFF codec_atrace_rc=$ATRACERC codec_watchdog_fired=$WATCHDOGFIRED $SUMMARY"
   printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$MESSAGE" >> "$LOGFILE"
   log -p "$PRIO" -t CarPlayTiming "$MESSAGE" 2>/dev/null
   if owns_workspace && safe_members; then
@@ -681,6 +690,10 @@ AWKSTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$AWKPID/stat" 2>/dev/null)
   sleep_pid=$!
   wait "$sleep_pid" || exit 0
   sleep_pid=
+  # Once the deadline commits, cancellation must not hide its outcome. The parent
+  # reaps this bounded identity check before publishing the marker or releasing
+  # the guard. Firing does not prove a producer was still alive or was killed.
+  trap '' TERM INT
   # ATRACERC is collected before the parent clears this watchdog. The parent
   # reaps this watchdog before releasing the lock or starting another capture.
   for owned_child in "$ATRACEPID:$ATRACESTART"; do
@@ -691,11 +704,12 @@ AWKSTART=$(awk '{sub(/^.*\) /,"");print $20}' "/proc/$AWKPID/stat" 2>/dev/null)
     # Never signal a recycled PID at the overall eight-second deadline.
     [ "$actual_start" = "$child_start" ] && kill -KILL "$child_pid" 2>/dev/null
   done
+  exit 124
 ) 8<&8 &
 WATCHPID=$!
 wait "$ATRACEPID"; ATRACERC=$?; ATRACEPID=
 wait "$AWKPID"; AWKRC=$?; AWKPID=
-kill "$WATCHPID" 2>/dev/null; wait "$WATCHPID" 2>/dev/null; WATCHPID=
+reap_watchdog
 STATUS=ok
 [ "$ATRACERC" = 0 ] || STATUS=atrace_error
 [ "$AWKRC" = 0 ] || STATUS=parser_error

@@ -28,6 +28,7 @@ from app.api.routes import (
     content,
     heatmap,
     ingest,
+    ingest_carplay_trace,
     ingest_maintenance,
     ingest_movement,
     media,
@@ -288,6 +289,7 @@ def create_app() -> FastAPI:
     app.include_router(ingest.router)
     app.include_router(ingest_movement.router)
     app.include_router(ingest_maintenance.router)
+    app.include_router(ingest_carplay_trace.router)
     app.include_router(obd_import.router)
 
     @app.get("/health", response_model=HealthOut, tags=["health"])

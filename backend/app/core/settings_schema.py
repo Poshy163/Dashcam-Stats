@@ -77,6 +77,8 @@ class SettingDef:
     dangerous: bool = False
     # Shown but not editable (derived/detected values).
     read_only: bool = False
+    # Internal state edited through a purpose-built action, rather than a raw input.
+    hidden: bool = False
     requires: str | None = None  # key of a bool setting that gates this one
 
 
@@ -1186,8 +1188,10 @@ SETTINGS: tuple[SettingDef, ...] = (
         "Runs a small sampler on the head unit that, while a phone is attached to CarPlay, "
         "reads the timing of the CarPlay video surface every few seconds along with load, "
         "temperature, Zlink's CPU and the hotspot's bitrate. The lines come home with the "
-        "unit log and show under Logs → CarPlay timing. Read-only on the unit; costs about a "
-        "fifth of a second of work per sample and nothing while no phone is attached.",
+        "unit log and show under Logs → CarPlay timing. Passive observations stay enabled "
+        "independently of heavy codec tracing, which is off unless explicitly requested "
+        "for a short diagnostic window on the Logs page. GPS context can continue while "
+        "the sampler is alive even without an attached phone.",
         requires="ingest.unit_logs",
     ),
     SettingDef(
@@ -1202,6 +1206,18 @@ SETTINGS: tuple[SettingDef, ...] = (
         maximum=120,
         unit="s",
         requires="ingest.carplay_timing",
+    ),
+    SettingDef(
+        "ingest.carplay_codec_trace_until_unix_s",
+        "CarPlay codec trace deadline",
+        "int",
+        0,
+        "ingest",
+        "Managed by the time-limited codec diagnostics control on Logs → CarPlay timing.",
+        minimum=0,
+        maximum=253402300799,
+        read_only=True,
+        hidden=True,
     ),
     SettingDef(
         "ingest.unit_display_url",
@@ -1462,7 +1478,7 @@ SETTINGS: tuple[SettingDef, ...] = (
         "string",
         "",
         "ingest",
-        "Comma-separated tags dropped on the unit before they are written, so noise "
+        "Comma-separated tags silenced at the log producer as well as the reader, so noise "
         "never crosses the link. Leave empty for the measured defaults, which silence "
         "the camera ISP tuning spam (ParamSet, isp_alg_fw) that is otherwise about "
         "four fifths of everything the unit logs. Add a tag here if your firmware is "
@@ -1480,6 +1496,17 @@ SETTINGS: tuple[SettingDef, ...] = (
         "(crash reporters, process killers, the thermal service, the recorder's liveness "
         "line, the CarPlay timing sampler). Measured on the unit: letting everything write "
         "cost the logger a quarter of a core that CarPlay needed.",
+        requires="ingest.unit_logs",
+    ),
+    SettingDef(
+        "ingest.unit_log_windowmanager_errors",
+        "Collect verbose Android window errors",
+        "bool",
+        False,
+        "ingest",
+        "Diagnostic use only. This firmware can produce hundreds of repeated window "
+        "errors per second, adding CPU and logging work. Leave off for normal driving; "
+        "fatal window errors and essential crash, recorder and thermal logs remain enabled.",
         requires="ingest.unit_logs",
     ),
     SettingDef(

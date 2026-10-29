@@ -14,7 +14,52 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
 | Poll plan | The existing trial OFF choice, revision 1 and no fallback reason were preserved. The next drive used the baseline plan; it does not validate the three-second trial. No automatic re-arm was performed. |
-| Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, permissions, folder access, stored drive identity and original OFF bounds survived. Both camera files advanced and temperature history continued. Parked indexing resumed after ingestion, and automatic backups completed with verified radio restoration. Restart evidence records `package_update` on the same kernel boot; no physical reboot test was performed. Diagnostic workspace recovery has a separate acceptance blocker below. |
+| Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, permissions, folder access, stored drive identity and original OFF bounds survived. Both camera files advanced and temperature history continued. Parked indexing resumed after ingestion, and automatic backups completed with verified radio restoration. Restart evidence records `package_update` on the same kernel boot; no physical reboot test was performed. The subsequent server/helper workspace recovery was verified on 28 October, as described below. |
+
+## Server/helper update: CarPlay diagnostic workload
+
+The 29 October follow-up reduces diagnostic work during normal driving without
+another companion APK update. Heavy codec tracing defaults **OFF**; the Logs →
+CarPlay timing page can request **15 minutes**, stop that request, and distinguish
+the requested state from a capture actually observed on the camera. The API caps
+explicit sessions at **30 minutes**. Absolute expiry survives reconnect/restart
+without renewal, and an elapsed-time limit protects a running lease against clock
+rollback. Expiry stops the owned codec capture while passive observations continue;
+it does not keep the camera awake.
+
+`WindowManager` writer logging now defaults to **F**, preserving fatal messages
+while suppressing its measured error flood. A separate diagnostic boolean allows
+errors explicitly; a deny-list entry still wins. A verified on-device receipt
+reconciles previous collector overrides across settings changes and interrupted
+application, including legacy **E** overrides. Removed overrides are restored only
+while they still match a recorded managed value. The receipt is bounded to
+**64 tags / 16 KiB**, with ownership, mode, identity and readback checks.
+
+Sampler schema **9** records requested/active tracing policy and expiry. Codec
+summaries add an explicit watchdog-fired marker; a fired deadline is not proof of
+decoder overload, and old records keep the field unavailable. See
+[CarPlay diagnostic policy and investigation](carplay-offline-diagnostics.md#normal-driving-and-optional-codec-tracing-schema-9).
+
+Both latest drives were backed up and their sampled window frame rates remained
+near **28.8 fps**, despite the driver's lag report. ZLink graphics high-input-latency
+flags increased to **18.31% / 16.67%**, versus **0.48%** on the earlier responsive
+drive; these counters do not measure CarPlay touch latency. A later parked capture
+found a native camera window/error loop. Static inspection confirmed its use of
+unsupported window type `2004`; no safe recorder-preserving native repair was
+established. Logging suppression and optional tracing address avoidable work, not a
+proven complete fix for CarPlay lag. No native APK, recorder, radio, display or
+thermal control was changed.
+
+The logging writer policy was also applied and read back on the parked camera:
+`WindowManager=F`, with crash, thermal and recorder tags still at `E`. Its new
+managed receipt validated successfully, and the older server's allowlist was pinned
+without `WindowManager` so it cannot undo that suppression before deployment.
+The active backup was retained; the main 92-file batch and later batches completed.
+A verified maintenance hold keeps this investigation's parked session awake.
+
+Release CI, deployed sampler hashes and a fresh driving comparison must be recorded
+separately before claiming complete runtime acceptance or improved responsiveness.
+Backup enablement remains unchanged; no companion APK update is needed.
 
 ## Server update: verified existing-copy cleanup
 
@@ -46,8 +91,8 @@ controls or backup enablement. Installation exposed two diagnostic recovery
 blockers: the camera had about 530 processes against the helper's 512-PID scan
 limit, and its legacy workspace retained the old helper's `777/666` permissions.
 A guarded administrative preparation refused before changing those permissions;
-the workspace contents and inodes were preserved. Actual retained-lock recovery
-and a subsequent CarPlay drive comparison remain separate acceptance checks.
+the workspace contents and inodes were preserved. At installation, actual retained-lock
+recovery and a subsequent CarPlay drive comparison were still pending.
 These changes do not establish a fix for the phone-to-screen lag observed on
 28 October.
 
@@ -58,10 +103,14 @@ under the stable guard with pinned identities and preserved contents; active,
 unreadable or unsafe workspaces remain blocked. Limit refusals now distinguish
 inventory size, candidate count and elapsed time in the timing API. See
 [diagnostic capture guard recovery](carplay-offline-diagnostics.md#diagnostic-capture-guard-recovery).
-This follow-up needs a server deployment, not another APK. Recovery of the actual
-camera workspace and a successful normal CarPlay capture still require live
-acceptance after deployment; the blocked captures from the previous drive cannot
-be reconstructed.
+This follow-up required a server deployment, not another APK. On 28 October,
+deployed revision `dda3335` and matching on-camera helper hashes were verified.
+Automatic recovery reported `recovered_malformed_owner` and a successful 8.23-second
+capture, preserving the original mode-`600` guard inode and leaving tracing off.
+That capture occurred at the drive handoff; it did not reconstruct the previous
+blocked observations or prove whole-drive coverage. The later 29 October drives
+used the recovered helper and acquired the guard on all five capture attempts;
+four produced valid summaries and one reported an `atrace` error with tracing off.
 
 For the original 0.3.22 release, local validation passed **3,854 backend tests** (144 platform/optional skips),
 **450 Android tests** including the saved private-grid replay, and **254 frontend

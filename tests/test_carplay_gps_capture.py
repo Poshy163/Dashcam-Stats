@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from app.ingest import carplay_timing
+
 SCRIPT = Path(__file__).resolve().parents[1] / "backend/app/ingest/carplay_timing.sh"
 SOURCE = SCRIPT.read_text(encoding="utf-8")
 PROGRAM = SOURCE.split("# BEGIN_GPS_AWK\n", 1)[1].split("# END_GPS_AWK", 1)[0]
@@ -234,7 +236,7 @@ gps_poll
     result = shell(command, shell_name=shell_name)
     assert result.returncode == 0 and not result.stderr, result.stderr
     message = result.stdout.strip()
-    assert "schema=8 acc=0 | event=gps_context" in message
+    assert f"schema={carplay_timing.SAMPLER_SCHEMA} acc=0 | event=gps_context" in message
     assert "gps_capture_status=ok" in message and "loc_gps_age_ms=1175" in message
     assert "gps_zlink_process_present=1 gps_native_process_present=0" in message
     assert "gps_poll_gap_ms=na" in message

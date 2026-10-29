@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # dashcam-stats CarPlay timing sampler. Deleting this file, its .pid and its .log removes
 # its diagnostics. It never changes radio, power, recorder or CarPlay settings.
-# Short guarded ATrace windows observe codec progress; raw trace data is not retained.
+# Guarded ATrace windows are disabled unless explicitly leased; raw traces are not retained.
 #
 # Every INTERVAL seconds, while a WLAN2 neighbour is present, it reads the frame timing of
 # package-named Zlink application buffer layers. Window presentation timing still cannot
@@ -17,6 +17,13 @@ PRIO="${2:-w}"
 # Ring overlap and actual polling gaps are logged, so overload or faster surfaces
 # cannot silently masquerade as continuous coverage.
 FRAME_INTERVAL="${3:-3}"
+# Absolute UTC expiry, not a duration: identical presence checks cannot renew tracing.
+CODEC_TRACE_UNTIL="${4:-0}"
+case "$CODEC_TRACE_UNTIL" in ''|*[!0-9]*|0[0-9]*) CODEC_TRACE_UNTIL=0 ;; esac
+[ "${#CODEC_TRACE_UNTIL}" -le 10 ] || CODEC_TRACE_UNTIL=0
+CODEC_TRACE_ACTIVE=0
+CODEC_TRACE_EXPIRES_MS=0
+CODEC_TRACE_POLICY_REPORTED=
 MARKPFX=/data/local/tmp/.dashcam_cpt_seen_
 LOG=/data/local/tmp/dashcam_carplay_timing.log
 PIDF=/data/local/tmp/.dashcam_carplay_timing.pid
@@ -38,7 +45,7 @@ if [ -f "$PIDF" ]; then
     *)
       if [ -r "/proc/$oldpid/cmdline" ] && tr '\000' ' ' < "/proc/$oldpid/cmdline" | grep -Fq "$SCRIPT"; then
         # Presence polls should not reset timing baselines or interrupt a trace window.
-        if kill -0 "$oldpid" 2>/dev/null && [ "$(cat "$BUILDF" 2>/dev/null)" = "$BUILD_ID:$INTERVAL:$FRAME_INTERVAL" ]; then
+        if kill -0 "$oldpid" 2>/dev/null && [ "$(cat "$BUILDF" 2>/dev/null)" = "$BUILD_ID:$INTERVAL:$FRAME_INTERVAL:$CODEC_TRACE_UNTIL" ]; then
           exit 0
         fi
         kill "$oldpid" 2>/dev/null
@@ -52,7 +59,7 @@ if [ -f "$PIDF" ]; then
   esac
 fi
 echo $$ > "$PIDF"
-echo "$BUILD_ID:$INTERVAL:$FRAME_INTERVAL" > "$BUILDF"
+echo "$BUILD_ID:$INTERVAL:$FRAME_INTERVAL:$CODEC_TRACE_UNTIL" > "$BUILDF"
 echo 0 > "$SEQF"
 
 prev_ticks=0; prev_t=0; prev_zpid=; prev_rx=0; prev_rx_t=0; idle_n=0; prev_drops=-1
@@ -61,9 +68,10 @@ prev_cticks=0; prev_ct=0; prev_cpid=
 slow_pid=; slow_last=0; last_active=0
 FRAME_CONTEXT=/data/local/tmp/.dashcam_cpt_context_$SESSION
 FRAME_SEQ=/data/local/tmp/.dashcam_cpt_frame_seq_$SESSION
-frame_pid=; link_pid=; codec_pid=; codec_start=; codec_last=0; codec_seq=0; sleep_pid=
+frame_pid=; link_pid=; codec_pid=; codec_start=; codec_starting=0; codec_last=0; codec_seq=0; sleep_pid=
 frame_start=; link_start_ticks=; slow_start=; sleep_start=
 gps_pid=; gps_worker_start=
+codec_lease_pid=; codec_lease_start=
 process_start() { awk '{sub(/^.*\) /,"");print $20}' "/proc/$1/stat" 2>/dev/null; }
 child_alive() {
   [ -n "$1" ] && [ -n "$2" ] && [ "$(process_start "$1")" = "$2" ] && kill -0 "$1" 2>/dev/null
@@ -72,6 +80,61 @@ codec_alive() {
   child_alive "$codec_pid" "$codec_start"
 }
 clock_ms() { awk '{printf "%.0f",$1*1000}' /proc/uptime; }
+stop_codec_worker() {
+  # A lease signal may interrupt the fork/start-time publication below. Let that
+  # critical section finish; its post-launch check will reap the now-identified child.
+  [ "${codec_starting:-0}" = 1 ] && return
+  # Only the child whose PID and start time we own; never stop a foreign tracer.
+  codec_alive && kill "$codec_pid" 2>/dev/null
+  [ -n "$codec_pid" ] && wait "$codec_pid" 2>/dev/null
+  codec_pid=; codec_start=
+}
+expire_codec_trace() {
+  CODEC_TRACE_ACTIVE=0
+  child_alive "$sleep_pid" "$sleep_start" && kill "$sleep_pid" 2>/dev/null
+  [ -n "$sleep_pid" ] && wait "$sleep_pid" 2>/dev/null
+  stop_codec_worker
+}
+initialize_codec_trace() {
+  lease_now=$(date +%s 2>/dev/null); lease_uptime=$(clock_ms)
+  case "$lease_now:$lease_uptime" in *[!0-9:]*|:*|*:) return ;; esac
+  # A bad device clock or unexpected lease fails closed. A monotonic deadline also
+  # prevents a later wall-clock rollback from extending this explicit session.
+  [ "$lease_now" -gt 0 ] && [ "$CODEC_TRACE_UNTIL" -gt "$lease_now" ] &&
+    [ "$CODEC_TRACE_UNTIL" -le $((lease_now+1800)) ] || return
+  CODEC_TRACE_EXPIRES_MS=$((lease_uptime+(CODEC_TRACE_UNTIL-lease_now)*1000))
+  CODEC_TRACE_ACTIVE=1
+}
+codec_trace_policy() {
+  policy_now=$1; policy_uptime=$2
+  case "$policy_now:$policy_uptime" in *[!0-9:]*|:*|*:) expire_codec_trace ;; esac
+  if [ "$CODEC_TRACE_ACTIVE" = 1 ]; then
+    if [ "$policy_now" -le 0 ] || [ "$policy_now" -ge "$CODEC_TRACE_UNTIL" ] ||
+       [ "$policy_uptime" -ge "$CODEC_TRACE_EXPIRES_MS" ]; then
+      expire_codec_trace
+    fi
+  fi
+  trace_requested=0; [ "$CODEC_TRACE_UNTIL" -gt 0 ] && trace_requested=1
+  trace_remaining=0
+  if [ "$CODEC_TRACE_ACTIVE" = 1 ]; then
+    trace_remaining=$((CODEC_TRACE_UNTIL-policy_now))
+    trace_monotonic_remaining=$(((CODEC_TRACE_EXPIRES_MS-policy_uptime+999)/1000))
+    [ "$trace_remaining" -le "$trace_monotonic_remaining" ] || trace_remaining=$trace_monotonic_remaining
+  fi
+  CODEC_TRACE_FIELDS="codec_trace_requested=$trace_requested codec_trace_active=$CODEC_TRACE_ACTIVE codec_trace_until_epoch_s=$CODEC_TRACE_UNTIL codec_trace_remaining_s=$trace_remaining"
+}
+codec_lease_loop() {
+  trap - EXIT
+  lease_sleep_pid=; lease_sleep_start=
+  trap 'exit 0' TERM INT
+  trap 'child_alive "$lease_sleep_pid" "$lease_sleep_start" && kill "$lease_sleep_pid" 2>/dev/null; [ -n "$lease_sleep_pid" ] && wait "$lease_sleep_pid" 2>/dev/null' EXIT
+  sleep "$1" &
+  lease_sleep_pid=$!; lease_sleep_start=$(process_start "$lease_sleep_pid")
+  wait "$lease_sleep_pid" || return
+  # Signal only our original parent. Its trap reaps only its codec child; passive
+  # frame, GPS and resource observations continue through the expiry.
+  child_alive "$SAMPLER_PID" "$SAMPLER_START" && kill -USR1 "$SAMPLER_PID" 2>/dev/null
+}
 # Deadline scheduling subtracts work time. After an overrun, skip missed deadlines
 # instead of issuing a burst of catch-up Binder calls.
 deadline_delay() {
@@ -83,19 +146,20 @@ deadline_delay() {
 cleanup() {
   # Signal all owned children first, then reap them before a replacement can start.
   codec_alive && kill "$codec_pid" 2>/dev/null
-  for child in "$frame_pid:$frame_start" "$link_pid:$link_start_ticks" "$gps_pid:$gps_worker_start" "$slow_pid:$slow_start" "$sleep_pid:$sleep_start"; do
+  for child in "$frame_pid:$frame_start" "$link_pid:$link_start_ticks" "$gps_pid:$gps_worker_start" "$slow_pid:$slow_start" "$sleep_pid:$sleep_start" "$codec_lease_pid:$codec_lease_start"; do
     child_alive "${child%:*}" "${child#*:}" && kill "${child%:*}" 2>/dev/null
   done
   if [ -n "$codec_pid" ]; then
     wait "$codec_pid" 2>/dev/null
   fi
-  for child in "$frame_pid" "$link_pid" "$gps_pid" "$slow_pid" "$sleep_pid"; do
+  for child in "$frame_pid" "$link_pid" "$gps_pid" "$slow_pid" "$sleep_pid" "$codec_lease_pid"; do
     [ -n "$child" ] && wait "$child" 2>/dev/null
   done
   rm -f "$FRAME_CONTEXT" "$FRAME_CONTEXT.new" "$FRAME_SEQ"
 }
 trap 'exit 0' TERM INT
 trap cleanup EXIT
+trap expire_codec_trace USR1
 # One append per sanitized event, shared by the independent workers. Rotation remains
 # with the foreground loop; workers reopen the current path for every append.
 save_message() {
@@ -308,7 +372,7 @@ gps_poll() {
   gps_next_interval=${gps_burst_state%%,*}
   case "$gps_next_interval" in 5000|15000) ;; *) gps_next_interval=15000; gps_burst_state=; gps_burst_fields=;; esac
   gps_seq=$((gps_seq+1))
-  message="sample=$SESSION-gps-$gps_token-$gps_seq session=$SESSION schema=8 acc=$gps_acc | event=gps_context gps_capture_start_ms=$gps_poll_start gps_capture_ms=$gps_capture_ms gps_poll_gap_ms=$gps_gap location_mode=$gps_mode gps_zlink_process_present=$gps_zlink_present gps_native_process_present=$gps_native_present $gps_fields $gps_burst_fields"
+  message="sample=$SESSION-gps-$gps_token-$gps_seq session=$SESSION schema=9 acc=$gps_acc | event=gps_context gps_capture_start_ms=$gps_poll_start gps_capture_ms=$gps_capture_ms gps_poll_gap_ms=$gps_gap location_mode=$gps_mode gps_zlink_process_present=$gps_zlink_present gps_native_process_present=$gps_native_present $gps_fields $gps_burst_fields"
   save_message "$message"
 }
 gps_worker_cleanup() {
@@ -387,7 +451,7 @@ diagnostic_context() {
     start_ticks=$(sed 's/.*) //' /proc/$zpid/stat 2>/dev/null | awk '{print $20}')
     sched="$sched zlink_start_ticks=${start_ticks:-na}"
   fi
-  diag="schema=8 wifi_country_code=${country:-na} mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
+  diag="schema=9 wifi_country_code=${country:-na} mem_available_kib=${mem:-na} cpu_pressure=${pcpu:-na} io_pressure=${pio:-na} memory_pressure=${pmem:-na} $clocks zlink_rss_kib=${rss:-na} zlink_threads=${threads:-na} $queues decoder_cpu=${ccpu:-na} $transport $display_queue $sched"
 }
 tcp_summary() {
   # ss exposes TCP_INFO per socket. Match the exact app UID on the socket header,
@@ -599,7 +663,7 @@ link_loop() {
         # The full diagnostic context is emitted separately. Keep this event below
         # the retained-message limit so its transport tail survives file recovery.
         link_acc=$(printf '%s\n' "$head" | awk '{for(i=1;i<=NF;i++)if($i~/^acc=[01]$/){print $i;exit}}')
-        link_head="session=$SESSION schema=8 ${link_acc:-acc=na}"
+        link_head="session=$SESSION schema=9 ${link_acc:-acc=na}"
         message="sample=$SESSION-link-$link_seq $link_head | event=wireless_link link_poll_gap_ms=$link_gap link_probe_ms=$(($(clock_ms)-link_start)) link_context_age_ms=$((link_start-context_ms)) $peer_stats $station_stats $transport_stats"
         save_message "$message"
         unset socket_rows socket6_rows neighbour_rows neighbour6_rows proc4_rows proc6_rows station_rows link_peers transport_result
@@ -700,7 +764,7 @@ slow_diagnostics() {
 }
 emit_slow() {
   slow_seq=$((slow_seq+1))
-  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=8 | $1"
+  message="sample=$SESSION-diag-$capture-$slow_seq session=$SESSION schema=9 | $1"
   save_message "$message"
 }
 emit() {
@@ -848,12 +912,18 @@ frame_loop() {
 # Start before any slow context probes, without depending on a CarPlay session.
 SAMPLER_PID=$$
 SAMPLER_START=$(process_start "$SAMPLER_PID")
+initialize_codec_trace
+if [ "$CODEC_TRACE_ACTIVE" = 1 ]; then
+  codec_lease_loop "$((CODEC_TRACE_UNTIL-lease_now))" &
+  codec_lease_pid=$!; codec_lease_start=$(process_start "$codec_lease_pid")
+fi
 ensure_gps_worker
 while :; do
   ensure_gps_worker
   rotate_log
   context_ms=$(clock_ms)
   now=$(date +%s)
+  codec_trace_policy "$now" "$context_ms"
   acc=$(settings get global acc_status 2>/dev/null)
   # Aggregate reachability states only.  A neighbour is useful sampling context, but it
   # does not identify a phone and cannot prove that CarPlay is active.
@@ -938,11 +1008,15 @@ while :; do
   fi
   bt=$(settings get global bluetooth_on 2>/dev/null)
   zlink_proc=0; [ -n "$zpid" ] && zlink_proc=1
-  diag="schema=8"
+  diag="schema=9"
   if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
     diagnostic_context
   fi
-  head="session=$SESSION acc=$acc phone=$phone neigh_count=$phone neigh=$neigh load=$load soc=$soc zlink_proc=$zlink_proc zlink_cpu=$zcpu rx_kbit=$kbit ap_drops=$drops obd_cpu=$ocpu bt=${bt:-na} sta=$sta ap=${ap:-na} $diag"
+  head="session=$SESSION acc=$acc phone=$phone neigh_count=$phone neigh=$neigh load=$load soc=$soc zlink_proc=$zlink_proc zlink_cpu=$zcpu rx_kbit=$kbit ap_drops=$drops obd_cpu=$ocpu bt=${bt:-na} sta=$sta ap=${ap:-na} $diag $CODEC_TRACE_FIELDS"
+  if [ "$CODEC_TRACE_POLICY_REPORTED" != "$CODEC_TRACE_ACTIVE" ]; then
+    emit "$head | event=codec_trace_policy"
+    CODEC_TRACE_POLICY_REPORTED=$CODEC_TRACE_ACTIVE
+  fi
 
   [ "$acc" = 1 ] || [ "$phone" -gt 0 ] && last_active=$now
   # First pass recovers retained summaries, then once/minute during activity and for
@@ -984,12 +1058,27 @@ while :; do
     wait "$codec_pid" 2>/dev/null
     codec_pid=; codec_start=
   fi
-  if [ "$active" = 1 ] && [ -n "$zpid" ] && [ $((now-codec_last)) -ge 60 ] && [ -r "$CODEC_SCRIPT" ]; then
+  # Recheck the lease immediately before launch; a slow context probe cannot launch
+  # a new trace after the expiry. The independent lease worker interrupts an owned
+  # capture even when the foreground context worker is asleep or blocked in a probe.
+  if [ "$CODEC_TRACE_ACTIVE" = 1 ]; then
+    codec_trace_policy "$(date +%s 2>/dev/null)" "$(clock_ms)"
+  fi
+  if [ "$CODEC_TRACE_ACTIVE" = 1 ] && [ "$active" = 1 ] && [ -n "$zpid" ] && [ $((now-codec_last)) -ge 60 ] && [ -r "$CODEC_SCRIPT" ]; then
     if [ -z "$codec_pid" ]; then
       codec_seq=$((codec_seq+1)); codec_last=$now
+      codec_starting=1
       sh "$CODEC_SCRIPT" "$SESSION" "$codec_seq" "$LOG" "$PRIO" &
       codec_pid=$!
       codec_start=$(process_start "$codec_pid")
+      codec_starting=0
+      # USR1 can land after the eligibility check but before child identity is
+      # recorded. Recheck after ownership is published so expiry cannot leave that
+      # newly launched capture behind or launch after a deferred expiry signal.
+      if [ "$CODEC_TRACE_ACTIVE" = 1 ]; then
+        codec_trace_policy "$(date +%s 2>/dev/null)" "$(clock_ms)"
+      fi
+      [ "$CODEC_TRACE_ACTIVE" = 1 ] || stop_codec_worker
     fi
   fi
   if ! child_alive "$frame_pid" "$frame_start"; then

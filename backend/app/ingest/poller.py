@@ -429,6 +429,9 @@ class IngestPoller:
                     # Read-only and independently throttled, with an ignition-off gate.
                     # A long footage copy must not hide the drive's retained timing log.
                     carplay_timing.recover_on_unit_present(self._address())
+                    # Apply an explicit trace-policy change even during a long copy.
+                    # Identical configurations do not upload or restart the sampler.
+                    carplay_timing.reconcile_on_unit_present(self._address(), config_only=True)
                     temperature_capture.on_unit_present(self._address())
                     await asyncio.sleep(self._online_interval())
                     continue

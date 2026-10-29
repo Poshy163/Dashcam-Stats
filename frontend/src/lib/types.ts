@@ -533,6 +533,13 @@ export interface CarPlayGpsContext extends CarPlayLocationMeasurements, CarPlayL
 /** One reading of the CarPlay video surface, sampled on the unit. */
 export interface CarPlayDiagnosticContext extends CarPlayGpsContext {
   diagnosticSchema?: number | null
+  /** Expensive tracing is explicitly leased; active means eligible, not tracing this instant. */
+  codecTraceRequested?: 0 | 1 | null
+  codecTraceActive?: 0 | 1 | null
+  codecTraceUntilEpochS?: number | null
+  codecTraceRemainingS?: number | null
+  /** The capture deadline fired; this does not diagnose decoder overload. */
+  codecWatchdogFired?: 0 | 1 | null
   memAvailableKib?: number | null
   cpuPressureAvg10?: number | null
   ioPressureAvg10?: number | null

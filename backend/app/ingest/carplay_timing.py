@@ -39,6 +39,7 @@ import base64
 import hashlib
 import math
 import re
+import shlex
 import time
 import uuid
 import zlib
@@ -81,10 +82,13 @@ MAX_RECOVERY_BYTES = MAX_RECOVERY_BYTES_PER_FILE * (REMOTE_LOG_ROTATIONS + 1)
 
 #: The logcat tag every sample carries. The unit-log collector's allow-list must name it.
 TAG = "CarPlayTiming"
-SAMPLER_SCHEMA = 8
+SAMPLER_SCHEMA = 9
 
 ENABLED_KEY = "ingest.carplay_timing"
 INTERVAL_KEY = "ingest.carplay_timing_interval_s"
+CODEC_TRACE_UNTIL_KEY = "ingest.carplay_codec_trace_until_unix_s"
+# A persisted absolute lease is never renewed by presence, reboot or server restart.
+MAX_CODEC_TRACE_LEASE_S = 1800
 DEFAULT_INTERVAL_S = 15
 MIN_INTERVAL_S = 5
 
@@ -106,6 +110,8 @@ ARM_RETRY_S = 30.0
 _SCRIPT_PATH = Path(__file__).with_name("carplay_timing.sh")
 _CODEC_SCRIPT_PATH = Path(__file__).with_name("carplay_codec.sh")
 _last_armed: dict[str, float] = {}
+_last_arm_config: dict[str, tuple[str, int, int, bool]] = {}
+_arm_failed: set[str] = set()
 _last_recovered: dict[str, float] = {}
 _tasks: set[asyncio.Task[None]] = set()
 _arm_locks: dict[str, asyncio.Lock] = {}
@@ -199,6 +205,37 @@ def interval_s() -> int:
     return max(MIN_INTERVAL_S, min(MAX_INTERVAL_S, raw))
 
 
+def codec_trace_until_unix_s() -> int:
+    """Return an explicit unexpired trace lease, or zero for passive diagnostics.
+
+    Refuse malformed, expired and unexpectedly long leases. In particular, an old
+    saved setting cannot restart expensive tracing when the server next restarts.
+    """
+    try:
+        raw = get_settings_service().get_nowait(CODEC_TRACE_UNTIL_KEY)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return 0
+        now = int(time.time())
+        if now <= 0 or not now < raw <= now + MAX_CODEC_TRACE_LEASE_S:
+            return 0
+        return raw
+    except Exception:
+        return 0
+
+
+def _capture_trace_until_unix_s() -> int:
+    try:
+        if get_settings_service().get_nowait("ingest.unit_logs") is not True:
+            return 0
+    except Exception:
+        return 0
+    return codec_trace_until_unix_s()
+
+
+def _arm_config() -> tuple[str, int, int, bool]:
+    return bundle_id(), interval_s(), _capture_trace_until_unix_s(), _enabled()
+
+
 async def arm(address: str) -> bool:
     async with _arm_locks.setdefault(address, asyncio.Lock()):
         return await _arm_locked(address)
@@ -213,12 +250,14 @@ async def _arm_locked(address: str) -> bool:
     if not _enabled():
         return False
     every = interval_s()
+    trace_until = _capture_trace_until_unix_s()
     try:
         await _deploy_bundle(address)
         await adb.shell(
             address,
             # `e` is the logcat priority the lines are emitted at -- see the module note.
-            f"setsid sh {REMOTE_SCRIPT} {every} e {FRAME_INTERVAL_S} </dev/null >/dev/null 2>&1 &",
+            f"setsid sh {REMOTE_SCRIPT} {every} e {FRAME_INTERVAL_S} {trace_until} "
+            "</dev/null >/dev/null 2>&1 &",
             timeout=ARM_TIMEOUT_S,
         )
         verified = await adb.shell(
@@ -226,7 +265,7 @@ async def _arm_locked(address: str) -> bool:
             "n=0; while [ $n -lt 100 ]; do "
             f"p=$(cat {REMOTE_PID} 2>/dev/null); "
             "case $p in ''|*[!0-9]*) ;; *) "
-            f'if [ "$(cat /data/local/tmp/.dashcam_carplay_timing.build 2>/dev/null)" = "{bundle_id()}:{every}:{FRAME_INTERVAL_S}" ] '
+            f'if [ "$(cat /data/local/tmp/.dashcam_carplay_timing.build 2>/dev/null)" = "{bundle_id()}:{every}:{FRAME_INTERVAL_S}:{trace_until}" ] '
             '&& kill -0 "$p" 2>/dev/null '
             f"&& tr '\\000' ' ' < /proc/$p/cmdline 2>/dev/null | grep -Fq '{REMOTE_SCRIPT}'; "
             "then echo sampler_verified; exit 0; fi ;; esac; n=$((n+1)); sleep 0.2; "
@@ -249,35 +288,124 @@ async def _arm_locked(address: str) -> bool:
         "armed the CarPlay timing sampler on the unit",
         interval_s=every,
         frame_interval_s=FRAME_INTERVAL_S,
+        codec_trace_until_unix_s=trace_until,
     )
     return True
 
 
+def _stop_command() -> str:
+    """Stop only the identified sampler; its EXIT handler reaps owned workers."""
+    return f"""
+unitlog_pidfile={shlex.quote(REMOTE_PID)}
+if [ ! -e "$unitlog_pidfile" ] && [ ! -L "$unitlog_pidfile" ]; then
+  echo sampler_stopped; exit 0
+fi
+[ -f "$unitlog_pidfile" ] && [ ! -L "$unitlog_pidfile" ] || exit 1
+unitlog_pid=$(timeout 2 head -c 32 "$unitlog_pidfile") || exit 1
+case "$unitlog_pid" in ''|*[!0-9]*|0*) exit 1;; esac
+[ "${{#unitlog_pid}}" -le 10 ] && [ "$unitlog_pid" -gt 1 ] || exit 1
+if [ ! -d "/proc/$unitlog_pid" ]; then echo sampler_stopped; exit 0; fi
+unitlog_uid=$(id -u) || exit 1
+[ "$(stat -c '%u' /proc/$unitlog_pid)" = "$unitlog_uid" ] || exit 1
+unitlog_identity() {{
+  awk '{{sub(/^.*\\) /, ""); print $1 " " $20}}' "/proc/$unitlog_pid/stat" 2>/dev/null
+}}
+unitlog_before=$(unitlog_identity)
+unitlog_start=${{unitlog_before#* }}
+case "$unitlog_start" in ''|*[!0-9]*) exit 1;; esac
+case "$unitlog_before" in Z*) echo sampler_stopped; exit 0;; esac
+timeout 2 head -c 4096 "/proc/$unitlog_pid/cmdline" | tr '\\000' '\\n' | {{
+  IFS= read -r unitlog_shell && IFS= read -r unitlog_script || exit 1
+  case "$unitlog_shell" in sh|/system/bin/sh|/bin/sh|mksh|/system/bin/mksh|/bin/mksh) ;; *) exit 1;; esac
+  [ "$unitlog_script" = {shlex.quote(REMOTE_SCRIPT)} ]
+}} || exit 1
+unitlog_current=$(unitlog_identity)
+[ "${{unitlog_current#* }}" = "$unitlog_start" ] || exit 1
+[ "$(stat -c '%u' /proc/$unitlog_pid)" = "$unitlog_uid" ] || exit 1
+kill -TERM "$unitlog_pid" 2>/dev/null || exit 1
+unitlog_attempt=0
+while [ "$unitlog_attempt" -lt 200 ]; do
+  if [ ! -d "/proc/$unitlog_pid" ]; then echo sampler_stopped; exit 0; fi
+  unitlog_after=$(unitlog_identity)
+  case "$unitlog_after" in
+    "Z $unitlog_start") echo sampler_stopped; exit 0;;
+    *" $unitlog_start") ;;
+    *) echo sampler_stopped; exit 0;;
+  esac
+  unitlog_attempt=$((unitlog_attempt+1)); sleep 0.1
+done
+exit 1
+""".strip()
+
+
+async def stop(address: str) -> bool:
+    """Explicit stop remains available after passive diagnostics are disabled."""
+    async with _arm_locks.setdefault(address, asyncio.Lock()):
+        try:
+            result = await adb.shell(address, _stop_command(), timeout=ARM_TIMEOUT_S)
+            if isinstance(result, adb.AdbResult):
+                result = result.stdout
+            return isinstance(result, str) and "sampler_stopped" in result.splitlines()
+        except adb.AdbError as exc:
+            log.warning(
+                "could not stop the CarPlay timing sampler",
+                category=_failure_category(exc),
+                error_type=type(exc).__name__,
+            )
+            return False
+
+
 def on_unit_present(address: str) -> None:
     """Arm cheaply whenever present; recover retained diagnostics only when parked."""
-    if _shutting_down or not _enabled():
+    if _shutting_down:
         return
-    recover_on_unit_present(address)
+    if _enabled():
+        recover_on_unit_present(address)
+    reconcile_on_unit_present(address)
+
+
+def reconcile_on_unit_present(
+    address: str, *, config_only: bool = False, force_off: bool = False
+) -> None:
+    """Apply changed diagnostic policy without pausing backup or renewing a lease.
+
+    The backup fast path uses config_only so ordinary polls do not upload an identical
+    bundle. A first observation still reconciles the deployed helper after a server
+    update; changed policy bypasses the ordinary five-minute health-check debounce.
+    """
+    enabled = _enabled()
+    if _shutting_down:
+        return
     if address in _arm_tasks and not _arm_tasks[address].done():
         return
     now = time.monotonic()
     last = _last_armed.get(address)
-    if last is not None and now - last < ARM_DEBOUNCE_S:
+    config = _arm_config()
+    changed = _last_arm_config.get(address) != config or (force_off and not enabled)
+    if not changed and config_only and address not in _arm_failed:
+        return
+    if not changed and last is not None and now - last < ARM_DEBOUNCE_S:
         return
     _last_armed[address] = now
-    task = asyncio.create_task(_arm_on_presence(address), name="ingest-carplay-timing")
+    _last_arm_config[address] = config
+    task = asyncio.create_task(
+        _arm_on_presence(address, stop_only=not enabled), name="ingest-carplay-timing"
+    )
     _track_presence_task(address, task, _arm_tasks, "arm")
 
 
-async def _arm_on_presence(address: str) -> None:
+async def _arm_on_presence(address: str, *, stop_only: bool = False) -> None:
     try:
-        armed = await arm(address)
+        armed = await stop(address) if stop_only else await arm(address)
     except Exception:
+        _arm_failed.add(address)
         _last_armed[address] = time.monotonic() - ARM_DEBOUNCE_S + ARM_RETRY_S
         raise
     if not armed:
+        _arm_failed.add(address)
         _last_armed[address] = time.monotonic() - ARM_DEBOUNCE_S + ARM_RETRY_S
     else:
+        _arm_failed.discard(address)
         _last_armed[address] = time.monotonic()
 
 
@@ -380,6 +508,8 @@ async def shutdown() -> None:
 
 def reset_for_tests() -> None:
     _last_armed.clear()
+    _last_arm_config.clear()
+    _arm_failed.clear()
     _last_recovered.clear()
     _arm_locks.clear()
     _arm_tasks.clear()
@@ -659,6 +789,13 @@ def _diagnostics(fields: dict[str, str]) -> dict[str, Any]:
     ):
         names[name] = name
     result = {name: _number(fields.get(key)) for name, key in names.items()}
+    for flag in ("codec_watchdog_fired", "codec_trace_requested", "codec_trace_active"):
+        result[flag] = int(fields[flag]) if fields.get(flag) in {"0", "1"} else None
+    for name in ("codec_trace_until_epoch_s", "codec_trace_remaining_s"):
+        value = _number(fields.get(name))
+        result[name] = (
+            int(value) if value is not None and value >= 0 and value.is_integer() else None
+        )
     country = fields.get("wifi_country_code", "")
     result["wifi_country_code"] = country if re.fullmatch(r"[A-Z]{2}", country) else None
     reported = fields.get("codec_reported_local", "")

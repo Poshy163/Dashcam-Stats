@@ -27,6 +27,14 @@ REAL_LINES = """--------- beginning of main
 """
 
 
+def _logging_reply(command: str, state: str = "running") -> str:
+    if unit_logs._LEVEL_READ_COMPLETE in command:
+        return f"absent\n{unit_logs._LEVEL_READ_COMPLETE}\n"
+    if unit_logs._LEVEL_APPLIED in command:
+        return unit_logs._LEVEL_APPLIED
+    return state
+
+
 class TestTheCaptureCommand:
     def test_it_bounds_its_own_size_on_the_unit(self):
         """An unbounded capture on a car's SD card is a slow way to fill it."""
@@ -321,7 +329,7 @@ class TestReenablingLogging:
 
         async def fake_shell(address, command, timeout=None):
             seen.append(command)
-            return "running"
+            return _logging_reply(command)
 
         monkeypatch.setattr(unit_logs.adb, "shell", fake_shell)
         assert await unit_logs.ensure_logging("unit") is True
@@ -332,7 +340,7 @@ class TestReenablingLogging:
     @pytest.mark.asyncio
     async def test_it_reports_failure_when_logd_stays_down(self, monkeypatch):
         async def fake_shell(address, command, timeout=None):
-            return "stopped"
+            return _logging_reply(command, "stopped")
 
         monkeypatch.setattr(unit_logs.adb, "shell", fake_shell)
         assert await unit_logs.ensure_logging("unit") is False
@@ -343,7 +351,7 @@ class TestReenablingLogging:
         and a status line implying it works."""
 
         async def fake_shell(address, command, timeout=None):
-            return "stopped"
+            return _logging_reply(command, "stopped")
 
         monkeypatch.setattr(unit_logs.adb, "shell", fake_shell)
         assert await unit_logs.arm("unit") is False
@@ -357,7 +365,7 @@ class TestArming:
 
         async def fake_shell(address, command, timeout=None):
             seen.append(command)
-            return "running"
+            return _logging_reply(command)
 
         monkeypatch.setattr(unit_logs.adb, "shell", fake_shell)
         await unit_logs.arm("unit")
@@ -373,7 +381,7 @@ class TestArming:
 
         async def fake_shell(address, command, timeout=None):
             seen.append(command)
-            return "running"
+            return _logging_reply(command)
 
         monkeypatch.setattr(unit_logs.adb, "shell", fake_shell)
         await unit_logs.arm("unit")
@@ -390,7 +398,7 @@ class TestArming:
 
         async def fake_shell(address, command, timeout=None):
             seen.append(command)
-            return "running"
+            return _logging_reply(command)
 
         monkeypatch.setattr(unit_logs.adb, "shell", fake_shell)
         await unit_logs.arm("unit")
@@ -447,25 +455,25 @@ class TestEnsureLogging:
 
         async def fake_shell(address, command, **kwargs):
             shells.append(command)
-            return "running"
+            return _logging_reply(command)
 
         monkeypatch.setattr(adb, "shell", fake_shell)
         monkeypatch.setattr(unit_logs, "get_settings_service", lambda: _AllowSettings(""))
 
         assert await unit_logs.ensure_logging("u:5555")
 
-        setup = shells[0]
+        setup = shells[1]
         assert "setprop persist.log.tag S" in setup
         assert 'persist.log.tag ""' not in setup, "clearing it is what unleashed the flood"
-        assert "setprop log.tag.CarPlayTiming E;" in setup
-        assert "setprop log.tag.AndroidRuntime E;" in setup
+        assert "CarPlayTiming - - - E 0 1" in setup
+        assert "AndroidRuntime - - - E 0 1" in setup
         assert "setprop ctl.start logd" in setup
 
     async def test_it_reports_logd_not_coming_up(self, monkeypatch):
         from app.ingest import adb
 
         async def fake_shell(address, command, **kwargs):
-            return "stopped"
+            return _logging_reply(command, "stopped")
 
         monkeypatch.setattr(adb, "shell", fake_shell)
         monkeypatch.setattr(unit_logs, "get_settings_service", lambda: _AllowSettings(""))

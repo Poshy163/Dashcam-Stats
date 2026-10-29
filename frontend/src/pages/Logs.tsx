@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
 
 import CarPlayTimingView from '@/components/CarPlayTimingView'
+import CarPlayTraceCard from '@/components/CarPlayTraceCard'
 import Spinner from '@/components/Spinner'
 import UnitLogView from '@/components/UnitLogView'
 import { EmptyState, ErrorState, PageHeader, Pagination } from '@/components/ui'
@@ -128,7 +129,7 @@ export default function Logs() {
       />
 
       {source === 'unit' && <UnitLogView live={live} />}
-      {source === 'carplay' && <CarPlayTimingView live={live} />}
+      {source === 'carplay' && <><CarPlayTraceCard /><CarPlayTimingView live={live} /></>}
 
       {source === 'server' && (
         <>

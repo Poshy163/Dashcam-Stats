@@ -1,5 +1,88 @@
 # Offline CarPlay delay diagnostics
 
+## Normal driving and optional codec tracing (schema 9)
+
+Heavy codec tracing is now **off by default**. Passive frame, transport, GPS and
+temperature observations remain separate. To investigate a particular incident,
+open **Logs → CarPlay timing → Heavy CarPlay diagnostics** and choose **Enable for
+15 minutes**. **Stop heavy tracing** cancels the request. The API accepts an explicit
+60–1,800-second window; the ordinary settings editor cannot write its internal deadline.
+
+Requests have an absolute expiry, not a duration renewed whenever the camera
+reconnects. A restart neither creates a request nor extends an existing one; an
+unexpired explicit request retains its original deadline. The camera also limits
+the lease with elapsed time so a wall-clock rollback cannot extend that running
+session. Expiry stops only the sampler's owned codec capture; passive workers
+continue. These controls acquire no wake lock and do not keep the camera awake.
+An offline request is intent, not proof that tracing ran: check fresh captured events
+and the deployed helper fingerprint after the camera reconnects.
+
+Schema 9 adds `codec_trace_policy` events and numeric `codec_trace_requested`,
+`codec_trace_active`, `codec_trace_until_epoch_s` and `codec_trace_remaining_s`
+fields. Requested and active are distinct; a retained expired request can be
+inactive. Codec capture summaries additionally report `codec_watchdog_fired`:
+`1` means the eight-second watchdog deadline committed, while `0` means it did
+not fire. It does not establish that a producer was killed or that the decoder
+was overloaded. A killed `atrace` exit alone cannot identify its cause. Older
+records leave the new fields unavailable rather than inventing historical values.
+
+## Writer logging policy
+
+The collector preserves the vendor's global `persist.log.tag=S` policy and raises
+only its selected tags. `WindowManager` now defaults to **F**: fatal messages remain
+eligible, while the observed error flood is suppressed at the writer. The separate
+**Collect verbose Android window errors** setting explicitly permits **E** for an
+investigation, including when an old saved allowlist still names the tag. A deny-list
+entry takes precedence. This reduces logging work; it does not repair a native
+window layout loop.
+
+Rearming reconciles the collector's previously managed overrides, not only the
+current allowlist. A bounded on-device receipt records original, previous and
+intended levels before property changes and verifies readback. It survives server
+restart and allows interrupted application to retry. Removed overrides are restored
+only while their current values still match a recorded collector value; unrelated
+changes are retained. The receipt is limited to 64 tags and 16 KiB, requires a
+same-owner, single-link regular file with mode `600`, and is serialized by a stable
+guard. Invalid, changed or unsafe receipts block reconciliation. Known legacy
+collector **E** overrides have a bounded migration path.
+
+Android checks tag-specific transient properties before persistent and global
+defaults; filtering only `logcat` output does not stop the writer's work.
+See [Android's logging filters](https://developer.android.com/tools/logcat) and
+[transient versus persistent logging properties](https://source.android.com/docs/core/tests/debug/understanding-logging).
+
+## 29 October drive investigation
+
+The latest two stored drives, starting **17:17** and **17:25 Adelaide time**, felt
+laggy to the driver. Their sampled window presentation remained near **28.8 fps**;
+this does not measure picture age or phone-to-screen latency. Same-lifetime ZLink
+graphics counters showed high-input-latency flags on **18.31%** and **16.67%** of
+new frames, compared with **0.48%** on the previous responsive drive. Those Android
+flags are a changed diagnostic signal, not measured CarPlay touch latency or proof
+of a cause. Sampled head-unit GPS fixes remained fresh, and neither the codec
+capture schedule nor native thermal status had a common transition 30 seconds
+after connection. Vendor thermal severity does not by itself establish a frequency
+cap or explain perceived lag.
+
+A later parked snapshot captured **2,137 unknown-window errors and 356 repeated-layout
+warnings in 7.778 seconds**. Read-only inspection of the installed native camera APK
+confirmed that `FloatPreviewWindow.showWindow()` assigns window type `2004`. AOSP
+identifies this as the removed `TYPE_KEYGUARD`; its policy logs unknown types.
+See [window constants](https://android.googlesource.com/platform/frameworks/base/+/master/core/java/android/view/WindowManager.java)
+and the [policy fallback](https://android.googlesource.com/platform/frameworks/base/+/5444e9d445f7c766898666c3d51ae21d3fde9eb0/core/java/android/view/WindowManagerPolicy.java).
+
+The native camera's hide path retains a tiny instance of that window; it is not a
+verified way to remove the faulty overlay while preserving recording. Opening
+Chrome can invoke the camera Activity's stop callback, as can switching to CarPlay
+or another app; an exclusive backup-display trigger was not established. The
+1920×1080 preview request can result from deliberate aspect-ratio cropping on the
+1920×720 screen, so it is not evidence of a screen-property fault. No native APK,
+recorder service, display dimension, radio or thermal setting was changed. The
+recorded flood is a plausible contributor, but its continuous presence at the
+reported driving onset and a lag improvement after these changes still need a new
+drive comparison. These server/helper changes require no companion APK update;
+their deployment and fresh runtime acceptance remain separate from local tests.
+
 ## Diagnostic capture guard recovery
 
 The server-deployed codec helper uses a stable kernel `flock` descriptor to
@@ -180,8 +263,9 @@ observe that path. Schema 6 retains its legacy fields for comparison and adds:
   Deltas are unavailable on first observation, incomplete reads, counter resets or
   socket membership or receive-counter availability changes. Raw addresses and
   socket identities stay in memory.
-- `codec_capture` events: a guarded five-second graphics/video trace at most once
-  per minute while capture is active and ZLink is present. Exact ZLink video-codec
+- `codec_capture` events: during an explicit unexpired diagnostic request, a guarded
+  five-second graphics/video trace at most once per minute while capture is active
+  and ZLink is present. Exact ZLink video-codec
   input and completed-work timestamps produce matched counts and median/p95/maximum
   local latency. Monotonic capture boundaries align these windows with other
   measurements. Skips, missing markers, overflow and failure are explicit; they

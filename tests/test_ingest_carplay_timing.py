@@ -109,6 +109,7 @@ async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off
 
     async def recover(address):
         recovered.append(address)
+        return 0, 0
 
     async def arm(_address):
         assert not running, "backup recovery must not restart the sampler"
@@ -141,6 +142,10 @@ async def test_parked_poll_fast_path_recovers_retained_timing_only_after_acc_off
         monkeypatch.setattr(module, "on_unit_present", lambda _address: None)
     monkeypatch.setattr(poller_module.wifi_startup, "on_unit_present", startup_guard_checks.append)
     monkeypatch.setattr(poller_module.asyncio, "sleep", stop_after_tick)
+    if running:
+        # A known, unchanged sampler is not restarted by backup polls. Initial or
+        # changed policy reconciliation has its own explicit lease-contract tests.
+        carplay_timing._last_arm_config["u:5555"] = carplay_timing._arm_config()
     try:
         await poller._loop()
         if carplay_timing._tasks:
@@ -637,7 +642,7 @@ class TestArming:
         # The interval from the setting, then the logcat priority the collector keeps.
         assert (
             f"sh {carplay_timing.REMOTE_SCRIPT} 20 e {carplay_timing.FRAME_INTERVAL_S} "
-            "</dev/null >/dev/null 2>&1 &"
+            "0 </dev/null >/dev/null 2>&1 &"
         ) in launch
 
     async def test_the_frame_cadence_is_passed_to_the_script(self, monkeypatch):

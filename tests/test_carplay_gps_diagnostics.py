@@ -153,7 +153,7 @@ async def test_gps_observation_is_recovered_deduplicated_and_exposed_by_timing_a
     assert await unit_logs.store(entries) == (1, 0)
     assert await unit_logs.store(entries) == (0, 1)
     response = await carplay_timing_samples(session=db_session, hours=1)
-    assert response["sampler_schema"] == 8
+    assert response["sampler_schema"] == carplay_timing.SAMPLER_SCHEMA
     assert response["samples"] == []  # GPS observations never fabricate frame measurements.
     [observation] = response["events"]
     assert observation["kind"] == "gps_context"

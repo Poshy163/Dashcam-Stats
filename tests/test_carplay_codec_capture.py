@@ -1,5 +1,6 @@
 """Exercise the exact bounded, privacy-filtering on-unit codec trace parser."""
 
+import os
 import re
 import shutil
 import subprocess
@@ -169,6 +170,7 @@ def test_active_tracer_is_untouched_and_produces_only_skipped_summary(tmp_path):
     output = logfile.read_text(encoding="utf-8")
     assert "codec_capture_status=trace_busy_or_unavailable" in output
     assert "codec_trace_off=0" in output
+    assert "codec_watchdog_fired=0" in output
     assert (trace / "tracing_on").read_text().strip() == "1"
     assert not (tmp_path / "lock").exists()
 
@@ -188,12 +190,61 @@ def test_watchdog_cancels_promptly_without_later_signalling_capture():
     if not Path(shell).is_file():
         pytest.skip("POSIX shell unavailable")
     watcher = SOURCE.split("(\n  sleep_pid=", 1)[1].split("WATCHPID=$!", 1)[0]
+    reaper = (
+        "reap_watchdog() {" + SOURCE.split("reap_watchdog() {", 1)[1].split("\nfinish() {", 1)[0]
+    )
     command = (
-        "exec 8</dev/null\nsleep 30 &\nATRACEPID=$!\n(\n  sleep_pid="
+        reaper
+        + "\nWATCHDOGFIRED=0\nexec 8</dev/null\nsleep 30 &\nATRACEPID=$!\n(\n  sleep_pid="
         + watcher
-        + 'WATCHPID=$!\nsleep 0.1\nkill "$WATCHPID"\nwait "$WATCHPID"\nkill -0 "$ATRACEPID"\nalive=$?\nkill "$ATRACEPID"\nwait "$ATRACEPID" 2>/dev/null\nexit "$alive"\n'
+        + 'WATCHPID=$!\nsleep 0.1\nreap_watchdog\nkill -0 "$ATRACEPID"\nalive=$?\nprintf "fired=%s watcher=%s\\n" "$WATCHDOGFIRED" "$WATCHPID"\nkill "$ATRACEPID"\nwait "$ATRACEPID" 2>/dev/null\nexit "$alive"\n'
     )
     began = time.monotonic()
     result = subprocess.run([shell, "-c", command], capture_output=True, text=True, timeout=3)
     assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "fired=0 watcher="
     assert time.monotonic() - began < 2
+
+
+@pytest.mark.parametrize("shell_name", ["sh", "mksh"])
+@pytest.mark.parametrize("identity_matches", [True, False])
+def test_watchdog_reports_its_deadline_without_signalling_a_changed_identity(
+    shell_name, identity_matches, tmp_path
+):
+    if os.name == "nt":
+        pytest.skip("Linux process identities are required for executable watchdog checks")
+    shell = shutil.which(shell_name)
+    assert shell is not None, f"{shell_name} is required for executable watchdog checks"
+    watcher = SOURCE.split("(\n  sleep_pid=", 1)[1].split("WATCHPID=$!", 1)[0]
+    watcher = watcher.replace("sleep 8 8<&8", "sleep 0.1 8<&8")
+    checkpoint = tmp_path / "deadline-fired"
+    watcher = watcher.replace("  exit 124", f"  : > '{checkpoint}'\n  exit 124")
+    reaper = (
+        "reap_watchdog() {" + SOURCE.split("reap_watchdog() {", 1)[1].split("\nfinish() {", 1)[0]
+    )
+    identity = (
+        'ATRACESTART=$(awk \'{sub(/^.*\\) /,"");print $20}\' "/proc/$ATRACEPID/stat")'
+        if identity_matches
+        else "ATRACESTART=not-the-owned-lifetime"
+    )
+    command = (
+        reaper
+        + "\nWATCHDOGFIRED=0\nexec 8</dev/null\nsleep 30 &\nATRACEPID=$!\n"
+        + identity
+        + "\n(\n  sleep_pid="
+        + watcher
+        # Cancel after the deadline has committed, potentially before its final
+        # exit. The marker must survive this parent/child cancellation race.
+        + f"WATCHPID=$!\nwhile [ ! -f '{checkpoint}' ]; do sleep 0.01; done\n"
+        + 'reap_watchdog\nprintf "fired=%s watcher=%s\\n" "$WATCHDOGFIRED" "$WATCHPID"\n'
+        + (
+            'wait "$ATRACEPID" 2>/dev/null\nprintf "producer=%s\\n" "$?"\n'
+            if identity_matches
+            else 'kill -0 "$ATRACEPID"\nprintf "alive=%s\\n" "$?"\nkill "$ATRACEPID"\nwait "$ATRACEPID" 2>/dev/null\n'
+        )
+        + "exit 0\n"
+    )
+    result = subprocess.run([shell, "-c", command], capture_output=True, text=True, timeout=3)
+    assert result.returncode == 0, result.stderr
+    assert "fired=1 watcher=\n" in result.stdout
+    assert ("producer=137" if identity_matches else "alive=0") in result.stdout

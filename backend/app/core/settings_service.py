@@ -823,6 +823,8 @@ class SettingsService:
 
         buckets: dict[str, list[dict[str, Any]]] = {key: [] for key in known}
         for defn in SETTINGS:
+            if defn.hidden:
+                continue
             bucket = defn.category if defn.category in known else "advanced"
             buckets.setdefault(bucket, []).append(_describe(defn, cache, explicit))
 
