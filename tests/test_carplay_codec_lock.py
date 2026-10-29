@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import signal
@@ -52,8 +53,37 @@ def start_identity(pid):
 def process_exited(pid):
     try:
         return Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2].split()[0] == "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return True
+
+
+@pytest.mark.parametrize("error_number", [errno.ENOENT, errno.ESRCH], ids=["enoent", "esrch"])
+def test_process_exited_accepts_process_disappearance_during_stat_read(monkeypatch, error_number):
+    """A proc entry may vanish before open or while its contents are being read."""
+    original = Path.read_text
+    target = Path("/proc/12345/stat")
+
+    def disappeared(path, *args, **kwargs):
+        if path == target:
+            raise OSError(error_number, os.strerror(error_number), str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", disappeared)
+    assert process_exited(12345) is True
+
+
+def test_process_exited_does_not_treat_permission_failure_as_process_exit(monkeypatch):
+    original = Path.read_text
+    target = Path("/proc/12345/stat")
+
+    def denied(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    with pytest.raises(PermissionError):
+        process_exited(12345)
 
 
 @pytest.fixture(params=["sh", "mksh"])
