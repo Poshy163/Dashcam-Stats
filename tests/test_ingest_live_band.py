@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -64,7 +64,14 @@ async def test_active_copy_observes_roaming_without_radio_controls(monkeypatch, 
     monkeypatch.setattr(poller, "_observe_unit_runtime", AsyncMock())
     monkeypatch.setattr(poller, "_address", lambda: "unit")
     monkeypatch.setattr(poller, "_interval", lambda: 1)
-    monkeypatch.setattr(poller_module.carplay_timing, "recover_on_unit_present", Mock())
+    recovery = Mock()
+    reconcile = Mock()
+    monkeypatch.setattr(poller_module.carplay_timing, "recover_on_unit_present", recovery)
+    # This fixture supplies only the two Wi-Fi reads. Diagnostic configuration work
+    # has its own deployment/lease tests; assert delegation here without allowing its
+    # background ADB requests to consume those finite radio-observation replies.
+    monkeypatch.setattr(poller_module.carplay_timing, "reconcile_on_unit_present", reconcile)
+    monkeypatch.setattr(poller_module.temperature_capture, "on_unit_present", Mock())
     forbidden = AsyncMock(side_effect=AssertionError("active observation must not change radios"))
     monkeypatch.setattr(band, "gate", forbidden)
     monkeypatch.setattr(band, "apply_selection_nudge", forbidden)
@@ -87,6 +94,8 @@ async def test_active_copy_observes_roaming_without_radio_controls(monkeypatch, 
     assert shell.await_count == 2
     assert all(call.args == ("unit", "cmd wifi status") for call in shell.await_args_list)
     assert all(call.kwargs == {"timeout": band.BAND_TIMEOUT_S} for call in shell.await_args_list)
+    assert recovery.call_args_list == [call("unit")] * 3
+    assert reconcile.call_args_list == [call("unit", config_only=True)] * 3
     forbidden.assert_not_called()
 
 

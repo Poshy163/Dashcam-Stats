@@ -376,6 +376,10 @@ def reconcile_on_unit_present(
     enabled = _enabled()
     if _shutting_down:
         return
+    # Optional deployment yields to recovery after a timeout; explicit OFF and
+    # stopping an already-disabled sampler remain available during that backoff.
+    if enabled and not force_off and adb.optional_requests_deferred(address):
+        return
     if address in _arm_tasks and not _arm_tasks[address].done():
         return
     now = time.monotonic()

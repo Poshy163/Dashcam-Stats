@@ -22,6 +22,7 @@ async def isolated_policy(monkeypatch):
     timing.reset_for_tests()
     monkeypatch.setattr(timing, "_enabled", lambda: True)
     monkeypatch.setattr(timing, "recover_on_unit_present", lambda _address: None)
+    monkeypatch.setattr(timing.adb, "optional_requests_deferred", lambda _address: False)
     yield
     await timing.shutdown()
     timing.reset_for_tests()
@@ -143,6 +144,59 @@ async def test_failed_config_reconciliation_retries_after_30_seconds_during_back
     timing.reconcile_on_unit_present("unit", config_only=True)
     await settle()
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("config_only", [False, True])
+async def test_optional_backoff_does_not_mark_policy_applied_and_reconciles_once_when_clear(
+    monkeypatch, config_only
+):
+    settings(monkeypatch, {})
+    deferred = [True]
+    monkeypatch.setattr(timing.adb, "optional_requests_deferred", lambda _address: deferred[0])
+    calls = []
+
+    async def arm(address):
+        calls.append(address)
+        return True
+
+    monkeypatch.setattr(timing, "arm", arm)
+    timing.reconcile_on_unit_present("unit", config_only=config_only)
+    await settle()
+    assert calls == []
+    assert timing._last_armed == {}
+    assert timing._last_arm_config == {}
+    assert timing._arm_tasks == {}
+    deferred[0] = False
+    timing.reconcile_on_unit_present("unit", config_only=config_only)
+    await settle()
+    timing.reconcile_on_unit_present("unit", config_only=config_only)
+    await settle()
+    assert calls == ["unit"]
+
+
+@pytest.mark.parametrize("enabled,force_off", [(True, True), (False, False), (False, True)])
+async def test_explicit_off_and_disabled_sampler_stop_remain_available_during_backoff(
+    monkeypatch, enabled, force_off
+):
+    settings(monkeypatch, {})
+    monkeypatch.setattr(timing, "_enabled", lambda: enabled)
+    monkeypatch.setattr(timing.adb, "optional_requests_deferred", lambda _address: True)
+    calls = []
+
+    async def arm(_address):
+        calls.append("arm_off")
+        assert timing._capture_trace_until_unix_s() == 0
+        return True
+
+    async def stop(_address):
+        calls.append("stop")
+        return True
+
+    monkeypatch.setattr(timing, "arm", arm)
+    monkeypatch.setattr(timing, "stop", stop)
+    timing.reconcile_on_unit_present("unit", config_only=True, force_off=force_off)
+    await settle()
+    assert calls == ["arm_off" if enabled else "stop"]
 
 
 async def test_policy_changed_during_an_upload_is_reconciled_on_the_next_presence(monkeypatch):

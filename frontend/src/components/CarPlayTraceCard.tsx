@@ -17,7 +17,7 @@ export default function CarPlayTraceCard() {
   return (
     <section className="card px-5 py-4" aria-label="Heavy CarPlay diagnostics">
       <h2 className="text-base font-semibold">Heavy CarPlay diagnostics</h2>
-      <p className="mt-1 text-sm text-content-muted">Off during normal driving. Short codec traces add diagnostic work and may affect performance. Passive frame, GPS and temperature observations continue separately.</p>
+      <p className="mt-1 text-sm text-content-muted">Off during normal driving. Short codec traces add diagnostic work and may affect performance. Passive frame, GPS and temperature observations work independently.</p>
       <p className="mt-2 text-sm" role="status">
         {state.isError ? 'Diagnostic request status is unavailable.'
           : state.isPending ? 'Checking diagnostic request…'

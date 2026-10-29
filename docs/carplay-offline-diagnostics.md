@@ -17,6 +17,10 @@ continue. These controls acquire no wake lock and do not keep the camera awake.
 An offline request is intent, not proof that tracing ran: check fresh captured events
 and the deployed helper fingerprint after the camera reconnects.
 
+Optional sampler deployment also respects the control channel's timeout backoff,
+so a retry does not compete with radio or wake-hold recovery. Explicit stop requests
+remain available during that backoff.
+
 Schema 9 adds `codec_trace_policy` events and numeric `codec_trace_requested`,
 `codec_trace_active`, `codec_trace_until_epoch_s` and `codec_trace_remaining_s`
 fields. Requested and active are distinct; a retained expired request can be
