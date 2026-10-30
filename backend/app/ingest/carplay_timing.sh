@@ -72,14 +72,39 @@ frame_pid=; link_pid=; codec_pid=; codec_start=; codec_starting=0; codec_last=0;
 frame_start=; link_start_ticks=; slow_start=; sleep_start=
 gps_pid=; gps_worker_start=
 codec_lease_pid=; codec_lease_start=
-process_start() { awk '{sub(/^.*\) /,"");print $20}' "/proc/$1/stat" 2>/dev/null; }
+# Cost note. On this unit every exec of awk/cat/printf costs tens of milliseconds of CPU
+# (a trivial awk measured 70 ms), so per-pass helpers use mksh builtins only. The old awk
+# helpers alone made an idle sampler cost about a fifth of a core. mksh arithmetic is
+# 32-bit: millisecond clocks are concatenated as strings and deadlines are compared by
+# difference, which stays exact modulo 2^32 for gaps far below 24 days.
+process_start() {
+  read -r process_line 2>/dev/null < "/proc/$1/stat" || return
+  set -- ${process_line##*") "}
+  [ "$#" -ge 20 ] && echo "${20}"
+}
+# utime+stime ticks of one process, or nothing when it cannot be read.
+process_ticks() {
+  read -r process_line 2>/dev/null < "/proc/$1/stat" || return
+  set -- ${process_line##*") "}
+  [ "$#" -ge 13 ] || return
+  case "${12}${13}" in ''|*[!0-9]*) return;; esac
+  echo $((${12}+${13}))
+}
 child_alive() {
   [ -n "$1" ] && [ -n "$2" ] && [ "$(process_start "$1")" = "$2" ] && kill -0 "$1" 2>/dev/null
 }
 codec_alive() {
   child_alive "$codec_pid" "$codec_start"
 }
-clock_ms() { awk '{printf "%.0f",$1*1000}' /proc/uptime; }
+clock_ms() {
+  read -r clock_up clock_idle 2>/dev/null < /proc/uptime || return
+  clock_s=${clock_up%%.*}; clock_frac=
+  [ "$clock_s" = "$clock_up" ] || clock_frac=${clock_up#*.}
+  clock_frac=${clock_frac}000; clock_frac=${clock_frac%"${clock_frac#???}"}
+  case "$clock_s" in ''|*[!0-9]*) return;; esac
+  case "$clock_frac" in *[!0-9]*) return;; esac
+  if [ "$clock_s" = 0 ]; then echo $((10#$clock_frac)); else echo "$clock_s$clock_frac"; fi
+}
 stop_codec_worker() {
   # A lease signal may interrupt the fork/start-time publication below. Let that
   # critical section finish; its post-launch check will reap the now-identified child.
@@ -138,10 +163,18 @@ codec_lease_loop() {
 # Deadline scheduling subtracts work time. After an overrun, skip missed deadlines
 # instead of issuing a burst of catch-up Binder calls.
 deadline_delay() {
-  awk -v deadline="$1" -v current="$2" -v step="$3" 'BEGIN {
-    if(deadline<=current)deadline+=(int((current-deadline)/step)+1)*step
-    printf "%.0f %.3f",deadline,(deadline-current)/1000
-  }'
+  # Prints "<next deadline ms> <seconds to wait>". The deadline is only fed back into
+  # this function, so a wrapped 32-bit value is harmless: only differences are used.
+  # Parenthesised: a wrapped deadline is negative, and "x--y" is a decrement in mksh.
+  delay_late=$(($2-($1)))
+  if [ "$delay_late" -ge 0 ]; then
+    delay_next=$((($1)+(delay_late/$3+1)*$3))
+  else
+    delay_next=$1
+  fi
+  delay_wait=$((delay_next-$2)); delay_ms=$((delay_wait%1000))
+  case "${#delay_ms}" in 1) delay_ms=00$delay_ms;; 2) delay_ms=0$delay_ms;; esac
+  echo "$delay_next $((delay_wait/1000)).$delay_ms"
 }
 cleanup() {
   # Signal all owned children first, then reap them before a replacement can start.
@@ -407,8 +440,37 @@ ensure_gps_worker() {
 }
 # All output is numeric aggregates. Never retain socket addresses, input events, screen
 # contents or full process/codec dumps. Missing proc access is unavailable, not zero.
+# Sets soc to the SoC zone in degrees, one decimal, or na. Called directly, not through
+# $(...), so the zone found once (the walk was 19 cat processes per pass) is kept; a zone
+# that stops being readable is looked up again.
+THERMAL_ROOT=/sys/class/thermal
+read_soc_temperature() {
+  soc=na
+  if [ -z "$soc_zone" ] || [ ! -r "$soc_zone/temp" ]; then
+    soc_zone=
+    for z in "$THERMAL_ROOT"/thermal_zone*; do
+      zone_type=; read -r zone_type 2>/dev/null < "$z/type"
+      [ "$zone_type" = "soc-thmzone" ] && soc_zone=$z
+    done
+  fi
+  soc_milli=
+  [ -n "$soc_zone" ] && read -r soc_milli 2>/dev/null < "$soc_zone/temp"
+  case "$soc_milli" in
+    '') ;;
+    *[!0-9]*) soc=$(awk '{printf "%.1f",$1/1000}' "$soc_zone/temp" 2>/dev/null) ;;
+    *) soc_tenths=$(((soc_milli+50)/100)); soc="$((soc_tenths/10)).$((soc_tenths%10))" ;;
+  esac
+}
 pressure() {
-  awk '$1=="some" {for(i=2;i<=NF;i++) if($i ~ /^avg10=/) {split($i,a,"=");print a[2];exit}}' "/proc/pressure/$1" 2>/dev/null
+  pressure_value=
+  while read -r pressure_kind pressure_fields; do
+    [ "$pressure_kind" = some ] || continue
+    for pressure_field in $pressure_fields; do
+      case "$pressure_field" in avg10=*) pressure_value=${pressure_field#avg10=}; break;; esac
+    done
+    break
+  done 2>/dev/null < "/proc/pressure/$1"
+  [ -n "$pressure_value" ] && echo "$pressure_value"
 }
 diagnostic_context() {
   country=$(timeout 1 cmd wifi get-country-code 2>/dev/null | sed -n 's/^Wifi Country Code = \([A-Z][A-Z]\)$/\1/p')
@@ -419,9 +481,15 @@ diagnostic_context() {
     END {if(n)printf "cpu_min_khz=%d cpu_max_khz=%d",lo,hi;else printf "cpu_min_khz=na cpu_max_khz=na"}')
   uid=na; rss=na; threads=na; queues="zlink_tcp_sockets=na zlink_rx_queue_bytes=na zlink_tx_queue_bytes=na"
   if [ -n "$zpid" ]; then
-    rss=$(awk '/^VmRSS:/ {print $2}' /proc/$zpid/status 2>/dev/null)
-    threads=$(awk '/^Threads:/ {print $2}' /proc/$zpid/status 2>/dev/null)
-    uid=$(awk '/^Uid:/ {print $2}' /proc/$zpid/status 2>/dev/null)
+    # One builtin pass instead of three awk processes. Unreadable stays empty, as before.
+    rss=; threads=; uid=
+    while read -r status_key status_value status_rest; do
+      case "$status_key" in
+        VmRSS:) rss=$status_value ;;
+        Threads:) threads=$status_value ;;
+        Uid:) uid=$status_value ;;
+      esac
+    done 2>/dev/null < "/proc/$zpid/status"
     # Linux tcp tables expose the owning UID in column 8, queue bytes as hex in column
     # 5. Count the app UID only; other processes' sockets must not become ZLink evidence.
     if [ -n "$uid" ] && [ -r /proc/net/tcp ] && [ -r /proc/net/tcp6 ]; then
@@ -433,9 +501,9 @@ diagnostic_context() {
     fi
   fi
   # Decoder service is shared by recording and playback: explicitly device-wide context.
-  cpid=$(pidof media.unisoc.codec2 2>/dev/null | cut -d' ' -f1); ccpu=na
+  cpid=$(pidof media.unisoc.codec2 2>/dev/null); cpid=${cpid%% *}; ccpu=na
   if [ -n "$cpid" ] && [ -r /proc/$cpid/stat ]; then
-    cticks=$(sed 's/.*) //' /proc/$cpid/stat 2>/dev/null | awk '{print $12+$13}')
+    cticks=$(process_ticks "$cpid")
     if [ "$prev_cpid" = "$cpid" ] && [ "$prev_ct" -gt 0 ] && [ -n "$cticks" ] && [ "$cticks" -ge "$prev_cticks" ]; then
       cdt=$((now-prev_ct)); [ "$cdt" -gt 0 ] && ccpu=$(( (cticks-prev_cticks)/cdt ))
     fi
@@ -444,7 +512,14 @@ diagnostic_context() {
     prev_cticks=0; prev_ct=0; prev_cpid=
   fi
   transport=$(timeout 2 ss -tine 2>/dev/null | tcp_summary)
-  display_queue=$(dumpsys -t 2 SurfaceFlinger 2>/dev/null | surface_queue_summary)
+  # A full SurfaceFlinger dump (~240 KB, ~120 ms measured) is produced on the compositor
+  # itself, the same thread that presents CarPlay frames. Its queued-frame count has read
+  # zero in every retained drive, so sample it at most every five minutes, not every pass.
+  display_queue="zlink_queued_layers=na zlink_queued_frames_max=na"
+  if [ "${queue_checked:-0}" -eq 0 ] || [ $((now-queue_checked)) -ge 300 ] || [ $((now-queue_checked)) -lt 0 ]; then
+    display_queue=$(dumpsys -t 2 SurfaceFlinger 2>/dev/null | surface_queue_summary)
+    queue_checked=$now
+  fi
   sched="zlink_main_runtime_ns=na zlink_main_wait_ns=na zlink_start_ticks=na"
   if [ -n "$zpid" ]; then
     sched=$(awk 'NF==3 && $1~/^[0-9]+$/ && $2~/^[0-9]+$/ {printf "zlink_main_runtime_ns=%s zlink_main_wait_ns=%s",$1,$2;found=1} END {if(!found)printf "zlink_main_runtime_ns=na zlink_main_wait_ns=na"}' /proc/$zpid/schedstat 2>/dev/null)
@@ -631,14 +706,22 @@ station_summary() {
 link_loop() {
   trap - EXIT
   link_seq=0; link_previous=0; link_deadline=$(clock_ms); transport_state=
+  # This firmware ships no iw. Probing it through timeout every three seconds cost two
+  # process starts per pass to learn the same thing; check once, report it unavailable.
+  link_iw=0; command -v iw >/dev/null 2>&1 && link_iw=1
   while :; do
     link_start=$(clock_ms)
     if [ -r "$FRAME_CONTEXT" ]; then
       { IFS= read -r active; IFS= read -r context_ms; IFS= read -r head; } < "$FRAME_CONTEXT"
       if [ "$active" = 1 ]; then
-        link_zpid=$(pidof com.zjinnova.zlink 2>/dev/null | cut -d" " -f1)
+        link_zpid=$(pidof com.zjinnova.zlink 2>/dev/null); link_zpid=${link_zpid%% *}
         link_uid=na
-        [ -n "$link_zpid" ] && link_uid=$(awk "/^Uid:/ {print \$2}" /proc/$link_zpid/status 2>/dev/null)
+        if [ -n "$link_zpid" ]; then
+          link_uid=
+          while read -r status_key status_value status_rest; do
+            [ "$status_key" = Uid: ] && { link_uid=$status_value; break; }
+          done 2>/dev/null < "/proc/$link_zpid/status"
+        fi
         neighbour_rows=$(timeout 1 ip -4 neigh show dev wlan2 2>/dev/null); neighbour_rc=$?
         # Keep resolved neighbours only. Failed/absent lookups cannot identify a peer.
         link_peers=$(printf '%s\n' "$neighbour_rows" | awk '$1~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $0~/ lladdr / && $NF!="FAILED" && $NF!="INCOMPLETE" {printf "%s ",$1}')
@@ -647,22 +730,31 @@ link_loop() {
         peer_stats=$(printf '%s\n' "$socket_rows" | peer_tcp_summary)
         neighbour6_rows=$(timeout 1 ip -6 neigh show dev wlan2 2>/dev/null); neighbour6_rc=$?
         socket6_rows=$(timeout 1 ss -6tine 2>/dev/null); socket6_rc=$?
-        proc4_rows=$(timeout 1 cat /proc/net/tcp 2>/dev/null); proc4_rc=$?
-        proc6_rows=$(timeout 1 cat /proc/net/tcp6 2>/dev/null); proc6_rc=$?
+        # procfs reads cannot block; $(< file) reads them without starting cat. A missing
+        # table still returns a non-zero status, which the summary reports as unavailable.
+        proc4_rows=$(< /proc/net/tcp); proc4_rc=$?
+        proc6_rows=$(< /proc/net/tcp6); proc6_rc=$?
         transport_result=$(printf '@p4 %s\n%s\n@p6 %s\n%s\n@n4 %s\n%s\n@n6 %s\n%s\n@s4 %s\n%s\n@s6 %s\n%s\n' \
           "$proc4_rc" "$proc4_rows" "$proc6_rc" "$proc6_rows" \
           "$neighbour_rc" "$neighbour_rows" "$neighbour6_rc" "$neighbour6_rows" \
           "$socket_rc" "$socket_rows" "$socket6_rc" "$socket6_rows" | transport_v6_summary)
         # Android mksh treats an unescaped pipe as pattern alternation here.
         transport_stats=${transport_result%%\|*}; transport_state=${transport_result#*\|}
-        station_rows=$(timeout 1 iw dev wlan2 station dump 2>/dev/null); station_rc=$?
+        station_rows=; station_rc=127
+        if [ "$link_iw" = 1 ]; then
+          station_rows=$(timeout 1 iw dev wlan2 station dump 2>/dev/null); station_rc=$?
+        fi
         station_ok=0; [ "$station_rc" = 0 ] && station_ok=1
         station_stats=$(printf '%s\n' "$station_rows" | station_summary)
         link_gap=na; [ "$link_previous" -gt 0 ] && link_gap=$((link_start-link_previous))
         link_previous=$link_start; link_seq=$((link_seq+1))
         # The full diagnostic context is emitted separately. Keep this event below
         # the retained-message limit so its transport tail survives file recovery.
-        link_acc=$(printf '%s\n' "$head" | awk '{for(i=1;i<=NF;i++)if($i~/^acc=[01]$/){print $i;exit}}')
+        case " $head " in
+          *" acc=0 "*) link_acc=acc=0 ;;
+          *" acc=1 "*) link_acc=acc=1 ;;
+          *) link_acc= ;;
+        esac
         link_head="session=$SESSION schema=9 ${link_acc:-acc=na}"
         message="sample=$SESSION-link-$link_seq $link_head | event=wireless_link link_poll_gap_ms=$link_gap link_probe_ms=$(($(clock_ms)-link_start)) link_context_age_ms=$((link_start-context_ms)) $peer_stats $station_stats $transport_stats"
         save_message "$message"
@@ -770,7 +862,7 @@ emit_slow() {
 emit() {
   # SurfaceFlinger pipelines run their loop bodies in subshells.  Keep the counter in a
   # tiny file so every emission, including one from a pipeline, receives a unique ID.
-  seq=$(cat "$SEQF" 2>/dev/null)
+  seq=; read -r seq 2>/dev/null < "$SEQF"
   case "$seq" in ''|*[!0-9]*) seq=0;; esac
   seq=$((seq + 1))
   echo "$seq" > "$SEQF"
@@ -805,10 +897,12 @@ sample_surfaces() {
       echo "$layers" | while IFS='	' read -r kind L; do
         idx=$((idx+1))
         # Never log a full window title: retain only its numeric SurfaceFlinger ID.
-        id=$(echo "$L" | sed -n 's/.*#\([0-9][0-9]*\)$/#\1/p')
-        [ -n "$id" ] || continue
+        # Builtins: this runs per surface every three seconds while CarPlay is up.
+        id=${L##*#}
+        case "$id" in ''|*[!0-9]*|"$L") continue ;; esac
+        id="#$id"
         mark="$MARKPFX${id#\#}"
-        seen=$(cat "$mark" 2>/dev/null)
+        seen=; read -r seen 2>/dev/null < "$mark"
         dumpsys -t 1 SurfaceFlinger --latency "$L" </dev/null 2>/dev/null | awk -v layer="$id" -v kind="$kind" -v idx="$idx" -v seen="${seen:-0}" -v poll_ms="$poll_ms" -v mark="$mark" '
           NR==1 { period=$1/1e6; next }
           NF>=3 && $2>0 && $2<9e18 {
@@ -818,7 +912,7 @@ sample_surfaces() {
             if ($3>0 && $3<9e18 && $2>=$3) ready[sprintf("%.0f",$2)]=($2-$3)/1e6
           }
           END {
-            if (n<3) { printf "layer=%s surface_kind=%s idx=%s frames=%d (idle)\n", layer, kind, idx, n; exit }
+            if (n<2) { printf "layer=%s surface_kind=%s idx=%s frames=%d (idle)\n", layer, kind, idx, n; exit }
             # sort presented timestamps, then the intervals between them
             for (i=0;i<n;i++) for (j=i+1;j<n;j++) if (p[j]<p[i]) { t=p[i]; p[i]=p[j]; p[j]=t }
             # Where this window ended, for the next one to start after. Printed with an
@@ -850,7 +944,7 @@ sample_surfaces() {
               if (m==0) first=p[i-1]
               last=p[i]; m++
             }
-            if (m<2) { printf "layer=%s surface_kind=%s idx=%s frames=%d new=0 ring_overlap=%s ring_gap_ms=%s surface_unchanged_ms=%s (no new frames)\n", layer, kind, idx, n, overlap, ring_gap, unchanged; exit }
+            if (m==0) { printf "layer=%s surface_kind=%s idx=%s frames=%d new=0 ring_overlap=%s ring_gap_ms=%s surface_unchanged_ms=%s (no new frames)\n", layer, kind, idx, n, overlap, ring_gap, unchanged; exit }
             span=(last-first)/1e9
             for (i=0;i<m;i++) for (j=i+1;j<m;j++) if (d[j]<d[i]) { t=d[i]; d[i]=d[j]; d[j]=t }
             for (i=0;i<rn;i++) for(j=i+1;j<rn;j++) if(rdelay[j]<rdelay[i]) {t=rdelay[i];rdelay[i]=rdelay[j];rdelay[j]=t}
@@ -875,8 +969,14 @@ sample_surfaces() {
             # so it needs no panel constant and follows the link if its cadence changes.
             hthr=2*med
             for (i=0;i<m;i++) { if (d[i]>thr) late++; if (d[i]>=hthr) hitch++ }
-            printf "layer=%s surface_kind=%s idx=%s fps=%.1f med=%.1f p95=%.1f max=%.1f late=%d%% hitch=%d n=%d new=%d span=%.1f period=%.1f thr=%.1f ready_n=%d ready_p95=%s ready_max=%s ring_overlap=%s ring_gap_ms=%s surface_unchanged_ms=%s\n",
-              layer, kind, idx, (span>0? m/span:0), med, d[int(m*0.95)-1<0?0:int(m*0.95)-1], d[m-1], 100*late/m, hitch, n, m, span, period, thr, rn, rp95, rmax, overlap, ring_gap, unchanged
+            # One new interval can contain the entire stall. Retain its duration and
+            # coverage instead of silently consuming it, but one interval cannot establish
+            # a cadence-relative late/hitch threshold. Do not turn that into healthy 0.
+            late_out=(m>1?sprintf("%d%%",100*late/m):"na")
+            hitch_out=(m>1?sprintf("%d",hitch):"na")
+            thr_out=(m>1?sprintf("%.1f",thr):"na")
+            printf "layer=%s surface_kind=%s idx=%s fps=%.1f med=%.1f p95=%.1f max=%.1f late=%s hitch=%s n=%d new=%d span=%.1f period=%.1f thr=%s ready_n=%d ready_p95=%s ready_max=%s ring_overlap=%s ring_gap_ms=%s surface_unchanged_ms=%s\n",
+              layer, kind, idx, (span>0? m/span:0), med, d[int(m*0.95)-1<0?0:int(m*0.95)-1], d[m-1], late_out, hitch_out, n, m, span, period, thr_out, rn, rp95, rmax, overlap, ring_gap, unchanged
           }' | while read -r stat; do emit "$head | $stat"; done
       done
     fi
@@ -937,16 +1037,23 @@ while :; do
   ')
   phone=${neighbour##*,count:}
   neigh=${neighbour%,count:*}
-  load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)
-  soc=na
-  for z in /sys/class/thermal/thermal_zone*; do
-    [ "$(cat $z/type 2>/dev/null)" = "soc-thmzone" ] && soc=$(awk '{printf "%.1f",$1/1000}' $z/temp 2>/dev/null)
+  # Activity needs a neighbour the kernel has heard from recently. A STALE entry outlives
+  # the phone by many minutes: parked with ignition off, three leftover entries kept the
+  # full sampler running at about two thirds of a core with no CarPlay at all (measured).
+  # A streaming phone is continually re-confirmed (REACHABLE/DELAY/PROBE), and while
+  # driving the ignition-plus-ZLink rule below applies regardless. phone stays the total.
+  fresh=0
+  for state in r d p; do
+    state_count=${neigh#*"$state":}; state_count=${state_count%%,*}
+    case "$state_count" in ''|*[!0-9]*) ;; *) fresh=$((fresh+state_count)) ;; esac
   done
+  load=; read -r load load_rest 2>/dev/null < /proc/loadavg
+  read_soc_temperature
   # Zlink CPU% over the interval from /proc/<pid>/stat (utime+stime, 100 ticks/s).
-  zpid=$(pidof com.zjinnova.zlink 2>/dev/null | cut -d' ' -f1)
+  zpid=$(pidof com.zjinnova.zlink 2>/dev/null); zpid=${zpid%% *}
   zcpu=na
   if [ -n "$zpid" ] && [ -r /proc/$zpid/stat ]; then
-    ticks=$(awk '{print $14+$15}' /proc/$zpid/stat 2>/dev/null)
+    ticks=$(process_ticks "$zpid")
     if [ "$prev_zpid" = "$zpid" ] && [ "$prev_t" -gt 0 ] && [ -n "$ticks" ] && [ "$ticks" -ge "$prev_ticks" ]; then
       dt=$((now-prev_t)); [ "$dt" -gt 0 ] && zcpu=$(( (ticks-prev_ticks) / dt ))
     fi
@@ -955,7 +1062,7 @@ while :; do
     prev_ticks=0; prev_t=0; prev_zpid=
   fi
   # Hotspot incoming bitrate (phone -> unit = the CarPlay picture).
-  rx=$(cat /sys/class/net/wlan2/statistics/rx_bytes 2>/dev/null)
+  rx=; read -r rx 2>/dev/null < /sys/class/net/wlan2/statistics/rx_bytes
   kbit=na
   if [ -n "$rx" ] && [ "$prev_rx_t" -gt 0 ] && [ "$rx" -ge "$prev_rx" ]; then
     rdt=$((now-prev_rx_t)); [ "$rdt" -gt 0 ] && kbit=$(( (rx-prev_rx)*8/rdt/1000 ))
@@ -965,19 +1072,35 @@ while :; do
   else
     prev_rx=0; prev_rx_t=0
   fi
-  sta=$(timeout 2 cmd wifi status 2>/dev/null | grep -oE 'Frequency: [0-9]+MHz|RSSI: -?[0-9]+' | head -2 | tr -d ' ' | tr '\n' '/' )
-  sta_mhz=$(echo "$sta" | sed -n 's/.*Frequency:\([0-9][0-9]*\)MHz.*/\1/p')
-  [ -n "$sta_mhz" ] || sta_mhz=na
-  ap=$(dumpsys -t 2 wifi 2>/dev/null | grep -oE 'wlan2=SoftApInfo\{[^}]*frequency= [0-9]+' | grep -oE '[0-9]+$' | head -1)
+  # The first two of these fields, spaces removed, '/'-joined: as grep|head|tr|tr made it.
+  sta=$(timeout 2 cmd wifi status 2>/dev/null | awk '{
+    line=$0
+    while(found<2 && match(line,/Frequency: [0-9]+MHz|RSSI: -?[0-9]+/)) {
+      part=substr(line,RSTART,RLENGTH);gsub(/ /,"",part);printf "%s/",part;found++
+      line=substr(line,RSTART+RLENGTH)
+    }
+  }')
+  sta_mhz=na
+  case "$sta" in *Frequency:*MHz*) sta_mhz=${sta##*Frequency:}; sta_mhz=${sta_mhz%%MHz*} ;; esac
+  case "$sta_mhz" in ''|*[!0-9]*) sta_mhz=na ;; esac
+  # The hotspot frequency is only in the full Wi-Fi dump: ~2 MB and ~0.5 s of system_server
+  # work, measured. It changes when the hotspot restarts, which also changes the neighbour
+  # table or the station channel, so read it then or every five minutes, not every pass.
+  if [ "${ap_checked:-0}" -eq 0 ] || [ $((now-ap_checked)) -ge 300 ] || [ $((now-ap_checked)) -lt 0 ] ||
+     [ "$phone" != "$prev_neigh" ] || [ "$sta_mhz" != "$prev_sta_mhz" ]; then
+    ap=$(dumpsys -t 2 wifi 2>/dev/null | grep -oE 'wlan2=SoftApInfo\{[^}]*frequency= [0-9]+' | grep -oE '[0-9]+$' | head -1)
+    ap_checked=$now
+  fi
   # What the hotspot link *lost*, not just what it carried. Dropped and errored frames on
   # the AP are the direct evidence of a link that stalled, which average bitrate cannot
   # show: measured across 234 samples rx_kbit correlates with late frames at r=-0.00, yet a
   # picture that visibly stutters is plainly losing something. Standard netdev counters, so
   # they are always present; the delta is what matters, not the total.
   drops=na
-  d_now=$(cat /sys/class/net/wlan2/statistics/tx_dropped 2>/dev/null)
-  e_now=$(cat /sys/class/net/wlan2/statistics/tx_errors 2>/dev/null)
-  r_now=$(cat /sys/class/net/wlan2/statistics/rx_dropped 2>/dev/null)
+  d_now=; e_now=; r_now=
+  read -r d_now 2>/dev/null < /sys/class/net/wlan2/statistics/tx_dropped
+  read -r e_now 2>/dev/null < /sys/class/net/wlan2/statistics/tx_errors
+  read -r r_now 2>/dev/null < /sys/class/net/wlan2/statistics/rx_dropped
   if [ -n "$d_now" ] && [ -n "$e_now" ] && [ -n "$r_now" ]; then
     total=$((d_now + e_now + r_now))
     # -1 until the first reading, because a healthy link legitimately sits at zero: using
@@ -995,10 +1118,10 @@ while :; do
   # column that will show it. Until it is recorded the question cannot be settled at all:
   # the logger polls whenever the engine runs and CarPlay samples exist only when the
   # engine runs, so the data collected so far has no contrast to correlate against.
-  opid=$(pidof com.dashcamstats.obdlogger 2>/dev/null | cut -d' ' -f1)
+  opid=$(pidof com.dashcamstats.obdlogger 2>/dev/null); opid=${opid%% *}
   ocpu=na
   if [ -n "$opid" ] && [ -r /proc/$opid/stat ]; then
-    oticks=$(awk '{print $14+$15}' /proc/$opid/stat 2>/dev/null)
+    oticks=$(process_ticks "$opid")
     if [ "$prev_opid" = "$opid" ] && [ "$prev_ot" -gt 0 ] && [ -n "$oticks" ] && [ "$oticks" -ge "$prev_oticks" ]; then
       odt=$((now-prev_ot)); [ "$odt" -gt 0 ] && ocpu=$(( (oticks-prev_oticks) / odt ))
     fi
@@ -1009,7 +1132,7 @@ while :; do
   bt=$(settings get global bluetooth_on 2>/dev/null)
   zlink_proc=0; [ -n "$zpid" ] && zlink_proc=1
   diag="schema=9"
-  if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
+  if [ "$fresh" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
     diagnostic_context
   fi
   head="session=$SESSION acc=$acc phone=$phone neigh_count=$phone neigh=$neigh load=$load soc=$soc zlink_proc=$zlink_proc zlink_cpu=$zcpu rx_kbit=$kbit ap_drops=$drops obd_cpu=$ocpu bt=${bt:-na} sta=$sta ap=${ap:-na} $diag $CODEC_TRACE_FIELDS"
@@ -1018,7 +1141,7 @@ while :; do
     CODEC_TRACE_POLICY_REPORTED=$CODEC_TRACE_ACTIVE
   fi
 
-  [ "$acc" = 1 ] || [ "$phone" -gt 0 ] && last_active=$now
+  [ "$acc" = 1 ] || [ "$fresh" -gt 0 ] && last_active=$now
   # First pass recovers retained summaries, then once/minute during activity and for
   # two minutes afterwards so decoder teardown records survive an offline departure.
   if { [ "$slow_last" -eq 0 ] || [ $((now-last_active)) -le 120 ]; } && [ $((now-slow_last)) -ge 60 ]; then
@@ -1039,7 +1162,7 @@ while :; do
   fi
   prev_neigh=$phone; prev_sta_mhz=$sta_mhz; prev_ap=${ap:-na}
 
-  if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
+  if [ "$fresh" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then
     # Preserve pressure/queue evidence even when no display layer is available.
     emit "$head | event=diagnostic_context"
     idle_n=0
@@ -1048,7 +1171,7 @@ while :; do
     # A heartbeat once a minute while no phone is attached: enough to prove it is alive.
     [ $((idle_n % 4)) -eq 1 ] && emit "$head | no phone on hotspot"
   fi
-  if [ "$phone" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then active=1; else active=0; fi
+  if [ "$fresh" -gt 0 ] || { [ "$acc" = 1 ] && [ -n "$zpid" ]; }; then active=1; else active=0; fi
   printf '%s\n%s\n%s\n' "$active" "$context_ms" "$head" > "$FRAME_CONTEXT.new"
   mv "$FRAME_CONTEXT.new" "$FRAME_CONTEXT"
   # Independent five-second codec windows, at most once/minute. These are local elapsed

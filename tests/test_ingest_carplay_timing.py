@@ -517,7 +517,7 @@ class TestTheScriptOnTheUnit:
         """
         script = self._script()
 
-        assert 'seen=$(cat "$mark" 2>/dev/null)' in script
+        assert 'seen=; read -r seen 2>/dev/null < "$mark"' in script
         assert "if (p[i] > seen+0)" in script
         # Written with an explicit integer format: these are nanosecond timestamps, and
         # awk's default output renders them in exponent form, which reads back as a

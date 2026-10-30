@@ -68,6 +68,32 @@ def test_ready_delay_excludes_overlapping_and_unavailable_fences():
     assert "ready_n=0 ready_p95=na ready_max=na" in unavailable
 
 
+@pytest.mark.parametrize("include_older_frame", [False, True])
+def test_single_new_frame_preserves_a_stall_without_inventing_cadence(include_older_frame):
+    previous, latest = 10_033_333_333, 16_033_333_333
+    rows = [f"0 {previous} {previous - 10_000_000}", f"0 {latest} {latest - 20_000_000}"]
+    if include_older_frame:
+        rows.insert(0, "0 10000000000 9990000000")
+    stats = surface_stats(rows, seen=previous)
+    sample = carplay_timing.parse_sample(datetime.now(UTC), "schema=9 | " + stats.strip())
+    assert sample is not None
+    assert sample["new_frames"] == 1
+    assert sample["span_s"] == 6.0
+    assert sample["max_ms"] == sample["median_ms"] == sample["p95_ms"] == 6000.0
+    assert sample["fps"] == 0.2
+    assert sample["ready_to_present_samples"] == 1
+    assert sample["ready_to_present_max_ms"] == 20.0
+    assert sample["late_pct"] is None
+    assert sample["hitches"] is None
+    assert sample["late_threshold_ms"] is None
+
+    # The interval belongs to exactly one poll; the next unchanged ring is an event.
+    repeated = surface_stats(rows, seen=latest)
+    message = "schema=9 | " + repeated.strip()
+    assert carplay_timing.parse_sample(datetime.now(UTC), message) is None
+    assert carplay_timing.parse_event(datetime.now(UTC), message)["kind"] == "surface_no_new_frames"
+
+
 def test_socket_summary_filters_uid_and_never_emits_addresses():
     match = re.search(r'awk -v uid="\$uid" \'(.*?)\'\)', carplay_timing.script(), re.S)
     assert match
@@ -322,9 +348,20 @@ def test_surface_queue_requires_exact_package_buffer_layer():
 
 
 def test_deadline_subtracts_work_and_skips_overruns_without_catchup_burst():
-    program = re.search(r"awk -v deadline=.*?\'(.*?)\'", carplay_timing.script(), re.S)[1]
-    assert run_awk(program, "", deadline=1000, current=1400, step=3000) == "4000 2.600"
-    assert run_awk(program, "", deadline=4000, current=7800, step=3000) == "10000 2.200"
+    sh = shutil.which("sh") or r"C:\Program Files\Git\usr\bin\sh.exe"
+    if not Path(sh).exists():
+        pytest.skip("sh is unavailable")
+    source = carplay_timing.script()
+    delay = source[source.index("deadline_delay() {") : source.index("\ncleanup() {")]
+
+    def run(*args):
+        command = delay + "\ndeadline_delay " + " ".join(str(arg) for arg in args) + "\n"
+        result = subprocess.run([sh, "-s"], input=command, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    assert run(1000, 1400, 3000) == "4000 2.600"
+    assert run(4000, 7800, 3000) == "10000 2.200"
 
 
 def test_ring_without_overlap_reports_unobserved_interval():
