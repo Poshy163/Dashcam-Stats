@@ -16,6 +16,19 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 | Poll plan | The existing trial OFF choice, revision 1 and no fallback reason were preserved. The next drive used the baseline plan; it does not validate the three-second trial. No automatic re-arm was performed. |
 | Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, permissions, folder access, stored drive identity and original OFF bounds survived. Both camera files advanced and temperature history continued. Parked indexing resumed after ingestion, and automatic backups completed with verified radio restoration. Restart evidence records `package_update` on the same kernel boot; no physical reboot test was performed. The subsequent server/helper workspace recovery was verified on 28 October, as described below. |
 
+## Candidate 0.3.23: balanced BLE interval (built, not installed)
+
+Source `bed288df504e5d0071e47c24eaafd837490d5f97`, `versionCode` 36. The adapter's BLE link
+requests `CONNECTION_PRIORITY_BALANCED` (30-50 ms) instead of `HIGH` (~11-15 ms), so the
+head unit's shared Marlin3 Lite Wi-Fi/Bluetooth radio services the adapter about three
+times less often and leaves airtime for the CarPlay hotspot. No schema, database or status
+change. Production-signed in the cirruslabs SDK 35 container on 30 October: APK SHA-256
+`c9cc7f8dcc99c6ab1d34c60ba5ea5ea79b531eb95ea0101a4c42b717946a59d0`, signer
+`e9191adb8f04a7117d71763c5e1332e7c0e4639a63afa09aef9c9bb1684d408d` (unchanged), 451 unit
+tests passed. Mount the whole repository for container builds: two tests read
+`tests/fixtures/obd_poll_plan_v8_calculations.json` from the repo root. Install and verify
+when the unit is next online and parked; then judge it on a warm daytime drive.
+
 ## Server/helper update: CarPlay diagnostic workload
 
 The 29 October follow-up reduces diagnostic work during normal driving without
