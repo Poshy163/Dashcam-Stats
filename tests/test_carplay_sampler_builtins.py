@@ -91,6 +91,7 @@ def test_deadline_delay_waits_correctly_across_the_32_bit_boundary(shell_name):
     [
         ("271937.30 100294.41", "271937300"),
         ("0.05 0.00", "50"),
+        ("0.00 0.00", "0"),  # leading zeros dropped without base# (not POSIX: dash)
         ("12.3 0", "12300"),
         ("5 0", "5000"),
         ("3000000.99 1.00", "3000000990"),  # beyond 32 bits: concatenated, not computed

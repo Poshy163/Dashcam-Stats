@@ -103,7 +103,12 @@ clock_ms() {
   clock_frac=${clock_frac}000; clock_frac=${clock_frac%"${clock_frac#???}"}
   case "$clock_s" in ''|*[!0-9]*) return;; esac
   case "$clock_frac" in *[!0-9]*) return;; esac
-  if [ "$clock_s" = 0 ]; then echo $((10#$clock_frac)); else echo "$clock_s$clock_frac"; fi
+  # Under one second, drop leading zeros by pattern: base# arithmetic is not POSIX (dash).
+  if [ "$clock_s" = 0 ]; then
+    clock_frac=${clock_frac#0}; clock_frac=${clock_frac#0}; echo "$clock_frac"
+  else
+    echo "$clock_s$clock_frac"
+  fi
 }
 stop_codec_worker() {
   # A lease signal may interrupt the fork/start-time publication below. Let that
