@@ -29,6 +29,22 @@ class ElmCommandRejectedException(message: String) : ElmException(message)
 data class DtcQueryResult(val codes: List<String>, val status: String)
 
 /**
+ * Connection interval requested for the adapter's BLE link.
+ *
+ * HIGH (about 11-15 ms) made the head unit's radio service this link roughly 70-90 times a
+ * second for the whole drive. That radio is the integrated Marlin3 Lite Wi-Fi/Bluetooth/GNSS
+ * subsystem, which also hosts the 5 GHz hotspot that carries wireless CarPlay video at
+ * 17-21 Mbit/s, so every connection event is airtime taken from that stream. BALANCED
+ * (30-50 ms) cuts those events roughly threefold. Command time is dominated by the ECU and the
+ * adapter's UART (about 690 ms per command, measured); the poll scheduler already budgets
+ * optional PIDs from observed command durations, so a slightly slower write/notify round trip
+ * only trims optional reads rather than causing timeouts (6 s per command).
+ */
+internal object ElmBleLinkPolicy {
+    const val CONNECTION_PRIORITY = BluetoothGatt.CONNECTION_PRIORITY_BALANCED
+}
+
+/**
  * Keep the parked gate adapter-local.  In particular, do not reset/configure the ELM or send a
  * Mode 01 request until the cheap voltage probe says the engine-on threshold may have been met.
  */
@@ -121,11 +137,11 @@ class ElmBleClient(
                 connection?.completeExceptionally(ElmException("could not start GATT discovery"))
             } else if (newState == BluetoothProfile.STATE_CONNECTED) {
                 gattConnected = true
-                // Advisory only: the cheap UART bridge still owns the real serial throughput,
-                // but a shorter BLE connection interval reduces avoidable fragment/write delay.
+                // Advisory only: the cheap UART bridge owns the real serial throughput. BALANCED
+                // leaves radio airtime for the CarPlay hotspot; see ElmBleLinkPolicy.
                 // Failure is harmless and must not invalidate an otherwise usable GATT link.
                 runCatching {
-                    gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                    gatt.requestConnectionPriority(ElmBleLinkPolicy.CONNECTION_PRIORITY)
                 }
                 metrics.gattConnectionEstablished()
             }
