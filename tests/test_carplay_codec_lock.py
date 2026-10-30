@@ -19,7 +19,9 @@ from app.ingest import carplay_timing
 SOURCE = (Path(__file__).resolve().parents[1] / "backend/app/ingest/carplay_codec.sh").read_text()
 
 
-def wait_for(predicate, seconds=5):
+def wait_for(predicate, seconds=20):
+    # Returns as soon as the checkpoint appears; the bound only decides when a busy
+    # shared runner counts as a hung fixture. 5 s failed CI (mksh-directory) on 30 Oct.
     deadline = time.monotonic() + seconds
     while True:
         value = predicate()
