@@ -214,6 +214,7 @@ _tasks: set[asyncio.Task] = set()
 _last_refresh: dict[str, float] = {}
 _tasks_by_address: dict[str, asyncio.Task[None]] = {}
 _pending_arrivals: set[str] = set()
+_arrival_requests: dict[str, tuple[object, tuple[tuple[str, str], ...], str]] = {}
 _needs_collection: set[str] = set()
 _shutting_down = False
 _READ_COMPLETE = "__DASHCAM_UNIT_LOG_READ_COMPLETE_V1__"
@@ -872,7 +873,11 @@ def _task_finished(address: str, task: asyncio.Task[None]) -> None:
         )
     if owns_address and address in _pending_arrivals and not _shutting_down:
         _pending_arrivals.discard(address)
-        on_unit_seen(address)
+        # The queued request already passed visit/config coalescing. Starting it
+        # directly preserves a newer arrival behind an older in-flight operation.
+        if _enabled():
+            _last_refresh[address] = time.monotonic()
+            _start_task(address, arrival=True)
 
 
 def _busy(address: str) -> bool:
@@ -890,10 +895,31 @@ def _start_task(address: str, *, arrival: bool) -> None:
     task.add_done_callback(lambda finished: _task_finished(address, finished))
 
 
-def on_unit_seen(address: str) -> None:
-    """The car has just arrived: drain what it recorded away, then start a fresh capture."""
+def on_unit_seen(address: str, *, visit_token: object | None = None) -> None:
+    """Collect/rearm once per visit and policy, even while the arrival gate holds.
+
+    The poller's online flag stays false until the uptime gate releases, so its
+    arrival callback can repeat every few seconds. A real disconnect or reboot has
+    a new token and is never suppressed by a time debounce. Legacy callers without
+    a token retain the explicit-arrival behavior.
+    """
     if _shutting_down or not _enabled():
         return
+    if visit_token is not None:
+        try:
+            request = (visit_token, tuple(sorted(writer_levels().items())), capture_command())
+        except ValueError:
+            # Let the existing background reconciliation report an invalid policy;
+            # fingerprinting must not turn it into a poller/visit failure.
+            pass
+        else:
+            if _arrival_requests.get(address) == request:
+                # Repeated held ticks are also a retry opportunity if collection or
+                # rearming failed. Reuse the bounded presence path; success stays quiet.
+                if address in _needs_collection:
+                    on_unit_present(address)
+                return
+            _arrival_requests[address] = request
     if _busy(address):
         _pending_arrivals.add(address)
         return
@@ -921,6 +947,7 @@ async def shutdown() -> None:
     global _shutting_down
     _shutting_down = True
     _pending_arrivals.clear()
+    _arrival_requests.clear()
     try:
         tasks = list(_tasks)
         for task in tasks:

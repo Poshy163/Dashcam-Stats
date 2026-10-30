@@ -570,7 +570,8 @@ class IngestPoller:
                         health.on_unit_seen(info.address, info.source)
                         # Same arrival moment, same reason: drain the vendor log the
                         # unit wrote while it was away, then start a fresh capture.
-                        unit_logs.on_unit_seen(info.address)
+                        # Held uptime ticks share this token; disconnect/reboot resets it.
+                        unit_logs.on_unit_seen(info.address, visit_token=self._backup_visit_token)
                         band.on_unit_present(info.address)
                         # The arrival gate: hold the first pull until the unit has been
                         # running long enough to be arriving rather than leaving. A hold

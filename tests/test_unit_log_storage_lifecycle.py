@@ -148,6 +148,7 @@ def isolated_tasks(monkeypatch):
     monkeypatch.setattr(unit_logs, "_last_refresh", {})
     monkeypatch.setattr(unit_logs, "_tasks_by_address", {})
     monkeypatch.setattr(unit_logs, "_pending_arrivals", set())
+    monkeypatch.setattr(unit_logs, "_arrival_requests", {})
     monkeypatch.setattr(unit_logs, "_needs_collection", set())
     monkeypatch.setattr(unit_logs, "_shutting_down", False)
 
@@ -213,6 +214,135 @@ async def test_slow_refresh_cannot_accumulate_tasks_or_lose_a_queued_arrival(
     for _ in range(4):
         await asyncio.sleep(0)
     assert refresh.await_count == arrival.await_count == 1
+    await unit_logs.shutdown()
+
+
+async def test_repeated_held_arrival_ticks_do_not_reconcile_or_restart_capture(
+    monkeypatch, isolated_tasks
+):
+    collect, arm = AsyncMock(return_value=(1, 0)), AsyncMock(return_value=True)
+    monkeypatch.setattr(unit_logs, "collect", collect)
+    monkeypatch.setattr(unit_logs, "arm", arm)
+    visit = object()
+    for _ in range(5):
+        unit_logs.on_unit_seen("unit", visit_token=visit)
+        if unit_logs._tasks:
+            await asyncio.wait(tuple(unit_logs._tasks), timeout=1)
+        await asyncio.sleep(0)
+    assert collect.await_count == arm.await_count == 1
+    await unit_logs.shutdown()
+
+
+async def test_inflight_arrival_coalesces_held_ticks_and_preserves_latest_new_visit(
+    monkeypatch, isolated_tasks
+):
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def collect(_address):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+        return 1, 0
+
+    arm = AsyncMock(return_value=True)
+    monkeypatch.setattr(unit_logs, "collect", collect)
+    monkeypatch.setattr(unit_logs, "arm", arm)
+    initial, middle, latest = object(), object(), object()
+    unit_logs.on_unit_seen("unit", visit_token=initial)
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    for _ in range(5):
+        unit_logs.on_unit_seen("unit", visit_token=initial)
+    assert not unit_logs._pending_arrivals
+    for visit in (middle, latest, latest):
+        unit_logs.on_unit_seen("unit", visit_token=visit)
+    assert len(unit_logs._tasks) == 1
+    assert unit_logs._pending_arrivals == {"unit"}
+    assert unit_logs._arrival_requests["unit"][0] is latest
+    release.set()
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert calls == arm.await_count == 2
+    assert not unit_logs._tasks and not unit_logs._pending_arrivals
+    unit_logs.on_unit_seen("unit", visit_token=latest)
+    assert not unit_logs._tasks
+    await unit_logs.shutdown()
+
+
+async def test_quick_reconnect_policy_change_and_distinct_addresses_are_not_suppressed(
+    monkeypatch, isolated_tasks
+):
+    collect, arm = AsyncMock(return_value=(1, 0)), AsyncMock(return_value=True)
+    levels = {"WindowManager": "F"}
+    monkeypatch.setattr(unit_logs, "collect", collect)
+    monkeypatch.setattr(unit_logs, "arm", arm)
+    monkeypatch.setattr(unit_logs, "writer_levels", lambda: levels)
+    monkeypatch.setattr(unit_logs, "capture_command", lambda: "capture")
+
+    async def arrival(address, visit):
+        unit_logs.on_unit_seen(address, visit_token=visit)
+        await asyncio.wait(tuple(unit_logs._tasks), timeout=1)
+        await asyncio.sleep(0)
+
+    first, second = object(), object()
+    await arrival("unit", first)
+    await arrival("unit", second)  # No elapsed debounce period or delay is required.
+    levels["WindowManager"] = "E"
+    await arrival("unit", second)
+    await arrival("other-unit", second)
+    assert [call.args[0] for call in arm.await_args_list] == ["unit", "unit", "unit", "other-unit"]
+    assert collect.await_count == 4
+    await unit_logs.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["collect", "arm"])
+async def test_failed_arrival_retries_on_bounded_presence_without_repeated_held_rearms(
+    monkeypatch, isolated_tasks, failure
+):
+    now = [1000.0]
+    collect = AsyncMock(
+        side_effect=[RuntimeError("import failed"), (1, 0)] if failure == "collect" else None,
+        return_value=(1, 0),
+    )
+    arm = AsyncMock(side_effect=[False, True] if failure == "arm" else None, return_value=True)
+    monkeypatch.setattr(unit_logs, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(unit_logs, "collect", collect)
+    monkeypatch.setattr(unit_logs, "arm", arm)
+    visit = object()
+    unit_logs.on_unit_seen("unit", visit_token=visit)
+    await asyncio.wait(tuple(unit_logs._tasks), timeout=1)
+    await asyncio.sleep(0)
+    assert "unit" in unit_logs._needs_collection
+    for _ in range(5):
+        unit_logs.on_unit_seen("unit", visit_token=visit)
+    assert not unit_logs._tasks
+    now[0] += unit_logs.REFRESH_S - 1
+    unit_logs.on_unit_seen("unit", visit_token=visit)
+    assert not unit_logs._tasks
+    now[0] += 1
+    unit_logs.on_unit_seen("unit", visit_token=visit)
+    assert unit_logs._tasks
+    await asyncio.wait(tuple(unit_logs._tasks), timeout=1)
+    await asyncio.sleep(0)
+    assert collect.await_count == 2
+    assert arm.await_count == (1 if failure == "collect" else 2)
+    assert "unit" not in unit_logs._needs_collection
+    await unit_logs.shutdown()
+
+
+async def test_invalid_policy_fingerprint_does_not_fail_the_poller(monkeypatch, isolated_tasks):
+    def invalid_levels():
+        raise ValueError("too many managed unit-log tags")
+
+    monkeypatch.setattr(unit_logs, "writer_levels", invalid_levels)
+    monkeypatch.setattr(unit_logs, "collect", AsyncMock(return_value=(0, 0)))
+    monkeypatch.setattr(unit_logs, "arm", AsyncMock(return_value=False))
+    unit_logs.on_unit_seen("unit", visit_token=object())
+    await asyncio.wait(tuple(unit_logs._tasks), timeout=1)
+    await asyncio.sleep(0)
+    assert "unit" in unit_logs._needs_collection
     await unit_logs.shutdown()
 
 
