@@ -702,6 +702,9 @@ def test_same_comm_exec_with_changed_argv_is_not_an_absence_proof(capture):
 @pytest.mark.parametrize("directory_mode", [0o777, 0o700])
 def test_real_legacy_modes_and_interrupted_tightening_recover(capture, directory_mode):
     capture.legacy(directory_mode=directory_mode)
+    # These cases test the workspace tree, not helper discovery. On a shared runner a
+    # same-UID process exec'ing mid-scan ends the real /proc scan early (31 Oct CI).
+    capture.synthetic_proc(1)
     row = capture.run()
     assert row["codec_lock_status"] == "recovered_malformed_owner"
     assert row["codec_capture_status"] == "ok"
@@ -730,6 +733,7 @@ def test_legacy_migration_never_normalizes_an_unsafe_tree(capture, case):
     elif case == "many_members":
         for index in range(32):
             (capture.lock / f"summary-1-{index}").write_text("preserve")
+    capture.synthetic_proc(1)  # A quiet /proc: see the recovery test above.
     before = capture.lock.stat().st_mode
     row = capture.run()
     assert row["codec_lock_status"] in {"unsafe_workspace", "recovery_failed"}
