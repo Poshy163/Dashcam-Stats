@@ -335,13 +335,25 @@ async def _await_quieting_evidence(address: str, logger_status: dict | None) -> 
 _NATIVE_WINDOW_END_MESSAGE = (
     "The native sleep window is ending; remaining footage stays on the card."
 )
+_IGNITION_ON_MESSAGE = (
+    "The ignition came on, so the backup stopped and gave Bluetooth and the hotspot back; "
+    "remaining footage stays on the card."
+)
+# Both are orderly, retryable ends of a window, classified identically.
+_ORDERLY_END_MESSAGES = frozenset({_NATIVE_WINDOW_END_MESSAGE, _IGNITION_ON_MESSAGE})
+
+
+def _orderly_end_message(error: object) -> str:
+    if isinstance(error, radio_coordinator.RadioIgnitionOn):
+        return _IGNITION_ON_MESSAGE
+    return _NATIVE_WINDOW_END_MESSAGE
 
 
 def _cancel_for_radio_stop(error: object) -> None:
     expected_end = isinstance(error, radio_coordinator.RadioWindowEnding)
     get_status().cancel(
         reason="native_sleep_window_ending" if expected_end else "radio_safety_lease_lost",
-        detail=_NATIVE_WINDOW_END_MESSAGE if expected_end else redact(error) if error else None,
+        detail=_orderly_end_message(error) if expected_end else redact(error) if error else None,
     )
 
 
@@ -364,7 +376,7 @@ def _classify_cancellation(result: RunResult) -> RunResult:
             None,
             "backup cancelled",
             "the transfer was cancelled",
-            _NATIVE_WINDOW_END_MESSAGE,
+            *_ORDERLY_END_MESSAGES,
         }
         result.state = (
             RunState.PARTIAL
@@ -374,7 +386,11 @@ def _classify_cancellation(result: RunResult) -> RunResult:
             else RunState.ERROR
         )
         if expected:
-            result.error = _NATIVE_WINDOW_END_MESSAGE
+            result.error = (
+                status.cancel_detail
+                if status.cancel_detail in _ORDERLY_END_MESSAGES
+                else _NATIVE_WINDOW_END_MESSAGE
+            )
         return result
     if (
         status.cancel_event.is_set()
@@ -2599,6 +2615,9 @@ async def _run_pull_started(
                     watchdog_deadline_s=int(_get("listen_timeout_s", 180)) * 2 + 120,
                     allow_zlink_rearm=bool(_get("zlink_hotspot_rearm", False)),
                     lease_loss_callback=cancel_for_radio_lease_loss,
+                    # Same policy as the start gate: a parked-only backup yields the
+                    # radios to CarPlay and the OBD logger the moment the driver is back.
+                    stop_on_ignition=bool(_get("only_when_parked", True)),
                 )
             except radio_coordinator.TransitionBusy as exc:
                 # A second process must not inventory/copy/delete the same card while the
@@ -2807,7 +2826,7 @@ async def _run_pull_started(
                     "could not safely quiet radios; restoring before transfer", error=redact(exc)
                 )
                 reason = (
-                    _NATIVE_WINDOW_END_MESSAGE
+                    _orderly_end_message(exc)
                     if window_ending
                     else status.radio_quieting_hold_reason or str(exc)
                 )
@@ -3250,11 +3269,14 @@ async def _run_pull_started(
         result.state = RunState.CANCELLED
         result.error = "backup cancelled"
         raise
-    except radio_coordinator.RadioWindowEnding:
-        interrupted_error = _NATIVE_WINDOW_END_MESSAGE
+    except radio_coordinator.RadioWindowEnding as exc:
+        interrupted_error = _orderly_end_message(exc)
         result = RunResult(state=RunState.ERROR, error=interrupted_error)
         status.cancel(reason="native_sleep_window_ending", detail=interrupted_error)
-        log.info("ending the pull before native sleep; preserving remaining footage")
+        if isinstance(exc, radio_coordinator.RadioIgnitionOn):
+            log.info("ending the pull because the ignition came on; preserving remaining footage")
+        else:
+            log.info("ending the pull before native sleep; preserving remaining footage")
     except adb.AdbError as exc:
         interrupted_error = redact(exc)
         result = RunResult(state=RunState.ERROR, error=interrupted_error)
@@ -3297,7 +3319,8 @@ async def _run_pull_started(
                 if interrupted_error is not None:
                     interrupted_error = f"{interrupted_error}; {detail}"
                 else:
-                    result.error = f"{result.error or _NATIVE_WINDOW_END_MESSAGE}; {detail}"
+                    orderly = status.cancel_detail or _NATIVE_WINDOW_END_MESSAGE
+                    result.error = f"{result.error or orderly}; {detail}"
                     result.state = (
                         RunState.PARTIAL if result.files or result.bytes else RunState.ERROR
                     )

@@ -50,6 +50,11 @@ LOGGER_QUIESCE_HEADROOM_S = 90.0
 LOGGER_RADIO_RECOVERY_MARGIN_S = 30.0
 MAX_WATCHDOG_DEADLINE_S = 480
 PROCESS_FENCE_NAME = ".ingest-radio-transition.lock"
+# How often a quieted backup re-reads the ignition. The car can leave home Wi-Fi about
+# ten seconds after the engine starts (3 Nov: 11 s), and the radios have to be handed
+# back while the unit is still reachable, so this is much tighter than the heartbeat.
+IGNITION_POLL_S = 3.0
+IGNITION_PROBE_TIMEOUT_S = 3.0
 
 
 class TransitionPhase(StrEnum):
@@ -86,6 +91,21 @@ class RadioWindowEnding(RadioTransitionError):
         super().__init__("native sleep deadline is ending the backup window")
 
 
+class RadioIgnitionOn(RadioWindowEnding):
+    """The driver is back: hand the radios back now instead of finishing the backlog.
+
+    An orderly stop exactly like a closing sleep window -- committed files are kept, the
+    rest stays on the card, and restoration must still pass every baseline check -- but
+    its cause is the ACC line reading on while a backup holds Bluetooth and the hotspot.
+    """
+
+    reason_code = "ignition_on"
+
+    def __init__(self) -> None:
+        self.recovery_state = "ignition_on"
+        RadioTransitionError.__init__(self, "the ignition came on during the backup")
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -115,7 +135,10 @@ class RadioTransition:
     process_fence: ProcessFileLock = field(repr=False)
     allow_zlink_rearm: bool = False
     lease_loss_callback: Callable[[], object] | None = field(default=None, repr=False)
+    #: Stop the backup and restore the radios as soon as the ignition reads on.
+    stop_on_ignition: bool = False
     _heartbeat_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _ignition_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _restore_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _logger_control_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _restore_result: bool | None = field(default=None, repr=False)
@@ -216,6 +239,30 @@ class RadioTransition:
             self._heartbeat_task = asyncio.create_task(
                 self._heartbeat_loop(), name=f"ingest-radio-lease-{self.transition_id}"
             )
+        if self.stop_on_ignition and self._ignition_task is None:
+            self._ignition_task = asyncio.create_task(
+                self._ignition_loop(), name=f"ingest-radio-ignition-{self.transition_id}"
+            )
+
+    async def _ignition_loop(self) -> None:
+        """Give the radios back the moment the driver returns.
+
+        The ignition gate only admits a backup while the car is off, but nothing else
+        noticed the driver coming back: the copy kept Bluetooth and the hotspot off until
+        the backlog or the radio lease ran out, so CarPlay and the OBD logger started the
+        drive without them (3 Nov: the logger missed the first 10.5 minutes). The stop
+        reuses the orderly window-ending path, so restoration and the logger's release run
+        as they do at every other end of a backup. An unreadable ACC line is not "on".
+        """
+        while not self._closed and not self.lease_lost:
+            await asyncio.sleep(IGNITION_POLL_S)
+            if self._closed or self.lease_lost:
+                return
+            state = await adb.ignition_state(self.address, timeout=IGNITION_PROBE_TIMEOUT_S)
+            if state == "on" and not self._closed:
+                log.info("the ignition came on during a backup; handing the radios back")
+                self._signal_lease_loss(RadioIgnitionOn())
+                return
 
     async def _heartbeat_loop(self) -> None:
         while not self._closed:
@@ -895,11 +942,13 @@ class RadioTransition:
         await self.close()
 
     async def _stop_heartbeat(self) -> None:
-        task, self._heartbeat_task = self._heartbeat_task, None
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+        tasks = (self._heartbeat_task, self._ignition_task)
+        self._heartbeat_task = self._ignition_task = None
+        for task in tasks:
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
 
     async def close(self) -> None:
         if self._closed:
@@ -952,6 +1001,7 @@ async def begin(
     watchdog_deadline_s: int,
     allow_zlink_rearm: bool = False,
     lease_loss_callback: Callable[[], object] | None = None,
+    stop_on_ignition: bool = False,
 ) -> RadioTransition:
     """Atomically claim the only active transition across all server processes."""
     if not radios.new_quieting_allowed():
@@ -1024,6 +1074,7 @@ async def begin(
         process_fence=process_fence,
         allow_zlink_rearm=allow_zlink_rearm,
         lease_loss_callback=lease_loss_callback,
+        stop_on_ignition=stop_on_ignition,
         _lease_valid_until=lease_started + LEASE_TTL_S,
     )
     transition.start_heartbeat()
