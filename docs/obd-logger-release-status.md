@@ -8,15 +8,42 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.22** (`versionCode` 35), installed in place on 28 October 2026 |
-| Source | `57c95731a81a2c2066833bc0ecc9b2d20fc22e7b` (`android/obd-logger/`), verified in the running companion, installed APK readback and matching deployed server |
+| Version | **0.3.23** (`versionCode` 36), installed in place on 30 October 2026 (0.3.24 built; see below) |
+| Source | `bed288df504e5d0071e47c24eaafd837490d5f97` (`android/obd-logger/`); installed APK SHA-256, version and production signer verified on 30 October (release record `release-record-0.3.23.txt`). 0.3.22 came from `57c95731a81a2c2066833bc0ecc9b2d20fc22e7b`. |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
 | Poll plan | The existing trial OFF choice, revision 1 and no fallback reason were preserved. The next drive used the baseline plan; it does not validate the three-second trial. No automatic re-arm was performed. |
 | Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, permissions, folder access, stored drive identity and original OFF bounds survived. Both camera files advanced and temperature history continued. Parked indexing resumed after ingestion, and automatic backups completed with verified radio restoration. Restart evidence records `package_update` on the same kernel boot; no physical reboot test was performed. The subsequent server/helper workspace recovery was verified on 28 October, as described below. |
 
-## Candidate 0.3.23: balanced BLE interval (built, not installed)
+## Candidate 0.3.24: Bluetooth-ready start and ignition release (built, install pending)
+
+Source `5d5646f0ba31646cfc563a018165d78dc6b71212`, `versionCode` 37. Two start-up changes for
+the head unit's shared Bluetooth/Wi-Fi radio, both found on 6 November:
+
+- **Wait for Bluetooth.** Every start from sleep woke the connection loop several times while
+  the adapter was still off, and each wake fired an attempt that failed within a millisecond
+  (three per start; backups that switch Bluetooth off added over a hundred a day). The loop now
+  waits for Bluetooth to be on and, after an observed off-to-on transition, waits a 12 s settle
+  so the iPhone's CarPlay Bluetooth handshake (10 s after Bluetooth on) is not sharing the radio
+  with the adapter's connect and ELM/ECU setup burst. Bluetooth already on connects at once;
+  backup requests still preempt the wait. Cost: the drive's OBD log starts about 8 s later.
+- **Yield a backup pause to the ignition.** A pause the logger had acknowledged is released as
+  soon as the 5-second ACC read shows the ignition on: one failed reply, the lingering request is
+  treated as absent everywhere, and the logger reconnects. On 3 November the pause outlived the
+  backup and the logger missed the first 10.5 minutes of the drive. A request first seen with the
+  ignition on is honoured. The server side (`b3eb9c7`) stops a parked backup within 3 s of the
+  ignition coming on.
+
+Events use existing codes only (`ingest.handoff resumed acc_on`, `obd.ble_connection skipped
+bluetooth_off`); no schema, database or status-file change. Production-signed in the cirruslabs
+SDK 35 container on 6 November: APK SHA-256
+`313c392067494a39ca0c8b32e6a350dae7af46d8ce2de96a981e3a3db1f89972`, signer
+`e9191adb8f04a7117d71763c5e1332e7c0e4639a63afa09aef9c9bb1684d408d` (unchanged), 461 unit tests
+passed including `StartupRadioPoliciesTest`. Install when the unit is online, parked, the server
+idle and no ingestion request present.
+
+## 0.3.23 installed: balanced BLE interval
 
 Source `bed288df504e5d0071e47c24eaafd837490d5f97`, `versionCode` 36. The adapter's BLE link
 requests `CONNECTION_PRIORITY_BALANCED` (30-50 ms) instead of `HIGH` (~11-15 ms), so the
@@ -27,7 +54,9 @@ change. Production-signed in the cirruslabs SDK 35 container on 30 October: APK 
 `e9191adb8f04a7117d71763c5e1332e7c0e4639a63afa09aef9c9bb1684d408d` (unchanged), 451 unit
 tests passed. Mount the whole repository for container builds: two tests read
 `tests/fixtures/obd_poll_plan_v8_calculations.json` from the repo root. Install and verify
-when the unit is next online and parked; then judge it on a warm daytime drive.
+when the unit is next online and parked; then judge it on a warm daytime drive. Installed and
+verified in place on 30 October (22:45 local); the next daytime drive still lagged, so BLE airtime
+was not the deciding factor.
 
 ## Server/helper update: CarPlay diagnostic workload
 
