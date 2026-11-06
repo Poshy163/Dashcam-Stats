@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -88,18 +89,29 @@ class ObdLoggerService : Service() {
     private var movementVisibleLaunch = false
     private val movementLifecycleLock = Any()
     private var movementStopping = false
+    private val bluetoothGate = BluetoothReadinessGate()
+    private val ignitionPauseRelease = IgnitionPauseRelease()
+    @Volatile
+    private var bluetoothWaitAnnounced = false
+    @Volatile
+    private var pauseReleasedByIgnition = false
+    @Volatile
+    private var ignitionOnObserved: Boolean? = null
 
     private val retryWakeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val reason = when (intent.action) {
                 BluetoothAdapter.ACTION_STATE_CHANGED -> {
-                    if (
-                        intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR) ==
-                        BluetoothAdapter.STATE_ON
-                    ) {
-                        LoggerWakeReason.BLUETOOTH_ON
-                    } else {
-                        null
+                    when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                        BluetoothAdapter.STATE_ON -> {
+                            bluetoothGate.observe(true, SystemClock.elapsedRealtime())
+                            LoggerWakeReason.BLUETOOTH_ON
+                        }
+                        BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_TURNING_OFF -> {
+                            bluetoothGate.observe(false, SystemClock.elapsedRealtime())
+                            null
+                        }
+                        else -> null
                     }
                 }
                 Intent.ACTION_SCREEN_ON -> LoggerWakeReason.SCREEN_ON
@@ -400,31 +412,58 @@ class ObdLoggerService : Service() {
                     }
                     when (val requestRead = readIngestionRequest(deviceRoot)) {
                         IngestionRequestRead.Absent -> {
-                            val resumed = IngestionQuiesceFiles.clearAcknowledgement(deviceRoot)
+                            // A request released for the ignition still exists on disk; keep
+                            // the "failed" reply visible to the server until it is withdrawn.
+                            val resumed = !pauseReleasedByIgnition &&
+                                IngestionQuiesceFiles.clearAcknowledgement(deviceRoot)
                             ingestionRequestId = null
                             if (resumed) {
                                 emitEvent("ingest.handoff", "info", "resumed", "resume_completed")
                                 publish("parked", loadedConfig)
                             }
-                            val reconnecting = reconnectAttempts.nextAttemptIsReconnect()
-                            try {
-                                runOneConnection(
-                                    loadedConfig,
-                                    deviceRoot,
-                                    reconnecting,
-                                    onEcuProof = {
-                                        connectionRetry.progressConfirmed()
-                                        clearRetryWakeSignals()
-                                    },
-                                )
-                            } catch (error: Exception) {
-                                if (error !is CancellationException) {
-                                    reconnectAttempts.connectionFailed()
+                            val bluetoothWait = bluetoothGate.delayBeforeConnect(
+                                bluetoothAdapterOn(),
+                                SystemClock.elapsedRealtime(),
+                            )
+                            if (bluetoothWait == null) {
+                                // Off: wait for the STATE_ON broadcast (it wakes this delay)
+                                // instead of failing a connection attempt every few seconds.
+                                if (!bluetoothWaitAnnounced) {
+                                    bluetoothWaitAnnounced = true
+                                    emitEvent("obd.ble_connection", "info", "skipped", "bluetooth_off")
                                 }
-                                throw error
+                                updateNotification("Waiting for Bluetooth")
+                                retryDelayMillis = 30_000
+                                // A backup's request must still be acknowledged promptly.
+                                retryDeviceRoot = deviceRoot
+                                retryMayBePreemptedByIngestion = true
+                            } else if (bluetoothWait > 0) {
+                                updateNotification("Waiting for Bluetooth to settle")
+                                retryDelayMillis = bluetoothWait
+                                retryDeviceRoot = deviceRoot
+                                retryMayBePreemptedByIngestion = true
+                            } else {
+                                bluetoothWaitAnnounced = false
+                                val reconnecting = reconnectAttempts.nextAttemptIsReconnect()
+                                try {
+                                    runOneConnection(
+                                        loadedConfig,
+                                        deviceRoot,
+                                        reconnecting,
+                                        onEcuProof = {
+                                            connectionRetry.progressConfirmed()
+                                            clearRetryWakeSignals()
+                                        },
+                                    )
+                                } catch (error: Exception) {
+                                    if (error !is CancellationException) {
+                                        reconnectAttempts.connectionFailed()
+                                    }
+                                    throw error
+                                }
+                                startupRecoveredDrive = null
+                                connectionRetry.progressConfirmed()
                             }
-                            startupRecoveredDrive = null
-                            connectionRetry.progressConfirmed()
                         }
                         is IngestionRequestRead.Invalid -> {
                             ingestionRequestId = null
@@ -1531,11 +1570,47 @@ class ObdLoggerService : Service() {
             it is IngestionRequestRead.Absent
         }
 
-    private fun readIngestionRequest(deviceRoot: File, cleanupAbsentMarkers: Boolean = true): IngestionRequestRead =
-        IngestionQuiesceFiles.readRequest(deviceRoot, cleanupAbsentMarkers = cleanupAbsentMarkers).also { request ->
-            sleepWindowController?.setIngestionRequestActive(request is IngestionRequestRead.Valid)
-            observeIngestionRequest(request)
+    private fun readIngestionRequest(deviceRoot: File, cleanupAbsentMarkers: Boolean = true): IngestionRequestRead {
+        val raw = IngestionQuiesceFiles.readRequest(deviceRoot, cleanupAbsentMarkers = cleanupAbsentMarkers)
+        // Every caller (the connection loop, the parked probe and the drive loop) reads the
+        // request here, so a pause released for the ignition is absent everywhere at once.
+        // The raw 5-second ACC read, not the sleep-window evidence, which follows a property
+        // transaction and can lag the ignition by seconds. Unknown is never "on".
+        val ignitionOn = ignitionOnObserved == true
+        val request = when (
+            ignitionPauseRelease.decide(raw, ignitionOn, lastAcknowledgedEventRequestId)
+        ) {
+            IgnitionPauseDecision.KEEP -> {
+                pauseReleasedByIgnition = false
+                raw
+            }
+            IgnitionPauseDecision.RELEASE -> {
+                pauseReleasedByIgnition = true
+                val released = (raw as IngestionRequestRead.Valid).request
+                runCatching {
+                    IngestionQuiesceFiles.publishFailed(
+                        deviceRoot,
+                        released,
+                        "the ignition came on; OBD logging resumed",
+                    )
+                }
+                ingestionRequestId = null
+                emitEvent("ingest.handoff", "warning", "resumed", "acc_on")
+                IngestionRequestRead.Absent
+            }
+            IgnitionPauseDecision.ALREADY_RELEASED -> {
+                pauseReleasedByIgnition = true
+                IngestionRequestRead.Absent
+            }
         }
+        sleepWindowController?.setIngestionRequestActive(request is IngestionRequestRead.Valid)
+        observeIngestionRequest(request)
+        return request
+    }
+
+    private fun bluetoothAdapterOn(): Boolean = runCatching {
+        getSystemService(BluetoothManager::class.java)?.adapter?.state == BluetoothAdapter.STATE_ON
+    }.getOrDefault(true) // An unreadable adapter must not stop logging; connect as before.
 
     private fun recordParserFailure(error: ElmProtocolException) {
         pipelineMetrics.parserFailure(
@@ -2265,6 +2340,7 @@ class ObdLoggerService : Service() {
     private fun recordSleepWindowObservation(value: SleepWindowControllerObservation) {
         when (value) {
             is SleepWindowControllerObservation.AccRead -> {
+                ignitionOnObserved = value.on
                 motionJournal?.acc(value.on)
                 clipIndexer?.notifyWorkModeChanged()
             }
