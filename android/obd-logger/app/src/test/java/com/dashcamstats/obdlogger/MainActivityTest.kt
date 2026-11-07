@@ -270,6 +270,25 @@ class MainActivityTest {
         }
     }
 
+    @Test fun theQuickToggleStopsAndRestartsTheSavedLogger() = withActivity { activity ->
+        val preferences = context.getSharedPreferences("obd_logger", Context.MODE_PRIVATE)
+        val toggle = field<Button>(activity, "quickToggle")
+        assertEquals("Turn OBD logging OFF", toggle.text.toString())
+
+        toggle.performClick()
+        waitUntil { field<TextView>(activity, "status").text.startsWith("Logger disabled") }
+        assertFalse(preferences.getBoolean("enabled", true))
+        assertEquals(ObdLoggerService::class.java.name,
+            Shadows.shadowOf(activity).nextStoppedService.component?.className)
+        assertEquals("Turn OBD logging ON", toggle.text.toString())
+        assertFalse(field<CheckBox>(activity, "enabled").isChecked)
+
+        toggle.performClick()
+        waitUntil { preferences.getBoolean("enabled", false) }
+        assertTrue(field<CheckBox>(activity, "enabled").isChecked)
+        assertEquals("Turn OBD logging OFF", toggle.text.toString())
+    }
+
     private fun withActivity(test: (MainActivity) -> Unit) {
         val controller = Robolectric.buildActivity(MainActivity::class.java).create().resume()
         val activity = controller.get()

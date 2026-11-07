@@ -56,6 +56,7 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var liveStatus: TextView
     private lateinit var metricsToggle: Button
+    private lateinit var quickToggle: Button
     private lateinit var liveMetrics: TextView
     private lateinit var credentialError: TextView
     private val activityScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -109,6 +110,18 @@ class MainActivity : Activity() {
             text = "Dashcam OBD logger"
             textSize = 24f
         })
+        // One tap from the driver's seat: the same persisted stop/start as the checkbox and
+        // "Save and apply" at the bottom of this form, for testing CarPlay with the logger off.
+        quickToggle = Button(this).apply {
+            textSize = 22f
+            setPadding(padding, padding, padding, padding)
+            setOnClickListener { toggleLogging() }
+        }
+        layout.addView(
+            quickToggle,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
         liveStatus = TextView(this).apply {
             textSize = 18f
             typeface = Typeface.MONOSPACE
@@ -295,6 +308,29 @@ class MainActivity : Activity() {
         renderLiveStatus()
     }
 
+    private fun refreshQuickToggle() {
+        if (!::quickToggle.isInitialized) return
+        quickToggle.text = if (savedConfiguration.enabled) "Turn OBD logging OFF" else "Turn OBD logging ON"
+        quickToggle.isEnabled = !saving
+    }
+
+    private fun toggleLogging() {
+        if (saving) return
+        if (savedConfiguration.enabled) {
+            enabled.isChecked = false
+            disableSavedLogger()
+        } else {
+            if (!ownership.isChecked) {
+                status.text = "Tick the adapter ownership box below, then turn logging on."
+                return
+            }
+            // Re-enables with this form's values, which match the saved settings unless edited.
+            enabled.isChecked = true
+            saveAndApply()
+        }
+        refreshQuickToggle()
+    }
+
     override fun onResume() {
         super.onResume()
         foreground = true
@@ -338,6 +374,7 @@ class MainActivity : Activity() {
     }
 
     private fun renderLiveStatus() {
+        refreshQuickToggle()
         renderTrialSetting()
         liveStatus.text = LiveStatusSummary.lines(publishedStatus, System.currentTimeMillis())
             .joinToString("\n")
@@ -521,6 +558,7 @@ class MainActivity : Activity() {
             }
             credentialLoadError = config.webhookCredentialError
             savedConfiguration = config
+            refreshQuickToggle()
             showCredentialError(credentialLoadError)
             if (applied.actionFailed) {
                 status.text = "Settings saved, but the logger could not be updated. Reopen the app and retry Save and apply."
@@ -557,6 +595,7 @@ class MainActivity : Activity() {
                 saving = false
             }
             savedConfiguration = savedConfiguration.copy(enabled = false)
+            refreshQuickToggle()
             status.text = if (stopped) "Logger disabled. Other unsaved edits were not applied."
                 else "Disabled setting saved, but the logger could not be stopped. Retry Save and apply."
         }
