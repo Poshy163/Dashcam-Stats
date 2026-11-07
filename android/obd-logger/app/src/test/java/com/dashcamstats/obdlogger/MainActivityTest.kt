@@ -284,9 +284,10 @@ class MainActivityTest {
         assertFalse(field<CheckBox>(activity, "enabled").isChecked)
 
         toggle.performClick()
-        waitUntil { preferences.getBoolean("enabled", false) }
+        // The label follows the completed save, a moment after the preference is written.
+        waitUntil { toggle.text.toString() == "Turn OBD logging OFF" }
+        assertTrue(preferences.getBoolean("enabled", false))
         assertTrue(field<CheckBox>(activity, "enabled").isChecked)
-        assertEquals("Turn OBD logging OFF", toggle.text.toString())
     }
 
     private fun withActivity(test: (MainActivity) -> Unit) {
