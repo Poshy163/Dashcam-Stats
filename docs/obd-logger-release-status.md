@@ -8,15 +8,27 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.23** (`versionCode` 36), installed in place on 30 October 2026 (0.3.24 built; see below) |
-| Source | `bed288df504e5d0071e47c24eaafd837490d5f97` (`android/obd-logger/`); installed APK SHA-256, version and production signer verified on 30 October (release record `release-record-0.3.23.txt`). 0.3.22 came from `57c95731a81a2c2066833bc0ecc9b2d20fc22e7b`. |
+| Version | **0.3.25** (`versionCode` 38), installed in place on 8 November 2026 |
+| Source | `656d12fbe6d52fb05d711504329854f5d2cf5ff0` (`android/obd-logger/`); installed APK SHA-256 `39682e85…64e3`, version and production signer verified on 8 November (release record `release-record-0.3.25.txt`). 0.3.23 came from `bed288df504e5d0071e47c24eaafd837490d5f97`. |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
 | Poll plan | The existing trial OFF choice, revision 1 and no fallback reason were preserved. The next drive used the baseline plan; it does not validate the three-second trial. No automatic re-arm was performed. |
 | Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, permissions, folder access, stored drive identity and original OFF bounds survived. Both camera files advanced and temperature history continued. Parked indexing resumed after ingestion, and automatic backups completed with verified radio restoration. Restart evidence records `package_update` on the same kernel boot; no physical reboot test was performed. The subsequent server/helper workspace recovery was verified on 28 October, as described below. |
 
-## Candidate 0.3.24: Bluetooth-ready start and ignition release (built, install pending)
+## 0.3.25 installed: one-tap logging switch (includes 0.3.24)
+
+Source `656d12fbe6d52fb05d711504329854f5d2cf5ff0`, `versionCode` 38. A large **Turn OBD logging
+OFF / ON** button at the top of the app's screen uses the existing persisted stop/start, so the
+logger can be fully stopped from the driver's seat to compare CarPlay with and without it; off
+stays off across ignition cycles and reboots. Includes the 0.3.24 changes below, which were built
+on 6 November but never installed. APK SHA-256
+`39682e8566b66c8934daf70ec649f46daa948d81376803d0c581a292595164e3`, same production signer, 462 unit
+tests passed. Installed in place on 8 November at 14:47 after cancelling a parked backup through
+the server: version, APK hash, signer, first-install time, permissions and a restarted service were
+verified, and `status.json` reports 0.3.25.
+
+## Candidate 0.3.24: Bluetooth-ready start and ignition release (built, superseded by 0.3.25)
 
 Source `5d5646f0ba31646cfc563a018165d78dc6b71212`, `versionCode` 37. Two start-up changes for
 the head unit's shared Bluetooth/Wi-Fi radio, both found on 6 November:
