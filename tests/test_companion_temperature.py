@@ -196,6 +196,9 @@ async def test_changed_chunk_only_import_and_sqlite_deduplication(monkeypatch, d
     content, _ = fixture()
     remote = Remote(content)
     monkeypatch.setattr(capture.adb, "shell", remote.shell)
+    # Keep the fixed fixture inside the store's 14-day retention; otherwise every store
+    # prunes the row it just wrote and the re-import counts as new (failed from 9 Nov 2026).
+    monkeypatch.setattr(unit_logs, "utcnow", lambda: AT + timedelta(hours=1))
     assert await capture.recover("unit") == (1, 0)
     assert await capture.recover("unit") == (0, 0)
     assert sum("samples-" in command for command in remote.commands) == 1
