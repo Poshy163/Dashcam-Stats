@@ -176,6 +176,71 @@ async def test_slow_refresh_does_not_append_another_full_interval(monkeypatch, h
     assert delays == [10, 2]
 
 
+def _fake_outage(monkeypatch, held, *, down_until):
+    """Run the heartbeat on a fake clock with ADB failing until ``down_until``."""
+    now, starts, budgets = [100.0], [], []
+    held._verified_at, held._end = now[0], 1000
+    monkeypatch.setattr(maintenance, "HEARTBEAT_INTERVAL_S", 10)
+    monkeypatch.setattr(maintenance, "HEARTBEAT_RETRY_DELAY_S", 0.25)
+    monkeypatch.setattr(maintenance.time, "monotonic", lambda: now[0])
+    real_timeout = asyncio.timeout
+
+    def recording_timeout(delay):
+        budgets.append(delay)
+        return real_timeout(delay)
+
+    async def pause(seconds):
+        now[0] += seconds
+
+    async def screen(_address):
+        starts.append(now[0])
+        now[0] += 1.5
+        if now[0] < down_until:
+            raise maintenance.MaintenanceTransient("screen", "screen_transport", "unavailable")
+        return NORMAL
+
+    async def power_proof(_address):
+        return maintenance.PowerProof(BOOT, 1000)
+
+    async def publish(_proof):
+        held._end = now[0] + maintenance.RESTORE_RESERVE_S
+
+    monkeypatch.setattr(maintenance.asyncio, "timeout", recording_timeout)
+    monkeypatch.setattr(maintenance.asyncio, "sleep", pause)
+    monkeypatch.setattr(maintenance, "_screen", screen)
+    monkeypatch.setattr(maintenance, "_power", power_proof)
+    monkeypatch.setattr(held, "_publish", publish)
+    finish = AsyncMock()
+    monkeypatch.setattr(held, "_end_hold", finish)
+    return now, starts, budgets, finish
+
+
+async def test_an_outage_longer_than_one_check_rides_on_the_verified_evidence(monkeypatch, held):
+    # 10 Nov 2026: one check that could not finish in 14 s ended a 30-minute hold
+    # and cancelled the backup, although the evidence had 6 s left and the device
+    # lease 21 s. ADB here is down for 15 s of a check that starts at 110.
+    now, starts, budgets, finish = _fake_outage(monkeypatch, held, down_until=124)
+    await held._heartbeat()
+    assert budgets == [maintenance.EVIDENCE_TTL_S - maintenance.HEARTBEAT_INTERVAL_S]
+    assert held._verified_at == now[0]
+    assert held._verified_at - starts[0] > 14
+    finish.assert_awaited_once_with(
+        "expired", "Maintenance ended; radios are restored before backup can resume."
+    )
+
+
+async def test_an_outage_past_the_evidence_horizon_still_ends_the_hold(monkeypatch, held):
+    _now, starts, _budgets, finish = _fake_outage(monkeypatch, held, down_until=10_000)
+    await held._heartbeat()
+    horizon = 100 + maintenance.EVIDENCE_TTL_S
+    # Time, not the attempt cap, stopped the retries, and none began on expired evidence.
+    assert len(starts) < maintenance.HEARTBEAT_MAX_ATTEMPTS
+    assert all(start < horizon for start in starts)
+    assert held._verified_at == 100
+    assert finish.await_args.args[0] == "failed"
+    assert "screen_transport" in finish.await_args.args[1]
+
+
 @pytest.mark.parametrize(
     "changes,code",
     [

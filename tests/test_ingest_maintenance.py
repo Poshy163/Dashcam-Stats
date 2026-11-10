@@ -435,7 +435,8 @@ async def test_aggregate_slow_refresh_timeout_closes_admission_and_restores(
     arm_for_test(controller, maintenance.time.monotonic())
     controller._address = "unit"
     monkeypatch.setattr(maintenance, "HEARTBEAT_INTERVAL_S", 0)
-    monkeypatch.setattr(maintenance, "HEARTBEAT_REFRESH_TIMEOUT_S", 0.01)
+    # The refresh is bounded by the evidence horizon; start it nearly expired.
+    controller._verified_at = maintenance.time.monotonic() - maintenance.EVIDENCE_TTL_S + 0.05
 
     async def stuck_screen(_address):
         await asyncio.Event().wait()

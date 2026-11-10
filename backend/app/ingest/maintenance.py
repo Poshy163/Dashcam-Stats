@@ -37,8 +37,11 @@ SYSTEMUI_SHA256 = "f3f7e00d938c6c74a88c5db24c60a908fbcd7923a7098f2b65439465921d6
 EVIDENCE_TTL_S = 30.0
 DEVICE_HEARTBEAT_TTL_S = 45
 HEARTBEAT_INTERVAL_S = 10.0
-HEARTBEAT_REFRESH_TIMEOUT_S = 14.0
-HEARTBEAT_MAX_ATTEMPTS = 8
+# A refresh that keeps failing retries on the last verified evidence until that
+# evidence expires (EVIDENCE_TTL_S); the on-device lease (DEVICE_HEARTBEAT_TTL_S)
+# outlives it. A fixed 14 s per refresh ended a 30-minute hold over one slow ADB
+# exchange on 10 Nov 2026. The attempt cap only stops a tight loop.
+HEARTBEAT_MAX_ATTEMPTS = 32
 HEARTBEAT_RETRY_DELAY_S = 0.25
 UI_DUMP_TIMEOUT_S = 5
 UI_SCREEN_TIMEOUT_S = 8.0
@@ -902,13 +905,13 @@ class MaintenanceController:
                 refresh_started = time.monotonic()
                 next_refresh = refresh_started + HEARTBEAT_INTERVAL_S
                 budget = min(
-                    HEARTBEAT_REFRESH_TIMEOUT_S,
                     self._verified_at + EVIDENCE_TTL_S - refresh_started,
                     self._end - RESTORE_RESERVE_S - refresh_started,
                 )
                 if budget <= 0:
                     failure_code = "heartbeat_evidence_expired"
                     raise MaintenanceRefused("Maintenance evidence expired before refresh.")
+                deadline = refresh_started + budget
                 async with asyncio.timeout(budget):
                     for attempt in range(1, HEARTBEAT_MAX_ATTEMPTS + 1):
                         try:
@@ -942,11 +945,13 @@ class MaintenanceController:
                                 attempt=attempt,
                                 elapsed_ms=round((time.monotonic() - refresh_started) * 1000),
                             )
-                            if attempt == HEARTBEAT_MAX_ATTEMPTS:
+                            delay = min(1.0, HEARTBEAT_RETRY_DELAY_S * 2 ** (attempt - 1))
+                            if (
+                                attempt == HEARTBEAT_MAX_ATTEMPTS
+                                or time.monotonic() + delay >= deadline
+                            ):
                                 raise
-                            await asyncio.sleep(
-                                min(1.0, HEARTBEAT_RETRY_DELAY_S * 2 ** (attempt - 1))
-                            )
+                            await asyncio.sleep(delay)
                 self._verified_at = time.monotonic()
             await self._end_hold(
                 "expired", "Maintenance ended; radios are restored before backup can resume."
