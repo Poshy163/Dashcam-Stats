@@ -109,3 +109,17 @@ Already done today: sampler overhead fix deployed (`0c0d3fd`; 73% -> 10% of a co
 - Also found: SystemUI's "Internet" Wi-Fi picker was open on the unit's screen, scanning every
   10 s while parked (since before 15:49). Closing it (Back) stopped the scans at 16:10:28.
   It did not affect today's drives (about 19 s of scan time across all driving).
+
+## 10 Nov - back to 1664x624 after a week-long A/B
+
+- 6 Nov 12:51 the unit went back to 1920x720 for an iOS 27.3 beta test; the user reported CarPlay
+  problems again. Over nine days: 1664x624 drives (3-5 Nov) streamed 10-15 Mbit/s typically (peak
+  22 or less) with 85-122 ms average decoder delay; 1920x720 drives (7-10 Nov) streamed 14-23 Mbit/s
+  with peaks at the ~26 Mbit/s ceiling and 124-167 ms decoder delay. Frame rate and late-frame share
+  were the same at both sizes.
+- OBD logger 0.3.25 adds a one-tap logging switch. Six drives with the logger off (9-10 Nov) matched
+  the logger-on drives, so the logger is not the cause. Side effect: with the logger off the server
+  holds every backup, because the logger supplies the sleep-window evidence.
+- 10 Nov 11:03: `wm size 624x1664` again, and `persist.sys.zqc.app.width/height` set to 1544/624 to
+  match the first trial (the vendor did not update them itself this time). Revert with
+  `wm size reset` plus `setprop persist.sys.zqc.app.width 1800` / `...height 720`.
