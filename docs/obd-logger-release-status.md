@@ -8,13 +8,97 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.27** (`versionCode` 40), installed in place on 16 November 2026 |
-| Source | `f14a202ab4d2fb1201430e134b3a1c5f26272ca3`; installed APK SHA-256 `f7679099…741f`, version and existing production signer verified (release record `release-record-0.3.27.txt`). |
+| Version | **0.3.28** (`versionCode` 41), installed in place on 17 November 2026; verification completed at 10:19 Adelaide time |
+| Source | `78dfeb7a870f4213c6536d118f8fe2da15481b3b`; installed APK SHA-256 `80e2f825…cba9`, version and existing production signer verified (`release-record-0.3.28.txt`) |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | The existing trial OFF choice, revision 1 and no fallback reason were preserved. Driving on 0.3.27 has not yet been validated. No automatic re-arm was performed. |
-| Deployment | Installed APK readback hash and production signer verified; UID 10162, original first-install time, permissions, saved trial/ownership/transfer settings, last-drive identity, original OFF bounds and 20 retained artifacts survived. The foreground service recovered automatically with `package_update` on the same kernel boot. Automatic backups were restored and two post-update runs completed successfully with Bluetooth, hotspot and logger recovery. Idle sleep property 300 seconds was verified; the unit became persistently unreachable just after the original countdown was due to expire at about 19:05 Adelaide time, consistent with normal sleep. No reboot, forced suspend or CarPlay driving test was performed. |
+| Poll plan | The saved trial OFF choice, revision 1 and no fallback reason were preserved. The 17 November drive on 0.3.27 was recorded successfully and the driver reported noticeably improved CarPlay. A drive on 0.3.28 has not yet been validated. |
+| Deployment | Installed APK readback hash and production signer verified; UID, original first-install time, permissions, saved settings, last drive and 20 retained artifacts survived. Foreground service recovered automatically on the same kernel boot. Backup 765 completed 49 files with radio/logger recovery. Idle 300 seconds verified. The maintenance hold was released and automatic backups restored. The unit stayed offline after the native sleep command, consistent with sleep; direct hardware suspension was not measured |
+
+## 0.3.28: preserve unknown ingestion state through sleep decisions
+
+Source `78dfeb7a870f4213c6536d118f8fe2da15481b3b`, `versionCode` 41. **Built and production-signed
+on 17 November 2026. Installed in place; verification completed at 10:19 Adelaide time.**
+
+The production build passed 473 Android tests, with one skipped and no failures/errors.
+Release lint passed with no errors and 57 warnings. The three new regression cases cover
+unreadable requests, queued completion events and preservation of the original OFF bounds.
+All 145 focused backend tests passed for quiet-work scheduling and fixed ingest/native-sleep
+deadlines. Version/code, embedded source revision, non-debug/audit-disabled release flags, single production signer and v2 signature were independently checked; the installed APK readback matched the archived hash.
+
+Archived APK: `C:\Users\poshe\.codex\artifacts\dashcam-obd-logger\dashcam-obd-logger-0.3.28-production.apk`. SHA-256: `80e2f82586912dac0cd9ae63ff5896d4dae904231e2d106fcdf344ec20aecba9`.
+Release record: `release-record-0.3.28.txt` beside the APK. Installation record: `installation-record-0.3.28-20261117.json` beside the APK.
+
+- **An unreadable request is unknown, not completed.** The logger previously passed both an
+  absent and an invalid ingestion request to the sleep controller as `false`. It now passes
+  valid, absent and invalid as three distinct states. An invalid read retains the last valid
+  active state; only confirmed absence completes that request. Unknown state reaches the
+  existing status and optional parked-work gates immediately, including while a property
+  transaction is still running.
+- **Queued completion cannot override newer uncertainty or a valid request.** The controller
+  checks current ingestion state before applying an older event. A recovered valid request
+  remains active; confirmed absence permits the established completion policy. Existing
+  fixed OFF bounds are preserved through these transitions.
+- **Keep the requested five-minute window away from Wi-Fi.** The user explicitly retained the
+  300-second away/idle setting. This update does not pre-arm the longer backup window while
+  driving away from Wi-Fi. The existing backup setting remains 1,200 seconds. If Wi-Fi arrives
+  too close to ignition-off, the firmware can already have captured the five-minute window;
+  changing the property afterward does not prove that deadline was extended. The server must
+  still stop safely when that original window runs out.
+
+This is a request-state safety correction. It does not change the polling plan, database or
+status schema, backup reserve or original native deadline, and does not claim to fix the
+separate generic radio-watchdog proof failure seen during the parked backup.
+
+The 17 November drive review covered two 0.3.27 trips, approximately 2.80 km and 2.54 km.
+The driver reported **noticeably improved CarPlay**. Both exported bundles validated; all
+114 created samples were persisted with no drops or database write failures. The return trip
+recorded 57 of 58 expected samples with contiguous sequences, no sample gaps, no connection
+losses and no poll overruns. The outbound trip recorded 57 of 59 expected samples; its timeout
+and disconnect followed ignition-off and zero RPM, rather than demonstrating an in-drive
+dropout. This supports healthy telemetry and the reported experience, but no direct CarPlay
+picture-age measurement was captured and it is not a controlled causal comparison.
+
+Native `soc-thmzone` observations ranged from 73.4-88.4 C outbound and 98.1-102.4 C on the
+return, then peaked at 105.7 C during parked backup/maintenance. These ranges exclude the
+legacy CarPlay sampler observations. A later read-only snapshot showed both CPU policies at
+their exposed 1.612 GHz hardware maximum and all five exposed cooling states at zero. That
+snapshot does not show active throttling; it cannot exclude an earlier transient limit or
+establish temperature as the cause of CarPlay delay.
+
+On arrival, Wi-Fi became available only 445 ms before ACC OFF, and the 1,200-second property
+was first verified 851 ms after OFF. Run 762 stopped when radio shutdown could no longer be
+verified; the saved generic reason does not identify a safe radio-tuning change. Run 763
+stopped as the conservative native sleep deadline approached. These observations do not
+justify weakening either safety boundary.
+
+The supported maintenance hold was verified before installation, with new backup starts temporarily
+paused and all radio recovery complete. The installed APK readback and production signer matched;
+UID 10162, original first-install time, grants, trial/ownership/transfer settings, last-drive identity
+and all 20 retained artifact hashes survived. The foreground service recovered automatically with
+`package_update`, on the same kernel boot. OFF bounds/window were already null before installation
+and remained null afterward. An initial verification assertion incorrectly required integer bounds;
+read-only verification resumed against the actual baseline without reinstalling. Null bounds do not
+create or extend a native deadline.
+
+Post-update run **765** completed successfully at 10:23:33 Adelaide: **49 files, 2,919,484,524 bytes**,
+with no reported error. Bluetooth and hotspot restoration and logger resume were all verified, with
+no remaining recovery required. The companion returned to parked, known inactive ingestion hold and
+verified `managed_idle` at **300 seconds**. Automatic backup was restored to its original enabled
+setting after the final sleep operation. No controlled CPU comparison or drive on 0.3.28 was performed.
+
+The temporary maintenance hold was stopped and verified inactive before issuing the guarded native
+`com.zqc.action.system_sleep` command. ADB transport dropped during that command, before a completion
+reply was received. Four passive TCP checks from **10:25:20 to 10:25:56 Adelaide** found the unit
+unreachable, consistent with sleep. Neither broadcast acknowledgment nor the post-sleep kernel
+suspend counter was observed. The original automatic-backup setting was restored and read back.
+The durable countdown-cancellation marker remains intact; the next genuine ignition cycle clears
+that maintenance history and restores ordinary countdown behavior. No reboot or raw forced suspend
+was used.
+
+Evidence for the drive review and focused backend checks is retained under
+`C:\Users\poshe\.codex\tmp\obd-drive-review-20261117`.
 
 ## 0.3.27 installed: fewer parked assessments and unused key reads
 
