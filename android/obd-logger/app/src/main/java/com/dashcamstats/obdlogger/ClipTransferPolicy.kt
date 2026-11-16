@@ -22,6 +22,7 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 import java.util.concurrent.Executors
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -110,6 +111,70 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
     private val ownedDecoderDispatcher = lazy { quietDecoderDispatcher() }
     @Volatile private var stopped = false
     private var sequence = 0L
+    private data class AnalysisIdentity(val key: String, val deadlineMs: Long)
+    private data class RefreshHint(val generation: Long, val observedAtMs: Long,
+        val candidates: List<AnalysisIdentity>, val dueAtMs: Long?)
+    private val refreshGeneration = AtomicLong()
+    @Volatile private var refreshHint: RefreshHint? = null
+    private var reportHintEligible = false
+
+    /** Scheduling advice only: never evidence for a skip, defer, or a new sleep deadline. */
+    internal fun needsPromptRefresh(): Boolean {
+        val hint = refreshHint ?: return true
+        if (hint.generation != refreshGeneration.get() || stopped || indexingSuspended) return true
+        val now = wallMs()
+        if (now < hint.observedAtMs || hint.dueAtMs?.let { now >= it } == true) return true
+        if (analysisJob?.isActive == true) return false // Completion already wakes the indexer.
+        return hint.candidates.any { analysisReady(it, now) }
+    }
+
+    private fun invalidateRefreshHint(): Long {
+        refreshHint = null
+        return refreshGeneration.incrementAndGet()
+    }
+
+    private fun analysisReady(identity: AnalysisIdentity, now: Long): Boolean = synchronized(cacheLock) {
+        // A terminal result evicted from the bounded cache must not be decoded again
+        // every card rotation. A restart may reconsider it, with the same fixed horizon.
+        (cached.containsKey(identity.key) || !attempted.containsKey(identity.key)) &&
+            resourceRetry.ready(identity.key, cached[identity.key], now, identity.deadlineMs)
+    }
+
+    private fun analysisCandidateIdentity(item: PolicyClip, card: String, publishedPaths: Set<String>,
+                                 rows: List<JSONObject>, now: Long): AnalysisIdentity? {
+        if (item.clip.relativePath !in publishedPaths || !item.stable ||
+            item.clip.size > 256L * 1024 * 1024 || item.boundEndMs == null || now < item.boundEndMs ||
+            rows.none { row ->
+                (row.optString("decision") == "defer" || row.optString("reason") == "visual_required") &&
+                    row.getJSONObject("clip").optString("relative_path") == item.clip.relativePath
+            }) return null
+        return AnalysisIdentity(key(item, card), item.boundEndMs + QUIET_ANALYSIS_RETRY_MS)
+    }
+
+    private fun rememberRefreshHint(generation: Long, items: List<PolicyClip>, card: String?,
+                                    rows: List<JSONObject>, publishedPaths: Set<String>,
+                                    reportState: String, truncated: Boolean) {
+        if (!reportHintEligible || reportState != "ready" || truncated || card == null) return
+        val now = wallMs()
+        val candidates = if (enabled && allowed()) items.mapNotNull {
+            analysisCandidateIdentity(it, card, publishedPaths, rows, now)
+        } else emptyList()
+        val deadlines = mutableListOf<Long>()
+        for (row in rows) {
+            if (row.optString("decision") == "defer") {
+                val until = runCatching { Instant.parse(row.getString("defer_until_utc")).toEpochMilli() }.getOrNull()
+                    ?: return // Unknown scheduling evidence keeps the short cadence.
+                deadlines += until
+            }
+            if (row.optString("reason") == "awaiting_post_guard") {
+                val end = runCatching { Instant.parse(row.getJSONObject("clip").getString("end_utc")).toEpochMilli() }.getOrNull()
+                    ?: return
+                deadlines += end + GUARD_PADDING_MS
+            }
+        }
+        // A concurrent analysis completion or suspension must not resurrect a stale hint.
+        refreshHint = RefreshHint(generation, now, candidates, deadlines.minOrNull())
+    }
 
     init {
         runCatching {
@@ -216,6 +281,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
 
     suspend fun publish(items: List<PolicyClip>, card: String?, reportState: String, truncated: Boolean,
                         unchanged: (MovementClip) -> Boolean) {
+        val refresh = invalidateRefreshHint()
         ensureIndexingAllowed()
         indexingSuspended = false
         sequence++
@@ -245,17 +311,8 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         // retain transfer without preventing the independent analysis from ever running.
         val now = wallMs()
         val candidate = if (stopped || !enabled || card == null || !allowed() || analysisJob?.isActive == true) null else items
-            .filter { it.clip.relativePath in publishedPaths && it.stable && it.freshFingerprint &&
-                it.clip.size <= 256L * 1024 * 1024 &&
-                it.boundEndMs != null && now >= it.boundEndMs && synchronized(cacheLock) {
-                    val identity = key(it, card)
-                    // A terminal result evicted from the bounded cache must not be decoded again
-                    // every card rotation. A restart may reconsider it, with the same fixed horizon.
-                    (cached.containsKey(identity) || !attempted.containsKey(identity)) &&
-                        resourceRetry.ready(identity, cached[identity], now, it.boundEndMs + QUIET_ANALYSIS_RETRY_MS)
-                } && rows.any { row ->
-                    (row.optString("decision") == "defer" || row.optString("reason") == "visual_required") &&
-                        row.getJSONObject("clip").optString("relative_path") == it.clip.relativePath } }
+            .filter { item -> item.freshFingerprint &&
+                analysisCandidateIdentity(item, card, publishedPaths, rows, now)?.let { analysisReady(it, now) } == true }
             .minWithOrNull(compareBy<PolicyClip>(
                 { if (now < checkNotNull(it.boundEndMs) + QUIET_TRANSFER_DEFER_MS) 0 else 1 },
                 // Finish the opposite view of a proven clip before starting many unpaired views.
@@ -306,6 +363,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                 rows = evaluate(items, card, wallMs())
             } else analysisJob = analysisScope.launch(analysisDispatcher ?: ownedDecoderDispatcher.value) {
                 fun failed(reason: QuietAnalysisReason = QuietAnalysisReason.ANALYSIS_STORAGE_UNAVAILABLE) {
+                    invalidateRefreshHint()
                     // Cache persistence and metadata checks are optional too. A result that could
                     // not be persisted must not remain quiet in memory or escape into the logger's
                     // uncaught-coroutine handler. Disk recovery never extends its defer deadline.
@@ -329,6 +387,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
                     if (error is CancellationException) throw error
                     if (error is ClipIndexWorkDeferred) attempted.remove(identity) else failed()
                 } finally {
+                    invalidateRefreshHint()
                     try { afterAnalysis() } catch (error: Exception) {
                         if (error is CancellationException) throw error
                         failed()
@@ -338,7 +397,8 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         }
         // Witnesses need the same current identity check as exclusion candidates.
         recheckQuietIdentities()
-        writeReport(rows, card, reportState, truncated)
+        val finalPaths = writeReport(rows, card, reportState, truncated)
+        rememberRefreshHint(refresh, items, card, rows, finalPaths, reportState, truncated)
     }
 
     private fun ensureIndexingAllowed() {
@@ -347,6 +407,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
 
     /** Safe from the ACC observer: cancellation and flags only, with no storage work. */
     fun pauseIndexing() {
+        invalidateRefreshHint()
         indexingSuspended = true
         analysisJob?.cancel()
     }
@@ -367,6 +428,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
     private fun writeReport(baseRows: List<JSONObject>, card: String?, reportState: String,
                             truncated: Boolean, requireIndexing: Boolean = true,
                             destination: File? = root()): Set<String> {
+        reportHintEligible = false
         if (requireIndexing) ensureIndexingAllowed()
         val active = enabled
         // Keep own qualification immutable. Repeated publication/truncation must not
@@ -403,7 +465,10 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         deferCount = rows.count { it.optString("decision") == "defer" }
         uploadCount = rows.size - skipCount - deferCount
         if (requireIndexing) ensureIndexingAllowed()
-        destination?.let { atomicJson(File(it, "movement/transfer-policy.json"), output) }
+        destination?.let {
+            atomicJson(File(it, "movement/transfer-policy.json"), output)
+            reportHintEligible = !output.getBoolean("truncated")
+        }
         return rows.map { it.getJSONObject("clip").getString("relative_path") }.toSet()
     }
 
@@ -412,6 +477,7 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
             JSONObject().put("key", key).put("visual", visual) }))) }
 
     fun stop() {
+        invalidateRefreshHint()
         stopped = true
         val job = analysisJob
         job?.cancel()

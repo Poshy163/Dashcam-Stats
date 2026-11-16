@@ -385,6 +385,94 @@ class ClipTransferPolicyTest {
         prefs.edit().putBoolean(QUIET_FILTER_ENABLED, false).commit()
     }
 
+    @Test fun refreshHintWaitsForPostGuardButBecomesDueAtOriginalBoundary() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        context.deleteDatabase("clip-movement.db")
+        File(context.filesDir, "quiet-analysis-v2.json").delete()
+        val prefs = context.getSharedPreferences(MOVEMENT_TREE_PREFERENCES, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(QUIET_FILTER_ENABLED, true).commit()
+        val journal = MotionJournal(context, backgroundScope)
+        val start = System.currentTimeMillis() / 60_000 * 60_000 - 60_000
+        var now = start + 60_000
+        fun observations(offsets: LongProgression) {
+            for (offset in offsets) journal.writableDatabase.execSQL(
+                "INSERT INTO observations(wall_ms,elapsed_ms,session_id,segment_id,kind,acc,timezone) VALUES(?,?,?,?,?,?,?)",
+                arrayOf(start + offset, start + offset, journal.sessionId, "one", "acc", 0, zone))
+        }
+        observations(-130_000L..60_000L step 5_000)
+        val items = (0..1).map { camera ->
+            val local = Instant.ofEpochMilli(start).atZone(ZoneId.systemDefault()).toLocalDateTime()
+            val name = local.format(java.time.format.DateTimeFormatter.ofPattern("uuuuMMddHHmmss")) + "_camera_$camera.ts"
+            val clip = MovementClip(name, "DCIM/Video/$name", name, "camera_$camera", local, 10_000, start + 30_000, false, false)
+            val assessment = MovementClassifier.assess(start, start + 30_000, journal.between(start, start + 30_000))
+            val body = JSONObject().put("clip_id", java.util.UUID.nameUUIDFromBytes(name.toByteArray()).toString())
+                .put("relative_path", clip.relativePath).put("camera_key", clip.camera).put("locked", false)
+                .put("size_bytes", clip.size).put("mtime_ms", clip.mtime)
+                .put("fingerprint", JSONObject().put("algorithm", "sha256-sampled-v1").put("sample_bytes", 16_384)
+                    .put("digest", "a".repeat(64)))
+                .put("local_start", local.toString()).put("timezone", zone)
+                .put("start_utc", Instant.ofEpochMilli(start).toString()).put("end_utc", Instant.ofEpochMilli(start + 30_000).toString())
+                .put("duration_ms", JSONObject.NULL).put("time_quality", "bounded")
+                .put("classification", assessment.classification).put("reasons", JSONArray(assessment.reasons))
+                .put("analysis_status", "complete").put("coverage", assessment.coverage).put("evidence", assessment.evidence)
+            PolicyClip(clip, body, true, true, Uri.parse("content://test/$name"), start, start + 30_000)
+        }
+        val root = File(context.cacheDir, "policy-refresh-post-guard").apply { mkdirs() }
+        var analyses = 0
+        val fake = object : VisualQuietAnalyzer(context) {
+            override suspend fun analyze(uri: Uri, allowed: () -> Boolean): JSONObject {
+                assertTrue(allowed()); analyses++; return quiet()
+            }
+        }
+        val policy = ClipTransferPolicy(context, journal, { root }, { true }, fake, { now })
+        repeat(2) { policy.publish(items, "b".repeat(64), "ready", false) { true } }
+        assertEquals(2, analyses); assertEquals(2, policy.deferCount)
+        assertFalse(policy.needsPromptRefresh())
+        val rows = JSONObject(File(root, "movement/transfer-policy.json").readText()).getJSONArray("decisions")
+        repeat(rows.length()) { index ->
+            assertEquals("awaiting_post_guard", rows.getJSONObject(index).getString("reason"))
+            assertEquals(Instant.ofEpochMilli(start + 30_000 + QUIET_TRANSFER_DEFER_MS).toString(),
+                rows.getJSONObject(index).getString("defer_until_utc"))
+        }
+        now = start + 30_000 + 122_000 - 1 // Existing ignition margin plus filename uncertainty.
+        assertFalse(policy.needsPromptRefresh())
+        now++
+        assertTrue(policy.needsPromptRefresh())
+        observations(65_000L..155_000L step 5_000)
+        policy.publish(items, "b".repeat(64), "ready", false) { true }
+        assertEquals(2, analyses); assertEquals(2, policy.skipCount)
+        assertFalse(policy.needsPromptRefresh())
+        policy.stop(); journal.stop(); journal.close()
+        prefs.edit().putBoolean(QUIET_FILTER_ENABLED, false).commit()
+    }
+
+    @Test fun refreshHintRequiresSuccessfulCompletePublicationAndIsRevokedOnSuspension() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        context.deleteDatabase("clip-movement.db")
+        File(context.filesDir, "quiet-analysis-v2.json").delete()
+        val journal = MotionJournal(context, backgroundScope)
+        val root = File(context.cacheDir, "policy-refresh-publication").apply { mkdirs() }
+        var destination: File? = root
+        val policy = ClipTransferPolicy(context, journal, { destination }, { true })
+        val card = "b".repeat(64)
+        assertTrue(policy.needsPromptRefresh())
+        policy.publish(emptyList(), card, "ready", false) { true }
+        assertFalse(policy.needsPromptRefresh())
+        destination = null
+        policy.publish(emptyList(), card, "ready", false) { true }
+        assertTrue(policy.needsPromptRefresh())
+        destination = root
+        policy.publish(emptyList(), card, "unavailable", false) { true }
+        assertTrue(policy.needsPromptRefresh())
+        policy.publish(emptyList(), card, "ready", true) { true }
+        assertTrue(policy.needsPromptRefresh())
+        policy.publish(emptyList(), card, "ready", false) { true }
+        assertFalse(policy.needsPromptRefresh())
+        assertTrue(policy.suspendIndexing("ignition_active"))
+        assertTrue(policy.needsPromptRefresh())
+        policy.stop(); journal.stop(); journal.close()
+    }
+
     @Test fun actualPublisherRequiresBothAnalysesFreshIdentityAndPersistentCoverageAndDisablesImmediately() = runTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         context.deleteDatabase("clip-movement.db")
@@ -425,7 +513,8 @@ class ClipTransferPolicyTest {
                 analyses++; return quiet()
             }
         }
-        val clock: () -> Long = System::currentTimeMillis
+        var currentNow = System.currentTimeMillis()
+        val clock: () -> Long = { currentNow }
         // A refusal cached by the former 85C/MODERATE resource policy must be
         // re-evaluated under the new policy, never inherited forever by this identity.
         val legacyEntries = items.map { item ->
@@ -438,14 +527,24 @@ class ClipTransferPolicyTest {
         File(context.filesDir, "quiet-analysis-v2.json").writeText(
             JSONObject().put("entries", JSONArray(legacyEntries)).toString())
         val policy = ClipTransferPolicy(context, journal, { root }, { true }, fake, clock)
+        assertTrue(policy.needsPromptRefresh())
         policy.publish(items.map { it.copy(stable = false, freshFingerprint = false) }, "b".repeat(64), "ready", false) { true }
         assertEquals(0, analyses); assertEquals(2, policy.deferCount)
         File(System.getProperty("java.io.tmpdir"), "transfer-policy-defer-v1-android.json")
             .writeText(JSONObject(File(root, "movement/transfer-policy.json").readText()).toString(2))
+        // Fingerprint rotation must retain the short cadence for an eligible analysis backlog.
+        policy.publish(items.map { it.copy(freshFingerprint = false) }, "b".repeat(64), "ready", false) { true }
+        assertEquals(0, analyses); assertTrue(policy.needsPromptRefresh())
         policy.publish(items, "b".repeat(64), "ready", false) { true }
         assertEquals(1, analyses); assertEquals(0, policy.skipCount); assertEquals(2, policy.deferCount)
+        assertTrue(policy.needsPromptRefresh())
         policy.publish(items, "b".repeat(64), "ready", false) { true }
         assertEquals(2, analyses); assertEquals(2, policy.skipCount)
+        assertFalse(policy.needsPromptRefresh())
+        currentNow--
+        assertTrue(policy.needsPromptRefresh())
+        currentNow++
+        assertFalse(policy.needsPromptRefresh())
         val report = File(root, "movement/transfer-policy.json")
         assertTrue(report.length() <= MOVEMENT_REPORT_MAX_BYTES)
         // Actual Android output is shared with the backend parser contract test.
@@ -462,6 +561,12 @@ class ClipTransferPolicyTest {
         asynchronous.publish(items, "b".repeat(64), "ready", false) { true }
         runCurrent()
         assertEquals(1, asynchronousCalls)
+        assertFalse(asynchronous.needsPromptRefresh())
+        // An active decoder does not postpone the original six-minute transfer deadline.
+        val originalNow = currentNow
+        currentNow = start + 30_000 + QUIET_TRANSFER_DEFER_MS
+        assertTrue(asynchronous.needsPromptRefresh())
+        currentNow = originalNow
         // A slow decoder never blocks metadata/pending publication and never launches a second decoder.
         repeat(3) { asynchronous.publish(items, "b".repeat(64), "ready", false) { true } }
         assertEquals(1, asynchronousCalls); assertEquals(2, asynchronous.deferCount)
@@ -472,6 +577,7 @@ class ClipTransferPolicyTest {
         val blocker = File(blockedCache, "prevent-replacement").apply { writeText("synthetic cache obstruction") }
         gate.complete(quiet()); runCurrent()
         assertEquals("unavailable", asynchronous.state)
+        assertTrue(asynchronous.needsPromptRefresh())
         asynchronous.publish(items, "b".repeat(64), "ready", false) { true }
         assertEquals(0, asynchronous.skipCount); assertEquals(0, asynchronous.deferCount)
         assertEquals(2, asynchronous.uploadCount); assertEquals(1, asynchronousCalls)
@@ -485,6 +591,9 @@ class ClipTransferPolicyTest {
         policy.publish(items.map { it.copy(freshFingerprint = false) }, "b".repeat(64), "ready", false) { true }
         // Cached content proof remains advisory until the server recomputes the current sampled hash.
         assertEquals(2, policy.skipCount)
+        assertFalse(policy.needsPromptRefresh())
+        policy.pauseIndexing()
+        assertTrue(policy.needsPromptRefresh())
         policy.publish(items, "b".repeat(64), "ready", false) { false }
         assertEquals(0, policy.skipCount)
         db.execSQL("INSERT INTO coverage_gaps(start_ms,end_ms) VALUES(?,?)", arrayOf(start + 10_000, start + 20_000))

@@ -318,7 +318,9 @@ class ObdLoggerService : Service() {
         } catch (error: Exception) {
             if (error is CancellationException) throw error
             startupAllowed = false
-            val config = runCatching { LoggerPreferences.load(this@ObdLoggerService) }.getOrNull()
+            val config = runCatching {
+                LoggerPreferences.load(this@ObdLoggerService, includeWebhookCredential = false)
+            }.getOrNull()
             val message = safeError(error)
             runCatching {
                 StatusPublisher.error(
@@ -496,7 +498,9 @@ class ObdLoggerService : Service() {
                 recovered = false
                 recoveryReason = "process_terminated"
                 val message = safeError(error)
-                val statusConfig = config ?: runCatching { LoggerPreferences.load(this) }.getOrNull()
+                val statusConfig = config ?: runCatching {
+                    LoggerPreferences.load(this, includeWebhookCredential = false)
+                }.getOrNull()
                 val root = DeviceFiles.removableRootOrNull(this)
                 val request = root?.let(::readIngestionRequest)
                 retryDeviceRoot = root
@@ -932,7 +936,9 @@ class ObdLoggerService : Service() {
             val reason = when (error) {
                 is PollTrialFallbackException -> "poll_trial_fallback"
                 is CancellationException -> if (
-                    runCatching { LoggerPreferences.load(this).canRun }.getOrDefault(true)
+                    runCatching {
+                        LoggerPreferences.load(this, includeWebhookCredential = false).canRun
+                    }.getOrDefault(true)
                 ) {
                     "process_terminated"
                 } else {
@@ -2113,7 +2119,9 @@ class ObdLoggerService : Service() {
         try {
             recordRetentionPrune(exporter.enforceRetention())
         } catch (error: Exception) {
-            val config = runCatching { LoggerPreferences.load(this) }.getOrNull()
+            val config = runCatching {
+                LoggerPreferences.load(this, includeWebhookCredential = false)
+            }.getOrNull()
             if (config != null) {
                 runCatching {
                     StatusPublisher.error(
@@ -2138,7 +2146,9 @@ class ObdLoggerService : Service() {
         try {
             exportWithEvent(driveId)
         } catch (error: Exception) {
-            val config = runCatching { LoggerPreferences.load(this) }.getOrNull()
+            val config = runCatching {
+                LoggerPreferences.load(this, includeWebhookCredential = false)
+            }.getOrNull()
             if (error is RemovableStorageUnavailableException && config != null) {
                 publish("storage_unavailable", config, safeError(error))
             } else if (config != null) {
@@ -2484,6 +2494,7 @@ class ObdLoggerService : Service() {
     private var lastWebhookDispatchAtMillis = 0L
 
     private fun dispatchIngestWebhook() {
+        if (!LoggerPreferences.load(this, includeWebhookCredential = false).webhookEnabled) return
         val config = LoggerPreferences.load(this)
         if (!config.webhookEnabled) return
         val configurationError = webhookConfigurationError(config)

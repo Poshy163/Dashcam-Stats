@@ -35,6 +35,7 @@ import java.time.format.DateTimeFormatter
 import java.time.format.ResolverStyle
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 import kotlin.math.min
 
@@ -45,6 +46,7 @@ internal const val MOVEMENT_TREE_URI = "dcim_tree_uri"
 internal const val MOVEMENT_GPS_ENABLED = "passive_gps_enabled"
 internal const val DRIVING_METADATA_INTERVAL_MS = 60_000L
 internal const val DRIVING_METADATA_MAX_ROWS = 128
+internal const val PARKED_FULL_REFRESH_MS = 30_000L
 
 // Built once. The indexer parses every row of the DCIM listing -- up to four thousand per
 // folder -- on each pass, and a parked pass repeats every few seconds. It was compiling
@@ -191,12 +193,22 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
                                  canAnalyze: () -> Boolean = { false },
                                  private val workMode: () -> ClipIndexWorkMode = { ClipIndexWorkMode.PARKED },
                                  private val elapsedMs: () -> Long = SystemClock::elapsedRealtime,
+                                 private val wallMs: () -> Long = System::currentTimeMillis,
                                  private val reportRoot: () -> File? = { DeviceFiles.removableRootOrNull(context) }) {
     @Volatile var state = "directory_required"
         private set
     @Volatile var clipCount = 0
         private set
     private val wake = Channel<Unit>(Channel.CONFLATED)
+    private val refreshRequests = AtomicLong()
+    private data class ParkedInventory(val tree: String, val timezone: String, val enabled: Boolean,
+                                       val gapGeneration: Long, val truncated: Boolean, val clips: List<MovementClip>)
+    private var lastParkedInventory: ParkedInventory? = null
+    private var lastParkedRefreshMs: Long? = null
+    private var lastParkedWallMs: Long? = null
+    private var lastRefreshRequest = -1L
+    private var settlingClips = false
+    private var fingerprintBacklog = false
     private val seen = mutableMapOf<String, Pair<Long, Long>>()
     private val fingerprints = mutableMapOf<String, JSONObject>()
     private val fingerprintScan = mutableMapOf<String, Long>()
@@ -210,12 +222,12 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
     @Volatile private var fullScanGeneration = 0L
     private val queryCancellations = ConcurrentHashMap.newKeySet<CancellationSignal>()
     @Volatile private var stopping = false
-    val transferPolicy = ClipTransferPolicy(context, journal, reportRoot, canAnalyze,
-        analysisScope = scope, afterAnalysis = { wake.trySend(Unit) },
+    val transferPolicy = ClipTransferPolicy(context, journal, reportRoot, canAnalyze, wallMs = wallMs,
+        analysisScope = scope, afterAnalysis = { requestFullRefresh() },
         indexingAllowed = { workMode() == ClipIndexWorkMode.PARKED && workGeneration == fullScanGeneration })
     private val preferences = context.getSharedPreferences(MOVEMENT_TREE_PREFERENCES, Context.MODE_PRIVATE)
     private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-        if (key == QUIET_FILTER_ENABLED || key == MOVEMENT_TREE_URI) wake.trySend(Unit)
+        if (key == QUIET_FILTER_ENABLED || key == MOVEMENT_TREE_URI) requestFullRefresh()
     }
     init { preferences.registerOnSharedPreferenceChangeListener(preferenceListener) }
     private val worker: Job = scope.launch {
@@ -227,7 +239,7 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
             val priority = android.os.Process.getThreadPriority(android.os.Process.myTid())
             try {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
-                try { scan() } catch (error: Exception) {
+                try { scan(forceRefresh = false) } catch (error: Exception) {
                     if (error is CancellationException) throw error
                     if (workMode() != ClipIndexWorkMode.PARKED) deferWork(workMode())
                     else { state = "scan_failed"; runCatching { publish(emptyList(), null, true) } }
@@ -268,7 +280,8 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
         } finally { queryCancellations.remove(cancellation) }
     }
 
-    internal suspend fun scan() {
+    /** An explicit scan refreshes evidence; periodic checks may reuse a recent full pass. */
+    internal suspend fun scan(forceRefresh: Boolean = true) {
         val mode = workMode()
         observedWorkMode = mode
         try {
@@ -277,7 +290,7 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
                 if (mode == ClipIndexWorkMode.DRIVING_OR_UNKNOWN) refreshDrivingMetadata()
                 return
             }
-            scanParked()
+            scanParked(forceRefresh)
         } catch (_: ClipIndexWorkDeferred) { deferWork(workMode()) }
     }
 
@@ -285,6 +298,11 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
         if (stopping) throw CancellationException("Clip indexer stopped")
         if (workMode() != ClipIndexWorkMode.PARKED || workGeneration != fullScanGeneration)
             throw ClipIndexWorkDeferred()
+    }
+
+    internal fun requestFullRefresh() {
+        refreshRequests.incrementAndGet()
+        wake.trySend(Unit)
     }
 
     /** Called after the existing ACC observation; this never performs disk or provider IO. */
@@ -297,7 +315,7 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
             transferPolicy.pauseIndexing()
             queryCancellations.forEach { it.cancel() }
         }
-        wake.trySend(Unit)
+        requestFullRefresh()
     }
 
     private fun deferWork(mode: ClipIndexWorkMode) {
@@ -338,8 +356,11 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
         // fingerprints or visual results; the next parked full pass reconciles them.
     }
 
-    private suspend fun scanParked() {
+    private suspend fun scanParked(forceRefresh: Boolean) {
         fullScanGeneration = workGeneration
+        val refreshRequest = refreshRequests.get()
+        // Capture before reading evidence: a concurrent gap must invalidate the next pass.
+        val gapGeneration = journal.gapGeneration
         ensureFullWorkAllowed()
         val tree = MovementTreeAccess.selected(context)
         if (tree == null) { state = "directory_required"; publish(emptyList(), null, false); return }
@@ -360,13 +381,37 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
         }
         val sorted = entries.sortedByDescending { it.localStart }.take(MOVEMENT_REPORT_MAX_CLIPS)
         val zone = ZoneId.systemDefault()
+        val newest = entries.groupBy { it.camera }.mapValues { (_, clips) -> clips.maxOf { it.localStart } }
+        // The newest clip has no closing bound and can never authorize an exclusion.
+        // Its normal growth alone need not reclassify every older clip. A new path,
+        // a removed path or any closed-clip metadata change still refreshes at once.
+        val inventory = ParkedInventory(tree.toString(), zone.id, transferPolicy.enabled, gapGeneration, directoryTruncated,
+            entries.map { if (it.localStart == newest[it.camera]) it.copy(size = 0, mtime = 0) else it }
+                .sortedWith(compareBy({ it.relativePath }, { it.id })))
+        val elapsed = elapsedMs()
+        val now = wallMs()
+        val lastRefresh = lastParkedRefreshMs
+        if (!forceRefresh && state == "ready" && inventory == lastParkedInventory &&
+            refreshRequest == lastRefreshRequest && lastRefresh != null &&
+            elapsed >= lastRefresh && elapsed - lastRefresh < PARKED_FULL_REFRESH_MS &&
+            lastParkedWallMs?.let { now >= it &&
+                (now - it) - (elapsed - lastRefresh) in -2_000L..2_000L } == true &&
+            !settlingClips && !fingerprintBacklog && !transferPolicy.needsPromptRefresh() &&
+            reportRoot()?.let { File(it, "movement/report.json").isFile &&
+                File(it, "movement/transfer-policy.json").isFile } == true) {
+            ensureFullWorkAllowed()
+            // Retain the ordinary five-second stability observation for growing clips,
+            // so the next filename can close them without an extra settling delay.
+            entries.forEach { seen["$cardId/${it.relativePath}"] = it.size to it.mtime }
+            return
+        }
         val output = mutableListOf<JSONObject>()
         val policyClips = mutableListOf<PolicyClip>()
         scanNumber += 1
         data class Inspection(val clip: MovementClip, val stable: Boolean, val start: Long?, val end: Long?,
                               val bounded: Boolean, val timeSafe: Boolean, val assessment: MotionAssessment,
                               val fingerprintEligible: Boolean)
-        val inspectedAt = System.currentTimeMillis()
+        val inspectedAt = now
         val inspections = sorted.map { clip ->
             currentCoroutineContext().ensureActive()
             ensureFullWorkAllowed()
@@ -441,6 +486,17 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
         state = "ready"; clipCount = output.size
         publish(output, cardId, directoryTruncated || entries.size > output.size, policyClips)
         deferredPublication = null
+        if (state == "ready") {
+            lastParkedInventory = inventory
+            lastParkedRefreshMs = elapsedMs()
+            lastParkedWallMs = wallMs()
+            lastRefreshRequest = refreshRequest
+            settlingClips = inspections.any { !it.stable && it.end != null }
+            fingerprintBacklog = inspections.any {
+                it.stable && it.fingerprintEligible &&
+                    "$cardId/${it.clip.relativePath}/${it.clip.size}/${it.clip.mtime}" !in fingerprintScan
+            }
+        }
     }
 
     private fun unchanged(tree: Uri, clip: MovementClip): Boolean {
@@ -494,7 +550,7 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
         ensureFullWorkAllowed()
         val report = JSONObject().put("schema_version", 1).put("source_id", journal.sourceId)
             .put("card_id", cardId ?: JSONObject.NULL).put("session_id", journal.sessionId).put("boot_id", journal.bootId)
-            .put("generated_at_utc", Instant.now().toString()).put("producer_version", BuildConfig.VERSION_NAME)
+            .put("generated_at_utc", Instant.ofEpochMilli(wallMs()).toString()).put("producer_version", BuildConfig.VERSION_NAME)
             .put("classifier_version", 1).put("report_only", true).put("truncated", truncated)
             .put("coverage_start_utc", bounds.first ?: JSONObject.NULL).put("coverage_end_utc", bounds.second ?: JSONObject.NULL)
             .put("status", state).put("clips", JSONArray(clips))

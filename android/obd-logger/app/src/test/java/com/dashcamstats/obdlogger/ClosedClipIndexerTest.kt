@@ -251,6 +251,201 @@ class ClosedClipIndexerTest {
         } finally { indexer.stop(); journal.stop(); journal.close() }
     }
 
+    @Test fun unchangedPeriodicChecksAvoidFingerprintAndReportWorkButRecheckIdenticalMetadataWithinThirtySeconds() = runTest {
+        val provider = provider("bounded-refresh")
+        val journal = MotionJournal(context, backgroundScope)
+        val root = File(context.cacheDir, "bounded-refresh-report").apply { mkdirs() }
+        var elapsed = 0L
+        val indexer = ClosedClipIndexer(context, journal, backgroundScope,
+            elapsedMs = { elapsed }, wallMs = { 1_792_541_460_000L + elapsed }) { root }
+        try {
+            indexer.scan(forceRefresh = false)
+            elapsed = 5_000
+            indexer.scan(forceRefresh = false) // The settling pass is not throttled.
+            val report = File(root, "movement/report.json")
+            val policy = File(root, "movement/transfer-policy.json")
+            val previous = report.readText()
+            val previousPolicy = policy.readText()
+            val opened = provider.fileOpens
+            val queries = provider.queries
+            val file = File(context.cacheDir, "bounded-refresh/20261020190000_camera_0.ts")
+            file.writeBytes(ByteArray(1024) { 0x48 }) // Same size and provider mtime.
+            for (next in listOf(10_000L, 15_000L, 20_000L, 25_000L, 30_000L)) {
+                elapsed = next
+                indexer.scan(forceRefresh = false)
+                assertEquals(opened, provider.fileOpens)
+                assertEquals(previous, report.readText())
+                assertEquals(previousPolicy, policy.readText())
+            }
+            assertEquals(queries + 15, provider.queries) // Discovery still reads all three directories.
+            elapsed = 35_000
+            indexer.scan(forceRefresh = false)
+            assertTrue(provider.fileOpens > opened)
+            fun digest(text: String): String {
+                val clips = JSONObject(text).getJSONArray("clips")
+                return (0 until clips.length()).map { clips.getJSONObject(it) }
+                    .single { it.getString("relative_path").endsWith("20261020190000_camera_0.ts") }
+                    .getJSONObject("fingerprint").getString("digest")
+            }
+            assertNotEquals(digest(previous), digest(report.readText()))
+        } finally { indexer.stop(); journal.stop(); journal.close() }
+    }
+
+    @Test fun growingOpenClipDoesNotRescanHistoryButNewNamesAndClosedChangesStillRefreshAndSettle() = runTest {
+        val provider = provider("inventory-refresh")
+        val journal = MotionJournal(context, backgroundScope)
+        val root = File(context.cacheDir, "inventory-refresh-report").apply { mkdirs() }
+        var elapsed = 0L
+        val indexer = ClosedClipIndexer(context, journal, backgroundScope,
+            elapsedMs = { elapsed }, wallMs = { 1_792_541_460_000L + elapsed }) { root }
+        try {
+            indexer.scan(forceRefresh = false)
+            elapsed = 5_000; indexer.scan(forceRefresh = false)
+            val name = "20261020190200_camera_0.ts"
+            val growing = File(context.cacheDir, "inventory-refresh/$name").apply { writeBytes(ByteArray(1024)) }
+            provider.names.add(name)
+            elapsed = 10_000; indexer.scan(forceRefresh = false)
+            val report = File(root, "movement/report.json")
+            assertEquals(7, JSONObject(report.readText()).getJSONArray("clips").length())
+            val afterDiscovery = report.readText()
+            val opened = provider.fileOpens
+            growing.appendBytes(ByteArray(1024))
+            elapsed = 15_000; indexer.scan(forceRefresh = false)
+            assertEquals(opened, provider.fileOpens)
+            assertEquals(afterDiscovery, report.readText())
+
+            val closedName = "20261020190000_camera_0.ts"
+            File(context.cacheDir, "inventory-refresh/$closedName").appendBytes(byteArrayOf(1))
+            fun row(): JSONObject {
+                val clips = JSONObject(report.readText()).getJSONArray("clips")
+                return (0 until clips.length()).map { clips.getJSONObject(it) }
+                    .single { it.getString("relative_path").endsWith(closedName) }
+            }
+            elapsed = 20_000; indexer.scan(forceRefresh = false)
+            assertEquals(1025, row().getInt("size_bytes"))
+            assertTrue(row().getJSONArray("reasons").toString().contains("file_unstable"))
+            elapsed = 25_000; indexer.scan(forceRefresh = false)
+            assertFalse(row().getJSONArray("reasons").toString().contains("file_unstable"))
+
+            provider.names.remove(closedName)
+            elapsed = 26_000; indexer.scan(forceRefresh = false)
+            assertEquals(6, JSONObject(report.readText()).getJSONArray("clips").length())
+        } finally { indexer.stop(); journal.stop(); journal.close() }
+    }
+
+    @Test fun refreshRequestsClockChangesSettingsAndStorageRecoveryBypassTheThrottle() = runTest {
+        val provider = provider("refresh-invalidation")
+        val journal = MotionJournal(context, backgroundScope)
+        val root = File(context.cacheDir, "refresh-invalidation-report").apply { mkdirs() }
+        var elapsed = 0L
+        var wall = 1_792_541_460_000L
+        var available = true
+        val indexer = ClosedClipIndexer(context, journal, backgroundScope,
+            elapsedMs = { elapsed }, wallMs = { wall }) { root.takeIf { available } }
+        try {
+            indexer.scan(forceRefresh = false)
+            elapsed = 5_000; wall += 5_000; indexer.scan(forceRefresh = false)
+            val opened = provider.fileOpens
+            elapsed = 6_000; wall += 1_000
+            indexer.requestFullRefresh() // The same wake used by completed visual analysis.
+            indexer.scan(forceRefresh = false)
+            assertTrue(provider.fileOpens > opened)
+            val afterWake = provider.fileOpens
+            elapsed = 7_000; wall -= 2_000
+            indexer.scan(forceRefresh = false)
+            assertTrue(provider.fileOpens > afterWake)
+            val afterRollback = provider.fileOpens
+            context.getSharedPreferences(MOVEMENT_TREE_PREFERENCES, Context.MODE_PRIVATE).edit()
+                .putBoolean(QUIET_FILTER_ENABLED, false).commit()
+            elapsed = 8_000; wall += 3_000; indexer.scan(forceRefresh = false)
+            assertTrue(provider.fileOpens > afterRollback)
+            assertFalse(JSONObject(File(root, "movement/transfer-policy.json").readText()).getBoolean("enabled"))
+            available = false
+            elapsed = 9_000; wall += 1_000; indexer.scan(forceRefresh = false)
+            assertEquals("storage_unavailable", indexer.state)
+            available = true
+            elapsed = 10_000; wall += 1_000; indexer.scan(forceRefresh = false)
+            assertEquals("ready", indexer.state)
+            provider.denied = true
+            elapsed = 11_000; wall += 1_000; indexer.scan(forceRefresh = false)
+            assertEquals("directory_unavailable", indexer.state)
+            provider.denied = false
+            elapsed = 12_000; wall += 1_000; indexer.scan(forceRefresh = false)
+            assertEquals("ready", indexer.state)
+            val afterRecovery = provider.fileOpens
+            elapsed = 13_000; wall += 60_000; indexer.scan(forceRefresh = false)
+            assertTrue(provider.fileOpens > afterRecovery)
+            val afterForwardJump = provider.fileOpens
+            // Wall time still advances, but much less than the monotonic interval.
+            elapsed = 18_000; wall += 1_000; indexer.scan(forceRefresh = false)
+            assertTrue(provider.fileOpens > afterForwardJump)
+        } finally { indexer.stop(); journal.stop(); journal.close() }
+    }
+
+    @Test fun everyNewJournalGapInvalidatesAnOtherwiseUnchangedParkedPass() = runTest {
+        val provider = provider("journal-gap-refresh")
+        val journal = MotionJournal(context, backgroundScope)
+        val root = File(context.cacheDir, "journal-gap-report").apply { mkdirs() }
+        var elapsed = 0L
+        val indexer = ClosedClipIndexer(context, journal, backgroundScope,
+            elapsedMs = { elapsed }, wallMs = { 1_792_541_460_000L + elapsed }) { root }
+        try {
+            indexer.scan(forceRefresh = false)
+            elapsed = 5_000; indexer.scan(forceRefresh = false)
+            val opened = provider.fileOpens
+            elapsed = 10_000; indexer.scan(forceRefresh = false)
+            assertEquals(opened, provider.fileOpens)
+            // The writer has not run: overflow the actual bounded observation channel.
+            repeat(257) { journal.acc(false) }
+            assertTrue(journal.failed)
+            val firstGap = journal.gapGeneration
+            assertTrue(firstGap > 0)
+            elapsed = 15_000; indexer.scan(forceRefresh = false)
+            assertTrue(provider.fileOpens > opened)
+            val afterGap = provider.fileOpens
+            elapsed = 20_000; indexer.scan(forceRefresh = false)
+            assertEquals(afterGap, provider.fileOpens)
+            journal.acc(false)
+            assertTrue(journal.gapGeneration > firstGap)
+            elapsed = 25_000; indexer.scan(forceRefresh = false)
+            assertTrue(provider.fileOpens > afterGap)
+        } finally { indexer.stop(); journal.stop(); journal.close() }
+    }
+
+    @Test fun ingestionAndIgnitionChangesRevokeCachedPolicyAndWakeAnImmediateParkedRefresh() = runTest {
+        val provider = provider("throttled-mode-wake")
+        val journal = MotionJournal(context, backgroundScope)
+        val root = File(context.cacheDir, "throttled-mode-wake-report").apply { mkdirs() }
+        var mode = ClipIndexWorkMode.PARKED
+        val indexer = ClosedClipIndexer(context, journal, backgroundScope,
+            workMode = { mode }, elapsedMs = { testScheduler.currentTime },
+            wallMs = { 1_792_541_460_000L + testScheduler.currentTime }) { root }
+        try {
+            advanceTimeBy(10_000); runCurrent()
+            val opened = provider.fileOpens
+            advanceTimeBy(5_000); runCurrent()
+            assertEquals(opened, provider.fileOpens)
+            for (away in listOf(ClipIndexWorkMode.INGESTION, ClipIndexWorkMode.DRIVING_OR_UNKNOWN)) {
+                mode = away; indexer.notifyWorkModeChanged(); runCurrent()
+                assertEquals(0, JSONObject(File(root, "movement/transfer-policy.json").readText())
+                    .getJSONArray("decisions").length())
+                val before = provider.fileOpens
+                mode = ClipIndexWorkMode.PARKED; indexer.notifyWorkModeChanged(); runCurrent()
+                assertEquals("ready", indexer.state)
+                assertTrue(provider.fileOpens > before)
+            }
+            provider.onChildren = {
+                provider.onChildren = null
+                mode = ClipIndexWorkMode.INGESTION; indexer.notifyWorkModeChanged()
+                throw OperationCanceledException("ingestion began during lightweight discovery")
+            }
+            advanceTimeBy(5_000); runCurrent()
+            assertEquals("ingestion_deferred", indexer.state)
+            assertEquals(0, JSONObject(File(root, "movement/transfer-policy.json").readText())
+                .getJSONArray("decisions").length())
+        } finally { indexer.stop(); journal.stop(); journal.close() }
+    }
+
     private fun provider(directory: String): TestProvider {
         val provider = TestProvider(File(context.cacheDir, directory).apply { mkdirs() })
         provider.attachInfo(context, ProviderInfo().apply { authority = "movement.test" })
@@ -270,7 +465,7 @@ class ClosedClipIndexerTest {
         val sortOrders = mutableListOf<String?>()
         var onChildren: (() -> Unit)? = null
         var onOpen: (() -> Unit)? = null
-        private val names = listOf("20261020190000_camera_0.ts", "20261020190100_camera_0.ts",
+        val names = mutableListOf("20261020190000_camera_0.ts", "20261020190100_camera_0.ts",
             "20261020190002_camera_1.ts", "20261020190102_camera_1.ts")
         private val locked = "20261020185900_camera_0.ts"
         private val orphan = "pre_20261020190200_camera_1.ts"

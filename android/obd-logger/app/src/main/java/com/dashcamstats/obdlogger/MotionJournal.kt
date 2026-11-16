@@ -19,6 +19,7 @@ import java.security.MessageDigest
 import java.time.Instant
 import java.time.ZoneId
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 internal const val MOTION_MAX_GAP_MS = 10_000L
@@ -76,6 +77,8 @@ internal class MotionJournal(context: Context, scope: CoroutineScope? = null) :
     private val writerScope = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val pending = Channel<MotionObservation>(256)
     private val pendingGaps = mutableListOf<Pair<Long, Long>>()
+    private val gapRevision = AtomicLong()
+    val gapGeneration: Long get() = gapRevision.get()
     private val writer: Job
     val sourceId: String
     val sessionId = UUID.randomUUID().toString()
@@ -163,6 +166,7 @@ internal class MotionJournal(context: Context, scope: CoroutineScope? = null) :
                 val a = pendingGaps.removeAt(0); val b = pendingGaps.removeAt(0)
                 pendingGaps.add(0, minOf(a.first, b.first) to maxOf(a.second, b.second))
             }
+            gapRevision.incrementAndGet()
         }
     }
 

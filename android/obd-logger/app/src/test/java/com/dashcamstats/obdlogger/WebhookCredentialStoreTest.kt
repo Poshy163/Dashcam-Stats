@@ -155,6 +155,37 @@ class WebhookCredentialStoreTest {
     }
 
     @Test
+    fun nonSecretReadsPreserveRunEligibilityAndBackupSleepConfiguration() {
+        val saved = LoggerConfig(
+            enabled = true,
+            ownershipTransferred = true,
+            adapterAddress = "AA:BB:CC:DD:EE:FF",
+            vehicleId = "vehicle",
+            loggerId = "logger",
+            voltageOn = 13.5,
+            voltageOff = 12.8,
+            offGraceSeconds = 45,
+            parkedIntervalSeconds = 60,
+            backupAwakeSeconds = 1_500,
+            idleAwakeSeconds = 180,
+            webhookApiKey = "configured-value",
+        )
+        LoggerPreferences.save(context, saved, store)
+        val full = LoggerPreferences.load(context, store)
+        val encrypted = prefs.getString(WebhookCredentialStore.ENCRYPTED_KEY, null)
+
+        val nonSecret = LoggerPreferences.load(context, includeWebhookCredential = false)
+        assertEquals(full.copy(webhookApiKey = "", webhookCredentialError = null), nonSecret)
+        assertTrue(nonSecret.canRun)
+        assertEquals(encrypted, prefs.getString(WebhookCredentialStore.ENCRYPTED_KEY, null))
+
+        // Cancellation classification must still see an explicit OFF without reading the key.
+        prefs.edit().putBoolean("enabled", false).commit()
+        assertFalse(LoggerPreferences.load(context, includeWebhookCredential = false).canRun)
+        assertEquals("configured-value", store.load().value)
+    }
+
+    @Test
     fun startupGateDoesNotWaitForCredentialLoadMonitor() {
         val entered = java.util.concurrent.CountDownLatch(1)
         val release = java.util.concurrent.CountDownLatch(1)
