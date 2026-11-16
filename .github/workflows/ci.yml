@@ -145,7 +145,15 @@ jobs:
       - name: Pytest
         env:
           PYTHONPATH: backend
-        run: pytest tests -n auto --tb=short --durations=15
+        run: pytest tests -n auto -m "not alone_in_proc" --tb=short --durations=15
+
+      # The codec lock cases prove process absence from the runner's real /proc, which the
+      # other xdist workers fill with forks and execs. A correct recovery was refused as
+      # unprovable on two of six consecutive pushes; alone, nothing else is spawning.
+      - name: Pytest (cases that need /proc to themselves)
+        env:
+          PYTHONPATH: backend
+        run: pytest tests/test_carplay_codec_lock.py -m alone_in_proc --tb=short --durations=5
 
   frontend:
     name: Frontend (lint + build)

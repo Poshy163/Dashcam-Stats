@@ -18,6 +18,20 @@ from app.ingest import carplay_timing
 
 SOURCE = (Path(__file__).resolve().parents[1] / "backend/app/ingest/carplay_codec.sh").read_text()
 
+# Run without other pytest-xdist workers on the machine.
+#
+# Before the script recovers a stale workspace it proves no legacy helper is alive, and it
+# does that from every process the user owns in /proc: one whose argv or name changes
+# between two reads is refused as unprovable, as it should be on the head unit. On a CI
+# runner the other workers are the same user and spend the whole run forking and exec'ing
+# -- ffmpeg, shells, the watchdog cases next door. That is the likeliest reason a recovery
+# that should say `ok` said `lock_owner_unavailable` on the pushes of 6 and 7 November:
+# both were refused at once rather than at the scan's four-second budget, which rules the
+# timeout out and leaves a process seen mid-change. It has not been reproduced off CI.
+# The lease below only keeps these cases apart from each other; it cannot quiet the rest
+# of the suite. CI therefore runs this module in a pass of its own.
+pytestmark = pytest.mark.alone_in_proc
+
 
 def wait_for(predicate, seconds=20):
     # Returns as soon as the checkpoint appears; the bound only decides when a busy
@@ -852,7 +866,9 @@ def test_parent_crash_during_pinned_chmod_keeps_guard_and_allows_partial_retry(c
                 return False
 
     wait_for(guard_released)
-    assert capture.run(3)["codec_capture_status"] == "ok"
+    # The whole row on failure: `codec_lock_status` names which proof refused.
+    recovered = capture.run(3)
+    assert recovered["codec_capture_status"] == "ok", recovered
     assert not capture.lock.exists()
 
 
