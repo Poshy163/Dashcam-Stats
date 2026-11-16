@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
-from sqlalchemy import func, select
+from sqlalchemy import case, exists, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
 from app.ai.models import describe_models, is_present
@@ -144,6 +146,84 @@ def _feature_status(settings, totals: StatusTotals) -> list[FeatureStatus]:
     ]
 
 
+@dataclass(frozen=True, slots=True)
+class _RecordingRollup:
+    """What ``/api/status`` reads from ``recordings``."""
+
+    states: dict[str, int]
+    recordings: int
+    duration_s: float
+    #: Which recordings currently publish telemetry / detections, and the newest
+    #: ``processed_at``. See :func:`_recording_rollup` for why these three.
+    telemetry_stamp: tuple
+    detection_stamp: tuple
+
+
+async def _recording_rollup(session: AsyncSession) -> _RecordingRollup:
+    """Everything the dashboard needs from ``recordings``, in one pass over it.
+
+    This used to be six statements, each walking the table: the visible count, the total
+    duration, the per-state counts, and one more inside each of the two cache fingerprints.
+    A recording row carries its whole ffprobe document, so the table is larger than the
+    page cache and every one of those walks reads it again from the top -- every ten
+    seconds, for as long as a dashboard is open, competing with the workers for the same
+    file. They all filter on the same handful of columns, so they are one ``GROUP BY``.
+
+    The last three columns are the recording side of the stamp the two memoised totals are
+    kept against. Counting ``telemetry_points`` to decide whether a count of
+    ``telemetry_points`` is still good costs as much as the count; what is needed is only
+    something that moves whenever that count could:
+
+    * a row is added -- the newest id in the table rises (read separately, and free: it
+      is the end of the primary key);
+    * a recording starts or stops being visible -- how many are, and the sum of their
+      ids. Both, because a count alone cannot tell one being hidden from another being
+      restored, and a sum alone cannot tell one going from two others with the same total
+      arriving;
+    * a recording's rows are replaced by fewer -- nothing above need move, but that is a
+      reprocess, and a reprocess ends by stamping ``processed_at``.
+    """
+
+    def tally(condition, value=1):
+        return func.coalesce(func.sum(case((condition, value), else_=0)), 0)
+
+    publishes_telemetry = visible_revision(Recording.telemetry_revision)
+    publishes_detection = visible_revision(Recording.detection_revision)
+    rows = (
+        await session.execute(
+            select(
+                Recording.state,
+                func.count(Recording.id),
+                tally(Recording.file_missing.is_(False)),
+                func.coalesce(func.sum(Recording.duration_s), 0.0),
+                tally(publishes_telemetry),
+                tally(publishes_telemetry, Recording.id),
+                tally(publishes_detection),
+                tally(publishes_detection, Recording.id),
+                func.max(Recording.processed_at),
+            )
+            .where(Recording.ignored.is_(False))
+            .group_by(Recording.state)
+        )
+    ).all()
+    newest_processed = max((row[8] for row in rows if row[8] is not None), default=None)
+    return _RecordingRollup(
+        states={row[0].value: int(row[1]) for row in rows},
+        recordings=sum(int(row[2]) for row in rows),
+        duration_s=sum(float(row[3] or 0.0) for row in rows),
+        telemetry_stamp=(
+            sum(int(row[4]) for row in rows),
+            sum(int(row[5]) for row in rows),
+            newest_processed,
+        ),
+        detection_stamp=(
+            sum(int(row[6]) for row in rows),
+            sum(int(row[7]) for row in rows),
+            newest_processed,
+        ),
+    )
+
+
 @router.get("/status", response_model=StatusOut)
 async def get_status(session: SessionDep):
     async def count_telemetry() -> int:
@@ -170,17 +250,18 @@ async def get_status(session: SessionDep):
             or 0
         )
 
+    rollup = await _recording_rollup(session)
+    newest_point, newest_track = (
+        await session.execute(
+            select(
+                select(func.max(TelemetryPoint.id)).scalar_subquery(),
+                select(func.max(TrackedObject.id)).scalar_subquery(),
+            )
+        )
+    ).one()
+
     totals = StatusTotals(
-        recordings=int(
-            (
-                await session.execute(
-                    select(func.count(Recording.id)).where(
-                        Recording.file_missing.is_(False), Recording.ignored.is_(False)
-                    )
-                )
-            ).scalar()
-            or 0
-        ),
+        recordings=rollup.recordings,
         # Drives, not journeys. The parked sessions are hidden from the list beside this
         # tile, and a count that included them would disagree with what the page shows.
         journeys=int(
@@ -193,39 +274,39 @@ async def get_status(session: SessionDep):
             ).scalar()
             or 0
         ),
-        # The two million-row joins are memoised against what they are counted from; the
-        # rest are cheap enough to run on every poll, and their inputs (ignored flags,
-        # plate merges) are not in any fingerprint.
-        telemetry_points=await map_cache.cached(
-            session, ("status", "telemetry_points"), count_telemetry
+        # The two million-row joins are memoised against what they are counted from.
+        telemetry_points=await map_cache.cached_for(
+            ("status", "telemetry_points"),
+            (newest_point, *rollup.telemetry_stamp),
+            count_telemetry,
         ),
-        tracked_objects=await map_cache.cached(
-            session,
+        tracked_objects=await map_cache.cached_for(
             ("status", "tracked_objects"),
+            (newest_track, *rollup.detection_stamp),
             count_tracked_objects,
-            fingerprint_of=map_cache.detection_fingerprint,
         ),
+        # Plates with a sighting in a visible recording. Asked plate by plate, because the
+        # first visible sighting settles it: the join this replaces visited every
+        # observation in the library and then threw all but one per plate away. Not
+        # memoised -- a plate merge moves it and is in no stamp -- and it no longer needs
+        # to be.
         plates=int(
             (
                 await session.execute(
-                    select(func.count(func.distinct(Plate.id)))
-                    .join(PlateObservation, PlateObservation.plate_id == Plate.id)
-                    .join(Recording, Recording.id == PlateObservation.recording_id)
-                    .where(visible_revision(Recording.plate_revision))
+                    select(func.count())
+                    .select_from(Plate)
+                    .where(
+                        exists().where(
+                            PlateObservation.plate_id == Plate.id,
+                            PlateObservation.recording_id == Recording.id,
+                            visible_revision(Recording.plate_revision),
+                        )
+                    )
                 )
             ).scalar()
             or 0
         ),
-        duration_s=float(
-            (
-                await session.execute(
-                    select(func.coalesce(func.sum(Recording.duration_s), 0.0)).where(
-                        Recording.ignored.is_(False)
-                    )
-                )
-            ).scalar()
-            or 0.0
-        ),
+        duration_s=rollup.duration_s,
     )
 
     # Cached, because the dashboard polls this every ten seconds and the walk behind it is
@@ -234,14 +315,7 @@ async def get_status(session: SessionDep):
     totals.footage_bytes = used
     totals.footage_files = files
 
-    state_rows = (
-        await session.execute(
-            select(Recording.state, func.count(Recording.id))
-            .where(Recording.ignored.is_(False))
-            .group_by(Recording.state)
-        )
-    ).all()
-    counts = {state.value: int(count) for state, count in state_rows}
+    counts = rollup.states
 
     since = datetime.now(UTC) - timedelta(hours=1)
     processed_last_hour = int(

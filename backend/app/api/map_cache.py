@@ -15,9 +15,10 @@ and update time is a handful of index lookups, which next to the query is free.
 Process-local and bounded. There is one backend process, so this is the only copy that
 matters, and the entry count is capped so a date picker cannot grow it without limit.
 
-The dashboard's heaviest totals (``/api/status``) use the same mechanism: counting every
-telemetry point or tracked object through a join on its recording's revision is most of
-that endpoint's cost, and it is polled every ten seconds.
+The dashboard's heaviest totals (``/api/status``) use the same store with their own, much
+cheaper stamp: that endpoint is polled every ten seconds, and counting a million-row
+table to decide whether a count of it is still good costs as much as the count. See
+``_recording_rollup`` in the system routes.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.visibility import visible_revision
-from app.db.models import Journey, Recording, TelemetryPoint, TrackedObject
+from app.db.models import Journey, Recording, TelemetryPoint
 
 T = TypeVar("T")
 
@@ -51,9 +52,14 @@ async def fingerprint(session: AsyncSession) -> Fingerprint:
       from a retention delete) move one or both.
     * Journeys: count, newest id and latest ``updated_at``. A rebuild replaces the rows;
       a split, merge or motion re-check updates one in place.
-    * Recordings: the latest ``processed_at`` and how many carry a current telemetry
-      revision. Reprocessing and invalidation each move one of these without touching
-      the telemetry table at all.
+    * Recordings: the latest ``processed_at`` and *which* recordings carry a current
+      telemetry revision. Reprocessing and invalidation each move one of these without
+      touching the telemetry table at all.
+
+    "Which" is how many there are and the sum of their ids. The count alone cannot tell
+    one recording being hidden from another being restored in the same interval -- same
+    number, different lines on the map -- and nothing else here moves when that happens.
+    Ids are distinct, so a one-for-one swap always moves their sum.
     """
     row = (
         await session.execute(
@@ -64,34 +70,17 @@ async def fingerprint(session: AsyncSession) -> Fingerprint:
                 select(func.max(Journey.id)).scalar_subquery(),
                 select(func.max(Journey.updated_at)).scalar_subquery(),
                 select(func.max(Recording.processed_at)).scalar_subquery(),
-                select(func.count(Recording.id))
-                .where(visible_revision(Recording.telemetry_revision))
-                .scalar_subquery(),
             )
         )
     ).one()
-    return tuple(row)
-
-
-async def detection_fingerprint(session: AsyncSession) -> Fingerprint:
-    """What the tracked-object count depends on.
-
-    A bare ``count(*)`` is a walk of the smallest index, which is an order of magnitude
-    cheaper than the join it stands in for; the recording-side term catches detection
-    revisions being invalidated without a row changing in ``tracked_objects``.
-    """
-    row = (
+    visible = (
         await session.execute(
-            select(
-                func.count(TrackedObject.id),
-                func.max(TrackedObject.id),
-                select(func.count(Recording.id))
-                .where(visible_revision(Recording.detection_revision))
-                .scalar_subquery(),
+            select(func.count(Recording.id), func.coalesce(func.sum(Recording.id), 0)).where(
+                visible_revision(Recording.telemetry_revision)
             )
         )
     ).one()
-    return tuple(row)
+    return (*row, *visible)
 
 
 async def cached(
@@ -104,10 +93,16 @@ async def cached(
     """Return the memoised value for ``key`` if the library is unchanged, else recompute.
 
     ``fingerprint_of`` names what the value depends on; the default is the map's.
+    """
+    return await cached_for(key, await fingerprint_of(session), compute)
+
+
+async def cached_for(key: tuple, stamp: Fingerprint, compute: Callable[[], Awaitable[T]]) -> T:
+    """:func:`cached` for a caller that already holds the stamp.
+
     Concurrent requests for the same key wait for the first to finish rather than each
     running the query -- two tabs opening the Map page should cost one computation.
     """
-    stamp = await fingerprint_of(session)
     hit = _lookup(key, stamp)
     if hit is not None:
         return hit[0]

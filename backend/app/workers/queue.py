@@ -16,6 +16,7 @@ from pathlib import Path
 
 from sqlalchemy import func, or_, select, true, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.config import get_config
 from app.core.logging import get_logger
@@ -124,6 +125,61 @@ def _current_run():
     """
     epoch = _reset_at
     return true() if epoch is None else ProcessingJob.queued_at >= epoch
+
+
+def _hidden_recordings():
+    """Ids of the recordings taken out of every view. Normally a handful."""
+    # Aliased so it stays a subquery of its own inside a statement that also reads
+    # ``recordings``, rather than being correlated to it.
+    hidden = aliased(Recording)
+    return select(hidden.id).where(hidden.ignored.is_(True))
+
+
+def visible_job():
+    """A job that belongs in the queue's lists and counts: its recording is not hidden.
+
+    Asked as "not one of the hidden recordings" rather than by joining each job to its
+    recording. The answers are the same -- a job's recording always exists, because the
+    foreign key is enforced and cascades -- but the join fetches a recording row for every
+    job in the table, and those rows are the widest in the database. The hidden set is
+    read once, from its index.
+    """
+    return or_(
+        ProcessingJob.recording_id.is_(None),
+        ProcessingJob.recording_id.not_in(_hidden_recordings()),
+    )
+
+
+async def visible_counts(session: AsyncSession, *criteria) -> dict[JobState, int]:
+    """How many :func:`visible_job` jobs match *criteria*, by state.
+
+    Counted as everything less the hidden, because each half is answered from an index
+    alone: the per-state totals from the state index, and the hidden few by walking from
+    their recordings. Filtering each job on its recording instead reads every job row and
+    every recording row to produce five numbers, and the queue's history runs to hundreds
+    of thousands of rows. The pages that ask poll every few seconds.
+
+    *criteria* narrow which jobs are counted (the current run, say). A caller that wants
+    one state takes it from the result rather than passing it in: an equality on the
+    state is the first thing the planner reaches for, and in the second query that turns
+    "the hidden recordings' few jobs" back into "every job in that state".
+    """
+    counts = {
+        state: int(count)
+        for state, count in await session.execute(
+            select(ProcessingJob.state, func.count(ProcessingJob.id))
+            .where(*criteria)
+            .group_by(ProcessingJob.state)
+        )
+    }
+    hidden = await session.execute(
+        select(ProcessingJob.state, func.count(ProcessingJob.id))
+        .where(ProcessingJob.recording_id.in_(_hidden_recordings()), *criteria)
+        .group_by(ProcessingJob.state)
+    )
+    for state, count in hidden:
+        counts[state] = counts.get(state, 0) - int(count)
+    return counts
 
 
 def restore_pause_state() -> bool:
@@ -1173,30 +1229,34 @@ async def stats(session: AsyncSession) -> dict[str, object]:
     the user had just asked for. Jobs from before the last reset are still in the table and
     still in the list below; they are simply no longer part of this run's arithmetic.
     """
-    visible = or_(ProcessingJob.recording_id.is_(None), Recording.ignored.is_(False))
-    rows = (
-        await session.execute(
-            select(ProcessingJob.state, func.count(ProcessingJob.id))
-            .outerjoin(Recording, Recording.id == ProcessingJob.recording_id)
-            .where(visible, _current_run())
-            .group_by(ProcessingJob.state)
-        )
-    ).all()
-    counts = {state.value: int(count) for state, count in rows}
+    counts = {
+        state.value: count
+        for state, count in (await visible_counts(session, _current_run())).items()
+    }
 
     # What is left of the thumbnail-first pass. Reported separately because it is a phase
     # of the run rather than a queue of its own, and because "1,400 waiting" means something
     # quite different when the next hour of it is thumbnails.
+    #
+    # The waiting jobs are found first, by id, and only those rows are then examined.
+    # Asked in one step, the planner weighs "queued or running" against "is a thumbnail"
+    # on the only statistics it has -- an average over every state and every kind --
+    # decides the kind is the more selective, and reads half the table's history to count
+    # jobs that are waiting. Usually none are. The inner query needs nothing but the
+    # state, so the state index answers it without touching the table at all.
+    waiting = aliased(ProcessingJob)
     thumbnails = int(
         (
             await session.execute(
-                select(func.count(ProcessingJob.id))
-                .outerjoin(Recording, Recording.id == ProcessingJob.recording_id)
-                .where(
-                    visible,
-                    _current_run(),
+                select(func.count(ProcessingJob.id)).where(
+                    ProcessingJob.id.in_(
+                        select(waiting.id).where(
+                            waiting.state.in_([JobState.QUEUED, JobState.RUNNING])
+                        )
+                    ),
                     ProcessingJob.kind == JobKind.THUMBNAIL,
-                    ProcessingJob.state.in_([JobState.QUEUED, JobState.RUNNING]),
+                    visible_job(),
+                    _current_run(),
                 )
             )
         ).scalar()
@@ -1213,12 +1273,7 @@ async def stats(session: AsyncSession) -> dict[str, object]:
                     ProcessingJob.state == JobState.COMPLETED,
                     ProcessingJob.finished_at >= midnight,
                     _current_run(),
-                    or_(
-                        ProcessingJob.recording_id.is_(None),
-                        ProcessingJob.recording_id.in_(
-                            select(Recording.id).where(Recording.ignored.is_(False))
-                        ),
-                    ),
+                    visible_job(),
                 )
             )
         ).scalar()

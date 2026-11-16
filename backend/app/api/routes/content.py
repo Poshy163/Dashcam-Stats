@@ -10,7 +10,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from fastapi.encoders import jsonable_encoder
 from pydantic import BeforeValidator
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select, union_all
 from sqlalchemy.orm import aliased, selectinload
 
 from app.ai.normalise_au import normalise
@@ -1577,6 +1577,75 @@ async def get_vehicle(vehicle_id: RowId, session: SessionDep):
 # --------------------------------------------------------------------------------------
 
 
+def _first_jobs_of_each_state(states: list[JobState], limit: int):
+    """Ids of every job that could be among the first *limit* rows of the job list.
+
+    The list's ordering is a ``CASE`` on the state followed by keys that differ per state,
+    which no index can serve: to return six rows the database sorted every job it holds,
+    fetching each one's recording to do it. The dashboard asks for those six rows every
+    ten seconds, and the history runs to hundreds of thousands.
+
+    Within one state the ordering is simple, though -- claim order for queued work, newest
+    first for everything else -- and a row cannot be in the first *limit* of the whole list
+    without being in the first *limit* of its own state. So each state contributes its
+    own head, read straight off an index, and the full ordering then only has those few
+    rows to arrange. Which rows come back, and in what order, is unchanged.
+
+    "Newest" is ``coalesce(finished_at, started_at, queued_at)``. Jobs that have finished
+    are read from the ``(state, finished_at)`` index; the ones that have not -- running
+    work, and cancellations from before ``finished_at`` was always stamped -- are few, and
+    are taken separately so that neither half needs the ``coalesce`` to be sorted.
+    """
+    job = aliased(ProcessingJob)
+    recording = aliased(Recording)
+    shown = or_(job.recording_id.is_(None), recording.ignored.is_(False))
+
+    def head(state: JobState, *criteria, order: tuple):
+        rows = (
+            select(job.id)
+            .outerjoin(recording, recording.id == job.recording_id)
+            .where(job.state == state, shown, *criteria)
+            .order_by(*order)
+            .limit(limit)
+            .subquery()
+        )
+        return select(rows.c.id)
+
+    heads = []
+    for state in states:
+        if state is JobState.QUEUED:
+            # `claim_next`'s keys, as in the list's own ordering below.
+            heads.append(
+                head(
+                    state,
+                    order=(
+                        job.priority.asc(),
+                        recording.started_at.is_(None).asc(),
+                        recording.started_at.asc(),
+                        job.queued_at.asc(),
+                        func.coalesce(job.finished_at, job.started_at, job.queued_at).desc(),
+                        job.id.desc(),
+                    ),
+                )
+            )
+            continue
+        heads.append(
+            head(
+                state,
+                job.finished_at.is_not(None),
+                order=(job.finished_at.desc(), job.id.desc()),
+            )
+        )
+        heads.append(
+            head(
+                state,
+                job.finished_at.is_(None),
+                order=(func.coalesce(job.started_at, job.queued_at).desc(), job.id.desc()),
+            )
+        )
+    return union_all(*heads)
+
+
 @router.get("/jobs", response_model=Paginated[JobOut])
 async def list_jobs(session: SessionDep, page: PaginationDep, state: str | None = None):
     stmt = select(ProcessingJob, Recording.filename).outerjoin(
@@ -1586,6 +1655,16 @@ async def list_jobs(session: SessionDep, page: PaginationDep, state: str | None 
     stmt = stmt.where(visible_job)
     if state:
         stmt = stmt.where(ProcessingJob.state == state)
+
+    try:
+        states = [JobState(state)] if state else list(JobState)
+    except ValueError:
+        # Not a state. Left to the query below to report, exactly as it always has.
+        states = None
+    if states is not None:
+        stmt = stmt.where(
+            ProcessingJob.id.in_(_first_jobs_of_each_state(states, page.offset + page.page_size))
+        )
 
     # Newest-queued-first put the running job at the bottom of a 2,000-row list.
     #
@@ -1629,14 +1708,16 @@ async def list_jobs(session: SessionDep, page: PaginationDep, state: str | None 
         ProcessingJob.id.desc(),
     )
 
-    count_stmt = (
-        select(func.count(ProcessingJob.id))
-        .outerjoin(Recording, Recording.id == ProcessingJob.recording_id)
-        .where(visible_job)
-    )
-    if state:
-        count_stmt = count_stmt.where(ProcessingJob.state == state)
-    total = int((await session.execute(count_stmt)).scalar() or 0)
+    if states is None:
+        count_stmt = (
+            select(func.count(ProcessingJob.id))
+            .outerjoin(Recording, Recording.id == ProcessingJob.recording_id)
+            .where(visible_job, ProcessingJob.state == state)
+        )
+        total = int((await session.execute(count_stmt)).scalar() or 0)
+    else:
+        counts = await queue.visible_counts(session)
+        total = counts.get(states[0], 0) if state else sum(counts.values())
 
     rows = (await session.execute(stmt.offset(page.offset).limit(page.page_size))).all()
     items = []
