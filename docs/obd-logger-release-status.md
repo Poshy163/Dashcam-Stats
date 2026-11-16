@@ -8,22 +8,92 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.25** (`versionCode` 38), installed in place on 8 November 2026 |
-| Source | `656d12fbe6d52fb05d711504329854f5d2cf5ff0` (`android/obd-logger/`); installed APK SHA-256 `39682e85…64e3`, version and production signer verified on 8 November (release record `release-record-0.3.25.txt`). 0.3.23 came from `bed288df504e5d0071e47c24eaafd837490d5f97`. |
+| Version | **0.3.27** (`versionCode` 40), installed in place on 16 November 2026 |
+| Source | `f14a202ab4d2fb1201430e134b3a1c5f26272ca3`; installed APK SHA-256 `f7679099…741f`, version and existing production signer verified (release record `release-record-0.3.27.txt`). |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
 | Status schema | `status.json` schema version 7 |
-| Poll plan | The existing trial OFF choice, revision 1 and no fallback reason were preserved. The next drive used the baseline plan; it does not validate the three-second trial. No automatic re-arm was performed. |
-| Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, permissions, folder access, stored drive identity and original OFF bounds survived. Both camera files advanced and temperature history continued. Parked indexing resumed after ingestion, and automatic backups completed with verified radio restoration. Restart evidence records `package_update` on the same kernel boot; no physical reboot test was performed. The subsequent server/helper workspace recovery was verified on 28 October, as described below. |
+| Poll plan | The existing trial OFF choice, revision 1 and no fallback reason were preserved. Driving on 0.3.27 has not yet been validated. No automatic re-arm was performed. |
+| Deployment | Installed APK readback hash and production signer verified; UID 10162, original first-install time, permissions, saved trial/ownership/transfer settings, last-drive identity, original OFF bounds and 20 retained artifacts survived. The foreground service recovered automatically with `package_update` on the same kernel boot. Automatic backups were restored and two post-update runs completed successfully with Bluetooth, hotspot and logger recovery. Idle sleep property 300 seconds was verified; the unit became persistently unreachable just after the original countdown was due to expire at about 19:05 Adelaide time, consistent with normal sleep. No reboot, forced suspend or CarPlay driving test was performed. |
 
-## Candidate 0.3.26: less work per tick, and a crash on a redelivered result (source only)
+## 0.3.27 installed: fewer parked assessments and unused key reads
 
-Source `0cb37f61a5d2631494c327071d9a025bc47c246e`, `versionCode` 39. **Not built, signed or
-installed, and never run on the head unit.** Written on 16 November from a code review of the
-0.3.6 to 0.3.25 changes, on a machine with no JDK or Android SDK; the only verification is the CI
-unit-test, lint and assemble job, which passed (run 43819850256). No schema, database,
-status-file or event change, and nothing that alters what the logger decides, so it can wait for
-the next reason to install.
+Source `f14a202ab4d2fb1201430e134b3a1c5f26272ca3`, `versionCode` 40. **Built, production-signed
+and installed on 16 November, with installation verified at 18:52 Adelaide time.**
+
+The clean production build passed 470 Android tests, with one skipped and no failures/errors.
+Release lint passed with no errors and 57 existing warnings. All eight new regression cases
+were verified in the full test reports; 309 focused backend tests also passed for fingerprint
+freshness, analysis scheduling, ignition cancellation and fixed backup/sleep deadlines.
+The APK's single production signer, v2 signature, version 0.3.27/code 40, embedded source revision,
+non-debug release flag and disabled voltage-only audit flag were independently checked.
+
+Archived APK: `C:\Users\poshe\.codex\artifacts\dashcam-obd-logger\dashcam-obd-logger-0.3.27-production.apk`.
+SHA-256: `f7679099f0987dc81e7f4b245735562a117d8350dcdae42afcd1ab9eb518741f`.
+The adjacent `release-record-0.3.27.txt` records the build, signer and validation evidence.
+
+- **Reuse unchanged parked assessments.** With quiet filtering enabled, lightweight directory
+  discovery still runs every five seconds. Once settling and pending analysis work are complete,
+  unchanged cards reuse the last full assessment until the 30-second refresh threshold. New or
+  removed clips, closed-clip metadata changes, settings, clock changes, missing reports/storage,
+  new journal coverage gaps and completed analysis bypass this throttle. Growth of the unbounded
+  newest clip alone does not reprocess the entire history. No cached report gets a new timestamp.
+- **Keep safety and scheduling boundaries.** Ignition and ingestion transitions still cancel
+  work and revoke decisions; analysis, postguard and defer deadlines remain anchored to their
+  original times. Fingerprint backlog retains the short cadence. Truncated cards conservatively
+  keep full checks every five seconds. The existing eight-fingerprints-per-pass budget remains:
+  the 30-second threshold requests a full assessment, not a rehash of every clip on a large card. The
+  server still validates target and witness fingerprints independently before omitting a clip.
+- **Remove unused credential reads.** Five error/cancellation handlers now load nonsecret
+  configuration only; disabled webhooks exit before decrypting. Legacy migration, the editable
+  settings form and enabled webhook validation/authentication retain their required reads.
+
+No database/schema, backup-awake or idle-awake setting, native sleep reserve, original OFF
+deadline, or status-heartbeat change. Installation used `adb install -r` after temporarily
+inhibiting new backup starts and waiting for the active run and radio restoration to finish;
+the original `ingest.enabled=true` setting was restored. No transfer cancellation or maintenance
+wake hold was needed. Backup runs 752 and 753 then each completed four files (491,536,904 bytes
+combined), with no errors and verified Bluetooth/hotspot/logger recovery.
+
+Two parked CPU captures measured 4.57% over 54.68 seconds and 7.26% over 59.40 seconds, compared
+with 10.57% over 60.74 seconds on 0.3.26: approximately 57% and 31% lower observed app CPU.
+These are percentages of one CPU core, from process ticks at `CLK_TCK=100`. The first new window
+had 2–4 clips and a younger process; the second had 6–8 clips and nearly the same process age as
+the old 4–6-clip capture. Both retained one PID, ready policy and parked/no-drive state. Movement
+and policy reports advanced four and five times respectively, versus ten previously; a settled
+four-clip interval showed about 31 seconds between writes. These short, unequal windows support
+reduced background work, not a controlled causal estimate or proof of improved CarPlay latency.
+
+The original OFF bounds remained unchanged throughout monitoring. Sleep stayed enabled, the
+native idle property read back 300 seconds, maintenance remained inactive and the same healthy
+logger process continued without crash-buffer entries. The server countdown reached 0.4 seconds
+at 08:35:02 UTC; the unit was offline by 08:35:21 UTC (19:05 Adelaide), with three consecutive
+offline/closed-ADB observations through 08:36:03 UTC. Backup recovery was complete before that
+loss of connectivity. This supports normal sleep remotely; hardware suspend was not measured
+directly. See `installation-record-0.3.27-20261116.json` beside the archived APK for installation,
+backup, CPU and sleep evidence. No further wake or power command was sent.
+
+## 0.3.26 installed: less work per tick, and a crash on a redelivered result
+
+Source `0cb37f61a5d2631494c327071d9a025bc47c246e`, `versionCode` 39. **Built, production-signed
+and installed in place on 16 November, with verification completed at 18:07 Adelaide time.** The local build used
+`e75f043c04d39285c0e7705322761b5e06be02be`, whose Android source and shared fixtures match the
+candidate commit, and embeds `e75f043c04d3`. The existing production signer was verified.
+The clean build completed with 462 tests passed, one skipped and no failures, including the new
+redelivered-result crash regression. Release lint passed with no errors and 57 warnings.
+The earlier CI unit-test, lint and assemble job also passed (run 43819850256).
+
+The archived artifact is `dashcam-obd-logger-0.3.26-production.apk` in
+`C:\Users\poshe\.codex\artifacts\dashcam-obd-logger`, with `release-record-0.3.26.txt`.
+APK SHA-256: `8015f6cf9ba9aa24841f2ebd10b2393d7ba7e4bcf83ac2681c161b58e76ea49c`.
+Installation followed a server-side backup cancellation and verified radio/logger recovery.
+The archived APK exactly matched the installed file; automatic background recovery and preserved
+settings/data were verified. See `installation-record-0.3.26-20261116.json` beside the APK.
+The short parked backup samples measured about 3.68% of one CPU core on 0.3.25 and 4.97% on
+0.3.26; they were separate, unequal windows under changing load, so they establish neither a
+performance improvement nor a regression. Camera/graphics processes dominated the sampled
+device load. A controlled driving comparison is still needed for any CarPlay claim.
+No schema, database, status-file or event change, and nothing that alters what the logger decides.
 
 - **Webhook key no longer decrypted on a timer.** Since the key moved into the Android
   Keystore, every `LoggerPreferences.load()` is a Keystore lookup and an AES-GCM decrypt unless
@@ -44,9 +114,19 @@ the next reason to install.
   service down with it, since they share a process. The feedback text is now dropped in that
   case and the action is still carried out. Covered by a new `MainActivityTest` case.
 
-Left alone on purpose, from the same review: the parked indexer's 5-second repeat interval and
-the `waiting` state that defeats the status write gate (both change on-device timing and want
-measuring there), and the remaining main-thread preference reads at startup.
+The 0.3.26 review left the parked indexer's 5-second repeat interval, possible extra writes
+during transient `waiting` states, and main-thread startup preference reads for later
+investigation. The live observations below distinguish measured work from suspected overhead.
+
+The post-install parked observation covered 60.74 seconds and 4–6 clips. Both movement reports
+advanced at least ten times, and the app used about 10.57% of one CPU core; repeated full parked
+work is a confirmed measurement target. All 24 sampled transfer-policy states were `ready`.
+The roughly ten-second status publications match the deliberate sleep-deadline heartbeat, so
+this observation did not establish redundant writes caused by transient `waiting` state.
+Five remaining error/cancellation-only preference reads could also skip unused credential
+decryption, but they are infrequent and no performance benefit was measured. These findings
+motivated the 0.3.27 release above. The resumed backups completed, radio/logger recovery verified,
+and the unit retained its normal sleep countdown without a maintenance hold.
 
 ## 0.3.25 installed: one-tap logging switch (includes 0.3.24)
 
