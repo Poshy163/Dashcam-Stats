@@ -18,11 +18,12 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 ## Candidate 0.3.26: less work per tick, and a crash on a redelivered result (source only)
 
-`versionCode` 39. **Not built, signed or installed, and never run on the head unit.** Written on
-16 November from a code review of the 0.3.6 to 0.3.25 changes, on a machine with no JDK or
-Android SDK; the only verification is the CI unit-test, lint and assemble job. No schema,
-database, status-file or event change, and nothing that alters what the logger decides, so it
-can wait for the next reason to install.
+Source `0cb37f61a5d2631494c327071d9a025bc47c246e`, `versionCode` 39. **Not built, signed or
+installed, and never run on the head unit.** Written on 16 November from a code review of the
+0.3.6 to 0.3.25 changes, on a machine with no JDK or Android SDK; the only verification is the CI
+unit-test, lint and assemble job, which passed (run 43819850256). No schema, database,
+status-file or event change, and nothing that alters what the logger decides, so it can wait for
+the next reason to install.
 
 - **Webhook key no longer decrypted on a timer.** Since the key moved into the Android
   Keystore, every `LoggerPreferences.load()` is a Keystore lookup and an AES-GCM decrypt unless
