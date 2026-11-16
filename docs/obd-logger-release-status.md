@@ -16,6 +16,37 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 | Poll plan | The existing trial OFF choice, revision 1 and no fallback reason were preserved. The next drive used the baseline plan; it does not validate the three-second trial. No automatic re-arm was performed. |
 | Deployment | Installed APK SHA-256 and production signer verified; app UID 10162, permissions, folder access, stored drive identity and original OFF bounds survived. Both camera files advanced and temperature history continued. Parked indexing resumed after ingestion, and automatic backups completed with verified radio restoration. Restart evidence records `package_update` on the same kernel boot; no physical reboot test was performed. The subsequent server/helper workspace recovery was verified on 28 October, as described below. |
 
+## Candidate 0.3.26: less work per tick, and a crash on a redelivered result (source only)
+
+`versionCode` 39. **Not built, signed or installed, and never run on the head unit.** Written on
+16 November from a code review of the 0.3.6 to 0.3.25 changes, on a machine with no JDK or
+Android SDK; the only verification is the CI unit-test, lint and assemble job. No schema,
+database, status-file or event change, and nothing that alters what the logger decides, so it
+can wait for the next reason to install.
+
+- **Webhook key no longer decrypted on a timer.** Since the key moved into the Android
+  Keystore, every `LoggerPreferences.load()` is a Keystore lookup and an AES-GCM decrypt unless
+  the caller opts out. Three callers that never read the key were doing it on a timer: the
+  status publish after every 5-second ACC read, the sleep-window controller on every event, and
+  the logger loop on every pass, which is every 500 ms for the whole of a backup. They now load
+  without it. The logger loop's first pass still reads it, because that read is what migrates a
+  key saved by an older build; the webhook itself is unchanged and loads its own.
+- **Quiet-clip pairing parses each timestamp once.** `applyPairGate` weighs every qualifying row
+  against every other and re-parsed both ISO timestamps of both rows for each comparison, twice
+  per indexer pass. They are remembered for the length of one call. Decisions are unchanged.
+- **Clip-name pattern and date format built once.** The indexer compiled a regular expression
+  and built a formatter for every row of the DCIM listing on every pass.
+- **A result delivered before the form exists no longer crashes the app.** The form is built
+  after a background load. If the activity is recreated underneath a permission dialog or the
+  folder picker (a day/night switch is enough), Android redelivers the result before that load
+  finishes; the callback touched a view that did not exist yet and threw, taking the logger
+  service down with it, since they share a process. The feedback text is now dropped in that
+  case and the action is still carried out. Covered by a new `MainActivityTest` case.
+
+Left alone on purpose, from the same review: the parked indexer's 5-second repeat interval and
+the `waiting` state that defeats the status write gate (both change on-device timing and want
+measuring there), and the remaining main-thread preference reads at startup.
+
 ## 0.3.25 installed: one-tap logging switch (includes 0.3.24)
 
 Source `656d12fbe6d52fb05d711504329854f5d2cf5ff0`, `versionCode` 38. A large **Turn OBD logging

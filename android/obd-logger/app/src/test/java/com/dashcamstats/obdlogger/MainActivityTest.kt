@@ -290,6 +290,38 @@ class MainActivityTest {
         assertTrue(field<CheckBox>(activity, "enabled").isChecked)
     }
 
+    @Test fun aResultDeliveredBeforeTheFormIsBuiltIsHandledWithoutCrashing() {
+        // Created but not yet idled: the configuration is still loading, so no view exists.
+        // This is the order Android uses when the activity is recreated underneath a
+        // permission dialog or the folder picker and the pending result is redelivered.
+        val controller = Robolectric.buildActivity(MainActivity::class.java).create()
+        val activity = controller.get()
+        try {
+            assertNull(runCatching { field<TextView>(activity, "status") }.getOrNull())
+
+            activity.onRequestPermissionsResult(101, emptyArray<String>(), IntArray(0))
+            activity.onRequestPermissionsResult(
+                100,
+                arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT),
+                intArrayOf(android.content.pm.PackageManager.PERMISSION_DENIED),
+            )
+            MainActivity::class.java.getDeclaredMethod(
+                "onActivityResult", Int::class.java, Int::class.java, android.content.Intent::class.java,
+            ).apply { isAccessible = true }.invoke(
+                activity, 201, android.app.Activity.RESULT_OK,
+                android.content.Intent().setData(android.net.Uri.parse("content://example.invalid/tree/dcim")),
+            )
+
+            // The denied permission still disabled the logger, with no form to show it on.
+            controller.resume()
+            waitUntil { runCatching { field<CheckBox>(activity, "pollTrial") }.getOrNull() != null }
+            waitUntil { !context.getSharedPreferences("obd_logger", Context.MODE_PRIVATE).getBoolean("enabled", true) }
+        } finally {
+            storage.release.countDown()
+            controller.pause().stop().destroy()
+        }
+    }
+
     private fun withActivity(test: (MainActivity) -> Unit) {
         val controller = Robolectric.buildActivity(MainActivity::class.java).create().resume()
         val activity = controller.get()

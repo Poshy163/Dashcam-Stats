@@ -446,12 +446,23 @@ internal class ClipTransferPolicy(private val context: Context, private val jour
         }
 
         fun applyPairGate(rows: List<JSONObject>, now: Long = System.currentTimeMillis()) {
-            fun bounds(row: JSONObject): Pair<Long, Long>? = runCatching {
-                val clip = row.getJSONObject("clip")
-                val start = Instant.parse(clip.getString("start_utc")).toEpochMilli()
-                val end = Instant.parse(clip.getString("end_utc")).toEpochMilli()
-                (start to end).takeIf { end > start }
-            }.getOrNull()
+            // Remembered per snapshot row for the length of this call. Every qualifying
+            // row is weighed against every other, and each comparison parsed both ISO
+            // timestamps of both rows again -- hundreds of thousands of parses for a full
+            // report, twice per indexer pass. The rows asked about are the snapshot taken
+            // below, which nothing mutates, so each needs parsing once.
+            val knownBounds = java.util.IdentityHashMap<JSONObject, Pair<Long, Long>?>()
+            fun bounds(row: JSONObject): Pair<Long, Long>? {
+                if (knownBounds.containsKey(row)) return knownBounds[row]
+                val parsed = runCatching {
+                    val clip = row.getJSONObject("clip")
+                    val start = Instant.parse(clip.getString("start_utc")).toEpochMilli()
+                    val end = Instant.parse(clip.getString("end_utc")).toEpochMilli()
+                    (start to end).takeIf { end > start }
+                }.getOrNull()
+                knownBounds[row] = parsed
+                return parsed
+            }
             fun own(row: JSONObject): String = when {
                 row.optString("decision") == "upload" && row.optString("reason") == "peer_coverage_required" -> "skip"
                 row.optString("decision") == "upload" && row.optString("reason") == "peer_analysis_pending" -> "defer"

@@ -46,6 +46,14 @@ internal const val MOVEMENT_GPS_ENABLED = "passive_gps_enabled"
 internal const val DRIVING_METADATA_INTERVAL_MS = 60_000L
 internal const val DRIVING_METADATA_MAX_ROWS = 128
 
+// Built once. The indexer parses every row of the DCIM listing -- up to four thousand per
+// folder -- on each pass, and a parked pass repeats every few seconds. It was compiling
+// this pattern and building this formatter again for each row. Both are immutable and
+// safe to share between threads.
+private val MOVEMENT_CLIP_NAME_PATTERN = Regex("^(pre_)?(\\d{14})_(camera_[01])\\.ts$")
+private val MOVEMENT_CLIP_START_FORMAT: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("uuuuMMddHHmmss").withResolverStyle(ResolverStyle.STRICT)
+
 internal enum class ClipIndexWorkMode { PARKED, DRIVING_OR_UNKNOWN, INGESTION }
 
 internal fun clipIndexWorkMode(parkedNow: Boolean, driveActive: Boolean,
@@ -467,11 +475,12 @@ internal class ClosedClipIndexer(private val context: Context, private val journ
 
     private fun parseClip(row: Array<Any>, prefix: String, locked: Boolean): MovementClip? {
         val name = row[1] as String
-        val match = Regex("^(pre_)?(\\d{14})_(camera_[01])\\.ts$").matchEntire(name) ?: return null
+        val match = MOVEMENT_CLIP_NAME_PATTERN.matchEntire(name) ?: return null
         val size = row[2] as Long; val mtime = row[3] as Long
         if (size <= 0 || size > 1L.shl(40) || mtime !in 0..4_102_444_800_000L) return null
-        val start = runCatching { LocalDateTime.parse(match.groupValues[2],
-            DateTimeFormatter.ofPattern("uuuuMMddHHmmss").withResolverStyle(ResolverStyle.STRICT)) }.getOrNull() ?: return null
+        val start = runCatching {
+            LocalDateTime.parse(match.groupValues[2], MOVEMENT_CLIP_START_FORMAT)
+        }.getOrNull() ?: return null
         return MovementClip(row[0] as String, prefix + name, name, match.groupValues[3], start,
             size, mtime, locked, match.groupValues[1].isNotEmpty())
     }

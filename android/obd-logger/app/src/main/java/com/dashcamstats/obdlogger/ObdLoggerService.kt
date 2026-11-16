@@ -341,6 +341,7 @@ class ObdLoggerService : Service() {
         var clearLeaseAfterBoot = recoveryReason == "device_restart"
         val connectionRetry = ConnectionRetryController()
         val reconnectAttempts = ReconnectAttemptTracker()
+        var webhookCredentialLoadedOnce = false
         while (scope.isActive) {
             var config: LoggerConfig? = null
             var retryDelayMillis: Long? = null
@@ -378,7 +379,16 @@ class ObdLoggerService : Service() {
                     recovered = true
                     recoveryReason = "process_terminated"
                 }
-                val loadedConfig = LoggerPreferences.load(this)
+                // The webhook key is read on the first pass only. That read is what moves a
+                // key saved by an older build into the Keystore, so it still happens once at
+                // startup. Nothing in this loop uses the key -- the webhook loads its own --
+                // and since it moved to the Keystore every load is a keystore round trip and
+                // a decrypt, on a loop that runs every half second for the whole of a backup.
+                val loadedConfig = LoggerPreferences.load(
+                    this,
+                    includeWebhookCredential = !webhookCredentialLoadedOnce,
+                )
+                webhookCredentialLoadedOnce = true
                 config = loadedConfig
                 if (!loadedConfig.canRun) {
                     publish("disabled", loadedConfig, "ownership or logger enable gate is off")
@@ -2402,8 +2412,11 @@ class ObdLoggerService : Service() {
         if (sleepStatusPublishJob?.isActive == true || !startupAllowed) return
         sleepStatusPublishJob = scope.launch {
             delay(250)
-            val config = runCatching { LoggerPreferences.load(this@ObdLoggerService) }.getOrNull()
-                ?: return@launch
+            // Without the webhook key: a status publish never reads it, and fetching it is
+            // a Keystore round trip and a decrypt. This runs after every ignition poll.
+            val config = runCatching {
+                LoggerPreferences.load(this@ObdLoggerService, includeWebhookCredential = false)
+            }.getOrNull() ?: return@launch
             publish(lastStatusState, config, lastStatusError)
         }
     }

@@ -639,25 +639,47 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 101) {
             startLogger()
-            status.text = "Passive GPS is optional. Missing permission leaves ACC and OBD movement reporting active."
+            showStatus("Passive GPS is optional. Missing permission leaves ACC and OBD movement reporting active.")
             return
         }
         if (requestCode == 100 && hasLoggerPermissions(this)) {
             startLogger()
         } else if (requestCode == 100) {
             LoggerPreferences.disable(this)
-            enabled.isChecked = false
+            if (::enabled.isInitialized) enabled.isChecked = false
             runCatching {
                 StatusPublisher.error(
                     this,
-                    ownership.isChecked,
+                    ownershipForStatus(),
                     "permission_required",
                     "Nearby Devices permission was denied; logger remains disabled",
                 )
             }
-            status.text = "Nearby Devices and notification permissions are required; logger disabled"
+            showStatus("Nearby Devices and notification permissions are required; logger disabled")
         }
     }
+
+    /**
+     * A result can arrive before the form exists. The form is built after a background
+     * load, and when the activity is recreated underneath a permission dialog or the folder
+     * picker -- a day/night switch is enough -- Android delivers the pending result during
+     * the restart, ahead of that load. Touching a view then throws, and the logger service
+     * shares this process. The message is feedback only, so it is dropped; what the result
+     * asked for is still done.
+     */
+    private fun showStatus(message: String) {
+        if (::status.isInitialized) status.text = message
+    }
+
+    /** The ownership the form shows, or what is saved when there is no form to ask yet. */
+    private fun ownershipForStatus(): Boolean =
+        if (::ownership.isInitialized) {
+            ownership.isChecked
+        } else {
+            runCatching {
+                LoggerPreferences.load(this, includeWebhookCredential = false).ownershipTransferred
+            }.getOrDefault(false)
+        }
 
     private fun startLogger() {
         activityScope.launch {
@@ -665,15 +687,17 @@ class MainActivity : Activity() {
                 runCatching { LoggerPreferences.load(this@MainActivity, includeWebhookCredential = false) }.getOrNull()
             }
             if (config == null) {
-                status.text = "Saved settings could not be loaded. Retry when storage is available."
+                showStatus("Saved settings could not be loaded. Retry when storage is available.")
                 return@launch
             }
             if (!config.canRun) {
-                status.text = "Ownership, valid adapter address, vehicle ID and logger ID are required"
+                showStatus("Ownership, valid adapter address, vehicle ID and logger ID are required")
                 return@launch
             }
-            status.text = if (runCatching { reloadSavedLogger(applicationContext) }.isSuccess) "Logger starting"
+            showStatus(
+                if (runCatching { reloadSavedLogger(applicationContext) }.isSuccess) "Logger starting"
                 else "Saved settings loaded, but the logger could not start. Reopen the app and retry Save and apply."
+            )
         }
     }
 
@@ -683,8 +707,8 @@ class MainActivity : Activity() {
         if (requestCode != 201 || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
         runCatching { MovementTreeAccess.save(this, uri, data.flags) }
-            .onSuccess { status.text = "Read-only DCIM access saved. Closed clips are indexed within one minute." }
-            .onFailure { status.text = "Select the recorder's DCIM folder and allow read access. Logging and backup continue." }
+            .onSuccess { showStatus("Read-only DCIM access saved. Closed clips are indexed within one minute.") }
+            .onFailure { showStatus("Select the recorder's DCIM folder and allow read access. Logging and backup continue.") }
     }
 
     private companion object {

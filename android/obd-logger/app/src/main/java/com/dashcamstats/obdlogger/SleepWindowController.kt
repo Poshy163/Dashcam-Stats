@@ -434,7 +434,9 @@ internal class AdaptiveSleepWindowController(
                         ingestionCompleted,
                     )
                 }
-                val config = LoggerPreferences.load(context)
+                // Only the two awake durations are read here, on every controller event. The
+                // webhook key would cost a Keystore round trip and a decrypt each time.
+                val config = LoggerPreferences.load(context, includeWebhookCredential = false)
                 retryer.reconcile(
                     state.wifiConnected,
                     state.ingestionStateKnown,
