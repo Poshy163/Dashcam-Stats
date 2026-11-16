@@ -1619,7 +1619,11 @@ class ObdLoggerService : Service() {
                 IngestionRequestRead.Absent
             }
         }
-        sleepWindowController?.setIngestionRequestActive(request is IngestionRequestRead.Valid)
+        sleepWindowController?.setIngestionRequestActive(when (request) {
+            is IngestionRequestRead.Valid -> true
+            IngestionRequestRead.Absent -> false
+            is IngestionRequestRead.Invalid -> null
+        })
         observeIngestionRequest(request)
         return request
     }

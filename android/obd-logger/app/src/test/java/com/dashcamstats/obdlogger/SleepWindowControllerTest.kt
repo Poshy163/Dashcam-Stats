@@ -4,6 +4,9 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import androidx.test.core.app.ApplicationProvider
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -14,7 +17,120 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
 @RunWith(RobolectricTestRunner::class)
+@OptIn(ExperimentalCoroutinesApi::class)
 class SleepWindowControllerTest {
+    @Test
+    fun unreadableLeaseCannotBecomeCompletionOrAuthorizeParkedWork() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val property = FakeProperty(IDLE_SLEEP_WINDOW_SECONDS)
+        var on = true
+        val controller = AdaptiveSleepWindowController(
+            context, this, property,
+            object : AccStateAccessor { override fun readAccOn(): Boolean = on },
+            elapsedMillis = { testScheduler.currentTime },
+            bootIdentity = { SleepBootIdentity("01234567-1234-1234-1234-012345678901", 12) },
+            deadlineStore = null,
+        )
+        try {
+            controller.start()
+            controller.setIngestionRequestActive(false)
+            runCurrent()
+            on = false
+            advanceTimeBy(5_000); runCurrent()
+            val original = controller.snapshot().deadline!!
+            assertEquals(IDLE_SLEEP_WINDOW_SECONDS, original.windowSeconds)
+
+            // A lease arriving after OFF may change the property but cannot extend
+            // the five-minute native countdown already captured for this parking.
+            controller.setIngestionRequestActive(true)
+            runCurrent()
+            assertEquals(ACTIVE_SLEEP_WINDOW_SECONDS, property.readSeconds())
+
+            controller.setIngestionRequestActive(null)
+            // Optional indexing sees uncertainty even before the policy worker runs.
+            assertFalse(controller.snapshot().ingestionStateKnown)
+            assertEquals(ClipIndexWorkMode.INGESTION, clipIndexWorkMode(true, false,
+                controller.snapshot().ingestionStateKnown, controller.snapshot().ingestionRequestActive))
+            runCurrent()
+            assertEquals(ACTIVE_SLEEP_WINDOW_SECONDS, property.readSeconds())
+            assertFalse(controller.snapshot().ingestionStateKnown)
+            assertTrue(controller.snapshot().ingestionRequestActive)
+
+            controller.setIngestionRequestActive(true)
+            runCurrent()
+            assertTrue(controller.snapshot().ingestionStateKnown)
+            assertEquals(listOf(ACTIVE_SLEEP_WINDOW_SECONDS), property.writes)
+
+            // Only a confirmed absence after the unknown read completes the valid lease.
+            controller.setIngestionRequestActive(null)
+            runCurrent()
+            controller.setIngestionRequestActive(false)
+            runCurrent()
+            assertEquals(IDLE_SLEEP_WINDOW_SECONDS, property.readSeconds())
+            assertTrue(controller.snapshot().ingestionStateKnown)
+            assertFalse(controller.snapshot().ingestionRequestActive)
+            assertEquals(original.offLowerElapsedMillis, controller.snapshot().deadline?.offLowerElapsedMillis)
+            assertEquals(original.offUpperElapsedMillis, controller.snapshot().deadline?.offUpperElapsedMillis)
+            assertEquals(original.windowSeconds, controller.snapshot().deadline?.windowSeconds)
+        } finally { controller.close(); runCurrent() }
+    }
+
+    @Test
+    fun unknownStartupAndQueuedCompletionWaitForConfirmedAbsence() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val property = FakeProperty(ACTIVE_SLEEP_WINDOW_SECONDS)
+        val controller = AdaptiveSleepWindowController(
+            context, this, property,
+            object : AccStateAccessor { override fun readAccOn(): Boolean = false },
+            elapsedMillis = { testScheduler.currentTime },
+            bootIdentity = { SleepBootIdentity("01234567-1234-1234-1234-012345678901", 12) },
+            deadlineStore = null,
+        )
+        try {
+            controller.start()
+            controller.setIngestionRequestActive(null)
+            runCurrent()
+            assertFalse(controller.snapshot().ingestionStateKnown)
+            assertEquals("awaiting_ingestion_state", controller.snapshot().policy)
+            assertTrue(property.writes.isEmpty())
+            controller.setIngestionRequestActive(false)
+            runCurrent()
+            assertEquals(IDLE_SLEEP_WINDOW_SECONDS, property.readSeconds())
+
+            controller.setIngestionRequestActive(true)
+            runCurrent()
+            val before = property.writes.toList()
+            controller.setIngestionRequestActive(false)
+            controller.setIngestionRequestActive(null)
+            runCurrent()
+            assertEquals(before, property.writes)
+            assertFalse(controller.snapshot().ingestionStateKnown)
+            assertEquals(ACTIVE_SLEEP_WINDOW_SECONDS, property.readSeconds())
+            controller.setIngestionRequestActive(false)
+            runCurrent()
+            assertEquals(IDLE_SLEEP_WINDOW_SECONDS, property.readSeconds())
+            assertTrue(controller.snapshot().ingestionStateKnown)
+        } finally { controller.close(); runCurrent() }
+    }
+
+    @Test
+    fun unknownOrNewlyActiveLeaseOverridesAStaleCompletionEvent() {
+        for (event in listOf(SleepWindowEvent.INGESTION_ENDED, SleepWindowEvent.INGESTION_STATE_UNKNOWN)) {
+            assertEquals("awaiting_ingestion_state", sleepWindowCommand(event,
+                wifiConnected = false, ingestionStateKnown = false, ingestionRequestActive = false,
+                ingestionCompleted = true, accStateKnown = true, accOn = false).policy)
+            assertEquals(ACTIVE_SLEEP_WINDOW_SECONDS, sleepWindowCommand(event,
+                wifiConnected = true, ingestionStateKnown = false, ingestionRequestActive = false,
+                ingestionCompleted = true, accStateKnown = true, accOn = false).targetSeconds)
+            assertEquals(ACTIVE_SLEEP_WINDOW_SECONDS, sleepWindowCommand(event,
+                wifiConnected = false, ingestionStateKnown = true, ingestionRequestActive = true,
+                ingestionCompleted = true, accStateKnown = true, accOn = false).targetSeconds)
+        }
+        assertEquals(IDLE_SLEEP_WINDOW_SECONDS, sleepWindowCommand(SleepWindowEvent.INGESTION_ABSENCE_OBSERVED,
+            wifiConnected = true, ingestionStateKnown = true, ingestionRequestActive = false,
+            ingestionCompleted = true, accStateKnown = true, accOn = false).targetSeconds)
+    }
+
     @Test
     fun stateTransitionsSelectManagedOrServerOwnedWindows() {
         assertEquals(

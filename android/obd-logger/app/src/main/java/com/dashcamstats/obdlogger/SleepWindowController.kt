@@ -31,6 +31,7 @@ internal enum class SleepWindowEvent {
     WIFI_LOST,
     INGESTION_STARTED,
     INGESTION_ABSENCE_OBSERVED,
+    INGESTION_STATE_UNKNOWN,
     INGESTION_ENDED,
     ACC_BECAME_ON,
     ACC_BECAME_OFF,
@@ -56,51 +57,43 @@ internal fun sleepWindowCommand(
     accOn: Boolean = false,
     activeSeconds: Int = ACTIVE_SLEEP_WINDOW_SECONDS,
     idleSeconds: Int = IDLE_SLEEP_WINDOW_SECONDS,
-): SleepWindowCommand = when (event) {
-    SleepWindowEvent.STARTED -> if (wifiConnected || ingestionRequestActive) {
+): SleepWindowCommand {
+    // Events can queue behind a property transaction. A newly active or unreadable lease
+    // must override an older completion event before that event can shorten the window.
+    if (ingestionRequestActive) return SleepWindowCommand("managed_active", activeSeconds)
+    if (!ingestionStateKnown) return if (wifiConnected) {
         SleepWindowCommand("managed_active", activeSeconds)
-    } else if (!ingestionStateKnown) {
-        SleepWindowCommand("awaiting_ingestion_state", null)
     } else {
-        SleepWindowCommand("managed_idle", idleSeconds)
-    }
-    SleepWindowEvent.WIFI_BECAME_PRESENT,
-    SleepWindowEvent.INGESTION_STARTED,
-    -> SleepWindowCommand("managed_active", activeSeconds)
-    SleepWindowEvent.WIFI_LOST -> if (ingestionRequestActive) {
-        SleepWindowCommand("managed_active", activeSeconds)
-    } else if (!ingestionStateKnown) {
         SleepWindowCommand("awaiting_ingestion_state", null)
-    } else {
-        SleepWindowCommand("managed_idle", idleSeconds)
     }
-    SleepWindowEvent.INGESTION_ABSENCE_OBSERVED -> if (wifiConnected) {
-        SleepWindowCommand("managed_active", activeSeconds)
-    } else if (!ingestionStateKnown) {
-        SleepWindowCommand("awaiting_ingestion_state", null)
-    } else {
-        SleepWindowCommand("managed_idle", idleSeconds)
-    }
-    SleepWindowEvent.INGESTION_ENDED -> when {
-        !wifiConnected -> SleepWindowCommand("managed_idle", idleSeconds)
-        accStateKnown && !accOn -> SleepWindowCommand("managed_idle", idleSeconds)
-        else -> SleepWindowCommand("managed_active", activeSeconds)
-    }
-    SleepWindowEvent.ACC_BECAME_ON -> when {
-        wifiConnected || ingestionRequestActive ->
+    return when (event) {
+        SleepWindowEvent.STARTED,
+        SleepWindowEvent.ACC_BECAME_ON,
+        -> if (wifiConnected) {
             SleepWindowCommand("managed_active", activeSeconds)
-        !ingestionStateKnown -> SleepWindowCommand("awaiting_ingestion_state", null)
-        else -> SleepWindowCommand("managed_idle", idleSeconds)
-    }
-    SleepWindowEvent.ACC_BECAME_OFF -> when {
-        ingestionRequestActive -> SleepWindowCommand("managed_active", activeSeconds)
-        !wifiConnected -> if (ingestionStateKnown) {
-            SleepWindowCommand("managed_idle", idleSeconds)
         } else {
-            SleepWindowCommand("awaiting_ingestion_state", null)
+            SleepWindowCommand("managed_idle", idleSeconds)
         }
-        ingestionCompleted -> SleepWindowCommand("managed_idle", idleSeconds)
-        else -> SleepWindowCommand("managed_active", activeSeconds)
+        SleepWindowEvent.WIFI_BECAME_PRESENT,
+        SleepWindowEvent.INGESTION_STARTED,
+        -> SleepWindowCommand("managed_active", activeSeconds)
+        SleepWindowEvent.WIFI_LOST -> SleepWindowCommand("managed_idle", idleSeconds)
+        SleepWindowEvent.INGESTION_ABSENCE_OBSERVED,
+        SleepWindowEvent.INGESTION_STATE_UNKNOWN,
+        -> if (wifiConnected && !(ingestionCompleted && accStateKnown && !accOn)) {
+            SleepWindowCommand("managed_active", activeSeconds)
+        } else {
+            SleepWindowCommand("managed_idle", idleSeconds)
+        }
+        SleepWindowEvent.INGESTION_ENDED -> when {
+            !wifiConnected -> SleepWindowCommand("managed_idle", idleSeconds)
+            accStateKnown && !accOn -> SleepWindowCommand("managed_idle", idleSeconds)
+            else -> SleepWindowCommand("managed_active", activeSeconds)
+        }
+        SleepWindowEvent.ACC_BECAME_OFF -> when {
+            !wifiConnected || ingestionCompleted -> SleepWindowCommand("managed_idle", idleSeconds)
+            else -> SleepWindowCommand("managed_active", activeSeconds)
+        }
     }
 }
 
@@ -502,27 +495,31 @@ internal class AdaptiveSleepWindowController(
         }
     }
 
-    fun setIngestionRequestActive(active: Boolean) {
+    /** Null means unreadable, not a confirmed removal of the last valid request. */
+    fun setIngestionRequestActive(active: Boolean?) {
         val event = synchronized(stateLock) {
             val wasKnown = ingestionStateKnown
             val wasActive = ingestionRequestActive
-            ingestionStateKnown = true
-            when {
-                !wasKnown -> {
-                    ingestionRequestActive = active
-                    if (active) ingestionCompleted = false
-                    if (active) {
-                        SleepWindowEvent.INGESTION_STARTED
-                    } else {
-                        SleepWindowEvent.INGESTION_ABSENCE_OBSERVED
+            if (active == null) {
+                ingestionStateKnown = false
+                // Retain whether a valid request was previously active. Only a later
+                // confirmed absence can complete it; another valid read resumes it.
+                if (wasKnown) SleepWindowEvent.INGESTION_STATE_UNKNOWN else null
+            } else {
+                ingestionStateKnown = true
+                ingestionRequestActive = active
+                when {
+                    active -> {
+                        ingestionCompleted = false
+                        if (!wasKnown || !wasActive) SleepWindowEvent.INGESTION_STARTED else null
                     }
+                    wasActive -> {
+                        ingestionCompleted = true
+                        SleepWindowEvent.INGESTION_ENDED
+                    }
+                    !wasKnown -> SleepWindowEvent.INGESTION_ABSENCE_OBSERVED
+                    else -> null
                 }
-                wasActive != active -> {
-                    ingestionRequestActive = active
-                    ingestionCompleted = !active
-                    if (active) SleepWindowEvent.INGESTION_STARTED else SleepWindowEvent.INGESTION_ENDED
-                }
-                else -> null
             }
         }
         event?.let(changes::trySend)
@@ -573,9 +570,16 @@ internal class AdaptiveSleepWindowController(
         }
     }
 
-    fun snapshot(): SleepWindowEvidence = evidence.copy(
-        deadline = deadlineTracker.snapshot(elapsedMillis()),
-    )
+    fun snapshot(): SleepWindowEvidence {
+        val ingestion = synchronized(stateLock) { ingestionStateKnown to ingestionRequestActive }
+        return evidence.copy(
+            // Unknown lease evidence must stop optional parked work immediately, even
+            // while its policy event waits behind an in-flight property transaction.
+            ingestionStateKnown = ingestion.first,
+            ingestionRequestActive = ingestion.second,
+            deadline = deadlineTracker.snapshot(elapsedMillis()),
+        )
+    }
 
     private fun reportObservation(value: SleepWindowControllerObservation) {
         runCatching { observation(value) }
