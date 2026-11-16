@@ -1215,3 +1215,23 @@ def test_selected_lens_defer_status_keeps_full_backlog_without_mixed_deadlines(t
     assert plan.policy_deferred_files == 1
     assert plan.policy_deferred_bytes == remote[0].size
     assert plan.policy_deferred_until_utc == doc["decisions"][0]["defer_until_utc"]
+
+
+def test_pairing_reads_the_card_listing_once_however_many_clips_qualify(monkeypatch):
+    """Naming a file on the card costs a path, a pattern match and a date parse.
+
+    Pairing did that for every file again for each clip that qualified, so a card holding
+    a few hundred clips cost seconds of computation on the event loop per evaluation --
+    and the filter evaluates several times a run, with the web API and the radio-lease
+    heartbeats waiting behind it each time.
+    """
+    doc = parked_filter.validate_policy_manifest(json.dumps(staggered_policy(pairs=12)))
+    remote = policy_inventory(doc)
+    named = Mock(side_effect=parked_filter.PurePosixPath)
+    monkeypatch.setattr(parked_filter, "PurePosixPath", named)
+
+    selected = parked_filter._paired_candidates(doc, remote, SOURCE)
+
+    assert len(selected) > 10
+    # Once to name each file, and once each by the two identity matches that precede it.
+    assert named.call_count <= 3 * len(remote)

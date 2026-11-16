@@ -10,6 +10,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -567,6 +568,23 @@ def _matched_proofs(
     ]
 
 
+@lru_cache(maxsize=8192)
+def _parsed_utc(value: str) -> datetime:
+    return movement._timestamp(value)
+
+
+def _utc(value: Any) -> datetime:
+    """``movement._timestamp``, remembered, for the comparisons made between decisions.
+
+    Pairing weighs every decision against every other, and each comparison parsed both
+    ends of both intervals from their ISO strings again -- a quarter of a million parses
+    for a policy of two hundred and forty clips, on the event loop. The same few hundred
+    strings come round each time, so they are parsed once. Only a successful parse is
+    kept, and anything that is not a string still goes to the original to be refused.
+    """
+    return _parsed_utc(value) if isinstance(value, str) else movement._timestamp(value)
+
+
 def _overlapping_entries(doc: dict[str, Any], decision: dict) -> list[dict]:
     clip = decision["clip"]
     start, end = movement._timestamp(clip["start_utc"]), movement._timestamp(clip["end_utc"])
@@ -576,8 +594,8 @@ def _overlapping_entries(doc: dict[str, Any], decision: dict) -> list[dict]:
         if entry["clip"]["relative_path"] != clip["relative_path"]
         and entry["clip"]["start_utc"] is not None
         and entry["clip"]["end_utc"] is not None
-        and movement._timestamp(entry["clip"]["start_utc"]) < end
-        and movement._timestamp(entry["clip"]["end_utc"]) > start
+        and _utc(entry["clip"]["start_utc"]) < end
+        and _utc(entry["clip"]["end_utc"]) > start
     ]
 
 
@@ -593,8 +611,8 @@ def _covers(peers: list[dict], start: datetime, end: datetime) -> bool:
     through = start
     for lower, upper in sorted(
         (
-            movement._timestamp(peer["clip"]["start_utc"]),
-            movement._timestamp(peer["clip"]["end_utc"]),
+            _utc(peer["clip"]["start_utc"]),
+            _utc(peer["clip"]["end_utc"]),
         )
         for peer in peers
     ):
@@ -615,6 +633,20 @@ def _paired_candidates(
     matched = _matched_proofs(doc, remote, source, accept or eligible_skip)
     witnesses = _matched_proofs(doc, remote, source, witness_accept or accept or _quiet_witness)
     witness_paths = {entry["clip"]["relative_path"] for entry in witnesses}
+    # The card listing, reduced once to the clips on it and the start time each is named
+    # for. This used to be redone for every matched decision -- a path, a regular
+    # expression and a `strptime` per file, per decision -- which on a card holding a few
+    # hundred clips is seconds of computation, on the event loop, several times in every
+    # filter evaluation. The start times are still parsed only when a decision reaches
+    # them, so a name that is not a real date is met exactly when it was before.
+    listed = []
+    for item in remote:
+        parent = PurePosixPath(item.directory or source).name
+        path = f"DCIM/{parent}/{item.name}"
+        match = movement._PATH.fullmatch(path)
+        if match is not None:
+            listed.append((path, match[2]))
+    listed_starts: dict[str, datetime] = {}
     # Every overlapping opposite-lens perspective must be present, independently quiet
     # and identity matched. Missing/locked/unknown peers protect the whole interval.
     paired = []
@@ -625,13 +657,12 @@ def _paired_candidates(
         local_start = datetime.fromisoformat(clip["local_start"])
         local_end = local_start + (end - start)
         unknown_peer = False
-        for item in remote:
-            parent = PurePosixPath(item.directory or source).name
-            path = f"DCIM/{parent}/{item.name}"
-            match = movement._PATH.fullmatch(path)
-            if match is None or path == clip["relative_path"]:
+        for path, stamp in listed:
+            if path == clip["relative_path"]:
                 continue
-            peer_start = datetime.strptime(match[2], "%Y%m%d%H%M%S")
+            peer_start = listed_starts.get(path)
+            if peer_start is None:
+                peer_start = listed_starts[path] = datetime.strptime(stamp, "%Y%m%d%H%M%S")
             entry = by_path.get(path)
             if local_start - timedelta(seconds=120) <= peer_start < local_end and (
                 entry is None
@@ -650,8 +681,8 @@ def _paired_candidates(
             and entry["clip"]["relative_path"] not in witness_paths
             and entry["clip"]["start_utc"] is not None
             and entry["clip"]["end_utc"] is not None
-            and movement._timestamp(entry["clip"]["start_utc"]) < end
-            and movement._timestamp(entry["clip"]["end_utc"]) > start
+            and _utc(entry["clip"]["start_utc"]) < end
+            and _utc(entry["clip"]["end_utc"]) > start
             for entry in doc["decisions"]
         ):
             continue

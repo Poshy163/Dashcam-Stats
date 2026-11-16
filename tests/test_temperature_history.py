@@ -361,3 +361,28 @@ async def test_api_allowed_ranges_and_empty_history_are_explicit(client, hours, 
 async def test_api_rejects_unapproved_or_malformed_range(client, hours):
     response = await client.get(f"/api/unit-logs/temperature?hours={hours}")
     assert response.status_code == 422
+
+
+async def test_api_computes_the_history_off_the_event_loop(db_session, monkeypatch):
+    """A week of readings is hundreds of milliseconds of parsing, hashing and sorting.
+
+    The temperature card asks for it every thirty seconds. Computed on the event loop,
+    every other request -- and the ingest's radio-lease and ignition heartbeats -- waits
+    for it each time.
+    """
+    import threading
+
+    computed_on = []
+    real = temperature.history
+
+    def recording(rows, **kwargs):
+        computed_on.append(threading.current_thread())
+        return real(rows, **kwargs)
+
+    monkeypatch.setattr(temperature, "history", recording)
+    await add_log(db_session, 0)
+    await db_session.commit()
+
+    await unit_temperature_history(session=db_session, hours=1)
+
+    assert computed_on and computed_on[0] is not threading.main_thread()

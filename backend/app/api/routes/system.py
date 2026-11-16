@@ -10,7 +10,6 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 from sqlalchemy import case, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import load_only
 
 from app.ai.models import describe_models, is_present
 from app.ai.openvino_session import (
@@ -856,27 +855,31 @@ async def unit_temperature_history(
         raise HTTPException(422, "Temperature hours must be one of 1, 6, 24 or 168")
     end = datetime.now(UTC)
     start = end - timedelta(hours=hours)
-    rows = list(
-        (
-            await session.scalars(
-                select(UnitLogEntry)
-                .options(load_only(UnitLogEntry.occurred_at, UnitLogEntry.message))
-                .where(
-                    UnitLogEntry.tag.in_((carplay_timing.TAG, temperature_capture.TAG)),
-                    UnitLogEntry.message.contains("soc="),
-                    # A copied context just inside the range may belong to a direct
-                    # observation just outside it. Read a bounded attribution margin.
-                    UnitLogEntry.occurred_at
-                    >= start - timedelta(milliseconds=temperature_history.MAX_CONTEXT_AGE_MS),
-                    UnitLogEntry.occurred_at <= end,
-                )
-                .order_by(UnitLogEntry.occurred_at.desc(), UnitLogEntry.id.desc())
-                .limit(temperature_history.MAX_INPUT_ROWS + 1)
+    # The two columns, not entities: up to twenty thousand rows come back, and building
+    # an ORM object for each is itself work done on the event loop.
+    rows = (
+        await session.execute(
+            select(UnitLogEntry.occurred_at, UnitLogEntry.message)
+            .where(
+                UnitLogEntry.tag.in_((carplay_timing.TAG, temperature_capture.TAG)),
+                UnitLogEntry.message.contains("soc="),
+                # A copied context just inside the range may belong to a direct
+                # observation just outside it. Read a bounded attribution margin.
+                UnitLogEntry.occurred_at
+                >= start - timedelta(milliseconds=temperature_history.MAX_CONTEXT_AGE_MS),
+                UnitLogEntry.occurred_at <= end,
             )
-        ).all()
-    )
+            .order_by(UnitLogEntry.occurred_at.desc(), UnitLogEntry.id.desc())
+            .limit(temperature_history.MAX_INPUT_ROWS + 1)
+        )
+    ).all()
     truncated = len(rows) > temperature_history.MAX_INPUT_ROWS
-    result = temperature_history.history(
+    # Off the event loop. Parsing, hashing and sorting a week of readings is several
+    # hundred milliseconds of pure computation, the temperature card asks again every
+    # thirty seconds, and for that long nothing else in the process runs -- not another
+    # request, and not the ingest's radio-lease and ignition heartbeats either.
+    result = await asyncio.to_thread(
+        temperature_history.history,
         rows[: temperature_history.MAX_INPUT_ROWS],
         hours=hours,
         range_start=start,
