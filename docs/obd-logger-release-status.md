@@ -30,6 +30,17 @@ deadlines. Version/code, embedded source revision, non-debug/audit-disabled rele
 Archived APK: `C:\Users\poshe\.codex\artifacts\dashcam-obd-logger\dashcam-obd-logger-0.3.28-production.apk`. SHA-256: `80e2f82586912dac0cd9ae63ff5896d4dae904231e2d106fcdf344ec20aecba9`.
 Release record: `release-record-0.3.28.txt` beside the APK. Installation record: `installation-record-0.3.28-20261117.json` beside the APK.
 
+The first GitHub run for `4766c5f` passed backend, frontend and Docker checks but failed
+the early-activity-result test: its background load sometimes built the form before the
+test asserted that no view existed. The test now controls the coroutine main dispatcher,
+delivers permission and folder-picker results before allowing initialization to run, then
+verifies that logging stays disabled after the form appears. This changes only the test;
+the production sources and installed, signed 0.3.28 APK above remain unchanged.
+The full Android CI command passed in a clean local checkout: 473 tests passed, one skipped,
+both lint variants had no errors, and both APK variants assembled. Removing the original
+view-initialization guard in that disposable checkout made the revised regression test fail
+with the original uninitialized-`status` crash, confirming that the check remains effective.
+
 - **An unreadable request is unknown, not completed.** The logger previously passed both an
   absent and an invalid ingestion request to the sleep controller as `false`. It now passes
   valid, absent and invalid as three distinct states. An invalid read retains the last valid

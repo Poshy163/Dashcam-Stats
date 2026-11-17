@@ -9,6 +9,11 @@ import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.TextView
 import androidx.test.core.app.ApplicationProvider
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
@@ -290,35 +295,51 @@ class MainActivityTest {
         assertTrue(field<CheckBox>(activity, "enabled").isChecked)
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     @Test fun aResultDeliveredBeforeTheFormIsBuiltIsHandledWithoutCrashing() {
-        // Created but not yet idled: the configuration is still loading, so no view exists.
+        // Keep form initialization queued until the results have been delivered: a paused
+        // Android looper alone does not stop create() from draining a fast IO completion.
         // This is the order Android uses when the activity is recreated underneath a
         // permission dialog or the folder picker and the pending result is redelivered.
-        val controller = Robolectric.buildActivity(MainActivity::class.java).create()
-        val activity = controller.get()
+        val dispatcher = StandardTestDispatcher()
+        Dispatchers.setMain(dispatcher)
         try {
-            assertNull(runCatching { field<TextView>(activity, "status") }.getOrNull())
+            val controller = Robolectric.buildActivity(MainActivity::class.java)
+            val activity = controller.get()
+            try {
+                controller.create()
+                Shadows.shadowOf(Looper.getMainLooper()).idle()
+                assertNull(runCatching { field<TextView>(activity, "status") }.getOrNull())
 
-            activity.onRequestPermissionsResult(101, emptyArray<String>(), IntArray(0))
-            activity.onRequestPermissionsResult(
-                100,
-                arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT),
-                intArrayOf(android.content.pm.PackageManager.PERMISSION_DENIED),
-            )
-            MainActivity::class.java.getDeclaredMethod(
-                "onActivityResult", Int::class.java, Int::class.java, android.content.Intent::class.java,
-            ).apply { isAccessible = true }.invoke(
-                activity, 201, android.app.Activity.RESULT_OK,
-                android.content.Intent().setData(android.net.Uri.parse("content://example.invalid/tree/dcim")),
-            )
+                activity.onRequestPermissionsResult(101, emptyArray<String>(), IntArray(0))
+                activity.onRequestPermissionsResult(
+                    100,
+                    arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT),
+                    intArrayOf(android.content.pm.PackageManager.PERMISSION_DENIED),
+                )
+                MainActivity::class.java.getDeclaredMethod(
+                    "onActivityResult", Int::class.java, Int::class.java, android.content.Intent::class.java,
+                ).apply { isAccessible = true }.invoke(
+                    activity, 201, android.app.Activity.RESULT_OK,
+                    android.content.Intent().setData(android.net.Uri.parse("content://example.invalid/tree/dcim")),
+                )
 
-            // The denied permission still disabled the logger, with no form to show it on.
-            controller.resume()
-            waitUntil { runCatching { field<CheckBox>(activity, "pollTrial") }.getOrNull() != null }
-            waitUntil { !context.getSharedPreferences("obd_logger", Context.MODE_PRIVATE).getBoolean("enabled", true) }
+                // The denied permission still disabled the logger, with no form to show it on.
+                assertFalse(context.getSharedPreferences("obd_logger", Context.MODE_PRIVATE).getBoolean("enabled", true))
+                assertNull(runCatching { field<TextView>(activity, "status") }.getOrNull())
+                controller.resume()
+                waitUntil {
+                    dispatcher.scheduler.runCurrent()
+                    runCatching { field<CheckBox>(activity, "pollTrial") }.getOrNull() != null
+                }
+                assertFalse(context.getSharedPreferences("obd_logger", Context.MODE_PRIVATE).getBoolean("enabled", true))
+            } finally {
+                storage.release.countDown()
+                controller.pause().stop().destroy()
+                dispatcher.scheduler.runCurrent()
+            }
         } finally {
-            storage.release.countDown()
-            controller.pause().stop().destroy()
+            Dispatchers.resetMain()
         }
     }
 
