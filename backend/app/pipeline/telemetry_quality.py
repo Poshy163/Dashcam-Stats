@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -201,6 +202,70 @@ def _is_independent_donor(point: TelemetryPoint) -> bool:
     )
 
 
+async def mark_stale_paired_copies(
+    session: AsyncSession,
+    source: Recording,
+    previous_start: datetime | None,
+    previous_end: datetime | None,
+) -> None:
+    """Recheck explicit copies against the repaired donor at the same overlay second."""
+    from app.pipeline.telemetry_repair import (
+        COPY_PENDING,
+        COPY_REQUESTED,
+        SOURCE_PENDING,
+        SOURCE_REQUESTED,
+    )
+
+    if previous_start is None or previous_end is None:
+        return
+    # Real pairs were matched by rounded capture second. The indexed time range
+    # avoids inspecting JSON across the library, including unrelated drives.
+    point = TelemetryPoint
+    copies = (
+        await session.scalars(
+            select(point).where(
+                point.has_fix.is_(True),
+                point.captured_at.between(
+                    previous_start - timedelta(seconds=1), previous_end + timedelta(seconds=1)
+                ),
+                point.recording_id != source.id,
+                point.quality_json["gps_source"].as_string() == "paired_camera",
+                point.quality_json["paired_recording_id"].as_integer() == source.id,
+            )
+        )
+    ).all()
+    if not copies:
+        return
+    donors = await session.scalars(
+        select(point).where(point.recording_id == source.id, point.has_fix.is_(True))
+    )
+    positions = {
+        round(p.captured_at.timestamp()): (p.lat, p.lon)
+        for p in donors
+        if p.captured_at is not None and _is_independent_donor(p)
+    }
+    stale = {
+        p.recording_id
+        for p in copies
+        if p.captured_at is not None
+        and positions.get(round(p.captured_at.timestamp())) != (p.lat, p.lon)
+    }
+    if stale:
+        await session.execute(
+            update(Recording)
+            .where(
+                Recording.id.in_(stale),
+                or_(
+                    Recording.telemetry_review_state.is_(None),
+                    Recording.telemetry_review_state.not_in(
+                        [COPY_PENDING, COPY_REQUESTED, SOURCE_PENDING, SOURCE_REQUESTED]
+                    ),
+                ),
+            )
+            .values(telemetry_review_state=COPY_PENDING)
+        )
+
+
 async def recover_from_paired_camera(
     session: AsyncSession,
     recording: Recording,
@@ -339,6 +404,9 @@ async def recover_from_paired_camera(
             target_recording.gps_recovered_count += changed
             target_recording.gps_point_count = sum(point.has_fix for point in target)
             target_recording.has_gps = target_recording.gps_point_count > 0
+            first = next((point for point in target if point.has_fix), None)
+            target_recording.start_lat = first.lat if first is not None else None
+            target_recording.start_lon = first.lon if first is not None else None
             target_recording.gps_gap_count = gaps
             target_recording.gps_longest_gap_s = longest
             target_recording.telemetry_problem_count = problems

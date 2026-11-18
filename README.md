@@ -103,6 +103,12 @@ metadata at all. Instead the date, coordinates and speed are *burned into the vi
 as an overlay. This app reads that overlay with OCR, which is why GPS works at all on such
 footage. Coordinates are recovered at the overlay's own 1 Hz update rate.
 
+With automatic processing and telemetry enabled, the server checks stored GPS readings
+for signs that damaged digits drew a false route. It rereads suspect recordings and
+checks positions copied to the other camera. New footage keeps its place ahead of these
+repairs. The check resumes after a restart and includes recordings as they finish the
+queue. The logs list each repair by recording ID and outcome.
+
 Because the source is an overlay rather than a sensor feed, be aware of what that means:
 coordinates carry the precision the camera prints (typically ~11 m), and **heading and
 distance are derived** from consecutive fixes rather than measured. If your camera does not

@@ -27,7 +27,7 @@ BASE = datetime(2026, 8, 4, 11, 11, 50, tzinfo=UTC)
 LAT, LON = -34.7981, 138.6510
 
 
-async def _recording(session, *, revision: str = "telemetry-v5") -> Recording:
+async def _recording(session, *, revision: str = CURRENT_REVISIONS["telemetry"]) -> Recording:
     # The seed already provides the front and rear cameras, so take the existing row
     # rather than inserting a second one against a unique key.
     camera = (
@@ -146,14 +146,13 @@ class TestExistingRecordingsAreRebuilt:
     """Case 14. A fix that only helps new footage does not fix this library."""
 
     def test_the_telemetry_revision_moved(self):
-        """Recordings carry the revision that produced them, and v4 predates every rule
-        added here. If this did not change, nothing already processed would be revisited."""
-        assert CURRENT_REVISIONS["telemetry"] == "telemetry-v5"
+        """v5 recordings predate the additional checks on damaged position digits."""
+        assert CURRENT_REVISIONS["telemetry"] == "telemetry-v6"
 
     def test_a_recording_processed_by_the_old_pipeline_is_outdated(self):
         class Stub:
             metadata_revision = CURRENT_REVISIONS["metadata"]
-            telemetry_revision = "telemetry-v4"
+            telemetry_revision = "telemetry-v5"
             detection_revision = CURRENT_REVISIONS["detection"]
             plate_revision = CURRENT_REVISIONS["plates"]
 

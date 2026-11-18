@@ -94,7 +94,19 @@ from app.osd import (
 )
 from app.osd.reasons import GpsQuality, GpsReason
 from app.pipeline.plate_repair import stamp_validation, validation_key
-from app.pipeline.telemetry_quality import quality_rollup, recover_from_paired_camera
+from app.pipeline.telemetry_quality import (
+    mark_stale_paired_copies,
+    quality_rollup,
+    recover_from_paired_camera,
+)
+from app.pipeline.telemetry_repair import (
+    COPY_PENDING,
+    COPY_REQUESTED,
+    SOURCE_PENDING,
+    SOURCE_REQUESTED,
+    finish_telemetry_review,
+    review_request,
+)
 
 
 def _gps_quality_of(sample) -> str:
@@ -942,7 +954,12 @@ async def stage_telemetry(
 ) -> StageResult:
     """Decode the burned-in overlay into telemetry points."""
     settings = get_settings_service()
+    review = await review_request(session, recording)
     if not bool(settings.get_nowait("telemetry.enabled")):
+        if review == SOURCE_REQUESTED:
+            recording.telemetry_review_state = SOURCE_PENDING
+        elif review == COPY_REQUESTED:
+            recording.telemetry_review_state = COPY_PENDING
         recording.telemetry_state = StageState.SKIPPED
         return StageResult("telemetry", True, "disabled")
 
@@ -956,6 +973,8 @@ async def stage_telemetry(
         # still needs to. `retryable` additionally stops the orchestrator stamping a
         # revision, which is what "reprocess outdated" reads -- both readers, not one.
         recording.telemetry_state = StageState.PENDING
+        if review in (SOURCE_REQUESTED, COPY_REQUESTED):
+            raise StageError("historical OCR repair has no overlay templates available")
         return StageResult("telemetry", True, "no overlay templates available", retryable=True)
 
     if progress:
@@ -996,6 +1015,7 @@ async def stage_telemetry(
             f"({len(result.samples)} samples read): {detail}"
         )
 
+    previous_start, previous_end = recording.started_at, recording.ended_at
     tz = await settings.timezone()
 
     # Establish one wall-clock origin for the recording before timestamping any sample.
@@ -1150,14 +1170,14 @@ async def stage_telemetry(
     await write_with_retry(session, write, what=f"store telemetry for {recording.filename}")
 
     recording.telemetry_point_count = len(rows)
-    recording.gps_point_count = result.fix_count
-    recording.has_gps = result.has_gps
+    stored_fixes = [row for row in rows if row["has_fix"]]
+    recording.gps_point_count = len(stored_fixes)
+    recording.has_gps = bool(stored_fixes)
     recording.distance_m = result.distance_m or None
     recording.avg_speed_kmh = result.avg_speed_kmh
     recording.max_speed_kmh = result.max_speed_kmh
-    if result.first_fix:
-        recording.start_lat = result.first_fix.lat
-        recording.start_lon = result.first_fix.lon
+    recording.start_lat = stored_fixes[0]["lat"] if stored_fixes else None
+    recording.start_lon = stored_fixes[0]["lon"] if stored_fixes else None
 
     gaps, longest_gap, problem_count, no_fix_count, ocr_gap_count, rejected_count = quality_rollup(
         rows
@@ -1190,6 +1210,9 @@ async def stage_telemetry(
 
     recording.telemetry_state = StageState.DONE
     paired_recoveries = await recover_from_paired_camera(session, recording)
+    if review in (SOURCE_REQUESTED, COPY_REQUESTED):
+        await mark_stale_paired_copies(session, recording, previous_start, previous_end)
+    await finish_telemetry_review(session, recording, review)
     log.info(
         "read telemetry from the overlay",
         recording=recording.filename,

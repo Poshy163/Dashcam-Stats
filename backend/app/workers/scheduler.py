@@ -22,6 +22,7 @@ from app.journeys.builder import JourneyBuilder
 from app.journeys.revalidation import revalidate_motion
 from app.pipeline.plate_repair import queue_plate_repairs
 from app.pipeline.repair import repair_durations
+from app.pipeline.telemetry_repair import REVIEW_BATCH_SIZE, review_telemetry
 from app.retention import execute as run_retention
 from app.retention import plan as plan_retention
 from app.retention import plan_idle, plan_parked
@@ -57,6 +58,7 @@ class TaskState:
     last_error: str | None = None
     runs: int = 0
     failures: int = 0
+    minimum_interval_s: float = 30.0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -85,6 +87,8 @@ class Scheduler:
         self._settling_scan_generation = 0
         self._ingest_scan_due_at: float | None = None
         self._ingest_scan_generation = 0
+        self._telemetry_review_delay = 30.0
+        self._telemetry_review_count = 0
 
     async def start(self) -> None:
         if self._running:
@@ -135,6 +139,13 @@ class Scheduler:
                 enabled=lambda: _flag("journeys.enabled"),
                 run=self._run_journey_motion_revalidation,
             ),
+            TaskState(
+                name="telemetry-ocr-review",
+                interval_s=lambda: _fixed(self._telemetry_review_delay),
+                enabled=lambda: _flag("telemetry.enabled"),
+                run=self._run_telemetry_review,
+                minimum_interval_s=2.0,
+            ),
         ]
 
         now = time.monotonic()
@@ -183,7 +194,7 @@ class Scheduler:
                     log.warning("scheduled task failed", task=task.name, error=str(exc))
                 finally:
                     try:
-                        interval = max(30.0, await task.interval_s())
+                        interval = max(task.minimum_interval_s, await task.interval_s())
                     except Exception:
                         interval = 300.0
                     task.next_run = time.monotonic() + interval
@@ -215,6 +226,14 @@ class Scheduler:
     async def _run_plate_revalidation(self) -> None:
         async with session_scope() as session:
             await queue_plate_repairs(session)
+
+    async def _run_telemetry_review(self) -> None:
+        self._telemetry_review_delay = 30.0
+        async with session_scope() as session:
+            inspected = await review_telemetry(session)
+        self._telemetry_review_count += inspected
+        if inspected == REVIEW_BATCH_SIZE:
+            self._telemetry_review_delay = 2.0
 
     async def _run_journey_motion_revalidation(self) -> None:
         await revalidate_motion()
@@ -558,6 +577,8 @@ class Scheduler:
     def describe(self) -> list[dict[str, object]]:
         descriptions = [task.as_dict() for task in self._tasks]
         for item in descriptions:
+            if item["name"] == "telemetry-ocr-review":
+                item["recordings_checked_since_start"] = self._telemetry_review_count
             deadlines = [
                 value
                 for value in (self._settling_scan_due_at, self._ingest_scan_due_at)

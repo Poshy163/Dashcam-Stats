@@ -6,12 +6,10 @@ work instead of making users guess whether an entire library needs decoding agai
 
 CURRENT_REVISIONS: dict[str, str] = {
     "metadata": "metadata-v2",
-    # v5: coordinates are only accepted at the overlay's own printed precision, positions
-    # are judged against the samples either side of them rather than only the one before,
-    # interpolation runs after validation instead of over the top of it, and every sample
-    # records how much it is trusted and why. Recordings processed by v4 hold positions
-    # that none of those rules had ever seen, so their telemetry is rebuilt.
-    "telemetry": "telemetry-v5",
+    # v6 checks damaged OCR reads that previously drew a moving route through a
+    # stationary sequence. Historical review selects recordings using their stored
+    # evidence so installing the update does not require decoding every video.
+    "telemetry": "telemetry-v6",
     "detection": "detection-v3",
     # v5 reads distinct source views and counts temporal agreement. Re-reading v4's one
     # saved vehicle image misses clear plates and can repeat a clipped side-view guess.

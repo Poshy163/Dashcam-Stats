@@ -591,6 +591,7 @@ class Scanner:
 
         row.fingerprint = fingerprint
         row.state = RecordingState.DISCOVERED
+        row.telemetry_review_state = None
         row.metadata_state = StageState.PENDING
         row.telemetry_state = StageState.PENDING
         row.detection_state = StageState.PENDING

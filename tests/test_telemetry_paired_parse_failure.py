@@ -180,6 +180,7 @@ async def test_paired_recovery_fills_only_exact_time_parse_failure_and_preserves
     ] == protected_before
     assert target.gps_recovered_count == 1
     assert target.gps_point_count == 2
+    assert (target.start_lat, target.start_lon) == (targets[0].lat, targets[0].lon)
     assert target.gps_ocr_gap_count == 3
     assert target.gps_no_fix_count == 1
     assert await recover_from_paired_camera(db_session, target) == 0

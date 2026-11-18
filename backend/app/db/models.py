@@ -364,6 +364,7 @@ class Recording(Base):
     # rest of the recording again.
     metadata_revision: Mapped[str | None] = mapped_column(String(32), nullable=True)
     telemetry_revision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    telemetry_review_state: Mapped[str | None] = mapped_column(String(32), index=True)
     detection_revision: Mapped[str | None] = mapped_column(String(32), nullable=True)
     plate_revision: Mapped[str | None] = mapped_column(String(32), nullable=True)
 

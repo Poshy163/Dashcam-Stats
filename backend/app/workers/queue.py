@@ -229,12 +229,15 @@ async def enqueue(
     stages: list[str] | None = None,
     priority: int = NEW_FOOTAGE_PRIORITY,
     force: bool = False,
+    preserve_recording_state: bool = False,
 ) -> ProcessingJob | None:
     """Queue work, refusing to stack duplicates for the same recording.
 
     ``force`` is for explicit user-requested reprocessing, where an existing queued job
     should be superseded rather than silently swallowing the request.
+    Background OCR reviews preserve the published recording until a worker claims it.
     """
+    inherited_review = None
     if recording_id is not None:
         if not force:
             existing = (
@@ -252,6 +255,9 @@ async def enqueue(
             if existing is not None:
                 return existing
         else:
+            from app.pipeline.telemetry_repair import supersede_review
+
+            inherited_review = await supersede_review(session, recording_id, stages)
             # Supersede, which is what "force" has always meant, rather than stack. Two
             # presses of "reprocess everything" used to leave two queued jobs per
             # recording and the whole library decoded twice; a third press, three times.
@@ -291,8 +297,10 @@ async def enqueue(
         max_attempts=int(settings.get_nowait("processing.retry_max_attempts")) + 1,
     )
     session.add(job)
+    if inherited_review is not None:
+        job.result = {"telemetry_review": inherited_review}
 
-    if recording_id is not None:
+    if recording_id is not None and not preserve_recording_state:
         recording = await session.get(Recording, recording_id)
         if recording is not None and recording.state not in (
             RecordingState.PROCESSING,

@@ -70,6 +70,72 @@ def test_valid_and_explicit_no_fix_are_unchanged_without_fallback(text, template
     assert (decoded, confidence) == expected
 
 
+@pytest.mark.parametrize(
+    "partial",
+    [
+        # A speed digit became the fourth decimal of a truncated latitude.
+        LINE.replace("3471 40 km/h", "347 0 E/h"),
+        # A wrong but well-shaped coordinate on a low contrast background.
+        LINE.replace("3471 40 km/h", "3484 /"),
+    ],
+)
+def test_partial_position_can_be_corrected_by_clearer_printed_fields(partial, templates):
+    image = rendered()
+    baseline = (glyphs.binarise(image), partial, 0.90)
+    initial = parse_osd_text(partial)
+    assert initial.has_fix and initial.speed_kmh is None and initial.lat != -12.3471
+    mask, text, confidence = glyphs._recheck_partial_position(image, templates, baseline, initial)
+    corrected = parse_osd_text(text)
+    assert (corrected.lat, corrected.lon, corrected.speed_kmh) == (-12.3471, 123.4567, 40)
+    assert glyphs.decode_line(mask, templates) == (text, confidence)
+
+
+def test_partial_position_is_preserved_on_disagreement_or_missing_speed_boundary(
+    templates, monkeypatch
+):
+    original = LINE.replace("3471 40 km/h", "3484 /")
+    image = rendered()
+    baseline = (glyphs.binarise(image), original, 0.90)
+    initial = parse_osd_text(original)
+
+    def masks(gray, threshold):
+        text = LINE if threshold == 190 else LINE.replace("3471", "3472")
+        return glyphs.binarise(rendered(text))
+
+    monkeypatch.setattr(glyphs, "_bright_mask", masks)
+    assert glyphs._recheck_partial_position(image, templates, baseline, initial) is baseline
+    monkeypatch.setattr(glyphs, "_bright_mask", lambda *_: glyphs.binarise(rendered(original)))
+    assert glyphs._recheck_partial_position(image, templates, baseline, initial) is baseline
+
+
+def test_only_unanimous_printed_boundaries_can_overrule_confident_split_digit(
+    templates, monkeypatch
+):
+    image = rendered()
+    mask = glyphs.binarise(image)
+    _, confidence = glyphs.decode_line(mask, templates)
+    for partial, correct in [
+        (LINE.replace("3471 40 km/h", "347 0"), True),
+        (LINE.replace("3471 40 km/h", "3470"), False),
+    ]:
+        baseline = (mask, partial, confidence)
+        initial = parse_osd_text(partial)
+        result = glyphs._recheck_partial_position(image, templates, baseline, initial)
+        assert (result is not baseline) == correct
+
+    partial = LINE.replace("3471 40 km/h", "347 0")
+    baseline = (mask, partial, confidence)
+    monkeypatch.setattr(
+        glyphs,
+        "_bright_mask",
+        lambda gray, threshold: mask if threshold < 210 else np.zeros_like(mask),
+    )
+    assert (
+        glyphs._recheck_partial_position(image, templates, baseline, parse_osd_text(partial))
+        is baseline
+    )
+
+
 def test_fused_digits_require_strong_full_height_matches(templates):
     mask = glyphs.binarise(rendered())
     parts = glyphs.segment_glyphs(mask)

@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 from app.core.logging import get_logger
+from app.osd.parser import OsdReading, parse_osd_text
 
 log = get_logger(__name__)
 
@@ -636,6 +637,81 @@ _COMPLETE_OVERLAY_RE = re.compile(
     r"E:[+-]?\d{1,3}\.\d{4}\s+N:[+-]?\d{1,3}\.\d{4}\s+\d{1,3}\s+km/h$"
 )
 _BRIGHT_THRESHOLDS = (190, 200, 205, 210, 215, 217, 220, 225)
+# A separate printed speed digit is important even if the unit is damaged. Compacting
+# a line like "N:-34.792 0 E/h" otherwise turns the speed into the last latitude digit.
+_POSITION_AND_SPEED_RE = re.compile(
+    r"(?:^|\s)E:(?P<lon>[+-]?\d{1,3}\.\d{4})\s+N:(?P<lat>[+-]?\d{1,2}\.\d{4})"
+    r"\s+(?P<speed>\d{1,3})(?=\s|$)"
+)
+_SPLIT_LAST_LAT_DIGIT = re.compile(r"N:[+-]?\d{1,2}\.\d{3}\s+\d(?=\s|$)")
+
+
+def _bright_mask(gray: np.ndarray, threshold: int) -> np.ndarray:
+    import cv2
+
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (gray >= threshold).astype(np.uint8), connectivity=8
+    )
+    keep = stats[:, cv2.CC_STAT_AREA] >= 12
+    keep[0] = False
+    return isolate_text_band(keep[labels])
+
+
+def _recheck_partial_position(
+    gray: np.ndarray,
+    templates: GlyphTemplates,
+    baseline: tuple[np.ndarray, str, float],
+    reading: OsdReading,
+) -> tuple[np.ndarray, str, float]:
+    """Change a weak position only if distinct bright masks resolve the printed fields."""
+    positions: list[tuple[np.ndarray, str, float]] = []
+    agreed = None
+    split_digit = bool(_SPLIT_LAST_LAT_DIGIT.search(reading.raw_text))
+    minimum_confidence = max(0.92, baseline[2] - (0.01 if split_digit else 0.0))
+    for threshold in (190, 200, 210):
+        mask = _bright_mask(gray, threshold)
+        text, confidence = decode_line(mask, templates)
+        fields = _POSITION_AND_SPEED_RE.search(text)
+        if fields is None or confidence < minimum_confidence:
+            continue
+        candidate = parse_osd_text(text, confidence=confidence)
+        if not candidate.has_fix or (
+            reading.captured_at is not None and candidate.captured_at != reading.captured_at
+        ):
+            continue
+        coordinates = (float(fields["lat"]), float(fields["lon"]))
+        speed = int(fields["speed"])
+        if coordinates != (candidate.lat, candidate.lon) or (
+            candidate.speed_kmh is not None and candidate.speed_kmh != speed
+        ):
+            continue
+        key = (*coordinates, speed)
+        if coordinates == (reading.lat, reading.lon) or (agreed is not None and agreed != key):
+            return baseline
+        # The timestamp and the road scene can dominate the line's mean confidence.
+        # Check the actual coordinate/speed glyphs before counting this mask as a vote.
+        first = len(text[: fields.start()].replace(" ", ""))
+        stop = first + len(fields.group().replace(" ", ""))
+        if any(
+            score < (0.90 if split_digit else 0.80)
+            for char, score in (
+                templates.classify(glyph.bitmap) for glyph in segment_glyphs(mask)[first:stop]
+            )
+            if char.isdigit()
+        ):
+            continue
+        agreed = key
+        positions.append((mask, text, confidence))
+    if len(positions) < 2:
+        return baseline
+    best = max(positions, key=lambda position: position[2])
+    if split_digit and len(positions) == 3 and best[2] >= baseline[2] - 0.005:
+        # A speed digit swallowed by latitude can have excellent correlation with the
+        # digit template. All three masks resolve the actual field boundary here.
+        return best
+    if best[2] >= baseline[2] + 0.015 and sum(p[2] >= baseline[2] for p in positions) >= 2:
+        return best
+    return baseline
 
 
 def _split_fused_digits(mask: np.ndarray, templates: GlyphTemplates) -> np.ndarray | None:
@@ -695,35 +771,28 @@ def _split_fused_digits(mask: np.ndarray, templates: GlyphTemplates) -> np.ndarr
 def decode_strip(strip: np.ndarray, templates: GlyphTemplates) -> tuple[np.ndarray, str, float]:
     """Decode normally, then conservatively retry an unreadable bright background.
 
-    Existing fixes and explicit no-fix readings are returned unchanged. A replacement
-    requires complete, strictly shaped telemetry and agreement across at least two masks;
-    conflicting candidates, weak digits and unresolved merged runs retain the original
-    failure. This changes extraction, never coordinate or track acceptance rules. Return
-    the selected mask as well so the debug image shows exactly what production decoded.
+    Positions with a readable speed and explicit no-fix readings return immediately.
+    A position whose speed field was lost gets a bounded check for digits merged with
+    scene texture. New and corrected positions require agreement across masks. Return
+    the selected mask so the debug image shows exactly what production decoded.
     """
-    from app.osd.parser import parse_osd_text
-
     mask = binarise(strip)
     text, confidence = decode_line(mask, templates)
     baseline = (mask, text, confidence)
     reading = parse_osd_text(text, confidence=confidence)
-    if reading.has_fix or reading.gps_status == "no_fix":
+    if (reading.has_fix and reading.speed_kmh is not None) or reading.gps_status == "no_fix":
         return baseline
     gray = strip[..., 0] if strip.ndim == 3 else strip
     if gray.shape[0] > 80 or gray.shape[1] > 4096 or np.count_nonzero(gray >= 190) < 500:
         return baseline
 
-    import cv2
+    if reading.has_fix:
+        return _recheck_partial_position(gray, templates, baseline, reading)
 
     agreed = None
     candidates: list[tuple[np.ndarray, str, float]] = []
     for threshold in _BRIGHT_THRESHOLDS:
-        _, labels, stats, _ = cv2.connectedComponentsWithStats(
-            (gray >= threshold).astype(np.uint8), connectivity=8
-        )
-        keep = stats[:, cv2.CC_STAT_AREA] >= 12
-        keep[0] = False
-        cleaned = isolate_text_band(keep[labels])
+        cleaned = _bright_mask(gray, threshold)
         # Do not search cuts in masks still dominated by scene texture.
         if decode_line(cleaned, templates)[1] < 0.88:
             continue
