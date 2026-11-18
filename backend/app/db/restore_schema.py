@@ -17,7 +17,9 @@ def describe_schema(connection: sqlite3.Connection) -> dict:
     map_triggers: dict[str, dict[str, str]] = {}
     for table, name, sql in connection.execute(
         "SELECT tbl_name, name, sql FROM sqlite_master "
-        "WHERE type='trigger' AND (name GLOB 'map_source_*' OR tbl_name='map_source_state')"
+        "WHERE type='trigger' AND (name GLOB 'map_source_*' OR tbl_name='map_source_state' "
+        "OR (tbl_name='journeys' AND EXISTS (SELECT 1 FROM pragma_table_info('journeys') "
+        "WHERE name='route_revision')))"
     ):
         map_triggers.setdefault(table, {})[name] = sql
     tables = [

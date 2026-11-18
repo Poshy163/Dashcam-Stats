@@ -41,14 +41,14 @@ async def test_routes_reuse_only_identical_journeys_across_library_changes(clien
 
     # Journey boundaries can land inside a cursor batch or on its first row.
     monkeypatch.setattr(heatmap, "_ROUTE_FETCH_BATCH", 3)
-    simplify = route_geometry_cache._simplify
+    simplify = route_geometry_cache.simplify_journey
     calls = []
 
     def measured(rows, tolerance_m):
         calls.append(rows[0][3])
         return simplify(rows, tolerance_m)
 
-    monkeypatch.setattr(route_geometry_cache, "_simplify", measured)
+    monkeypatch.setattr(route_geometry_cache, "simplify_journey", measured)
     before = (await client.get("/api/map/routes")).json()
     assert len(calls) == before["journeys"] == before["segments"] == 2
 
@@ -73,30 +73,6 @@ async def test_routes_reuse_only_identical_journeys_across_library_changes(clien
     assert len(calls) == 3
 
 
-def test_geometry_cache_evicts_by_vertices_and_by_journeys(monkeypatch):
-    monkeypatch.setattr(route_geometry_cache, "_MAX_POINTS", 2)
-    monkeypatch.setattr(route_geometry_cache, "_MAX_JOURNEYS", 2)
-    route_geometry_cache.clear()
-    try:
-
-        def get(recording, count):
-            rows = [(0.0, 0.0001 * i, None, recording, False) for i in range(count)]
-            return route_geometry_cache.journey_lines(rows, 0, cacheable=True)
-
-        first = get(1, 2)
-        assert get(1, 2) is first
-        get(2, 2)
-        assert get(1, 2) is not first
-        empty = get(3, 1)
-        get(4, 1)
-        get(5, 1)
-        assert get(3, 1) is not empty
-        oversized = get(6, 3)
-        assert get(6, 3) is not oversized
-    finally:
-        route_geometry_cache.clear()
-
-
 def test_geometry_honours_utc_offsets_and_subsecond_gaps():
     rows = [
         (0.0, 0.0000, "2026-08-08 00:00:00", 1, False),
@@ -104,7 +80,7 @@ def test_geometry_honours_utc_offsets_and_subsecond_gaps():
         (0.0, 0.0002, "2026-08-08 00:00:20.000001", 1, False),
         (0.0, 0.0003, None, 1, False),
     ]
-    assert route_geometry_cache.journey_lines(rows, 0, cacheable=False) == [
+    assert route_geometry_cache.simplify_journey(rows, 0) == [
         [(0.0, 0.0000), (0.0, 0.0001)],
         [(0.0, 0.0002), (0.0, 0.0003)],
     ]

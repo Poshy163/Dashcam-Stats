@@ -18,12 +18,16 @@ Rounding is honest about the source data. The overlay prints four decimal places
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Query
 from sqlalchemy import (
     Float,
+    Select,
     String,
     desc,
     distinct,
@@ -31,12 +35,13 @@ from sqlalchemy import (
     literal_column,
     or_,
     select,
+    text,
     type_coerce,
 )
 from sqlalchemy import cast as sa_cast
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
-from app.api import map_cache, route_geometry_cache
+from app.api import journey_snapshot, map_cache, route_geometry_cache
 from app.api.deps import SQLITE_MAX_INT, SessionDep
 from app.api.schemas import HeatmapOut, RoutesOut
 from app.api.visibility import journey_has_visible_recording, visible_revision
@@ -78,6 +83,14 @@ MAX_ROUTE_POINTS = 250_000
 #: per-batch overhead is invisible, small enough that the buffer stays a rounding error
 #: next to the journey being assembled.
 _ROUTE_FETCH_BATCH = 2_000
+_JOURNEYS_PER_BATCH = 128
+_JOURNEY_REVISIONS = text("""
+    SELECT NULL AS journey_id, unassigned_route_revision AS revision
+    FROM map_source_state WHERE id = 1
+    UNION ALL
+    SELECT id AS journey_id, route_revision AS revision FROM journeys
+    ORDER BY journey_id
+""")
 
 
 def _drawable_quality():
@@ -310,15 +323,9 @@ async def routes(
     )
 
 
-async def _routes(
-    session: AsyncSession,
-    start: datetime | None,
-    end: datetime | None,
-    journey_id: int | None,
-    simplify_m: float,
-    max_points: int,
-) -> RoutesOut:
-    # Resolve camera role and visibility once per recording, before scanning its fixes.
+def _route_query(
+    start: datetime | None, end: datetime | None, journey_id: int | None, *, incremental: bool
+) -> Select:
     front_recordings = (
         select(Recording.id)
         .outerjoin(Camera, Recording.camera_id == Camera.id)
@@ -327,6 +334,17 @@ async def _routes(
             (Camera.role == CameraRole.FRONT) | (Camera.id.is_(None)),
         )
     )
+    has_fix = TelemetryPoint.has_fix.is_(True)
+    if incremental:
+        # Seek by journey_id in ix_telemetry_journey_time, then check the recording
+        # by its primary key. Otherwise SQLite may start from every front recording
+        # or every has_fix entry in ix_telemetry_map, even for one changed journey.
+        has_fix = func.likely(has_fix)
+        visible_recording = front_recordings.where(
+            Recording.id == TelemetryPoint.recording_id
+        ).exists()
+    else:
+        visible_recording = TelemetryPoint.recording_id.in_(front_recordings)
     stmt = (
         select(
             TelemetryPoint.journey_id,
@@ -337,8 +355,8 @@ async def _routes(
             TelemetryPoint.breaks_segment,
         )
         .where(
-            TelemetryPoint.has_fix.is_(True),
-            TelemetryPoint.recording_id.in_(front_recordings),
+            has_fix,
+            visible_recording,
             TelemetryPoint.lat.is_not(None),
             TelemetryPoint.lon.is_not(None),
             # Rejected positions carry no coordinate, so the nulls above already exclude
@@ -367,64 +385,148 @@ async def _routes(
         stmt = stmt.where(TelemetryPoint.captured_at <= end)
     if journey_id is not None:
         stmt = stmt.where(TelemetryPoint.journey_id == journey_id)
+    return stmt
 
-    # Streamed one journey at a time, not collected and then capped.
-    #
-    # The rows are ordered by journey, so a journey's fixes arrive contiguously and can be
-    # simplified the moment the next one starts. That is what makes the cap below actually
-    # bound anything: `max_points` used to be applied *after* every drawable fix in the
-    # library had already been materialised in Python, so on a mature library opening the
-    # Heatmap page allocated hundreds of megabytes -- in a process that is also holding an
-    # OpenVINO graph and an ffmpeg decode buffer -- before discarding all but a fraction.
-    # Only one drive is ever resident now, and the read stops as soon as the cap is hit.
+
+async def _read_route_groups(
+    connection: AsyncConnection, queries: list[Select], tolerance_m: float
+) -> AsyncGenerator[tuple[int | None, route_geometry_cache.Lines], None]:
+    """Stream the ordered rows and simplify one complete journey at a time."""
+    current: int | None = None
+    fixes: list[route_geometry_cache.RouteFix] = []
+    for stmt in queries:
+        result = await connection.stream(stmt.execution_options(yield_per=_ROUTE_FETCH_BATCH))
+        try:
+            async for batch in result.partitions(_ROUTE_FETCH_BATCH):
+                for row_journey, lat, lon, captured_at, recording_id, breaks_segment in batch:
+                    if fixes and row_journey != current:
+                        yield current, route_geometry_cache.simplify_journey(fixes, tolerance_m)
+                        fixes = []
+                    current = row_journey
+                    fixes.append((lat, lon, captured_at, recording_id, breaks_segment))
+        finally:
+            await result.close()
+    if fixes:
+        yield current, route_geometry_cache.simplify_journey(fixes, tolerance_m)
+
+
+async def _incremental_route_groups(
+    connection: AsyncConnection, tolerance_m: float
+) -> AsyncGenerator[tuple[int | None, route_geometry_cache.Lines], None]:
+    # In SQLite legacy transaction mode consecutive SELECTs can see different commits.
+    # A read-only savepoint pins revisions and rows to one snapshot, even if this caller
+    # already has a transaction. Workers can continue publishing in WAL mode.
+    async with connection.begin_nested():
+        revisions = (await connection.execute(_JOURNEY_REVISIONS)).all()
+        all_fixes = _route_query(None, None, None, incremental=False)
+        if (
+            not revisions
+            or revisions[0][0] is not None
+            or any(not isinstance(token, bytes) or len(token) != 16 for _, token in revisions)
+        ):
+            # A damaged revision cannot identify saved geometry. Draw directly from the fixes.
+            async with aclosing(_read_route_groups(connection, [all_fixes], tolerance_m)) as raw:
+                async for group in raw:
+                    yield group
+            return
+
+        batch_size = _JOURNEYS_PER_BATCH
+        first = await asyncio.to_thread(journey_snapshot.load, dict(revisions[:batch_size]))
+        cold = not first and not await asyncio.to_thread(
+            journey_snapshot.has_any, dict(revisions[batch_size:])
+        )
+        if cold:
+            # One sequential pass with the original covering index is much cheaper than
+            # hundreds of journey-index seeks on an empty cache. Seed as the cursor advances.
+            batch_size = len(revisions)
+        changed_fixes = _route_query(None, None, None, incremental=True)
+        for offset in range(0, len(revisions), batch_size):
+            window = dict(revisions[offset : offset + batch_size])
+            cached = (
+                first if offset == 0 else await asyncio.to_thread(journey_snapshot.load, window)
+            )
+            missing = window.keys() - cached.keys()
+            queries = []
+            if cold:
+                queries.append(all_fixes)
+            else:
+                # Combining NULL and IN with OR can make SQLite scan every fix twice.
+                # NULL sorts first; use the covering recording index for that single group.
+                if None in missing:
+                    queries.append(all_fixes.where(TelemetryPoint.journey_id.is_(None)))
+                assigned = missing - {None}
+                if assigned:
+                    queries.append(changed_fixes.where(TelemetryPoint.journey_id.in_(assigned)))
+            # The raw cursor skips every cache hit. Keep a single lookahead to merge
+            # its output with cached geometry in the original order. A missing key
+            # might have no visible fixes at all, e.g. a rear-camera-only journey.
+            changed = {}
+            async with aclosing(_read_route_groups(connection, queries, tolerance_m)) as raw:
+                try:
+                    ahead = None
+                    for group, revision in window.items():
+                        if group in cached:
+                            lines = cached[group]
+                        else:
+                            if ahead is None:
+                                ahead = await anext(raw, None)
+                            lines = None
+                            if ahead is not None and ahead[0] == group:
+                                lines = ahead[1]
+                                ahead = None
+                            changed[group] = revision, lines
+                            if len(changed) == _JOURNEYS_PER_BATCH:
+                                await asyncio.to_thread(journey_snapshot.save, changed)
+                                changed.clear()
+                        if lines is not None:
+                            yield group, lines
+                finally:
+                    if changed:
+                        await asyncio.to_thread(journey_snapshot.save, changed)
+
+
+async def _routes(
+    session: AsyncSession,
+    start: datetime | None,
+    end: datetime | None,
+    journey_id: int | None,
+    simplify_m: float,
+    max_points: int,
+) -> RoutesOut:
+    if session.autoflush:
+        await session.flush()
+    connection = await session.connection()
+    incremental = (
+        connection.dialect.name == "sqlite"
+        and start is None
+        and end is None
+        and journey_id is None
+        and simplify_m == DEFAULT_SIMPLIFY_M
+    )
+    groups = (
+        _incremental_route_groups(connection, simplify_m)
+        if incremental
+        else _read_route_groups(
+            connection, [_route_query(start, end, journey_id, incremental=False)], simplify_m
+        )
+    )
     lines: list[list[list[float]]] = []
     points_sent = 0
     truncated = False
     journeys = 0
-
-    fixes: list[route_geometry_cache.RouteFix] = []
-    # Filtered overlays can reuse the whole-response cache without displacing the
-    # default map's per-journey geometry as users explore different dates and settings.
-    cacheable = (
-        start is None and end is None and journey_id is None and simplify_m == DEFAULT_SIMPLIFY_M
-    )
-
-    def emit() -> bool:
-        """Simplify the buffered journey into ``lines``. True when the cap was reached."""
-        nonlocal points_sent, truncated, journeys
-        journeys += 1
-        for segment in route_geometry_cache.journey_lines(fixes, simplify_m, cacheable=cacheable):
-            if points_sent + len(segment) > max_points:
-                truncated = True
-                return True
-            lines.append([[round(lat, 4), round(lon, 4)] for lat, lon in segment])
-            points_sent += len(segment)
-        return False
-
-    current: int | None = None
-    # The overlay consumes scalar columns only. Streaming them from this session's
-    # connection avoids building a second set of ORM result rows for every fix.
-    if session.autoflush:
-        await session.flush()
-    connection = await session.connection()
-    result = await connection.stream(stmt.execution_options(yield_per=_ROUTE_FETCH_BATCH))
-    try:
-        # Iterate asynchronously once per batch and unpack the buffered columns by position.
-        async for batch in result.partitions(_ROUTE_FETCH_BATCH):
-            for row_journey, lat, lon, captured_at, recording_id, breaks_segment in batch:
-                if fixes and row_journey != current:
-                    if emit():
-                        break
-                    fixes = []
-                current = row_journey
-                fixes.append((lat, lon, captured_at, recording_id, breaks_segment))
+    async with aclosing(groups):
+        async for _, segments in groups:
+            # A journey with even one drawable fix counts, including one whose
+            # first line exceeds the cap. Never return a fraction of a segment.
+            journeys += 1
+            for segment in segments:
+                if points_sent + len(segment) > max_points:
+                    truncated = True
+                    break
+                lines.append([[round(lat, 4), round(lon, 4)] for lat, lon in segment])
+                points_sent += len(segment)
             if truncated:
                 break
-        else:
-            if fixes:
-                emit()
-    finally:
-        await result.close()
 
     return RoutesOut(
         lines=lines,

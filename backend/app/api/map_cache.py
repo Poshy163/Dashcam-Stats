@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api import map_snapshot, route_geometry_cache
+from app.api import journey_snapshot, map_snapshot
 
 T = TypeVar("T")
 MapLayer = TypeVar("MapLayer", bound=BaseModel)
@@ -92,7 +92,7 @@ def clear() -> None:
     """Release process-local results and geometry."""
     _entries.clear()
     _locks.clear()
-    route_geometry_cache.clear()
+    journey_snapshot.clear()
 
 
 def size() -> int:

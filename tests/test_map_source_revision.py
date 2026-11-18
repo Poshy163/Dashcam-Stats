@@ -102,14 +102,22 @@ async def test_compatible_restore_checks_map_triggers_and_starts_new_lineage(
     from app.db import backup
     from app.db.session import dispose_engine
 
+    now = datetime.now(UTC)
+    db_session.add(Journey(started_at=now, ended_at=now))
+    await db_session.commit()
     initial_token = await _token(db_session)
+    group_revisions = (
+        "SELECT unassigned_route_revision FROM map_source_state "
+        "UNION ALL SELECT route_revision FROM journeys"
+    )
+    initial_groups = (await db_session.scalars(text(group_revisions))).all()
     snapshot = backup.create_backup()
     altered = tmp_path / "altered.db"
     altered.write_bytes(snapshot.read_bytes())
     with closing(sqlite3.connect(altered)) as cx, cx:
-        cx.execute("DROP TRIGGER map_source_point_insert")
+        cx.execute("DROP TRIGGER map_source_route_point_insert")
         cx.execute(
-            "CREATE TRIGGER map_source_point_insert AFTER INSERT ON telemetry_points BEGIN SELECT 1; END"
+            "CREATE TRIGGER map_source_route_point_insert AFTER INSERT ON telemetry_points BEGIN SELECT 1; END"
         )
     with pytest.raises(ValueError, match="map invalidation triggers"):
         backup.validate_database(altered, compatible=True)
@@ -120,4 +128,7 @@ async def test_compatible_restore_checks_map_triggers_and_starts_new_lineage(
     assert backup.apply_pending_restore()
     with closing(sqlite3.connect(app_config.db_path)) as cx:
         new_token = cx.execute("SELECT revision FROM map_source_state WHERE id = 1").fetchone()[0]
+        restored_groups = [row[0] for row in cx.execute(group_revisions)]
     assert len(new_token) == 16 and new_token != initial_token
+    assert len(restored_groups) == len(initial_groups) >= 2
+    assert all(len(token) == 16 and token not in initial_groups for token in restored_groups)

@@ -16,12 +16,15 @@ from app.config import get_config
 
 Layer = TypeVar("Layer", bound=BaseModel)
 _MAX_BYTES = 16 * 1024 * 1024
-# Bump when a map computation changes the meaning of an existing set of parameters.
-_FORMAT = 1
+# Route v1 had no companion per-journey geometry. A miss after upgrading warms
+# it on the first visit so new footage only needs to refresh its own journey.
+_FORMATS = {"heatmap": 1, "routes": 2}
 
 
 def _header(key: tuple, revision: bytes) -> bytes:
-    parameters = json.dumps([_FORMAT, sqlite3.sqlite_version, *key], separators=(",", ":")).encode()
+    parameters = json.dumps(
+        [_FORMATS[key[0]], sqlite3.sqlite_version, *key], separators=(",", ":")
+    ).encode()
     return hashlib.sha256(revision + parameters).digest()
 
 
