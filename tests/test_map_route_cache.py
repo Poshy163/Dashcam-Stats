@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import update
 
 from app.api import route_geometry_cache
+from app.api.geometry import simplify_indices, split_indices
 from app.api.routes import heatmap
 from app.db.models import Journey, Recording, RecordingState, TelemetryPoint
 from app.db.session import session_scope
@@ -107,3 +108,19 @@ def test_geometry_honours_utc_offsets_and_subsecond_gaps():
         [(0.0, 0.0000), (0.0, 0.0001)],
         [(0.0, 0.0002), (0.0, 0.0003)],
     ]
+
+
+def test_route_simplification_keeps_first_tied_vertex_and_original_endpoints():
+    points = [(0.0, 0.0)] * 3 + [(0.001, 0.001)] * 3 + [(0.002, 0.0)] * 3
+    assert simplify_indices(points, 15) == [0, 3, 8]
+    assert simplify_indices(points, 0) == list(range(9))
+    assert simplify_indices(points[:3], 15) == [0, 2]
+
+
+def test_route_jump_threshold_uses_physical_distance_across_dateline_and_near_pole():
+    # 0.0017 degrees at the equator is ~189 m. The next step spans ~211 m.
+    equator = [(0, 0.0, None), (0, 0.0017, None), (0, 0.0036, None), (0, 0.0037, None)]
+    assert split_indices(equator) == [[0, 1], [2, 3]]
+    # These longitudes cross the date line then advance 2 degrees at 89.99 N.
+    pole = [(89.99, 179.9, None), (89.99, -179.9, None), (89.99, -177.9, None)]
+    assert split_indices(pole) == [[0, 1, 2]]

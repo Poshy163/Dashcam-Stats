@@ -10,11 +10,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+from contextlib import closing
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 
 from app.config import get_config
+from app.db.heat_index import heat_index_needs_refresh, refresh_heat_index
 
 _RESTORE_PUBLISH_LOCK = threading.Lock()
 RESTORE_DISK_RESERVE = 64 * 1024**2
@@ -77,7 +79,8 @@ def _validate_compatibility(connection: sqlite3.Connection) -> str:
     if revision not in supported:
         raise ValueError("Backup migration revision is not supported by this application version")
     actual = describe_schema(connection)
-    for table, expected_table in _expected_schema(revision).items():
+    expected_schema = _expected_schema(revision)
+    for table, expected_table in expected_schema.items():
         if table not in actual:
             raise ValueError(f"Backup schema is missing required table {table}")
         for name, expected in expected_table["columns"].items():
@@ -85,6 +88,8 @@ def _validate_compatibility(connection: sqlite3.Connection) -> str:
                 raise ValueError(f"Backup schema is incompatible at {table}.{name}")
         if actual[table]["foreign_keys"] != expected_table["foreign_keys"]:
             raise ValueError(f"Backup foreign-key schema is incompatible at {table}")
+        if actual[table]["map_triggers"] != expected_table["map_triggers"]:
+            raise ValueError(f"Backup map invalidation triggers are incompatible at {table}")
         if [index for index in actual[table]["indexes"] if index["unique"]] != [
             index for index in expected_table["indexes"] if index["unique"]
         ]:
@@ -94,6 +99,12 @@ def _validate_compatibility(connection: sqlite3.Connection) -> str:
                 raise ValueError(f"Backup index or unique constraint is missing at {table}")
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise ValueError("Backup contains invalid foreign-key references")
+    if "map_source_state" in expected_schema:
+        token_shape = connection.execute(
+            "SELECT typeof(revision), length(revision) FROM map_source_state WHERE id = 1"
+        ).fetchone()
+        if token_shape != ("blob", 16):
+            raise ValueError("Backup has an invalid map source revision")
     return revision
 
 
@@ -103,11 +114,22 @@ def backup_dir() -> Path:
     return path
 
 
-def validate_database(path: Path, *, compatible: bool = False) -> str | None:
+def validate_database(
+    path: Path, *, compatible: bool = False, prepare_staged_restore: bool = False
+) -> str | None:
     # Validation only receives standalone snapshots, never the active WAL database.
     # Immutable reads avoid creating sidecars beside uploads and cannot change bytes.
     connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro&immutable=1", uri=True)
     try:
+        if prepare_staged_restore and heat_index_needs_refresh(connection):
+            # Only rewrite our private staged copy, and only after recognising the
+            # schema. integrity_check recomputes expression keys using this runtime.
+            _validate_compatibility(connection)
+            connection.close()
+            with closing(sqlite3.connect(path)) as staged:
+                staged.execute("PRAGMA trusted_schema = OFF")
+                refresh_heat_index(staged)
+            return validate_database(path, compatible=compatible)
         result = connection.execute("PRAGMA integrity_check").fetchone()
         if not result or result[0] != "ok":
             raise ValueError(
@@ -158,6 +180,8 @@ def _create_snapshot(target: Path, *, checkpoint: bool = False) -> Path:
         os.close(descriptor)
         destination = sqlite3.connect(str(temporary))
         source.backup(destination, pages=1024, progress=check_space)
+        # Pre-migration backups can run before startup has rebuilt the live index.
+        refresh_heat_index(destination)
         destination.close()
         destination = None
         validate_database(temporary)
@@ -242,7 +266,7 @@ class RestoreUpload:
         self.handle.flush()
         os.fsync(self.handle.fileno())
         self.handle.close()
-        self.revision = validate_database(self.path, compatible=True)
+        self.revision = validate_database(self.path, compatible=True, prepare_staged_restore=True)
 
     def publish(self) -> Path:
         if self.revision is None:
@@ -279,7 +303,13 @@ def apply_pending_restore() -> bool:
     pending = backup_dir() / "restore.pending.db"
     if not pending.is_file():
         return False
-    validate_database(pending, compatible=True)
+    revision = validate_database(pending, compatible=True, prepare_staged_restore=True)
+    if revision is not None and "map_source_state" in _expected_schema(revision):
+        # A restore starts a new cache lineage, even if someone edited this backup
+        # outside the application. Rekey before atomic replacement. Closing the last
+        # connection checkpoints any WAL pages back into the staged file.
+        with closing(sqlite3.connect(pending)) as connection, connection:
+            connection.execute("UPDATE map_source_state SET revision = randomblob(16) WHERE id = 1")
     database = get_config().db_path
     if database.is_file():
         stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")

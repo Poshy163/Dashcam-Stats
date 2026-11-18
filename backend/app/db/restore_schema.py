@@ -11,6 +11,15 @@ import tempfile
 
 
 def describe_schema(connection: sqlite3.Connection) -> dict:
+    # Restoring a cache token without its invalidation triggers could serve old GPS
+    # positions indefinitely after the next drive. Compare the installed definitions
+    # to a freshly migrated database of the uploaded revision.
+    map_triggers: dict[str, dict[str, str]] = {}
+    for table, name, sql in connection.execute(
+        "SELECT tbl_name, name, sql FROM sqlite_master "
+        "WHERE type='trigger' AND (name GLOB 'map_source_*' OR tbl_name='map_source_state')"
+    ):
+        map_triggers.setdefault(table, {})[name] = sql
     tables = [
         row[0]
         for row in connection.execute(
@@ -35,15 +44,16 @@ def describe_schema(connection: sqlite3.Connection) -> dict:
                 if index[4]
                 else None
             )
+            terms = list(connection.execute(f"PRAGMA index_xinfo({index_name})"))
             indexes.append(
                 {
                     "unique": bool(index[2]),
                     "partial": bool(index[4]),
                     "predicate": predicate.strip() if predicate else None,
-                    "columns": [
-                        list(row[2:])
-                        for row in connection.execute(f"PRAGMA index_xinfo({index_name})")
-                    ],
+                    "columns": [list(row[2:]) for row in terms],
+                    # SQLite describes every expression term with the same -2
+                    # placeholder. Compare the actual defining SQL before REINDEX.
+                    "expression_sql": sql if any(row[1] == -2 for row in terms) else None,
                 }
             )
         result[table] = {
@@ -52,6 +62,7 @@ def describe_schema(connection: sqlite3.Connection) -> dict:
             "foreign_keys": sorted(
                 [list(row[1:]) for row in connection.execute(f"PRAGMA foreign_key_list({quoted})")]
             ),
+            "map_triggers": map_triggers.get(table, {}),
         }
     return result
 

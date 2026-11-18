@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from app.osd.engine import haversine_m
+from app.osd.geo import haversine_m
 
 #: Metres per degree of latitude. Longitude shrinks with latitude, but Douglas-Peucker
 #: only needs a consistent scale to compare distances against, not a projection.
@@ -49,6 +49,13 @@ def simplify_indices(points: Sequence[tuple[float, float]], tolerance_m: float) 
     keep = [False] * len(points)
     keep[0] = keep[-1] = True
 
+    # The 1 Hz overlay often reports the same four-decimal position for many fixes.
+    # Each split only needs the first candidate in each equal run: all the others
+    # have the same distance and the strict comparison below always keeps the first.
+    following = [len(points)] * len(points)
+    for index in range(len(points) - 2, -1, -1):
+        following[index] = following[index + 1] if points[index] == points[index + 1] else index + 1
+
     stack: list[tuple[int, int]] = [(0, len(points) - 1)]
     while stack:
         first, last = stack.pop()
@@ -62,7 +69,8 @@ def simplify_indices(points: Sequence[tuple[float, float]], tolerance_m: float) 
         cross = bx * ay - by * ax
 
         worst_index, worst = first, -1.0
-        for index in range(first + 1, last):
+        index = first + 1
+        while index < last:
             px, py = points[index]
             if norm == 0:
                 distance = ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5
@@ -70,6 +78,7 @@ def simplify_indices(points: Sequence[tuple[float, float]], tolerance_m: float) 
                 distance = abs(dy * px - dx * py + cross) / norm
             if distance > worst:
                 worst_index, worst = index, distance
+            index = following[index]
 
         if worst > tolerance:
             keep[worst_index] = True
@@ -122,6 +131,10 @@ def split_indices(
     runs: list[list[int]] = []
     current: list[int] = []
     previous: tuple[float, float, float | None] | None = None
+    # A path along a meridian and then a parallel bounds the great-circle distance.
+    # 111,320 m exceeds a degree on our sphere, so smaller steps cannot cross the
+    # threshold. Near the boundary (or across the antimeridian) use the exact check.
+    short_step_degrees = max_jump_m / _METRES_PER_DEGREE
 
     for index, sample in enumerate(samples):
         lat, lon, seconds = sample
@@ -132,9 +145,15 @@ def split_indices(
                 and prev_seconds is not None
                 and (seconds - prev_seconds) > max_gap_s
             )
-            jumped = haversine_m(prev_lat, prev_lon, lat, lon) > max_jump_m
             marked = bool(breaks[index]) if breaks is not None and index < len(breaks) else False
-            if gapped or jumped or marked:
+            if (
+                gapped
+                or marked
+                or (
+                    abs(lat - prev_lat) + abs(lon - prev_lon) >= short_step_degrees
+                    and haversine_m(prev_lat, prev_lon, lat, lon) > max_jump_m
+                )
+            ):
                 if len(current) > 1:
                     runs.append(current)
                 current = []

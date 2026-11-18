@@ -21,6 +21,7 @@ if str(_BACKEND_ROOT) not in sys.path:
 
 from app.config import get_config  # noqa: E402
 from app.db import models  # noqa: E402
+from app.db.heat_index import refresh_heat_index  # noqa: E402
 from app.db.session import SQLITE_PRAGMAS  # noqa: E402
 
 config = context.config
@@ -95,6 +96,8 @@ def run_migrations_online() -> None:
 
 
 def _run(connection: Connection) -> None:
+    if connection.dialect.name == "sqlite":
+        refresh_heat_index(connection.connection.driver_connection)
     context.configure(
         connection=connection,
         target_metadata=target_metadata,

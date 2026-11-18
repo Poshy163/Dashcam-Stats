@@ -22,7 +22,17 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Query
-from sqlalchemy import Float, String, desc, distinct, func, or_, select, type_coerce
+from sqlalchemy import (
+    Float,
+    String,
+    desc,
+    distinct,
+    func,
+    literal_column,
+    or_,
+    select,
+    type_coerce,
+)
 from sqlalchemy import cast as sa_cast
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -110,10 +120,12 @@ async def heatmap(
 ):
     """Grid cells with a visit count, ready to be drawn as a heat layer."""
     key = ("heatmap", precision, start, end, journey_id, camera, min_speed_kmh, limit)
+    default_view = key == ("heatmap", DEFAULT_PRECISION, None, None, None, None, 5.0, MAX_CELLS)
     return await map_cache.cached(
         session,
         key,
         lambda: _heatmap(session, precision, start, end, journey_id, camera, min_speed_kmh, limit),
+        snapshot=HeatmapOut if default_view else None,
     )
 
 
@@ -127,8 +139,20 @@ async def _heatmap(
     min_speed_kmh: float,
     limit: int,
 ) -> HeatmapOut:
-    lat_cell = func.round(TelemetryPoint.lat, precision)
-    lon_cell = func.round(TelemetryPoint.lon, precision)
+    # The initial page requests this whole-library view. SQLite matches expressions and
+    # partial-index predicates structurally, so its grid and cutoff must be SQL literals
+    # for ix_telemetry_heat_cells to serve the aggregation directly in cell order.
+    indexed_grid = (
+        precision == 3
+        and min_speed_kmh == 5
+        and start is None
+        and end is None
+        and camera is None
+        and journey_id is None
+    )
+    grid = literal_column("3") if indexed_grid else precision
+    lat_cell = func.round(TelemetryPoint.lat, grid)
+    lon_cell = func.round(TelemetryPoint.lon, grid)
 
     # Distinct *seconds*, not rows. Front and rear record the same drive, both burn the same
     # GPS overlay and both are sampled at 1 Hz, so one real second of driving produces two
@@ -139,9 +163,10 @@ async def _heatmap(
     # Counting seconds instead of dropping a camera keeps stretches where only the rear
     # had a fix. The coalesce is what makes that safe: a reading can now carry a position
     # without a timestamp, and those rows would otherwise count as nothing at all.
+    # strftime returns text. A time-less fix uses its integer row ID, which SQLite
+    # counts separately even if an epoch second happens to have the same digits.
     second = func.coalesce(
-        func.strftime("%s", TelemetryPoint.captured_at),
-        "row:" + sa_cast(TelemetryPoint.id, String),
+        func.strftime(literal_column("'%s'"), TelemetryPoint.captured_at), TelemetryPoint.id
     )
     weight = func.count(distinct(second))
     recordings = select(Recording.id).where(visible_revision(Recording.telemetry_revision))
@@ -149,6 +174,11 @@ async def _heatmap(
         recordings = recordings.join(Camera, Recording.camera_id == Camera.id).where(
             Camera.key == camera
         )
+    visible_recording = TelemetryPoint.recording_id.in_(recordings)
+    if indexed_grid:
+        # Most recordings are visible. Without this selectivity hint ANALYZE can lead
+        # SQLite to seek one recording at a time and sort the whole library by cell.
+        visible_recording = func.likely(visible_recording)
 
     stmt = (
         select(
@@ -170,7 +200,7 @@ async def _heatmap(
             TelemetryPoint.has_fix.is_(True),
             # Seek the eligible recordings in the map index. One hidden clip must never
             # contribute fixes merely because another clip has a visible revision.
-            TelemetryPoint.recording_id.in_(recordings),
+            visible_recording,
             TelemetryPoint.lat.is_not(None),
             TelemetryPoint.lon.is_not(None),
             _drawable_quality(),
@@ -197,8 +227,9 @@ async def _heatmap(
     if min_speed_kmh > 0:
         # Null speeds are kept: an unreadable speed field says nothing about whether the
         # car was moving, and discarding those fixes would punch holes in real routes.
+        cutoff = literal_column("5") if indexed_grid else min_speed_kmh
         stmt = stmt.where(
-            (TelemetryPoint.speed_kmh.is_(None)) | (TelemetryPoint.speed_kmh >= min_speed_kmh)
+            (TelemetryPoint.speed_kmh.is_(None)) | (TelemetryPoint.speed_kmh >= cutoff)
         )
     if start is not None:
         stmt = stmt.where(TelemetryPoint.captured_at >= start)
@@ -270,8 +301,12 @@ async def routes(
     no extra information.
     """
     key = ("routes", start, end, journey_id, simplify_m, max_points)
+    default_view = key == ("routes", None, None, None, DEFAULT_SIMPLIFY_M, MAX_ROUTE_POINTS)
     return await map_cache.cached(
-        session, key, lambda: _routes(session, start, end, journey_id, simplify_m, max_points)
+        session,
+        key,
+        lambda: _routes(session, start, end, journey_id, simplify_m, max_points),
+        snapshot=RoutesOut if default_view else None,
     )
 
 
@@ -367,7 +402,12 @@ async def _routes(
         return False
 
     current: int | None = None
-    result = await session.stream(stmt.execution_options(yield_per=_ROUTE_FETCH_BATCH))
+    # The overlay consumes scalar columns only. Streaming them from this session's
+    # connection avoids building a second set of ORM result rows for every fix.
+    if session.autoflush:
+        await session.flush()
+    connection = await session.connection()
+    result = await connection.stream(stmt.execution_options(yield_per=_ROUTE_FETCH_BATCH))
     try:
         # Iterate asynchronously once per batch and unpack the buffered columns by position.
         async for batch in result.partitions(_ROUTE_FETCH_BATCH):

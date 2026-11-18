@@ -501,6 +501,23 @@ class TelemetryPoint(Base):
             "breaks_segment",
             sqlite_where=text("has_fix IS 1 AND lat IS NOT NULL AND lon IS NOT NULL"),
         ),
+        # The overview scans moving fixes in grid-cell order. Include every quality so
+        # the live visibility and quality rules can still decide which fixes to count.
+        Index(
+            "ix_telemetry_heat_cells",
+            "has_fix",
+            text("round(lat, 3)"),
+            text("round(lon, 3)"),
+            text("coalesce(strftime('%s', captured_at), id)"),
+            "recording_id",
+            "journey_id",
+            "speed_kmh",
+            "gps_quality",
+            sqlite_where=text(
+                "has_fix IS 1 AND lat IS NOT NULL AND lon IS NOT NULL "
+                "AND (speed_kmh IS NULL OR speed_kmh >= 5)"
+            ),
+        ),
         CheckConstraint("lat IS NULL OR (lat >= -90 AND lat <= 90)", name="ck_telemetry_lat"),
         CheckConstraint("lon IS NULL OR (lon >= -180 AND lon <= 180)", name="ck_telemetry_lon"),
     )

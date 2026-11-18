@@ -603,6 +603,42 @@ class TestHeatmapStatistics:
     something a user does casually with a dropdown.
     """
 
+    async def test_default_grid_keeps_time_less_fixes_distinct_from_epoch_seconds(self, client):
+        from datetime import UTC, datetime
+
+        from app.db.models import TelemetryPoint
+
+        async with session_scope() as session:
+            rec = Recording(
+                rel_path="early.ts", filename="early.ts", state=RecordingState.COMPLETED
+            )
+            session.add(rec)
+            await session.flush()
+            instant = datetime.fromtimestamp(11, UTC)
+            for row_id, capture, speed in [
+                (11, None, None),
+                (12, instant, 5.0),
+                (13, instant, 15.0),
+                (14, None, 4.9),
+            ]:
+                session.add(
+                    TelemetryPoint(
+                        id=row_id,
+                        recording_id=rec.id,
+                        t_offset_s=float(row_id),
+                        captured_at=capture,
+                        lat=-34.8123,
+                        lon=138.6754,
+                        has_fix=True,
+                        speed_kmh=speed,
+                    )
+                )
+        response = await client.get("/api/map/heatmap?precision=3&min_speed_kmh=5")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["points"] == [[-34.812, 138.675, 2]]
+        assert body["average_speed_kmh"] == 10.0
+
     @pytest.fixture
     async def both_cameras(self, db_session):
         from datetime import UTC, datetime, timedelta
@@ -1249,6 +1285,109 @@ class TestMapCache:
         # A different grid is a different answer, so it is a different entry.
         (await client.get("/api/map/heatmap?precision=2")).json()
         assert calls["heatmap"] == 2
+
+    @pytest.mark.parametrize(
+        ("layer", "default_query", "filter_query"),
+        [("heatmap", "?min_speed_kmh=5", "?precision=4"), ("routes", "", "?simplify_m=0")],
+    )
+    async def test_default_map_survives_restart_and_refreshes_after_edit(
+        self, client, app_config, a_short_drive, monkeypatch, layer, default_query, filter_query
+    ):
+        from unittest.mock import AsyncMock
+
+        from sqlalchemy import update
+
+        from app.api import map_cache
+        from app.api.routes import heatmap
+        from app.db.models import TelemetryPoint
+
+        recording_id, _ = a_short_drive
+        endpoint = "/api/map/" + layer
+        compute = AsyncMock(wraps=getattr(heatmap, "_" + layer))
+        monkeypatch.setattr(heatmap, "_" + layer, compute)
+        first = await client.get(endpoint + default_query)
+        assert first.is_success
+        path = app_config.cache_dir / f"map-{layer}.snapshot"
+        saved = path.read_bytes()
+        assert (await client.get(endpoint + filter_query)).is_success
+        assert path.read_bytes() == saved
+        map_cache.clear()
+        assert (await client.get(endpoint + default_query)).content == first.content
+        assert compute.await_count == 2
+
+        # A damaged snapshot recovers even when its revision header is intact.
+        map_cache.clear()
+        path.write_bytes(saved[:-1])
+        assert (await client.get(endpoint + default_query)).content == first.content
+        assert compute.await_count == 3
+        assert path.read_bytes() == saved
+
+        async with session_scope() as session:
+            await session.execute(
+                update(TelemetryPoint)
+                .where(TelemetryPoint.recording_id == recording_id)
+                .values(lon=139.0)
+            )
+        map_cache.clear()
+        edited = await client.get(endpoint + default_query)
+        assert edited.is_success and edited.content != first.content
+        assert compute.await_count == 4
+        assert path.read_bytes() != saved
+
+    async def test_concurrent_map_reads_share_work_and_discard_racing_snapshot(
+        self, client, app_config, a_short_drive, monkeypatch
+    ):
+        import asyncio
+
+        from sqlalchemy import update
+
+        from app.api import map_snapshot
+        from app.api.routes import heatmap
+        from app.db.models import TelemetryPoint
+
+        recording_id, _ = a_short_drive
+        real_routes = heatmap._routes
+        started, resume = asyncio.Event(), asyncio.Event()
+        calls = 0
+        saved = []
+        save = map_snapshot.save
+
+        def track_save(key, revision, value):
+            saved.append(value.model_dump())
+            save(key, revision, value)
+
+        async def pause_after_read(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            result = await real_routes(*args, **kwargs)
+            if calls == 1:
+                started.set()
+                await resume.wait()
+            return result
+
+        monkeypatch.setattr(heatmap, "_routes", pause_after_read)
+        monkeypatch.setattr(map_snapshot, "save", track_save)
+        first = asyncio.create_task(client.get("/api/map/routes"))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        try:
+            followers = [asyncio.create_task(client.get("/api/map/routes")) for _ in range(3)]
+            async with session_scope() as session:
+                await session.execute(
+                    update(TelemetryPoint)
+                    .where(TelemetryPoint.recording_id == recording_id)
+                    .values(lon=139.0)
+                )
+        finally:
+            resume.set()
+        initial, *updated = await asyncio.gather(first, *followers)
+        assert initial.is_success
+        assert all(
+            response.is_success and response.content != initial.content for response in updated
+        )
+        assert len({response.content for response in updated}) == 1
+        assert calls == 2
+        assert saved == [updated[0].json()]
+        assert (app_config.cache_dir / "map-routes.snapshot").is_file()
 
     async def test_new_telemetry_invalidates_the_cached_lines(self, client, a_short_drive):
         from datetime import UTC, datetime, timedelta

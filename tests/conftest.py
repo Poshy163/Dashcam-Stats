@@ -181,8 +181,7 @@ async def db_session(app_config) -> AsyncIterator:
     # challenged.
     reset_auth_state()
     ratelimit.reset()
-    # The map aggregates are memoised on a fingerprint of row counts and ids, which two
-    # freshly seeded test databases can share while holding different coordinates.
+    # Each test gets a cold in-process aggregate and per-journey geometry cache.
     from app.api import map_cache
 
     map_cache.clear()

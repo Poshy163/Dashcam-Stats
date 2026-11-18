@@ -85,17 +85,19 @@ class TestMigrations:
         # on someone's library months later, so the two are compared directly.
         engine = get_engine()
         async with engine.connect() as conn:
-            actual = await conn.run_sync(
-                lambda c: {
-                    name: {ix["name"] for ix in inspect(c).get_indexes(name)}
-                    for name in inspect(c).get_table_names()
-                }
+            # SQLAlchemy's reflection skips SQLite indexes containing expressions.
+            actual = set(
+                (
+                    await conn.exec_driver_sql(
+                        "SELECT tbl_name, name FROM sqlite_master WHERE type = 'index'"
+                    )
+                ).all()
             )
 
         missing: list[str] = []
         for name, table in Base.metadata.tables.items():
             for index in table.indexes:
-                if index.name not in actual.get(name, set()):
+                if (name, index.name) not in actual:
                     missing.append(f"{name}.{index.name}")
         assert not missing, f"migrations do not create: {sorted(missing)}"
 
@@ -108,6 +110,50 @@ class TestMigrations:
             cameras = (await session.execute(select(Camera))).scalars().all()
         assert len({c.key for c in cameras}) == len(cameras)
         await dispose_engine()
+
+    async def test_sqlite_upgrade_refreshes_heat_keys_in_live_and_staged_databases(
+        self, app_config
+    ):
+        import sqlite3
+        from contextlib import closing
+
+        from app.db import backup
+        from app.db.heat_index import SQLITE_VERSION_NUMBER
+        from app.db.models import Recording, TelemetryPoint
+
+        await init_db()
+        async with session_scope() as session:
+            rec = Recording(rel_path="heat.ts", filename="heat.ts")
+            session.add(rec)
+            await session.flush()
+            session.add(
+                TelemetryPoint(
+                    recording_id=rec.id, t_offset_s=0.0, lat=-34.7955, lon=138.7365, has_fix=True
+                )
+            )
+        await dispose_engine()
+
+        # Reproduce a snapshot from a library with different native ROUND results.
+        with closing(sqlite3.connect(app_config.db_path)) as connection, connection:
+            connection.create_function("round", 2, lambda _value, _precision: 0, deterministic=True)
+            connection.execute("REINDEX ix_telemetry_heat_cells")
+            connection.execute("PRAGMA user_version = 3000000")
+        with pytest.raises(ValueError, match="integrity check failed"):
+            backup.validate_database(app_config.db_path)
+
+        # Backing up rewrites the detached copy. Uploads received before the
+        # upgrade can also be staged on a newer server.
+        snapshot = backup.create_backup()
+        old_backup = app_config.db_path.read_bytes()
+        await init_db(seed=False)
+        await dispose_engine()
+        pending = backup.stage_restore(old_backup)
+        for path in (app_config.db_path, snapshot, pending):
+            backup.validate_database(path, compatible=True)
+            with closing(sqlite3.connect(path)) as connection:
+                assert connection.execute("PRAGMA user_version").fetchone() == (
+                    SQLITE_VERSION_NUMBER,
+                )
 
     async def test_stale_revision_is_backed_up_once_before_upgrade(self, app_config):
         import asyncio
