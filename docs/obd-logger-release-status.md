@@ -8,13 +8,67 @@ procedures live in [`obd-dashcam-logger.md`](obd-dashcam-logger.md); this page i
 
 | | |
 |---|---|
-| Version | **0.3.28** (`versionCode` 41), installed in place on 17 November 2026; verification completed at 10:19 Adelaide time |
-| Source | `78dfeb7a870f4213c6536d118f8fe2da15481b3b`; installed APK SHA-256 `80e2f825…cba9`, version and existing production signer verified (`release-record-0.3.28.txt`) |
+| Version | **0.3.29** (versionCode 42), installed in place on 18 November 2026 at 18:12 Adelaide |
+| Source | `c177eb96966f7e647f02da8a7adfd0664e3c3e6e` |
 | Application ID | `com.dashcamstats.obdlogger` |
 | Target / compile SDK | 34 / 35 |
-| Status schema | `status.json` schema version 7 |
-| Poll plan | The saved trial OFF choice, revision 1 and no fallback reason were preserved. The 17 November drive on 0.3.27 was recorded successfully and the driver reported noticeably improved CarPlay. A drive on 0.3.28 has not yet been validated. |
-| Deployment | Installed APK readback hash and production signer verified; UID, original first-install time, permissions, saved settings, last drive and 20 retained artifacts survived. Foreground service recovered automatically on the same kernel boot. Backup 765 completed 49 files with radio/logger recovery. Idle 300 seconds verified. The maintenance hold was released and automatic backups restored. The unit stayed offline after the native sleep command, consistent with sleep; direct hardware suspension was not measured |
+| Status schema | 7 |
+| Poll plan | Baseline plan 7. The existing trial setting was preserved. |
+| Deployment | Installed APK SHA-256 `0cb59c1a3b10061a12316362967780fc495e22c93e90810b209734e94d9bcaea` and production signer verified. Backups and temperature capture verified on the parked unit. First drive on 0.3.29 pending. |
+
+## 0.3.29 installed on 18 November after eight drives on 0.3.28
+
+The eight verified bundles cover 86.93 km. All 1,801 collected samples were persisted
+(1,817 expected at the nominal cadence). Each drive's sequence was contiguous. The median
+interval was 5.02 seconds and the longest was 11.58 seconds. The logger recorded P0420 again.
+Both camera channels had footage segments throughout all eight drives, with at most 62 seconds
+between starts. None of the 38 stale-recording alerts overlapped a drive. This check used
+clip timestamps and did not inspect individual frames.
+
+**ECU shutdown.** Seven drives issued a redundant ECU probe 14.7–22.0 seconds after ignition-off.
+Each probe failed after 6.42–6.50 seconds. Every associated row had 12.7 V at the adapter
+and no live ECU readings. Six recordings ended with `connection_lost`. Baseline polling now
+defers this extra probe when all requested live PIDs are unanswered, the current row is below
+the configured off voltage, and recent ignition evidence reports OFF. Ordinary polling, the
+engine-stop grace period and backup handoff continue. The probe becomes eligible again as soon
+as either shutdown signal changes or becomes uncertain.
+
+**Temperature history.** The unit had 32 temperature chunks. Every 30 seconds the previous
+publisher queried file metadata six times per unchanged closed chunk. One attributes read now
+supplies the needed fields, saving 155 metadata lookups for 31 closed chunks per pass. A changed
+file or remount still receives content verification. After installation, the logger published two
+successive new readings and all 32 manifest hashes matched their on-card files (8,014 readings).
+
+**CarPlay and heat.** The driver reported occasional lag. Six of the eight drives had retained
+ZLink window timing. The largest presentation interval was 3.12 s at 16:38 Adelaide on
+17 November. The 12:27 drive on 18 November contained a 1.46 s interval around 12:33.
+The day's last two drives had maxima of 212 ms and 176 ms. The measured surface was the package
+window. Phone frame age and the exact times the driver perceived lag are unknown.
+The native SoC sensor reached 107.0°C on the midday drive. During parked backup, at 107.3°C,
+CPU cooling was active and the two frequency ceilings were 1.536 GHz and 0.768 GHz against
+a 1.612 GHz hardware maximum. The parked observation cannot identify the cause of a driving hitch.
+
+**Other findings.** Optional PID 0x15 yielded 152 malformed replies and two missing replies
+from 154 requests, consuming 102.3 seconds across the drives. The existing cooldown skipped
+236 polls. Longer backoff would delay recognition if the sensor resumes answering. Strict
+validation and polling intervals were retained. Incident attribution and any improvement in
+perceived CarPlay lag require a subsequent drive on this version.
+
+The clean production build passed 475 Android tests with one skipped and release lint reported
+zero errors and 57 warnings. The installed APK matched the archive byte for byte. UID, permissions,
+first-install time, saved settings, last drive and 20 retained artifact hashes survived. The
+foreground service resumed automatically on the same kernel boot.
+
+Arrival backup 769 transferred 223 files (12.40 GB) before installation. Automatic runs 770
+and 771 then copied 14 more files (827,251,700 bytes) without errors. The backlog reached zero.
+Bluetooth, hotspot and the logger recovered and the 300-second idle setting was verified.
+Maintenance was released and the native sleep command was issued at about 18:19 Adelaide.
+The firmware guards passed, ADB disconnected before acknowledging the broadcast, and all three
+subsequent reachability checks were offline. Automatic backups were restored and read back.
+Physical suspend for that specific request remains unconfirmed.
+
+The signed APK, release record and `installation-record-0.3.29-20261118.json` are archived in
+`C:\Users\poshe\.codex\artifacts\dashcam-obd-logger`.
 
 ## 0.3.28: preserve unknown ingestion state through sleep decisions
 
