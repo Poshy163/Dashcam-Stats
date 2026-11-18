@@ -16,6 +16,27 @@ enum class ServiceStartupDecision { START, STOP_DISABLED, STOP_PERMISSION_REQUIR
  */
 internal const val ECU_SILENCE_RECOVERY_CYCLES = 3
 
+/** Decide when to re-prove a silent ECU while the normal drive/engine-off poll loop continues. */
+internal class SilentBusRecovery {
+    private var unansweredCycles = 0
+    val awaitingLiveData: Boolean get() = unansweredCycles > 0
+
+    fun probeDue(allLivePidsUnanswered: Boolean, ignitionOn: Boolean?, cycleVoltage: Double?, voltageOff: Double): Boolean {
+        if (!allLivePidsUnanswered) {
+            unansweredCycles = 0
+            return false
+        }
+        unansweredCycles = (unansweredCycles + 1).coerceAtMost(ECU_SILENCE_RECOVERY_CYCLES)
+        if (unansweredCycles < ECU_SILENCE_RECOVERY_CYCLES) return false
+        // After key-off it is normal for ATRV to work after the ECU stops responding. Keep
+        // collecting rows through the grace period without starting a long protocol search.
+        // Only this cycle's validated voltage qualifies. Reconsider on every subsequent row.
+        if (ignitionOn == false && cycleVoltage != null && cycleVoltage < voltageOff) return false
+        unansweredCycles = 0
+        return true
+    }
+}
+
 internal const val EXTRA_STARTUP_RECOVERY_REASON =
     "com.dashcamstats.obdlogger.extra.STARTUP_RECOVERY_REASON"
 

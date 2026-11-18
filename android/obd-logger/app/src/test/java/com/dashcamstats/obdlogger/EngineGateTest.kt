@@ -21,6 +21,31 @@ import java.util.zip.ZipFile
 @OptIn(ExperimentalCoroutinesApi::class)
 class EngineGateTest {
     @Test
+    fun lowVoltageAfterIgnitionOffDefersReproofThroughGraceAndFreshEvidenceRestoresIt() {
+        for ((ignition, voltage) in listOf(true to 12.7, null to 12.7, false to null, false to 13.0)) {
+            val recovery = SilentBusRecovery()
+            // Replay the observed shutdown: unanswered live PIDs but ATRV still returns 12.7 V.
+            repeat(8) {
+                assertFalse(recovery.probeDue(true, false, 12.7, 13.0))
+                assertTrue(recovery.awaitingLiveData)
+            }
+            assertTrue(recovery.probeDue(true, ignition, voltage, 13.0))
+            assertFalse(recovery.awaitingLiveData)
+        }
+    }
+
+    @Test
+    fun silentRunningBusStillRecoversAfterThreeUnansweredCyclesAndAResponseResetsTheCount() {
+        val recovery = SilentBusRecovery()
+        repeat(2) { assertFalse(recovery.probeDue(true, true, 13.6, 13.0)) }
+        assertFalse(recovery.probeDue(false, true, 13.6, 13.0))
+        assertFalse(recovery.awaitingLiveData)
+        repeat(2) { assertFalse(recovery.probeDue(true, true, 13.6, 13.0)) }
+        assertTrue(recovery.probeDue(true, true, 13.6, 13.0))
+        assertFalse(recovery.probeDue(true, true, 13.6, 13.0))
+    }
+
+    @Test
     fun recentRpmVetoesDipButSustainedLowVoltageStops() {
         val gate = EngineGate(voltageOff = 13.0, graceMillis = 30_000, rpmVetoMillis = 30_000)
         assertTrue(gate.remainsOnline(0, 13.4, 850.0))

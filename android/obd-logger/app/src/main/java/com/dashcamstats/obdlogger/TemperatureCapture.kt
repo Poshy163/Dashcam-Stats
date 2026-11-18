@@ -22,8 +22,10 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.file.Files
+import java.nio.file.NoSuchFileException
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.FileTime
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
@@ -125,6 +127,9 @@ internal class TemperatureJournal(
     private val chunkReadings: Int = TEMPERATURE_CHUNK_READINGS,
     private val maxChunks: Int = TEMPERATURE_MAX_CHUNKS,
     private val read: (File, Int) -> ByteArray = ::readBounded,
+    private val mirrorAttributes: (File) -> BasicFileAttributes = {
+        Files.readAttributes(it.toPath(), BasicFileAttributes::class.java)
+    },
 ) {
     private data class Chunk(val file: String, val readings: List<TemperatureReading>, val bytes: ByteArray) {
         val digest = sha256(bytes)
@@ -136,7 +141,12 @@ internal class TemperatureJournal(
     private var loaded = false
     private var highWatermark = 0L
     private var chunks = emptyList<Chunk>()
-    private data class VerifiedMirror(val digest: String, val size: Long, val modified: Long)
+    private data class VerifiedMirror(val digest: String, val size: Long, val modified: FileTime, val fileKey: Any?)
+    private fun mirrorStamp(file: File, chunk: Chunk): VerifiedMirror? {
+        val attrs = try { mirrorAttributes(file) } catch (_: NoSuchFileException) { return null }
+        if (!attrs.isRegularFile || attrs.size() != chunk.bytes.size.toLong()) return null
+        return VerifiedMirror(chunk.digest, attrs.size(), attrs.lastModifiedTime(), attrs.fileKey())
+    }
     private var mirrorIdentity: String? = null
     private val verifiedMirror = mutableMapOf<String, VerifiedMirror>()
     val latest: TemperatureReading? get() = chunks.lastOrNull()?.readings?.lastOrNull()
@@ -187,13 +197,19 @@ internal class TemperatureJournal(
         // an active-chunk replacement its hash will fail and it can retry safely.
         for (chunk in chunks) {
             val destination = File(directory, chunk.file)
-            val stamp = VerifiedMirror(chunk.digest, destination.length(), destination.lastModified())
-            val same = destination.isFile && destination.length() == chunk.bytes.size.toLong() &&
-                (verifiedMirror[chunk.file] == stamp || runCatching {
+            // Reuse the same metadata snapshot after a cache hit or a successful hash check.
+            // Only an atomic replacement needs a new snapshot of the published file.
+            val stamp = mirrorStamp(destination, chunk)
+            if (stamp != null && (verifiedMirror[chunk.file] == stamp || runCatching {
                     sha256(read(destination, TEMPERATURE_MAX_CHUNK_BYTES)) == chunk.digest
-                }.getOrDefault(false))
-            if (!same) write(destination, chunk.bytes)
-            verifiedMirror[chunk.file] = VerifiedMirror(chunk.digest, destination.length(), destination.lastModified())
+                }.getOrDefault(false))) {
+                verifiedMirror[chunk.file] = stamp
+            } else {
+                write(destination, chunk.bytes)
+                verifiedMirror[chunk.file] = checkNotNull(mirrorStamp(destination, chunk)) {
+                    "Temperature mirror replacement unavailable"
+                }
+            }
         }
         val manifest = JSONObject().put("schema_version", 1).put("source", TEMPERATURE_CAPTURE_SOURCE)
             .put("sensor", TEMPERATURE_SENSOR).put("capture_interval_ms", TEMPERATURE_CAPTURE_INTERVAL_MS)

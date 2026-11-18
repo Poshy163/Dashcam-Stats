@@ -1064,7 +1064,7 @@ class ObdLoggerService : Service() {
         // 01a05d40: the ECU proof passed, then 79 consecutive samples arrived with every
         // bus PID missing and the drive was filed as complete with zero errors. Counting
         // consecutive fully-missing cycles is what turns that from silence into evidence.
-        var busSilentCycles = 0
+        val silentBusRecovery = SilentBusRecovery()
         var activeSupported = supported
         try {
             while (scope.isActive) {
@@ -1202,14 +1202,11 @@ class ObdLoggerService : Service() {
                 // A cycle where every requested PID went unanswered is the bus being silent,
                 // not a slow sample. One such cycle is ordinary -- a single dropped frame, a
                 // reconnect -- so recovery waits for a run of them.
-                busSilentCycles = if (liveCommandAttempts > 0 && missing.size == requested.size) {
-                    busSilentCycles + 1
-                } else {
-                    0
-                }
-                if (busSilentCycles == ECU_SILENCE_RECOVERY_CYCLES) {
+                val unanswered = liveCommandAttempts > 0 && missing.size == requested.size
+                // The in-memory deadline snapshot expires old or unreadable ACC observations.
+                val ignitionOn = if (unanswered) sleepWindowController?.snapshot()?.deadline?.ignitionOn else null
+                if (silentBusRecovery.probeDue(unanswered, ignitionOn, values["adapter_voltage"] as? Double, config.voltageOff)) {
                     activeSupported = recoverSilentBus(elm, driveId, deviceRoot, activeSupported)
-                    busSilentCycles = 0
                 }
                 quiesceRequest()?.let { return RecordingExit.Quiesce(it) }
                 val liveCycleElapsed = SystemClock.elapsedRealtime() - cycleStarted
@@ -1218,7 +1215,7 @@ class ObdLoggerService : Service() {
                 // already measured parse/persist work is not charged twice.
                 val diagnosticBudgetMillis = sparseDiagnosticBudget.requiredBudgetMillis()
                 var diagnosticMillis = 0L
-                val diagnosticAllowed = samplePersisted && busSilentCycles == 0 &&
+                val diagnosticAllowed = samplePersisted && !silentBusRecovery.awaitingLiveData &&
                     ObdPollPlan.mayRunSparseDiagnostic(
                         liveCycleElapsed, diagnosticBudgetMillis,
                         liveScheduler.remainingTailMillis(boundedElapsedMillis(primaryTailStarted)),

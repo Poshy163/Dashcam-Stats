@@ -17,6 +17,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.time.Instant
 
@@ -152,19 +154,29 @@ class TemperatureCaptureTest {
 
     @Test fun steadyCaptureDoesNotReadClosedMirrorPayloadsAndAChangedMountIsVerifiedAgain() {
         val payloadReads = mutableListOf<String>()
+        val metadataReads = mutableListOf<String>()
         var destination = mirror()
         val store = TemperatureJournal(privateRoot(), { destination }, chunkReadings = 2,
             read = { file, maximum ->
                 if (file.parentFile == destination && file.name.startsWith("samples-")) payloadReads += file.name
                 file.readBytes().also { require(it.size <= maximum) }
+            }, mirrorAttributes = { file ->
+                metadataReads += file.name
+                Files.readAttributes(file.toPath(), BasicFileAttributes::class.java)
             })
         repeat(5) { index -> store.append(index); store.publish("running", epoch.plusSeconds(index * 30L)) }
         assertFalse(payloadReads.contains("samples-1.json"))
+        metadataReads.clear()
+        store.append(5)
+        store.publish("running", epoch.plusSeconds(150))
+        assertEquals(mapOf("samples-1.json" to 1, "samples-3.json" to 1, "samples-5.json" to 2),
+            metadataReads.groupingBy { it }.eachCount())
+        assertTrue(payloadReads.isEmpty())
         val other = File(temporary.root, "other-mount").apply { mkdirs() }
         mirror().listFiles()!!.forEach { File(other, it.name).writeBytes(it.readBytes()) }
         destination = other
-        store.publish("running", epoch.plusSeconds(150))
-        assertTrue(payloadReads.contains("samples-1.json"))
+        store.publish("running", epoch.plusSeconds(180))
+        assertEquals(setOf("samples-1.json", "samples-3.json", "samples-5.json"), payloadReads.toSet())
     }
 
     @Test fun incompletePublicPublicationIsRetriedWithoutDuplicatingPrivateRows() {
