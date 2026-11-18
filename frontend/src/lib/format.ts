@@ -67,7 +67,7 @@ let displayTimeZone: string | undefined
  * a clip driven at 4pm should read as 4pm from a laptop in another country — and the queue
  * should agree with the recording it names.
  *
- * Set once from `/api/status`. Until it is, formatting falls back to the browser's zone,
+ * Set from the shared display settings. Until it is, formatting falls back to the browser's zone,
  * which is the old behaviour and is right often enough to be a sane default.
  */
 export function setDisplayTimeZone(zone: string | undefined): void {

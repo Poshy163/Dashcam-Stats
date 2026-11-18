@@ -12,6 +12,7 @@ import type {
   CarPlayTimingOut,
   DashcamTemperatureCapture,
   DashcamTemperatureHistory,
+  DisplaySettings,
   Heatmap,
   HeatmapFilters,
   Job,
@@ -140,11 +141,6 @@ function convertKeys<T>(value: unknown, transform: (key: string) => string): T {
   return value as T
 }
 
-/** Settings keys are dotted identifiers owned by the backend and must survive verbatim. */
-function convertPreservingKeys<T>(value: unknown): T {
-  return value as T
-}
-
 type Query = Record<string, string | number | boolean | null | undefined>
 
 function buildQuery(params?: Query): string {
@@ -173,9 +169,9 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
 
 async function request<T>(
   path: string,
-  options: RequestInit & { query?: Query; rawKeys?: boolean } = {},
+  options: RequestInit & { query?: Query; responseKeys?: 'raw' | 'top-level' } = {},
 ): Promise<T> {
-  const { query, rawKeys, ...init } = options
+  const { query, responseKeys, ...init } = options
   const response = await fetch(`/api${path}${buildQuery(query)}`, {
     ...init,
     headers: apiHeaders(init.headers),
@@ -201,10 +197,15 @@ async function request<T>(
 
   if (response.status === 204) return undefined as T
   const json = await response.json()
-  return rawKeys ? convertPreservingKeys<T>(json) : convertKeys<T>(json, snakeToCamel)
+  if (responseKeys === 'raw') return json as T
+  if (responseKeys === 'top-level') {
+    // Map coordinates are nested numeric tuples. Only the envelope has keys to convert.
+    return Object.fromEntries(Object.entries(json).map(([key, value]) => [snakeToCamel(key), value])) as T
+  }
+  return convertKeys<T>(json, snakeToCamel)
 }
 
-function post<T>(path: string, body?: unknown, opts: { rawKeys?: boolean } = {}): Promise<T> {
+function post<T>(path: string, body?: unknown, opts: { responseKeys?: 'raw' } = {}): Promise<T> {
   return request<T>(path, {
     method: 'POST',
     body: body === undefined ? undefined : JSON.stringify(convertKeys(body, camelToSnake)),
@@ -909,9 +910,9 @@ export const api = {
 
   map: {
     /** Grid-aggregated fixes, ready for a heat layer. See the `Heatmap` type. */
-    heatmap: (filters?: HeatmapFilters) => request<Heatmap>('/map/heatmap', { query: filters }),
+    heatmap: (filters?: HeatmapFilters) => request<Heatmap>('/map/heatmap', { query: filters, responseKeys: 'top-level' }),
     /** The paths themselves, split at signal gaps. See the `Routes` type. */
-    routes: (filters?: RouteFilters) => request<Routes>('/map/routes', { query: filters }),
+    routes: (filters?: RouteFilters) => request<Routes>('/map/routes', { query: filters, responseKeys: 'top-level' }),
   },
 
   jobs: {
@@ -966,16 +967,17 @@ export const api = {
   },
 
   settings: {
+    display: () => request<DisplaySettings>('/settings/display'),
     // Setting keys are dotted backend identifiers ("storage.max_footage_gb"); converting
     // them to camelCase would break the round-trip, so these calls keep keys verbatim.
-    get: () => request<SettingCategory[]>('/settings', { rawKeys: true }),
+    get: () => request<SettingCategory[]>('/settings', { responseKeys: 'raw' }),
     update: (values: Record<string, unknown>) =>
       request<SettingCategory[]>('/settings', {
         method: 'PUT',
         body: JSON.stringify({ values }),
-        rawKeys: true,
+        responseKeys: 'raw',
       }),
-    reset: (keys: string[]) => post<SettingCategory[]>('/settings/reset', { keys }, { rawKeys: true }),
+    reset: (keys: string[]) => post<SettingCategory[]>('/settings/reset', { keys }, { responseKeys: 'raw' }),
   },
 
   scan: {

@@ -241,7 +241,7 @@ class TestTheJourneyRefreshDoesNotHoldTheLockAcrossItsReads:
     async def test_a_rebuild_commits_between_journeys(self, db_session, monkeypatch):
         """Forty-five journeys refreshed inside one transaction is minutes of held lock.
         Committing per journey also means an interrupted rebuild keeps what it finished."""
-        from app.api.visibility import visible_journey_ids
+        from app.api.visibility import journey_has_visible_recording
         from app.db.models import RecordingState
         from app.db.session import get_session_factory
         from app.journeys.builder import JourneyBuilder
@@ -287,7 +287,8 @@ class TestTheJourneyRefreshDoesNotHoldTheLockAcrossItsReads:
                     dict((await reader.execute(select(Recording.id, Recording.journey_id))).all())
                     == memberships
                 ), "a reader lost an existing recording's membership"
-                assert set((await reader.scalars(visible_journey_ids())).all()) == set(journeys), (
+                visible_ids = select(Journey.id).where(journey_has_visible_recording())
+                assert set(await reader.scalars(visible_ids)) == set(journeys), (
                     "the library disappeared between journey commits"
                 )
 

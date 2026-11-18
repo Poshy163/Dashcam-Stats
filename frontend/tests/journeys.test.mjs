@@ -52,7 +52,7 @@ async function mountJourneys(t, { entries = ['/journeys'], empty = false, timezo
   globalThis.fetch = async (url, init) => {
     const request = new URL(url, 'http://localhost')
     requests.push({ url: request, init })
-    if (request.pathname === '/api/status') return new Response(JSON.stringify({ timezone }))
+    if (request.pathname === '/api/settings/display') return new Response(JSON.stringify({ timezone }))
     if (request.pathname === '/api/journeys/motion-quality') return new Response(JSON.stringify({ total: 4, pending: 0, moving: 4, unconfirmed: 0, unknown: 0 }))
     assert.equal(request.pathname, '/api/journeys', `Unexpected request: ${request}`)
     assert.equal(init?.method ?? 'GET', 'GET', 'selection tests must never merge journeys')

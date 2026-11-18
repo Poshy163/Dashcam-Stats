@@ -298,7 +298,7 @@ class Recording(Base):
         ForeignKey("cameras.id"), nullable=True, index=True
     )
     journey_id: Mapped[int | None] = mapped_column(
-        ForeignKey("journeys.id", ondelete="SET NULL"), nullable=True, index=True
+        ForeignKey("journeys.id", ondelete="SET NULL"), nullable=True
     )
 
     # --- change detection -------------------------------------------------------------
@@ -397,7 +397,7 @@ class Recording(Base):
     thumbnail_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     # --- bookkeeping ------------------------------------------------------------------
-    ignored: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    ignored: Mapped[bool] = mapped_column(Boolean, default=False)
     # A protected/event recording is never eligible for retention cleanup.
     protected: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     event_type: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
@@ -420,6 +420,8 @@ class Recording(Base):
     __table_args__ = (
         Index("ix_recordings_state_started", "state", "started_at"),
         Index("ix_recordings_camera_started", "camera_id", "started_at"),
+        Index("ix_recordings_ignored_started", "ignored", "started_at"),
+        Index("ix_recordings_journey_ignored", "journey_id", "ignored"),
     )
 
 
@@ -478,14 +480,27 @@ class TelemetryPoint(Base):
     __table_args__ = (
         UniqueConstraint("recording_id", "t_offset_s", name="uq_telemetry_recording_offset"),
         Index("ix_telemetry_journey_time", "journey_id", "captured_at"),
-        Index("ix_telemetry_recording_offset", "recording_id", "t_offset_s"),
-        # The heat map's hot path: every drawable position, in journey order. Including
-        # the quality keeps that query index-only rather than visiting rows to discard
-        # the rejected ones.
+        # Quality-specific lookups and counts, optionally restricted to one journey.
         Index("ix_telemetry_quality", "gps_quality", "journey_id"),
         # The whole-library heat map and route overlay filter on has_fix and a date range
         # with no journey to narrow by; without this they sweep every point ever recorded.
         Index("ix_telemetry_fix_captured", "has_fix", "captured_at"),
+        # Serve both map layers from this projection of the fixes that have coordinates.
+        # Reading a position otherwise also loads the much larger OCR provenance rows.
+        Index(
+            "ix_telemetry_map",
+            "has_fix",
+            "recording_id",
+            "journey_id",
+            "captured_at",
+            "t_offset_s",
+            "lat",
+            "lon",
+            "gps_quality",
+            "speed_kmh",
+            "breaks_segment",
+            sqlite_where=text("has_fix IS 1 AND lat IS NOT NULL AND lon IS NOT NULL"),
+        ),
         CheckConstraint("lat IS NULL OR (lat >= -90 AND lat <= 90)", name="ck_telemetry_lat"),
         CheckConstraint("lon IS NULL OR (lon >= -180 AND lon <= 180)", name="ck_telemetry_lon"),
     )

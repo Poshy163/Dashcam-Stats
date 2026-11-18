@@ -31,6 +31,7 @@ from typing import Any, TypeVar
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api import route_geometry_cache
 from app.api.visibility import visible_revision
 from app.db.models import Journey, Recording, TelemetryPoint
 
@@ -61,12 +62,15 @@ async def fingerprint(session: AsyncSession) -> Fingerprint:
     number, different lines on the map -- and nothing else here moves when that happens.
     Ids are distinct, so a one-for-one swap always moves their sum.
     """
+    # SQLite can count b-tree entries and look up the last rowid independently.
+    # Putting both aggregates in one SELECT makes it visit every telemetry row,
+    # even on a cache hit.
     row = (
         await session.execute(
             select(
-                func.count(TelemetryPoint.id),
-                func.max(TelemetryPoint.id),
-                select(func.count(Journey.id)).scalar_subquery(),
+                select(func.count()).select_from(TelemetryPoint).scalar_subquery(),
+                select(func.max(TelemetryPoint.id)).scalar_subquery(),
+                select(func.count()).select_from(Journey).scalar_subquery(),
                 select(func.max(Journey.id)).scalar_subquery(),
                 select(func.max(Journey.updated_at)).scalar_subquery(),
                 select(func.max(Recording.processed_at)).scalar_subquery(),
@@ -136,6 +140,7 @@ def clear() -> None:
     """Forget everything. For tests, and for anything that swaps the database underneath."""
     _entries.clear()
     _locks.clear()
+    route_geometry_cache.clear()
 
 
 def size() -> int:

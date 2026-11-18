@@ -377,6 +377,13 @@ class SettingCategoryOut(BaseModel):
     settings: list[SettingOut] = Field(default_factory=list)
 
 
+class DisplaySettingsOut(BaseModel):
+    timezone: str
+    tile_url: str
+    attribution: str
+    max_zoom: int
+
+
 class SettingsUpdate(BaseModel):
     values: dict[str, Any]
 

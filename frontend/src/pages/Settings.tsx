@@ -4,6 +4,7 @@ import { useSearchParams } from 'react-router-dom'
 
 import Spinner from '@/components/Spinner'
 import { ErrorState, PageHeader } from '@/components/ui'
+import { DISPLAY_SETTINGS_KEY } from '@/lib/useDisplaySettings'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { formatBytes, formatDate, formatRelative } from '@/lib/format'
@@ -54,6 +55,7 @@ export default function Settings() {
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
       client.setQueryData(['settings'], categories)
+      void client.invalidateQueries({ queryKey: DISPLAY_SETTINGS_KEY })
       client.invalidateQueries({ queryKey: ['status'] })
       client.invalidateQueries({ queryKey: ['system-hardware'] })
     },
@@ -68,6 +70,7 @@ export default function Settings() {
     mutationFn: (key: string) => api.settings.reset([key]),
     onSuccess: (categories, key) => {
       client.setQueryData(['settings'], categories)
+      void client.invalidateQueries({ queryKey: DISPLAY_SETTINGS_KEY })
       // A saved default must also replace this field's unsaved draft. Otherwise the
       // draft hides the reset and the next Save silently writes the old value back.
       setDirty((current) => {

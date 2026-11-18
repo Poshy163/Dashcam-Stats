@@ -140,20 +140,18 @@ def drive_filter():
     )
 
 
-def visible_journey_ids():
-    """Journey ids backed by at least one fully rebuilt recording.
+def journey_has_visible_recording():
+    """A journey backed by at least one fully rebuilt recording.
 
     ``NULL`` remains visible for databases created before analysis revisions existed.
     Missing footage is intentionally included: size retention marks an analysed recording
     deleted, but keeps its finalised analysis and history. Ignored discard tombstones and
     unfinished recordings still fail the shared visibility rule.
     """
+    # Look up members of the candidate journey and stop after its first visible clip.
     return (
-        select(Recording.journey_id)
-        .where(
-            Recording.journey_id.is_not(None),
-            # `visible_revision` carries the ignored check now.
-            visible_revision(Recording.telemetry_revision),
-        )
-        .distinct()
+        select(1)
+        .where(Recording.journey_id == Journey.id, visible_revision(Recording.telemetry_revision))
+        .correlate(Journey)
+        .exists()
     )

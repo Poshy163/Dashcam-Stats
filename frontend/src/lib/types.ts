@@ -783,13 +783,20 @@ export interface SettingDef {
   /** Key of a boolean setting that gates this one; used to grey out dependents. */
   requires: string | null
   // snake_case on purpose. Unlike every other response, settings are fetched with
-  // `rawKeys` so the dotted setting identifiers survive the round trip, which means these
+  // raw keys so the dotted setting identifiers survive the round trip, which means these
   // two arrive exactly as the backend spells them. Declaring them camelCase made both
   // permanently `undefined`, and `!setting.isDefault` therefore always true — so a "reset
   // to default" link appeared beside all forty controls on a fresh install, next to
   // settings nobody had touched.
   read_only: boolean
   is_default: boolean
+}
+
+export interface DisplaySettings {
+  timezone: string
+  tileUrl: string
+  attribution: string
+  maxZoom: number
 }
 
 export interface SettingCategory {
@@ -929,7 +936,7 @@ export interface HeatmapFilters {
  */
 export interface Routes {
   /** Polylines, each a list of [lat, lon] pairs. */
-  lines: number[][][]
+  lines: [number, number][][]
   journeys: number
   segments: number
   points: number

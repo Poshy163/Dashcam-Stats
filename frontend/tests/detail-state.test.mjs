@@ -47,7 +47,7 @@ async function mountDetail(t, { Component = PlateDetail, route = '/plates/:id', 
   globalThis.fetch = async (url, init) => {
     const request = new URL(url, 'http://localhost')
     requests.push({ url: request, init })
-    if (request.pathname === '/api/settings') return new Response('[]')
+    if (request.pathname === '/api/settings/display') return new Response('{}')
     const match = request.pathname.match(/^\/api\/plates\/(\d+)(?:\/(observations|correct|merge))?$/)
     assert.ok(match, `Unexpected request: ${url}`)
     if (match[2] === 'observations') return new Response(JSON.stringify({ items: await observationsFor(Number(match[1])), page: Number(request.searchParams.get('page') ?? 1), pages: 3, total: 60, page_size: 25 }))

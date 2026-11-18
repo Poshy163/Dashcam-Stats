@@ -20,6 +20,7 @@ from app.ai.runtime import describe_media_policy, describe_runtime
 from app.api import map_cache
 from app.api.deps import PaginationDep, RowIdFilter, SessionDep
 from app.api.schemas import (
+    DisplaySettingsOut,
     FeatureStatus,
     JourneyOut,
     LogEntryOut,
@@ -36,7 +37,7 @@ from app.api.schemas import (
     StatusTotals,
     UnitLogEntryOut,
 )
-from app.api.visibility import drive_filter, visible_journey_ids, visible_revision
+from app.api.visibility import drive_filter, journey_has_visible_recording, visible_revision
 from app.auth.service import ensure_credential_loaded
 from app.config import get_config
 from app.core.logging import get_logger
@@ -267,7 +268,7 @@ async def get_status(session: SessionDep):
             (
                 await session.execute(
                     select(func.count(Journey.id)).where(
-                        Journey.id.in_(visible_journey_ids()), drive_filter()
+                        journey_has_visible_recording(), drive_filter()
                     )
                 )
             ).scalar()
@@ -377,7 +378,7 @@ async def get_status(session: SessionDep):
     latest = (
         await session.execute(
             select(Journey)
-            .where(Journey.id.in_(visible_journey_ids()), drive_filter())
+            .where(journey_has_visible_recording(), drive_filter())
             .order_by(Journey.started_at.desc())
             .limit(1)
         )
@@ -411,6 +412,18 @@ async def get_status(session: SessionDep):
 @router.get("/settings", response_model=list[SettingCategoryOut])
 async def get_settings():
     return get_settings_service().describe_settings()
+
+
+@router.get("/settings/display", response_model=DisplaySettingsOut)
+async def display_settings() -> DisplaySettingsOut:
+    """Presentation settings shared by the application shell and map views."""
+    settings = get_settings_service()
+    return DisplaySettingsOut(
+        timezone=settings.get_nowait("general.timezone"),
+        tile_url=settings.get_nowait("maps.tile_url"),
+        attribution=settings.get_nowait("maps.attribution"),
+        max_zoom=settings.get_nowait("maps.max_zoom"),
+    )
 
 
 @router.put("/settings", response_model=list[SettingCategoryOut])

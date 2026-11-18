@@ -11,7 +11,9 @@ const directory = await mkdtemp(fileURLToPath(new URL('../node_modules/.map-view
 after(() => rm(directory, { recursive: true, force: true }))
 await build({
   stdin: {
-    contents: `export { default as FitMapToData } from '@/components/FitMapToData';`,
+    contents: `export { default as FitMapToData } from '@/components/FitMapToData';
+      export { mapBounds } from '@/lib/mapBounds';
+      export { api } from '@/lib/api';`,
     resolveDir: fileURLToPath(new URL('..', import.meta.url)), loader: 'tsx',
   },
   outfile: path.join(directory, 'viewport.mjs'), bundle: true, format: 'esm', platform: 'node', jsx: 'automatic',
@@ -24,7 +26,33 @@ await build({
     },
   }],
 })
-const { FitMapToData } = await import(pathToFileURL(path.join(directory, 'viewport.mjs')).href)
+const { FitMapToData, mapBounds, api } = await import(pathToFileURL(path.join(directory, 'viewport.mjs')).href)
+
+test('overlay bounds include disjoint routes and weighted cells while ignoring missing fixes', () => {
+  assert.deepEqual(mapBounds([[[-35, 139], [-34, 138]], [[-36, 141], [0, 0], [NaN, 145]]]), [[-36, 138], [-34, 141]])
+  assert.deepEqual(mapBounds([[[0, 123, 9], [-1, 125, 2]]]), [[-1, 123], [0, 125]])
+  assert.deepEqual(mapBounds([[[], [0, 0]]]), [])
+})
+
+test('map API converts metadata and filter keys without recopying coordinates', async t => {
+  const lines = [[[-35, 138], [-34, 139]]]
+  const points = [[-35, 138, 4]]
+  const responses = new Map([
+    ['/api/map/routes', { lines, simplify_m: 15 }],
+    ['/api/map/heatmap?min_speed_kmh=5', { points, max_weight: 4, total_points: 4 }],
+  ])
+  t.mock.method(globalThis, 'fetch', async url => {
+    assert.ok(responses.has(url))
+    return { ok: true, json: async () => responses.get(url) }
+  })
+  const routes = await api.map.routes()
+  const heat = await api.map.heatmap({ minSpeedKmh: 5 })
+  assert.equal(routes.lines, lines)
+  assert.equal(routes.simplifyM, 15)
+  assert.equal(heat.points, points)
+  assert.equal(heat.maxWeight, 4)
+  assert.equal(heat.totalPoints, 4)
+})
 
 test('map refits changed geographic coverage even when the point count stays the same, without undoing panning for identical bounds', async t => {
   const oldMap = globalThis.__viewportTestMap

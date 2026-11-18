@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import select
 
-from app.api.visibility import visible_journey_ids
+from app.api.visibility import journey_has_visible_recording
 from app.db.models import (
     Journey,
     Plate,
@@ -161,7 +161,8 @@ async def test_an_independent_reader_keeps_the_library_at_each_commit(
             async with get_session_factory()() as reader:
                 await _assert_attached(reader, recording_ids)
                 assert await _payload(reader) == before
-                visible = set((await reader.scalars(visible_journey_ids())).all())
+                visible_ids = select(Journey.id).where(journey_has_visible_recording())
+                visible = set(await reader.scalars(visible_ids))
                 assert visible == set(original_ids)
                 seen.append(visible)
 

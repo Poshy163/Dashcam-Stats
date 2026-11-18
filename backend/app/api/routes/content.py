@@ -10,7 +10,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from fastapi.encoders import jsonable_encoder
 from pydantic import BeforeValidator
-from sqlalchemy import and_, case, func, or_, select, union_all
+from sqlalchemy import and_, case, func, or_, select, tuple_, union_all
 from sqlalchemy.orm import aliased, selectinload
 
 from app.ai.normalise_au import normalise
@@ -44,8 +44,8 @@ from app.api.schemas import (
 )
 from app.api.visibility import (
     drive_filter,
+    journey_has_visible_recording,
     telemetry_quality_view,
-    visible_journey_ids,
     visible_revision,
 )
 from app.core.logging import get_logger
@@ -265,7 +265,6 @@ async def get_recording_neighbours(recording_id: RowId, session: SessionDep):
 
     base = select(Recording.id, Recording.filename, Recording.started_at).where(
         Recording.ignored.is_(False),
-        Recording.id != current.id,
         Recording.camera_id == current.camera_id
         if current.camera_id is not None
         else Recording.camera_id.is_(None),
@@ -280,14 +279,10 @@ async def get_recording_neighbours(recording_id: RowId, session: SessionDep):
         later = (Recording.id.asc(),)
         earlier = (Recording.id.desc(),)
     else:
-        after = or_(
-            Recording.started_at > current.started_at,
-            and_(Recording.started_at == current.started_at, Recording.id > current.id),
-        )
-        before = or_(
-            Recording.started_at < current.started_at,
-            and_(Recording.started_at == current.started_at, Recording.id < current.id),
-        )
+        # The tuple lets SQLite seek into the camera/time index at the open clip.
+        position = tuple_(Recording.started_at, Recording.id)
+        after = position > (current.started_at, current.id)
+        before = position < (current.started_at, current.id)
         later = (Recording.started_at.asc(), Recording.id.asc())
         earlier = (Recording.started_at.desc(), Recording.id.desc())
 
@@ -537,28 +532,6 @@ async def telemetry_quality(
         visible.append(_before_end_of(Recording.started_at, date_to))
     status_case = _telemetry_status_case()
 
-    # One aggregate query for the tiles: no rows come back, only the tallies.
-    tallies = (
-        await session.execute(
-            select(
-                status_case.label("status"),
-                func.count(Recording.id),
-                func.coalesce(func.sum(Recording.gps_gap_count), 0),
-                func.coalesce(func.sum(Recording.gps_recovered_count), 0),
-            )
-            .where(*visible)
-            .group_by(status_case)
-        )
-    ).all()
-
-    counts = {"healthy": 0, "degraded": 0, "no_fix": 0, "pending": 0}
-    total = total_gaps = paired = 0
-    for status_value, count, gaps, recovered in tallies:
-        counts[str(status_value)] = int(count)
-        total += int(count)
-        total_gaps += int(gaps or 0)
-        paired += int(recovered or 0)
-
     done = Recording.telemetry_state == StageState.DONE
     revision_current = (
         func.coalesce(Recording.telemetry_revision, "") == CURRENT_REVISIONS["telemetry"]
@@ -568,7 +541,8 @@ async def telemetry_quality(
     measured = and_(current, has_samples)
     incomplete = _telemetry_gps_incomplete()
     warnings = Recording.telemetry_problem_count > 0
-    issue_filters = [*visible, status_case != "healthy"]
+    issue_condition = status_case != "healthy"
+    filtered_count = []
     if reason is not None:
         reason_conditions = {
             "analysis_pending": ~done,
@@ -586,20 +560,24 @@ async def telemetry_quality(
             ),
             "telemetry_warnings": and_(measured, warnings),
         }
-        issue_filters.append(reason_conditions[reason])
-    issue_total = int(
-        await session.scalar(select(func.count(Recording.id)).where(*issue_filters)) or 0
-    )
+        issue_condition = and_(issue_condition, reason_conditions[reason])
+        filtered_count.append(func.count().filter(issue_condition).label("filtered_issues"))
 
     def total_when(condition, value=1):
         return func.coalesce(func.sum(case((condition, value), else_=0)), 0)
 
-    # Coverage and warning counts use the same current analysed population. They can
-    # overlap, and accepted positions include interpolation/repair, not just direct fixes.
+    # Read the visible library once for all tiles and the filtered page count.
     coverage = (
         (
             await session.execute(
                 select(
+                    func.count().label("total"),
+                    func.count().filter(~done).label("pending"),
+                    func.count().filter(status_case == "healthy").label("healthy"),
+                    func.count().filter(status_case == "no_fix").label("no_fix"),
+                    func.coalesce(func.sum(Recording.gps_gap_count), 0).label("total_gaps"),
+                    func.coalesce(func.sum(Recording.gps_recovered_count), 0).label("paired"),
+                    *filtered_count,
                     total_when(measured).label("recordings"),
                     total_when(measured, Recording.telemetry_point_count).label("total_points"),
                     total_when(measured, Recording.gps_point_count).label("accepted_points"),
@@ -625,6 +603,7 @@ async def telemetry_quality(
         .mappings()
         .one()
     )
+    issue_total = coverage.get("filtered_issues", coverage["total"] - coverage["healthy"])
 
     # And one bounded column query for the table, ordered by the same key the page sorts
     # on so the limit takes the worst rows rather than an arbitrary slice.
@@ -646,7 +625,7 @@ async def telemetry_quality(
                 Recording.telemetry_problem_count,
                 status_case.label("status"),
             )
-            .where(*issue_filters)
+            .where(*visible, issue_condition)
             .order_by(
                 Recording.gps_longest_gap_s.desc(),
                 Recording.telemetry_problem_count.desc(),
@@ -678,10 +657,13 @@ async def telemetry_quality(
         for row in rows
     ]
     return TelemetryQualityOut(
-        recordings=total,
-        **counts,
-        total_gaps=total_gaps,
-        paired_recoveries=paired,
+        recordings=coverage["total"],
+        healthy=coverage["healthy"],
+        degraded=coverage["total"] - coverage["pending"] - coverage["healthy"] - coverage["no_fix"],
+        no_fix=coverage["no_fix"],
+        pending=coverage["pending"],
+        total_gaps=coverage["total_gaps"],
+        paired_recoveries=coverage["paired"],
         outdated_recordings=coverage["outdated_recordings"],
         empty_recordings=coverage["empty_recordings"],
         gps_coverage=TelemetryGpsCoverageOut.model_validate(dict(coverage)),
@@ -789,7 +771,7 @@ async def list_journeys(
                 "date_from must be on or before date_to",
             )
 
-    stmt = select(Journey).where(Journey.id.in_(visible_journey_ids()))
+    stmt = select(Journey).where(journey_has_visible_recording())
     if not include_parked:
         # A parked session is a real grouping of real footage and not a drive. Hidden here
         # rather than never created, because the recordings still have to belong somewhere
@@ -827,7 +809,7 @@ async def rebuild_journeys(session: SessionDep):
     touched = await JourneyBuilder().rebuild(session)
     await session.flush()
     total = await session.scalar(select(func.count(Journey.id)))
-    visible = select(func.count(Journey.id)).where(Journey.id.in_(visible_journey_ids()))
+    visible = select(func.count(Journey.id)).where(journey_has_visible_recording())
     return {
         "journeys_touched": touched,
         "total_journeys": int(total or 0),
@@ -842,7 +824,7 @@ async def get_journey(journey_id: RowId, session: SessionDep):
         await session.execute(
             select(Journey).where(
                 Journey.id == journey_id,
-                Journey.id.in_(visible_journey_ids()),
+                journey_has_visible_recording(),
             )
         )
     ).scalar_one_or_none()
@@ -1869,7 +1851,7 @@ async def search(session: SessionDep, q: str = Query(..., min_length=1)):
     # one before falling back to nothing.
     journey_stmt = (
         select(Journey)
-        .where(Journey.id.in_(visible_journey_ids()))
+        .where(journey_has_visible_recording())
         .order_by(Journey.started_at.desc())
         .limit(20)
     )
@@ -1879,7 +1861,7 @@ async def search(session: SessionDep, q: str = Query(..., min_length=1)):
         except ValueError:
             continue
         # Added to the base statement, not a fresh one: replacing it dropped the
-        # `visible_journey_ids()` restriction the title branch keeps, so searching a date
+        # `journey_has_visible_recording()` restriction the title branch keeps, so searching a date
         # was the one way to reach journeys every other route hides.
         journey_stmt = journey_stmt.where(
             Journey.started_at >= _day_start(day.date()),

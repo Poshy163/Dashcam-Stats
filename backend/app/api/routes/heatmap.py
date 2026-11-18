@@ -22,15 +22,14 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Query
-from sqlalchemy import Float, String, distinct, func, or_, select
+from sqlalchemy import Float, String, desc, distinct, func, or_, select, type_coerce
 from sqlalchemy import cast as sa_cast
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api import map_cache
+from app.api import map_cache, route_geometry_cache
 from app.api.deps import SQLITE_MAX_INT, SessionDep
-from app.api.geometry import build_polylines
 from app.api.schemas import HeatmapOut, RoutesOut
-from app.api.visibility import visible_journey_ids, visible_revision
+from app.api.visibility import journey_has_visible_recording, visible_revision
 from app.core.logging import get_logger
 from app.db.models import Camera, CameraRole, Journey, Recording, TelemetryPoint
 from app.osd.reasons import DRAWABLE
@@ -145,6 +144,11 @@ async def _heatmap(
         "row:" + sa_cast(TelemetryPoint.id, String),
     )
     weight = func.count(distinct(second))
+    recordings = select(Recording.id).where(visible_revision(Recording.telemetry_revision))
+    if camera is not None:
+        recordings = recordings.join(Camera, Recording.camera_id == Camera.id).where(
+            Camera.key == camera
+        )
 
     stmt = (
         select(
@@ -159,17 +163,14 @@ async def _heatmap(
             func.sum(TelemetryPoint.speed_kmh).label("speed_sum"),
             func.count(TelemetryPoint.speed_kmh).label("speed_count"),
         )
-        # This join is load-bearing. Referencing Recording only in the WHERE clause makes
-        # SQLAlchemy add it as a second, unrelated FROM item: a Cartesian product where
-        # one valid recording makes every invalidated telemetry row look valid. That is
-        # why reanalysis removed the route lines but left the heat layer behind.
-        .join(Recording, Recording.id == TelemetryPoint.recording_id)
         # has_fix alone is not enough: a row can carry the flag with null coordinates if a
         # reading was rejected after the flag was set, and null coordinates would round to
         # a cell at Null Island.
         .where(
             TelemetryPoint.has_fix.is_(True),
-            visible_revision(Recording.telemetry_revision),
+            # Seek the eligible recordings in the map index. One hidden clip must never
+            # contribute fixes merely because another clip has a visible revision.
+            TelemetryPoint.recording_id.in_(recordings),
             TelemetryPoint.lat.is_not(None),
             TelemetryPoint.lon.is_not(None),
             _drawable_quality(),
@@ -187,7 +188,9 @@ async def _heatmap(
         .group_by(lat_cell, lon_cell)
         # Densest first, so a truncated response still shows the places most driven rather
         # than an arbitrary slice.
-        .order_by(weight.desc())
+        # Order by the result column. Repeating the parameterised aggregate makes SQLite
+        # maintain a second DISTINCT set for the same cell.
+        .order_by(desc("weight"))
         .limit(limit + 1)
     )
 
@@ -203,9 +206,6 @@ async def _heatmap(
         stmt = stmt.where(TelemetryPoint.captured_at <= end)
     if journey_id is not None:
         stmt = stmt.where(TelemetryPoint.journey_id == journey_id)
-    if camera is not None:
-        stmt = stmt.join(Camera, Recording.camera_id == Camera.id).where(Camera.key == camera)
-
     rows = (await session.execute(stmt)).all()
     truncated = len(rows) > limit
     rows = rows[:limit]
@@ -283,21 +283,27 @@ async def _routes(
     simplify_m: float,
     max_points: int,
 ) -> RoutesOut:
+    # Resolve camera role and visibility once per recording, before scanning its fixes.
+    front_recordings = (
+        select(Recording.id)
+        .outerjoin(Camera, Recording.camera_id == Camera.id)
+        .where(
+            visible_revision(Recording.telemetry_revision),
+            (Camera.role == CameraRole.FRONT) | (Camera.id.is_(None)),
+        )
+    )
     stmt = (
         select(
             TelemetryPoint.journey_id,
             TelemetryPoint.lat,
             TelemetryPoint.lon,
-            TelemetryPoint.captured_at,
-            TelemetryPoint.t_offset_s,
+            type_coerce(TelemetryPoint.captured_at, String),
             TelemetryPoint.recording_id,
             TelemetryPoint.breaks_segment,
         )
-        .join(Recording, TelemetryPoint.recording_id == Recording.id)
-        .outerjoin(Camera, Recording.camera_id == Camera.id)
         .where(
             TelemetryPoint.has_fix.is_(True),
-            visible_revision(Recording.telemetry_revision),
+            TelemetryPoint.recording_id.in_(front_recordings),
             TelemetryPoint.lat.is_not(None),
             TelemetryPoint.lon.is_not(None),
             # Rejected positions carry no coordinate, so the nulls above already exclude
@@ -312,8 +318,6 @@ async def _routes(
                     )
                 ),
             ),
-            # A rear-camera-only stretch is rare and not worth a second copy of every road.
-            (Camera.role == CameraRole.FRONT) | (Camera.id.is_(None)),
         )
         .order_by(
             TelemetryPoint.journey_id.asc(),
@@ -343,14 +347,18 @@ async def _routes(
     truncated = False
     journeys = 0
 
-    fixes: list[tuple[float, float, float | None]] = []
-    breaks: list[bool] = []
+    fixes: list[route_geometry_cache.RouteFix] = []
+    # Filtered overlays can reuse the whole-response cache without displacing the
+    # default map's per-journey geometry as users explore different dates and settings.
+    cacheable = (
+        start is None and end is None and journey_id is None and simplify_m == DEFAULT_SIMPLIFY_M
+    )
 
     def emit() -> bool:
         """Simplify the buffered journey into ``lines``. True when the cap was reached."""
         nonlocal points_sent, truncated, journeys
         journeys += 1
-        for segment in build_polylines(fixes, tolerance_m=simplify_m, breaks=breaks):
+        for segment in route_geometry_cache.journey_lines(fixes, simplify_m, cacheable=cacheable):
             if points_sent + len(segment) > max_points:
                 truncated = True
                 return True
@@ -359,30 +367,21 @@ async def _routes(
         return False
 
     current: int | None = None
-    started = False
-    previous_recording: int | None = None
     result = await session.stream(stmt.execution_options(yield_per=_ROUTE_FETCH_BATCH))
     try:
-        async for row in result:
-            if started and row.journey_id != current:
-                if emit():
-                    break
-                fixes = []
-                breaks = []
-            current = row.journey_id
-            started = True
-            seconds = row.captured_at.timestamp() if row.captured_at is not None else None
-            fixes.append((float(row.lat), float(row.lon), seconds))
-            # The stored flag is set on the first drawable fix of *every* recording, because
-            # the per-clip walk that sets it has no anchor yet at that point. Across a
-            # journey it would mean a break at every clip boundary -- which is not what the
-            # journey-detail view draws, and the two must agree. `single_track` applies the
-            # same suppression for that view.
-            clip_start = previous_recording is not None and previous_recording != row.recording_id
-            previous_recording = row.recording_id
-            breaks.append(bool(row.breaks_segment) and not clip_start)
+        # Iterate asynchronously once per batch and unpack the buffered columns by position.
+        async for batch in result.partitions(_ROUTE_FETCH_BATCH):
+            for row_journey, lat, lon, captured_at, recording_id, breaks_segment in batch:
+                if fixes and row_journey != current:
+                    if emit():
+                        break
+                    fixes = []
+                current = row_journey
+                fixes.append((lat, lon, captured_at, recording_id, breaks_segment))
+            if truncated:
+                break
         else:
-            if started:
+            if fixes:
                 emit()
     finally:
         await result.close()
@@ -417,7 +416,7 @@ async def coverage(
             Journey.max_lon,
         )
         .where(
-            Journey.id.in_(visible_journey_ids()),
+            journey_has_visible_recording(),
             or_(
                 Journey.motion_json["status"].as_string().is_(None),
                 Journey.motion_json["status"].as_string() == "moving",

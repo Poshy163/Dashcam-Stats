@@ -39,10 +39,11 @@ await build({
   }],
 })
 
-const state = { authenticated: true, required: true, statusCalls: 0 }
+const state = { authenticated: true, required: true, statusCalls: 0, displayCalls: 0 }
 globalThis.__routerTest = {
   api: {
     auth: { state: async () => ({ required: state.required, authenticated: state.authenticated }) },
+    settings: { display: async () => { state.displayCalls++; return { timezone: 'Australia/Adelaide' } } },
     status: async () => { state.statusCalls++; return { timezone: 'Australia/Adelaide' } },
   },
 }
@@ -87,12 +88,14 @@ function page(root) {
   return root.root.findByType('output').props['data-page']
 }
 
-test('sign-in preserves the requested recording and seek query without pre-auth status reads', async t => {
+test('sign-in loads display settings for the bookmarked recording without querying dashboard totals', async t => {
   state.authenticated = false
   state.statusCalls = 0
+  state.displayCalls = 0
   const { root, navigation } = await mount(t, '/recordings/27?t=42&camera=rear')
   assert.equal(root.toJSON(), 'Sign in')
   assert.equal(state.statusCalls, 0)
+  assert.equal(state.displayCalls, 0)
   state.authenticated = true
   await act(async () => { await globalThis.__routerTest.login() })
   await settle()
@@ -100,7 +103,8 @@ test('sign-in preserves the requested recording and seek query without pre-auth 
   assert.equal(root.root.findByType('output').children.join(''), '{"id":"27"}')
   assert.equal(navigation.location.pathname + navigation.location.search, '/recordings/27?t=42&camera=rear')
   assert.equal(document.title, 'Recording · Dashcam Analyser')
-  assert.ok(state.statusCalls > 0)
+  assert.equal(state.displayCalls, 1)
+  assert.equal(state.statusCalls, 0)
 })
 
 test('query navigation and browser history preserve bookmarked plate filters', async t => {

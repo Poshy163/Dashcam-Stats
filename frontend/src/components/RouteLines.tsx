@@ -4,7 +4,7 @@ import L from 'leaflet'
 
 interface Props {
   /** Polylines as [lat, lon] pairs. One drive is usually several, split at signal gaps. */
-  lines: number[][][]
+  lines: [number, number][][]
   color?: string
   opacity?: number
   weight?: number
@@ -33,14 +33,7 @@ export default function RouteLines({
   const paths = useMemo(
     () =>
       lines
-        .map((line) =>
-          line
-            .filter(
-              ([lat, lon]) =>
-                Number.isFinite(lat) && Number.isFinite(lon) && (lat !== 0 || lon !== 0),
-            )
-            .map(([lat, lon]) => [lat, lon] as [number, number]),
-        )
+        .map((line) => line.filter(([lat, lon]) => Number.isFinite(lat) && Number.isFinite(lon) && (lat !== 0 || lon !== 0)))
         .filter((line) => line.length > 1),
     [lines],
   )
@@ -70,6 +63,7 @@ export default function RouteLines({
     group.addTo(map)
     return () => {
       map.removeLayer(group)
+      map.removeLayer(renderer)
     }
   }, [map, paths, color, opacity, weight])
 

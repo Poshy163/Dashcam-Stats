@@ -1,26 +1,16 @@
-import { useMemo, useState } from 'react'
+import { lazy, Suspense, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { MapContainer, TileLayer } from 'react-leaflet'
-// Imported beside the library rather than in main.tsx, so the ~14 kB of Leaflet CSS
-// is emitted with the lazily-loaded map chunk instead of the stylesheet every page
-// blocks on.
-import 'leaflet/dist/leaflet.css'
 
-import FitMapToData from '@/components/FitMapToData'
-import HeatLayer from '@/components/HeatLayer'
-import RouteLines from '@/components/RouteLines'
+import RouteContentReady from '@/components/RouteContentReady'
 import Spinner from '@/components/Spinner'
 import { DerivedHint, EmptyState, ErrorState, PageHeader, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
 import { formatDuration } from '@/lib/format'
+import { mapBounds } from '@/lib/mapBounds'
 import { useMapSettings } from '@/lib/useMapSettings'
 
-// The tile provider comes from the settings the Settings page offers, not from constants
-// here. Those constants meant a user who pointed the app at their own tile server got the
-// journey map from it and this one from OpenStreetMap, under an attribution line naming a
-// provider that was not serving the tiles. `RouteMap`'s own defaults are the fallback.
-const TILES = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'
-const ATTRIBUTION = '&copy; OpenStreetMap contributors'
+// Start both map queries while the browser downloads Leaflet and its heat plugin.
+const HeatmapCanvas = lazy(() => import('@/components/HeatmapCanvas'))
 
 /** Grid resolutions offered, with what each is actually useful for. */
 const RESOLUTIONS = [
@@ -76,16 +66,11 @@ export default function HeatmapPage() {
   })
 
   const data = query.data
-  const points = useMemo(() => data?.points ?? [], [data])
-  const heatPoints = useMemo(
-    () => points.map(([lat, lon, weight]) => ({ lat, lon, weight })),
-    [points],
-  )
-  const mapPoints = useMemo<[number, number][]>(() => {
-    const heat = layer === 'routes' ? [] : points.map(([lat, lon]) => [lat, lon] as [number, number])
-    const lines = layer === 'heat' ? [] : (routes.data?.lines ?? []).flat().filter(([lat, lon]) => Number.isFinite(lat) && Number.isFinite(lon)).map(([lat, lon]) => [lat!, lon!] as [number, number])
-    return [...heat, ...lines]
-  }, [layer, points, routes.data])
+  const points = data?.points
+  const lines = routes.data?.lines
+  const heatBounds = useMemo(() => points ? mapBounds([points]) : [], [points])
+  const routeBounds = useMemo(() => lines ? mapBounds(lines) : [], [lines])
+  const fitPoints = layer === 'heat' ? heatBounds : layer === 'routes' ? routeBounds : [...heatBounds, ...routeBounds]
 
   const mode = MODES.find((m) => m.value === minSpeedKmh) ?? MODES[0]!
 
@@ -144,7 +129,7 @@ export default function HeatmapPage() {
       {maps.query.isPending && <Spinner label="Loading map provider…" className="py-8" />}
       {maps.query.isError && <ErrorState title="Could not load map settings" error={maps.query.error} retry={() => maps.query.refetch()} />}
 
-      {data && mapPoints.length === 0 && !query.isLoading && (layer === 'heat' || routes.isSuccess) && (
+      {data && fitPoints.length === 0 && !query.isLoading && (layer === 'heat' || routes.isSuccess) && (
         <EmptyState
           title="No GPS data yet"
           description={
@@ -156,62 +141,54 @@ export default function HeatmapPage() {
       )}
 
       {data && (
-        <>
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <StatTile label="Grid cells" value={data.cells.toLocaleString()} />
-            <StatTile
-              label="Time represented"
-              value={formatDuration(data.totalPoints)}
-              hint="One GPS fix per second of footage"
-            />
-            <StatTile
-              label="Busiest cell"
-              value={formatDuration(data.maxWeight)}
-              hint="Longest time spent inside a single cell"
-            />
-            <StatTile
-              label="Average speed"
-              value={data.averageSpeedKmh != null ? `${data.averageSpeedKmh} km/h` : '—'}
-            />
-          </div>
-
-        </>
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <StatTile label="Grid cells" value={data.cells.toLocaleString()} />
+          <StatTile
+            label="Time represented"
+            value={formatDuration(data.totalPoints)}
+            hint="One GPS fix per second of footage"
+          />
+          <StatTile
+            label="Busiest cell"
+            value={formatDuration(data.maxWeight)}
+            hint="Longest time spent inside a single cell"
+          />
+          <StatTile
+            label="Average speed"
+            value={data.averageSpeedKmh != null ? `${data.averageSpeedKmh} km/h` : '—'}
+          />
+        </div>
       )}
 
-      {mapPoints.length > 0 && maps.query.isSuccess && <div className="overflow-hidden rounded-lg border border-border">
-            <MapContainer center={mapPoints[0]!} zoom={12} scrollWheelZoom className="h-[70vh] w-full">
-              <TileLayer
-                url={maps.tileUrl ?? TILES}
-                attribution={maps.attribution ?? ATTRIBUTION}
-                maxZoom={maps.maxZoom ?? 19}
-              />
-              <FitMapToData points={mapPoints} />
-              {layer !== 'routes' && data && (
-                <HeatLayer
-                  points={heatPoints}
-                  maxWeight={data.maxWeight}
-                  precision={data.precision}
-                />
-              )}
-              {layer !== 'heat' && routes.data && <RouteLines lines={routes.data.lines} />}
-            </MapContainer>
-          </div>}
+      <Suspense fallback={fitPoints.length > 0 && maps.query.isSuccess ? <Spinner label="Loading map…" /> : null}>
+        <RouteContentReady>
+          <HeatmapCanvas
+            fitPoints={fitPoints}
+            settingsLoaded={maps.query.isSuccess}
+            tileUrl={maps.tileUrl}
+            attribution={maps.attribution}
+            maxZoom={maps.maxZoom}
+            heat={layer !== 'routes' ? data : undefined}
+            routes={layer !== 'heat' ? routes.data : undefined}
+          />
+        </RouteContentReady>
+      </Suspense>
 
-          <DerivedHint>
-            {layer !== 'routes' && <>{mode.hint} Colour is scaled logarithmically, so a road driven twice stays
-            visible next to a driveway parked in for hours. </>}
-            {layer === 'routes' && 'Routes show traced roads independently of the heat grid and speed filters. '}
-            {layer !== 'heat' && routes.data && (
-              <>
-                {' '}
-                Routes are {routes.data.segments.toLocaleString()} traced lines across{' '}
-                {routes.data.journeys} journeys, broken wherever the signal was lost rather
-                than joined across the gap.
-                {routes.data.truncated && ' Not all of them fit; some are not shown.'}
-              </>
-            )}
-            {layer !== 'routes' && data?.truncated && ' Showing the densest cells only — zoom the grid out for full coverage.'}
-          </DerivedHint>
+      <DerivedHint>
+        {layer !== 'routes' && <>{mode.hint} Colour is scaled logarithmically, so a road driven twice stays
+        visible next to a driveway parked in for hours. </>}
+        {layer === 'routes' && 'Routes show traced roads independently of the heat grid and speed filters. '}
+        {layer !== 'heat' && routes.data && (
+          <>
+            {' '}
+            Routes are {routes.data.segments.toLocaleString()} traced lines across{' '}
+            {routes.data.journeys} journeys, broken wherever the signal was lost rather
+            than joined across the gap.
+            {routes.data.truncated && ' Not all of them fit; some are not shown.'}
+          </>
+        )}
+        {layer !== 'routes' && data?.truncated && ' Showing the densest cells only — zoom the grid out for full coverage.'}
+      </DerivedHint>
     </div>
   )
 }

@@ -3,36 +3,13 @@ import { useMap } from 'react-leaflet'
 import L from 'leaflet'
 import 'leaflet.heat'
 
-export interface HeatPoint {
-  lat: number
-  lon: number
-  weight: number
-}
-
 interface Props {
-  points: HeatPoint[]
+  points: [number, number, number][]
   /** Weight of the busiest cell, from the server, used to normalise the ramp. */
   maxWeight: number
   /** Grid resolution the server aggregated at, in decimal places. */
   precision: number
   opacity?: number
-}
-
-/**
- * Intensities are compressed logarithmically, and that is not a cosmetic choice.
- *
- * The overlay samples once a second regardless of whether the car is moving, so time spent
- * stationary lands over and over in one cell: a driveway can hold thousands of fixes while
- * a road driven twice holds two. On a linear ramp the result is one incandescent dot at
- * home and an invisible road network everywhere else — technically a correct rendering of
- * the data, and useless as a picture of where someone drives.
- *
- * A log curve keeps the ordering intact while bringing three orders of magnitude into a
- * range the eye can actually read.
- */
-function intensity(weight: number, maxWeight: number): number {
-  if (maxWeight <= 1) return 1
-  return Math.log1p(Math.max(weight, 0)) / Math.log1p(maxWeight)
 }
 
 /**
@@ -59,13 +36,16 @@ function radiusForZoom(zoom: number, precision: number): number {
 export default function HeatLayer({ points, maxWeight, precision, opacity = 0.85 }: Props) {
   const map = useMap()
 
-  const data = useMemo<[number, number, number][]>(
-    () =>
-      points
-        .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lon) && (p.lat !== 0 || p.lon !== 0))
-        .map((p) => [p.lat, p.lon, intensity(p.weight, maxWeight)]),
-    [points, maxWeight],
-  )
+  const data = useMemo(() => {
+    const normalized: [number, number, number][] = []
+    // Logarithmic intensities keep an occasional drive visible beside hours of parked fixes.
+    const scale = Math.log1p(maxWeight)
+    for (const [lat, lon, weight] of points) {
+      if (!Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0)) continue
+      normalized.push([lat, lon, maxWeight <= 1 ? 1 : Math.log1p(Math.max(weight, 0)) / scale])
+    }
+    return normalized
+  }, [points, maxWeight])
 
   useEffect(() => {
     if (data.length === 0) return

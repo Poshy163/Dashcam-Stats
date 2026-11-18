@@ -74,6 +74,21 @@ class TestReadEndpoints:
 class TestSettingsPayload:
     """The exact shape the Settings page consumes."""
 
+    async def test_display_settings_follow_camera_and_tile_configuration(self, client):
+        values = {
+            "general.timezone": "Australia/Adelaide",
+            "maps.tile_url": "https://tiles.example.test/{z}/{x}/{y}.png",
+            "maps.attribution": "Test tiles",
+            "maps.max_zoom": 16,
+        }
+        assert (await client.put("/api/settings", json={"values": values})).status_code == 200
+        assert (await client.get("/api/settings/display")).json() == {
+            "timezone": "Australia/Adelaide",
+            "tile_url": values["maps.tile_url"],
+            "attribution": "Test tiles",
+            "max_zoom": 16,
+        }
+
     async def test_choices_is_always_a_list(self, client):
         """The bug: `None` here made the whole response fail validation."""
         categories = (await client.get("/api/settings")).json()
@@ -1124,7 +1139,8 @@ class TestRecordingNeighbours:
                     size_bytes=1,
                     state=RecordingState.COMPLETED,
                     camera_id=cam.id,
-                    started_at=base + timedelta(minutes=minute),
+                    # Front clips a and b share a timestamp and must be ordered by ID.
+                    started_at=base + timedelta(minutes=minute // 3),
                     ignored=hidden,
                 )
                 session.add(rec)

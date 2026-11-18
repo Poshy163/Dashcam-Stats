@@ -4,6 +4,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 
 import Spinner from '@/components/Spinner'
 import { DerivedHint, EmptyState, ErrorState, PageHeader, Pagination } from '@/components/ui'
+import { useDisplaySettings } from '@/lib/useDisplaySettings'
 import { api } from '@/lib/api'
 import { invalidateAnalysisQueries } from '@/lib/queryInvalidation'
 import { formatDate, formatDistance, formatDuration, formatSpeed, formatTime } from '@/lib/format'
@@ -16,7 +17,7 @@ const DATE_PRESETS: [JourneyDatePreset, string][] = [['today', 'Today'], ['yeste
 export default function Journeys() {
   const [params, setParams] = useSearchParams()
   const client = useQueryClient()
-  const status = useQuery({ queryKey: ['status'], queryFn: api.status, staleTime: 300_000 })
+  const { data: display } = useDisplaySettings()
   const motion = useQuery({
     queryKey: ['journey-motion-quality'],
     queryFn: () => api.journeys.motionQuality(),
@@ -88,13 +89,13 @@ export default function Journeys() {
     setParams(next)
   }
   const choosePreset = (preset: JourneyDatePreset) => {
-    if (!status.data?.timezone) return
-    const dates = journeyDatePreset(preset, status.data.timezone)
+    if (!display?.timezone) return
+    const dates = journeyDatePreset(preset, display.timezone)
     updateDates(dates.dateFrom, dates.dateTo)
   }
   const presetSelected = (preset: JourneyDatePreset) => {
-    if (!status.data?.timezone) return false
-    const dates = journeyDatePreset(preset, status.data.timezone)
+    if (!display?.timezone) return false
+    const dates = journeyDatePreset(preset, display.timezone)
     return dateFrom === dates.dateFrom && dateTo === dates.dateTo
   }
 
@@ -144,12 +145,12 @@ export default function Journeys() {
           <div>
             <h2 className="section-title">Filter journeys</h2>
             <p className="mt-1 text-sm text-content-muted">
-              Find journeys by their start date. Dates use {status.data?.timezone ?? 'the camera’s configured timezone'}.
+              Find journeys by their start date. Dates use {display?.timezone ?? 'the camera’s configured timezone'}.
             </p>
           </div>
           <div className="flex flex-wrap gap-1.5">
             {DATE_PRESETS.map(([preset, label]) => (
-              <button key={preset} className="btn aria-pressed:border-accent/50 aria-pressed:bg-accent-muted" aria-pressed={presetSelected(preset)} disabled={!status.data?.timezone} onClick={() => choosePreset(preset)}>{label}</button>
+              <button key={preset} className="btn aria-pressed:border-accent/50 aria-pressed:bg-accent-muted" aria-pressed={presetSelected(preset)} disabled={!display?.timezone} onClick={() => choosePreset(preset)}>{label}</button>
             ))}
             <button className="btn aria-pressed:border-accent/50 aria-pressed:bg-accent-muted" aria-pressed={!hasDates} onClick={() => updateDates('', '')}>All dates</button>
           </div>

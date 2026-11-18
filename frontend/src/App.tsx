@@ -1,4 +1,4 @@
-import { Suspense, useEffect } from 'react'
+import { lazy as lazyComponent, Suspense, useEffect } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
 
@@ -7,6 +7,7 @@ import RouteBoundary from '@/components/RouteBoundary'
 import Spinner from '@/components/Spinner'
 import { ErrorState } from '@/components/ui'
 import { api, setUnauthorizedHandler } from '@/lib/api'
+import { useDisplaySettings } from '@/lib/useDisplaySettings'
 import { useDisplayTimeZone } from '@/lib/useDisplayTimeZone'
 import { lazyRoute as lazy } from '@/lib/lazyRoute'
 import { AUTH_STATE_KEY, resetForIdentityChange } from '@/lib/queryInvalidation'
@@ -18,7 +19,8 @@ const Dashboard = lazy(() => import('@/pages/Dashboard'))
 const Recordings = lazy(() => import('@/pages/Recordings'))
 const RecordingViewer = lazy(() => import('@/pages/RecordingViewer'))
 const Journeys = lazy(() => import('@/pages/Journeys'))
-const Heatmap = lazy(() => import('@/pages/Heatmap'))
+// Heatmap marks the route ready after its independently downloaded map canvas resolves.
+const Heatmap = lazyComponent(() => import('@/pages/Heatmap'))
 const TelemetryHealth = lazy(() => import('@/pages/TelemetryHealth'))
 const JourneyDetail = lazy(() => import('@/pages/JourneyDetail'))
 const ObdDrives = lazy(() => import('@/pages/ObdDrives'))
@@ -84,18 +86,8 @@ export default function App() {
     return () => setUnauthorizedHandler(null)
   }, [client])
 
-  // Timestamps are rendered in the camera's timezone, not the viewer's — the footage, the
-  // burned-in overlay and the filenames are all in the camera's local time, so a clip
-  // driven at 4pm should read as 4pm wherever it is being looked at. Set here rather than
-  // in a page, because every page formats dates and the first one rendered would otherwise
-  // use the browser's zone until something else happened to fetch the status.
-  const status = useQuery({
-    queryKey: ['status'],
-    queryFn: api.status,
-    staleTime: 300_000,
-    enabled: auth.isSuccess && !locked,
-  })
-  useDisplayTimeZone(status.data?.timezone)
+  const display = useDisplaySettings(auth.isSuccess && !locked)
+  useDisplayTimeZone(display.data?.timezone)
 
   if (auth.isLoading) return <Spinner label="Loading…" className="py-24" />
 
@@ -121,7 +113,12 @@ export default function App() {
 
   return (
     <Layout auth={auth.data} theme={theme} onToggleTheme={toggleTheme}>
-      {status.isError && location.pathname !== '/' && <div className="mb-4"><ErrorState title="Could not load application status" error={status.error} retry={() => void status.refetch()} />{!status.data?.timezone && <p className="hint mt-2">Dates use your browser’s timezone until the camera timezone is available.</p>}</div>}
+      {display.isError && (
+        <div className="mb-4">
+          <ErrorState title="Could not load display settings" error={display.error} retry={() => void display.refetch()} />
+          {!display.data?.timezone && <p className="hint mt-2">Dates use your browser’s timezone until the camera timezone is available.</p>}
+        </div>
+      )}
       {/* Keyed on the path so a page that failed does not keep its error across a
           navigation — otherwise one broken route makes the whole app look broken. */}
       <RouteBoundary key={location.pathname}>
