@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -30,6 +32,33 @@ from app.core.settings_service import get_settings_service
 from app.hardware.ffmpeg import intel_media_lock
 
 log = get_logger(__name__)
+
+
+def _upstream_predictions(detector: Any, frame: np.ndarray) -> list[Any]:
+    try:
+        return detector.predict(frame)
+    except Exception as exc:
+        log.warning("inference failed", error=f"{type(exc).__name__}: {exc}")
+        return []
+
+
+async def _finish_gpu_call(operation: Callable[[], Any]) -> Any:
+    # Cancelling to_thread does not stop the native call. Hold the Intel slot until
+    # it returns, including when both a job cancellation and a timeout arrive.
+    task = asyncio.create_task(asyncio.to_thread(operation))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        if not task.cancelled():
+            task.exception()  # observe a failed native call before propagating cancellation
+        raise asyncio.CancelledError
+    return task.result()
 
 
 @dataclass(slots=True)
@@ -126,7 +155,7 @@ async def load_detector(name: str, *, conf_thresh: float | None = None) -> Any |
             owner = YoloV9Detector
         else:
             raise ValueError(f"unsupported detector runtime: {spec.runtime}")
-        with use_openvino_session(owner):
+        with use_openvino_session(owner, single_frame_gpu=spec.name == "rfdetr-medium"):
             return create_detector(path, **kwargs)
 
     try:
@@ -233,56 +262,91 @@ class ObjectDetector:
             # Let the recording retry instead of silently submitting to a disabled GPU.
             ensure_cpu(reason)
 
+    @property
+    def prepares_gpu_frames(self) -> bool:
+        return (
+            self._spec is not None
+            and self._spec.name == "rfdetr-medium"
+            and "GPU" in (self.device or "").upper()
+        )
+
+    def prepare_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Use the same RF-DETR preprocessing as predict(), including the batch axis."""
+        from open_image_models.detection.core.rf_detr.preprocess import preprocess
+
+        return np.ascontiguousarray(preprocess(frame, self._detector.img_size))
+
+    async def _run_prediction(self, operation: Callable[[], Any]) -> Any:
+        if "GPU" in (self.device or "").upper():
+            gate = intel_media_lock()
+            failure = gpu_backend_disabled() or gate.unhealthy
+            if failure is None and not gpu_context_failed():
+                # A known failure needs only CPU recovery, even if a decoder owns the
+                # slot. Recheck after waiting in case a holder has since poisoned it.
+                async with gate:
+                    failure = gpu_backend_disabled() or gate.unhealthy
+                    if failure is None and not gpu_context_failed():
+                        try:
+                            return await _finish_gpu_call(operation)
+                        except Exception:
+                            # OpenVINO publishes a failed context before releasing its
+                            # request. Retry this very frame on ORT outside both locks.
+                            failure = gpu_backend_disabled()
+                            if failure is None and not gpu_context_failed():
+                                raise
+        elif gpu_context_failed():
+            failure = gpu_backend_disabled()
+        else:
+            return await asyncio.to_thread(operation)
+        # CPU recovery can fail. Let the recording retry instead of returning an
+        # empty detection. It runs outside the GPU slot on plain ONNX Runtime.
+        await asyncio.to_thread(self._demote_to_cpu, failure or "the GPU context failed")
+        return await asyncio.to_thread(operation)
+
     async def detect(
-        self, frame: np.ndarray, *, classes: frozenset[str] | None = None
+        self,
+        frame: np.ndarray,
+        *,
+        classes: frozenset[str] | None = None,
+        prepared: np.ndarray | None = None,
     ) -> list[Detection2D]:
         """Detect road objects in one BGR frame."""
         if self._detector is None:
             return []
 
-        settings = get_settings_service()
-        wanted = classes if classes is not None else await settings.detection_classes()
+        wanted = (
+            classes if classes is not None else await get_settings_service().detection_classes()
+        )
         wanted = frozenset(w for w in wanted if w in ROAD_CLASSES) or ROAD_CLASSES
 
         height, width = frame.shape[:2]
         if not height or not width:
             return []
 
-        device = (self.device or "").upper()
-        if "GPU" in device or gpu_context_failed():
-            # Two independent reasons to get off this chip, and only one of them used to be
-            # asked about.
-            #
-            # `gpu_safe()` reports stuck *ffmpeg* children and says nothing about OpenVINO.
-            # When a `CL_OUT_OF_RESOURCES` takes the inference context down, the session
-            # records the verdict durably and re-raises -- but the upstream library catches
-            # every exception from a batch and returns empty lists, so nothing here ever saw
-            # it. The session stayed compiled for a device that cannot serve it, every
-            # subsequent frame failed the same way, and the stage recorded "0 vehicles" as a
-            # success for the whole remaining queue.
-            #
-            # Reading the recorded verdict is what closes that: the demotion then happens
-            # from an ordinary call site rather than from inside the driver's failing stack,
-            # which is the thing the session's own comment rules out.
-            failure = gpu_backend_disabled()
-            if failure or gpu_context_failed() or not intel_media_lock().gpu_safe():
-                await asyncio.to_thread(
-                    self._demote_to_cpu,
-                    failure or intel_media_lock().unhealthy or "the Intel media slot is unhealthy",
-                )
-                device = (self.device or "").upper()
+        detector = self._detector
+        if prepared is not None or self.prepares_gpu_frames:
+            from open_image_models.detection.core.rf_detr.postprocess import (
+                convert_to_detection_result,
+            )
 
-        try:
-            guard = intel_media_lock() if "GPU" in device else contextlib.nullcontext()
-            # VAAPI and OpenVINO are both stable independently on this iGPU, but the
-            # driver's shared OpenCL/media resources fail when they execute together.
-            # Detection feeds frames in bounded decoded batches, so no decoder is held by
-            # this same task while inference takes the common slot.
-            async with guard:
-                predictions = await asyncio.to_thread(self._detector.predict, frame)
-        except Exception as exc:
-            log.warning("inference failed", error=f"{type(exc).__name__}: {exc}")
-            return []
+            if prepared is None:
+                prepared = await asyncio.to_thread(self.prepare_frame, frame)
+            outputs = await self._run_prediction(
+                partial(detector.model.run, None, {detector.input_name: prepared})
+            )
+            predictions = await asyncio.to_thread(
+                convert_to_detection_result,
+                boxes=outputs[0],
+                logits=outputs[1],
+                class_labels=detector.class_labels,
+                image_size=(height, width),
+                score_threshold=detector.conf_thresh,
+                num_select=detector.num_select,
+            )
+        else:
+            predictions = await self._run_prediction(
+                partial(_upstream_predictions, detector, frame)
+            )
 
         results: list[Detection2D] = []
         for prediction in predictions:

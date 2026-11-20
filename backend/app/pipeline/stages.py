@@ -17,7 +17,7 @@ import asyncio
 import contextlib
 import itertools
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -1421,13 +1421,30 @@ async def stage_detect(
         if decoder_used != "software":
             decoder_used = decoder
 
-    async def analyse_frame(offset: float, frame: np.ndarray) -> None:
-        nonlocal frames, inferred, gated, anchor_signature, last_detections
+    async def read_sample(
+        decoded: AsyncIterator[tuple[float, np.ndarray]],
+    ) -> tuple[float, np.ndarray, bool, np.ndarray | None] | None:
+        nonlocal anchor_signature
+        sample = await anext(decoded, None)
+        if sample is None:
+            return None
+        offset, frame = sample
         signature = _motion_signature(frame, osd_top) if gating_enabled else None
         gate = False
         if signature is not None and anchor_signature is not None:
             changed = float((np.abs(signature - anchor_signature) > _MOTION_PIXEL_DELTA).mean())
             gate = changed < min_change
+        prepared = None
+        if not gate:
+            anchor_signature = signature
+            if getattr(detector, "prepares_gpu_frames", False):
+                prepared = await asyncio.to_thread(detector.prepare_frame, frame)
+        return offset, frame, gate, prepared
+
+    async def analyse_frame(
+        offset: float, frame: np.ndarray, gate: bool, prepared: np.ndarray | None
+    ) -> None:
+        nonlocal frames, inferred, gated, last_detections
         if gate:
             # Unchanged scene: the same objects are still there, so re-affirm the previous
             # frame's detections to the tracker instead of paying for a second pass. This
@@ -1438,13 +1455,15 @@ async def stage_detect(
             tracker.update(last_detections, offset, frame)
             gated += 1
         else:
-            detections = await detector.detect(frame)
+            detections = (
+                await detector.detect(frame, prepared=prepared)
+                if prepared is not None
+                else await detector.detect(frame)
+            )
             if device := detector.device:
                 inference_devices[device] = None
             tracker.update(detections, offset, frame)
             last_detections = detections
-            if signature is not None:
-                anchor_signature = signature
             inferred += 1
         frames += 1
         if progress and duration:
@@ -1481,8 +1500,22 @@ async def stage_detect(
                 on_decoder=note_decoder,
             )
         ) as decoded:
-            async for offset, frame in decoded:
-                await analyse_frame(offset, frame)
+            sample = await read_sample(decoded)
+            following = None
+            try:
+                while sample is not None:
+                    # Only read and prepare the next frame. Inference, tracker updates
+                    # and original-resolution crops stay strictly in decoded order.
+                    if getattr(detector, "prepares_gpu_frames", False):
+                        following = asyncio.create_task(read_sample(decoded))
+                    await analyse_frame(*sample)
+                    sample = await following if following else await read_sample(decoded)
+                    following = None
+            finally:
+                if following is not None:
+                    following.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await following  # finish the read before aclosing the decoder
     except DecodeError as exc:
         # Partial results from a damaged file are still worth keeping -- but "nothing at
         # all" is not a partial result, and a decoder that fell over is not evidence about

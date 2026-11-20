@@ -17,6 +17,7 @@ So this drives the real stage body. It needs no ffmpeg, no model and no GPU.
 
 from __future__ import annotations
 
+import asyncio
 from itertools import pairwise
 
 import numpy as np
@@ -357,6 +358,79 @@ class TestMotionGating:
         assert detector.seen == 2
         assert result.stats["frames_inferred"] == 2
         assert result.stats["frames_gated"] == 6
+
+    async def test_gpu_prepares_one_frame_ahead_in_order_and_skips_gated_frames(
+        self, db_session, monkeypatch
+    ):
+        prepared_levels = []
+        inferred_levels = []
+        second_prepared = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        class GpuDetector:
+            device = "GPU.0"
+            prepares_gpu_frames = True
+
+            def prepare_frame(self, frame):
+                level = int(frame[0, 0, 0])
+                prepared_levels.append(level)
+                if len(prepared_levels) == 2:
+                    loop.call_soon_threadsafe(second_prepared.set)
+                return np.array([level])
+
+            async def detect(self, frame, *, prepared):
+                if not inferred_levels:
+                    await asyncio.wait_for(second_prepared.wait(), 2)
+                    assert prepared_levels == [0, 200]
+                level = int(frame[0, 0, 0])
+                assert prepared.item() == level
+                inferred_levels.append(level)
+                return []
+
+        sequence = [self._empty(), self._bright(), self._bright(), self._empty()]
+        self._install(monkeypatch, GpuDetector(), sequence)
+        result, _ = await self._run()
+        assert result.ok
+        assert result.stats["frames_gated"] == 1
+        assert inferred_levels == prepared_levels == [0, 200, 0]
+
+    async def test_gpu_cancellation_closes_decoder_with_lookahead_in_progress(
+        self, db_session, monkeypatch
+    ):
+        reading_next = asyncio.Event()
+        decoder_closed = asyncio.Event()
+
+        class GpuDetector:
+            device = "GPU.0"
+            prepares_gpu_frames = True
+
+            def prepare_frame(self, frame):
+                return frame
+
+            async def detect(self, frame, *, prepared):
+                await asyncio.Future()
+
+        async def iter_frames(path, **kwargs):
+            try:
+                yield 0, self._empty()
+                reading_next.set()
+                await asyncio.Future()
+            finally:
+                decoder_closed.set()
+
+        self._install(monkeypatch, GpuDetector(), [])
+        monkeypatch.setattr(stages, "iter_frames", iter_frames)
+        recording = Recording(rel_path="cancel.ts", filename="cancel.ts", width=64, height=64)
+        db_session.add(recording)
+        await db_session.flush()
+        task = asyncio.create_task(stages.stage_detect(db_session, recording))
+        try:
+            await asyncio.wait_for(reading_next.wait(), 2)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert decoder_closed.is_set()
 
     async def test_an_object_entering_a_static_scene_is_still_detected(
         self, db_session, monkeypatch

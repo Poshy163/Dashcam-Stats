@@ -607,13 +607,17 @@ class OpenVINOSession:
     models keep one request per worker thread to allow concurrent inference.
     """
 
-    def __init__(self, model_path: str | Path, *, device: str | None = None) -> None:
+    def __init__(
+        self, model_path: str | Path, *, device: str | None = None, single_frame_gpu: bool = False
+    ) -> None:
         # Reading metadata and querying compiled-model properties are native calls too.
         # A model load queued behind a failed inference must stop before any of them.
         with _exclusive_native_lane():
-            self._initialize(model_path, device=device)
+            self._initialize(model_path, device=device, single_frame_gpu=single_frame_gpu)
 
-    def _initialize(self, model_path: str | Path, *, device: str | None = None) -> None:
+    def _initialize(
+        self, model_path: str | Path, *, device: str | None, single_frame_gpu: bool
+    ) -> None:
         if gpu_context_failed():
             raise RuntimeError("OpenVINO is disabled after a native GPU context failure")
         core = _get_core()
@@ -633,13 +637,38 @@ class OpenVINOSession:
         config.update(_model_cache_options(target))
 
         started = time.monotonic()
+        gpu_batch_limit = None
         with _gpu_inference_lock:
             if gpu_context_failed() or (
                 target.upper().startswith("GPU") and gpu_backend_disabled() is not None
             ):
                 raise RuntimeError("OpenVINO GPU is disabled; create a fresh CPU runtime")
             try:
-                compiled = core.compile_model(model, target, config)
+                compiled = None
+                if (
+                    single_frame_gpu
+                    and target.upper().startswith("GPU")
+                    and len(model.inputs) == 1
+                    and _port_shape(model.inputs[0]) == ("dynamic_0", 3, 576, 576)
+                ):
+                    # The worker submits one image. Keep the compiler's batch dimension
+                    # dynamic within [1..2]: this retained the original tracks and crops
+                    # on the NAS, while both [1] and [0..1] changed detections or tracks.
+                    try:
+                        model.reshape([(1, 2), 3, 576, 576])
+                        compiled = core.compile_model(model, target, config)
+                        gpu_batch_limit = 2
+                    except Exception as exc:
+                        if is_gpu_context_failure(exc):
+                            raise
+                        log.warning(
+                            "single-frame GPU compilation failed; retrying original model",
+                            model=model_path.name,
+                            error=str(exc),
+                        )
+                        model = core.read_model(str(model_path))
+                if compiled is None:
+                    compiled = core.compile_model(model, target, config)
             except Exception as exc:
                 if target.upper().startswith("GPU") and is_gpu_context_failure(exc):
                     disable_gpu_backend(f"{type(exc).__name__}: {exc}"[:500], durable=True)
@@ -701,6 +730,8 @@ class OpenVINOSession:
             device=target,
             seconds=round(time.monotonic() - started, 3),
             performance_hint=performance_hint,
+            gpu_batch_limit=gpu_batch_limit,
+            detector_batch_size=1 if single_frame_gpu else None,
             optimal_requests=requests,
         )
 
@@ -814,8 +845,9 @@ class OpenVINOSession:
 class _OrtFacade:
     """Delegate ONNX Runtime metadata APIs but replace session construction."""
 
-    def __init__(self, original: ModuleType) -> None:
+    def __init__(self, original: ModuleType, *, single_frame_gpu: bool) -> None:
         self._original = original
+        self._single_frame_gpu = single_frame_gpu
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._original, name)
@@ -829,7 +861,7 @@ class _OrtFacade:
     ) -> Any:
         del providers, kwargs
         try:
-            return OpenVINOSession(model_path)
+            return OpenVINOSession(model_path, single_frame_gpu=self._single_frame_gpu)
         except Exception as exc:
             log.warning(
                 "direct OpenVINO session failed; using ONNX Runtime CPU",
@@ -844,7 +876,7 @@ class _OrtFacade:
 
 
 @contextlib.contextmanager
-def use_openvino_session(owner: type[Any]) -> Iterator[None]:
+def use_openvino_session(owner: type[Any], *, single_frame_gpu: bool = False) -> Iterator[None]:
     """Make one upstream inference class construct :class:`OpenVINOSession`.
 
     Only that class's defining module is patched, rather than the process-wide
@@ -852,9 +884,9 @@ def use_openvino_session(owner: type[Any]) -> Iterator[None]:
     ``finally`` block, so unrelated ONNX Runtime calls cannot observe the facade.
     """
     module = sys.modules[owner.__module__]
-    original = module.ort
     with _module_patch_lock:
-        module.ort = _OrtFacade(original)
+        original = module.ort
+        module.ort = _OrtFacade(original, single_frame_gpu=single_frame_gpu)
         try:
             yield
         finally:

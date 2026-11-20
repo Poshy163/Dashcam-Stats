@@ -52,6 +52,76 @@ def test_gpu_compile_context_failure_does_not_compile_cpu_in_poisoned_core(monke
     assert runtime.read_gpu_failure_marker() is not None
 
 
+@pytest.mark.parametrize(
+    ("device", "opt_in", "bounded_error", "expected"),
+    [
+        ("GPU.0", True, None, [(1, 2)]),
+        ("GPU.0", False, None, ["dynamic_0"]),
+        ("CPU", True, None, ["dynamic_0"]),
+        ("NPU", True, None, ["dynamic_0"]),
+        ("GPU.0", True, "shape unsupported by plugin", [(1, 2), "dynamic_0"]),
+        ("GPU.0", True, "CL_OUT_OF_RESOURCES", [(1, 2)]),
+    ],
+)
+def test_single_frame_gpu_specialization_and_recovery(
+    monkeypatch, device, opt_in, bounded_error, expected
+):
+    class Graph:
+        def __init__(self):
+            self.inputs = [SimpleNamespace(shape=("dynamic_0", 3, 576, 576))]
+            self.outputs = []
+
+        def reshape(self, shape):
+            assert shape == [(1, 2), 3, 576, 576]
+            self.inputs[0].shape = tuple(shape)
+
+    batches = []
+
+    def compile_model(model, target, _config):
+        assert target == device
+        batch = model.inputs[0].shape[0]
+        batches.append(batch)
+        if bounded_error and batch == (1, 2):
+            raise RuntimeError(bounded_error)
+        return SimpleNamespace(outputs=[], get_property=lambda _: 1)
+
+    core = SimpleNamespace(read_model=lambda _: Graph(), compile_model=compile_model)
+    monkeypatch.setattr(runtime, "_get_core", lambda: core)
+    monkeypatch.setattr(runtime, "_port_shape", lambda port: port.shape)
+    monkeypatch.setattr(runtime, "_model_cache_options", lambda _: {})
+    if bounded_error == "CL_OUT_OF_RESOURCES":
+        with pytest.raises(RuntimeError, match=bounded_error):
+            runtime.OpenVINOSession("fixture.onnx", device=device, single_frame_gpu=opt_in)
+        assert runtime.gpu_context_failed()
+    else:
+        session = runtime.OpenVINOSession("fixture.onnx", device=device, single_frame_gpu=opt_in)
+        assert session.get_inputs()[0].shape == (expected[-1], 3, 576, 576)
+    assert batches == expected
+
+
+def test_bounded_gpu_shape_keeps_upstream_dynamic_batch_metadata(monkeypatch):
+    ov = pytest.importorskip("openvino")
+    from openvino import opset13 as ops
+
+    image = ops.parameter([-1, 3, 576, 576], dtype=np.float32, name="image")
+    graph = ov.Model([ops.relu(image)], [image])
+
+    def compile_model(model, target, _config):
+        assert target == "GPU.0"
+        batch = model.inputs[0].partial_shape[0]
+        assert (batch.get_min_length(), batch.get_max_length()) == (1, 2)
+        return ov.Core().compile_model(model, "CPU")
+
+    core = SimpleNamespace(read_model=lambda _: graph, compile_model=compile_model)
+    monkeypatch.setattr(runtime, "_get_core", lambda: core)
+    monkeypatch.setattr(runtime, "_model_cache_options", lambda _: {})
+    session = runtime.OpenVINOSession("fixture.onnx", device="GPU.0", single_frame_gpu=True)
+    info = session.get_inputs()[0]
+    assert info.shape == ("dynamic_0", 3, 576, 576)
+    frame = np.ones((1, 3, 576, 576), dtype=np.float32)
+    np.testing.assert_array_equal(session.run(None, {info.name: frame})[0], frame)
+
+
 def test_native_failure_from_compiled_property_is_not_ignored(monkeypatch):
     def failed_property(_key):
         raise RuntimeError("CL_OUT_OF_RESOURCES in GPU property")
