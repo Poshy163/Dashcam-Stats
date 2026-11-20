@@ -1405,6 +1405,7 @@ async def stage_detect(
     duration = recording.duration_s or 0.0
     frames = 0
     inferred = 0
+    inference_devices: dict[str, None] = {}
     gated = 0
     decoder_used: str | None = None
     #: The last frame actually run through the detector, and the detections it produced.
@@ -1438,6 +1439,8 @@ async def stage_detect(
             gated += 1
         else:
             detections = await detector.detect(frame)
+            if device := detector.device:
+                inference_devices[device] = None
             tracker.update(detections, offset, frame)
             last_detections = detections
             if signature is not None:
@@ -1690,7 +1693,7 @@ async def stage_detect(
             # looked" are different answers and the recording page shows them differently.
             "gps_fixes": len(fixes),
             "tracks_without_position": unlocated,
-            "device": detector.device,
+            "device": " + ".join(inference_devices) or None,
             "decoder": decoder_used,
         },
     )
@@ -2161,7 +2164,7 @@ async def stage_plates(
                 if "vaapi" in decoders_used
                 else None
             ),
-            "device": "CPU",
+            "device": "CPU" if any(checked.values()) else None,
             **orientation.describe(),
         },
     )

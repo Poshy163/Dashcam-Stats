@@ -71,6 +71,27 @@ async def _immediate(fn, *args, **kwargs):
 
 
 class TestTheDetectionStageActuallyRuns:
+    async def test_device_fallback_within_a_clip_preserves_both_devices(
+        self, db_session, decoded_clip, monkeypatch
+    ):
+        from app.core.settings_service import get_settings_service
+
+        await get_settings_service().set("processing.motion_gating", False)
+
+        async def detect(frame):
+            decoded_clip.seen += 1
+            decoded_clip.device = "GPU.0" if decoded_clip.seen <= 2 else "CPU"
+            return []
+
+        monkeypatch.setattr(decoded_clip, "detect", detect)
+        recording = Recording(
+            rel_path="mixed.ts", filename="mixed.ts", width=16, height=16, duration_s=2
+        )
+        db_session.add(recording)
+        await db_session.flush()
+        result = await stages.stage_detect(db_session, recording)
+        assert result.stats["device"] == "GPU.0 + CPU"
+
     async def test_every_decoded_frame_reaches_the_detector(self, db_session, decoded_clip):
         """The regression: this raised TypeError on the first frame.
 

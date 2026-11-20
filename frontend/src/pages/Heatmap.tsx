@@ -7,7 +7,7 @@ import { DerivedHint, EmptyState, ErrorState, PageHeader, StatTile } from '@/com
 import { api } from '@/lib/api'
 import { formatDuration } from '@/lib/format'
 import { mapBounds } from '@/lib/mapBounds'
-import { MAP_REVISION_KEY, refreshMapRevision } from '@/lib/queryInvalidation'
+import { MAP_FALLBACK_REFRESH_MS, MAP_REVISION_KEY, refreshMapRevision } from '@/lib/queryInvalidation'
 import { useMapSettings } from '@/lib/useMapSettings'
 
 // Start both map queries while the browser downloads Leaflet and its heat plugin.
@@ -58,15 +58,14 @@ export default function HeatmapPage() {
     refetchInterval: 30_000,
     refetchOnWindowFocus: true,
   })
-  // Establish the first revision before fetching either layer. Later checks reuse
-  // that baseline across visits, so both layers start together and retain pan/zoom.
-  const canFetchLayers = !revision.isPending
-  const layerStaleTime = revision.data && !revision.isError ? Infinity : 5 * 60 * 1000
+  // Both layers start alongside the revision check. Each response identifies its
+  // source revision so a late response can still be reconciled on the next poll.
+  const layerStaleTime = revision.data && !revision.isError ? Infinity : MAP_FALLBACK_REFRESH_MS
   const query = useQuery({
     queryKey: ['heatmap', precision, minSpeedKmh],
     queryFn: () => api.map.heatmap({ precision, minSpeedKmh }),
-    enabled: canFetchLayers,
     staleTime: layerStaleTime,
+    refetchInterval: revision.isError ? MAP_FALLBACK_REFRESH_MS : false,
   })
 
   const routes = useQuery({
@@ -75,7 +74,8 @@ export default function HeatmapPage() {
     // Independent of the heat filters on purpose: the roads driven do not change when the
     // grid resolution or the speed filter does, so refetching them would be wasted work.
     staleTime: layerStaleTime,
-    enabled: canFetchLayers && layer !== 'heat',
+    refetchInterval: revision.isError ? MAP_FALLBACK_REFRESH_MS : false,
+    enabled: layer !== 'heat',
   })
 
   const data = query.data
@@ -136,7 +136,7 @@ export default function HeatmapPage() {
 
       {query.isError && <ErrorState error={query.error} retry={() => query.refetch()} />}
 
-      {(revision.isPending || query.isLoading) && <Spinner label="Loading heatmap…" className="py-24" />}
+      {query.isLoading && <Spinner label="Loading heatmap…" className="py-24" />}
       {layer !== 'heat' && routes.isLoading && <Spinner label="Loading traced routes…" className="py-8" />}
       {layer !== 'heat' && routes.isError && <ErrorState title="Could not load traced routes" error={routes.error} retry={() => routes.refetch()} />}
       {maps.query.isPending && <Spinner label="Loading map provider…" className="py-8" />}

@@ -33,6 +33,7 @@ from app.db.models import (
     RecordingState,
     StageState,
 )
+from app.pipeline.devices import device_summary, stage_devices
 
 log = get_logger(__name__)
 
@@ -436,6 +437,11 @@ async def claim_next(
                 heartbeat_at=now,
                 attempts=ProcessingJob.attempts + 1,
                 progress=0.0,
+                stage_current=None,
+                speed_realtime=None,
+                decoder=None,
+                inference_device=None,
+                resource_state=None,
                 finished_at=None,
                 error_message=None,
             )
@@ -494,7 +500,7 @@ async def heartbeat(
 
     await session.execute(
         update(ProcessingJob)
-        .where(ProcessingJob.id == job_id)
+        .where(ProcessingJob.id == job_id, ProcessingJob.state == JobState.RUNNING)
         .values(**values)
         .execution_options(synchronize_session=False)
     )
@@ -533,8 +539,9 @@ async def complete(
         job.speed_realtime = speed
     if decoder is not None:
         job.decoder = decoder
-    if device is not None:
-        job.inference_device = device
+    reported = device_summary(stage_devices(result).values()) or device
+    if reported is not None:
+        job.inference_device = reported
     await session.flush()
     await _follow_up_after_thumbnail(session, job)
 

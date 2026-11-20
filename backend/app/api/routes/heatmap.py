@@ -24,7 +24,7 @@ from contextlib import aclosing
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Response
 from sqlalchemy import (
     Select,
     String,
@@ -40,8 +40,10 @@ from app.api import heat_cells, journey_snapshot, map_cache, route_geometry_cach
 from app.api.deps import SQLITE_MAX_INT, SessionDep
 from app.api.schemas import HeatmapOut, RoutesOut
 from app.api.visibility import journey_has_visible_recording, visible_revision
+from app.core.backup_priority import backup_priority_active
 from app.core.logging import get_logger
 from app.db.models import Camera, CameraRole, Journey, Recording, TelemetryPoint
+from app.db.session import session_scope
 
 log = get_logger(__name__)
 
@@ -72,6 +74,8 @@ DEFAULT_SIMPLIFY_M = 15.0
 #: drawing than the map is worth, so the response says it was cut rather than quietly
 #: handing back a partial road network that looks complete.
 MAX_ROUTE_POINTS = 250_000
+_DEFAULT_HEAT = ("heatmap", DEFAULT_PRECISION, None, None, None, None, 5.0, MAX_CELLS)
+_DEFAULT_ROUTES = ("routes", None, None, None, DEFAULT_SIMPLIFY_M, MAX_ROUTE_POINTS)
 
 #: Rows fetched per round trip while streaming the route query. Large enough that the
 #: per-batch overhead is invisible, small enough that the buffer stays a rounding error
@@ -90,6 +94,7 @@ _JOURNEY_REVISIONS = text("""
 @router.get("/map/heatmap", response_model=HeatmapOut)
 async def heatmap(
     session: SessionDep,
+    response: Response,
     precision: int = Query(
         DEFAULT_PRECISION,
         ge=MIN_PRECISION,
@@ -115,12 +120,13 @@ async def heatmap(
 ):
     """Grid cells with a visit count, ready to be drawn as a heat layer."""
     key = ("heatmap", precision, start, end, journey_id, camera, min_speed_kmh, limit)
-    default_view = key == ("heatmap", DEFAULT_PRECISION, None, None, None, None, 5.0, MAX_CELLS)
+    default_view = key == _DEFAULT_HEAT
     return await map_cache.cached(
         session,
         key,
         lambda: _heatmap(session, precision, start, end, journey_id, camera, min_speed_kmh, limit),
         snapshot=HeatmapOut if default_view else None,
+        response_headers=response.headers,
     )
 
 
@@ -137,6 +143,10 @@ async def _heatmap(
     rows = await heat_cells.read_rows(
         session, precision, start, end, journey_id, camera, min_speed_kmh, limit
     )
+    return await asyncio.to_thread(_heatmap_response, rows, precision, limit)
+
+
+def _heatmap_response(rows, precision: int, limit: int) -> HeatmapOut:
     truncated = len(rows) > limit
     rows = rows[:limit]
 
@@ -171,6 +181,7 @@ async def _heatmap(
 @router.get("/map/routes", response_model=RoutesOut)
 async def routes(
     session: SessionDep,
+    response: Response,
     start: datetime | None = Query(None, description="Only fixes at or after this instant."),
     end: datetime | None = Query(None, description="Only fixes at or before this instant."),
     journey_id: Annotated[
@@ -200,12 +211,13 @@ async def routes(
     no extra information.
     """
     key = ("routes", start, end, journey_id, simplify_m, max_points)
-    default_view = key == ("routes", None, None, None, DEFAULT_SIMPLIFY_M, MAX_ROUTE_POINTS)
+    default_view = key == _DEFAULT_ROUTES
     return await map_cache.cached(
         session,
         key,
         lambda: _routes(session, start, end, journey_id, simplify_m, max_points),
         snapshot=RoutesOut if default_view else None,
+        response_headers=response.headers,
     )
 
 
@@ -286,14 +298,22 @@ async def _read_route_groups(
             async for batch in result.partitions(_ROUTE_FETCH_BATCH):
                 for row_journey, lat, lon, captured_at, recording_id, breaks_segment in batch:
                     if fixes and row_journey != current:
-                        yield current, route_geometry_cache.simplify_journey(fixes, tolerance_m)
+                        yield (
+                            current,
+                            await asyncio.to_thread(
+                                route_geometry_cache.simplify_journey, fixes, tolerance_m
+                            ),
+                        )
                         fixes = []
                     current = row_journey
                     fixes.append((lat, lon, captured_at, recording_id, breaks_segment))
         finally:
             await result.close()
     if fixes:
-        yield current, route_geometry_cache.simplify_journey(fixes, tolerance_m)
+        yield (
+            current,
+            await asyncio.to_thread(route_geometry_cache.simplify_journey, fixes, tolerance_m),
+        )
 
 
 async def _incremental_route_groups(
@@ -378,6 +398,8 @@ async def _routes(
     journey_id: int | None,
     simplify_m: float,
     max_points: int,
+    *,
+    background: bool = False,
 ) -> RoutesOut:
     if session.autoflush:
         await session.flush()
@@ -396,12 +418,14 @@ async def _routes(
             connection, [_route_query(start, end, journey_id, incremental=False)], simplify_m
         )
     )
-    lines: list[list[list[float]]] = []
+    lines: route_geometry_cache.Lines = []
     points_sent = 0
     truncated = False
     journeys = 0
     async with aclosing(groups):
         async for _, segments in groups:
+            if background and backup_priority_active():
+                raise _WarmupDeferred
             # A journey with even one drawable fix counts, including one whose
             # first line exceeds the cap. Never return a fraction of a segment.
             journeys += 1
@@ -409,19 +433,65 @@ async def _routes(
                 if points_sent + len(segment) > max_points:
                     truncated = True
                     break
-                lines.append([[round(lat, 4), round(lon, 4)] for lat, lon in segment])
+                lines.append(segment)
                 points_sent += len(segment)
             if truncated:
                 break
 
+    return await asyncio.to_thread(
+        _routes_response, lines, journeys, points_sent, simplify_m, truncated
+    )
+
+
+def _routes_response(
+    lines, journeys: int, points_sent: int, simplify_m: float, truncated: bool
+) -> RoutesOut:
     return RoutesOut(
-        lines=lines,
+        lines=[[[round(lat, 4), round(lon, 4)] for lat, lon in segment] for segment in lines],
         journeys=journeys,
         segments=len(lines),
         points=points_sent,
         simplify_m=simplify_m,
         truncated=truncated,
     )
+
+
+class _WarmupDeferred(Exception):
+    """The transfer or a newer map revision takes priority over speculative work."""
+
+
+async def warm_default_layers(revision: bytes) -> bool:
+    """Prepare the same authenticated-view data HTTP requests share, heat first."""
+    if backup_priority_active():
+        return False
+    # Publish pending cell changes first. A read-only heat request can overlay
+    # them live, but a background pass would then aggregate the same cells twice.
+    async with session_scope() as session:
+        if await map_cache.source_revision(session) != revision:
+            return False
+        if not await heat_cells.refresh_heat_cells(session):
+            return False
+    for key, model in ((_DEFAULT_HEAT, HeatmapOut), (_DEFAULT_ROUTES, RoutesOut)):
+        if backup_priority_active():
+            return False
+        async with session_scope() as session:
+            # cached() serializes each layer separately, including foreground reads.
+            # Check after acquiring its lock to avoid building for an obsolete revision
+            # when another visitor was already working on the same layer.
+            async def compute(key=key, session=session):
+                if backup_priority_active() or await map_cache.source_revision(session) != revision:
+                    raise _WarmupDeferred
+                if key == _DEFAULT_HEAT:
+                    return await _heatmap(session, *key[1:])
+                return await _routes(session, *key[1:], background=True)
+
+            try:
+                await map_cache.cached(session, key, compute, snapshot=model)
+            except _WarmupDeferred:
+                return False
+            if await map_cache.source_revision(session) != revision:
+                return False
+    return True
 
 
 @router.get("/map/coverage", response_model=list[dict])

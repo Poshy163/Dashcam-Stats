@@ -38,6 +38,12 @@ async def test_browser_revision_and_background_heat_refresh(client, db_session):
     published = await revision()
     assert published != initial
 
+    for path in ("/api/map/routes", "/api/map/heatmap?precision=3&min_speed_kmh=5"):
+        for _ in range(2):
+            response = await client.get(path)
+            assert response.status_code == 200
+            assert response.headers["X-Map-Revision"] == published
+
     scheduler = Scheduler()
     await scheduler._run_heat_cells()
     assert await db_session.scalar(text("SELECT weight FROM map_heat_cells")) == 1

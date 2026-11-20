@@ -36,6 +36,54 @@ def test_reported_decoder_prefers_any_software_fallback():
     assert WorkerPool._decoder_from(report) == "software"
 
 
+async def test_job_history_reports_each_inference_stage_including_older_results(client, db_session):
+    result = {
+        "stages": [
+            {"name": "telemetry", "stats": {"decoder": "software"}},
+            {"name": "detection", "stats": {"device": "GPU"}},
+            {"name": "plates", "stats": {"device": "CPU"}},
+        ]
+    }
+    older = ProcessingJob(state=JobState.COMPLETED, inference_device="CPU", result=result)
+    legacy = ProcessingJob(state=JobState.COMPLETED, inference_device="GPU.0")
+    empty = ProcessingJob(state=JobState.COMPLETED, result={"stages": [None, {"stats": None}]})
+    current = ProcessingJob(state=JobState.RUNNING)
+    db_session.add_all([older, legacy, empty, current])
+    await db_session.flush()
+    await queue.complete(db_session, current, result, device="CPU", speed=0.18)
+    await db_session.commit()
+    assert await queue.heartbeat(db_session, current.id, device="CPU") is JobState.COMPLETED
+    await db_session.refresh(current)
+    assert current.inference_device == "GPU + CPU"
+    response = await client.get("/api/jobs", params={"state": "completed"})
+    assert response.status_code == 200
+    items = {row["id"]: row for row in response.json()["items"]}
+    for job in (older, current):
+        assert items[job.id]["stage_devices"] == {"detection": "GPU", "plates": "CPU"}
+        assert items[job.id]["inference_device"] == "GPU + CPU"
+    assert items[current.id]["speed_realtime"] == 0.18
+    assert items[legacy.id]["inference_device"] == "GPU.0" and not items[legacy.id]["stage_devices"]
+    assert items[empty.id]["inference_device"] is None and not items[empty.id]["stage_devices"]
+
+
+async def test_a_new_attempt_clears_previous_heartbeat_devices_and_speed(db_session):
+    retry = ProcessingJob(
+        state=JobState.QUEUED,
+        inference_device="GPU",
+        decoder="vaapi",
+        speed_realtime=3.0,
+        stage_current="detection",
+        resource_state="running",
+    )
+    db_session.add(retry)
+    await db_session.commit()
+    async with session_scope() as session:
+        job = await queue.claim_next(session, "retry-worker")
+        assert job.id == retry.id
+        assert job.inference_device is job.decoder is job.speed_realtime is None
+        assert job.stage_current is job.resource_state is None
+
+
 async def test_a_cold_hardware_probe_keeps_the_event_loop_responsive(monkeypatch):
     """A queued job can start before the background startup probe fills the cache."""
     probe_started = threading.Event()

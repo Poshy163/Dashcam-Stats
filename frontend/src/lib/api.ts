@@ -169,7 +169,7 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
 
 async function request<T>(
   path: string,
-  options: RequestInit & { query?: Query; responseKeys?: 'raw' | 'top-level' } = {},
+  options: RequestInit & { query?: Query; responseKeys?: 'raw' | 'map-layer' } = {},
 ): Promise<T> {
   const { query, responseKeys, ...init } = options
   const response = await fetch(`/api${path}${buildQuery(query)}`, {
@@ -198,9 +198,11 @@ async function request<T>(
   if (response.status === 204) return undefined as T
   const json = await response.json()
   if (responseKeys === 'raw') return json as T
-  if (responseKeys === 'top-level') {
+  if (responseKeys === 'map-layer') {
     // Map coordinates are nested numeric tuples. Only the envelope has keys to convert.
-    return Object.fromEntries(Object.entries(json).map(([key, value]) => [snakeToCamel(key), value])) as T
+    const layer = Object.fromEntries(Object.entries(json).map(([key, value]) => [snakeToCamel(key), value]))
+    layer.sourceRevision = response.headers.get('X-Map-Revision')
+    return layer as T
   }
   return convertKeys<T>(json, snakeToCamel)
 }
@@ -914,9 +916,9 @@ export const api = {
   map: {
     revision: (signal?: AbortSignal) => request<string | null>('/system/map-revision', { signal }),
     /** Grid-aggregated fixes, ready for a heat layer. See the `Heatmap` type. */
-    heatmap: (filters?: HeatmapFilters) => request<Heatmap>('/map/heatmap', { query: filters, responseKeys: 'top-level' }),
+    heatmap: (filters?: HeatmapFilters) => request<Heatmap>('/map/heatmap', { query: filters, responseKeys: 'map-layer' }),
     /** The paths themselves, split at signal gaps. See the `Routes` type. */
-    routes: (filters?: RouteFilters) => request<Routes>('/map/routes', { query: filters, responseKeys: 'top-level' }),
+    routes: (filters?: RouteFilters) => request<Routes>('/map/routes', { query: filters, responseKeys: 'map-layer' }),
   },
 
   jobs: {

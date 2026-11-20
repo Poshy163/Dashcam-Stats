@@ -196,7 +196,7 @@ export default function Queue() {
                 {job.resourceState === 'waiting_for_vaapi' && (
                   <span className="text-state-warn">Waiting for shared VAAPI decoder</span>
                 )}
-                {job.inferenceDevice && <span>AI: {job.inferenceDevice}</span>}
+                {job.inferenceDevice && <span>Inference used {job.inferenceDevice}</span>}
                 {job.recordingId && (
                   // The one question worth asking about a job in flight is what the
                   // pipeline is actually reading, and until now the only route to that
@@ -274,7 +274,23 @@ export default function Queue() {
                       <div className="mt-0.5 text-xs text-state-error">{job.errorMessage}</div>
                     )}
                   </td>
-                  <td className="p-2 text-content-muted">{job.stageCurrent ?? '—'}</td>
+                  <td className="p-2 text-content-muted">
+                    {job.state === 'completed' ? (
+                      <>
+                        {Object.entries(job.stageDevices ?? {}).map(([stage, device]) => (
+                          <div key={stage}><span className="capitalize">{stage}</span> · {device}</div>
+                        ))}
+                        {!Object.keys(job.stageDevices ?? {}).length && job.inferenceDevice && (
+                          <div>Inference · {job.inferenceDevice}</div>
+                        )}
+                        {job.speedRealtime != null && (
+                          <span className="whitespace-nowrap text-xs" title="Clip duration divided by total processing time">
+                            {realtimeFactor(job.speedRealtime)}
+                          </span>
+                        )}
+                      </>
+                    ) : job.stageCurrent ?? '—'}
+                  </td>
                   <td className="tabular p-2">{job.attempts}/{job.maxAttempts}</td>
                   <td className="tabular p-2 text-content-muted">{formatDateTime(job.queuedAt)}</td>
                   <td className="p-2">

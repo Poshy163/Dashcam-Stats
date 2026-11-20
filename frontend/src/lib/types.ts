@@ -278,6 +278,7 @@ export interface Job {
   speedRealtime: number | null
   decoder: string | null
   inferenceDevice: string | null
+  stageDevices?: Record<string, string>
   resourceState: string | null
   attempts: number
   maxAttempts: number
@@ -904,6 +905,7 @@ export interface SearchResults {
  * the area covered rather than the time spent covering it.
  */
 export interface Heatmap {
+  sourceRevision: string | null
   points: [number, number, number][]
   /** Grid resolution in decimal places: 2 is about 1.1 km, 3 about 110 m, 4 about 11 m. */
   precision: number
@@ -936,6 +938,7 @@ export interface HeatmapFilters {
  * across any of those would draw a road that does not exist.
  */
 export interface Routes {
+  sourceRevision: string | null
   /** Polylines, each a list of [lat, lon] pairs. */
   lines: [number, number][][]
   journeys: number

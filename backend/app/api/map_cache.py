@@ -11,6 +11,7 @@ from weakref import WeakValueDictionary
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.datastructures import MutableHeaders
 
 from app.api import journey_snapshot, map_snapshot
 
@@ -39,6 +40,7 @@ async def cached(
     compute: Callable[[], Awaitable[MapLayer]],
     *,
     snapshot: type[MapLayer] | None = None,
+    response_headers: MutableHeaders | None = None,
 ) -> MapLayer:
     """Read a layer for the current revision. Only the default layers also persist on disk."""
     if session.get_bind().dialect.name != "sqlite":
@@ -49,6 +51,10 @@ async def cached(
         if revision is None:
             return await compute()
 
+        if response_headers is not None:
+            # Stamp the revision *before* reading a layer. If a write lands during
+            # the read, the browser will revalidate against the newer token.
+            response_headers["X-Map-Revision"] = revision.hex()
         stamp = (revision,)
         hit = _entries.get(key)
         if hit is not None and hit[0] == stamp:

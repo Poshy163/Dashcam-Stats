@@ -15,7 +15,9 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from app.api import map_cache
 from app.api.heat_cells import refresh_heat_cells
+from app.core.backup_priority import backup_priority_active
 from app.core.logging import get_logger, prune_logs
 from app.core.settings_service import get_settings_service
 from app.db.session import session_scope
@@ -47,6 +49,12 @@ _POST_PROCESS_IDLE_QUEUE_LIMIT = 512
 _SETTLING_SCAN_LIMIT = 3
 _SETTLING_SCAN_MIN_DELAY_S = 30.0
 _INGEST_SCAN_DEBOUNCE_S = 2.0
+
+# Two observations of the same committed map revision filter out bursts of writes.
+# Bound speculative work when a long processing queue keeps publishing new clips.
+_MAP_WARM_POLL_S = 5.0
+_MAP_WARM_MIN_INTERVAL_S = 30.0
+_MAP_WARM_BUDGET_S = 20.0
 
 
 @dataclass(slots=True)
@@ -90,6 +98,9 @@ class Scheduler:
         self._ingest_scan_generation = 0
         self._telemetry_review_delay = 30.0
         self._telemetry_review_count = 0
+        self._observed_map_revision: bytes | None = None
+        self._finished_map_revision: bytes | None = None
+        self._next_map_warm_at = 0.0
 
     async def start(self) -> None:
         if self._running:
@@ -153,6 +164,13 @@ class Scheduler:
                 enabled=lambda: _fixed(True),
                 run=self._run_heat_cells,
             ),
+            TaskState(
+                name="map-snapshots",
+                interval_s=lambda: _fixed(_MAP_WARM_POLL_S),
+                minimum_interval_s=_MAP_WARM_POLL_S,
+                enabled=lambda: _fixed(True),
+                run=self._run_map_warmup,
+            ),
         ]
 
         now = time.monotonic()
@@ -161,7 +179,7 @@ class Scheduler:
             # scan, retention and pruning all hitting the database simultaneously. Retention
             # can release space immediately and the first heat grid can warm before a visit
             # to Map. These two startup passes run serially.
-            if task.name in ("retention", "map-heat-cells"):
+            if task.name in ("retention", "map-heat-cells", "map-snapshots"):
                 task.next_run = now
             else:
                 task.next_run = now + 10.0 + index * 5.0 + random.uniform(0, 5)
@@ -232,8 +250,35 @@ class Scheduler:
     async def _run_heat_cells(self) -> None:
         # Dirty cells survive restarts. One pass per interval coalesces multiple clip
         # publications. A concurrent source change is picked up on the following pass.
+        if backup_priority_active():
+            return
         async with session_scope() as session:
             await refresh_heat_cells(session)
+
+    async def _run_map_warmup(self) -> None:
+        from app.api.routes.heatmap import warm_default_layers
+
+        if backup_priority_active():
+            return
+        async with session_scope() as session:
+            revision = await map_cache.source_revision(session)
+        if revision is None or revision == self._finished_map_revision:
+            return
+        if revision != self._observed_map_revision:
+            self._observed_map_revision = revision
+            return
+        now = time.monotonic()
+        if now < self._next_map_warm_at:
+            return
+        self._next_map_warm_at = now + _MAP_WARM_MIN_INTERVAL_S
+        try:
+            async with asyncio.timeout(_MAP_WARM_BUDGET_S):
+                if await warm_default_layers(revision):
+                    self._finished_map_revision = revision
+        except TimeoutError:
+            # A genuinely large library can complete on demand. Leave the partial
+            # per-journey cache and avoid repeating this attempt for the same revision.
+            self._finished_map_revision = revision
 
     async def _run_plate_revalidation(self) -> None:
         async with session_scope() as session:

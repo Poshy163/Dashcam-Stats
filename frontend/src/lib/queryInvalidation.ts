@@ -31,16 +31,21 @@ export function invalidateAnalysisQueries(client: QueryClient): Promise<void> {
 }
 
 export const MAP_REVISION_KEY = ['map-revision'] as const
+export const MAP_FALLBACK_REFRESH_MS = 5 * 60 * 1000
 
 export async function refreshMapRevision(client: QueryClient, signal: AbortSignal): Promise<string | null> {
   const revision = await api.map.revision(signal)
-  if (client.getQueryData(MAP_REVISION_KEY) !== revision) {
-    // Inactive filter variants are marked stale too, so switching back to Street or
-    // including parked fixes observes any intervening edit or footage removal.
-    await client.invalidateQueries({
-      predicate: (query) => MAP_QUERY_ROOTS.has(String(query.queryKey[0])),
-    })
-  }
+  // Recheck each returned layer even when the token hasn't changed since the last
+  // poll. A slower layer can finish after that poll with an earlier revision.
+  void client.invalidateQueries({
+    predicate: (query) => {
+      if (!MAP_QUERY_ROOTS.has(String(query.queryKey[0]))) return false
+      const layer = query.state.data as { sourceRevision?: string | null } | undefined
+      if (!layer) return false
+      if (revision && layer.sourceRevision) return revision !== layer.sourceRevision
+      return Date.now() - query.state.dataUpdatedAt >= MAP_FALLBACK_REFRESH_MS
+    },
+  }, { cancelRefetch: false })
   return revision
 }
 

@@ -68,6 +68,7 @@ from app.db.models import (
 )
 from app.journeys.builder import JourneyBuilder
 from app.journeys.track import single_track
+from app.pipeline.devices import device_summary, stage_devices
 from app.pipeline.orchestrator import invalidate_recordings
 from app.pipeline.revisions import CURRENT_REVISIONS, INVALIDATED_REVISION
 from app.workers import queue
@@ -1706,6 +1707,10 @@ async def list_jobs(session: SessionDep, page: PaginationDep, state: str | None 
     for job, filename in rows:
         out = JobOut.model_validate(job)
         out.recording_filename = filename
+        if job.state == JobState.COMPLETED:
+            out.stage_devices = stage_devices(job.result)
+            if out.stage_devices:
+                out.inference_device = device_summary(out.stage_devices.values())
         items.append(out)
 
     return Paginated[JobOut](

@@ -22,6 +22,7 @@ from app.db.models import JobKind, JobState, ProcessingJob, Recording
 from app.db.retry import is_locked_error
 from app.db.session import session_scope
 from app.hardware.detect import detect_hardware_async
+from app.pipeline.devices import device_summary
 from app.pipeline.orchestrator import RunReport, pending_stages, run_stages
 from app.pipeline.stages import StageError, StageResult, ensure_thumbnail
 from app.workers import queue
@@ -302,20 +303,6 @@ class WorkerPool:
                 await asyncio.sleep(_IDLE_SLEEP_S)
 
     @staticmethod
-    def _device_from(report) -> str | None:
-        """The inference device a stage reported using, if any ran.
-
-        Stages record it in their own stats rather than on the report, because only the
-        stages that actually run a model know one. Telemetry-only work legitimately has
-        no answer.
-        """
-        for stage in reversed(report.stages):
-            device = (stage.stats or {}).get("device")
-            if device:
-                return str(device)
-        return None
-
-    @staticmethod
     def _decoder_from(report) -> str | None:
         """Summarise the decoder actually used, preferring any software fallback."""
         found: str | None = None
@@ -488,7 +475,7 @@ class WorkerPool:
                     active.decoder = str(decoder)
                 device = stats.get("device")
                 if device:
-                    active.inference_device = str(device)
+                    active.inference_device = device_summary((active.inference_device, str(device)))
 
             report = await run_stages(
                 session,
@@ -498,10 +485,6 @@ class WorkerPool:
                 stage_complete=on_stage_complete,
             )
             active.speed_realtime = report.realtime_factor
-            # Which device actually ran inference is only known once a stage has used
-            # one, and it is worth surfacing: it is the difference between the iGPU
-            # doing the work and the CPU quietly doing it instead.
-            active.inference_device = self._device_from(report) or active.inference_device
             active.decoder = self._decoder_from(report) or active.decoder
 
             # Metadata inspection can discover playable-but-damaged footage, while a

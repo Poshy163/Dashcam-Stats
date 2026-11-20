@@ -287,6 +287,7 @@ class JobOut(ApiModel):
     speed_realtime: float | None = None
     decoder: str | None = None
     inference_device: str | None = None
+    stage_devices: dict[str, str] = Field(default_factory=dict)
     resource_state: str | None = None
     attempts: int = 0
     max_attempts: int = 3
