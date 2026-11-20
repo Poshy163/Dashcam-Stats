@@ -15,6 +15,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from app.api.heat_cells import refresh_heat_cells
 from app.core.logging import get_logger, prune_logs
 from app.core.settings_service import get_settings_service
 from app.db.session import session_scope
@@ -146,19 +147,24 @@ class Scheduler:
                 run=self._run_telemetry_review,
                 minimum_interval_s=2.0,
             ),
+            TaskState(
+                name="map-heat-cells",
+                interval_s=lambda: _fixed(30.0),
+                enabled=lambda: _fixed(True),
+                run=self._run_heat_cells,
+            ),
         ]
 
         now = time.monotonic()
         for index, task in enumerate(self._tasks):
             # Stagger the first run. Firing every task at once on boot would have the
-            # scan, retention and pruning all hitting the database simultaneously.  The
-            # exception is retention: run it once immediately on every service restart so
-            # already-analysed junk and over-limit old footage free space without waiting
-            # as long as the configured (six-hour by default) interval.  The loop is
-            # serial, so the later staggered tasks cannot race this startup sweep.
-            task.next_run = (
-                now if task.name == "retention" else now + 10.0 + index * 5.0 + random.uniform(0, 5)
-            )
+            # scan, retention and pruning all hitting the database simultaneously. Retention
+            # can release space immediately and the first heat grid can warm before a visit
+            # to Map. These two startup passes run serially.
+            if task.name in ("retention", "map-heat-cells"):
+                task.next_run = now
+            else:
+                task.next_run = now + 10.0 + index * 5.0 + random.uniform(0, 5)
 
         if self._pending_idle_recordings:
             self._post_process_idle_due_at = now + _POST_PROCESS_IDLE_DEBOUNCE_S
@@ -222,6 +228,12 @@ class Scheduler:
             await asyncio.sleep(1.0)
 
     # -- tasks -------------------------------------------------------------------------
+
+    async def _run_heat_cells(self) -> None:
+        # Dirty cells survive restarts. One pass per interval coalesces multiple clip
+        # publications. A concurrent source change is picked up on the following pass.
+        async with session_scope() as session:
+            await refresh_heat_cells(session)
 
     async def _run_plate_revalidation(self) -> None:
         async with session_scope() as session:

@@ -119,6 +119,25 @@ def media(monkeypatch):
 
 
 class TestTheSlotIsNotFreeUntilTheChildIsGone:
+    async def test_cancel_during_startup_keeps_an_unreaped_child_in_the_gate(
+        self, media, monkeypatch
+    ):
+        monkeypatch.setattr(ffmpeg_module, "MEDIA_LAUNCH_SETTLE_S", 5)
+        monkeypatch.setattr(ffmpeg_module, "PROCESS_EXIT_GRACE_S", 0.01)
+        media.template["dies_on_kill"] = False
+        task = asyncio.create_task(ffmpeg_module._spawn_media(["ffmpeg"]))
+        while not media.launched:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        child = media.launched[0]
+        gate = ffmpeg_module.intel_media_lock()
+        assert child.killed and [item["pid"] for item in gate.live_children()] == [child.pid]
+        child.finish(-9)
+        async with gate:
+            assert not gate.live_children()
+
     async def test_an_early_break_kills_the_decoder_before_the_slot_is_released(self, media):
         """The thumbnail path, which runs on every recording.
 
@@ -673,7 +692,7 @@ class TestAPoisonedGpuContextIsFatalToTheGpu:
         gpu_port = object()
 
         class GpuRequest:
-            def infer(self, feed):
+            def infer(self, feed, *, share_outputs):
                 raise RuntimeError("[GPU] clFlush, error code: -5 CL_OUT_OF_RESOURCES")
 
         def forbidden_core():
@@ -688,7 +707,7 @@ class TestAPoisonedGpuContextIsFatalToTheGpu:
         session._outputs = (TensorInfo("output", (1,)),)
         session._output_ports = {"output": gpu_port}
         session._compiled = SimpleNamespace(create_infer_request=lambda: GpuRequest())
-        session._local = threading.local()
+        session._requests = SimpleNamespace()
         session._model = object()
         session._model_name = "rf-detr-small-512-coco.onnx"
         session._config = {}

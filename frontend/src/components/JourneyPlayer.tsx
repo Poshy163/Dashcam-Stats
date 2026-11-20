@@ -5,6 +5,7 @@ import { api, type OBDSeriesSample } from '@/lib/api'
 import { formatClock, formatDateTime, formatDuration, formatSpeed } from '@/lib/format'
 import { buildPlayableTimeline, playbackAtTimestamp } from '@/lib/journeyPlayback'
 import { ErrorState } from '@/components/ui'
+import { RecordingVideo } from '@/components/RecordingVideo'
 import type { JourneyDetail, Recording } from '@/lib/types'
 
 function sampleAt(samples: OBDSeriesSample[], timestampMs: number): OBDSeriesSample | null {
@@ -129,11 +130,11 @@ export default function JourneyPlayer({ journey, driveId }: { journey: JourneyDe
       {series.isError && <ErrorState title="Could not load the playback telemetry" error={series.error} retry={() => void series.refetch()} />}
       {playbackError && <ErrorState title="Could not play this clip" error={new Error('The video could not be loaded or decoded. Try the recording detail or another camera angle.')} retry={() => { setPlaybackError(false); video.current?.load() }} />}
       <div className="relative bg-black">
-        <video
+        <RecordingVideo
           ref={video}
           key={clip.id}
           className="aspect-video w-full"
-          src={api.recordings.streamUrl(clip.id)}
+          recordingId={clip.id}
           controls
           preload="metadata"
           playsInline

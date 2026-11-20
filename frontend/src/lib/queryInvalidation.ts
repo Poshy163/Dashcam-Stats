@@ -1,9 +1,11 @@
 import type { QueryClient } from '@tanstack/react-query'
 
+import { api } from '@/lib/api'
+
 // Views backed by pipeline output. Reanalysis retains old database rows until their
 // replacements succeed, so each view must refetch after invalidation and while the queue
 // repopulates. Keeping the roots here prevents one mutation remembering Vehicles while
-// another remembers the map but forgets Recordings and its newly-created thumbnails.
+// another forgets Recordings and its newly-created thumbnails.
 const ANALYSIS_QUERY_ROOTS = new Set([
   'status',
   'recordings',
@@ -13,8 +15,6 @@ const ANALYSIS_QUERY_ROOTS = new Set([
   'recording-plates',
   'journeys',
   'journey',
-  'heatmap',
-  'map-routes',
   'telemetry-quality',
   'plates',
   'plate',
@@ -24,17 +24,24 @@ const ANALYSIS_QUERY_ROOTS = new Set([
 ])
 const MAP_QUERY_ROOTS = new Set(['heatmap', 'map-routes'])
 
-export function invalidateAnalysisQueries(
-  client: QueryClient,
-  options: { includeMaps?: boolean } = {},
-): Promise<void> {
-  const includeMaps = options.includeMaps ?? true
+export function invalidateAnalysisQueries(client: QueryClient): Promise<void> {
   return client.invalidateQueries({
-    predicate: (query) => {
-      const root = String(query.queryKey[0] ?? '')
-      return ANALYSIS_QUERY_ROOTS.has(root) && (includeMaps || !MAP_QUERY_ROOTS.has(root))
-    },
+    predicate: (query) => ANALYSIS_QUERY_ROOTS.has(String(query.queryKey[0])),
   })
+}
+
+export const MAP_REVISION_KEY = ['map-revision'] as const
+
+export async function refreshMapRevision(client: QueryClient, signal: AbortSignal): Promise<string | null> {
+  const revision = await api.map.revision(signal)
+  if (client.getQueryData(MAP_REVISION_KEY) !== revision) {
+    // Inactive filter variants are marked stale too, so switching back to Street or
+    // including parked fixes observes any intervening edit or footage removal.
+    await client.invalidateQueries({
+      predicate: (query) => MAP_QUERY_ROOTS.has(String(query.queryKey[0])),
+    })
+  }
+  return revision
 }
 
 /** Who the app thinks it is talking to. The shell renders off this and nothing else. */

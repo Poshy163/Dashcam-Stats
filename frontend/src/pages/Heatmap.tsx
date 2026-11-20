@@ -1,5 +1,5 @@
 import { lazy, Suspense, useMemo, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 
 import RouteContentReady from '@/components/RouteContentReady'
 import Spinner from '@/components/Spinner'
@@ -7,6 +7,7 @@ import { DerivedHint, EmptyState, ErrorState, PageHeader, StatTile } from '@/com
 import { api } from '@/lib/api'
 import { formatDuration } from '@/lib/format'
 import { mapBounds } from '@/lib/mapBounds'
+import { MAP_REVISION_KEY, refreshMapRevision } from '@/lib/queryInvalidation'
 import { useMapSettings } from '@/lib/useMapSettings'
 
 // Start both map queries while the browser downloads Leaflet and its heat plugin.
@@ -43,17 +44,29 @@ const LAYERS = [
 type Layer = (typeof LAYERS)[number]['value']
 
 export default function HeatmapPage() {
+  const client = useQueryClient()
   const maps = useMapSettings()
   const [precision, setPrecision] = useState(3)
   const [minSpeedKmh, setMinSpeedKmh] = useState(5)
   const [layer, setLayer] = useState<Layer>('both')
 
+  const revision = useQuery({
+    queryKey: MAP_REVISION_KEY,
+    queryFn: ({ signal }) => refreshMapRevision(client, signal),
+    staleTime: 0,
+    retry: false,
+    refetchInterval: 30_000,
+    refetchOnWindowFocus: true,
+  })
+  // Establish the first revision before fetching either layer. Later checks reuse
+  // that baseline across visits, so both layers start together and retain pan/zoom.
+  const canFetchLayers = !revision.isPending
+  const layerStaleTime = revision.data && !revision.isError ? Infinity : 5 * 60 * 1000
   const query = useQuery({
     queryKey: ['heatmap', precision, minSpeedKmh],
     queryFn: () => api.map.heatmap({ precision, minSpeedKmh }),
-    // The aggregate changes only when footage is processed, and it is the most expensive
-    // read in the app; refetching it on every window focus is wasted work.
-    staleTime: 5 * 60 * 1000,
+    enabled: canFetchLayers,
+    staleTime: layerStaleTime,
   })
 
   const routes = useQuery({
@@ -61,8 +74,8 @@ export default function HeatmapPage() {
     queryFn: () => api.map.routes(),
     // Independent of the heat filters on purpose: the roads driven do not change when the
     // grid resolution or the speed filter does, so refetching them would be wasted work.
-    staleTime: 5 * 60 * 1000,
-    enabled: layer !== 'heat',
+    staleTime: layerStaleTime,
+    enabled: canFetchLayers && layer !== 'heat',
   })
 
   const data = query.data
@@ -123,7 +136,7 @@ export default function HeatmapPage() {
 
       {query.isError && <ErrorState error={query.error} retry={() => query.refetch()} />}
 
-      {query.isLoading && <Spinner label="Aggregating GPS fixes…" className="py-24" />}
+      {(revision.isPending || query.isLoading) && <Spinner label="Loading heatmap…" className="py-24" />}
       {layer !== 'heat' && routes.isLoading && <Spinner label="Loading traced routes…" className="py-8" />}
       {layer !== 'heat' && routes.isError && <ErrorState title="Could not load traced routes" error={routes.error} retry={() => routes.refetch()} />}
       {maps.query.isPending && <Spinner label="Loading map provider…" className="py-8" />}

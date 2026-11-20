@@ -26,28 +26,22 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query
 from sqlalchemy import (
-    Float,
     Select,
     String,
-    desc,
-    distinct,
     func,
-    literal_column,
     or_,
     select,
     text,
     type_coerce,
 )
-from sqlalchemy import cast as sa_cast
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
-from app.api import journey_snapshot, map_cache, route_geometry_cache
+from app.api import heat_cells, journey_snapshot, map_cache, route_geometry_cache
 from app.api.deps import SQLITE_MAX_INT, SessionDep
 from app.api.schemas import HeatmapOut, RoutesOut
 from app.api.visibility import journey_has_visible_recording, visible_revision
 from app.core.logging import get_logger
 from app.db.models import Camera, CameraRole, Journey, Recording, TelemetryPoint
-from app.osd.reasons import DRAWABLE
 
 log = get_logger(__name__)
 
@@ -91,18 +85,6 @@ _JOURNEY_REVISIONS = text("""
     SELECT id AS journey_id, route_revision AS revision FROM journeys
     ORDER BY journey_id
 """)
-
-
-def _drawable_quality():
-    """Positions a map may draw: read directly, or conservatively reconstructed.
-
-    ``gps_quality`` is null on rows written before it existed. Those are treated as
-    drawable on the strength of ``has_fix``, which is what every consumer relied on before
-    this column, rather than vanishing from the map until the library is reprocessed.
-    """
-    return TelemetryPoint.gps_quality.is_(None) | TelemetryPoint.gps_quality.in_(
-        [str(quality) for quality in DRAWABLE]
-    )
 
 
 @router.get("/map/heatmap", response_model=HeatmapOut)
@@ -152,105 +134,9 @@ async def _heatmap(
     min_speed_kmh: float,
     limit: int,
 ) -> HeatmapOut:
-    # The initial page requests this whole-library view. SQLite matches expressions and
-    # partial-index predicates structurally, so its grid and cutoff must be SQL literals
-    # for ix_telemetry_heat_cells to serve the aggregation directly in cell order.
-    indexed_grid = (
-        precision == 3
-        and min_speed_kmh == 5
-        and start is None
-        and end is None
-        and camera is None
-        and journey_id is None
+    rows = await heat_cells.read_rows(
+        session, precision, start, end, journey_id, camera, min_speed_kmh, limit
     )
-    grid = literal_column("3") if indexed_grid else precision
-    lat_cell = func.round(TelemetryPoint.lat, grid)
-    lon_cell = func.round(TelemetryPoint.lon, grid)
-
-    # Distinct *seconds*, not rows. Front and rear record the same drive, both burn the same
-    # GPS overlay and both are sampled at 1 Hz, so one real second of driving produces two
-    # rows wherever both cameras had a lock. Counting rows made the map claim 12 h 45 m of
-    # driving against about 10 h 56 m of actual elapsed journey time — arithmetically
-    # impossible — and doubled the heat on exactly the roads with the best coverage.
-    #
-    # Counting seconds instead of dropping a camera keeps stretches where only the rear
-    # had a fix. The coalesce is what makes that safe: a reading can now carry a position
-    # without a timestamp, and those rows would otherwise count as nothing at all.
-    # strftime returns text. A time-less fix uses its integer row ID, which SQLite
-    # counts separately even if an epoch second happens to have the same digits.
-    second = func.coalesce(
-        func.strftime(literal_column("'%s'"), TelemetryPoint.captured_at), TelemetryPoint.id
-    )
-    weight = func.count(distinct(second))
-    recordings = select(Recording.id).where(visible_revision(Recording.telemetry_revision))
-    if camera is not None:
-        recordings = recordings.join(Camera, Recording.camera_id == Camera.id).where(
-            Camera.key == camera
-        )
-    visible_recording = TelemetryPoint.recording_id.in_(recordings)
-    if indexed_grid:
-        # Most recordings are visible. Without this selectivity hint ANALYZE can lead
-        # SQLite to seek one recording at a time and sort the whole library by cell.
-        visible_recording = func.likely(visible_recording)
-
-    stmt = (
-        select(
-            sa_cast(lat_cell, Float).label("lat"),
-            sa_cast(lon_cell, Float).label("lon"),
-            weight.label("weight"),
-            # Summed rather than averaged per cell. An average of per-cell averages weights
-            # a cell holding one fix the same as a cell holding four thousand, so the
-            # reported figure moved from 25.3 to 49.9 km/h on identical data purely by
-            # changing the grid resolution. Totals divided at the end are invariant under
-            # it, which is the property the number needs to mean anything.
-            func.sum(TelemetryPoint.speed_kmh).label("speed_sum"),
-            func.count(TelemetryPoint.speed_kmh).label("speed_count"),
-        )
-        # has_fix alone is not enough: a row can carry the flag with null coordinates if a
-        # reading was rejected after the flag was set, and null coordinates would round to
-        # a cell at Null Island.
-        .where(
-            TelemetryPoint.has_fix.is_(True),
-            # Seek the eligible recordings in the map index. One hidden clip must never
-            # contribute fixes merely because another clip has a visible revision.
-            visible_recording,
-            TelemetryPoint.lat.is_not(None),
-            TelemetryPoint.lon.is_not(None),
-            _drawable_quality(),
-            # Retain raw positions for inspection, but do not draw sensor wander as a
-            # travelled route after the journey's motion check failed to establish one.
-            or_(
-                TelemetryPoint.journey_id.is_(None),
-                TelemetryPoint.journey_id.not_in(
-                    select(Journey.id).where(
-                        Journey.motion_json["status"].as_string().in_(["unconfirmed", "unknown"])
-                    )
-                ),
-            ),
-        )
-        .group_by(lat_cell, lon_cell)
-        # Densest first, so a truncated response still shows the places most driven rather
-        # than an arbitrary slice.
-        # Order by the result column. Repeating the parameterised aggregate makes SQLite
-        # maintain a second DISTINCT set for the same cell.
-        .order_by(desc("weight"))
-        .limit(limit + 1)
-    )
-
-    if min_speed_kmh > 0:
-        # Null speeds are kept: an unreadable speed field says nothing about whether the
-        # car was moving, and discarding those fixes would punch holes in real routes.
-        cutoff = literal_column("5") if indexed_grid else min_speed_kmh
-        stmt = stmt.where(
-            (TelemetryPoint.speed_kmh.is_(None)) | (TelemetryPoint.speed_kmh >= cutoff)
-        )
-    if start is not None:
-        stmt = stmt.where(TelemetryPoint.captured_at >= start)
-    if end is not None:
-        stmt = stmt.where(TelemetryPoint.captured_at <= end)
-    if journey_id is not None:
-        stmt = stmt.where(TelemetryPoint.journey_id == journey_id)
-    rows = (await session.execute(stmt)).all()
     truncated = len(rows) > limit
     rows = rows[:limit]
 
@@ -362,7 +248,7 @@ def _route_query(
             # Rejected positions carry no coordinate, so the nulls above already exclude
             # them. Naming the quality as well keeps the intent legible and covers a row
             # that was cleared by one route and not the other.
-            _drawable_quality(),
+            heat_cells.drawable_quality(),
             or_(
                 TelemetryPoint.journey_id.is_(None),
                 TelemetryPoint.journey_id.not_in(

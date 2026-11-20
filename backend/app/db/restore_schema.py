@@ -17,7 +17,8 @@ def describe_schema(connection: sqlite3.Connection) -> dict:
     map_triggers: dict[str, dict[str, str]] = {}
     for table, name, sql in connection.execute(
         "SELECT tbl_name, name, sql FROM sqlite_master "
-        "WHERE type='trigger' AND (name GLOB 'map_source_*' OR tbl_name='map_source_state' "
+        "WHERE type='trigger' AND (name GLOB 'map_source_*' "
+        "OR tbl_name IN ('map_source_state', 'map_heat_cells', 'map_heat_dirty') "
         "OR (tbl_name='journeys' AND EXISTS (SELECT 1 FROM pragma_table_info('journeys') "
         "WHERE name='route_revision')))"
     ):
@@ -38,9 +39,12 @@ def describe_schema(connection: sqlite3.Connection) -> dict:
         indexes = []
         for index in connection.execute(f"PRAGMA index_list({quoted})"):
             index_name = '"' + index[1].replace('"', '""') + '"'
-            sql = connection.execute(
+            definition = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (index[1],)
-            ).fetchone()[0]
+            ).fetchone()
+            # A WITHOUT ROWID table stores its primary key in the table itself.
+            # pragma_index_list reports it, but sqlite_master has no index entry.
+            sql = definition[0] if definition else None
             predicate = (
                 re.split(r"\bWHERE\b", sql, maxsplit=1, flags=re.IGNORECASE)[-1]
                 if index[4]

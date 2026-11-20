@@ -94,6 +94,45 @@ def test_healthy_cpu_inference_is_parallel_and_gpu_waits_for_it():
         assert writer_entered.is_set()
 
 
+@pytest.mark.parametrize(("device", "request_count"), [("GPU.0", 1), ("CPU", 2), ("NPU", 2)])
+def test_workers_share_only_gpu_requests_and_keep_their_own_results(
+    device, request_count, monkeypatch
+):
+    requests = []
+    output = object()
+    graph = SimpleNamespace(inputs=[], outputs=[output])
+
+    def create_request():
+        buffer = np.empty(1)
+        requests.append(buffer)
+
+        def infer(feed, *, share_outputs=None):
+            buffer[:] = feed["input"]
+            if device.startswith("GPU"):
+                assert share_outputs is False
+            return {output: buffer if share_outputs else buffer.copy()}
+
+        return SimpleNamespace(infer=infer)
+
+    compiled = SimpleNamespace(
+        outputs=[output], get_property=lambda _: 1, create_infer_request=create_request
+    )
+    core = SimpleNamespace(read_model=lambda _: graph, compile_model=lambda *_: compiled)
+    monkeypatch.setattr(runtime, "_get_core", lambda: core)
+    monkeypatch.setattr(runtime, "_model_cache_options", lambda _: {})
+    session = runtime.OpenVINOSession("fixture.onnx", device=device)
+    start = threading.Barrier(2)
+
+    def run(number):
+        start.wait(timeout=5)
+        return session.run(None, {"input": np.array([number])})[0]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        outputs = list(executor.map(run, [1, 2]))
+    assert len(requests) == request_count
+    assert [array.item() for array in outputs] == [1, 2]
+
+
 def test_waiting_gpu_request_rechecks_failure_before_entering_native_code():
     entered = []
     request = SimpleNamespace(infer=lambda _feed: entered.append(True) or {"output": np.ones(1)})

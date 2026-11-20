@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 
 import Spinner from '@/components/Spinner'
+import { RecordingVideo } from '@/components/RecordingVideo'
 import {
   DerivedHint,
   ErrorState,
@@ -576,10 +577,11 @@ function RecordingViewerContent({ recordingId }: { recordingId: number }) {
               This recording is no longer on disk.
             </div>
           ) : (
-            <video
+            <RecordingVideo
+              key={r.id}
               ref={videoRef}
               className="w-full rounded-lg bg-black"
-              src={api.recordings.streamUrl(r.id)}
+              recordingId={r.id}
               controls
               preload="metadata"
               playsInline

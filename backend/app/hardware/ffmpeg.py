@@ -405,7 +405,14 @@ async def _spawn_media(
         if settle:
             # Held past the spawn on purpose: `create_subprocess_exec` returns at exec, and
             # every part that can abort happens after that.
-            await asyncio.sleep(MEDIA_LAUNCH_SETTLE_S)
+            try:
+                await asyncio.sleep(MEDIA_LAUNCH_SETTLE_S)
+            except asyncio.CancelledError:
+                # The caller has not received the child yet. Stop it here so a
+                # cancelled request cannot leave a GPU process outside the gate.
+                child = _register_child(proc, Path(cmd[0]).name, gated=True)
+                await _close_child(proc, child, graceful=False)
+                raise
     return proc
 
 
@@ -673,6 +680,103 @@ async def _run(
                 raise DecodeError(f"hardware decode was withheld before launch: {reason}")
             return await _run_process(cmd, timeout, stdin, gated=True)
     return await _run_process(cmd, timeout, stdin)
+
+
+async def encode_playback(source: Path, output: Path) -> str:
+    """Encode a seekable H.264/AAC copy, reporting the encoder that produced it."""
+    from app.ai.openvino_session import gpu_context_failed
+    from app.hardware.detect import DRI_PATH
+
+    threads = str(native_thread_budget())
+    base = [
+        ffmpeg_path(),
+        "-hide_banner",
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-abort_on",
+        "empty_output_stream",
+    ]
+    # Decode on the CPU: the camera's H.264 Baseline profile can be rejected by
+    # iHD for decoding even though the same device can encode AVC successfully.
+    inputs = [
+        "-fflags",
+        "+genpts+igndts",
+        "-threads",
+        threads,
+        "-filter_threads",
+        threads,
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+    ]
+    tail = [
+        "-fps_mode",
+        "vfr",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-ac",
+        "2",
+        "-movflags",
+        "+faststart",
+        str(output),
+    ]
+    # Both encoders emit 4:2:0. Pad a single pixel for odd-sized footage.
+    pad = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+    for node in sorted(DRI_PATH.glob("renderD*")):
+        async with intel_media_lock() as gate:
+            if not gate.gpu_safe() or gpu_context_failed():
+                break
+            cmd = [
+                *base,
+                "-vaapi_device",
+                str(node),
+                *inputs,
+                "-vf",
+                f"{pad},format=nv12,hwupload",
+                "-c:v",
+                "h264_vaapi",
+                "-qp",
+                "23",
+                *tail,
+            ]
+            code, _, stderr = await _run_process(cmd, DEFAULT_DECODE_TIMEOUT, gated=True)
+            if code == 0 and output.is_file() and output.stat().st_size > 0:
+                return "h264_vaapi"
+            log.warning(
+                "VAAPI playback encode failed",
+                device=str(node),
+                error=stderr[-500:].decode(errors="replace"),
+            )
+    cmd = [
+        *base,
+        *inputs,
+        "-vf",
+        pad,
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-threads",
+        threads,
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        *tail,
+    ]
+    code, _, stderr = await _run_process(cmd, DEFAULT_DECODE_TIMEOUT)
+    if code or not output.is_file() or output.stat().st_size == 0:
+        raise FFmpegError(
+            "Could not encode compatible video", stderr=stderr[-500:].decode(errors="replace")
+        )
+    return "libx264"
 
 
 async def ffprobe_raw(

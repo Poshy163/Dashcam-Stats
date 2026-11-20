@@ -487,7 +487,7 @@ class TestInferenceProviders:
         output_port = object()
 
         class Request:
-            def infer(self, input_feed):
+            def infer(self, input_feed, *, share_outputs):
                 nonlocal active, maximum
                 with counter_lock:
                     active += 1

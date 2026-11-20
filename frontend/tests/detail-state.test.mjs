@@ -13,7 +13,7 @@ const directory = await mkdtemp(fileURLToPath(new URL('../node_modules/.detail-s
 after(() => rm(directory, { recursive: true, force: true }))
 await build({
   stdin: {
-    contents: `export { default as PlateDetail } from '@/pages/PlateDetail'; export { default as JourneyDetail } from '@/pages/JourneyDetail'; export { default as RecordingViewer } from '@/pages/RecordingViewer'; export { default as RouteMap } from '@/components/RouteMap';`,
+    contents: `export { default as PlateDetail } from '@/pages/PlateDetail'; export { default as JourneyDetail } from '@/pages/JourneyDetail'; export { default as RecordingViewer } from '@/pages/RecordingViewer'; export { RecordingVideo } from '@/components/RecordingVideo'; export { default as RouteMap } from '@/components/RouteMap';`,
     resolveDir: fileURLToPath(new URL('..', import.meta.url)), loader: 'tsx',
   },
   outfile: path.join(directory, 'details.mjs'), bundle: true, format: 'esm', platform: 'node', jsx: 'automatic',
@@ -32,7 +32,29 @@ await build({
     },
   }],
 })
-const { PlateDetail, JourneyDetail, RecordingViewer, RouteMap } = await import(pathToFileURL(path.join(directory, 'details.mjs')).href)
+const { PlateDetail, JourneyDetail, RecordingViewer, RecordingVideo, RouteMap } = await import(pathToFileURL(path.join(directory, 'details.mjs')).href)
+
+test('recording playback retries codec errors once and seeks back to the original position', async t => {
+  let root, errors = 0, plays = 0
+  await act(async () => { root = create(React.createElement(RecordingVideo, { recordingId: 42, onError: () => { errors++ } })) })
+  t.after(() => act(() => root.unmount()))
+  const video = () => root.root.findByType('video')
+  const element = { currentTime: 12, duration: 60, paused: false, error: { code: 2 }, play: async () => { plays++ } }
+  const event = { currentTarget: element }
+  await act(async () => video().props.onError(event))
+  assert.equal(errors, 1)
+  assert.equal(video().props.src, '/stream/42')
+  element.error.code = 3
+  await act(async () => video().props.onError(event))
+  assert.equal(video().props.src, '/stream/42?compatibility=true')
+  assert.equal(errors, 1)
+  element.currentTime = 0
+  await act(async () => video().props.onLoadedMetadata(event))
+  assert.equal(element.currentTime, 12)
+  assert.equal(plays, 1)
+  await act(async () => video().props.onError(event))
+  assert.equal(errors, 2)
+})
 
 async function settle() {
   for (let n = 0; n < 4; n++) await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })

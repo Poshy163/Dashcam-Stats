@@ -18,7 +18,7 @@ import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -603,9 +603,8 @@ def _port_shape(port: Any) -> tuple[int | str, ...]:
 class OpenVINOSession:
     """The ``InferenceSession`` subset required by the detector and OCR packages.
 
-    Each worker thread owns an infer request.  OpenVINO can therefore schedule requests
-    from concurrent recordings through the model's shared GPU streams without duplicating
-    weights or serialising all workers behind one Python lock.
+    GPU models reuse one request in the exclusive native lane. CPU and NPU
+    models keep one request per worker thread to allow concurrent inference.
     """
 
     def __init__(self, model_path: str | Path, *, device: str | None = None) -> None:
@@ -629,6 +628,8 @@ class OpenVINOSession:
         config: dict[str, str] = {"PERFORMANCE_HINT": performance_hint}
         if target.upper().startswith("CPU"):
             config["INFERENCE_NUM_THREADS"] = str(cpu_inference_threads())
+        elif target.upper().startswith("GPU"):
+            config["NUM_STREAMS"] = "1"
         config.update(_model_cache_options(target))
 
         started = time.monotonic()
@@ -655,13 +656,18 @@ class OpenVINOSession:
                 performance_hint = selected_performance_hint(target)
                 config["PERFORMANCE_HINT"] = performance_hint
                 config["INFERENCE_NUM_THREADS"] = str(cpu_inference_threads())
+                config.pop("NUM_STREAMS", None)
                 config.pop("CACHE_DIR", None)
                 config.update(_model_cache_options(target))
                 compiled = core.compile_model(model, target, config)
 
         self.device = target
         self._compiled = compiled
-        self._local = threading.local()
+        # A thread pool can visit one GPU model from many different threads. Their
+        # calls are serialized, so they can share its native request and buffers.
+        self._requests = (
+            SimpleNamespace() if target.upper().startswith("GPU") else threading.local()
+        )
         self._cpu_session = None
         self._model_path = str(model_path)
         # Retain these objects after a GPU fault: destroying them can itself enter the
@@ -710,10 +716,10 @@ class OpenVINOSession:
         return [f"OpenVINO:{self.device}"]
 
     def _request(self) -> Any:
-        request = getattr(self._local, "request", None)
+        request = getattr(self._requests, "request", None)
         if request is None:
             request = self._compiled.create_infer_request()
-            self._local.request = request
+            self._requests.request = request
         return request
 
     def _move_to_cpu(self, reason: str) -> None:
@@ -772,7 +778,9 @@ class OpenVINOSession:
                 if gpu_backend_disabled() is not None:
                     raise RuntimeError("OpenVINO GPU is disabled after an earlier failure")
                 try:
-                    result = self._request().infer(input_feed)
+                    # OpenVINO copies output tensors to NumPy before infer() returns.
+                    # The next worker may reuse all native buffers as soon as we unlock.
+                    result = self._request().infer(input_feed, share_outputs=False)
                 except Exception as exc:
                     if is_gpu_context_failure(exc):
                         # Persist while holding the inference lane, before a waiting

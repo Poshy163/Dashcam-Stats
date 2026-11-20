@@ -26,7 +26,9 @@ _locks: WeakValueDictionary[tuple, asyncio.Lock] = WeakValueDictionary()
 _REVISION = text("SELECT revision FROM map_source_state WHERE id = 1")
 
 
-async def _revision(session: AsyncSession) -> bytes | None:
+async def source_revision(session: AsyncSession) -> bytes | None:
+    if session.get_bind().dialect.name != "sqlite":
+        return None
     revision = await session.scalar(_REVISION)
     return revision if isinstance(revision, bytes) and len(revision) == 16 else None
 
@@ -43,7 +45,7 @@ async def cached(
         return await compute()
 
     async with _locks.setdefault(key, asyncio.Lock()):
-        revision = await _revision(session)
+        revision = await source_revision(session)
         if revision is None:
             return await compute()
 
@@ -62,7 +64,7 @@ async def cached(
         value = await compute()
         # Ingest may commit between reading the revision and streaming the layer.
         # Return this request's result, but only publish it if both belong to one revision.
-        if await _revision(session) == revision:
+        if await source_revision(session) == revision:
             _remember(key, stamp, value)
             if snapshot is not None:
                 await asyncio.to_thread(map_snapshot.save, key, revision, value)

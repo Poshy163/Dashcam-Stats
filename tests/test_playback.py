@@ -21,6 +21,7 @@ from app.media.playback import (
     BROWSER_NATIVE_SUFFIXES,
     cache_dir,
     cache_usage,
+    compatible_playback,
     ensure_playable,
     is_browser_native,
     prune_cache,
@@ -107,6 +108,14 @@ class TestCache:
         assert prune_cache(limit_bytes=512) == 1
         assert not only.exists()
 
+    def test_protected_compatible_copy_counts_toward_the_budget(self, app_config):
+        existing = cache_dir() / "other.mp4"
+        existing.write_bytes(b"o" * 100)
+        compatible = cache_dir() / "compatible.mp4"
+        compatible.write_bytes(b"c" * 1024)
+        assert prune_cache(limit_bytes=1024, keep=compatible) == 1
+        assert compatible.is_file() and not existing.exists()
+
     def test_prune_is_a_noop_under_the_limit(self, app_config):
         (cache_dir() / "00000001.mp4").write_bytes(b"x" * 100)
         assert prune_cache(limit_bytes=10 * 1024) == 0
@@ -189,3 +198,107 @@ class TestRemux:
         """A corrupt file must not 500 the stream endpoint."""
         result = await ensure_playable(damaged_clips["garbage"], 48)
         assert result.path.exists()
+
+
+@pytest.mark.parametrize(
+    "poisoned,vaapi_code,expected",
+    [(False, 0, "h264_vaapi"), (False, 1, "libx264"), (True, 0, "libx264")],
+)
+async def test_compatibility_encoder_selection(
+    tmp_path, monkeypatch, poisoned, vaapi_code, expected
+):
+    from app.ai import openvino_session
+    from app.hardware import detect, ffmpeg
+
+    monkeypatch.setattr(detect, "DRI_PATH", tmp_path)
+    (tmp_path / "renderD128").touch()
+    monkeypatch.setattr(openvino_session, "gpu_context_failed", lambda: poisoned)
+    monkeypatch.setattr(ffmpeg, "ffmpeg_path", lambda: "ffmpeg")
+    calls = []
+
+    async def run(cmd, timeout, *, gated=False):
+        encoder = cmd[cmd.index("-c:v") + 1]
+        calls.append(encoder)
+        assert "-hwaccel" not in cmd
+        assert gated == ffmpeg.intel_media_lock().locked() == (encoder == "h264_vaapi")
+        if encoder == "h264_vaapi":
+            assert "hwupload" in cmd[cmd.index("-vf") + 1]
+            if vaapi_code:
+                return vaapi_code, b"", b"driver rejected encoder"
+        Path(cmd[-1]).write_bytes(b"encoded")
+        return 0, b"", b""
+
+    monkeypatch.setattr(ffmpeg, "_run_process", run)
+    assert await ffmpeg.encode_playback(tmp_path / "input.ts", tmp_path / "output.mp4") == expected
+    assert calls == (
+        ["libx264"] if poisoned else ["h264_vaapi", "libx264"] if vaapi_code else ["h264_vaapi"]
+    )
+
+
+async def test_compatible_copy_is_atomic_and_bound_to_the_source(app_config, monkeypatch, tmp_path):
+    from app.media import playback
+
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"original")
+    attempts = []
+
+    async def encode(source, partial):
+        attempts.append(partial)
+        partial.write_bytes(b"unfinished")
+        if len(attempts) == 1:
+            raise asyncio.CancelledError
+        await asyncio.sleep(0)
+        partial.write_bytes(source.read_bytes())
+        return "libx264"
+
+    monkeypatch.setattr(playback, "encode_playback", encode)
+    with pytest.raises(asyncio.CancelledError):
+        await compatible_playback(source, 42)
+    assert not list(cache_dir().iterdir())
+    first, second = await asyncio.gather(
+        compatible_playback(source, 42), compatible_playback(source, 42)
+    )
+    assert first.path == second.path and first.encoder == second.encoder == "libx264"
+    assert len(attempts) == 2
+    source.write_bytes(b"replaced clip")
+    new = await compatible_playback(source, 42)
+    assert new.path != first.path and new.path.read_bytes() == b"replaced clip"
+    assert not list(cache_dir().glob("*.part.mp4"))
+
+
+@pytest.mark.needs_ffmpeg
+async def test_compatible_stream_serves_decodable_h264_aac_and_ranges(
+    app_config,
+    client,
+    db_session,
+    front_clip,
+    monkeypatch,
+    tmp_path,
+):
+    import shutil
+
+    from app.db.models import Recording
+    from app.hardware import detect, ffmpeg
+
+    monkeypatch.setattr(detect, "DRI_PATH", tmp_path / "no-gpu")
+    shutil.copyfile(front_clip, app_config.footage_dir / "input.ts")
+    rec = Recording(filename="input.ts", rel_path="input.ts")
+    db_session.add(rec)
+    await db_session.commit()
+    url = f"/stream/{rec.id}?compatibility=true"
+    response = await client.get(url, headers={"Range": "bytes=0-1023"})
+    assert response.status_code == 206, response.text[:200]
+    assert response.headers["x-playback-encoder"] == "libx264"
+    assert response.headers["content-type"] == "video/mp4"
+    assert len(response.content) == 1024 and b"ftyp" in response.content
+    copy = next(cache_dir().glob("*-libx264.mp4"))
+    streams = (await ffmpeg.ffprobe_raw(copy))["streams"]
+    assert {stream["codec_name"] for stream in streams} == {"h264", "aac"}
+    original = await ffmpeg.ffprobe_raw(front_clip)
+    video = next(s for s in streams if s["codec_type"] == "video")
+    original_video = next(s for s in original["streams"] if s["codec_type"] == "video")
+    assert (video["width"], video["height"]) == (original_video["width"], original_video["height"])
+    code, _, err = await ffmpeg._run_process(
+        [ffmpeg.ffmpeg_path(), "-v", "error", "-i", str(copy), "-f", "null", "-"], 30
+    )
+    assert code == 0 and not err

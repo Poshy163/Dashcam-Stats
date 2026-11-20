@@ -89,7 +89,6 @@ export default function Layout({
   const pending = (stats?.queued ?? 0) + (stats?.running ?? 0)
   const done = stats?.completedToday ?? 0
   const wasBusy = useRef(false)
-  const lastMapRefresh = useRef(0)
   const lastCounts = useRef({ pending: 0, done: 0 })
 
   // Refresh derived pages when work actually lands, and once more on the transition to
@@ -112,13 +111,7 @@ export default function Layout({
     const moved = pending !== lastCounts.current.pending || done !== lastCounts.current.done
     lastCounts.current = { pending, done }
     if (isBusy || wasBusy.current || moved) {
-      const now = Date.now()
-      // The heat aggregation is deliberately heavier than a list read. Thirty seconds is
-      // live enough to watch it repopulate without executing it every five seconds for a
-      // multi-hour library rebuild.
-      const includeMaps = !isBusy || now - lastMapRefresh.current >= 30_000
-      if (includeMaps) lastMapRefresh.current = now
-      void invalidateAnalysisQueries(client, { includeMaps })
+      void invalidateAnalysisQueries(client)
     }
     wasBusy.current = isBusy
   }, [client, pending, done])

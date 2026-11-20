@@ -912,6 +912,7 @@ export const api = {
   },
 
   map: {
+    revision: (signal?: AbortSignal) => request<string | null>('/system/map-revision', { signal }),
     /** Grid-aggregated fixes, ready for a heat layer. See the `Heatmap` type. */
     heatmap: (filters?: HeatmapFilters) => request<Heatmap>('/map/heatmap', { query: filters, responseKeys: 'top-level' }),
     /** The paths themselves, split at signal gaps. See the `Routes` type. */

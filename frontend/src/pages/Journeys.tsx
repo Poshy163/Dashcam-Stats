@@ -65,11 +65,8 @@ export default function Journeys() {
     mutationFn: () => api.journeys.merge(selected),
     onSuccess: () => {
       setSelection({ scope: selectionScope, ids: [] })
-      // Everything derived, not just this list. A merge deletes journey rows and re-parents
-      // every recording's journeyId, so the journey detail view, the Recordings list's
-      // journey filter and both map layers are all stale afterwards — which is precisely
-      // the "one mutation remembers Vehicles and forgets Recordings" problem the shared
-      // helper exists to end.
+      // A merge re-parents recordings and removes journeys. Refresh the lists and
+      // detail views together. Map observes the resulting database revision on visit.
       void invalidateAnalysisQueries(client)
     },
   })

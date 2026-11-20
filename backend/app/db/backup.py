@@ -310,6 +310,8 @@ def apply_pending_restore() -> bool:
         # connection checkpoints any WAL pages back into the staged file.
         with closing(sqlite3.connect(pending)) as connection, connection:
             connection.execute("UPDATE map_source_state SET revision = randomblob(16) WHERE id = 1")
+            if "map_heat_cells" in _expected_schema(revision):
+                connection.execute("UPDATE map_source_state SET heat_cells_ready = 0 WHERE id = 1")
             if "route_revision" in _expected_schema(revision)["journeys"]["columns"]:
                 connection.execute("UPDATE journeys SET route_revision = randomblob(16)")
                 connection.execute(

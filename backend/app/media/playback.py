@@ -21,12 +21,13 @@ import asyncio
 import contextlib
 import os
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from app.config import get_config
 from app.core.logging import get_logger
-from app.hardware.ffmpeg import DEFAULT_DECODE_TIMEOUT, FFmpegError, ffmpeg_path
+from app.hardware.ffmpeg import DEFAULT_DECODE_TIMEOUT, FFmpegError, encode_playback, ffmpeg_path
 
 log = get_logger(__name__)
 
@@ -36,6 +37,8 @@ BROWSER_NATIVE_SUFFIXES = frozenset({".mp4", ".m4v", ".webm", ".ogg", ".ogv", ".
 #: Per-recording locks so two viewers opening the same clip remux it once, not twice.
 _locks: dict[int, asyncio.Lock] = {}
 _locks_guard = asyncio.Lock()
+# Each compatibility copy decodes a complete clip. Bound concurrent CPU fallbacks too.
+_transcode_lock = asyncio.Lock()
 
 
 @dataclass(slots=True)
@@ -44,6 +47,7 @@ class Playable:
     media_type: str
     #: True when the file was remuxed rather than served from the footage directory.
     from_cache: bool
+    encoder: str | None = None
 
 
 def cache_dir() -> Path:
@@ -262,6 +266,43 @@ async def ensure_playable(source: Path, recording_id: int) -> Playable:
     return Playable(path=target, media_type="video/mp4", from_cache=True)
 
 
+async def compatible_playback(source: Path, recording_id: int) -> Playable:
+    """Cache a browser-compatible copy separately from full-quality stream copies."""
+    stat = await asyncio.to_thread(source.stat)
+    stem = f"{recording_id:08d}-{stat.st_size:x}-{stat.st_mtime_ns:x}"
+    directory = cache_dir()
+
+    def cached() -> Playable | None:
+        for encoder in ("h264_vaapi", "libx264"):
+            path = directory / f"{stem}-{encoder}.mp4"
+            with contextlib.suppress(FileNotFoundError):
+                if path.stat().st_size:
+                    _touch(path)
+                    return Playable(path, "video/mp4", True, encoder)
+        return None
+
+    hit = cached()
+    if hit is not None:
+        return hit
+    async with _transcode_lock:
+        hit = cached()
+        if hit is not None:
+            return hit
+        # A timed-out filesystem child can outlive its request. A fresh partial name
+        # keeps its file descriptor separate from the next encode attempt.
+        handle, name = tempfile.mkstemp(prefix=f"{stem}-", suffix=".part.mp4", dir=directory)
+        os.close(handle)
+        partial = Path(name)
+        try:
+            encoder = await encode_playback(source, partial)
+            target = directory / f"{stem}-{encoder}.mp4"
+            partial.replace(target)
+        finally:
+            partial.unlink(missing_ok=True)
+        await asyncio.to_thread(prune_cache, keep=target)
+        return Playable(target, "video/mp4", True, encoder)
+
+
 async def ensure_export_clip(
     source: Path, recording_id: int, *, start_s: float = 0.0, end_s: float | None = None
 ) -> Path:
@@ -363,35 +404,34 @@ def prune_cache(limit_bytes: int | None = None, *, keep: Path | None = None) -> 
         limit_bytes = int(gb * 1024**3)
 
     protected = None if keep is None else os.path.normcase(os.path.abspath(keep))
-    entries = []
+    entries: list[tuple[float, str, int]] = []
+    total = 0
     for directory in _cache_dirs():
         try:
-            # `.part.mp4` is a transfer in progress, not a cache entry: evicting one deletes
-            # the file its own ffmpeg is still writing.
-            entries.extend(
-                e
-                for e in os.scandir(directory)
-                if e.is_file()
-                and not e.name.endswith(".part.mp4")
-                and os.path.normcase(os.path.abspath(e.path)) != protected
-            )
+            with os.scandir(directory) as files:
+                for entry in files:
+                    if entry.name.endswith(".part.mp4") or not entry.is_file():
+                        continue
+                    # Another sweep can remove an entry between enumeration and stat.
+                    with contextlib.suppress(FileNotFoundError):
+                        stat = entry.stat()
+                        total += stat.st_size
+                        if os.path.normcase(os.path.abspath(entry.path)) != protected:
+                            entries.append((stat.st_mtime, entry.path, stat.st_size))
         except OSError:
             continue
-    if not entries:
-        return 0
-
-    total = sum(e.stat().st_size for e in entries)
     if total <= limit_bytes:
         return 0
 
-    entries.sort(key=lambda e: e.stat().st_mtime)
     removed = 0
-    for entry in entries:
+    for _, path, size in sorted(entries):
         if total <= limit_bytes:
             break
-        size = entry.stat().st_size
         try:
-            os.unlink(entry.path)
+            os.unlink(path)
+        except FileNotFoundError:
+            total -= size
+            continue
         except OSError:
             continue
         total -= size

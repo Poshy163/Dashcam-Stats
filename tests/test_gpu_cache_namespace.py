@@ -85,6 +85,8 @@ def test_gpu_compile_fallback_restores_cpu_cache_namespace(monkeypatch, cache_ke
     try:
         session = runtime.OpenVINOSession("model.onnx", device="GPU")
         assert session.device == "CPU"
+        assert calls[0][1]["NUM_STREAMS"] == "1"
+        assert "NUM_STREAMS" not in calls[1][1]
         assert calls[0][1]["CACHE_DIR"].endswith("_intel_" + "a" * 64)
         assert calls[1][1]["CACHE_DIR"] == str(app_config.data_dir / "openvino_cache_2025.4.1")
     finally:

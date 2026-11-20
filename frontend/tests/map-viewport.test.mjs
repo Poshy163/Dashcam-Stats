@@ -6,6 +6,7 @@ import path from 'node:path'
 import { build } from 'esbuild'
 import React from 'react'
 import { act, create } from 'react-test-renderer'
+import { QueryClient } from '@tanstack/react-query'
 
 const directory = await mkdtemp(fileURLToPath(new URL('../node_modules/.map-viewport-test-', import.meta.url)))
 after(() => rm(directory, { recursive: true, force: true }))
@@ -13,7 +14,8 @@ await build({
   stdin: {
     contents: `export { default as FitMapToData } from '@/components/FitMapToData';
       export { mapBounds } from '@/lib/mapBounds';
-      export { api } from '@/lib/api';`,
+      export { api } from '@/lib/api';
+      export { invalidateAnalysisQueries, MAP_REVISION_KEY, refreshMapRevision } from '@/lib/queryInvalidation';`,
     resolveDir: fileURLToPath(new URL('..', import.meta.url)), loader: 'tsx',
   },
   outfile: path.join(directory, 'viewport.mjs'), bundle: true, format: 'esm', platform: 'node', jsx: 'automatic',
@@ -26,7 +28,35 @@ await build({
     },
   }],
 })
-const { FitMapToData, mapBounds, api } = await import(pathToFileURL(path.join(directory, 'viewport.mjs')).href)
+const { FitMapToData, mapBounds, api, invalidateAnalysisQueries, MAP_REVISION_KEY, refreshMapRevision } =
+  await import(pathToFileURL(path.join(directory, 'viewport.mjs')).href)
+
+test('all cached map filters refresh only when the server map revision changes', async t => {
+  const client = new QueryClient()
+  t.after(() => client.clear())
+  let revision = 'before'
+  t.mock.method(globalThis, 'fetch', async url => {
+    assert.equal(url, '/api/system/map-revision')
+    return { ok: true, json: async () => revision }
+  })
+  const mapKeys = [['heatmap', 3, 5], ['heatmap', 4, 0], ['map-routes']]
+  for (const key of mapKeys) client.setQueryData(key, {})
+  client.setQueryData(['recordings'], {})
+  client.setQueryData(MAP_REVISION_KEY, revision)
+  const refreshRevision = () => client.fetchQuery({
+    queryKey: MAP_REVISION_KEY,
+    queryFn: ({ signal }) => refreshMapRevision(client, signal),
+  })
+
+  await invalidateAnalysisQueries(client)
+  await refreshRevision()
+  assert.equal(client.getQueryState(['recordings']).isInvalidated, true)
+  assert.ok(mapKeys.every(key => !client.getQueryState(key).isInvalidated))
+
+  revision = 'after'
+  await refreshRevision()
+  assert.ok(mapKeys.every(key => client.getQueryState(key).isInvalidated))
+})
 
 test('overlay bounds include disjoint routes and weighted cells while ignoring missing fixes', () => {
   assert.deepEqual(mapBounds([[[-35, 139], [-34, 138]], [[-36, 141], [0, 0], [NaN, 145]]]), [[-36, 138], [-34, 141]])

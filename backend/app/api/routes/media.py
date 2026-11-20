@@ -19,8 +19,9 @@ from app.api.deps import RowId, SessionDep
 from app.core.logging import get_logger
 from app.core.paths import PathTraversalError, resolve_footage_path, resolve_media_path
 from app.db.models import Recording
+from app.hardware.ffmpeg import FFmpegError
 from app.media import ensure_playable
-from app.media.playback import ensure_export_clip
+from app.media.playback import compatible_playback, ensure_export_clip
 
 log = get_logger(__name__)
 
@@ -91,6 +92,7 @@ async def stream_recording(
     session: SessionDep,
     request: Request,
     range_header: str | None = Header(default=None, alias="Range"),
+    compatibility: bool = False,
 ) -> Response:
     """Serve video with HTTP range support.
 
@@ -118,12 +120,23 @@ async def stream_recording(
 
     # The camera records MPEG-TS, which no browser can demux. The H.264 inside is fine,
     # so this hands back a remuxed MP4 (copied, not re-encoded) and serves that instead.
-    playable = await ensure_playable(path, recording_id)
+    if compatibility:
+        try:
+            playable = await compatible_playback(path, recording_id)
+        except FFmpegError as exc:
+            log.warning("compatible playback failed", recording_id=recording_id, error=exc.stderr)
+            raise HTTPException(
+                422, "Could not create a compatible video for this recording"
+            ) from exc
+    else:
+        playable = await ensure_playable(path, recording_id)
     path = playable.path
 
     size = (await asyncio.to_thread(path.stat)).st_size
     media_type = playable.media_type
     base_headers = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"}
+    if playable.encoder:
+        base_headers["X-Playback-Encoder"] = playable.encoder
 
     if not range_header:
         return FileResponse(path, media_type=media_type, headers=base_headers)

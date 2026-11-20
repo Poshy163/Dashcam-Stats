@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse
 from sqlalchemy import case, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -991,6 +991,14 @@ async def system_info(session: SessionDep):
             "active": get_worker_pool().current_jobs(),
         },
     }
+
+
+@router.get("/system/map-revision")
+async def map_revision(session: SessionDep, response: Response) -> str | None:
+    """Opaque token shared by all map filters. A change invalidates cached layers."""
+    response.headers["Cache-Control"] = "private, no-store"
+    revision = await map_cache.source_revision(session)
+    return revision.hex() if revision is not None else None
 
 
 @router.get("/system/database")

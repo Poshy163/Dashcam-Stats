@@ -14,6 +14,41 @@ async def _token(session) -> bytes:
     return value
 
 
+async def test_browser_revision_and_background_heat_refresh(client, db_session):
+    from app.workers.scheduler import Scheduler
+
+    async def revision():
+        response = await client.get("/api/system/map-revision")
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "private, no-store"
+        assert response.json() == (await _token(db_session)).hex()
+        return response.json()
+
+    initial = await revision()
+    rec = Recording(
+        rel_path="map.ts", filename="map.ts", size_bytes=0, state=RecordingState.COMPLETED
+    )
+    db_session.add(rec)
+    await db_session.commit()
+    assert await revision() == initial
+    db_session.add(
+        TelemetryPoint(recording_id=rec.id, t_offset_s=0, lat=-32, lon=137, has_fix=True)
+    )
+    await db_session.commit()
+    published = await revision()
+    assert published != initial
+
+    scheduler = Scheduler()
+    await scheduler._run_heat_cells()
+    assert await db_session.scalar(text("SELECT weight FROM map_heat_cells")) == 1
+    assert await revision() == published
+    rec.ignored = True
+    await db_session.commit()
+    assert await revision() != published
+    await scheduler._run_heat_cells()
+    assert await db_session.scalar(text("SELECT count(*) FROM map_heat_cells")) == 0
+
+
 async def test_map_revision_tracks_published_inputs_and_rollback(db_session):
     session = db_session
     now = datetime.now(UTC)

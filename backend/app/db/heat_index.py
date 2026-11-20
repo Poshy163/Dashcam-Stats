@@ -30,6 +30,14 @@ def refresh_heat_index(connection: sqlite3.Connection) -> None:
     connection.execute("SAVEPOINT refresh_heat_index")
     try:
         connection.execute("REINDEX ix_telemetry_heat_cells")
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'map_heat_cells'"
+        ).fetchone():
+            # Materialized coordinates and persisted layer snapshots also carry
+            # keys rounded by the previous SQLite runtime.
+            connection.execute(
+                "UPDATE map_source_state SET heat_cells_ready = 0, revision = randomblob(16)"
+            )
         connection.execute(f"PRAGMA user_version = {SQLITE_VERSION_NUMBER}")
     except BaseException:
         connection.execute("ROLLBACK TO refresh_heat_index")
