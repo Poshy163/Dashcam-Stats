@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.config import get_config
+from app.core.backup_priority import backup_priority_active
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service, local_midnight_utc
 from app.db.models import (
@@ -316,7 +317,7 @@ async def claim_next(
     session: AsyncSession, worker_id: str, *, active_recording_ids: Sequence[int] = ()
 ) -> ProcessingJob | None:
     """Atomically take the next runnable job, or None."""
-    if _paused:
+    if _paused or backup_priority_active():
         return None
 
     now = datetime.now(UTC)
@@ -416,7 +417,9 @@ async def claim_next(
             .limit(1)
         )
     ).scalar_one_or_none()
-    if runnable is None:
+    # Operator pause or a footage transfer may have started while the read was in
+    # flight. Once the atomic claim is submitted, the worker owns that attempt.
+    if runnable is None or _paused or backup_priority_active():
         return None
 
     claimed = (
@@ -1336,6 +1339,7 @@ async def stats(session: AsyncSession) -> dict[str, object]:
         # infer it from a queue full of jobs that are not what they look like.
         "phase": "thumbnails" if thumbnails else ("analysis" if queued or running else "idle"),
         "paused": _paused,
+        "backup_priority_active": backup_priority_active(),
         "throughput_per_hour": throughput,
         "estimated_minutes_remaining": eta_minutes,
     }

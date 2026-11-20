@@ -34,6 +34,34 @@ async def standalone_migration_engine(app_config):
 
 
 class TestMigrations:
+    def test_footage_receive_rate_preserves_old_history_through_upgrade_and_downgrade(
+        self, app_config
+    ):
+        import sqlite3
+        from contextlib import closing
+
+        from alembic import command
+
+        from app.db.session import alembic_config
+
+        config = alembic_config()
+        command.upgrade(config, "0031")
+        with closing(sqlite3.connect(app_config.db_path)) as conn, conn:
+            conn.execute(
+                "INSERT INTO ingest_runs (id, started_at, throughput_mbs_avg) "
+                "VALUES (1, '2026-11-01 12:00:00', 13.59)"
+            )
+        command.upgrade(config, "0032")
+        with closing(sqlite3.connect(app_config.db_path)) as conn:
+            assert conn.execute(
+                "SELECT throughput_mbs_avg, footage_receive_mbs FROM ingest_runs WHERE id = 1"
+            ).fetchone() == (13.59, None)
+        command.downgrade(config, "0031")
+        with closing(sqlite3.connect(app_config.db_path)) as conn:
+            assert conn.execute(
+                "SELECT throughput_mbs_avg FROM ingest_runs WHERE id = 1"
+            ).fetchone() == (13.59,)
+
     async def test_upgrade_creates_every_declared_table(self, migrated):
         engine = get_engine()
         async with engine.connect() as conn:

@@ -11,12 +11,13 @@ Nothing caught it because no test had ever called the endpoint. These do.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 
 import pytest
 from sqlalchemy import select, update
 
-from app.db.models import Plate, Recording, RecordingState
+from app.db.models import IngestRun, Plate, Recording, RecordingState
 from app.db.session import session_scope
 
 # The `client` fixture lives in conftest.py; several test modules now need it.
@@ -69,6 +70,45 @@ class TestReadEndpoints:
             f"{path} returned {response.status_code}: {response.text[:400]}"
         )
         assert response.json() is not None
+
+
+async def test_backup_history_rates_include_setup_and_handle_legacy_timestamps(client):
+    start = datetime(2026, 11, 20, tzinfo=UTC)
+    async with session_scope() as session:
+        for run_id, state, seconds, size, receiver in [
+            (1, "ok", 20, 8_000_000, None),
+            (2, "partial", 40, 8_000_000, 1.5),
+            (3, "error", 5, 0, None),
+            (4, "ok", 0, 8_000_000, None),
+            (5, "ok", -1, 8_000_000, None),
+            (6, "running", None, 8_000_000, None),
+        ]:
+            session.add(
+                IngestRun(
+                    id=run_id,
+                    started_at=start,
+                    finished_at=start + timedelta(seconds=seconds) if seconds is not None else None,
+                    state=state,
+                    bytes_transferred=size,
+                    throughput_mbs_avg=2.0,
+                    footage_receive_mbs=receiver,
+                )
+            )
+
+    response = await client.get("/api/ingest/history")
+    assert response.status_code == 200
+    rows = {row["id"]: row for row in response.json()["items"]}
+    assert {key: row["end_to_end_mbs"] for key, row in rows.items()} == {
+        1: 0.4,
+        2: 0.2,
+        3: 0.0,
+        4: None,
+        5: None,
+        6: None,
+    }
+    assert rows[2]["footage_receive_mbs"] == 1.5
+    assert rows[1]["footage_receive_mbs"] is None
+    assert rows[1]["throughput_mbs_avg"] == 2.0
 
 
 class TestSettingsPayload:

@@ -23,6 +23,7 @@ SettingType = Literal["bool", "int", "float", "string", "select", "path", "bytes
 # the puller fight the app over the persistent vendor property during radio recovery.
 INGEST_SLEEP_WINDOW_ACTIVE_SECONDS = 1200
 INGEST_SLEEP_WINDOW_IDLE_SECONDS = 300
+INGEST_STREAM_FILES_DEFAULT = 12
 FIXED_SETTING_VALUES: dict[str, object] = {
     "ingest.manage_sleep_window": True,
 }
@@ -264,6 +265,15 @@ SETTINGS: tuple[SettingDef, ...] = (
         "How many recordings are analysed at once.",
         minimum=1,
         maximum=16,
+    ),
+    SettingDef(
+        "processing.prioritize_footage_backup",
+        "Prioritise footage backup",
+        "bool",
+        True,
+        "processing",
+        "Let active analysis jobs finish and wait to start new jobs while footage is copying. "
+        "Processing resumes automatically after the transfer.",
     ),
     SettingDef(
         "processing.hardware_acceleration",
@@ -1738,13 +1748,12 @@ SETTINGS: tuple[SettingDef, ...] = (
     ),
     SettingDef(
         "ingest.chunk_size",
-        "Transfer batch chunk size",
+        "Files per transfer connection",
         "int",
-        5,
+        INGEST_STREAM_FILES_DEFAULT,
         "ingest",
-        "How many files to stream and verify per chunk. Completed files are committed to "
-        "permanent storage and reclaimed from the card after each chunk, so an interrupted "
-        "transfer retains its progress and never re-downloads completed files.",
+        "How many recordings to request on one connection. Larger groups avoid reconnecting "
+        "as often. The server checks and files completed recordings while the stream continues.",
         minimum=1,
         maximum=50,
         unit="files",
@@ -1752,18 +1761,13 @@ SETTINGS: tuple[SettingDef, ...] = (
     ),
     SettingDef(
         "ingest.commit_queue_depth",
-        "Chunks that may await filing while copying",
+        "Finished batches that may await filing",
         "int",
         2,
         "ingest",
-        "Filing a finished chunk into permanent storage and erasing it from the card used to "
-        "happen with the copy stopped, so the link sat idle through both. It now runs behind "
-        "the transfer, and this is how far ahead the copy may get: each waiting chunk is that "
-        "many recordings held in the staging area rather than filed, so raising it trades "
-        "local disk for a little speed. The gain is small — one card delete is about a fifth "
-        "of a second against a chunk that takes some twelve seconds to copy — and the real "
-        "benefit is that a delete which hangs no longer holds up a good connection. Set to 1 "
-        "to keep filing close behind the copy.",
+        "The server files completed recordings in the background. This limit makes the "
+        "download wait if the footage disk falls behind. Card cleanup, when enabled, "
+        "follows durable storage of each recording.",
         minimum=1,
         maximum=10,
         unit="chunks",

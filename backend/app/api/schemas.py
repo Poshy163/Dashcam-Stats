@@ -308,6 +308,7 @@ class QueueStatsOut(BaseModel):
     #: "thumbnails", "analysis" or "idle" -- which pass the queue is working through.
     phase: str = "idle"
     paused: bool = False
+    backup_priority_active: bool = False
     throughput_per_hour: float | None = None
     estimated_minutes_remaining: float | None = None
 

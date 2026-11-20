@@ -13,18 +13,22 @@ import asyncio
 import contextlib
 import os
 import shutil
+import stat
 import time
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 
 from app.config import get_config
+from app.core.backup_priority import prioritize_footage_transfer
 from app.core.logging import get_logger
 from app.core.settings_schema import (
     INGEST_SLEEP_WINDOW_ACTIVE_SECONDS,
     INGEST_SLEEP_WINDOW_IDLE_SECONDS,
+    INGEST_STREAM_FILES_DEFAULT,
 )
 from app.core.settings_service import get_settings_service
 from app.ingest import (
@@ -78,6 +82,10 @@ class _RunLifecycle:
     released: bool = False
     policy_fingerprint_checks: int = 0
     analysis_released: set[str] = field(default_factory=set)
+    # None means a receiver failed without returning its counters.
+    footage_receive: transport.TransferResult | None = field(
+        default_factory=transport.TransferResult
+    )
 
 
 # Status clears its start and can admit a successor before history writes finish.
@@ -782,35 +790,15 @@ def _absorb(total: transport.TransferResult, part: transport.TransferResult) -> 
         total.error = part.error
 
 
-#: How many finished chunks may be waiting to be committed before the transfer waits.
-#:
-#: Backpressure, not a buffer to be filled. Each queued chunk is `chunk_size` recordings
-#: sitting in staging on the footage filesystem, so an unbounded queue would trade card
-#: space for local disk on a link fast enough to outrun the commit -- and the whole point of
-#: committing progressively is that an interrupted window leaves finished files where the
-#: scanner can see them, not stranded in staging.
+#: Bound the number of completed filing batches waiting in staging while copying continues.
 COMMIT_QUEUE_DEPTH = 2
 
 
 class _CommitPipeline:
-    """Commit-and-reclaim running *behind* the transfer instead of inside it.
+    """File completed recordings in order while the receiver writes later files.
 
-    The bulk socket and the ADB control channel are independent -- :mod:`app.ingest.radios`
-    relies on exactly that, since the control channel is idle while the tar stream moves
-    bytes. Yet the commit and the card delete used to run between chunks with the stream
-    stopped, so the one thing guaranteed not to be doing work during them was the link.
-
-    The cost of that is small on average and occasionally large. A commit is a ``stat`` and
-    a rename; a reclaim is one ADB round trip, measured at ~185 ms against the live unit, on
-    a chunk that takes some twelve seconds to move. But an ADB call that wedges takes its
-    full timeout, and this application has recorded twenty-second ones -- twenty seconds of
-    a twenty-minute window spent holding a healthy link idle while a delete decides whether
-    it is going to answer.
-
-    So chunks are handed to a worker and the stream carries straight on. Nothing about the
-    safety ordering changes: a card delete still happens only after the commit for those
-    exact files returned them, and both still run one chunk at a time in arrival order.
-    What changes is who waits.
+    A single worker flushes and publishes each batch, then reclaims only the files
+    that were successfully committed. Card cleanup uses the separate ADB channel.
 
     Failures are kept, not raised into the transfer. The first one stops further work --
     nothing should still be erasing a card after a commit failed -- but the queue keeps
@@ -939,6 +927,114 @@ async def _can_resume_stream(address: str) -> bool:
     return allowed
 
 
+class _FilingError(Exception):
+    """Carry a filing exception through the receiver's socket-error handling."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+class _ClosedFootage:
+    """Hand closed tar members to the filing worker without ending the connection."""
+
+    GROUP_SIZE = 4
+
+    def __init__(
+        self,
+        chunk: list[RemoteFile],
+        submit: Callable[[list[RemoteFile]], Awaitable[None]],
+        status: IngestStatus,
+    ) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._remaining = {item.name: item for item in chunk}
+        self._ready: list[RemoteFile] = []
+        self._submit = submit
+        self._status = status
+
+    def file_done(self, name: str) -> None:
+        # Called on the receiver thread AFTER closing and validating the member.
+        self._status.file_done(name)
+        item = self._remaining.pop(name, None)
+        if item is None:
+            return
+        self._ready.append(item)
+        if len(self._ready) == self.GROUP_SIZE:
+            # Wait for queue admission so slow filing bounds the staging backlog.
+            # The pipeline does the actual disk flush and card reclaim concurrently.
+            try:
+                asyncio.run_coroutine_threadsafe(self._flush(), self._loop).result()
+            except Exception as exc:
+                # In particular, a filing OSError must not become a retryable socket error.
+                raise _FilingError(exc) from exc
+
+    async def _flush(self) -> None:
+        batch, self._ready = self._ready, []
+        await self._submit(batch)
+
+    async def finish(self, completed: list[str]) -> None:
+        # A receiver can also return complete members in its terminal result. Process
+        # them exactly once across all attempts, after the receiver threads have joined.
+        for name in completed:
+            item = self._remaining.pop(name, None)
+            if item is not None:
+                self._ready.append(item)
+            if len(self._ready) == self.GROUP_SIZE:
+                await self._flush()
+        if self._ready:
+            await self._flush()
+
+
+async def _receive_footage(
+    receive: Callable[[], transport.TransferResult],
+    listener: asyncio.subprocess.Process | None,
+    status: IngestStatus,
+) -> tuple[transport.TransferResult, bool]:
+    """Keep the listener, staging area and filing pipeline owned until the reader exits."""
+
+    async def read() -> transport.TransferResult:
+        lifecycle = _run_lifecycle.get()
+        try:
+            part = await asyncio.to_thread(receive)
+        except BaseException as exc:
+            if lifecycle is not None:
+                lifecycle.footage_receive = None
+            if isinstance(exc, _FilingError):
+                raise exc.error from None
+            raise
+        if lifecycle is not None and lifecycle.footage_receive is not None:
+            lifecycle.footage_receive.bytes_received += part.bytes_received
+            lifecycle.footage_receive.seconds += part.seconds
+        return part
+
+    reader = asyncio.create_task(read())
+
+    async def stop_and_join() -> bool:
+        try:
+            return await adb.stop_listener(listener)
+        finally:
+            await reader
+
+    try:
+        result = await asyncio.shield(reader)
+    except asyncio.CancelledError:
+        status.cancel_event.set()
+        raise
+    finally:
+        cleanup = asyncio.create_task(stop_and_join())
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        was_serving = cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
+    return result, was_serving
+
+
+@prioritize_footage_transfer()
 async def _move(
     info: UnitInfo,
     files: list[RemoteFile],
@@ -948,18 +1044,15 @@ async def _move(
     port: int,
     timeout_s: int,
     lease: radio_coordinator.RadioTransition | None = None,
-    chunk_size: int = 5,
+    chunk_size: int = INGEST_STREAM_FILES_DEFAULT,
     on_chunk_completed: Callable[[list[RemoteFile]], Awaitable[None]] | None = None,
     yield_after_chunk: Callable[[], Awaitable[bool]] | None = None,
 ) -> transport.TransferResult:
     """Stream *files* off the unit into *staging*, in bounded chunks per directory.
 
-    One listener per directory chunk rather than one for the entire run. The card keeps
-    ordinary segments and incident-locked ones in separate directories, and ``tar`` is
-    rooted at the directory it is run from. Chunking streams files in small batches (e.g. 5
-    at a time) so completed recordings are committed and reclaimed from the card
-    progressively. If a transfer is interrupted, all recordings completed before the drop
-    are preserved on disk and freed on the card rather than lost in staging and redone.
+    Each listener serves one directory chunk. Submit completed members for filing inside
+    the stream, and leave the checks for radio state and newly eligible footage at the
+    listener boundaries. A retry requests only the missing members of this chunk.
 
     Its own function because the run calls it more than once: for the plan drawn on
     arrival, and again for each sweep that finds recordings the camera closed while the
@@ -985,6 +1078,9 @@ async def _move(
             pending = chunk
             batch_result = transport.TransferResult()
             chunk_retried = False
+            closed = (
+                _ClosedFootage(chunk, on_chunk_completed, status) if on_chunk_completed else None
+            )
             while pending:
                 if lease is not None:
                     lease.raise_if_lease_lost()
@@ -1009,20 +1105,21 @@ async def _move(
                     timeout_s=timeout_s,
                 )
                 status.set_phase(Phase.TRANSFERRING)
-                try:
-                    part = await asyncio.to_thread(
+                part, was_serving = await _receive_footage(
+                    partial(
                         transport.receive,
                         host,
                         port,
                         staging,
                         expected={item.name: item.size for item in pending},
                         on_file_started=status.file_started,
-                        on_file_done=status.file_done,
+                        on_file_done=closed.file_done if closed is not None else status.file_done,
                         on_bytes=status.add_bytes,
                         cancel=status.cancel_event,
-                    )
-                finally:
-                    was_serving = await adb.stop_listener(listener)
+                    ),
+                    listener,
+                    status,
+                )
                 batch_result.files.extend(part.files)
                 batch_result.bytes_received += part.bytes_received
                 batch_result.seconds += part.seconds
@@ -1052,8 +1149,8 @@ async def _move(
                 log.info("resumed interrupted footage successfully", files=len(batch_result.files))
             _absorb(transferred, batch_result)
 
-            if on_chunk_completed is not None:
-                await on_chunk_completed(chunk)
+            if closed is not None:
+                await closed.finish(batch_result.files)
 
             if lease is not None:
                 lease.raise_if_lease_lost()
@@ -1238,7 +1335,8 @@ def delta(
 
         local = footage / item.name
         try:
-            same = local.is_file() and local.stat().st_size == item.size
+            local_stat = local.stat()
+            same = stat.S_ISREG(local_stat.st_mode) and local_stat.st_size == item.size
         except OSError:
             same = False
         if same:
@@ -2856,7 +2954,7 @@ async def _run_pull_started(
                 name="ingest-show-backup-page",
             )
 
-        chunk_size = int(_get("chunk_size", 5))
+        chunk_size = int(_get("chunk_size", INGEST_STREAM_FILES_DEFAULT))
         expected = {item.name: item.size for item in plan.files}
         wanted = list(plan.files)
         analysis_batch_yielded = False
@@ -2894,7 +2992,7 @@ async def _run_pull_started(
                         movement_logger,
                         refresh_logger=True,
                     )
-                    if not latest.analysis_ready:
+                    if not latest.analysis_ready or not latest.deferred:
                         return False
                     remaining_plan = await asyncio.to_thread(
                         delta,
@@ -2930,7 +3028,6 @@ async def _run_pull_started(
 
         async def _commit_and_reclaim_chunk(chunk: list[RemoteFile]) -> None:
             chunk_expected = {item.name: item.size for item in chunk}
-            status.set_phase(Phase.VERIFYING)
             chunk_committed = await asyncio.to_thread(commit, staging, footage, chunk_expected)
             if chunk_committed:
                 committed.extend(chunk_committed)
@@ -2942,52 +3039,44 @@ async def _run_pull_started(
                     if to_reclaim:
                         await _reclaim(info, to_reclaim, lease=radio_transition)
 
-        # Started here rather than around the whole run: the sweeps below draw their own
-        # plans and commit inline, and a pipeline outliving the transfer it belongs to
-        # would have chunks in flight while the run decided it was finished.
-        pipeline = _CommitPipeline(
-            _commit_and_reclaim_chunk,
-            depth=int(_get("commit_queue_depth", COMMIT_QUEUE_DEPTH)),
-        )
-        pipeline.start()
-        try:
-            transferred = await _move(
-                info,
-                plan.files,
-                staging=staging,
-                host=host,
-                port=port,
-                timeout_s=timeout_s,
-                lease=radio_transition,
-                chunk_size=chunk_size,
-                on_chunk_completed=pipeline.submit,
-                yield_after_chunk=_yield_for_new_analysis,
+        async def _move_and_commit(
+            files: list[RemoteFile],
+            *,
+            yield_after_chunk: Callable[[], Awaitable[bool]] | None = None,
+        ) -> transport.TransferResult:
+            # Each inventory owns its worker. Finish it before another sweep can
+            # inspect the card or error recovery can take over the staging directory.
+            pipeline = _CommitPipeline(
+                _commit_and_reclaim_chunk,
+                depth=int(_get("commit_queue_depth", COMMIT_QUEUE_DEPTH)),
             )
-        except BaseException:
-            # The window shut or the lease went. Whatever is queued has not been committed,
-            # and the second pass below is what picks those files up -- so drop it rather
-            # than spend a dead link finding out.
-            await pipeline.close(discard=True)
-            raise
-        # Awaited before `committed` is read: the run may not work out what is still
-        # outstanding while the worker is halfway through telling it.
-        await pipeline.close()
+            pipeline.start()
+            try:
+                part = await _move(
+                    info,
+                    files,
+                    staging=staging,
+                    host=host,
+                    port=port,
+                    timeout_s=timeout_s,
+                    lease=radio_transition,
+                    chunk_size=chunk_size,
+                    on_chunk_completed=pipeline.submit,
+                    yield_after_chunk=yield_after_chunk,
+                )
+            except BaseException:
+                await pipeline.close(discard=True)
+                raise
 
-        status.set_phase(Phase.VERIFYING)
-        remaining_expected = {
-            item.name: item.size for item in plan.files if item.name not in set(committed)
-        }
-        if remaining_expected and staging.is_dir():
-            more_committed = await asyncio.to_thread(commit, staging, footage, remaining_expected)
-            if more_committed:
-                committed.extend(more_committed)
-                if bool(_get("delete_after_verify", False)):
-                    if radio_transition is not None:
-                        radio_transition.raise_if_lease_lost()
-                    by_name = {item.name: item for item in plan.files}
-                    to_reclaim = [by_name[name] for name in more_committed if name in by_name]
-                    if to_reclaim:
-                        await _reclaim(info, to_reclaim, lease=radio_transition)
+            status.set_phase(Phase.VERIFYING)
+            await pipeline.close()
+            committed_names = set(committed)
+            remaining = [item for item in files if item.name not in committed_names]
+            if remaining and staging.is_dir():
+                await _commit_and_reclaim_chunk(remaining)
+            return part
+
+        transferred = await _move_and_commit(plan.files, yield_after_chunk=_yield_for_new_analysis)
 
         # The sweeps: re-check the card before calling the run done. The plan was drawn
         # when the car arrived, and the recording the camera was writing at that moment --
@@ -3053,38 +3142,12 @@ async def _run_pull_started(
             )
             status.extend_plan(more)
             status.set_phase(Phase.TRANSFERRING)
-            more_expected = {item.name: item.size for item in more.files}
             # Keep this inventory before receiving: a quiet-state failure between
             # chunks must still salvage complete files from the current sweep.
-            expected.update(more_expected)
+            expected.update((item.name, item.size) for item in more.files)
             wanted.extend(more.files)
-            part = await _move(
-                info,
-                more.files,
-                staging=staging,
-                host=host,
-                port=port,
-                timeout_s=timeout_s,
-                lease=radio_transition,
-                chunk_size=chunk_size,
-                on_chunk_completed=_commit_and_reclaim_chunk,
-            )
+            part = await _move_and_commit(more.files)
             _absorb(transferred, part)
-            status.set_phase(Phase.VERIFYING)
-            remaining_more = {
-                name: size for name, size in more_expected.items() if name not in set(committed)
-            }
-            if remaining_more and staging.is_dir():
-                more_committed = await asyncio.to_thread(commit, staging, footage, remaining_more)
-                if more_committed:
-                    committed.extend(more_committed)
-                    if bool(_get("delete_after_verify", False)):
-                        if radio_transition is not None:
-                            radio_transition.raise_if_lease_lost()
-                        by_name = {item.name: item for item in more.files}
-                        to_reclaim = [by_name[name] for name in more_committed if name in by_name]
-                        if to_reclaim:
-                            await _reclaim(info, to_reclaim, lease=radio_transition)
 
         # The rescue: cut-short recordings stranded outside Video by a power cut. After
         # the sweeps, while the link is still proven good, and only on a run that has not
@@ -3542,6 +3605,7 @@ async def _persist(result: RunResult, trigger: str) -> None:
 
     finished_at = datetime.now(UTC)
     lifecycle = _run_lifecycle.get()
+    received = lifecycle.footage_receive if lifecycle is not None else None
     async with session_scope() as session:
         session.add(
             IngestRun(
@@ -3552,6 +3616,11 @@ async def _persist(result: RunResult, trigger: str) -> None:
                 files_transferred=result.files,
                 bytes_transferred=result.bytes,
                 throughput_mbs_avg=result.throughput_mbs,
+                footage_receive_mbs=(
+                    received.throughput_mbs
+                    if received is not None and received.bytes_received and received.seconds > 0
+                    else None
+                ),
                 error=redact(result.error) if result.error else None,
             )
         )

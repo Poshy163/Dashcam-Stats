@@ -128,6 +128,30 @@ class TestTheDelta:
         assert plan.bytes == 200
         assert plan.backlog_files == 2
 
+    def test_one_metadata_lookup_checks_both_type_and_size(self, tmp_path, monkeypatch):
+        regular = tmp_path / "20260812120000_camera_0.ts"
+        directory = tmp_path / "20260812120100_camera_0.ts"
+        regular.write_bytes(b"clip")
+        directory.mkdir()
+        paths = [regular, directory]
+        remote = [RemoteFile(path.name, path.stat().st_size, 0) for path in paths]
+
+        original_stat = Path.stat
+        looked_up = []
+
+        def counted_stat(path, *args, **kwargs):
+            looked_up.append(path)
+            return original_stat(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "stat", counted_stat)
+            patch.setattr(Path, "is_file", lambda path: pytest.fail("separate file-type lookup"))
+            plan = delta(remote, tmp_path, skip_active_s=15, camera="both")
+
+        assert looked_up == paths
+        assert plan.duplicate_candidates == [remote[0]]
+        assert plan.files == [remote[1]]
+
     def test_the_guard_is_judged_on_the_units_own_clock(self, tmp_path):
         """The mtimes come from the head unit; comparing them to this machine's clock
         measures the drift between two computers rather than the age of a file.
@@ -1772,6 +1796,75 @@ class TestARunEndToEnd:
         # Each plan is listed and then listed again by the still-growing check: arrival
         # (1, 2), the sweep that found the new clip (3, 4), the sweep that found nothing (5).
         assert listings["count"] == 5
+
+    async def test_sweep_keeps_copying_while_a_prior_recording_is_being_committed(
+        self, db_session, unit, app_config, monkeypatch
+    ):
+        from app.ingest import adb, puller
+        from app.ingest.models import Phase, RunState
+        from app.ingest.status import get_status
+
+        await self._enable(
+            **{"ingest.chunk_size": 1, "ingest.sweep_passes": 1, "ingest.delete_after_verify": True}
+        )
+        first = "20260812120200_camera_0.ts"
+        second = "20260812120300_camera_0.ts"
+        inventory = adb.inventory
+
+        async def list_with_new_recordings(address, source):
+            if unit.served["names"] is not None:
+                unit.payload.update({first: b"c" * 4096, second: b"d" * 4096})
+            return await inventory(address, source)
+
+        monkeypatch.setattr(adb, "inventory", list_with_new_recordings)
+        committing = threading.Event()
+        release = threading.Event()
+        commit = puller.commit
+
+        def block_first_commit(staging, footage, expected):
+            if first in expected:
+                committing.set()
+                assert release.wait(10)
+            return commit(staging, footage, expected)
+
+        monkeypatch.setattr(puller, "commit", block_first_commit)
+        receive = transport.receive
+        status = get_status()
+        received_second = threading.Event()
+
+        def observe_second_receive(host, port, staging, **kwargs):
+            if second in kwargs["expected"]:
+                assert committing.wait(5)
+                assert status.snapshot()["phase"] == Phase.TRANSFERRING.value
+            result = receive(host, port, staging, **kwargs)
+            if second in result.files:
+                received_second.set()
+            return result
+
+        monkeypatch.setattr(transport, "receive", observe_second_receive)
+        draining = asyncio.Event()
+        set_phase = status.set_phase
+
+        def observe_phase(phase):
+            set_phase(phase)
+            if phase is Phase.VERIFYING and first in unit.payload:
+                assert received_second.is_set(), "the sweep still has recordings to receive"
+                draining.set()
+
+        monkeypatch.setattr(status, "set_phase", observe_phase)
+        run = asyncio.create_task(puller.run_pull(trigger="manual"))
+        try:
+            await asyncio.wait_for(draining.wait(), timeout=8)
+            assert not run.done()
+            assert first not in unit.deleted and second not in unit.deleted
+        finally:
+            release.set()
+            result = await run
+        assert result.state is RunState.OK, result.error
+        assert result.files == 4
+        assert unit.deleted[-2:] == [first, second]
+        for name in (first, second):
+            assert (app_config.footage_dir / name).read_bytes() == unit.payload[name]
 
     async def test_a_cut_short_recording_is_rescued_under_its_proper_name(
         self, db_session, unit, app_config, monkeypatch

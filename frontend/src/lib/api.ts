@@ -383,7 +383,10 @@ export interface IngestRun {
   state: string
   filesTransferred: number
   bytesTransferred: number
+  /** Legacy reported rate, with a time interval that varies by outcome. */
   throughputMbsAvg: number
+  endToEndMbs: number | null
+  footageReceiveMbs: number | null
   error: string | null
 }
 

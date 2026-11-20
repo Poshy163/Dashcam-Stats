@@ -808,6 +808,8 @@ class IngestRun(Base):
     files_transferred: Mapped[int] = mapped_column(Integer, default=0)
     bytes_transferred: Mapped[int] = mapped_column(Integer, default=0)
     throughput_mbs_avg: Mapped[float] = mapped_column(Float, default=0.0)
+    #: Raw footage archive bytes per receiver second, including retries.
+    footage_receive_mbs: Mapped[float | None] = mapped_column(Float, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 

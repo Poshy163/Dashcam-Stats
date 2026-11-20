@@ -317,8 +317,22 @@ async def ingest_cancel() -> dict[str, object]:
     return {"cancelled": True}
 
 
+def _end_to_end_mbs(row: IngestRun) -> float | None:
+    if row.started_at is None or row.finished_at is None:
+        return None
+    elapsed = (row.finished_at - row.started_at).total_seconds()
+    if elapsed <= 0:
+        return None
+    return round(row.bytes_transferred / 1_000_000 / elapsed, 2)
+
+
 @router.get("/ingest/history", summary="Past transfers")
 async def ingest_history(session: SessionDep, page: PaginationDep) -> dict[str, object]:
+    """Report saved bytes per elapsed second and, when measured, the footage receiver rate.
+
+    The legacy throughput_mbs_avg field has historically used different time intervals
+    depending on the outcome. It is retained for existing clients.
+    """
     total = int((await session.execute(select(func.count(IngestRun.id)))).scalar() or 0)
     rows = (
         (
@@ -343,6 +357,8 @@ async def ingest_history(session: SessionDep, page: PaginationDep) -> dict[str, 
                 "files_transferred": row.files_transferred,
                 "bytes_transferred": row.bytes_transferred,
                 "throughput_mbs_avg": row.throughput_mbs_avg,
+                "end_to_end_mbs": _end_to_end_mbs(row),
+                "footage_receive_mbs": row.footage_receive_mbs,
                 "error": redact(row.error) if row.error else None,
             }
             for row in rows

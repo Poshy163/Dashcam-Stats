@@ -753,7 +753,7 @@ async def test_run_ends_completed_batch_and_restores_radios_for_new_pending_pair
     async def inventory_policy(*_args, **_kwargs):
         return parked_filter.FilterResult(
             [original, later, new_opposite] if "copy" in events else [original, later, pair[1]],
-            deferred=[(item, until) for item in pair] if "copy" in events else [],
+            deferred=[(item, until) for item in pair] if "pair closed" in events else [],
             analysis_ready="copy" in events,
         )
 
@@ -764,6 +764,12 @@ async def test_run_ends_completed_batch_and_restores_radios_for_new_pending_pair
         staging.mkdir(exist_ok=True)
         (staging / original.name).write_bytes(unit.payload)
         await on_chunk_completed([original])
+        with monkeypatch.context() as patch:
+            boundary_delta = Mock(wraps=puller.delta)
+            patch.setattr(puller, "delta", boundary_delta)
+            assert not await yield_after_chunk()
+            boundary_delta.assert_not_called()
+        events.append("pair closed")
         assert await yield_after_chunk()
         return transport.TransferResult(
             files=[original.name], bytes_received=original.size, complete=True

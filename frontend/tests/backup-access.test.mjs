@@ -39,6 +39,7 @@ async function flush() {
 async function mount(t, {
   entry = '/backup', getStatus = () => idle, getBundles = () => paginated([bundle(11)]), eventStream,
   getRadioStatus = () => ({ quieting_enabled: false, transition: null }),
+  history = [{ id: 90, started_at: '2026-10-01T04:00:00Z', state: 'ok', files_transferred: 2, bytes_transferred: 100 }],
   getObdStatus = () => ({ stored_drive_count: 11, failed_count: 1, copy_throughput_mbs: 0, event_stream: eventStream }),
   onCancel = () => ({ cancelled: true }),
 } = {}) {
@@ -53,7 +54,7 @@ async function mount(t, {
       case '/api/ingest/status': body = await getStatus(); break
       case '/api/ingest/radio-status': body = await getRadioStatus(); break
       case '/api/ingest/cancel': body = await onCancel(); break
-      case '/api/ingest/history': body = paginated([{ id: 90, started_at: '2026-10-01T04:00:00Z', state: 'ok', files_transferred: 2, bytes_transferred: 100 }]); break
+      case '/api/ingest/history': body = paginated(history); break
       case '/api/obd/status': body = await getObdStatus(); break
       case '/api/system/info': body = { version: 'main', source_revision: 'abcdef0123456789' }; break
       case '/api/unit-logs/temperature': body = { source: 'retained_carplay_timing', sensor: 'soc-thmzone', hours: 24, range_start: '2026-10-01T00:00:00Z', range_end: '2026-10-02T00:00:00Z', bucket_s: 300, gap_threshold_s: 90, latest: null, minimum_c: null, maximum_c: null, unique_observation_count: 0, source_row_count: 0, input_truncated: false, output_truncated: false, truncated: false, points: [] }; break
@@ -75,6 +76,20 @@ async function mount(t, {
   await flush()
   return { root, client, requests }
 }
+
+test('transfer history separates measured receive speed and whole-run speed for old and partial runs', async t => {
+  const row = { id: 90, started_at: '2026-10-01T04:00:00Z', state: 'ok', files_transferred: 2, bytes_transferred: 100, throughput_mbs_avg: 98 }
+  const { root } = await mount(t, { history: [
+    { ...row, end_to_end_mbs: 3.72, footage_receive_mbs: null },
+    { ...row, id: 91, state: 'partial', end_to_end_mbs: 8.21, footage_receive_mbs: 15.14 },
+    { ...row, id: 92, state: 'error', end_to_end_mbs: 0, footage_receive_mbs: null },
+  ] })
+  const table = root.root.findAllByType('table').find(node =>
+    node.findAllByType('th').some(th => th.children.join('') === 'Start-to-finish speed'))
+  const data = table.findAllByType('tbody')[0].findAllByType('tr')
+  const rates = data.map(tr => tr.findAllByType('td').slice(-2).map(td => td.children.join('')))
+  assert.deepEqual(rates, [['3.7 MB/s', '—'], ['8.2 MB/s', '15.1 MB/s'], ['0.0 MB/s', '—']])
+})
 
 test('an acknowledged stop stays disabled through shutdown, then prevents a new pull until recovery settles', async t => {
   let current = { ...idle, state: 'running', phase: 'transferring' }

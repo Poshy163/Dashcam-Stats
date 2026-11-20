@@ -1224,7 +1224,12 @@ export default function Backup() {
                 <th className="px-4 py-3 font-medium">Result</th>
                 <th className="px-4 py-3 font-medium">Files</th>
                 <th className="px-4 py-3 font-medium">Size</th>
-                <th className="px-4 py-3 font-medium">Speed</th>
+                <th className="px-4 py-3 font-medium" title="Saved bytes divided by the full backup duration, including setup and checks.">
+                  Start-to-finish speed
+                </th>
+                <th className="px-4 py-3 font-medium" title="Footage archive bytes per second during receive attempts, including retries and staging writes.">
+                  Footage receive speed
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -1244,7 +1249,10 @@ export default function Backup() {
                   <td className="tabular px-4 py-3">{run.filesTransferred}</td>
                   <td className="tabular px-4 py-3">{formatBytes(run.bytesTransferred)}</td>
                   <td className="tabular px-4 py-3">
-                    {run.throughputMbsAvg ? `${run.throughputMbsAvg.toFixed(1)} MB/s` : '—'}
+                    {run.endToEndMbs != null ? `${run.endToEndMbs.toFixed(1)} MB/s` : '—'}
+                  </td>
+                  <td className="tabular px-4 py-3">
+                    {run.footageReceiveMbs != null ? `${run.footageReceiveMbs.toFixed(1)} MB/s` : '—'}
                   </td>
                 </tr>
               ))}

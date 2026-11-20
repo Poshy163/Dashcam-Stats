@@ -42,6 +42,12 @@ export default function Queue() {
   })
   const running = (stats.data?.running ?? 0) > 0
   const thumbnails = stats.data?.thumbnailsPending ?? 0
+  let queueStatus: string | undefined
+  if (stats.data?.paused) {
+    queueStatus = 'Queue is paused'
+  } else if (stats.data?.backupPriorityActive && stats.data.queued > 0) {
+    queueStatus = 'New processing jobs will start after the footage transfer.'
+  }
 
   const jobs = useQuery({
     queryKey: ['jobs', state, page],
@@ -86,7 +92,7 @@ export default function Queue() {
     <div className="space-y-4">
       <PageHeader
         title="Processing queue"
-        subtitle={stats.data?.paused ? 'Queue is paused' : undefined}
+        subtitle={queueStatus}
         actions={
           <>
             {stats.data?.paused ? (

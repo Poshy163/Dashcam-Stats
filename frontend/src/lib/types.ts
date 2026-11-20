@@ -297,6 +297,7 @@ export interface QueueStats {
   /** Which pass the run is working through. */
   phase: 'thumbnails' | 'analysis' | 'idle'
   paused: boolean
+  backupPriorityActive: boolean
   throughputPerHour: number | null
   estimatedMinutesRemaining: number | null
 }
