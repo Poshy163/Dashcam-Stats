@@ -2,6 +2,7 @@ package com.dashcamstats.obdlogger
 
 import java.time.Duration
 import java.time.Instant
+import kotlin.math.roundToLong
 
 /** Bounded zero-order integration of the MAF-derived estimate, never an ECU fuel counter. */
 internal class EstimatedFuelAccumulator(
@@ -34,7 +35,8 @@ internal class EstimatedFuelAccumulator(
         invalid: Boolean = false,
         responseAgeMillis: Long? = null,
         timed: Boolean = false,
-    ) {
+    ): RateInterval? {
+        var interval: RateInterval? = null
         val gap = previousAt?.let { Duration.between(it, capturedAt).toMillis() / 1000.0 } ?: 0.0
         var unusable = invalid || (requireTiming && !timed) ||
             (estimatedRate != null && (!estimatedRate.isFinite() || estimatedRate < 0))
@@ -56,13 +58,8 @@ internal class EstimatedFuelAccumulator(
             if (unusable || !contiguous || effectiveGap <= 0) {
                 rate = null
                 rateAt = null
-            } else if (rate != null && rateAt != null) {
-                val ageAtStart = Duration.between(rateAt, previousEffectiveAt).toMillis() / 1000.0
-                val covered = minOf(effectiveGap, (nominalMafSeconds * 1.5 - ageAtStart).coerceAtLeast(0.0))
-                if (covered > 0) {
-                    hasEvidence = true
-                    litres += rate!! * covered / 3600
-                }
+            } else if (previousEffectiveAt != null && effectiveAt != null) {
+                interval = integrateHeldRate(previousEffectiveAt!!, effectiveAt, nominalMafSeconds * 1.5)
             }
             if (estimatedRate != null && !unusable) {
                 rate = estimatedRate
@@ -73,19 +70,14 @@ internal class EstimatedFuelAccumulator(
             previousAt = capturedAt
             previousSequence = sequence
             previousDriveId = driveId
-            return
+            return interval
         }
         if (previousTimed == true) contiguous = false
         if (unusable || !contiguous) {
             rate = null
             rateAt = null
-        } else if (rate != null && rateAt != null) {
-            val ageAtStart = Duration.between(rateAt, previousAt).toMillis() / 1000.0
-            val covered = minOf(gap, (nominalCycleSeconds * 3 * 1.5 - ageAtStart).coerceAtLeast(0.0))
-            if (covered > 0) {
-                hasEvidence = true
-                litres += rate!! * covered / 3600
-            }
+        } else if (previousAt != null) {
+            interval = integrateHeldRate(previousAt!!, capturedAt, nominalCycleSeconds * 3 * 1.5)
         }
         if (estimatedRate != null && !unusable) {
             rate = estimatedRate
@@ -96,6 +88,18 @@ internal class EstimatedFuelAccumulator(
         previousDriveId = driveId
         previousEffectiveAt = capturedAt
         previousTimed = false
+        return interval
+    }
+
+    private fun integrateHeldRate(start: Instant, end: Instant, maxHoldSeconds: Double): RateInterval? {
+        val heldRate = rate ?: return null
+        val expires = rateAt?.plusNanos((maxHoldSeconds * 1e9).roundToLong()) ?: return null
+        val until = minOf(end, expires)
+        if (start >= until) return null
+        val interval = RateInterval(start, until, heldRate, heldRate)
+        hasEvidence = true
+        litres += interval.integral(start, until)
+        return interval
     }
 
     companion object {

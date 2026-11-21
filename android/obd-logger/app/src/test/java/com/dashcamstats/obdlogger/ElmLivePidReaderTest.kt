@@ -9,6 +9,47 @@ import org.junit.Test
 
 class ElmLivePidReaderTest {
     @Test
+    fun downstreamOxygenReportsOneBoundedReasonPerDriveWithoutExtraRequests() = runTest {
+        val sourceMismatch = iso(0x15, 0x68, 0x80, source = 0x11)
+        val checksumMismatch = iso(0x15, 0x68, 0x80, checksumDelta = 1)
+        val cases = listOf(
+            "41 15 68 80\r>" to DownstreamOxygenRejection.HEADER,
+            iso(0x15, 0x68) to DownstreamOxygenRejection.LENGTH,
+            sourceMismatch to DownstreamOxygenRejection.SOURCE,
+            checksumMismatch to DownstreamOxygenRejection.CHECKSUM,
+            iso(0x15, 0x68, 0x80, source = 0x11, checksumDelta = 1) to DownstreamOxygenRejection.CHECKSUM,
+            iso(0x14, 0x68, 0x80) to DownstreamOxygenRejection.OTHER,
+            (sourceMismatch.removeSuffix(">") + checksumMismatch) to DownstreamOxygenRejection.OTHER,
+            "unparseable text\r>" to DownstreamOxygenRejection.OTHER,
+        )
+        for ((response, reason) in cases) {
+            val reader = ElmLivePidReader()
+            val tracker = LivePidMalformedTracker()
+            val commands = mutableListOf<String>()
+            suspend fun reject(): ElmProtocolException {
+                return runCatching { reader.queryPayload(0x15, 0x10) { commands += it; response } }
+                    .exceptionOrNull() as ElmProtocolException
+            }
+            val first = reject()
+            assertEquals(reason, first.downstreamOxygenRejection)
+            assertTrue(tracker.shouldReportRejection(first))
+            tracker.recordValid(0x15)
+            val next = reject()
+            assertEquals(reason, next.downstreamOxygenRejection)
+            assertFalse(tracker.shouldReportRejection(next))
+            assertTrue(LivePidMalformedTracker().shouldReportRejection(next))
+            assertEquals(listOf("01151", "0115"), commands)
+        }
+        val valid = iso(0x15, 0x68, 0x80)
+        val read = ElmLivePidReader().queryPayload(0x15, 0x10) { sourceMismatch.removeSuffix(">") + valid }
+        assertEquals(listOf(0x68.toByte(), 0x80.toByte()), read?.toList())
+        val unrelated = runCatching {
+            ElmProtocol.requirePayload(checksumMismatch, "0114", 0x14, 2, 0x10)
+        }.exceptionOrNull() as ElmProtocolException
+        assertNull(unrelated.downstreamOxygenRejection)
+    }
+
+    @Test
     fun malformedSuffixedReplySelectsPlainOnlyForThatPidOnItsNextScheduledPoll() = runTest {
         val reader = ElmLivePidReader()
         val session = ElmCommandSession()

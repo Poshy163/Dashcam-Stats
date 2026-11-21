@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from .fuel import EstimatedFuelAccumulator
-from .schema import parse_utc, utc_text
-from .timing import MotionAccumulator, maf_cadence_s, nominal_cycle_s
+from .fuel import EstimatedFuelAccumulator, MatchedFuelEconomy
+from .schema import MAX_V1_FUEL_CONSUMPTION_L_100KM, parse_utc, utc_text
+from .timing import MotionAccumulator, has_response_times, maf_cadence_s, nominal_cycle_s
 
 
 def calculate_summary(
@@ -24,6 +24,7 @@ def calculate_summary(
         expected_interval_s = nominal_cycle_s(drive.get("poll_plan_version"))
     require_timing = drive.get("poll_plan_version") == 8
     motion = MotionAccumulator(expected_interval_s, require_timing=require_timing)
+    economy = MatchedFuelEconomy(not_before=start)
     fuel_estimate = EstimatedFuelAccumulator(
         nominal_cycle_s=expected_interval_s,
         maf_cadence_s=maf_cadence_s(drive.get("poll_plan_version")),
@@ -37,22 +38,31 @@ def calculate_summary(
     previous: dict[str, Any] | None = None
     for current in samples:
         count += 1
-        fuel_estimate.observe(
+        at = parse_utc(current["timestamp_utc"])
+        fuel_interval = fuel_estimate.observe(
             drive=current.get("drive_id"),
             sequence=current.get("sequence"),
-            captured_at=parse_utc(current["timestamp_utc"]),
+            captured_at=at,
             estimated_rate=current.get("estimated_fuel_rate"),
             ecu_data_status=current.get("ecu_data_status"),
             quality=current.get("quality"),
         )
-        motion.observe(
+        speed_interval = motion.observe(
             drive=current.get("drive_id"),
             sequence=current.get("sequence"),
-            captured_at=parse_utc(current["timestamp_utc"]),
+            captured_at=at,
             speed=current.get("vehicle_speed"),
             rpm=current.get("engine_rpm"),
             status=current.get("ecu_data_status"),
             quality=current.get("quality"),
+        )
+        economy.observe(
+            current.get("drive_id"),
+            current.get("sequence"),
+            at,
+            require_timing or has_response_times(current.get("quality")),
+            speed_interval,
+            fuel_interval,
         )
         speed = current.get("vehicle_speed")
         if isinstance(speed, int | float):
@@ -83,6 +93,8 @@ def calculate_summary(
 
     fuel_l = fuel_estimate.litres
     fuel_evidence = fuel_estimate.has_evidence
+    # A long idle with almost no movement can exceed the v1 wire field's range.
+    consumption = economy.consumption
     distance_km = motion.distance_km
     expected = max(int(duration_s // expected_interval_s) + 1 if duration_s else 0, count)
     received = min(100.0, count * 100.0 / expected) if expected else 0.0
@@ -107,7 +119,9 @@ def calculate_summary(
         "idle_duration_s": motion.idle_s if motion.idle_evidence else None,
         "estimated_fuel_used_l": fuel_l if fuel_evidence else None,
         "average_fuel_consumption_l_per_100km": (
-            fuel_l * 100.0 / distance_km if distance_km > 0 and fuel_evidence else None
+            consumption
+            if consumption is not None and consumption <= MAX_V1_FUEL_CONSUMPTION_L_100KM
+            else None
         ),
         "maximum_coolant_temperature_c": max_coolant,
         "maximum_engine_load_pct": max_load,

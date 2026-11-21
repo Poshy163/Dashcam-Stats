@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 SCHEMA_VERSION = 1
+MAX_V1_FUEL_CONSUMPTION_L_100KM = 10_000
 BUNDLE_FORMAT = "dashcam-obd"
 BUNDLE_SUFFIX = ".obd2.zip"
 BUNDLE_MEMBERS = (

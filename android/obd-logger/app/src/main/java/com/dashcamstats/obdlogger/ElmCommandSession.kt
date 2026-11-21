@@ -272,6 +272,7 @@ internal class ElmLivePidReader(private val suffixDisabled: () -> Unit = {}) {
                 throw ElmProtocolException(
                     "$command reply failed ISO header/length/source/checksum validation; " +
                         "next scheduled poll uses a plain request",
+                    error.downstreamOxygenRejection,
                 )
             }
             throw error

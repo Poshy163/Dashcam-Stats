@@ -7,6 +7,27 @@ existing ADB arrival backup.
 The exact producer/validator contracts are [obd-bundle-schema-v1.md](obd-bundle-schema-v1.md)
 and [obd-app-event-schema-v1.md](obd-app-event-schema-v1.md).
 
+Companion 0.3.31 keeps the 12-second settling period after Bluetooth turns on.
+After the voltage checks and checksum-valid ECU proof, the
+five-second plan writes its first sample as soon as the supported speed and RPM reads
+finish. The three-second trial also captures MAF and the individual response ages for
+that sample. When at least one of those readings decodes, the next adapter-voltage
+check runs immediately after the write. The protocol number, oxygen sensor layout
+and OBD standard use spare time in later polling work. Each static value appears in
+samples only after the ECU returns it.
+
+The first rejected downstream oxygen sensor reply (PID 0x15) in a drive produces a
+diagnostic describing the failed check. The logger uses the reply from the scheduled
+poll. The diagnostic contains only the reason.
+
+The drive dashboard groups recorded rows by the accessory-power state reported by
+the logger. It shows speed, RPM and voltage-only rows during shutdown alongside their
+whole-recording counts. The server uses the retained event journal from the same logger
+session. Missing journal sequences and expired ignition evidence appear as unknown.
+Fuel economy uses the distance and estimated fuel from intervals with both readings.
+The dashboard shows the shares of recorded distance and time those intervals cover.
+Total distance and estimated litres each use all their own valid intervals.
+
 Companion 0.3.9 adds optional, report-only on-camera clip movement manifests and server
 maintenance wake holds. Setup, classification limits and physical checks are documented in
 [clip-movement-manifests.md](clip-movement-manifests.md). These reports do not filter or delete

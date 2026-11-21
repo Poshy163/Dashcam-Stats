@@ -494,6 +494,15 @@ internal class LivePidMalformedTracker(
     private data class State(val failures: Int, val retryAtCycle: Long, val afterOpportunity: Long? = null)
     private val states = mutableMapOf<Int, State>()
     private val nextOpportunityRetryPids = nextOpportunityRetryPids.toSet()
+    private var downstreamOxygenReported = false
+
+    /** Each recording owns one tracker. Successful reads and cooldown expiry cannot rearm it. */
+    fun shouldReportRejection(error: ElmProtocolException): Boolean {
+        if (error.downstreamOxygenRejection == null) return true
+        if (downstreamOxygenReported) return false
+        downstreamOxygenReported = true
+        return true
+    }
 
     init {
         require(baseCooldownCycles >= 1)
@@ -573,7 +582,7 @@ object ObdPollPlan {
     // v7 preserves this nominal cadence. LivePollScheduler admits optional due commands
     // against measured remaining time; omitted values remain missing, never carried forward.
 
-    /** Constant for the life of a drive: polled once after the ECU proof, carried into every sample. */
+    /** Read at most once in a spare slot after the first row, then included in subsequent samples. */
     val staticOnce = listOf(0x13, 0x1C)
 
     fun requestedPids(

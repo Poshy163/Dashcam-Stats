@@ -6,19 +6,23 @@ import pytest
 from sqlalchemy import select
 
 from app.db.models import OBDBundle, OBDDrive, OBDSample
-from app.ingest.obd_reconciliation import reconcile_drive_projection
+from app.ingest.obd_reconciliation import (
+    PROJECTION_VERSION,
+    reconcile_all_drives,
+    reconcile_drive_projection,
+)
 
 BASE = datetime(2026, 9, 30, tzinfo=UTC)
 
 
-async def _stored_drive(session, *, plan, rows, finish_sequence=None):
+async def _stored_drive(session, *, plan, rows, finish_sequence=None, identifier="a", speed=60.0):
     finish_sequence = max(row[0] for row in rows) if finish_sequence is None else finish_sequence
     finish = BASE + timedelta(seconds=5 * finish_sequence)
     bundle = OBDBundle(
-        drive_id="coverage-drive",
-        bundle_hash="a" * 64,
+        drive_id=f"coverage-drive-{identifier}",
+        bundle_hash=identifier * 64,
         schema_version=1,
-        filename="coverage-drive.zip",
+        filename=f"coverage-drive-{identifier}.zip",
         vehicle_id="synthetic-vehicle",
         logger_id="synthetic-logger",
         logger_version="0.3.3",
@@ -45,11 +49,11 @@ async def _stored_drive(session, *, plan, rows, finish_sequence=None):
         session.add(
             OBDSample(
                 drive_db_id=drive.id,
-                sample_id=f"coverage-sample-{sequence}",
+                sample_id=f"{identifier}-coverage-sample-{sequence}",
                 sequence=sequence,
                 captured_at=BASE + timedelta(seconds=5 * sequence),
                 ecu_data_status="live",
-                vehicle_speed_kmh=60.0,
+                vehicle_speed_kmh=speed,
                 engine_rpm=1000.0,
                 engine_load_pct=20.0,
                 adapter_voltage_v=14.0,
@@ -62,6 +66,67 @@ async def _stored_drive(session, *, plan, rows, finish_sequence=None):
         )
     await session.flush()
     return drive
+
+
+async def test_fleet_economy_uses_joint_observations_across_drives(db_session, client):
+    missing = await _stored_drive(db_session, plan=7, rows=[(i, None, None) for i in range(7)])
+    await reconcile_drive_projection(db_session, missing)
+    await db_session.commit()
+    summary_url = "/api/obd/drives/summary"
+    fleet = (await client.get(summary_url)).json()
+    assert fleet["total_fuel_used_l"] is None
+    assert fleet["average_fuel_consumption_l_100km"] is None
+    assert fleet["fuel_economy_coverage_pct"] == 0
+
+    rows = [(i, 6 if i % 3 == 0 else None, None) for i in range(7)]
+    idle = await _stored_drive(db_session, plan=7, rows=rows, identifier="b", speed=0)
+    await reconcile_drive_projection(db_session, idle)
+    assert idle.average_fuel_consumption_l_100km is None
+    assert idle.summary_json["fuel_economy_fuel_l"] == pytest.approx(0.05)
+    moving = await _stored_drive(db_session, plan=7, rows=rows, identifier="c")
+    await reconcile_drive_projection(db_session, moving)
+    await db_session.commit()
+    fleet = (await client.get(summary_url)).json()
+    assert fleet["total_distance_km"] == pytest.approx(1)
+    assert fleet["fuel_economy_distance_km"] == pytest.approx(0.5)
+    assert fleet["fuel_economy_fuel_l"] == pytest.approx(0.1)
+    assert fleet["fuel_economy_coverage_pct"] == pytest.approx(50)
+    assert fleet["fuel_economy_time_coverage_pct"] == pytest.approx(200 / 3)
+    assert fleet["average_fuel_consumption_l_100km"] == pytest.approx(20)
+    drives = (await client.get("/api/obd/drives")).json()["items"]
+    covered = next(row for row in drives if row["drive_id"] == moving.drive_id)
+    assert covered["fuel_economy_coverage_pct"] == pytest.approx(100)
+    assert covered["average_fuel_consumption_l_100km"] == pytest.approx(10)
+
+
+async def test_measured_zero_estimated_fuel_is_distinct_from_absent_maf(db_session, client):
+    rows = [(i, 0.0 if i % 3 == 0 else None, None) for i in range(7)]
+    drive = await _stored_drive(db_session, plan=7, rows=rows)
+    await reconcile_drive_projection(db_session, drive)
+    await db_session.commit()
+    fleet = (await client.get("/api/obd/drives/summary")).json()
+    assert fleet["total_fuel_used_l"] == 0
+    assert fleet["average_fuel_consumption_l_100km"] == 0
+
+
+async def test_overview_waits_for_historical_economy_reconciliation(db_session, client):
+    rows = [(i, 6.0 if i % 3 == 0 else None, None) for i in range(7)]
+    current = await _stored_drive(db_session, plan=7, rows=rows)
+    await reconcile_drive_projection(db_session, current)
+    historical = await _stored_drive(db_session, plan=7, rows=rows, identifier="b")
+    historical.distance_km = 0.5
+    historical.average_fuel_consumption_l_100km = 3.0
+    await db_session.commit()
+
+    url = "/api/obd/drives/summary"
+    pending = (await client.get(url)).json()
+    assert pending["total_distance_km"] == pytest.approx(1)
+    assert pending["average_fuel_consumption_l_100km"] is None
+    assert pending["fuel_economy_coverage_pct"] is None
+    assert (await reconcile_all_drives())["ready"] == 2
+    rebuilt = (await client.get(url)).json()
+    assert rebuilt["average_fuel_consumption_l_100km"] == pytest.approx(10)
+    assert rebuilt["fuel_economy_coverage_pct"] == 100
 
 
 def _signals(drive):
@@ -79,7 +144,7 @@ async def test_stored_derived_values_use_maf_phase_without_changing_samples_or_t
     result = await reconcile_drive_projection(db_session, drive)
 
     assert result["status"] == "ready"
-    assert drive.gap_analysis_json["projection_version"] == 6
+    assert drive.gap_analysis_json["projection_version"] == PROJECTION_VERSION
     assert drive.sample_count == 7
     assert drive.estimated_fuel_used_l == pytest.approx(6 * 25 / 3600)
     assert drive.data_completeness_percentage == 100.0

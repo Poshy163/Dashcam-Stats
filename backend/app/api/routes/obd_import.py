@@ -50,6 +50,8 @@ from app.ingest.obd_storage import (
 )
 from app.ingest.obd_transfer import get_obd_transfer_status
 from app.obd import battery
+from app.obd.fuel import economy_coverage, fuel_consumption
+from app.obd.ignition_coverage import ignition_coverage
 from app.obd.recording_gaps import missing_duration_metadata, recording_gap_context
 from app.obd.timing import pid_is_missing, response_time, row_is_live
 
@@ -124,6 +126,9 @@ def _drive(
     row: OBDDrive, *, include_quality: bool = False, recording_context=None
 ) -> dict[str, object]:
     bundle = row.bundle
+    summary = row.summary_json if isinstance(row.summary_json, dict) else {}
+    matched_distance = summary.get("fuel_economy_distance_km")
+    matched_time = summary.get("fuel_economy_duration_s")
     result: dict[str, object] = {
         "drive_id": row.drive_id,
         "vehicle_id": row.vehicle_id,
@@ -166,7 +171,14 @@ def _drive(
         "maximum_rpm": row.maximum_rpm,
         "idle_duration_s": row.idle_duration_s,
         "estimated_fuel_used_l": row.estimated_fuel_used_l,
-        "average_fuel_consumption_l_100km": row.average_fuel_consumption_l_100km,
+        "average_fuel_consumption_l_100km": (
+            row.average_fuel_consumption_l_100km if matched_distance is not None else None
+        ),
+        "fuel_economy_distance_km": matched_distance,
+        "fuel_economy_fuel_l": summary.get("fuel_economy_fuel_l"),
+        "fuel_economy_duration_s": matched_time,
+        "fuel_economy_coverage_pct": economy_coverage(matched_distance, row.distance_km),
+        "fuel_economy_time_coverage_pct": economy_coverage(matched_time, row.duration_s),
         "maximum_coolant_temperature_c": row.maximum_coolant_temperature_c,
         "maximum_engine_load_pct": row.maximum_engine_load_pct,
         "missing_data_duration_s": row.missing_data_duration_s,
@@ -372,12 +384,17 @@ async def list_drives(session: SessionDep, page: PaginationDep) -> dict[str, obj
 
 @router.get("/drives/summary", summary="Aggregate rollups across every stored drive")
 async def drives_summary(session: SessionDep) -> dict[str, object]:
+    economy_duration = OBDDrive.summary_json["fuel_economy_duration_s"].as_float()
     (
         count,
         distance,
         duration,
         idle,
         fuel,
+        matched_fuel,
+        matched_distance,
+        matched_time,
+        economy_drives,
         max_speed,
         max_rpm,
         max_coolant,
@@ -390,6 +407,10 @@ async def drives_summary(session: SessionDep) -> dict[str, object]:
                 func.sum(OBDDrive.duration_s),
                 func.sum(OBDDrive.idle_duration_s),
                 func.sum(OBDDrive.estimated_fuel_used_l),
+                func.sum(OBDDrive.summary_json["fuel_economy_fuel_l"].as_float()),
+                func.sum(OBDDrive.summary_json["fuel_economy_distance_km"].as_float()),
+                func.sum(economy_duration),
+                func.count(economy_duration),
                 func.max(OBDDrive.maximum_speed_kmh),
                 func.max(OBDDrive.maximum_rpm),
                 func.max(OBDDrive.maximum_coolant_temperature_c),
@@ -411,16 +432,21 @@ async def drives_summary(session: SessionDep) -> dict[str, object]:
         )
     ).scalar()
     total_distance = float(distance or 0.0)
-    total_fuel = float(fuel or 0.0)
+    if economy_drives != count:
+        # Historical drives acquire the new summary in separate startup transactions.
+        matched_fuel = matched_distance = matched_time = None
     return {
         "drive_count": int(count or 0),
         "total_distance_km": total_distance,
         "total_duration_s": float(duration or 0.0),
         "total_idle_duration_s": float(idle or 0.0),
-        "total_fuel_used_l": total_fuel,
-        "average_fuel_consumption_l_100km": (
-            total_fuel / total_distance * 100.0 if total_distance > 0 else None
-        ),
+        "total_fuel_used_l": float(fuel) if fuel is not None else (None if count else 0.0),
+        "fuel_economy_fuel_l": matched_fuel,
+        "fuel_economy_distance_km": matched_distance,
+        "fuel_economy_duration_s": matched_time,
+        "fuel_economy_coverage_pct": economy_coverage(matched_distance, distance),
+        "fuel_economy_time_coverage_pct": economy_coverage(matched_time, duration),
+        "average_fuel_consumption_l_100km": fuel_consumption(matched_fuel, matched_distance),
         "maximum_speed_kmh": float(max_speed) if max_speed is not None else None,
         "maximum_rpm": float(max_rpm) if max_rpm is not None else None,
         "maximum_coolant_temperature_c": (float(max_coolant) if max_coolant is not None else None),
@@ -689,6 +715,14 @@ async def drive_series(
             for row in diagnostics
         ],
     }
+
+
+@router.get("/drives/{drive_id}/ignition-coverage")
+async def drive_ignition_coverage(drive_id: str, session: SessionDep) -> dict:
+    drive = await session.scalar(select(OBDDrive).where(OBDDrive.drive_id == drive_id))
+    if drive is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "OBD drive was not found")
+    return await ignition_coverage(session, drive)
 
 
 @router.post(

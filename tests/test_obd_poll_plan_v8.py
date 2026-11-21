@@ -28,6 +28,7 @@ from app.ingest.obd_reconciliation import (
     reconcile_drive_projection,
     specs_for_poll_plan,
 )
+from app.obd.fuel import MatchedFuelEconomy
 from app.obd.summary import calculate_summary
 
 FIXTURE = json.loads(
@@ -52,6 +53,7 @@ def test_receipt_time_calculation_fixture_matches_streaming_projection(case):
         nominal_cycle_s=3 if case["poll_plan_version"] == 8 else 5,
         maf_cadence_s=3 if case["poll_plan_version"] == 8 else 15,
         require_timing=case["poll_plan_version"] == 8,
+        economy=MatchedFuelEconomy(not_before=parsed(case["start_time_utc"])),
     )
     for sample in case["samples"]:
         rollup.observe(
@@ -70,6 +72,7 @@ def test_receipt_time_calculation_fixture_matches_streaming_projection(case):
         "distance_km": rollup.distance_km if rollup.distance_intervals else None,
         "estimated_fuel_used_l": rollup.estimated_fuel_used_l if rollup.fuel_evidence else None,
         "idle_duration_s": rollup.idle_duration_s if rollup.idle_evidence else None,
+        "average_fuel_consumption_l_per_100km": rollup.economy.consumption,
     }
     for name, expected in case["expected"].items():
         assert (
@@ -77,6 +80,8 @@ def test_receipt_time_calculation_fixture_matches_streaming_projection(case):
             if expected is not None
             else summary[name] is None
         )
+        if name == "average_fuel_consumption_l_per_100km":
+            expected = case.get("canonical_consumption", expected)
         assert (
             actual[name] == pytest.approx(expected)
             if expected is not None

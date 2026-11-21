@@ -125,3 +125,57 @@ def test_python_export_summary_matches_canonical_sparse_fuel(failed_maf):
         [],
     )
     assert summary["estimated_fuel_used_l"] == pytest.approx(integrate(*rows).estimated_fuel_used_l)
+
+
+def test_missing_maf_preserves_economy_over_covered_distance():
+    rows = []
+    for second in range(0, 61, 5):
+        missing = second >= 30 and second % 15 == 0
+        row = sample(
+            second,
+            6.0 if second % 15 == 0 and not missing else None,
+            quality={"missing_pids": [16]} if missing else None,
+        )
+        row.vehicle_speed_kmh = 60.0
+        rows.append(row)
+    result = integrate(*rows)
+    assert result.distance_km == pytest.approx(1.0)
+    assert result.estimated_fuel_used_l == pytest.approx(6 * 25 / 3600)
+    assert result.economy.duration_s == 25
+    assert result.economy.distance_km == pytest.approx(25 / 60)
+    assert result.economy.consumption == pytest.approx(10.0)
+
+
+def test_timed_fuel_and_speed_intersect_across_successive_rows():
+    rollup = _Rollup(nominal_cycle_s=3, maf_cadence_s=3, require_timing=True)
+    for index in range(4):
+        row = sample(
+            3 + index * 3,
+            3.6 * (index + 1),
+            sequence=index,
+            quality={"pid_response_age_ms": {"0D": 1000, "10": 200}},
+        )
+        row.vehicle_speed_kmh = 36 * index
+        rollup.observe(row)
+    # Speed covers [2,11], fuel covers [2.8,11.8]. Their shared interval crosses
+    # two fuel-rate changes at 5.8 and 8.8 and two speed observations at 5 and 8.
+    assert rollup.economy.duration_s == pytest.approx(8.2)
+    assert rollup.economy.litres == pytest.approx((3 * 3.6 + 3 * 7.2 + 2.2 * 10.8) / 3600)
+    assert rollup.economy.distance_km == pytest.approx(6 * (9**2 - 0.8**2) / 3600)
+
+
+def test_missing_fuel_at_idle_reduces_time_coverage_with_all_distance_covered():
+    rows = []
+    for second in range(0, 61, 5):
+        missing = second >= 45 and second % 15 == 0
+        row = sample(
+            second,
+            6 if second % 15 == 0 and not missing else None,
+            quality={"missing_pids": [16]} if missing else None,
+        )
+        row.vehicle_speed_kmh = 60 if second < 35 else 0
+        rows.append(row)
+    rollup = integrate(*rows)
+    assert rollup.economy.distance_km == pytest.approx(rollup.distance_km)
+    assert rollup.economy.duration_s == 40
+    assert rollup.economy.litres == pytest.approx(6 * 40 / 3600)

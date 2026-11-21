@@ -6,6 +6,7 @@ import Spinner from '@/components/Spinner'
 import { ObdLifecycleBadge, ObdLifecycleReason } from '@/components/ObdLifecycle'
 import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/components/ui'
 import { api } from '@/lib/api'
+import { formatFuelEconomy } from '@/lib/obdFuelEconomy'
 import { formatDateTime, formatDuration, formatRelative, formatSpeed } from '@/lib/format'
 
 export default function ObdDrives() {
@@ -50,13 +51,9 @@ export default function ObdDrives() {
             hint={`${formatDuration(totals.data.totalDurationS)} driven`}
           />
           <StatTile
-            label="Fuel used"
-            value={`${totals.data.totalFuelUsedL.toFixed(2)} L`}
-            hint={
-              totals.data.averageFuelConsumptionL100km != null
-                ? `${totals.data.averageFuelConsumptionL100km.toFixed(1)} L/100 km overall`
-                : undefined
-            }
+            label="Estimated fuel used"
+            value={totals.data.totalFuelUsedL != null ? `${totals.data.totalFuelUsedL.toFixed(2)} L` : '—'}
+            hint={formatFuelEconomy(totals.data)}
           />
           <StatTile
             label="Idle time"
@@ -92,7 +89,7 @@ export default function ObdDrives() {
                 <th className="p-2 font-medium">Distance</th>
                 <th className="p-2 font-medium">Avg / max speed</th>
                 <th className="p-2 font-medium">Max RPM</th>
-                <th className="p-2 font-medium">Fuel</th>
+                <th className="p-2 font-medium">Estimated fuel</th>
                 <th className="p-2 font-medium">Samples</th>
                 <th className="p-2 font-medium">DTCs</th>
               </tr>
@@ -125,6 +122,7 @@ export default function ObdDrives() {
                   </td>
                   <td className="tabular p-2">
                     {drive.estimatedFuelUsedL != null ? `${drive.estimatedFuelUsedL.toFixed(2)} L` : '—'}
+                    <div className="text-xs text-content-muted">{formatFuelEconomy(drive)}</div>
                   </td>
                   <td className="tabular p-2">
                     {drive.sampleCount.toLocaleString()}

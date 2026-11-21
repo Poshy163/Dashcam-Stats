@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 RESPONSE_AGES_KEY = "pid_response_age_ms"
@@ -68,6 +69,24 @@ def pid_is_missing(quality: object, pid: int) -> bool:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class RateInterval:
+    start: datetime
+    end: datetime
+    first: float
+    last: float
+
+    def integral(self, start: datetime, end: datetime) -> float:
+        """Integrate the linear rate over part of this interval, in hours."""
+        seconds = (end - start).total_seconds()
+        midpoint = (start - self.start).total_seconds() + seconds / 2
+        rate = (
+            self.first
+            + (self.last - self.first) * midpoint / (self.end - self.start).total_seconds()
+        )
+        return rate * seconds / 3600
+
+
 class MotionAccumulator:
     """Speed receipt intervals for timed rows, with the historical untimed arithmetic."""
 
@@ -102,8 +121,9 @@ class MotionAccumulator:
         rpm: float | None,
         status: object,
         quality: object,
-    ) -> None:
+    ) -> RateInterval | None:
         timed = has_response_times(quality) or self.require_timing
+        covered = None
         live = row_is_live(status, quality)
         speed_at = (
             response_time(captured_at, quality, 0x0D, require_timing=self.require_timing)
@@ -151,8 +171,26 @@ class MotionAccumulator:
                 if prev_speed is not None and speed is not None:
                     self.distance_km += (prev_speed + speed) / 2 * gap / 3600
                     self.distance_intervals += 1
+                    if (
+                        prev_live
+                        and live
+                        and not pid_is_missing(quality, 0x0D)
+                        and prev_speed_at is not None
+                        and speed_at is not None
+                    ):
+                        covered = RateInterval(prev_speed_at, speed_at, prev_speed, speed)
                 if prev_rpm is not None and prev_speed is not None:
                     self.idle_evidence = True
                     if prev_rpm > 300 and prev_speed < 1:
                         self.idle_s += gap
-        self.previous = (drive, sequence, captured_at, speed_at, speed, rpm, timed, live)
+        self.previous = (
+            drive,
+            sequence,
+            captured_at,
+            speed_at,
+            speed,
+            rpm,
+            timed,
+            live and not pid_is_missing(quality, 0x0D),
+        )
+        return covered

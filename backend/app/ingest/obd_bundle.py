@@ -34,6 +34,7 @@ from app.db.models import (
     OBDSample,
     utcnow,
 )
+from app.obd.schema import MAX_V1_FUEL_CONSUMPTION_L_100KM
 from app.obd.timing import PID_FIELDS, RESPONSE_AGES_KEY, nominal_cycle_s
 
 SCHEMA_VERSION = 1
@@ -242,7 +243,7 @@ SAMPLE_NUMERIC_RANGES: dict[str, tuple[float, float]] = {
     "oxygen_sensor_2_short_term_fuel_trim": (-100, 100),
     "adapter_voltage": (0, 40),
     "estimated_fuel_rate": (0, 1000),
-    "estimated_fuel_consumption": (0, 10000),
+    "estimated_fuel_consumption": (0, MAX_V1_FUEL_CONSUMPTION_L_100KM),
     "distance_with_mil": (0, 65535),
 }
 
@@ -1436,7 +1437,7 @@ def _validate_summary(
         "maximum_rpm": (0, 20000),
         "idle_duration_s": (0, 2_678_400),
         "estimated_fuel_used_l": (0, 750_000),
-        "average_fuel_consumption_l_per_100km": (0, 10000),
+        "average_fuel_consumption_l_per_100km": (0, MAX_V1_FUEL_CONSUMPTION_L_100KM),
         "maximum_coolant_temperature_c": (-80, 250),
         "maximum_engine_load_pct": (0, 100),
         "missing_data_duration_s": (0, 2_678_400),

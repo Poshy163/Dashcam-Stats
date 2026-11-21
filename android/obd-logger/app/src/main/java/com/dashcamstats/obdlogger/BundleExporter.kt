@@ -26,6 +26,7 @@ data class ExportedBundle(val file: File, val sha256: String)
 internal const val RETAIN_RECENT_EXPORTED_DRIVES = 16
 internal const val RETENTION_CANDIDATE_BATCH = 16
 internal const val RETENTION_DELETE_BATCH = 4
+private const val MAX_V1_FUEL_CONSUMPTION_L_100KM = 10_000.0
 
 private val LEGACY_MANIFEST_FIELDS = setOf(
     "schema_version", "bundle_format", "drive_id", "vehicle_id", "adapter_id", "logger_id",
@@ -328,6 +329,7 @@ class BundleExporter(
         val cycleSeconds = if (trial) 3.0 else 5.0
         val fuelEstimate = EstimatedFuelAccumulator(cycleSeconds, if (trial) 3.0 else 15.0, requireTiming = trial)
         val motion = TimedMotionAccumulator(cycleSeconds, requireTiming = trial)
+        val economy = MatchedFuelEconomy(start)
         var missing = 0.0
         var speedSum = 0.0
         var speedCount = 0
@@ -344,30 +346,34 @@ class BundleExporter(
                 "trial sample has no valid response timing object"
             }
             val rowAt = Instant.parse(current.getString("timestamp_utc"))
+            val driveId = current.getString("drive_id")
+            val sequence = current.getLong("sequence")
+            val hasTiming = quality.has(PID_RESPONSE_AGES_KEY)
             val missingPids = quality.optJSONArray("missing_pids")
             val missingMaf = missingPids != null && (0 until missingPids.length()).any {
                 missingPids.optInt(it, -1) == 0x10
             }
-            fuelEstimate.observe(
-                driveId = current.getString("drive_id"),
-                sequence = current.getLong("sequence"),
+            val fuelInterval = fuelEstimate.observe(
+                driveId = driveId,
+                sequence = sequence,
                 capturedAt = rowAt,
                 estimatedRate = if (current.isNull("estimated_fuel_rate")) null else current.optDouble("estimated_fuel_rate"),
                 invalid = current.optString("ecu_data_status") != "live" ||
                     quality.optString("transport", "ok") != "ok" || missingMaf ||
-                    (quality.has(PID_RESPONSE_AGES_KEY) && quality.optJSONObject(PID_RESPONSE_AGES_KEY) == null),
+                    (hasTiming && quality.optJSONObject(PID_RESPONSE_AGES_KEY) == null),
                 responseAgeMillis = obdResponseAgeMillis(quality, 0x10),
-                timed = quality.has(PID_RESPONSE_AGES_KEY),
+                timed = hasTiming,
             )
-            motion.observe(
-                drive = current.getString("drive_id"),
-                sequence = current.getLong("sequence"),
+            val speedInterval = motion.observe(
+                drive = driveId,
+                sequence = sequence,
                 rowAt = rowAt,
                 speed = current.number("vehicle_speed"),
                 rpm = current.number("engine_rpm"),
                 status = current.optString("ecu_data_status"),
                 quality = quality,
             )
+            economy.observe(sequence, rowAt, trial || hasTiming, speedInterval, fuelInterval)
             current.number("vehicle_speed")?.let { speed ->
                 speedSum += speed
                 speedCount += 1
@@ -433,11 +439,7 @@ class BundleExporter(
             )
             .put(
                 "average_fuel_consumption_l_per_100km",
-                if (distance > 0 && fuelEvidence) {
-                    fuel * 100 / distance
-                } else {
-                    JSONObject.NULL
-                },
+                economy.consumption?.takeIf { it <= MAX_V1_FUEL_CONSUMPTION_L_100KM } ?: JSONObject.NULL,
             )
             .put("maximum_coolant_temperature_c", maximumCoolant ?: JSONObject.NULL)
             .put("maximum_engine_load_pct", maximumLoad ?: JSONObject.NULL)

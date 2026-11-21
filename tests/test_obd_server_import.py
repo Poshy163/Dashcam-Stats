@@ -1866,6 +1866,30 @@ class TestDriveSeriesApi:
     The server keeps every sample. These endpoints make that retained resolution reachable.
     """
 
+    async def test_downstream_oxygen_rejection_reaches_dashboard(
+        self, db_session, app_config, client
+    ):
+        drive_id = "drive_oxygen_rejection"
+        payload = {
+            "category": "downstream_o2_checksum",
+            "message": "Downstream oxygen sensor (PID 0x15). The ISO checksum did not match.",
+        }
+        event = {
+            "diagnostic_id": "diag_oxygen_rejection",
+            "drive_id": drive_id,
+            "timestamp_utc": BASE.isoformat(),
+            "kind": "parser_failure",
+            "payload": payload,
+        }
+        bundle = make_bundle(app_config.obd_verified_dir, drive_id, diagnostics=[event])
+        async with session_scope() as session:
+            await store_validated_bundle(session, validate_bundle(bundle, config=app_config))
+        response = await client.get(f"/api/obd/drives/{drive_id}/series")
+        assert response.status_code == 200
+        [returned] = response.json()["diagnostics"]
+        assert returned["kind"] == "parser_failure"
+        assert returned["payload"] == payload
+
     @pytest.mark.parametrize(
         ("stop_reason", "expected", "vehicle_data"),
         [
@@ -2316,10 +2340,25 @@ class TestDriveSeriesApi:
         assert response.headers["cache-control"] == "private, no-store"
         assert response.headers["x-content-type-options"] == "nosniff"
 
+    @pytest.mark.parametrize("nearly_stationary", [False, True])
     async def test_missing_summary_remains_visible_in_drive_api(
-        self, db_session, app_config, client
+        self, db_session, app_config, client, nearly_stationary
     ):
-        path = make_bundle(app_config.obd_verified_dir, "drive_api_missing_summary")
+        drive_id = "drive_api_missing_summary"
+        url = f"/api/obd/drives/{drive_id}"
+        samples = [_sample(drive_id, i) for i in range(13)]
+        for i, sample in enumerate(samples):
+            if nearly_stationary:
+                sample["vehicle_speed"] = int(i == 12)
+            else:
+                sample["vehicle_speed"] = 60
+            if i % 3 == 0 and (nearly_stationary or i < 6):
+                sample["estimated_fuel_rate"] = 6
+            else:
+                sample.pop("estimated_fuel_rate")
+                if i % 3 == 0:
+                    sample["quality"]["missing_pids"] = [16]
+        path = make_bundle(app_config.obd_verified_dir, drive_id, samples=samples)
         replacement = path.with_suffix(".replacement")
         with zipfile.ZipFile(path, "r") as source:
             retained = {
@@ -2329,16 +2368,32 @@ class TestDriveSeriesApi:
             for name, body in retained.items():
                 target.writestr(name, body)
         replacement.replace(path)
+        original = path.read_bytes()
         checked = validate_bundle(path, config=app_config)
+        assert checked.summary.keys() == obd_bundle.SUMMARY_FIELDS_V1
+        wire_ratio = checked.summary["average_fuel_consumption_l_per_100km"]
+        if nearly_stationary:
+            assert wire_ratio is None  # The strict ZIP field allows at most 10,000 L/100 km.
+        else:
+            assert wire_ratio == pytest.approx(10)
         async with session_scope() as session:
             await store_validated_bundle(session, checked)
 
-        response = await client.get("/api/obd/drives/drive_api_missing_summary/series")
+        response = await client.get(f"{url}/series")
         assert response.status_code == 200
         drive = response.json()["drive"]
         assert drive["summary_source"] == "derived"
-        assert drive["sample_count"] == 2
+        assert drive["sample_count"] == 13
         assert drive["validation_warnings"]
+        assert drive["average_fuel_consumption_l_100km"] == pytest.approx(
+            14_400 if nearly_stationary else 10
+        )
+        assert drive["fuel_economy_duration_s"] == (60 if nearly_stationary else 25)
+        reprocessed = await client.post(f"{url}/reprocess")
+        assert reprocessed.status_code == 200
+        assert reprocessed.json()["result"]["changed"] is False
+        assert reprocessed.json()["drive"]["fuel_economy_fuel_l"] == drive["fuel_economy_fuel_l"]
+        assert (await client.get(f"{url}/bundle")).content == original
 
     async def test_unknown_drive_series_is_a_404(self, db_session, client):
         response = await client.get("/api/obd/drives/drive_missing/series")

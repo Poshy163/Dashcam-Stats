@@ -103,6 +103,13 @@ failed transport, unavailable ECU, or invalid rate. A new valid rate starts a ne
 no estimate extends beyond the last observed row. Uncovered periods remain excluded, so
 the resulting total is still a partial estimate when data is missing.
 
+The server calculates average L/100 km over intervals with both speed and estimated
+fuel. It integrates speed and fuel over their common timestamps, including fuel consumed
+while stopped. The dashboard shows the percentage of recorded OBD distance and elapsed
+recording time covered by those intervals. Missing fuel during a stop can leave distance
+coverage at 100% while reducing time coverage. With no covered distance, average L/100 km
+is unavailable. The overview pools covered fuel and distance across drives.
+
 Server startup reconciliation rebuilds historical cached summaries from stored samples;
 the immutable observations and original bundle summaries remain unchanged. Projection
 version 4 introduced the corrected fuel integration; version 5 also counts derived fuel

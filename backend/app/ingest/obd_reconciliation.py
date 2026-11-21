@@ -20,9 +20,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models import OBDBundle, OBDDiagnostic, OBDDrive, OBDSample, utcnow
 from app.db.session import get_session_factory
-from app.obd.fuel import EstimatedFuelAccumulator
+from app.obd.fuel import EstimatedFuelAccumulator, MatchedFuelEconomy
 from app.obd.timing import (
     MotionAccumulator,
+    has_response_times,
     maf_cadence_s,
     nominal_cycle_s,
     response_time,
@@ -31,7 +32,7 @@ from app.obd.timing import (
 log = structlog.get_logger(__name__)
 
 POLL_PLAN_VERSION = 8
-PROJECTION_VERSION = 6
+PROJECTION_VERSION = 7
 NOMINAL_CYCLE_S = 5.0
 GAP_TOLERANCE = 1.5
 MAX_RECORDED_GAPS = 100
@@ -654,6 +655,7 @@ class _Rollup:
     previous_rpm: float | None = None
     fuel_estimate: EstimatedFuelAccumulator = field(default_factory=EstimatedFuelAccumulator)
     motion: MotionAccumulator = field(default_factory=MotionAccumulator)
+    economy: MatchedFuelEconomy = field(default_factory=MatchedFuelEconomy)
 
     def __post_init__(self) -> None:
         self.fuel_estimate = EstimatedFuelAccumulator(
@@ -700,7 +702,7 @@ class _Rollup:
         if fuel_rate is not None:
             fuel_rate = float(fuel_rate)
 
-        self.fuel_estimate.observe(
+        fuel_interval = self.fuel_estimate.observe(
             drive=row.drive_db_id,
             sequence=row.sequence,
             captured_at=row.captured_at,
@@ -711,7 +713,7 @@ class _Rollup:
         self.fuel_evidence = self.fuel_estimate.has_evidence
         self.estimated_fuel_used_l = self.fuel_estimate.litres
 
-        self.motion.observe(
+        speed_interval = self.motion.observe(
             drive=row.drive_db_id,
             sequence=row.sequence,
             captured_at=row.captured_at,
@@ -719,6 +721,14 @@ class _Rollup:
             rpm=rpm,
             status=row.ecu_data_status,
             quality=row.quality_json,
+        )
+        self.economy.observe(
+            row.drive_db_id,
+            row.sequence,
+            row.captured_at,
+            self.require_timing or has_response_times(row.quality_json),
+            speed_interval,
+            fuel_interval,
         )
         self.distance_km = self.motion.distance_km
         self.distance_intervals = self.motion.distance_intervals
@@ -853,6 +863,7 @@ async def reconcile_drive_projection(
         }
         transport = _Cadence()
         rollup = _Rollup(
+            economy=MatchedFuelEconomy(not_before=drive.started_at),
             nominal_cycle_s=cycle_s,
             maf_cadence_s=maf_cadence_s(poll_plan_version),
             require_timing=poll_plan_version == 8,
@@ -1021,11 +1032,10 @@ async def reconcile_drive_projection(
             "maximum_rpm": rollup.maximum_rpm,
             "idle_duration_s": rollup.idle_duration_s if rollup.idle_evidence else None,
             "estimated_fuel_used_l": fuel_used_l,
-            "average_fuel_consumption_l_per_100km": (
-                fuel_used_l * 100.0 / distance_km
-                if fuel_used_l is not None and distance_km is not None and distance_km > 0
-                else None
-            ),
+            "average_fuel_consumption_l_per_100km": rollup.economy.consumption,
+            "fuel_economy_distance_km": rollup.economy.distance_km,
+            "fuel_economy_fuel_l": rollup.economy.litres if rollup.economy.duration_s > 0 else None,
+            "fuel_economy_duration_s": rollup.economy.duration_s,
             "maximum_coolant_temperature_c": rollup.maximum_coolant_temperature_c,
             "maximum_engine_load_pct": rollup.maximum_engine_load_pct,
             "dtcs_observed": dtcs,

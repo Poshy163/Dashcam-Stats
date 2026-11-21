@@ -520,7 +520,16 @@ export interface OBDRecordingGap {
   timestampBasis: 'response_completion' | 'row_observation'
 }
 
-export interface OBDDriveSummary {
+export interface OBDFuelEconomy {
+  averageFuelConsumptionL100km: number | null
+  fuelEconomyDistanceKm: number | null
+  fuelEconomyFuelL: number | null
+  fuelEconomyDurationS: number | null
+  fuelEconomyCoveragePct: number | null
+  fuelEconomyTimeCoveragePct: number | null
+}
+
+export interface OBDDriveSummary extends OBDFuelEconomy {
   driveId: string
   vehicleId: string
   startedAt: string
@@ -554,7 +563,6 @@ export interface OBDDriveSummary {
   maximumRpm: number | null
   idleDurationS: number | null
   estimatedFuelUsedL: number | null
-  averageFuelConsumptionL100km: number | null
   maximumCoolantTemperatureC: number | null
   maximumEngineLoadPct: number | null
   missingDataDurationS: number | null
@@ -637,13 +645,12 @@ export interface OBDGapAnalysis {
   aggregateSignalCompletenessPercentage: number | null
 }
 
-export interface OBDDrivesTotals {
+export interface OBDDrivesTotals extends OBDFuelEconomy {
   driveCount: number
   totalDistanceKm: number
   totalDurationS: number
   totalIdleDurationS: number
-  totalFuelUsedL: number
-  averageFuelConsumptionL100km: number | null
+  totalFuelUsedL: number | null
   maximumSpeedKmh: number | null
   maximumRpm: number | null
   maximumCoolantTemperatureC: number | null
@@ -737,6 +744,17 @@ export interface OBDDriveSeries {
   samples: OBDSeriesSample[]
   diagnostics: { observedAt: string | null; kind: string; payload: Record<string, unknown> }[]
 }
+
+export interface OBDIgnitionCoverageCounts {
+  rows: number
+  speedRows: number
+  rpmRows: number
+  speedAndRpmRows: number
+  voltageRows: number
+  voltageOnlyRows: number
+}
+
+export type OBDIgnitionCoverage = Record<'accOn' | 'accOff' | 'unknown' | 'total', OBDIgnitionCoverageCounts>
 
 export interface OBDStatus {
   logger: OBDLoggerStatus | null
@@ -954,6 +972,8 @@ export const api = {
     bundles: (query?: Query) => request<Paginated<OBDBundle>>('/obd/bundles', { query }),
     drives: (query?: Query) => request<Paginated<OBDDriveSummary>>('/obd/drives', { query }),
     drivesSummary: () => request<OBDDrivesTotals>('/obd/drives/summary'),
+    ignitionCoverage: (driveId: string) =>
+      request<OBDIgnitionCoverage>(`/obd/drives/${encodeURIComponent(driveId)}/ignition-coverage`),
     driveSeries: (driveId: string, query?: { start?: string; end?: string; signals?: string; maxPoints?: number; diagnosticPage?: number; diagnosticPageSize?: number }) =>
       request<OBDDriveSeries>(`/obd/drives/${encodeURIComponent(driveId)}/series`, { query }),
     driveForJourney: (journeyId: number) =>

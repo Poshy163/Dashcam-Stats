@@ -52,7 +52,7 @@ class BundleExporterProductionTest {
 
     @Test
     fun productionExporterUsesTheSharedTimedFuelDistanceAndIdleFixtures() {
-        for ((index, case) in trialCalculationCases().take(6).withIndex()) {
+        for ((index, case) in trialCalculationCases().filterNot { it.optBoolean("calculation_only") }.withIndex()) {
             val driveId = "timed-calculation-$index"
             database.startDrive(DriveRecord(
                 driveId = driveId, vehicleId = "car", adapterId = "adapter", loggerId = "logger",
@@ -86,8 +86,10 @@ class BundleExporterProductionTest {
                     JSONObject(it.readText())
                 }
                 val expected = case.getJSONObject("expected")
-                for (key in listOf("distance_km", "estimated_fuel_used_l", "idle_duration_s")) {
-                    assertEquals(case.getString("name") + " $key", expected.getDouble(key), summary.getDouble(key), 1e-10)
+                for (key in expected.keys()) {
+                    val label = case.getString("name") + " $key"
+                    if (expected.isNull(key)) assertEquals(label, JSONObject.NULL, summary.get(key))
+                    else assertEquals(label, expected.getDouble(key), summary.getDouble(key), 1e-10)
                 }
                 val manifest = zip.getInputStream(zip.getEntry("manifest.json")).bufferedReader().use {
                     JSONObject(it.readText())

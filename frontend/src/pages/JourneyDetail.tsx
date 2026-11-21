@@ -9,6 +9,7 @@ import { DerivedHint, EmptyState, ErrorState, PageHeader, StatTile, StateBadge }
 import { api } from '@/lib/api'
 import { availableFootageDurations } from '@/lib/journeyPlayback'
 import { rowIdFilter } from '@/lib/listFilters'
+import { formatFuelEconomy } from '@/lib/obdFuelEconomy'
 import { useMapSettings } from '@/lib/useMapSettings'
 import {
   formatDate,
@@ -226,11 +227,7 @@ function JourneyDetailContent({ journeyId }: { journeyId: number }) {
                   ? `${obd.data.drive.estimatedFuelUsedL.toFixed(2)} L`
                   : '—'
               }
-              hint={
-                obd.data.drive.averageFuelConsumptionL100km != null
-                  ? `${obd.data.drive.averageFuelConsumptionL100km.toFixed(1)} L/100 km`
-                  : undefined
-              }
+              hint={formatFuelEconomy(obd.data.drive)}
             />
             <StatTile
               label="Average RPM"

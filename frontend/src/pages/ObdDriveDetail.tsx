@@ -8,10 +8,12 @@ import { ObdLifecycleBadge, ObdLifecycleExplanation, ObdLifecycleReason } from '
 import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
 import { ObdPollTiming } from '@/components/ObdPollTiming'
 import { ObdRecordingGaps } from '@/components/ObdRecordingGaps'
+import { ObdIgnitionCoverage } from '@/components/ObdIgnitionCoverage'
 import ObdFaultSummary from '@/components/ObdFaultSummary'
 import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/components/ui'
 import { api, type OBDBattery, type OBDSeriesSample } from '@/lib/api'
 import { formatDateTime, formatDateTimeMillis, formatDuration, formatRelative, formatSpeed, formatTime, utcInputValue } from '@/lib/format'
+import { formatFuelEconomy } from '@/lib/obdFuelEconomy'
 import { listPage } from '@/lib/listFilters'
 import { buildSignalTimings, deriveDrivingStats, signalSegments } from '@/lib/obdSignalTiming'
 import type { SignalTimeline } from '@/lib/obdSignalTiming'
@@ -774,13 +776,9 @@ export default function ObdDriveDetail() {
         />
         <StatTile label="Top speed" value={formatSpeed(drive.maximumSpeedKmh)} />
         <StatTile
-          label="Fuel used"
+          label="Estimated fuel used"
           value={drive.estimatedFuelUsedL != null ? `${drive.estimatedFuelUsedL.toFixed(2)} L` : '—'}
-          hint={
-            drive.averageFuelConsumptionL100km != null
-              ? `${drive.averageFuelConsumptionL100km.toFixed(1)} L/100 km`
-              : undefined
-          }
+          hint={formatFuelEconomy(drive)}
         />
         <StatTile
           label="Samples"
@@ -860,6 +858,7 @@ export default function ObdDriveDetail() {
       </div>
 
       <ObdRecordingGaps drive={drive} />
+      <ObdIgnitionCoverage driveId={drive.driveId} />
       {drive.producerMissingDataDurationS != null && <p className="text-xs text-content-muted">
         Camera-reported missing time: {formatDuration(drive.producerMissingDataDurationS)}.
         {' '}This uses the camera&apos;s own definition and can differ from the server&apos;s within-recording gap threshold.
@@ -1196,6 +1195,10 @@ export default function ObdDriveDetail() {
                   <td className="p-2 text-xs text-content-muted">
                     {event.kind === 'poll_timing' ? (
                       <ObdPollTiming payload={event.payload} />
+                    ) : event.kind === 'parser_failure' &&
+                      typeof event.payload.category === 'string' && event.payload.category.startsWith('downstream_o2_') &&
+                      typeof event.payload.message === 'string' ? (
+                      event.payload.message
                     ) : (
                       <code>{JSON.stringify(event.payload)}</code>
                     )}

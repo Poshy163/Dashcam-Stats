@@ -91,7 +91,8 @@
       "expected": {
         "distance_km": 0.093,
         "estimated_fuel_used_l": 0.015,
-        "idle_duration_s": 2.8
+        "idle_duration_s": 2.8,
+        "average_fuel_consumption_l_per_100km": 16.329704510108865
       }
     },
     {
@@ -183,7 +184,8 @@
       "expected": {
         "distance_km": 0.15,
         "estimated_fuel_used_l": 0.01,
-        "idle_duration_s": 0
+        "idle_duration_s": 0,
+        "average_fuel_consumption_l_per_100km": 20
       }
     },
     {
@@ -256,7 +258,8 @@
       "expected": {
         "distance_km": 0.05,
         "estimated_fuel_used_l": 0.01,
-        "idle_duration_s": 0
+        "idle_duration_s": 0,
+        "average_fuel_consumption_l_per_100km": 20
       }
     },
     {
@@ -340,7 +343,8 @@
       "expected": {
         "distance_km": 0.15,
         "estimated_fuel_used_l": 0.0075,
-        "idle_duration_s": 0
+        "idle_duration_s": 0,
+        "average_fuel_consumption_l_per_100km": 10
       }
     },
     {
@@ -450,7 +454,8 @@
       "expected": {
         "distance_km": 0.3333333333333333,
         "estimated_fuel_used_l": 0.025333333333333333,
-        "idle_duration_s": 0
+        "idle_duration_s": 0,
+        "average_fuel_consumption_l_per_100km": 14.468085106382981
       }
     },
     {
@@ -532,7 +537,8 @@
       "expected": {
         "distance_km": 0.3333333333333333,
         "estimated_fuel_used_l": 0.041666666666666664,
-        "idle_duration_s": 0
+        "idle_duration_s": 0,
+        "average_fuel_consumption_l_per_100km": 12.5
       }
     },
     {
@@ -604,8 +610,10 @@
       "expected": {
         "distance_km": null,
         "estimated_fuel_used_l": 0.01,
-        "idle_duration_s": null
-      }
+        "idle_duration_s": null,
+        "average_fuel_consumption_l_per_100km": null
+      },
+      "calculation_only": true
     },
     {
       "name": "v8_row_clock_regression",
@@ -677,8 +685,251 @@
       "expected": {
         "distance_km": 0.05,
         "estimated_fuel_used_l": null,
-        "idle_duration_s": 0
+        "idle_duration_s": 0,
+        "average_fuel_consumption_l_per_100km": null
+      },
+      "calculation_only": true
+    },
+    {
+      "name": "v8_disjoint_fuel_and_speed",
+      "poll_plan_version": 8,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:08Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:05Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 4000,
+              "0D": 4000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 1,
+          "timestamp_utc": "2026-10-22T00:00:08Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 4000,
+              "0D": 4000,
+              "10": 200
+            }
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        }
+      ],
+      "expected": {
+        "distance_km": 0.05,
+        "estimated_fuel_used_l": 0.005,
+        "idle_duration_s": 0,
+        "average_fuel_consumption_l_per_100km": null
       }
+    },
+    {
+      "name": "v7_stationary",
+      "poll_plan_version": 7,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:05Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:00Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": []
+          },
+          "vehicle_speed": 0,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 1,
+          "timestamp_utc": "2026-10-22T00:00:05Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": []
+          },
+          "vehicle_speed": 0,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        }
+      ],
+      "expected": {
+        "distance_km": 0,
+        "estimated_fuel_used_l": 0.008333333333333333,
+        "idle_duration_s": 5,
+        "average_fuel_consumption_l_per_100km": null
+      }
+    },
+    {
+      "name": "v8_replies_predate_drive_start",
+      "poll_plan_version": 8,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:04Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:01Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 2000,
+              "0D": 2000,
+              "10": 2000
+            }
+          },
+          "vehicle_speed": 0,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 1,
+          "timestamp_utc": "2026-10-22T00:00:04Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": [],
+            "pid_response_age_ms": {
+              "0C": 2000,
+              "0D": 2000,
+              "10": 2000
+            }
+          },
+          "vehicle_speed": 36,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 6,
+          "mass_air_flow": 18.252499999999998
+        }
+      ],
+      "expected": {
+        "distance_km": 0.015,
+        "estimated_fuel_used_l": 0.005,
+        "idle_duration_s": 3,
+        "average_fuel_consumption_l_per_100km": 25
+      }
+    },
+    {
+      "name": "v7_zero_fuel_while_moving",
+      "poll_plan_version": 7,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:05Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:00Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": []
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 0,
+          "mass_air_flow": 0.0
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 1,
+          "timestamp_utc": "2026-10-22T00:00:05Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": []
+          },
+          "vehicle_speed": 60,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 0,
+          "mass_air_flow": 0.0
+        }
+      ],
+      "expected": {
+        "distance_km": 0.08333333333333333,
+        "estimated_fuel_used_l": 0,
+        "idle_duration_s": 0,
+        "average_fuel_consumption_l_per_100km": 0
+      }
+    },
+    {
+      "name": "v7_economy_above_v1_wire_limit",
+      "poll_plan_version": 7,
+      "start_time_utc": "2026-10-22T00:00:00Z",
+      "finish_time_utc": "2026-10-22T00:00:05Z",
+      "samples": [
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 0,
+          "timestamp_utc": "2026-10-22T00:00:00Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": []
+          },
+          "vehicle_speed": 0,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 120,
+          "mass_air_flow": 365.05
+        },
+        {
+          "drive_id": "timing-fixture",
+          "sequence": 1,
+          "timestamp_utc": "2026-10-22T00:00:05Z",
+          "ecu_data_status": "live",
+          "quality": {
+            "transport": "ok",
+            "parser": "ok",
+            "missing_pids": []
+          },
+          "vehicle_speed": 1,
+          "engine_rpm": 1000,
+          "estimated_fuel_rate": 120,
+          "mass_air_flow": 365.05
+        }
+      ],
+      "expected": {
+        "distance_km": 0.0006944444444444445,
+        "estimated_fuel_used_l": 0.16666666666666666,
+        "idle_duration_s": 5,
+        "average_fuel_consumption_l_per_100km": null
+      },
+      "canonical_consumption": 24000
     }
   ]
 }

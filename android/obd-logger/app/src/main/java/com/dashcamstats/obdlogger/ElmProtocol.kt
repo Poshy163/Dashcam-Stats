@@ -1,6 +1,17 @@
 package com.dashcamstats.obdlogger
 
-class ElmProtocolException(message: String) : RuntimeException(message)
+enum class DownstreamOxygenRejection(val description: String) {
+    HEADER("The ISO header or the position of the PID marker was invalid."),
+    LENGTH("The reply length did not match the two-byte PID payload."),
+    CHECKSUM("The ISO checksum did not match."),
+    SOURCE("The checksum was valid, but the reply came from a different ECU."),
+    OTHER("No matching PID frame was identifiable, or the candidate frames failed different checks."),
+}
+
+class ElmProtocolException(
+    message: String,
+    val downstreamOxygenRejection: DownstreamOxygenRejection? = null,
+) : RuntimeException(message)
 
 enum class ElmCommandCategory(val metricName: String) {
     ADAPTER_LOCAL("adapter_local"),
@@ -274,6 +285,16 @@ object ElmProtocol {
         length: Int,
         expectedSource: Int? = null,
         mode: Int = 0x01,
+    ): Pair<Int, ByteArray>? = findPayload(response, command, pid, length, expectedSource, mode)
+
+    private inline fun findPayload(
+        response: String,
+        command: String,
+        pid: Int,
+        length: Int,
+        expectedSource: Int?,
+        mode: Int,
+        rejected: (ByteArray, Int, Int) -> Unit = { _, _, _ -> },
     ): Pair<Int, ByteArray>? {
         val marker = byteArrayOf((mode + 0x40).toByte(), pid.toByte())
         for (frame in frames(response, command)) {
@@ -281,7 +302,10 @@ object ElmProtocol {
                 at + 1 < frame.size && frame[at] == marker[0] && frame[at + 1] == marker[1]
             } ?: continue
             val end = index + marker.size + length
-            if (!validIso(frame, index, expectedSource) || frame.size != end + 1) continue
+            if (!validIso(frame, index, expectedSource) || frame.size != end + 1) {
+                rejected(frame, index, end + 1)
+                continue
+            }
             val source = frame[2].toInt() and 0xFF
             return source to frame.copyOfRange(index + marker.size, end)
         }
@@ -295,16 +319,27 @@ object ElmProtocol {
         length: Int,
         expectedSource: Int? = null,
         mode: Int = 0x01,
-    ): Pair<Int, ByteArray> = payload(
-        response,
-        command,
-        pid,
-        length,
-        expectedSource,
-        mode,
-    ) ?: throw ElmProtocolException(
-        "$command reply failed ISO header/length/source/checksum validation",
-    )
+    ): Pair<Int, ByteArray> {
+        fun invalid(reason: DownstreamOxygenRejection? = null): Nothing = throw ElmProtocolException(
+            "$command reply failed ISO header/length/source/checksum validation", reason,
+        )
+        if (pid != 0x15 || mode != 1 || expectedSource == null) {
+            return payload(response, command, pid, length, expectedSource, mode) ?: invalid()
+        }
+        var reason: DownstreamOxygenRejection? = null
+        return findPayload(response, command, pid, length, expectedSource, mode) { frame, index, size ->
+            // Classify only candidates rejected by the normal parser. A later valid candidate
+            // still wins. Do not attribute a corrupt frame to an ECU based on its source byte.
+            val failure = when {
+                index != 3 || frame[0] != 0x48.toByte() || frame[1] != 0x6B.toByte() ->
+                    DownstreamOxygenRejection.HEADER
+                frame.size != size -> DownstreamOxygenRejection.LENGTH
+                !checksum(frame) -> DownstreamOxygenRejection.CHECKSUM
+                else -> DownstreamOxygenRejection.SOURCE
+            }
+            reason = if (reason == null || reason == failure) failure else DownstreamOxygenRejection.OTHER
+        } ?: invalid(reason ?: DownstreamOxygenRejection.OTHER)
+    }
 
     fun modePayloads(
         response: String,

@@ -23,12 +23,14 @@ internal class LivePollScheduler(private val monotonicMillis: () -> Long) {
     private val lastAttempts = mutableMapOf<Int, Long>()
     private var highWater = monotonicMillis().coerceAtLeast(0)
 
-    fun beginCycle(sequence: Long, requestedPids: List<Int>, startedAtMillis: Long): Cycle {
+    fun beginCycle(sequence: Long, requestedPids: List<Int>, startedAtMillis: Long,
+                   includeVoltage: Boolean = true): Cycle {
         val critical = requestedPids.filter { ObdPollPlan.tier(it) == "fast" }
         val optional = requestedPids.filter { ObdPollPlan.tier(it) != "fast" }
             .sortedWith(compareBy<Int> { if (it == 0x10) 0 else 1 }
                 .thenBy { lastAttempts[it] ?: Long.MIN_VALUE })
-        return Cycle(sequence, startedAtMillis, critical + listOf(null) + optional)
+        val voltage = if (includeVoltage) listOf(null) else emptyList()
+        return Cycle(sequence, startedAtMillis, critical + voltage + optional)
     }
 
     fun observeAttempt(pid: Int, sequence: Long) {

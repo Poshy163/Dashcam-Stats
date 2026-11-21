@@ -56,18 +56,20 @@ internal class TimedMotionAccumulator(
         rpm: Double?,
         status: String,
         quality: JSONObject,
-    ) {
+    ): RateInterval? {
         val timed = quality.has(PID_RESPONSE_AGES_KEY) || requireTiming
         val live = status == "live" && quality.optString("transport", "ok") == "ok"
         val missing = quality.optJSONArray("missing_pids")
         fun missingPid(pid: Int): Boolean = missing != null && (0 until missing.length()).any {
             missing.optInt(it, -1) == pid
         }
+        val speedUsable = live && !missingPid(0x0D)
         var speedAt = if (speed != null || !timed) obdResponseTime(rowAt, quality, 0x0D, requireTiming) else null
         val rpmAt = if (rpm != null) obdResponseTime(rowAt, quality, 0x0C, requireTiming) else null
         var observedRpm = rpm
-        if (timed && (!live || missingPid(0x0D))) speedAt = null
+        if (timed && !speedUsable) speedAt = null
         if (timed && (!live || rpmAt == null || missingPid(0x0C))) observedRpm = null
+        var interval: RateInterval? = null
         previous?.let { first ->
             val rowGap = Duration.between(first.rowAt, rowAt).toMillis() / 1000.0
             val contiguous = (!timed && !first.timed) || (
@@ -82,6 +84,9 @@ internal class TimedMotionAccumulator(
                 if (first.speed != null && speed != null) {
                     distanceKm += (first.speed + speed) / 2 * gap / 3600
                     distanceIntervals += 1
+                    if (first.live && speedUsable && first.speedAt != null && speedAt != null) {
+                        interval = RateInterval(first.speedAt, speedAt, first.speed, speed)
+                    }
                 }
                 if (first.rpm != null && first.speed != null) {
                     idleEvidence = true
@@ -89,6 +94,7 @@ internal class TimedMotionAccumulator(
                 }
             }
         }
-        previous = Observation(drive, sequence, rowAt, speedAt, speed, observedRpm, timed, live)
+        previous = Observation(drive, sequence, rowAt, speedAt, speed, observedRpm, timed, speedUsable)
+        return interval
     }
 }
