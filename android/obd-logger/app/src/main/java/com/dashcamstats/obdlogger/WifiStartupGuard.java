@@ -8,6 +8,7 @@ import android.os.SystemClock;
 import android.util.Log;
 
 import java.io.File;
+import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -27,6 +28,7 @@ import java.util.concurrent.TimeUnit;
 public final class WifiStartupGuard {
     private static final File ROOT = new File("/data/local/tmp/dashcam_wifi_startup");
     private static final File ENABLED = new File(ROOT, "enabled");
+    private static final File RECONNECT_ENABLED = new File(ROOT, "zlink_reconnect_enabled");
     private static final File LEASE = new File(ROOT, "lease");
     private static final File READY = new File(ROOT, "ready");
     private static final File BOOT = new File("/proc/sys/kernel/random/boot_id");
@@ -233,6 +235,21 @@ public final class WifiStartupGuard {
         }
     }
 
+    private static void checkCarPlayReconnect(long wakeElapsed) {
+        if (wakeElapsed < 0 || !RECONNECT_ENABLED.isFile()) return;
+        long age = SystemClock.elapsedRealtime() - wakeElapsed;
+        long wakeEpoch = (System.currentTimeMillis() - age) / 1000;
+        // Keep the ignition and autojoin watchdog responsive while the one-shot check runs.
+        String run = "result=$(unzip -p \"$CLASSPATH\" assets/zlink_reconnect.sh"
+                + " | /system/bin/sh -s -- \"$1\") && [ \"$result\" = reconnect_requested ]"
+                + " && log -p e -t WifiStartupGuard zlink_phone_reconnect_requested";
+        try {
+            new ProcessBuilder("/system/bin/sh", "-c", run, "zlink-reconnect", Long.toString(wakeEpoch))
+                    .redirectInput(new File("/dev/null")).redirectOutput(new File("/dev/null"))
+                    .redirectError(new File("/dev/null")).start();
+        } catch (IOException ignored) { /* An optional retry cannot interrupt the Wi-Fi lease. */ }
+    }
+
     private void watch(boolean test) throws Exception {
         // A file lock, not PID matching, prevents duplicate controllers and PID reuse races.
         try (RandomAccessFile file = new RandomAccessFile(new File(ROOT, "watch.lock"), "rw");
@@ -260,6 +277,7 @@ public final class WifiStartupGuard {
                     long now = SystemClock.elapsedRealtime();
                     long deadline = test ? (now < testDeadline ? testDeadline : 0)
                             : policy.observe(acc.read(), now);
+                    if (!test) checkCarPlayReconnect(policy.takeReconnectWake(now));
                     if (deadline == 0 && !lease.isEmpty()) {
                         if (restore(lease)) lease = "";
                     } else if (deadline != 0 && lease.isEmpty() && deadline != attemptedDeadline) {

@@ -63,6 +63,42 @@ Do not remove `guard.apk` or lease state while recovery is outstanding. Verify
 
 ## Evidence
 
+### Wireless CarPlay reconnect on the Q30
+
+Companion 0.3.30 adds an optional phone-specific retry to the existing ignition
+watcher. On the 21 November return trip, ZLink's Bluetooth socket to the paired
+iPhone closed before the phone received its hotspot address. ZLink was still
+waiting five minutes later. On the outward trip the iPhone already had an
+address when the socket closed, and video started within a second.
+
+On an observed ignition start, the watcher checks once after 35 seconds. It uses
+the existing ZLink and hotspot records to match the order of events and allows
+at least 20 seconds after the phone receives its address for CarPlay to start.
+Recovery requires the stock ZLink main screen, a disconnected CarPlay status,
+and an idle decoder. The Bluetooth helper checks the same bonded smartphone,
+hands-free call state and media playback before asking Android to disconnect
+and reconnect that phone's profiles. A backup or ignition-off cancels eligibility.
+The existing Bluetooth pairing is preserved. The single event
+`zlink_phone_reconnect_requested` records that Android accepted the reconnect
+request. A new ZLink video session confirms that projection actually recovered.
+
+To enable on this Q30, install the signed update while parked and enable the
+retry in the opted-in watcher's private directory:
+
+```sh
+touch /data/local/tmp/dashcam_wifi_startup/zlink_reconnect_enabled
+```
+
+The running watcher uses its original private APK until it exits. During a
+parked update, verify ignition is off and there is no outstanding autojoin
+lease, temporarily remove the ordinary `enabled` marker, wait for the watcher
+to exit, then restore that marker so the server can re-arm it. Verify that
+`guard.apk` matches the installed companion and that `watch.pid` belongs to
+the new watcher. Removing only `zlink_reconnect_enabled` disables the phone
+retry independently of the Wi-Fi joining delay.
+
+### Wi-Fi guard diagnostics
+
 `events.log` and one rotation each retain about 32 KiB of fixed-vocabulary events.
 `WifiStartupGuard` also emits to logcat and is in the server's default tag allow-list.
 No network names, keys, MAC addresses, network IDs or raw exception messages are logged.
