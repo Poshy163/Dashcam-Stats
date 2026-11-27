@@ -235,19 +235,84 @@ public final class WifiStartupGuard {
         }
     }
 
-    private static void checkCarPlayReconnect(long wakeElapsed) {
-        if (wakeElapsed < 0 || !RECONNECT_ENABLED.isFile()) return;
-        long age = SystemClock.elapsedRealtime() - wakeElapsed;
-        long wakeEpoch = (System.currentTimeMillis() - age) / 1000;
-        // Keep the ignition and autojoin watchdog responsive while the one-shot check runs.
-        String run = "result=$(unzip -p \"$CLASSPATH\" assets/zlink_reconnect.sh"
-                + " | /system/bin/sh -s -- \"$1\") && [ \"$result\" = reconnect_requested ]"
-                + " && log -p e -t WifiStartupGuard zlink_phone_reconnect_requested";
-        try {
-            new ProcessBuilder("/system/bin/sh", "-c", run, "zlink-reconnect", Long.toString(wakeEpoch))
-                    .redirectInput(new File("/dev/null")).redirectOutput(new File("/dev/null"))
-                    .redirectError(new File("/dev/null")).start();
-        } catch (IOException ignored) { /* An optional retry cannot interrupt the Wi-Fi lease. */ }
+    private static final class ReconnectChecks implements AutoCloseable {
+        private long activeWake = -1;
+        private long wakeWallMillis;
+        private ReconnectWake owner;
+        private java.lang.Process plan;
+        private static final String SCRIPT =
+                "unzip -p \"$CLASSPATH\" assets/zlink_reconnect.sh | /system/bin/sh -s -- \"$@\"";
+
+        @Override public void close() {
+            if (owner != null) {
+                try { owner.close(); } catch (IOException ignored) { }
+                owner = null;
+            }
+            if (plan != null) {
+                // This process only reads control/lease evidence. Never kill the phone helper.
+                if (plan.isAlive()) plan.destroy();
+                try { plan.getInputStream().close(); } catch (IOException ignored) { }
+                plan = null;
+            }
+        }
+
+        private java.lang.Process start(String mode) throws IOException {
+            boolean planning = "waiting-plan".equals(mode);
+            String command = planning ? SCRIPT : "result=$(" + SCRIPT + "); case \"$result\" in "
+                    + "reconnect_requested) log -p e -t WifiStartupGuard zlink_phone_reconnect_requested;; "
+                    + "waiting_connect_requested|waiting_cycle_requested) log -p e -t WifiStartupGuard "
+                    + "\"zlink_phone_${result}\";; esac";
+            java.util.ArrayList<String> args = new java.util.ArrayList<>();
+            java.util.Collections.addAll(args, "/system/bin/sh", "-c", command, "zlink-reconnect",
+                    Long.toString(wakeWallMillis / 1000));
+            if (!mode.isEmpty()) args.add(mode);
+            if ("waiting".equals(mode)) args.add(owner.token);
+            ProcessBuilder builder = new ProcessBuilder(args);
+            builder.environment().put("DASHCAM_RECONNECT_WAKE", owner.token);
+            builder.redirectInput(new File("/dev/null")).redirectError(new File("/dev/null"));
+            if (!planning) builder.redirectOutput(new File("/dev/null"));
+            return builder.start();
+        }
+
+        void observe(StartupWifiPolicy policy, long now) {
+            long wake = policy.currentWake();
+            try {
+                if (wake != activeWake) {
+                    close();
+                    activeWake = wake;
+                    if (wake >= 0 && RECONNECT_ENABLED.isFile()) {
+                        wakeWallMillis = System.currentTimeMillis() - (now - wake);
+                        owner = ReconnectWake.open(ROOT.toPath());
+                    }
+                }
+                if (owner == null) return;
+                if (now - wake > 200_000 || !RECONNECT_ENABLED.isFile()
+                        || Math.abs(System.currentTimeMillis() - wakeWallMillis - (now - wake)) > 2_000) {
+                    close();
+                    return;
+                }
+                if (policy.takeReconnectWake(now) >= 0) start("");
+                if (policy.takeLeasePlan(now) && !owner.wasClaimed()) plan = start("waiting-plan");
+                if (plan != null && !plan.isAlive()) {
+                    try (java.io.InputStream input = plan.getInputStream()) {
+                        // A completed read-only process prints one small line with no peer identifiers.
+                        byte[] bytes = new byte[32];
+                        int length = input.read(bytes);
+                        if (plan.exitValue() == 0 && length > 0 && length < bytes.length && input.read() < 0) {
+                            String reply = new String(bytes, 0, length, StandardCharsets.US_ASCII);
+                            if (reply.matches("late_due [1-9][0-9]{8,10}\\n")) {
+                                long epoch = Long.parseLong(reply.substring(9).trim());
+                                policy.acceptLeasePlan(wake, now, wake + epoch * 1000 - wakeWallMillis);
+                            }
+                        }
+                    } finally { plan = null; }
+                }
+                if (policy.takeLateRetry(now) && !owner.wasClaimed()) start("waiting");
+            } catch (IOException | RuntimeException ignored) {
+                // A failed optional probe must never interrupt the Wi-Fi lease or try again.
+                close();
+            }
+        }
     }
 
     private void watch(boolean test) throws Exception {
@@ -260,6 +325,8 @@ public final class WifiStartupGuard {
             String stale = read(LEASE);
             if (!stale.isEmpty() && !restore(stale)) return;
             StartupWifiPolicy policy = new StartupWifiPolicy();
+            ReconnectChecks reconnect = new ReconnectChecks();
+            try { ReconnectWake.cleanOrphans(ROOT.toPath()); } catch (IOException ignored) { }
             String lease = "";
             long attemptedDeadline = 0;
             long sampledDeadline = 0;
@@ -277,7 +344,7 @@ public final class WifiStartupGuard {
                     long now = SystemClock.elapsedRealtime();
                     long deadline = test ? (now < testDeadline ? testDeadline : 0)
                             : policy.observe(acc.read(), now);
-                    if (!test) checkCarPlayReconnect(policy.takeReconnectWake(now));
+                    if (!test) reconnect.observe(policy, now);
                     if (deadline == 0 && !lease.isEmpty()) {
                         if (restore(lease)) lease = "";
                     } else if (deadline != 0 && lease.isEmpty() && deadline != attemptedDeadline) {
@@ -294,6 +361,7 @@ public final class WifiStartupGuard {
                     Thread.sleep(250);
                 }
             } finally {
+                reconnect.close();
                 if (!lease.isEmpty()) restore(lease);
                 Files.deleteIfExists(new File(ROOT, "watch.pid").toPath());
             }

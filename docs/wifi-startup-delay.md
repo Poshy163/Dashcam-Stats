@@ -97,6 +97,26 @@ to exit, then restore that marker so the server can re-arm it. Verify that
 the new watcher. Removing only `zlink_reconnect_enabled` disables the phone
 retry independently of the Wi-Fi joining delay.
 
+Companion 0.3.32 also handles a saved iPhone that joins the CarPlay hotspot but
+never starts the Bluetooth iAP handshake. The watcher checks the existing DHCP
+record during startup and waits at least 90 seconds from the phone's lease before
+acting. ZLink must still be on its connection screen with no handshake or video.
+The early and late checks share one attempt per observed ignition. A call, audio
+playback, a different phone or a backup keeps the late check from acting.
+
+Enroll the two addresses of the known phone once while parked, after a successful
+wireless CarPlay drive and after re-arming the updated watcher:
+
+```sh
+python tools/enroll_carplay_phone.py --serial <connected-dashcam-serial>
+```
+
+Enrollment matches the saved hotspot peer, ZLink's Bluetooth handoff and the
+completed video decoder from that drive. It stores the pair in the private guard
+directory and prints only the result. Use `--check-only` to test the evidence.
+Repeat enrollment after replacing the paired phone or changing its Wi-Fi identity.
+An unverified phone gets no late retry.
+
 ### Wi-Fi guard diagnostics
 
 `events.log` and one rotation each retain about 32 KiB of fixed-vocabulary events.

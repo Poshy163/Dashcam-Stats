@@ -18,6 +18,9 @@ import android.os.Process;
 import android.os.SystemClock;
 import android.provider.Settings;
 
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.InputStreamReader;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
@@ -27,17 +30,19 @@ import java.nio.file.Paths;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /** Shell entry point for an already diagnosed failed handoff on the Q30's Android 14 build.
- * Takes check|retry and a peer address. Only the outcome is printed.
+ * Checks or retries one previously identified smartphone. Only the outcome is printed.
  */
 @SuppressLint({"MissingPermission", "NewApi"})
 public final class CarPlayPhoneBluetooth implements BluetoothProfile.ServiceListener {
     // System BluetoothProfile constants omitted from the public SDK stubs.
     private static final int A2DP_SINK = 11;
     private static final int HEADSET_CLIENT = 16;
+    static final int UNKNOWN_PEER_STATE = -1;
     private static final Path LOCAL_TMP = Paths.get("/data/local/tmp");
     private final CountDownLatch profilesReady = new CountDownLatch(2);
     private volatile BluetoothProfile headset;
@@ -76,6 +81,10 @@ public final class CarPlayPhoneBluetooth implements BluetoothProfile.ServiceList
 
     private static boolean classicConnected(Method handle, BluetoothDevice phone) throws Exception {
         int value = (int) handle.invoke(phone, BluetoothDevice.TRANSPORT_BREDR);
+        return validHandle(value);
+    }
+
+    private static boolean validHandle(int value) {
         // HCI connection handles are 12-bit, with 0xF00 through 0xFFF reserved.
         return value >= 0 && value <= 0xEFF;
     }
@@ -92,7 +101,8 @@ public final class CarPlayPhoneBluetooth implements BluetoothProfile.ServiceList
     }
 
     @SuppressWarnings("deprecation") // The stock Android 14 HFP client can use SCO.
-    private boolean audioIdle(Context context, BluetoothDevice phone) throws Exception {
+    private boolean audioIdle(Context context, BluetoothDevice phone, boolean hasConnection, boolean waiting)
+            throws Exception {
         BluetoothProfile hfp = headset;
         BluetoothProfile a2dp = sink;
         AudioManager audio = context.getSystemService(AudioManager.class);
@@ -100,8 +110,17 @@ public final class CarPlayPhoneBluetooth implements BluetoothProfile.ServiceList
                 || audio.isMusicActive() || audio.isBluetoothScoOn()) return false;
         int hfpState = hfp.getConnectionState(phone);
         int a2dpState = a2dp.getConnectionState(phone);
-        if (hfpState != BluetoothProfile.STATE_CONNECTED && a2dpState != BluetoothProfile.STATE_CONNECTED) return false;
+        if (hasConnection != (hfpState == BluetoothProfile.STATE_CONNECTED
+                || a2dpState == BluetoothProfile.STATE_CONNECTED)) return false;
         if (!onlyEligiblePeer(hfp, phone, hfpState) || !onlyEligiblePeer(a2dp, phone, a2dpState)) return false;
+        if (waiting) {
+            int[] transitions = { BluetoothProfile.STATE_CONNECTING, BluetoothProfile.STATE_DISCONNECTING };
+            List<BluetoothDevice> hfpChanging = hfp.getDevicesMatchingConnectionStates(transitions);
+            List<BluetoothDevice> sinkChanging = a2dp.getDevicesMatchingConnectionStates(transitions);
+            if (hfpChanging == null || !hfpChanging.isEmpty() || sinkChanging == null || !sinkChanging.isEmpty()) {
+                return false;
+            }
+        }
         if (hfpState == BluetoothProfile.STATE_CONNECTED) {
             Class<?> api = hfp.getClass();
             Object calls = api.getMethod("getCurrentCalls", BluetoothDevice.class).invoke(hfp, phone);
@@ -158,7 +177,55 @@ public final class CarPlayPhoneBluetooth implements BluetoothProfile.ServiceList
         return restored;
     }
 
-    private String run(Context context, String address, boolean retry) throws Exception {
+    // A missing BR/EDR handle alone can also mean a binder failure. Require independent
+    // link and profile reads, all on the unique eligible phone, before a connect-only request.
+    int waitingPeer(Context context, BluetoothAdapter adapter, BluetoothDevice phone,
+            Method handle, Method isConnected) throws Exception {
+        if (!adapter.isEnabled() || !isOnlyBondedPhone(adapter, phone)) return UNKNOWN_PEER_STATE;
+        int value = (int) handle.invoke(phone, BluetoothDevice.TRANSPORT_BREDR);
+        boolean connected = validHandle(value);
+        if ((!connected && value != BluetoothDevice.ERROR) || (boolean) isConnected.invoke(phone) != connected
+                || !audioIdle(context, phone, connected, true)) return UNKNOWN_PEER_STATE;
+        return value;
+    }
+
+    // Reuse the signed watcher's read-only predicate after profile proxy setup. A successful
+    // callback must still refer to this wake, ZLink process, historical peer and waiting page.
+    private static boolean stillWaiting(String edge, String phone, String pid, String token) throws Exception {
+        String command = "unzip -p \"$CLASSPATH\" assets/zlink_reconnect.sh | /system/bin/sh -s -- \"$@\"";
+        java.lang.Process probe = new ProcessBuilder("/system/bin/sh", "-c", command, "verify",
+                edge, "waiting-verify", phone, pid, token).redirectError(new File("/dev/null")).start();
+        try (BufferedReader reply = new BufferedReader(new InputStreamReader(probe.getInputStream(),
+                java.nio.charset.StandardCharsets.US_ASCII))) {
+            return probe.waitFor(15, TimeUnit.SECONDS) && probe.exitValue() == 0
+                    && "waiting_ready".equals(reply.readLine()) && reply.readLine() == null;
+        } finally {
+            probe.destroyForcibly();
+        }
+    }
+
+    static String actIfStillWaiting(Callable<Integer> peer, Callable<Boolean> waiting,
+            Callable<Boolean> claim, Callable<String> connect, Callable<String> cycle) throws Exception {
+        int first = peer.call();
+        if (first != BluetoothDevice.ERROR && !validHandle(first)) return "peer_unavailable";
+        if (!waiting.call()) return "no_longer_waiting";
+        // An intervening disconnect or reconnect changes the handle. Leave that attempt alone.
+        if (peer.call() != first) return "peer_changed";
+        if (!claim.call()) return "wake_or_gate_changed";
+        if (first == BluetoothDevice.ERROR) {
+            String result = connect.call();
+            return "reconnect_requested".equals(result) ? "waiting_connect_requested" : result;
+        }
+        String result = cycle.call();
+        return "reconnect_requested".equals(result) ? "waiting_cycle_requested" : result;
+    }
+
+    private String run(Context context, String[] args) throws Exception {
+        boolean waiting = "waiting".equals(args[0]);
+        boolean retry = "retry".equals(args[0]);
+        String address = args[1].toUpperCase(Locale.ROOT);
+        String token = args.length > 2 ? args[args.length - 1] : null;
+        if (token != null && !ReconnectWake.isCurrent(token)) return "wake_or_gate_changed";
         if (!"com.android.shell".equals(context.getAttributionSource().getPackageName())
                 || context.getAttributionSource().getUid() != Process.SHELL_UID) return "wrong_identity";
         for (String permission : new String[]{"BLUETOOTH_CONNECT", "BLUETOOTH_PRIVILEGED", "MODIFY_PHONE_STATE"}) {
@@ -185,6 +252,14 @@ public final class CarPlayPhoneBluetooth implements BluetoothProfile.ServiceList
             if (!adapter.getProfileProxy(context, this, HEADSET_CLIENT)
                     || !adapter.getProfileProxy(context, this, A2DP_SINK)
                     || !profilesReady.await(3, TimeUnit.SECONDS)) return "profiles_unavailable";
+            if (waiting) {
+                Method isConnected = BluetoothDevice.class.getMethod("isConnected");
+                return actIfStillWaiting(() -> waitingPeer(context, adapter, phone, handle, isConnected),
+                        () -> stillWaiting(args[2], address, args[3], token),
+                        () -> veto(context) == null && ReconnectWake.claim(token),
+                        () -> restore(adapter, phone, connect),
+                        () -> cycle(adapter, phone, handle, connect, disconnect));
+            }
             if (!classicConnected(handle, phone)) {
                 if (!retry) {
                     // Disconnected profiles can return null calls / idle audio. Only exercise
@@ -199,11 +274,13 @@ public final class CarPlayPhoneBluetooth implements BluetoothProfile.ServiceList
                 }
                 return "no_classic_link";
             }
-            if (!audioIdle(context, phone)) return "audio_or_profile_busy";
+            if (!audioIdle(context, phone, true, false)) return "audio_or_profile_busy";
             if (!isOnlyBondedPhone(adapter, phone) || !classicConnected(handle, phone)) return "peer_changed";
             if (!retry) return "ready";
             String reason = veto(context);
-            return reason != null ? reason : cycle(adapter, phone, handle, connect, disconnect);
+            if (reason != null) return reason;
+            if (token != null && !ReconnectWake.claim(token)) return "wake_or_gate_changed";
+            return cycle(adapter, phone, handle, connect, disconnect);
         } finally {
             if (headset != null) adapter.closeProfileProxy(HEADSET_CLIENT, headset);
             if (sink != null) adapter.closeProfileProxy(A2DP_SINK, sink);
@@ -229,18 +306,29 @@ public final class CarPlayPhoneBluetooth implements BluetoothProfile.ServiceList
                 .invoke(loaded, true, null);
     }
 
+    private static boolean validArgs(String[] args) {
+        if (args.length < 2 || !BluetoothAdapter.checkBluetoothAddress(args[1].toUpperCase(Locale.ROOT))) return false;
+        switch (args[0]) {
+            case "check": return args.length == 2;
+            case "retry": return args.length == 2 || (args.length == 3 && ReconnectWake.validToken(args[2]));
+            case "waiting":
+                return args.length == 5 && args[2].matches("[1-9][0-9]{0,10}")
+                        && args[3].matches("[1-9][0-9]{0,9}") && ReconnectWake.validToken(args[4]);
+            default: return false;
+        }
+    }
+
     @SuppressWarnings("deprecation") // app_process does not supply an application main looper.
     public static void main(String[] args) {
         if (Process.myUid() != Process.SHELL_UID) finish("wrong_identity");
         if (Build.VERSION.SDK_INT != 34) finish("unsupported");
-        if (args.length != 2 || !("check".equals(args[0]) || "retry".equals(args[0]))
-                || !BluetoothAdapter.checkBluetoothAddress(args[1].toUpperCase(Locale.ROOT))) finish("invalid_args");
+        if (!validArgs(args)) finish("invalid_args");
         try {
             Looper.prepareMainLooper();
             Context shell = shellContext();
             new Thread(() -> {
                 try {
-                    finish(new CarPlayPhoneBluetooth().run(shell, args[1].toUpperCase(Locale.ROOT), "retry".equals(args[0])));
+                    finish(new CarPlayPhoneBluetooth().run(shell, args));
                 } catch (InvocationTargetException error) {
                     finish(error.getCause() instanceof SecurityException ? "permission_or_attribution_denied" : "api_error");
                 } catch (SecurityException denied) {
@@ -259,6 +347,8 @@ public final class CarPlayPhoneBluetooth implements BluetoothProfile.ServiceList
 
     private static void finish(String outcome) {
         System.out.println(outcome);
-        System.exit("ready".equals(outcome) || "reconnect_requested".equals(outcome) ? 0 : 1);
+        boolean accepted = "ready".equals(outcome) || "reconnect_requested".equals(outcome)
+                || "waiting_connect_requested".equals(outcome) || "waiting_cycle_requested".equals(outcome);
+        System.exit(accepted ? 0 : 1);
     }
 }

@@ -18,6 +18,15 @@ WIFI = "02:00:00:00:00:22"
 PACKAGE = "com.zjinnova.zlink"
 MAIN = f"{PACKAGE}/com.zjinnova.android.zlink.features.main.MainActivity"
 UUID = "00000000-deca-fade-deca-deafdecacafe"
+TOKEN = "00000000-0000-0000-0000-000000000123"
+
+
+def zlink(offset, text, *, pid=2537):
+    return f"{EDGE + offset:.3f} {pid} 2537 E zj : {text}\n"
+
+
+POWER_ON = "[ScreenManager]calculateViewPortSize() called  by function SystemEventsBroadcastReceiver ACTION_POWER_ON"
+WAITING = zlink(-0.532, "updateStates:CP") + zlink(0.411, POWER_ON)
 
 
 def radio_log(*, early_close=True):
@@ -32,12 +41,12 @@ def radio_log(*, early_close=True):
     )
 
 
-def lease(offset=12, mac=WIFI):
-    stamp = datetime.fromtimestamp(EDGE + offset, UTC).isoformat(timespec="seconds")
+def lease(offset=12, mac=WIFI, address="192.0.2.9"):
+    stamp = datetime.fromtimestamp(EDGE + offset, UTC).strftime("%Y-%m-%dT%H:%M:%S")
     return (
         f"{stamp}.501326 - [wlan2.DHCP.Repository] DHCPREQUEST assignedLease null, "
-        f"reqAddr=192.0.2.9, sidSet=false: created/renewed lease clientId: 01, hwAddr: {mac}, "
-        "netAddr: 192.0.2.9/24, expTime: 208000692, hostname: iPhone\n"
+        f"reqAddr={address}, sidSet=false: created/renewed lease clientId: 01, hwAddr: {mac}, "
+        f"netAddr: {address}/24, expTime: 208000692, hostname: iPhone\n"
     )
 
 
@@ -66,7 +75,7 @@ def check(tmp_path):
     if not shell or not Path(shell).is_file():
         pytest.skip("POSIX shell unavailable")
 
-    def run(*, armed=True, backup=False, **overrides):
+    def run(*, armed=True, backup=False, args=(), managed=False, **overrides):
         guard = tmp_path / "guard"
         guard.mkdir(exist_ok=True)
         if armed:
@@ -79,6 +88,7 @@ def check(tmp_path):
             "status": "0",
             "pid": "2537",
             "wifi_mac": WIFI,
+            "identity": BT,
             "activity": f"    topResumedActivity=ActivityRecord{{42 u0 {MAIN} t435 d0}}\n",
             "log": radio_log(),
             "network": lease(),
@@ -97,6 +107,7 @@ def check(tmp_path):
             SCRIPT.read_text(encoding="utf-8")
             .replace("/data/local/tmp/dashcam_wifi_startup", "./guard")
             .replace("/data/local/tmp/.dashcam_analyser_radios", "./backup")
+            .replace("/system/bin/sh -s -- lookup", "sh -s -- lookup")
         )
         mocks = r"""
 date() { if [ "$1" = '+%s' ]; then cat now; else command date "$@"; fi; }
@@ -128,13 +139,23 @@ dumpsys() {
     esac
 }
 app_process() { printf '%s\n' "$*" >> requests; cat helper; }
+unzip() {
+    [ "$*" = '-p synthetic.apk assets/zlink_peer.sh' ] || return 1
+    printf '%s\n' 'test "$1" = lookup && test "$2" = "$(cat wifi_mac)" && cat identity'
+}
 """
         result = subprocess.run(
-            [shell, "-s", "--", str(EDGE)],
+            [shell, "-s", "--", str(EDGE), *args],
             input=mocks + script,
             cwd=tmp_path,
-            env={**os.environ, "TZ": "UTC", "LC_ALL": "C"},
-            text=True,
+            env={
+                **os.environ,
+                "TZ": "UTC",
+                "LC_ALL": "C",
+                "CLASSPATH": "synthetic.apk",
+                "DASHCAM_RECONNECT_WAKE": TOKEN if managed else "",
+            },
+            encoding="utf-8",
             capture_output=True,
             timeout=8,
             check=True,
@@ -143,6 +164,151 @@ app_process() { printf '%s\n' "$*" >> requests; cat helper; }
         return result.stdout.strip(), calls.read_text().splitlines() if calls.exists() else []
 
     return run
+
+
+def test_managed_early_retry_supplies_same_ignition_claim(check):
+    assert check(managed=True) == (
+        "reconnect_requested",
+        [f"/system/bin com.dashcamstats.obdlogger.CarPlayPhoneBluetooth retry {BT} {TOKEN}"],
+    )
+
+
+def test_one_plan_uses_latest_matching_lease_rounded_up_to_whole_second(check):
+    assert check(
+        args=("waiting-plan",), now=str(EDGE + 70), log=WAITING, network=lease(6) + lease(25)
+    ) == (f"late_due {EDGE + 116}", [])
+
+
+@pytest.mark.parametrize("observed_phone", [False, True], ids=["stalled", "manually-reconnected"])
+def test_november_27_morning_from_wake_to_lease_grace(check, observed_phone):
+    # Offsets from the 10:52:23 vendor wake. Lease fractions are synthetic.
+    log = (
+        zlink(-0.532, "updateStates:CP")
+        + zlink(-0.525, "updateStates:CP")
+        + zlink(-0.494, "updateStates:CP")
+        + zlink(0.411, POWER_ON)
+    )
+    if observed_phone:
+        log += (
+            zlink(45.490, f"[zjBtService]device:{BT}   uuid:{UUID}")
+            + zlink(48.759, "java.io.IOException: bt socket closed, read return: -1")
+            + zlink(49.665, "updateStates:CP")
+        )
+    evidence = {"log": log, "network": lease(11) + lease(14, "02:00:00:00:00:33", "192.0.2.10")}
+    plan = check(args=("waiting-plan",), now=str(EDGE + 70), **evidence)
+    if observed_phone:
+        assert plan == ("skip_progress", [])
+        assert check(args=("waiting", TOKEN), now=str(EDGE + 102), **evidence) == (
+            "skip_progress",
+            [],
+        )
+    else:
+        assert plan == (f"late_due {EDGE + 102}", [])
+        assert check(args=("waiting", TOKEN), now=str(EDGE + 101), **evidence) == ("skip_lease", [])
+        assert check(
+            args=("waiting", TOKEN),
+            now=str(EDGE + 102),
+            helper="waiting_connect_requested",
+            **evidence,
+        ) == (
+            "waiting_connect_requested",
+            [
+                f"/system/bin com.dashcamstats.obdlogger.CarPlayPhoneBluetooth waiting {BT} {EDGE} 2537 {TOKEN}"
+            ],
+        )
+
+
+@pytest.mark.parametrize("outcome", ["waiting_connect_requested", "waiting_cycle_requested"])
+def test_waiting_accepts_distinct_wifi_client_and_preserves_startup_chatter(check, outcome):
+    status, calls = check(
+        args=("waiting", TOKEN),
+        now=str(EDGE + 120),
+        log=WAITING + zlink(3, "updateStates:CP"),
+        # Nov 27: a second hotspot client received its own IP 3 s after the iPhone.
+        network=lease(11) + lease(14, "02:00:00:00:00:33", "192.0.2.10"),
+        helper=outcome,
+    )
+    assert status == outcome
+    assert calls == [
+        f"/system/bin com.dashcamstats.obdlogger.CarPlayPhoneBluetooth waiting {BT} {EDGE} 2537 {TOKEN}"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("options", "reason"),
+    [
+        ({"now": str(EDGE + 102)}, "lease"),  # just under 90 s from +12.501
+        ({"now": str(EDGE + 201)}, "stale"),
+        ({"network": lease(-3)}, "lease"),
+        ({"network": lease(6) + lease(100)}, "lease"),
+        ({"network": lease(10) + lease(20, "02:00:00:00:00:33")}, "lease"),
+        ({"network": lease(10) + lease(20, WIFI, "192.0.2.10")}, "lease"),
+        ({"network": lease() + "DUMP TIMEOUT (3s)\n"}, "lease"),
+        (
+            {
+                "network": lease()
+                + lease(20).split(" - ")[0]
+                + " - [wlan2.DHCP] DHCP Packet Listener stopped\n"
+            },
+            "lease",
+        ),
+        ({"log": ""}, "progress"),
+        ({"log": WAITING.replace("2537 2537", "2555 2537")}, "progress"),
+        ({"log": zlink(-100, POWER_ON)}, "progress"),
+        ({"log": WAITING + zlink(80, POWER_ON)}, "progress"),
+        ({"log": WAITING + zlink(40, f"[zjBtService]device:{BT}   uuid:{UUID}")}, "progress"),
+        ({"log": WAITING + zlink(71, "bt socket closed, read return: -1")}, "progress"),
+        (
+            {"log": WAITING + zlink(118, "-------------获取到图片数据18307-------------")},
+            "progress",
+        ),
+        ({"log_failed": "1"}, "progress"),
+        ({"identity": ""}, "identity"),
+        ({"identity": BT + "\n02:00:00:00:00:44"}, "identity"),
+        ({"metrics": IDLE_METRICS.replace("18:18:54", "18:22:53")}, "decoder_history"),
+        (
+            {
+                "resources": IDLE_RESOURCES.replace(
+                    "Pid: 2537", "Pid: 2537\n Name: c2.unisoc.avc.decoder"
+                )
+            },
+            "decoder",
+        ),
+        ({"later_status": "1"}, "projection"),
+        ({"backup": True}, "backup"),
+    ],
+)
+def test_waiting_declines_ambiguous_or_changed_evidence(check, options, reason):
+    inputs = {"log": WAITING, "now": str(EDGE + 120), **options}
+    status, calls = check(args=("waiting", TOKEN), **inputs)
+    assert status == f"skip_{reason}"
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("address", "pid", "status"),
+    [(BT, "2537", "waiting_ready"), (WIFI, "2537", "skip_identity"), (BT, "3133", "skip_process")],
+)
+def test_fresh_helper_verification_never_calls_helper_again(check, address, pid, status):
+    assert check(
+        args=("waiting-verify", address, pid, TOKEN), log=WAITING, now=str(EDGE + 120)
+    ) == (status, [])
+
+
+def test_final_verification_skips_native_handshake_started_during_profile_binding(check):
+    log = WAITING + zlink(119.73, f"[zjBtService]device:{BT}   uuid:{UUID}")
+    assert check(args=("waiting-verify", BT, "2537", TOKEN), log=log, now=str(EDGE + 120)) == (
+        "skip_progress",
+        [],
+    )
+
+
+def test_suppresses_unexpected_helper_diagnostics_and_peer_identity(check):
+    status, calls = check(
+        args=("waiting", TOKEN), log=WAITING, now=str(EDGE + 120), helper=f"unexpected {BT}"
+    )
+    assert status == "skip_phone"
+    assert len(calls) == 1
 
 
 def test_failed_return_requests_one_retry_for_the_classic_peer(check):
