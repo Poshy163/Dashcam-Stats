@@ -175,6 +175,16 @@ def _report(ok: bool = True) -> RunReport:
 
 
 class TestRecordingTheOutcome:
+    async def test_persistent_summary_contention_requeues_only_summary(self, job):
+        report = _report(ok=False)
+        report.transient = report.retry_summary_only = True
+        active = ActiveJob(job_id=job, recording_id=1, filename="outcome.ts")
+        assert await WorkerPool()._finish(job, active, report=report)
+        async with session_scope() as session:
+            row = await session.get(ProcessingJob, job)
+            assert row.state == JobState.QUEUED
+            assert row.stages == ["summarise"]
+
     async def test_a_completed_analysis_notifies_the_cleanup_scheduler(self, job, monkeypatch):
         requested: list[int] = []
         monkeypatch.setattr("app.workers.worker._request_idle_cleanup", requested.append)

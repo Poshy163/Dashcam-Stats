@@ -85,6 +85,8 @@ import asyncio
 import contextlib
 import re
 import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from app.core.logging import get_logger
 from app.core.settings_service import get_settings_service
@@ -331,6 +333,28 @@ def is_fast(frequency_mhz: int) -> bool:
     return frequency_mhz >= _FAST_FLOOR_MHZ
 
 
+@dataclass(frozen=True, slots=True)
+class LinkReading:
+    address: str
+    observed_at: datetime
+    frequency_mhz: int
+    signal_dbm: int | None
+    link_mbps: int | None
+
+
+_latest_link: LinkReading | None = None
+_SIGNAL_DBM = re.compile(r"(?:^|,\s*)RSSI:\s*(-?\d{1,3})\b", re.IGNORECASE)
+_LINK_MBPS = re.compile(r"(?:^|,\s*)Link speed:\s*(\d{1,5})\s*Mbps\b", re.IGNORECASE)
+
+
+def observed_link(address: str, start: datetime, end: datetime) -> LinkReading | None:
+    """An existing successful read of this unit during this run."""
+    sample = _latest_link
+    if sample and sample.address == address and start <= sample.observed_at <= end:
+        return sample
+    return None
+
+
 async def read_link(address: str) -> tuple[int | None, str]:
     """The live link's (frequency MHz, ssid), or (None, "") when the unit will not say."""
     try:
@@ -338,7 +362,21 @@ async def read_link(address: str) -> tuple[int | None, str]:
     except adb.AdbError as exc:
         log.debug("could not read the unit's WiFi status", error=str(exc))
         return None, ""
-    return parse_link(reply)
+    frequency, ssid = parse_link(reply)
+    if frequency is not None:
+        global _latest_link
+        signal = _SIGNAL_DBM.search(reply)
+        speed = _LINK_MBPS.search(reply)
+        dbm = int(signal[1]) if signal else None
+        mbps = int(speed[1]) if speed else None
+        _latest_link = LinkReading(
+            address,
+            datetime.now(UTC),
+            frequency,
+            dbm if dbm is not None and -126 <= dbm < 0 else None,
+            mbps if mbps and mbps <= 65535 else None,
+        )
+    return frequency, ssid
 
 
 def parse_scan_for_5g(scan_reply: str, ssid: str) -> bool | None:

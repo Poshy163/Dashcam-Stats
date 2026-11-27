@@ -27,7 +27,7 @@ from app.core.logging import get_logger
 from app.db.models import OBDLoggerEvent, utcnow
 from app.db.retry import is_locked_error
 from app.db.session import get_engine
-from app.ingest import adb
+from app.ingest import adb, carplay_outcome
 from app.ingest.obd_bundle import SAFE_DRIVE_ID
 
 log = get_logger(__name__)
@@ -709,6 +709,7 @@ async def sync_remote_events(
             result.accepted, result.duplicates, result.sequence_gap = await store_event_snapshot(
                 snapshot
             )
+            carplay_outcome.on_event_snapshot(address, snapshot)
             if result.sequence_gap:
                 log.warning(
                     "the app event snapshot starts after unseen sequence rows",

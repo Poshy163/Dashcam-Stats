@@ -60,6 +60,8 @@ async def test_observed_shutdown_rows_and_late_journal(db_session, client, tmp_p
     await store_samples(tmp_path, samples)
     before = (await client.get(URL)).json()
     assert before["unknown"] == before["total"]
+    assert before["startup"]["acc_to_first_speed_rpm_s"] is None
+    assert before["startup"]["drive_to_first_speed_rpm_s"] == 0
     assert before["total"]["rows"] == 70
     async with session_scope() as session:
         later_export = event(11, 450, "export_completed", session="next-boot", anchor=True)
@@ -94,6 +96,7 @@ async def test_observed_shutdown_rows_and_late_journal(db_session, client, tmp_p
     }
     assert after["unknown"]["rows"] == 0
     assert after["total"] == before["total"]
+    assert after["startup"]["acc_to_first_speed_rpm_s"] == 18
 
 
 async def test_unobserved_prefix_ignition_restart_and_partial_ecu_rows(
@@ -117,6 +120,7 @@ async def test_unobserved_prefix_ignition_restart_and_partial_ecu_rows(
         )
     result = (await client.get(URL)).json()
     assert result["unknown"]["speed_and_rpm_rows"] == result["unknown"]["rows"] == 1
+    assert result["startup"]["acc_to_first_speed_rpm_s"] is None
     assert result["acc_off"]["voltage_only_rows"] == 1
     assert result["acc_off"]["rows"] == 2
     assert result["acc_on"] == {
@@ -132,6 +136,7 @@ async def test_unobserved_prefix_ignition_restart_and_partial_ecu_rows(
         session.add(event(2, 0, "engine_detected", source="another-car", anchor=True))
     ambiguous = (await client.get(URL)).json()
     assert ambiguous["unknown"] == ambiguous["total"]
+    assert ambiguous["startup"]["stages"] == {}
     assert (await client.get("/api/obd/drives/no_such_drive/ignition-coverage")).status_code == 404
 
 
@@ -150,3 +155,66 @@ async def test_missing_journal_sequence_expires_previous_acc_state(db_session, c
     assert result["acc_on"]["rows"] == 1
     assert result["unknown"]["rows"] == 1
     assert result["acc_off"]["rows"] == 2
+
+
+async def test_startup_uses_first_valid_pair_and_only_final_connection(
+    db_session, client, tmp_path
+):
+    samples = [_sample(DRIVE, i, telemetry=False) for i in range(5)]
+    samples[0].update(adapter_voltage=13.8)
+    samples[1].update(ecu_data_status="last_known", engine_rpm=800, vehicle_speed=10)
+    samples[2].update(engine_rpm=800, vehicle_speed=0)
+    samples[2]["quality"]["missing_pids"] = [13]
+    samples[3].update(engine_rpm=800, vehicle_speed=0)
+    samples[3]["quality"]["pid_response_age_ms"] = {"0C": 100}
+    samples[4].update(engine_rpm=0, vehicle_speed=0)
+    await store_samples(tmp_path, samples)
+
+    def stage(seq, at, kind, outcome, reason):
+        entry = event(seq, at, reason)
+        entry.kind, entry.outcome = kind, outcome
+        return entry
+
+    async with session_scope() as session:
+        session.add_all(
+            [
+                event(1, -27, "acc_on"),
+                stage(2, -21, "obd.ble_connection", "succeeded", "notifications_ready"),
+                stage(3, -20, "obd.elm_session", "succeeded", "elm_ready"),
+                stage(4, -19, "obd.ecu_session", "skipped", "voltage_below_stop"),
+                stage(5, -7, "obd.ble_connection", "succeeded", "notifications_ready"),
+                stage(6, -5, "obd.elm_session", "succeeded", "elm_ready"),
+                stage(7, -4, "obd.elm_session", "retrying", "voltage_below_stop"),
+                stage(8, -1, "obd.ecu_session", "succeeded", "ecu_proof_valid"),
+                event(9, 0, "engine_detected", anchor=True),
+            ]
+        )
+    result = (await client.get(URL)).json()["startup"]
+    assert result["drive_to_first_speed_rpm_s"] == 20
+    assert result["acc_to_first_speed_rpm_s"] == 47
+    assert result["low_voltage_parked_waits"] == result["startup_voltage_rechecks"] == 1
+    assert result["stages"] == {"bluetooth_ready_s": 20, "adapter_ready_s": 22, "ecu_ready_s": 26}
+
+
+async def test_gap_before_pair_and_restarted_recording_have_no_ignition_latency(
+    db_session, client, tmp_path
+):
+    samples = [_sample(DRIVE, i, telemetry=i == 2) for i in range(3)]
+    await store_samples(tmp_path, samples)
+    async with session_scope() as session:
+        session.add_all(
+            [
+                event(1, -20, "acc_on"),
+                event(3, 0, "engine_detected", anchor=True),
+            ]
+        )
+    startup = (await client.get(URL)).json()["startup"]
+    assert startup["acc_to_first_speed_rpm_s"] is None
+    assert startup["drive_to_first_speed_rpm_s"] == 10
+    async with session_scope() as session:
+        prior_drive = event(2, -10, "engine_detected", anchor=True)
+        prior_drive.drive_id = "other_recording"
+        session.add(prior_drive)
+    startup = (await client.get(URL)).json()["startup"]
+    assert startup["observed_acc_on_at"] is None
+    assert startup["drive_to_first_speed_rpm_s"] == 10

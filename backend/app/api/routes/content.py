@@ -67,7 +67,7 @@ from app.db.models import (
     Vehicle,
 )
 from app.journeys.builder import JourneyBuilder
-from app.journeys.track import single_track
+from app.journeys.track import gps_distance_partial, single_track
 from app.pipeline.devices import device_summary, stage_devices
 from app.pipeline.orchestrator import invalidate_recordings
 from app.pipeline.revisions import CURRENT_REVISIONS, INVALIDATED_REVISION
@@ -924,6 +924,7 @@ async def get_journey(journey_id: RowId, session: SessionDep):
     # late; the read had already happened.
     detail = JourneyDetailOut(
         **JourneyOut.model_validate(journey).model_dump(),
+        gps_distance_partial=gps_distance_partial(path, journey.started_at, journey.ended_at),
         recordings=[RecordingOut.model_validate(r) for r in recordings],
         route=route,
     )

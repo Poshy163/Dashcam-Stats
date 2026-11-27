@@ -15,7 +15,7 @@ from statistics import median
 from app.journeys.track import TrackPoint
 from app.osd.geo import haversine_m
 
-MOTION_REVISION = "motion-v1"
+MOTION_REVISION = "motion-v2"
 
 
 @dataclass

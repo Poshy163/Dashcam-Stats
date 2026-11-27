@@ -9,11 +9,15 @@ from types import SimpleNamespace
 
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import FileResponse
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import joinedload, load_only
 
 from app.api.deps import PaginationDep, RowId, SessionDep
+from app.api.geometry import DEFAULT_MAX_GAP_S
+from app.api.visibility import visible_revision
 from app.db.models import (
+    Camera,
+    CameraRole,
     Journey,
     OBDBundle,
     OBDBundleState,
@@ -21,6 +25,8 @@ from app.db.models import (
     OBDDrive,
     OBDLoggerEvent,
     OBDSample,
+    Recording,
+    TelemetryPoint,
     utcnow,
 )
 from app.ingest.obd_bundle import (
@@ -49,7 +55,10 @@ from app.ingest.obd_storage import (
     storage_claim_lock,
 )
 from app.ingest.obd_transfer import get_obd_transfer_status
+from app.journeys.motion import assess_motion
+from app.journeys.track import single_track
 from app.obd import battery
+from app.obd.carplay_outcome import drive_carplay_outcome
 from app.obd.fuel import economy_coverage, fuel_consumption
 from app.obd.ignition_coverage import ignition_coverage
 from app.obd.recording_gaps import missing_duration_metadata, recording_gap_context
@@ -491,10 +500,92 @@ async def drive_for_journey(journey_id: RowId, session: SessionDep) -> dict[str,
         if overlap > best_overlap:
             best, best_overlap = row, overlap
     contexts = await recording_gap_context(session, [best]) if best else {}
-    return {
+    response = {
         "drive": _drive(best, recording_context=contexts[best.id]) if best else None,
         "overlap_s": best_overlap if best else None,
     }
+    if len(candidates) == 1 and _comparable_distance(best, journey, best_overlap):
+        # A single engine log spanning two camera journeys is ambiguous in reverse.
+        another_journey = await session.scalar(
+            select(Journey.id)
+            .where(
+                Journey.id != journey_id,
+                Journey.started_at < best.finished_at,
+                Journey.ended_at > best.started_at,
+            )
+            .limit(1)
+        )
+        if another_journey is None and not await _camera_kept_moving(session, journey, best):
+            response["matched_distance_km"] = best.distance_km
+    return response
+
+
+def _comparable_distance(drive: OBDDrive, journey: Journey, overlap_s: float) -> bool:
+    # Footage may continue for many minutes after parking. Match its start and the
+    # engine log's span rather than requiring these different end times to agree.
+    duration = (drive.finished_at - drive.started_at).total_seconds()
+    if (
+        drive.bundle.state != OBDBundleState.STORED.value
+        or drive.processing_status != "ready"
+        or drive.distance_km is None
+        or duration <= 0
+        or overlap_s < duration * 0.9
+        or abs((drive.started_at - journey.started_at).total_seconds()) > 90
+    ):
+        return False
+    signals = (drive.gap_analysis_json or {}).get("signals") or []
+    return any(
+        signal.get("name") == "vehicle_speed"
+        and signal.get("supported") is True
+        and (signal.get("expected_observation_count") or 0) >= 3
+        and (signal.get("coverage_percentage") or 0) >= 80
+        for signal in signals
+    )
+
+
+async def _camera_kept_moving(session: SessionDep, journey: Journey, drive: OBDDrive) -> bool:
+    # The cameras keep recording while parked. A trailing timestamp alone cannot
+    # distinguish that normal tail from an engine log that stopped during the drive.
+    cutoff = drive.finished_at + timedelta(seconds=DEFAULT_MAX_GAP_S)
+    if journey.ended_at <= cutoff:
+        return False
+    fixes = (
+        await session.execute(
+            select(
+                TelemetryPoint.recording_id,
+                TelemetryPoint.t_offset_s,
+                TelemetryPoint.captured_at,
+                TelemetryPoint.lat,
+                TelemetryPoint.lon,
+                TelemetryPoint.speed_kmh,
+                TelemetryPoint.breaks_segment,
+                Recording.started_at,
+                Camera.role,
+            )
+            .join(Recording, Recording.id == TelemetryPoint.recording_id)
+            .outerjoin(Camera, Camera.id == Recording.camera_id)
+            .where(
+                TelemetryPoint.journey_id == journey.id,
+                Recording.journey_id == journey.id,
+                Recording.ignored.is_(False),
+                visible_revision(Recording.telemetry_revision),
+                or_(Recording.ended_at.is_(None), Recording.ended_at >= cutoff),
+                TelemetryPoint.has_fix.is_(True),
+                TelemetryPoint.lat.is_not(None),
+                TelemetryPoint.lon.is_not(None),
+            )
+        )
+    ).all()
+    if not fixes:
+        return False
+
+    def tail_is_moving():
+        starts = {row.recording_id: row.started_at for row in fixes}
+        fronts = {row.recording_id for row in fixes if row.role == CameraRole.FRONT}
+        tail = [point for point in single_track(fixes, starts, fronts) if point.at >= cutoff]
+        return assess_motion(tail).evidence["status"] == "moving"
+
+    return await asyncio.to_thread(tail_is_moving)
 
 
 async def _journey_for_drive(session, drive: OBDDrive) -> dict[str, object] | None:
@@ -723,6 +814,14 @@ async def drive_ignition_coverage(drive_id: str, session: SessionDep) -> dict:
     if drive is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "OBD drive was not found")
     return await ignition_coverage(session, drive)
+
+
+@router.get("/drives/{drive_id}/carplay-outcome")
+async def carplay_outcome(drive_id: str, session: SessionDep) -> dict:
+    drive = await session.scalar(select(OBDDrive).where(OBDDrive.drive_id == drive_id))
+    if drive is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "OBD drive was not found")
+    return await drive_carplay_outcome(session, drive)
 
 
 @router.post(

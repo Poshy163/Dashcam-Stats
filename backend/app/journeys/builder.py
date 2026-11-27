@@ -39,7 +39,7 @@ from app.db.models import (
 from app.db.retry import commit_with_retry
 from app.ingest.clip_exclusions import IntentionalGapBarriers, intentional_intervals
 from app.journeys.motion import assess_motion
-from app.journeys.track import single_track
+from app.journeys.track import gps_distance_partial, single_track
 from app.osd import haversine_m
 from app.osd.outliers import (
     looks_like_sign_loss,
@@ -1279,6 +1279,9 @@ class JourneyBuilder:
         )
         journey.motion_json = {
             **motion.evidence,
+            "gps_distance_partial": gps_distance_partial(
+                track, journey.started_at, journey.ended_at
+            ),
             "observed_distance_m": observed_distance,
             "observed_avg_speed_kmh": observed_average,
             "observed_max_speed_kmh": max(

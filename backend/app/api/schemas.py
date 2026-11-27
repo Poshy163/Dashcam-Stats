@@ -174,6 +174,7 @@ class JourneyOut(ApiModel):
 
 
 class JourneyDetailOut(JourneyOut):
+    gps_distance_partial: bool | None = None
     recordings: list[RecordingOut] = Field(default_factory=list)
     #: Drawable segments, each ``[lat, lon, recording_id, t_offset_s]``.
     #:

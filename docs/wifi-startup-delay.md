@@ -117,6 +117,13 @@ directory and prints only the result. Use `--check-only` to test the evidence.
 Repeat enrollment after replacing the paired phone or changing its Wi-Fi identity.
 An unverified phone gets no late retry.
 
+The Wireless CarPlay panel on an OBD drive shows available timings for hotspot
+readiness, the enrolled phone's lease and handshake, any helper request, and
+ZLink video. The server reads existing Android histories during a parked visit.
+The collector sends milestone times and decoder durations without phone addresses.
+Decoder start is estimated from a completed session. A missing observation leaves
+that milestone unknown.
+
 ### Wi-Fi guard diagnostics
 
 `events.log` and one rotation each retain about 32 KiB of fixed-vocabulary events.

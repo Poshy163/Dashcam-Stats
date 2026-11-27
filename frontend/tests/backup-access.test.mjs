@@ -85,10 +85,10 @@ test('transfer history separates measured receive speed and whole-run speed for 
     { ...row, id: 92, state: 'error', end_to_end_mbs: 0, footage_receive_mbs: null },
   ] })
   const table = root.root.findAllByType('table').find(node =>
-    node.findAllByType('th').some(th => th.children.join('') === 'Start-to-finish speed'))
+    node.findAllByType('th').some(th => th.children.join('') === 'Transfer speed'))
   const data = table.findAllByType('tbody')[0].findAllByType('tr')
-  const rates = data.map(tr => tr.findAllByType('td').slice(-2).map(td => td.children.join('')))
-  assert.deepEqual(rates, [['3.7 MB/s', '—'], ['8.2 MB/s', '15.1 MB/s'], ['0.0 MB/s', '—']])
+  const rates = data.map(tr => tr.findAllByType('td')[4].findAllByType('div').map(div => div.children.join('')))
+  assert.deepEqual(rates, [['Overall 3.7 MB/s', 'Receiving —'], ['Overall 8.2 MB/s', 'Receiving 15.1 MB/s'], ['Overall 0.0 MB/s', 'Receiving —']])
 })
 
 test('an acknowledged stop stays disabled through shutdown, then prevents a new pull until recovery settles', async t => {

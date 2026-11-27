@@ -359,6 +359,7 @@ async def ingest_history(session: SessionDep, page: PaginationDep) -> dict[str, 
                 "throughput_mbs_avg": row.throughput_mbs_avg,
                 "end_to_end_mbs": _end_to_end_mbs(row),
                 "footage_receive_mbs": row.footage_receive_mbs,
+                "accounting": row.accounting,
                 "error": redact(row.error) if row.error else None,
             }
             for row in rows

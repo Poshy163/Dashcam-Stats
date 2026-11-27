@@ -750,6 +750,11 @@ async def store(
             accepted += int(result.rowcount or 0)
         # Commit retention and new rows together. A failed prune must not leave a
         # partially reported import or remove the previously committed generation.
+        if entries and entries[0].tag == "DashcamTemperature":
+            # Journal chunks are homogeneous, validated and bounded to 256 observations.
+            from app.ingest.run_accounting import record_imported_peaks
+
+            await record_imported_peaks(session, entries)
         await _prune(session)
         return accepted
 

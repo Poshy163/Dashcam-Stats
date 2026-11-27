@@ -153,6 +153,7 @@ export interface Journey {
     status: 'moving' | 'unconfirmed' | 'unknown'
     rejectedSpeedSamples: number
     observedDistanceM: number | null
+    gpsDistancePartial?: boolean | null
     observedMaxSpeedKmh: number | null
   } | null
   id: number
@@ -178,6 +179,7 @@ export interface Journey {
 export type RoutePoint = [lat: number, lon: number, recordingId: number, offsetS: number]
 
 export interface JourneyDetail extends Journey {
+  gpsDistancePartial?: boolean | null
   recordings: Recording[]
   /**
    * Drawable segments. Separate lines rather than one, because the breaks between them

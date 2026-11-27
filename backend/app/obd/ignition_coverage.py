@@ -29,7 +29,7 @@ class Coverage:
         self.voltage_only_rows += voltage_only
 
 
-async def _acc_transitions(session, drive):
+async def _ignition_journal(session, drive):
     # ACC broadcasts usually lack a drive ID. Anchor to the recording session.
     # Export or recovery after a restart can reference that drive from a different session.
     event = OBDLoggerEvent
@@ -48,10 +48,15 @@ async def _acc_transitions(session, drive):
         )
     ).all()
     if len(anchors) != 1:
-        return []
+        return [], []
     source, app_session = anchors[0]
     query = select(
-        event.occurred_at, event.sequence, event.kind, event.outcome, event.reason_code
+        event.occurred_at,
+        event.sequence,
+        event.kind,
+        event.outcome,
+        event.reason_code,
+        event.drive_id,
     ).where(
         event.source_id_hash == source,
         event.session_id_hash == app_session,
@@ -93,13 +98,84 @@ async def _acc_transitions(session, drive):
         ):
             transitions.append((row.occurred_at, row.reason_code))
         prior = row
-    return transitions
+    return transitions, within
+
+
+_STAGE_EVENTS = {
+    ("obd.ble_connection", "notifications_ready"): "bluetooth_ready_s",
+    ("obd.elm_session", "elm_ready"): "adapter_ready_s",
+    ("obd.ecu_session", "ecu_proof_valid"): "ecu_ready_s",
+}
+
+
+def _startup_timing(drive, transitions, events, first_pair):
+    def seconds(start, end):
+        return round((end - start).total_seconds(), 3)
+
+    result = {
+        "observed_acc_on_at": None,
+        "first_speed_rpm_at": first_pair.isoformat() if first_pair else None,
+        "acc_to_first_speed_rpm_s": None,
+        "drive_to_first_speed_rpm_s": (
+            seconds(drive.started_at, first_pair)
+            if first_pair and first_pair >= drive.started_at
+            else None
+        ),
+        "stages": {},
+        "low_voltage_parked_waits": None,
+        "startup_voltage_rechecks": None,
+    }
+    through = first_pair or drive.started_at
+    # Only an uninterrupted observation spanning drive creation and the first recorded pair
+    # can link the recording to this ignition. A later restart/edge cannot repair a missing one.
+    states = [(at, state) for at, state in transitions if at <= through]
+    if not states:
+        return result
+    edge, state = states[-1]
+    if state != "acc_on" or edge > drive.started_at or through < drive.started_at:
+        return result
+    if any(
+        row.kind == "drive.lifecycle"
+        and row.outcome == "started"
+        and row.reason_code == "engine_detected"
+        and row.drive_id != drive.drive_id
+        and edge <= row.occurred_at <= through
+        for row in events
+    ):
+        # A recorder reconnect on a long-running ignition is not a new ignition startup.
+        return result
+    result["observed_acc_on_at"] = edge.isoformat()
+    if first_pair:
+        result["acc_to_first_speed_rpm_s"] = seconds(edge, first_pair)
+    stages = result["stages"]
+    parked_waits = rechecks = 0
+    for row in events:
+        if not edge <= row.occurred_at <= drive.started_at:
+            continue
+        low_voltage = row.reason_code in {"voltage_below_start", "voltage_below_stop"}
+        if low_voltage and row.kind == "obd.ecu_session" and row.outcome == "skipped":
+            parked_waits += 1
+        if low_voltage and row.kind == "obd.elm_session" and row.outcome == "retrying":
+            rechecks += 1
+        stage = _STAGE_EVENTS.get((row.kind, row.reason_code))
+        if stage and row.outcome == "succeeded":
+            if stage == "bluetooth_ready_s":
+                stages.clear()  # A later connection supersedes an earlier unsuccessful setup.
+            stages[stage] = seconds(edge, row.occurred_at)
+        elif row.kind in {"obd.ble_connection", "obd.elm_session", "obd.ecu_session"} and (
+            row.outcome == "failed" or (row.outcome == "skipped" and low_voltage)
+        ):
+            stages.clear()
+    result["low_voltage_parked_waits"] = parked_waits
+    result["startup_voltage_rechecks"] = rechecks
+    return result
 
 
 async def ignition_coverage(session, drive: OBDDrive) -> dict:
-    transitions = await _acc_transitions(session, drive)
+    transitions, events = await _ignition_journal(session, drive)
     times = [at for at, _ in transitions]
     phases = {key: Coverage() for key in ("acc_on", "acc_off", "unknown", "total")}
+    first_pair = None
     plan, specs = specs_for_poll_plan((drive.manifest_json or {}).get("poll_plan_version"))
     dynamic = [spec for spec in specs if spec.pid is not None and spec.provenance == "measured"]
     query = select(
@@ -129,6 +205,8 @@ async def ignition_coverage(session, drive: OBDDrive) -> dict:
                 and response_time(at, quality, 0x0C, require_timing=plan == 8) is not None
             )
             voltage = live and battery is not None
+            if speed and rpm and (first_pair is None or at < first_pair):
+                first_pair = at
             # A legacy row can contain an optional ECU value without a response time.
             # It still disqualifies the row from the stricter voltage-only category.
             fields = (speed, rpm, voltage, voltage and all(value is None for value in values))
@@ -136,4 +214,7 @@ async def ignition_coverage(session, drive: OBDDrive) -> dict:
             phases["total"].observe(*fields)
     finally:
         await result.close()
-    return {key: asdict(value) for key, value in phases.items()}
+    return {
+        **{key: asdict(value) for key, value in phases.items()},
+        "startup": _startup_timing(drive, transitions, events, first_pair),
+    }

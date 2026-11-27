@@ -810,6 +810,7 @@ class IngestRun(Base):
     throughput_mbs_avg: Mapped[float] = mapped_column(Float, default=0.0)
     #: Raw footage archive bytes per receiver second, including retries.
     footage_receive_mbs: Mapped[float | None] = mapped_column(Float, nullable=True)
+    accounting: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
@@ -1137,6 +1138,16 @@ class OBDLoggerEvent(Base):
         Index("ix_obd_logger_events_kind_time", "kind", "occurred_at"),
         Index("ix_obd_logger_events_drive_time", "drive_id", "occurred_at"),
     )
+
+
+class OBDCarPlayObservation(Base):
+    """Positive phone/decoder milestones recovered at a parked visit, without peer identities."""
+
+    __tablename__ = "obd_carplay_observations"
+    source_id_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    occurred_at: Mapped[datetime] = mapped_column(UtcDateTime, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), primary_key=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
 
 
 class UnitLogEntry(Base):

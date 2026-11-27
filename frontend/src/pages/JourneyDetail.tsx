@@ -135,11 +135,19 @@ function JourneyDetailContent({ journeyId }: { journeyId: number }) {
         </p>
       )}
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-[repeat(auto-fit,minmax(8rem,1fr))]">
         <StatTile
-          label="Distance"
+          label={journey.gpsDistancePartial ? 'GPS distance · partial' : 'GPS distance'}
           value={<DerivedHint>{formatDistance(journey.distanceM)}</DerivedHint>}
+          hint={journey.gpsDistancePartial ? 'Part of the journey has no continuous GPS track.' : undefined}
         />
+        {obd.data?.matchedDistanceKm != null && (
+          <StatTile
+            label="OBD distance"
+            value={formatDistance(obd.data.matchedDistanceKm * 1000)}
+            hint="From speed readings on the matched engine drive."
+          />
+        )}
         <StatTile
           label="Average speed"
           value={<DerivedHint>{formatSpeed(journey.avgSpeedKmh)}</DerivedHint>}

@@ -224,7 +224,7 @@ export default function Journeys() {
               <div className="tabular font-mono mt-3 flex flex-wrap gap-x-5 gap-y-1.5 text-xs text-content-muted">
                 {journey.hasGps ? (
                   <>
-                    <span className="text-content font-bold"><DerivedHint>{formatDistance(journey.distanceM)}</DerivedHint></span>
+                    <span className="text-content font-bold"><DerivedHint>{formatDistance(journey.distanceM)}</DerivedHint> {journey.motionJson?.gpsDistancePartial ? '· partial GPS' : 'GPS'}</span>
                     <span>avg <span className="text-content font-bold">{formatSpeed(journey.avgSpeedKmh)}</span></span>
                     <span>max <span className="text-accent font-bold">{formatSpeed(journey.maxSpeedKmh)}</span></span>
                   </>

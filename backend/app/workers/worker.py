@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from app.core.logging import get_logger, log_context
 from app.core.settings_service import get_settings_service
 from app.damaged_policy import apply_damaged_policy
-from app.db.models import JobKind, JobState, ProcessingJob, Recording
+from app.db.models import JobKind, JobState, ProcessingJob, Recording, RecordingState, utcnow
 from app.db.retry import is_locked_error
 from app.db.session import session_scope
 from app.hardware.detect import detect_hardware_async
@@ -554,6 +554,22 @@ class WorkerPool:
                             permanent=report.permanent,
                             transient=report.transient,
                         )
+                        if report.retry_summary_only:
+                            # All earlier stages committed. Keep their output across
+                            # worker restarts even for an explicitly requested full job.
+                            job.stages = ["summarise"]
+                            recording = await session.get(Recording, job.recording_id)
+                            if (
+                                recording is not None
+                                and recording.state == RecordingState.PROCESSING
+                            ):
+                                if job.state == JobState.QUEUED:
+                                    recording.state = RecordingState.QUEUED
+                                else:
+                                    recording.state = RecordingState.FAILED
+                                    recording.error_message = report.error
+                                    recording.error_count += 1
+                                    recording.last_error_at = utcnow()
                     else:
                         await queue.complete(
                             session,

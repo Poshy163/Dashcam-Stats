@@ -2467,6 +2467,106 @@ class TestDriveSeriesApi:
         assert series["journey"]["title"] == "the school run"
         assert series["journey"]["overlap_s"] == pytest.approx(5.0)
 
+    async def test_distance_comparison_requires_unique_overlap_and_speed_coverage(
+        self, db_session, app_config, client
+    ):
+        from app.db.models import Journey
+
+        checked = validate_bundle(
+            make_bundle(app_config.obd_verified_dir, "drive_distance_match"), config=app_config
+        )
+        async with session_scope() as session:
+            await store_validated_bundle(session, checked)
+            drive = await session.scalar(select(OBDDrive))
+            drive.finished_at = BASE + timedelta(minutes=5)
+            drive.distance_km = 2.882
+            drive.processing_status = "ready"
+            speed = {"name": "vehicle_speed", "supported": True, "expected_observation_count": 60}
+            drive.gap_analysis_json = {"signals": [{**speed, "coverage_percentage": 96}]}
+            journey = Journey(
+                started_at=BASE - timedelta(seconds=26), ended_at=BASE + timedelta(minutes=19)
+            )
+            session.add(journey)
+            await session.flush()
+            path = f"/api/obd/drives/for-journey/{journey.id}"
+        assert (await client.get(path)).json()["matched_distance_km"] == pytest.approx(2.882)
+        async with session_scope() as session:
+            drive = await session.scalar(select(OBDDrive))
+            drive.gap_analysis_json = {"signals": [{**speed, "coverage_percentage": 32}]}
+        assert "matched_distance_km" not in (await client.get(path)).json()
+        async with session_scope() as session:
+            drive = await session.scalar(select(OBDDrive))
+            drive.gap_analysis_json = {"signals": [{**speed, "coverage_percentage": 100}]}
+            session.add(Journey(started_at=BASE, ended_at=BASE + timedelta(minutes=1)))
+        ambiguous = (await client.get(path)).json()
+        assert "matched_distance_km" not in ambiguous
+        assert ambiguous["drive"]["drive_id"] == "drive_distance_match"
+
+    @pytest.mark.parametrize("moving", [False, True])
+    async def test_camera_tail_only_vetoes_distance_when_movement_is_confirmed(
+        self, db_session, app_config, client, moving
+    ):
+        from app.db.models import Journey, Recording, RecordingState, TelemetryPoint
+
+        checked = validate_bundle(
+            make_bundle(app_config.obd_verified_dir, "drive_camera_tail"), config=app_config
+        )
+        async with session_scope() as session:
+            await store_validated_bundle(session, checked)
+            drive = await session.scalar(select(OBDDrive))
+            drive.finished_at = BASE + timedelta(minutes=5)
+            drive.distance_km = 2.882
+            drive.processing_status = "ready"
+            # As on the two morning drives, the engine log starts about 24 s late
+            # and reports 70 of 81 scheduled speed observations.
+            drive.gap_analysis_json = {
+                "signals": [
+                    {
+                        "name": "vehicle_speed",
+                        "supported": True,
+                        "expected_observation_count": 81,
+                        "received_observation_count": 70,
+                        "coverage_percentage": 100 * 70 / 81,
+                    }
+                ]
+            }
+            journey = Journey(
+                started_at=BASE - timedelta(seconds=24), ended_at=BASE + timedelta(minutes=19)
+            )
+            session.add(journey)
+            await session.flush()
+            recording = Recording(
+                filename="tail.ts",
+                rel_path="tail.ts",
+                size_bytes=2000,
+                state=RecordingState.COMPLETED,
+                journey_id=journey.id,
+                started_at=drive.finished_at,
+                ended_at=journey.ended_at,
+            )
+            session.add(recording)
+            await session.flush()
+            for second in range(10, 31):
+                session.add(
+                    TelemetryPoint(
+                        recording_id=recording.id,
+                        journey_id=journey.id,
+                        t_offset_s=second,
+                        captured_at=drive.finished_at + timedelta(seconds=second),
+                        has_fix=True,
+                        lat=1 + (second * 10 if moving else 0) / 111_195,
+                        lon=1,
+                        speed_kmh=36 if moving or second == 20 else 0,
+                    )
+                )
+            path = f"/api/obd/drives/for-journey/{journey.id}"
+        result = (await client.get(path)).json()
+        assert result["drive"]["drive_id"] == "drive_camera_tail"
+        if moving:
+            assert "matched_distance_km" not in result
+        else:
+            assert result["matched_distance_km"] == pytest.approx(2.882)
+
     async def test_summary_of_an_empty_library_is_all_zeroes(self, db_session, client):
         response = await client.get("/api/obd/drives/summary")
         assert response.status_code == 200

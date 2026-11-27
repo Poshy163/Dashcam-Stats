@@ -71,6 +71,7 @@ from app.ingest.obd_transfer import (
     sync_remote_bundles,
     verified_bundle_matches,
 )
+from app.ingest.run_accounting import RunAccounting, observed_temperature
 from app.ingest.status import IngestStatus, get_status
 
 log = get_logger(__name__)
@@ -80,6 +81,7 @@ log = get_logger(__name__)
 class _RunLifecycle:
     started_at: datetime
     released: bool = False
+    accounting: RunAccounting = field(default_factory=RunAccounting)
     policy_fingerprint_checks: int = 0
     analysis_released: set[str] = field(default_factory=set)
     # None means a receiver failed without returning its counters.
@@ -2309,6 +2311,7 @@ async def run_pull(
                 if not lifecycle.released and status.running:
                     result.seconds = time.monotonic() - started
                     _classify_cancellation(result)
+                    _record_stop_reason(lifecycle.accounting, result, status)
                     result.error = redact(result.error) if result.error else None
                     status.finish(result)
                     lifecycle.released = True
@@ -2341,6 +2344,8 @@ async def _run_pull_started(
     obd_inventory_ok = True
     obd_transfer_error: Exception | None = None
     obd_events: asyncio.Task[EventSyncResult] | None = None
+    lifecycle = _run_lifecycle.get()
+    accounting = lifecycle.accounting if lifecycle is not None else RunAccounting()
     committed: list[str] = []
     expected: dict[str, int] = {}
     initial_backlog_sizes: dict[str, int] = {}
@@ -2564,6 +2569,11 @@ async def _run_pull_started(
             for item in [*plan.files, *(item for item, _ in filtered_inventory.deferred)]
         }
         camera = str(_get("camera_filter", "both"))
+        accounting.inventory(
+            datetime.now(UTC),
+            [*plan.files, *(item for item, _ in filtered_inventory.deferred)],
+            camera,
+        )
         if camera != "both":
             plan.files = [item for item in plan.files if item.name.endswith(f"_{camera}.ts")]
         duplicate_candidates = [
@@ -2753,6 +2763,7 @@ async def _run_pull_started(
                         error=redact(exc),
                     )
                     restored = await _restore_radio_transition(radio_transition, error=exc)
+                    accounting.radio_recovery_pending = not restored
                     radio_transition = None
                     result = _radio_shutdown_hold(
                         f"logger preparation failed: {exc}"
@@ -2774,9 +2785,11 @@ async def _run_pull_started(
             try:
                 if radio_transition is not None:
                     radio_transition.raise_if_lease_lost()
+                accounting.obd_result_known = False
                 obd_result = await sync_remote_bundles(
                     info, ingest_status=status, remote=remote_obd
                 )
+                accounting.obd_result_known = True
                 if radio_transition is not None:
                     radio_transition.raise_if_lease_lost()
             except Exception as exc:
@@ -2820,6 +2833,7 @@ async def _run_pull_started(
                     error=redact(exc),
                 )
                 restored = await _restore_radio_transition(radio_transition, error=exc)
+                accounting.radio_recovery_pending = not restored
                 radio_transition = None
                 result = _radio_shutdown_hold(
                     f"OBD backup must complete before shutdown: {exc}"
@@ -2929,6 +2943,7 @@ async def _run_pull_started(
                     else status.radio_quieting_hold_reason or str(exc)
                 )
                 restored = await _restore_radio_transition(radio_transition, error=exc)
+                accounting.radio_recovery_pending = not restored
                 radio_transition = None
                 result = _radio_shutdown_hold(
                     reason if restored else "radio recovery could not be verified before transfer"
@@ -3012,6 +3027,11 @@ async def _run_pull_started(
                         time.time() + skew,
                         camera=str(_get("camera_filter", "both")),
                     )
+                    accounting.inventory(
+                        datetime.now(UTC),
+                        [*analysis_yield_plan.files, *(item for item, _ in latest.deferred)],
+                        camera,
+                    )
                     if not analysis_yield_plan.policy_deferred_files:
                         return False
                     _note_analysis_backlog(analysis_yield_plan, latest)
@@ -3031,6 +3051,7 @@ async def _run_pull_started(
             chunk_committed = await asyncio.to_thread(commit, staging, footage, chunk_expected)
             if chunk_committed:
                 committed.extend(chunk_committed)
+                accounting.commit(chunk_committed, chunk_expected)
                 if bool(_get("delete_after_verify", False)):
                     if radio_transition is not None:
                         radio_transition.raise_if_lease_lost()
@@ -3118,6 +3139,11 @@ async def _run_pull_started(
                 time.time() + skew,
                 camera=str(_get("camera_filter", "both")),
             )
+            accounting.inventory(
+                datetime.now(UTC),
+                [*more.files, *(item for item, _ in sweep_inventory.deferred)],
+                camera,
+            )
             status.set_policy_deferred(more)
             if more.policy_deferred_files and quiet_requested and sweep_inventory.analysis_ready:
                 analysis_batch_yielded = True
@@ -3183,6 +3209,7 @@ async def _run_pull_started(
                 wanted.extend(rescued)
                 committed = [*committed, *rescued_names]
                 expected.update(rescued_sizes)
+                accounting.commit(rescued_names, rescued_sizes)
 
         if analysis_batch_yielded:
             plan.backlog_files += len(analysis_new_backlog)
@@ -3245,9 +3272,12 @@ async def _run_pull_started(
                 earlier_names = {item.name for item in remote_obd}
                 late_bundles = [item for item in late_inventory if item.name not in earlier_names]
                 if late_bundles and not status.cancel_event.is_set():
+                    previous_counts_known = accounting.obd_result_known
+                    accounting.obd_result_known = False
                     late_result = await sync_remote_bundles(
                         info, ingest_status=status, remote=late_bundles
                     )
+                    accounting.obd_result_known = previous_counts_known
                     if obd_result is None:
                         obd_result = late_result
                     else:
@@ -3369,6 +3399,7 @@ async def _run_pull_started(
             except (asyncio.CancelledError, Exception) as exc:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await asyncio.shield(radio_transition.require_recovery(exc))
+            accounting.radio_recovery_pending = not restored
             if not restored and result.state is RunState.OK:
                 result = RunResult(
                     state=RunState.PARTIAL,
@@ -3401,6 +3432,7 @@ async def _run_pull_started(
                         await asyncio.to_thread(commit, staging, footage, remaining_expected)
                     )
             committed = list(dict.fromkeys(committed))
+            accounting.commit(committed, expected)
             saved_bytes = sum(expected[name] for name in committed)
             saved_files = len(committed)
             if obd_result is not None:
@@ -3476,6 +3508,16 @@ async def _run_pull_started(
                 log.error("could not notify scanner about committed footage", error=redact(exc))
         lifecycle = _run_lifecycle.get()
         _classify_cancellation(result)
+        if obd_result is not None:
+            accounting.obd_copied = obd_result.copied
+            accounting.obd_duplicates = obd_result.duplicates
+            accounting.obd_bytes = obd_result.bytes
+            accounting.obd_failed = obd_result.failed
+        if lifecycle is not None and info is not None:
+            accounting.wifi = band.observed_link(
+                info.address, lifecycle.started_at, datetime.now(UTC)
+            )
+        _record_stop_reason(accounting, result, status)
         result.error = redact(result.error) if result.error else None
         status.finish(result)
         if lifecycle is not None:
@@ -3598,6 +3640,32 @@ async def _deliberately_removed() -> set[str]:
         return set()
 
 
+def _record_stop_reason(accounting: RunAccounting, result: RunResult, status: IngestStatus) -> None:
+    if status.cancel_reason == "native_sleep_window_ending" and (
+        result.error in _ORDERLY_END_MESSAGES
+        or result.error in {None, "backup cancelled"}
+        or (
+            accounting.radio_recovery_pending
+            and result.error
+            and result.error.removesuffix("; radio restoration remains pending and will be retried")
+            in _ORDERLY_END_MESSAGES
+        )
+    ):
+        accounting.stop_reason = (
+            "ignition_on" if status.cancel_detail == _IGNITION_ON_MESSAGE else "sleep_deadline"
+        )
+    elif status.cancel_reason == "radio_safety_lease_lost":
+        accounting.stop_reason = "radio_safety"
+    elif result.state == RunState.CANCELLED:
+        accounting.stop_reason = "cancelled"
+    elif result.state in (RunState.PARTIAL, RunState.ERROR):
+        accounting.stop_reason = (
+            "radio_recovery"
+            if result.error == "radio restoration remains pending and will be retried"
+            else "failure"
+        )
+
+
 async def _persist(result: RunResult, trigger: str) -> None:
     """Record the run for history. Live progress deliberately stays in memory."""
     from app.db.models import IngestRun
@@ -3607,28 +3675,45 @@ async def _persist(result: RunResult, trigger: str) -> None:
     lifecycle = _run_lifecycle.get()
     received = lifecycle.footage_receive if lifecycle is not None else None
     async with session_scope() as session:
-        session.add(
-            IngestRun(
-                started_at=lifecycle.started_at if lifecycle is not None else finished_at,
-                finished_at=finished_at,
-                trigger=trigger,
-                state=result.state.value,
-                files_transferred=result.files,
-                bytes_transferred=result.bytes,
-                throughput_mbs_avg=result.throughput_mbs,
-                footage_receive_mbs=(
-                    received.throughput_mbs
-                    if received is not None and received.bytes_received and received.seconds > 0
-                    else None
-                ),
-                error=redact(result.error) if result.error else None,
-            )
+        accounting = lifecycle.accounting.document(received) if lifecycle is not None else None
+        row = IngestRun(
+            accounting=accounting,
+            started_at=lifecycle.started_at if lifecycle is not None else finished_at,
+            finished_at=finished_at,
+            trigger=trigger,
+            state=result.state.value,
+            files_transferred=result.files,
+            bytes_transferred=result.bytes,
+            throughput_mbs_avg=result.throughput_mbs,
+            footage_receive_mbs=(
+                received.throughput_mbs
+                if received is not None and received.bytes_received and received.seconds > 0
+                else None
+            ),
+            error=redact(result.error) if result.error else None,
         )
+        session.add(row)
+        if lifecycle is not None:
+            # Lock in this run before reading its journal, so an arriving import can
+            # either be seen here or update the committed row on its next transaction.
+            await session.flush()
+            try:
+                async with session.begin_nested():
+                    peak = await observed_temperature(session, lifecycle.started_at, finished_at)
+                    row.accounting = {**accounting, **peak}
+            except Exception:
+                log.warning("backup history temperature unavailable")
 
 
 async def _record_run_completion(result: RunResult, trigger: str, *, continuation: bool) -> None:
     """Persist every material attempt while announcing only once per visit."""
-    if result.state in (RunState.IDLE, RunState.OFFLINE):
+    lifecycle = _run_lifecycle.get()
+    carryover = (
+        lifecycle is not None
+        and lifecycle.accounting.stop_reason in {"sleep_deadline", "ignition_on"}
+        and bool(lifecycle.accounting.found)
+    )
+    if result.state is RunState.OFFLINE or (result.state is RunState.IDLE and not carryover):
         return
     try:
         await _persist(result, trigger)
@@ -3645,7 +3730,7 @@ async def _record_run_completion(result: RunResult, trigger: str, *, continuatio
     # History is one row per completed attempt, including a successful re-drain.
     # Notification is one per visit. Coupling these conditions made history stale whenever
     # an initial band/recovery hold returned IDLE and the continuation did the transfer.
-    if not continuation:
+    if not continuation and result.state is not RunState.IDLE:
         with contextlib.suppress(Exception):
             await report_event(
                 "finished" if result.state is RunState.OK else "error", result=result

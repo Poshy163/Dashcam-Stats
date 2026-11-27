@@ -377,6 +377,30 @@ export interface IngestRadioStatus {
   transition: IngestRadioTransitionStatus | null
 }
 
+export interface IngestRunAccounting {
+  firstInventoryAt: string | null
+  lastInventoryAt: string | null
+  footageFoundFiles: number | null
+  footageFoundBytes: number | null
+  footageSavedFiles: number
+  footageSavedBytes: number
+  footageRemainingFiles: number | null
+  footageRemainingBytes: number | null
+  obdCopied: number | null
+  obdCopiedBytes: number | null
+  obdDuplicates: number | null
+  obdFailed: number | null
+  stopReason: 'sleep_deadline' | 'ignition_on' | 'radio_safety' | 'radio_recovery' | 'cancelled' | 'failure' | null
+  radioRecoveryPending: boolean
+  receiveSeconds: number | null
+  wifiObservedAt: string | null
+  wifiFrequencyMhz: number | null
+  wifiSignalDbm: number | null
+  wifiLinkMbps: number | null
+  temperatureObservedAt: string | null
+  socTemperatureC: number | null
+}
+
 export interface IngestRun {
   id: number
   startedAt: string | null
@@ -389,6 +413,7 @@ export interface IngestRun {
   throughputMbsAvg: number
   endToEndMbs: number | null
   footageReceiveMbs: number | null
+  accounting?: IngestRunAccounting | null
   error: string | null
 }
 
@@ -745,6 +770,22 @@ export interface OBDDriveSeries {
   diagnostics: { observedAt: string | null; kind: string; payload: Record<string, unknown> }[]
 }
 
+export interface CarPlayMilestone {
+  at: string
+  afterIgnitionS: number
+}
+
+export interface OBDCarPlayOutcome {
+  status: 'unknown' | 'saved_phone_joined' | 'phone_handshake' | 'decoder_observed' | 'carplay_session' | 'zlink_video' | 'carplay_video'
+  ignitionAt: string | null
+  observedUntil: string | null
+  hotspot: CarPlayMilestone | null
+  savedPhoneLease: CarPlayMilestone | null
+  phoneHandshake: CarPlayMilestone | null
+  videoSession: (CarPlayMilestone & { outputConfirmed: boolean; durationS: number }) | null
+  helper: (CarPlayMilestone & { action: 'early_retry' | 'waiting_connect' | 'waiting_cycle' }) | null
+}
+
 export interface OBDIgnitionCoverageCounts {
   rows: number
   speedRows: number
@@ -754,7 +795,17 @@ export interface OBDIgnitionCoverageCounts {
   voltageOnlyRows: number
 }
 
-export type OBDIgnitionCoverage = Record<'accOn' | 'accOff' | 'unknown' | 'total', OBDIgnitionCoverageCounts>
+export type OBDIgnitionCoverage = Record<'accOn' | 'accOff' | 'unknown' | 'total', OBDIgnitionCoverageCounts> & {
+  startup: {
+    observedAccOnAt: string | null
+    firstSpeedRpmAt: string | null
+    accToFirstSpeedRpmS: number | null
+    driveToFirstSpeedRpmS: number | null
+    lowVoltageParkedWaits: number | null
+    startupVoltageRechecks: number | null
+    stages: { bluetoothReadyS?: number; adapterReadyS?: number; ecuReadyS?: number }
+  }
+}
 
 export interface OBDStatus {
   logger: OBDLoggerStatus | null
@@ -972,12 +1023,14 @@ export const api = {
     bundles: (query?: Query) => request<Paginated<OBDBundle>>('/obd/bundles', { query }),
     drives: (query?: Query) => request<Paginated<OBDDriveSummary>>('/obd/drives', { query }),
     drivesSummary: () => request<OBDDrivesTotals>('/obd/drives/summary'),
+    carplayOutcome: (driveId: string) =>
+      request<OBDCarPlayOutcome>(`/obd/drives/${encodeURIComponent(driveId)}/carplay-outcome`),
     ignitionCoverage: (driveId: string) =>
       request<OBDIgnitionCoverage>(`/obd/drives/${encodeURIComponent(driveId)}/ignition-coverage`),
     driveSeries: (driveId: string, query?: { start?: string; end?: string; signals?: string; maxPoints?: number; diagnosticPage?: number; diagnosticPageSize?: number }) =>
       request<OBDDriveSeries>(`/obd/drives/${encodeURIComponent(driveId)}/series`, { query }),
     driveForJourney: (journeyId: number) =>
-      request<{ drive: OBDDriveSummary | null; overlapS: number | null }>(
+      request<{ drive: OBDDriveSummary | null; overlapS: number | null; matchedDistanceKm?: number }>(
         `/obd/drives/for-journey/${journeyId}`,
       ),
     reprocessDrive: (driveId: string) =>

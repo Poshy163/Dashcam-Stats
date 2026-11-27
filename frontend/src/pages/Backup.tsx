@@ -15,6 +15,7 @@ import type {
   IngestRadioDeviceState,
   IngestRadioStatus,
   IngestRadioTransitionStatus,
+  IngestRun,
   IngestStatus,
   OBDBundle,
 } from '@/lib/api'
@@ -34,6 +35,22 @@ const STATES: Record<IngestStatus['state'], { label: string; tone: 'default' | '
   offline: { label: 'Car not here', tone: 'default' },
   unauthorized: { label: 'Not authorised', tone: 'error' },
   cancelled: { label: 'Cancelled', tone: 'warn' },
+}
+
+function backupRunLabel(run: IngestRun) {
+  switch (run.accounting?.stopReason) {
+    case 'sleep_deadline': return 'Stopped for scheduled sleep'
+    case 'ignition_on': return 'Stopped for ignition'
+    case 'radio_safety': return 'Radio safety stop'
+    case 'radio_recovery': return 'Radio recovery needed'
+    case 'failure': return run.state === 'partial' ? 'Partly saved before failure' : 'Failed'
+  }
+  if (run.state === 'ok' && run.accounting?.footageRemainingFiles) return 'Batch saved'
+  return STATES[run.state as IngestStatus['state']]?.label ?? run.state
+}
+
+function fileTotal(files: number | null, bytes: number | null) {
+  return files == null ? 'Unknown' : `${files} ${files === 1 ? 'file' : 'files'} · ${formatBytes(bytes)}`
 }
 
 /**
@@ -1222,14 +1239,10 @@ export default function Backup() {
               <tr className="text-left text-xs uppercase tracking-wide text-content-faint">
                 <th className="px-4 py-3 font-medium">When</th>
                 <th className="px-4 py-3 font-medium">Result</th>
-                <th className="px-4 py-3 font-medium">Files</th>
-                <th className="px-4 py-3 font-medium">Size</th>
-                <th className="px-4 py-3 font-medium" title="Saved bytes divided by the full backup duration, including setup and checks.">
-                  Start-to-finish speed
-                </th>
-                <th className="px-4 py-3 font-medium" title="Footage archive bytes per second during receive attempts, including retries and staging writes.">
-                  Footage receive speed
-                </th>
+                <th className="px-4 py-3 font-medium" title="Found counts eligible clips seen across this run. Remaining uses the latest inventory, less confirmed saves.">Footage</th>
+                <th className="px-4 py-3 font-medium">OBD bundles</th>
+                <th className="px-4 py-3 font-medium">Transfer speed</th>
+                <th className="px-4 py-3 font-medium">Camera and Wi-Fi</th>
               </tr>
             </thead>
             <tbody>
@@ -1238,21 +1251,61 @@ export default function Backup() {
                   <td className="whitespace-nowrap px-4 py-3">{formatDateTime(run.startedAt)}</td>
                   <td className="px-4 py-3">
                     <span className={run.state === 'ok' ? 'text-state-ok' : 'text-state-warn'}>
-                      {STATES[run.state as IngestStatus['state']]?.label ?? run.state}
+                      {backupRunLabel(run)}
                     </span>
+                    {run.accounting?.radioRecoveryPending && (
+                      <div className="text-xs text-state-warn">Radio restoration pending at finish</div>
+                    )}
                     {run.error && (
-                      <div className="mt-0.5 max-w-md truncate text-xs text-content-faint">
-                        {run.error}
-                      </div>
+                      <div className="mt-0.5 max-w-md text-xs text-content-faint">{run.error}</div>
                     )}
                   </td>
-                  <td className="tabular px-4 py-3">{run.filesTransferred}</td>
-                  <td className="tabular px-4 py-3">{formatBytes(run.bytesTransferred)}</td>
-                  <td className="tabular px-4 py-3">
-                    {run.endToEndMbs != null ? `${run.endToEndMbs.toFixed(1)} MB/s` : '—'}
+                  <td className="tabular whitespace-nowrap px-4 py-3">
+                    {run.accounting ? (
+                      <>
+                        <div>Found {fileTotal(run.accounting.footageFoundFiles, run.accounting.footageFoundBytes)}</div>
+                        <div>Saved {fileTotal(run.accounting.footageSavedFiles, run.accounting.footageSavedBytes)}</div>
+                        <div>Remaining {fileTotal(run.accounting.footageRemainingFiles, run.accounting.footageRemainingBytes)}</div>
+                        <div className="text-xs text-content-faint">
+                          {run.accounting.lastInventoryAt
+                            ? <>Last inventory {formatDateTime(run.accounting.lastInventoryAt)}</>
+                            : 'No inventory recorded'}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div>{fileTotal(run.filesTransferred, run.bytesTransferred)} combined</div>
+                        <div className="text-xs text-content-faint">Older run · no inventory breakdown</div>
+                      </>
+                    )}
                   </td>
                   <td className="tabular px-4 py-3">
-                    {run.footageReceiveMbs != null ? `${run.footageReceiveMbs.toFixed(1)} MB/s` : '—'}
+                    {run.accounting?.obdCopied != null ? (
+                      <>
+                        <div>{run.accounting.obdCopied} saved · {formatBytes(run.accounting.obdCopiedBytes)}</div>
+                        {!!run.accounting.obdDuplicates && <div>{run.accounting.obdDuplicates} already saved</div>}
+                        {!!run.accounting.obdFailed && <div className="text-state-warn">{run.accounting.obdFailed} failed</div>}
+                      </>
+                    ) : 'Unknown'}
+                  </td>
+                  <td className="tabular whitespace-nowrap px-4 py-3">
+                    <div title="Saved bytes divided by elapsed time including setup and checks.">
+                      Overall {run.endToEndMbs != null ? `${run.endToEndMbs.toFixed(1)} MB/s` : '—'}
+                    </div>
+                    <div title="Footage archive bytes divided by time receiving them, including retries and staging writes.">
+                      Receiving {run.footageReceiveMbs != null ? `${run.footageReceiveMbs.toFixed(1)} MB/s` : '—'}
+                      {run.accounting?.receiveSeconds != null && <> over {formatDuration(run.accounting.receiveSeconds)}</>}
+                    </div>
+                  </td>
+                  <td className="tabular whitespace-nowrap px-4 py-3">
+                    <div title={run.accounting?.temperatureObservedAt ? formatDateTime(run.accounting.temperatureObservedAt) : undefined}>
+                      Peak chip temperature {run.accounting?.socTemperatureC != null ? `${run.accounting.socTemperatureC.toFixed(1)} °C` : '—'}
+                    </div>
+                    <div title={run.accounting?.wifiObservedAt ? formatDateTime(run.accounting.wifiObservedAt) : undefined}>
+                      Wi-Fi {run.accounting?.wifiFrequencyMhz != null ? `${run.accounting.wifiFrequencyMhz} MHz` : '—'}
+                      {run.accounting?.wifiSignalDbm != null && <> · {run.accounting.wifiSignalDbm} dBm</>}
+                      {run.accounting?.wifiLinkMbps != null && <div>Link rate {run.accounting.wifiLinkMbps} Mbps</div>}
+                    </div>
                   </td>
                 </tr>
               ))}

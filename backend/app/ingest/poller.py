@@ -30,6 +30,7 @@ from app.core.logging import get_logger
 from app.ingest import (
     adb,
     band,
+    carplay_outcome,
     carplay_timing,
     health,
     puller,
@@ -132,6 +133,7 @@ class IngestPoller:
         # the app going down is exactly the kind of absence it exists to cover.
         await health.shutdown()
         await unit_logs.shutdown()
+        await carplay_outcome.shutdown()
         await carplay_timing.shutdown()
         await temperature_capture.shutdown()
         await wifi_startup.shutdown()

@@ -16,7 +16,9 @@ from app.ingest import obd_control, poller, puller, radio_coordinator
 from app.ingest.models import RunResult, RunState
 from app.ingest.status import IngestStatus
 from app.journeys.builder import JourneyBuilder, JourneyRefreshConflict
+from app.journeys.summary_queue import summary_turn
 from app.pipeline import stages
+from app.pipeline.orchestrator import run_stages
 
 BASE = datetime(2026, 10, 22, 7, tzinfo=UTC)
 
@@ -78,6 +80,76 @@ def pause_derivation(monkeypatch):
     # than merely checking whether the new planning helper exists.
     monkeypatch.setattr(JourneyBuilder, "_find_stale_sighting_positions", staticmethod(derive))
     return entered, release
+
+
+async def test_concurrent_summaries_attach_both_new_clips_to_one_journey(db_session, monkeypatch):
+    first, _ = await seed(db_session, existing=False)
+    second = Recording(
+        filename="paired.ts",
+        rel_path="paired.ts",
+        state=RecordingState.PROCESSING,
+        started_at=first.started_at,
+        ended_at=first.ended_at,
+        duration_s=60,
+    )
+    db_session.add(second)
+    await db_session.commit()
+    entered, release = pause_derivation(monkeypatch)
+
+    async def summarise(recording_id):
+        async with get_session_factory()() as session:
+            recording = await session.get(Recording, recording_id)
+            return await run_stages(session, recording, ["summarise"])
+
+    a = asyncio.create_task(summarise(first.id))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    b = asyncio.create_task(summarise(second.id))
+    release.set()
+    assert all(report.ok for report in await asyncio.wait_for(asyncio.gather(a, b), timeout=15))
+    await db_session.refresh(first)
+    await db_session.refresh(second)
+    assert first.journey_id is not None and first.journey_id == second.journey_id
+
+
+async def test_summary_retries_only_the_summary_from_fresh_state(db_session, monkeypatch):
+    rec, _ = await seed(db_session)
+    original = stages.STAGES["summarise"]
+    attempts = 0
+
+    async def conflict_once(session, recording, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise JourneyRefreshConflict("concurrent clip")
+        return await original(session, recording, **kwargs)
+
+    monkeypatch.setitem(stages.STAGES, "summarise", conflict_once)
+    report = await run_stages(db_session, rec, ["summarise"])
+    assert report.ok and attempts == 2 and rec.state == RecordingState.COMPLETED
+
+
+async def test_summary_turn_waits_for_overlapping_commits_but_allows_other_drives(db_session):
+    first, _ = await seed(db_session, existing=False)
+    same = SimpleNamespace(started_at=first.started_at, ended_at=first.ended_at)
+    later = SimpleNamespace(
+        started_at=first.started_at + timedelta(days=1), ended_at=first.ended_at + timedelta(days=1)
+    )
+    ready, entered = asyncio.Event(), asyncio.Event()
+
+    async def queued():
+        session = AsyncMock()
+        session.execute.return_value = []
+        session.commit.side_effect = ready.set
+        async with summary_turn(session, same):
+            entered.set()
+
+    async with summary_turn(db_session, first):
+        task = asyncio.create_task(queued())
+        await asyncio.wait_for(ready.wait(), timeout=5)
+        async with summary_turn(db_session, later):
+            assert not entered.is_set()
+    await asyncio.wait_for(task, timeout=5)
+    assert entered.is_set()
 
 
 @pytest.mark.parametrize("existing", [False, True])

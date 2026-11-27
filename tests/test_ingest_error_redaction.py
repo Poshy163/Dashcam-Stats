@@ -41,6 +41,7 @@ async def test_history_redacts_previously_persisted_database_parameters():
         bytes_transferred=0,
         throughput_mbs_avg=0,
         footage_receive_mbs=None,
+        accounting=None,
         error="database is locked [SQL: INSERT INTO leases] [parameters: secret-value]",
     )
 

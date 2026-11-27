@@ -20,6 +20,7 @@ from app.core.logging import get_logger
 from app.db.models import Journey, Recording, RecordingState, StageState
 from app.db.retry import commit_with_retry, is_locked_error
 from app.journeys.builder import JourneyRefreshConflict
+from app.journeys.summary_queue import summary_turn
 from app.pipeline.revisions import CURRENT_REVISIONS, INVALIDATED_REVISION, REVISION_FIELDS
 from app.pipeline.stages import STAGE_ORDER, STAGES, StageError, StageResult
 
@@ -88,6 +89,7 @@ class RunReport:
     #: spending four of them turns a perfectly good recording into a permanent failure
     #: for a reason that has nothing to do with the recording.
     transient: bool = False
+    retry_summary_only: bool = False
     elapsed_s: float = 0.0
     realtime_factor: float | None = None
 
@@ -296,6 +298,23 @@ async def _revive(session: AsyncSession, recording_id: int) -> Recording | None:
         return None
 
 
+async def _commit_summary(session, recording, progress):
+    async with summary_turn(session, recording):
+        for attempt in range(3):
+            try:
+                result = await STAGES["summarise"](session, recording, progress=progress)
+                await session.flush()
+                await commit_with_retry(session, what="commit journey summary")
+                return result
+            except JourneyRefreshConflict:
+                if attempt == 2:
+                    raise
+                # Rebuild the rejected plan from committed inputs. Its completion
+                # fields must be set again after rollback, inside the next summary.
+                await session.rollback()
+                await session.refresh(recording)
+
+
 async def run_stages(
     session: AsyncSession,
     recording: Recording,
@@ -358,7 +377,10 @@ async def run_stages(
 
         stage_started = time.monotonic()
         try:
-            result = await stage(session, recording, progress=stage_progress)
+            if name == "summarise":
+                result = await _commit_summary(session, recording, stage_progress)
+            else:
+                result = await stage(session, recording, progress=stage_progress)
             elapsed = round(time.monotonic() - stage_started, 3)
             if result.stats is None:
                 result.stats = {}
@@ -385,10 +407,11 @@ async def run_stages(
                 decoder=result.stats.get("decoder"),
                 device=result.stats.get("device"),
             )
-            await session.flush()
             # Release the write lock between stages rather than holding it across the
             # next decode. See the note above the first commit.
-            await commit_with_retry(session, what=f"commit stage {name}")
+            if name != "summarise":
+                await session.flush()
+                await commit_with_retry(session, what=f"commit stage {name}")
         except StageError as exc:
             recording = await _revive(session, report.recording_id) or recording
             if attr:
@@ -425,6 +448,13 @@ async def run_stages(
             # fault raises StageError with `permanent` set. `transient` is carried
             # separately so the queue can tell a database lock from a real defect.
             report.transient = is_locked_error(exc) or isinstance(exc, JourneyRefreshConflict)
+            if name == "summarise" and isinstance(exc, JourneyRefreshConflict):
+                report.retry_summary_only = True
+                log.info(
+                    "journey changed during summary; deferring its refresh",
+                    recording=recording.filename,
+                )
+                break
             recording.state = RecordingState.FAILED
             recording.error_message = report.error
             recording.error_count += 1

@@ -31,6 +31,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
+from app.api.geometry import DEFAULT_MAX_GAP_S
 from app.osd.validate import clock_is_plausible
 
 
@@ -156,4 +157,19 @@ def single_track(
     return result
 
 
-__all__ = ["TrackPoint", "moment_of", "single_track"]
+def gps_distance_partial(track: list[TrackPoint], start: datetime, end: datetime) -> bool | None:
+    """Check both edges and interior breaks of the camera-deduplicated position track."""
+    previous = None
+    for point in track:
+        if point.lat is None or point.lon is None:
+            continue
+        if previous is None:
+            if (point.at - start).total_seconds() > DEFAULT_MAX_GAP_S:
+                return True
+        elif point.breaks_segment or (point.at - previous).total_seconds() > DEFAULT_MAX_GAP_S:
+            return True
+        previous = point.at
+    return None if previous is None else (end - previous).total_seconds() > DEFAULT_MAX_GAP_S
+
+
+__all__ = ["TrackPoint", "gps_distance_partial", "moment_of", "single_track"]

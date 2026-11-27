@@ -9,6 +9,7 @@ import { ObdAppEventTimeline } from '@/components/ObdAppEventTimeline'
 import { ObdPollTiming } from '@/components/ObdPollTiming'
 import { ObdRecordingGaps } from '@/components/ObdRecordingGaps'
 import { ObdIgnitionCoverage } from '@/components/ObdIgnitionCoverage'
+import { ObdCarPlayOutcome } from '@/components/ObdCarPlayOutcome'
 import ObdFaultSummary from '@/components/ObdFaultSummary'
 import { EmptyState, ErrorState, PageHeader, Pagination, StatTile } from '@/components/ui'
 import { api, type OBDBattery, type OBDSeriesSample } from '@/lib/api'
@@ -858,6 +859,7 @@ export default function ObdDriveDetail() {
       </div>
 
       <ObdRecordingGaps drive={drive} />
+      <ObdCarPlayOutcome driveId={drive.driveId} />
       <ObdIgnitionCoverage driveId={drive.driveId} />
       {drive.producerMissingDataDurationS != null && <p className="text-xs text-content-muted">
         Camera-reported missing time: {formatDuration(drive.producerMissingDataDurationS)}.

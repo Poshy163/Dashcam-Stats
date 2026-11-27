@@ -10,7 +10,7 @@ from app.db.models import Journey, Recording, RecordingState, TelemetryPoint
 from app.journeys.builder import JourneyBuilder
 from app.journeys.motion import MOTION_REVISION, assess_motion
 from app.journeys.revalidation import motion_coverage, revalidate_motion
-from app.journeys.track import TrackPoint
+from app.journeys.track import TrackPoint, gps_distance_partial
 from app.retention.parked import parked_journey_ids
 
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -20,6 +20,26 @@ def point(t, speed, metres=0, *, east=0, broken=False):
     return TrackPoint(
         1, float(t), metres / 111_195, east / 111_195, speed, BASE + timedelta(seconds=t), broken
     )
+
+
+@pytest.mark.parametrize(
+    ("seconds", "partial"),
+    [
+        ([], None),
+        ([0, 10, 20, 30], False),
+        ([18, 25, 30], True),
+        ([0, 5, 10], True),
+        ([0, 5, 25, 30], True),
+    ],
+)
+def test_gps_distance_coverage_uses_both_ends_and_gaps(seconds, partial):
+    track = [point(t, 36, t * 10) for t in seconds]
+    assert gps_distance_partial(track, BASE, BASE + timedelta(seconds=30)) is partial
+
+
+def test_gps_distance_flags_a_rejected_leg_between_close_fixes():
+    track = [point(0, 36), point(1, 36, broken=True)]
+    assert gps_distance_partial(track, BASE, BASE + timedelta(seconds=1))
 
 
 def test_source_speed_spike_is_rejected_despite_perfect_ocr():

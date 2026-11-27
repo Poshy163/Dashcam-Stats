@@ -4,6 +4,18 @@ The on-device logger is the Android companion under `android/obd-logger`. It is 
 separate from the server container while using the same version-one bundle contract and the
 existing ADB arrival backup.
 
+Companion 0.3.33 gives a brief startup voltage dip one extra check. After an
+observed ignition-on transition, it can read the adapter voltage again after
+five seconds if ignition stays on and backup has not requested the adapter.
+Both voltage gates share this one check. The usual voltage thresholds, ECU
+response validation and 12-second Bluetooth settling period still apply.
+
+On the OBD drive page, startup timing runs from observed ignition-on to the
+first recorded row with valid speed and RPM. The page shows available setup
+milestones and leaves missing evidence unknown. Journey details label incomplete
+GPS distances and show speed-derived OBD distance separately for a single
+well-matched drive. The route follows the camera's recorded positions.
+
 The exact producer/validator contracts are [obd-bundle-schema-v1.md](obd-bundle-schema-v1.md)
 and [obd-app-event-schema-v1.md](obd-app-event-schema-v1.md).
 
