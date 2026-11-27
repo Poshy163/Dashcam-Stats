@@ -90,6 +90,7 @@ class ObdLoggerService : Service() {
     private val movementLifecycleLock = Any()
     private var movementStopping = false
     private val bluetoothGate = BluetoothReadinessGate()
+    private val startupVoltageRecheck = StartupVoltageRecheck()
     private val ignitionPauseRelease = IgnitionPauseRelease()
     @Volatile
     private var bluetoothWaitAnnounced = false
@@ -645,8 +646,24 @@ class ObdLoggerService : Service() {
         val controlPresent = {
             readIngestionRequest(deviceRoot) !is IngestionRequestRead.Absent
         }
+        val voltageOnlyMode = config.voltageOnlyMode || BuildConfig.VOLTAGE_ONLY_AUDIT
+        suspend fun startupVoltage(voltage: Double?, lowReason: String): Double? {
+            if (voltageOnlyMode) return voltage
+            return startupVoltageRecheck.afterLowReading(
+                voltage, config.voltageOn, SystemClock::elapsedRealtime,
+                allowed = { !controlPresent() && AndroidAccStateAccessor(this).readAccOn() == true },
+                wait = { delay(it) },
+                onRetry = {
+                    emitEvent(
+                        "obd.elm_session", "info", "retrying", lowReason,
+                        metrics = mapOf("retry_delay_ms" to StartupVoltageRecheck.DELAY_MILLIS),
+                    )
+                },
+                readVoltage = { elm.probeAdapterVoltage(controlPresent) },
+            )
+        }
         val parkedVoltage = try {
-            elm.probeAdapterVoltage(controlPresent)
+            startupVoltage(elm.probeAdapterVoltage(controlPresent), "voltage_below_start")
         } catch (_: ElmQuiesceRequestedException) {
             elm.disconnect(false)
             client = null
@@ -661,7 +678,7 @@ class ObdLoggerService : Service() {
             throw error
         }
         val engineCandidate = parkedProbeMayInitialize(
-            config.voltageOnlyMode || BuildConfig.VOLTAGE_ONLY_AUDIT,
+            voltageOnlyMode,
             parkedVoltage,
             config.voltageOn,
         )
@@ -680,7 +697,6 @@ class ObdLoggerService : Service() {
             client = null
             return
         }
-        val voltageOnlyMode = config.voltageOnlyMode || BuildConfig.VOLTAGE_ONLY_AUDIT
         if (!engineCandidate) {
             if (parkedTransition) {
                 emitEvent("obd.ecu_session", "info", "skipped", "voltage_below_start")
@@ -715,7 +731,7 @@ class ObdLoggerService : Service() {
         val elmStarted = SystemClock.elapsedRealtime()
         emitEvent("obd.elm_session", "info", "started", "adapter_voltage_valid")
         val voltage = try {
-            elm.initialize(controlPresent).also {
+            val initializedVoltage = elm.initialize(controlPresent).also {
                 emitEvent(
                     "obd.elm_session",
                     "info",
@@ -724,6 +740,7 @@ class ObdLoggerService : Service() {
                     metrics = mapOf("elm_init_ms" to boundedElapsedMillis(elmStarted)),
                 )
             }
+            startupVoltage(initializedVoltage, "voltage_below_stop")
         } catch (_: ElmQuiesceRequestedException) {
             elm.disconnect(false)
             client = null
@@ -789,6 +806,7 @@ class ObdLoggerService : Service() {
             return
         }
         check(lifecycle.acceptChecksumValidEcuProof(true))
+        startupVoltageRecheck.engineProved()
         // A checksum-valid ECU response is meaningful recovery even though this connection may
         // remain inside runOneConnection for the rest of the drive. Do not let old failures keep
         // escalating the next reconnect delay toward its cap.
@@ -2413,6 +2431,7 @@ class ObdLoggerService : Service() {
         when (value) {
             is SleepWindowControllerObservation.AccRead -> {
                 ignitionOnObserved = value.on
+                startupVoltageRecheck.observeAcc(value.on, SystemClock.elapsedRealtime())
                 motionJournal?.acc(value.on)
                 clipIndexer?.notifyWorkModeChanged()
             }
